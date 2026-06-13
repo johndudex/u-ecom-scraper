@@ -49,7 +49,14 @@ def _needs_browser_queue(scraper_path: str, scraping_method: str) -> bool:
     try:
         with open(scraper_path, "r", encoding="utf-8") as fh:
             head = fh.read(2000).lower()
-        for indicator in ("seleniumbase", "undetected", "uc_open", "uc_mode", "chrome_driver", "selenium"):
+        for indicator in (
+            "seleniumbase",
+            "undetected",
+            "uc_open",
+            "uc_mode",
+            "chrome_driver",
+            "selenium",
+        ):
             if indicator in head:
                 return True
     except Exception:
@@ -73,7 +80,9 @@ def _build_field_summary_from_analysis(slug: str, root: str) -> str:
     if not fields:
         return "Product analysis has no field mappings."
 
-    lines = [f"Fields mapped from initial product page ({analysis.get('analyzed_products', '?')} products):"]
+    lines = [
+        f"Fields mapped from initial product page ({analysis.get('analyzed_products', '?')} products):"
+    ]
     for field_name, field_info in fields.items():
         if isinstance(field_info, dict):
             method = field_info.get("method", "?")
@@ -126,7 +135,18 @@ def _format_output_products(output_path: str) -> str:
 
     for i, p in enumerate(products[:5], 1):
         lines.append(f"--- Product {i} ---")
-        for field in ["title", "price", "original_price", "availability", "currency", "url", "brand", "sku"]:
+        for field in [
+            "title",
+            "price",
+            "original_price",
+            "availability",
+            "currency",
+            "url",
+            "brand",
+            "sku",
+            "status_code",
+            "remarks",
+        ]:
             val = p.get(field, "")
             if val:
                 val_str = str(val)[:120]
@@ -144,7 +164,9 @@ def field_confirmation(state: ScrapeState) -> Command:
 
     if state.get("sample_only", False):
         job_id = state.get("job_id", 0)
-        logger.info("field_confirmation: skipping (sample_only mode), going to execution")
+        logger.info(
+            "field_confirmation: skipping (sample_only mode), going to execution"
+        )
         try:
             from django.utils.timezone import now as dj_now
             from scraper.models import Step
@@ -169,7 +191,12 @@ def field_confirmation(state: ScrapeState) -> Command:
     sample_text = ""
 
     if os.path.isfile(input_path):
-        cmd_args = ["--input", input_path, "--sample", str(FIELD_CONFIRMATION_SAMPLE_COUNT)]
+        cmd_args = [
+            "--input",
+            input_path,
+            "--sample",
+            str(FIELD_CONFIRMATION_SAMPLE_COUNT),
+        ]
 
         scraping_method = state.get("scraping_method", "")
         if _needs_browser_queue(scraper_path, scraping_method):
@@ -185,7 +212,9 @@ def field_confirmation(state: ScrapeState) -> Command:
                 logger.info("field_confirmation: reading output file %s", output_file)
                 sample_text = _format_output_products(output_file)
     else:
-        logger.info("field_confirmation: input_urls.json not found, running scraper with initial product URL")
+        logger.info(
+            "field_confirmation: input_urls.json not found, running scraper with initial product URL"
+        )
         product_url = state.get("product_url", "")
         if product_url:
             cmd_args = ["--urls", product_url]
@@ -199,7 +228,9 @@ def field_confirmation(state: ScrapeState) -> Command:
             if not sample_text:
                 output_file = _find_latest_output(slug, root)
                 if output_file:
-                    logger.info("field_confirmation: reading output file %s", output_file)
+                    logger.info(
+                        "field_confirmation: reading output file %s", output_file
+                    )
                     sample_text = _format_output_products(output_file)
 
     if not sample_text:
@@ -212,7 +243,9 @@ def field_confirmation(state: ScrapeState) -> Command:
                 severity = issue.get("severity", "?")
                 desc = issue.get("description", issue.get("field", "?"))
                 issue_lines.append(f"  - [{severity.upper()}] {desc}")
-            issue_text = "\n".join(issue_lines) if issue_lines else "  (no issues listed)"
+            issue_text = (
+                "\n".join(issue_lines) if issue_lines else "  (no issues listed)"
+            )
             sample_text = (
                 f"Test assessment: {assessment}\n"
                 f"Issues found:\n{issue_text}\n\n"
@@ -293,7 +326,11 @@ def _run_sample_in_process(scraper_path: str, args: list[str], cwd: str) -> str:
     cmd = ["python3", scraper_path] + args
     try:
         result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=120, cwd=cwd,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=cwd,
         )
         return result.stdout[:5000]
     except subprocess.TimeoutExpired:
@@ -308,7 +345,9 @@ def _run_sample_via_queue(scraper_path: str, args: list[str]) -> str:
         import json
         from django.conf import settings
 
-        browser_service_url = getattr(settings, "BROWSER_SERVICE_URL", "http://browser-service:8001")
+        browser_service_url = getattr(
+            settings, "BROWSER_SERVICE_URL", "http://browser-service:8001"
+        )
         resp = httpx.post(
             f"{browser_service_url}/scrape",
             json={
@@ -339,10 +378,14 @@ def _persist_field_confirmation_sample(job_id: int, sample_text: str) -> None:
             seq=seq,
         )
     except Exception as exc:
-        logger.warning("Failed to persist field_confirmation sample for job %s: %s", job_id, exc)
+        logger.warning(
+            "Failed to persist field_confirmation sample for job %s: %s", job_id, exc
+        )
 
 
-def _persist_field_confirmation_decision(job_id: int, decision: dict, feedback: str) -> None:
+def _persist_field_confirmation_decision(
+    job_id: int, decision: dict, feedback: str
+) -> None:
     if not job_id:
         return
     try:
@@ -361,4 +404,6 @@ def _persist_field_confirmation_decision(job_id: int, decision: dict, feedback: 
             seq=seq,
         )
     except Exception as exc:
-        logger.warning("Failed to persist field_confirmation decision for job %s: %s", job_id, exc)
+        logger.warning(
+            "Failed to persist field_confirmation decision for job %s: %s", job_id, exc
+        )

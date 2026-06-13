@@ -620,17 +620,14 @@ def build_scraper_analyzer_message(state: dict) -> list:
         )
 
     retry_section = ""
-    test_report_path = f"workspace/{slug}/test_report.json"
     scraper_draft_path = f"workspace/{slug}/scraper_draft.py"
     scraper_analysis_path = f"workspace/{slug}/scraper_analysis.json"
     if state.get("test_report"):
         retry_section = (
-            f"\n### RETRY MODE\n"
-            f"A previous scraper failed testing. Read these files to understand what went wrong:\n"
-            f"- Test report: {test_report_path}\n"
-            f"- Broken scraper: {scraper_draft_path}\n"
-            f"- Previous scraper analysis: {scraper_analysis_path}\n"
-            f"Adjust the strategy, proxy tier, and selectors based on what failed.\n"
+            f"\n{_summarize_test_report(state)}\n"
+            f"Read the broken scraper at: {scraper_draft_path}\n"
+            f"Read the previous analysis at: {scraper_analysis_path}\n"
+            f"Adjust the strategy, proxy tier, and selectors based on the failures above.\n"
             f"Escalate proxy tier if connection was blocked.\n"
         )
 
@@ -729,6 +726,43 @@ def _url_discovery_rules(site_input_urls: list[str]) -> str:
     )
 
 
+def _summarize_test_report(state: dict) -> str:
+    report = state.get("test_report")
+    if not report:
+        return ""
+    assessment = report.get("overall_assessment", "UNKNOWN")
+    confidence = report.get("confidence_score", 0.0)
+    issues = report.get("issues", [])
+    retry_count = state.get("test_retry_count", 0)
+
+    lines = [
+        f"### Previous Test Results (Retry Cycle {retry_count + 1})",
+        f"- **Assessment:** {assessment}",
+        f"- **Confidence:** {confidence:.0%}",
+    ]
+    if issues:
+        high = [i for i in issues if i.get("severity") == "high"]
+        medium = [i for i in issues if i.get("severity") == "medium"]
+        if high:
+            lines.append(f"\n**HIGH severity ({len(high)}):**")
+            for i in high[:5]:
+                field = i.get("field", i.get("description", "?"))
+                desc = i.get("description", "")
+                expected = i.get("expected", "")
+                actual = i.get("actual", "")
+                lines.append(f"  - `{field}`: {desc}")
+                if expected or actual:
+                    lines.append(f"    Expected: {expected!r} | Actual: {actual!r}")
+        if medium:
+            lines.append(f"\n**MEDIUM severity ({len(medium)}):**")
+            for i in medium[:3]:
+                field = i.get("field", i.get("description", "?"))
+                lines.append(f"  - `{field}`: {i.get('description', '')}")
+    if retry_count > 0:
+        lines.append(f"\n*{retry_count} previous attempt(s) failed.*")
+    return "\n".join(lines)
+
+
 def build_code_writer_message(state: dict) -> list:
     """Build the initial HumanMessage for the code-writer agent.
 
@@ -762,10 +796,10 @@ def build_code_writer_message(state: dict) -> list:
     test_report_path = f"workspace/{slug}/test_report.json"
     if state.get("test_report"):
         retry_section = (
-            f"\n\n**RETRY MODE** — A previous test found issues. "
-            f"Read the test report at: {test_report_path}\n"
-            f"Apply the suggested fixes to the existing scraper at: "
-            f"workspace/{slug}/scraper_draft.py\n"
+            f"\n\n{_summarize_test_report(state)}\n"
+            f"Read the full test report at: {test_report_path}\n"
+            f"Fix the scraper at: workspace/{slug}/scraper_draft.py\n"
+            f"Focus on the HIGH severity issues above. Do NOT change parts that work.\n"
         )
 
     algolia_section = ""
@@ -923,6 +957,17 @@ def build_code_writer_message(state: dict) -> list:
         f"(requests library may not support Brotli)\n"
         f"{_url_discovery_rules(site_input_urls)}\n"
         f"- Deviate from the template's input/output structure\n\n"
+        f"### Soft 404 Detection (CRITICAL)\n"
+        f"Many e-commerce sites return HTTP 200 for deleted/expired products but show "
+        f"'Product Not Found', 'No Longer Available', or redirect to a search page.\n\n"
+        f"Your scraper MUST detect these cases and set the `remarks` field:\n"
+        f"- Check if JSON-LD contains a Product type — if not, likely not a product page\n"
+        f"- Check if the page title or H1 contains 'not found', 'unavailable', "
+        f"'discontinued', 'no longer available'\n"
+        f"- Check if the final URL after redirects differs from the requested product URL\n"
+        f"- When detected, set `remarks` to a description like "
+        f"'Soft 404: product not found' and leave title/price empty — "
+        f"do NOT extract data from a non-product page.\n\n"
         f"### Image Extraction Rules (CRITICAL)\n"
         f"Product images must be scoped to the PRODUCT GALLERY only. Never capture:\n"
         f"- Navigation banners, header images, or hero images\n"
@@ -956,10 +1001,21 @@ def build_code_tester_message(state: dict) -> list:
     """Build the initial HumanMessage for the code-tester agent."""
     slug = state.get("site_slug", "unknown")
 
+    retry_context = ""
+    retry_count = state.get("test_retry_count", 0)
+    if retry_count > 0:
+        retry_context = (
+            f"\n### RETEST MODE (Cycle {retry_count + 1})\n"
+            f"The scraper was modified after previous test failures. "
+            f"Focus your validation on the fields that previously failed. "
+            f"Read the previous test report at: workspace/{slug}/test_report.json\n\n"
+        )
+
     content = (
         f"## OBJECTIVE\n"
         f"Building a product scraper for {slug}. Validate the generated scraper "
         f"extracts correct field values from product pages.\n\n"
+        f"{retry_context}"
         f"## Your Task: Test the Scraper\n\n"
         f"**Site slug:** {slug}\n"
         f"**Scraper path:** workspace/{slug}/scraper_draft.py\n"
@@ -996,6 +1052,25 @@ def build_code_tester_message(state: dict) -> list:
         f"every product. Only flag as a high-severity issue if the product is clearly on "
         f"sale (e.g., there's a strikethrough price or 'was' price visible) but the "
         f"field is still empty. Missing optional fields should be severity 'low' or 'info'.\n\n"
+        f"### Dead URLs (404s and Redirects)\n"
+        f"Some product URLs may no longer be valid — they return 404, redirect to a "
+        f"different page, or show 'product not found'. These are NOT scraper bugs.\n\n"
+        f"When evaluating scraper output:\n"
+        f"- Check the `status_code` field per product. Status codes 301, 302, 303, 307, "
+        f"308, 404, 410, or 451 indicate dead/expired product pages — EXCLUDE these "
+        f"from your quality assessment entirely.\n"
+        f"- Only flag missing `title` or `price` as issues for products with `status_code` "
+        f"200 that are clearly real product pages.\n"
+        f"- If a product has `status_code` 200 but shows a 'product not found' message, "
+        f"check the `remarks` field — the scraper may have noted this.\n"
+        f"- When calculating `confidence_score`, count dead URLs as 'skipped' (excluded "
+        f"from denominator), NOT as failures.\n"
+        f"- If ALL sampled URLs are dead (all non-200), set `overall_assessment` to PASS "
+        f"with `confidence_score` 1.0 and note 'all sampled URLs are dead — cannot assess "
+        f"scraper quality, but no scraper errors detected'.\n\n"
+        f"- Soft 404s: If a product has `status_code` 200 but the `remarks` field "
+        f"mentions 'soft 404', 'product not found', or similar, treat it the same as "
+        f"a dead URL — exclude from quality assessment.\n\n"
         f"### Image Validation\n"
         f"Check the `images` field for these common problems:\n"
         f"- Too many images (>20) likely means the scraper captured banners, nav images, "
