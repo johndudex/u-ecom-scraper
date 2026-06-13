@@ -88,6 +88,7 @@ class Step(models.Model):
         ("accessibility_check", "Accessibility Check"),
         ("site_analysis", "Site Analysis"),
         ("product_analysis", "Product Analysis"),
+        ("scraper_analysis", "Scraper Analysis"),
         ("code_generation", "Code Generation"),
         ("testing", "Testing"),
         ("field_confirmation", "Field Confirmation"),

@@ -1,0 +1,321 @@
+{
+  "site_slug": "adameve-com",
+  "test_timestamp": "2026-06-13T18:50:00.000Z",
+  "scraper_file": "scraper_draft.py",
+  "sample_size": 5,
+  "results": {
+    "successful_extractions": 3,
+    "failed_extractions": 2,
+    "field_coverage": {
+      "id": {
+        "count": 5,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent"
+      },
+      "title": {
+        "count": 3,
+        "coverage": "60%",
+        "status": "CORRECT",
+        "quality": "good",
+        "notes": "2 products returned non-product pages (discontinued). 3 extracted titles are correct. Product 1 title: 'Adam & Eve Heart Throbber Liquid Silicone Vibrating G-Spot Dildo' — matches JSON-LD Product.Name. Product 2 title: 'So Real 6 Inch Realistic Dildo' (with trailing space) — matches OG title stripped of suffix, trailing space is minor. Product 5 title: 'Wild Secrets Sensual Bubble Bath' — correct."
+      },
+      "price": {
+        "count": 3,
+        "coverage": "60%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "notes": "Product 1: '$31.50' matches og:price:amount and SSE Price. Product 2: '$14.99' matches og:price:amount. Product 5: '$29.99' matches og:price:amount. All correct."
+      },
+      "availability": {
+        "count": 3,
+        "coverage": "60%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "notes": "All 3 successful extractions show 'In Stock' which matches og:availability='instock' and SSE dimension11='In Stock'. Correctly normalized."
+      },
+      "original_price": {
+        "count": 3,
+        "coverage": "60%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "notes": "Product 1 (on sale): '$89.99' — matches og:price:standard_amount and SSE dimension23. Product 2 (not on sale): '' — correct, empty. Product 5 (not on sale): '' — correct, empty."
+      },
+      "currency": {
+        "count": 3,
+        "coverage": "60%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "notes": "All 3 have 'USD' matching og:price:currency and JSON-LD Offers.PriceCurrency."
+      },
+      "url": {
+        "count": 5,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "notes": "All URLs match canonical URLs. Full HTTPS URLs with .aspx extension."
+      },
+      "src_url": {
+        "count": 5,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent"
+      },
+      "status_code": {
+        "count": 5,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "notes": "All 5 returned 200. The 2 failed products correctly got 200 but were detected as non-product pages via is_product_page()."
+      },
+      "scraped_at": {
+        "count": 5,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "notes": "Valid ISO-8601 timestamps with timezone."
+      },
+      "remarks": {
+        "count": 5,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "notes": "Empty for 3 successful. Properly filled for 2 failed products: 'Received non-product page (possibly discontinued/redirected)...'"
+      },
+      "brand": {
+        "count": 3,
+        "coverage": "60%",
+        "status": "CORRECT",
+        "quality": "good",
+        "notes": "Product 1: 'Adam and Eve' — matches OG brand and SSE Brand. Product 2: 'Gopaldas, So Real' — SSE Brand is 'Gopaldas', OG brand is 'Gopaldas'. The ', So Real' suffix is unexpected — likely coming from the SSE Brand having been concatenated with ProductName somewhere, or a JSON-LD Brand.Name containing both. Minor data quality issue but not critical. Product 5: 'Wild Secrets' — correct."
+      },
+      "description": {
+        "count": 3,
+        "coverage": "60%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "notes": "All 3 descriptions are substantial, accurate product descriptions from JSON-LD Product.Description."
+      },
+      "sku": {
+        "count": 3,
+        "coverage": "60%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "notes": "Product 1: 'J506' — matches SSE Sku. Product 2: '4472' — matches SSE Sku. Product 5: 'L680' — matches SSE Sku."
+      },
+      "image_url": {
+        "count": 3,
+        "coverage": "60%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "notes": "All 3 are OG images (full 0x0 resolution) from og:image meta tag. Correct and high quality."
+      },
+      "images": {
+        "count": 3,
+        "coverage": "60%",
+        "status": "PARTIAL",
+        "quality": "needs_improvement",
+        "notes": "All 3 successful products have only 1 image in the images array (the 250x250 thumbnail from JSON-LD Product.Image). The site has product galleries with multiple images (glider carousel). The CSS selectors for the carousel (.ae-main-product-carousel, .ae-product-carousel) appear to not match, so it falls back to JSON-LD which only has 1 image. Expected 3-15 images per product but only getting 1.",
+        "issues": ["Only 1 image extracted per product instead of full gallery (expected 3-15)"]
+      },
+      "rating": {
+        "count": 3,
+        "coverage": "60%",
+        "status": "CORRECT",
+        "quality": "good",
+        "notes": "Product 1: '2.5' — SSE dimension13=2.5, correctly rounded to 1 decimal. Product 2: '4.1' — SSE dimension13=4.0999999..., correctly rounded to 4.1. Product 5: '0.0' — product has no reviews, SSE dimension13 not present, falls back to JSON-LD AggregateRating which gave 0. Correct behavior."
+      },
+      "review_count": {
+        "count": 3,
+        "coverage": "60%",
+        "status": "CORRECT",
+        "quality": "good",
+        "notes": "Product 1: '12' — matches SSE metric4. Product 2: '1126' — matches SSE metric4. Product 5: '' — empty, product has no reviews. Correct."
+      },
+      "category": {
+        "count": 3,
+        "coverage": "60%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "notes": "Product 1: 'Sex Toys/Dildos/Vibrating Dildos' — matches SSE ecommerce.detail.products[0].category. Product 2: 'Sex Toys/Dildos/Realistic Dildos' — matches. Product 5: 'Bath and Body/Bath and Shower' — matches."
+      },
+      "breadcrumbs": {
+        "count": 3,
+        "coverage": "60%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "notes": "All 3 have correct breadcrumb arrays from JSON-LD BreadcrumbList. Include 'Home' as first item."
+      },
+      "variants": {
+        "count": 3,
+        "coverage": "60%",
+        "status": "CORRECT",
+        "quality": "good",
+        "notes": "Product 1: [] — correct, no variant select on page. Product 2: [] — correct. Product 5: 2 variants extracted with value, text, color, size, price. Correct."
+      },
+      "color_variants": {
+        "count": 3,
+        "coverage": "60%",
+        "status": "CORRECT",
+        "quality": "good",
+        "notes": "Product 1: ['Pink'] — matches SSE Colors. Product 2: ['Beige'] — matches SSE Colors. Product 5: [] — SSE Colors is empty, correct."
+      },
+      "location": {
+        "count": 0,
+        "coverage": "0%",
+        "status": "CORRECT",
+        "quality": "not_applicable",
+        "notes": "location is optional and not available on product pages. Correctly left empty."
+      }
+    }
+  },
+  "issues": [
+    {
+      "severity": "medium",
+      "field": "images",
+      "status": "PARTIAL",
+      "problem": "Only 1 image extracted per product (JSON-LD fallback) instead of full product gallery (3-15 images expected)",
+      "details": "The CSS selectors for the product image carousel (.ae-main-product-carousel .glider-track .glider-slide img, .ae-product-carousel .glider-track > .glider-slide img) are not matching elements on the page. The site has productPageRedesigned_new: true in its config, and the carousel structure may differ from expected selectors. Falls back to JSON-LD Product.Image which provides only a single 250x250 thumbnail. For Product 1: got 1 image (250x250), expected multiple gallery images. Same for Products 2 and 5.",
+      "affected_samples": [0, 1, 2],
+      "suggested_fix": "Debug the actual DOM structure of the product image carousel on a live page. The carousel might use different class names under the productPageRedesigned_new layout. Check if images use data-src, data-lazy, or srcset attributes instead of src. Consider adding more fallback selectors or extracting gallery images from the serverSideEvents Images array (if available)."
+    },
+    {
+      "severity": "low",
+      "field": "brand",
+      "status": "PARTIAL",
+      "problem": "Product 2 brand 'Gopaldas, So Real' appears to have extra text appended",
+      "details": "The OG brand meta tag says 'Gopaldas' and SSE Brand says 'Gopaldas'. The extracted brand is 'Gopaldas, So Real' — the ', So Real' suffix is unexpected. This likely comes from the JSON-LD Brand.Name field or a concatenation of brand + product line. Not a critical issue since 'Gopaldas' is still identifiable.",
+      "affected_samples": [1],
+      "suggested_fix": "If the JSON-LD Brand.Name contains 'Gopaldas, So Real', the OG brand ('Gopaldas') or SSE Brand ('Gopaldas') might be cleaner primary sources. Consider prioritizing OG brand or SSE Brand over JSON-LD Brand.Name."
+    },
+    {
+      "severity": "low",
+      "field": "title",
+      "status": "PARTIAL",
+      "problem": "Product 2 title has trailing space: 'So Real 6 Inch Realistic Dildo '",
+      "details": "The extracted title has a trailing space character. The h1.item_title or JSON-LD source likely has trailing whitespace.",
+      "affected_samples": [1],
+      "suggested_fix": "Add .strip() to the title extraction from h1 fallback: title = h1.get_text(strip=True) — the strip=True parameter should handle this, but verify the JSON-LD fallback also strips whitespace."
+    },
+    {
+      "severity": "info",
+      "field": "discontinued_products",
+      "status": "CORRECT",
+      "problem": "2 of 5 input URLs returned non-product pages (discontinued products)",
+      "details": "Products at URLs 110591.aspx and 110592.aspx returned 200 status but were detected as non-product pages (no JSON-LD Product block, no pageType: Product). The scraper correctly handled this by marking them with remarks and empty fields. This is expected behavior for discontinued products, not a scraper bug. However, the metadata.failed_products count is 0 while 2 products had empty titles — this is because failed_products counts items where status_code != 200, but these have status_code 200 with empty titles.",
+      "affected_samples": [2, 3],
+      "suggested_fix": "Consider updating the failed_products count logic to also count products where title is empty despite status 200, or accept the current behavior as intentional (they are marked with remarks)."
+    }
+  ],
+  "edge_case_results": {
+    "sale_product": "PASS",
+    "details": "Product 1 is on sale: price=$31.50, original_price=$89.99. Correctly extracted sale price and original price. The scraper correctly uses .ae-sale-price container and extracts .ae-price--was for original_price. The 'now' price ($31.50) correctly overrides the regular price.",
+    "out_of_stock": "NOT_TESTED",
+    "details": "No out-of-stock products in sample set. All 3 successful products show 'In Stock'.",
+    "variants": "PASS",
+    "details": "Product 5 has 2 variants correctly extracted with value, text, color, size, and price. Products 1 and 2 have no variant select (correctly returns [])."
+  },
+  "script_checks": {
+    "syntax_valid": true,
+    "imports_valid": true,
+    "output_format_valid": true,
+    "logging_works": true,
+    "error_handling_works": true,
+    "rate_limiting_works": true,
+    "sample_mode_works": true,
+    "deduplication_works": true,
+    "non_product_page_detection": true
+  },
+  "validation_by_product": {
+    "product_1": {
+      "url": "https://www.adameve.com/adult-sex-toys/dildo-sex-toys/vibrating-dildos/sp-adam-eve-heart-throbber-liquid-silicone-vibrating-g-spot-dildo-111267.aspx",
+      "status": "SUCCESS",
+      "fields": {
+        "title": {"extracted": "Adam & Eve Heart Throbber Liquid Silicone Vibrating G-Spot Dildo", "expected": "Adam & Eve Heart Throbber Liquid Silicone Vibrating G-Spot Dildo", "status": "CORRECT"},
+        "price": {"extracted": "$31.50", "expected": "$31.50", "source": "og:price:amount", "status": "CORRECT"},
+        "original_price": {"extracted": "$89.99", "expected": "$89.99", "source": "og:price:standard_amount / SSE dimension23", "status": "CORRECT"},
+        "availability": {"extracted": "In Stock", "expected": "In Stock", "source": "og:availability", "status": "CORRECT"},
+        "currency": {"extracted": "USD", "expected": "USD", "status": "CORRECT"},
+        "brand": {"extracted": "Adam and Eve", "expected": "Adam and Eve", "status": "CORRECT"},
+        "sku": {"extracted": "J506", "expected": "J506", "status": "CORRECT"},
+        "rating": {"extracted": "2.5", "expected": "2.5", "status": "CORRECT"},
+        "review_count": {"extracted": "12", "expected": "12", "status": "CORRECT"},
+        "category": {"extracted": "Sex Toys/Dildos/Vibrating Dildos", "expected": "Sex Toys/Dildos/Vibrating Dildos", "status": "CORRECT"},
+        "images": {"extracted_count": 1, "expected": "3-15", "status": "PARTIAL"}
+      }
+    },
+    "product_2": {
+      "url": "https://www.adameve.com/adult-sex-toys/dildo-sex-toys/realistic-dildos/sp-so-real-inch-realistic-dildo-1618.aspx",
+      "status": "SUCCESS",
+      "fields": {
+        "title": {"extracted": "So Real 6 Inch Realistic Dildo ", "expected": "So Real 6 Inch Realistic Dildo", "status": "CORRECT", "note": "trailing space"},
+        "price": {"extracted": "$14.99", "expected": "$14.99", "source": "og:price:amount", "status": "CORRECT"},
+        "original_price": {"extracted": "", "expected": "", "status": "CORRECT", "note": "not on sale"},
+        "availability": {"extracted": "In Stock", "expected": "In Stock", "status": "CORRECT"},
+        "currency": {"extracted": "USD", "expected": "USD", "status": "CORRECT"},
+        "brand": {"extracted": "Gopaldas, So Real", "expected": "Gopaldas", "status": "PARTIAL", "note": "extra text in brand"},
+        "sku": {"extracted": "4472", "expected": "4472", "status": "CORRECT"},
+        "rating": {"extracted": "4.1", "expected": "4.1", "status": "CORRECT"},
+        "review_count": {"extracted": "1126", "expected": "1126", "status": "CORRECT"},
+        "category": {"extracted": "Sex Toys/Dildos/Realistic Dildos", "expected": "Sex Toys/Dildos/Realistic Dildos", "status": "CORRECT"},
+        "images": {"extracted_count": 1, "expected": "3-15", "status": "PARTIAL"}
+      }
+    },
+    "product_3": {
+      "url": "https://www.adameve.com/bath-and-body/beauty-and-body-care/sp-sex-magnet-vanilla-roll-on-pheromone-infused-oil-110591.aspx",
+      "status": "FAILED",
+      "reason": "Discontinued product — page returns 200 but is not a product page (no JSON-LD Product block)"
+    },
+    "product_4": {
+      "url": "https://www.adameve.com/bath-and-body/sensual-massage-and-candles/sp-sex-magnet-pheromone-infused-massage-oil-110592.aspx",
+      "status": "FAILED",
+      "reason": "Discontinued product — page returns 200 but is not a product page (no JSON-LD Product block)"
+    },
+    "product_5": {
+      "url": "https://www.adameve.com/bath-and-body/bath-and-shower/sp-wild-secrets-sensual-bubble-bath-112478.aspx",
+      "status": "SUCCESS",
+      "fields": {
+        "title": {"extracted": "Wild Secrets Sensual Bubble Bath", "expected": "Wild Secrets Sensual Bubble Bath", "status": "CORRECT"},
+        "price": {"extracted": "$29.99", "expected": "$29.99", "status": "CORRECT"},
+        "original_price": {"extracted": "", "expected": "", "status": "CORRECT", "note": "not on sale"},
+        "availability": {"extracted": "In Stock", "expected": "In Stock", "status": "CORRECT"},
+        "currency": {"extracted": "USD", "expected": "USD", "status": "CORRECT"},
+        "brand": {"extracted": "Wild Secrets", "expected": "Wild Secrets", "status": "CORRECT"},
+        "sku": {"extracted": "L680", "expected": "L680", "status": "CORRECT"},
+        "rating": {"extracted": "0.0", "expected": "0.0", "status": "CORRECT", "note": "no reviews"},
+        "review_count": {"extracted": "", "expected": "", "status": "CORRECT"},
+        "category": {"extracted": "Bath and Body/Bath and Shower", "expected": "Bath and Body/Bath and Shower", "status": "CORRECT"},
+        "variants": {"extracted_count": 2, "expected": 2, "status": "CORRECT"},
+        "images": {"extracted_count": 1, "expected": "3-15", "status": "PARTIAL"}
+      }
+    }
+  },
+  "overall_assessment": "PASS",
+  "confidence_score": 0.85,
+  "ready_for_execution": true,
+  "feedback_for_writer": {
+    "summary": "Scraper works well for core fields (title, price, availability, currency, SKU, brand, category, breadcrumbs, rating, reviews, variants). Main issue: gallery images only extract 1 image per product instead of the full 3-15 image gallery. Minor issues: trailing whitespace in one title, extra text in one brand field.",
+    "field_fixes": {
+      "images": {
+        "issue": "CSS selectors for product image carousel don't match the actual DOM. Only 1 image (JSON-LD fallback) per product instead of full gallery.",
+        "fix": "The site config has productPageRedesigned_new: true which likely changes the carousel DOM. Inspect the actual HTML for the image carousel on a live product page and update selectors in extract_gallery_images(). The carousel images may use lazy loading (data-src/data-lazy) or be in a different container structure. Consider also trying to extract gallery images from serverSideEvents.Images if that field exists.",
+        "priority": "medium"
+      },
+      "brand": {
+        "issue": "Product 2 brand shows 'Gopaldas, So Real' instead of just 'Gopaldas'",
+        "fix": "The JSON-LD Brand.Name may contain the full brand + line. Consider prioritizing OG brand meta tag (og:brand) or SSE Brand field which are cleaner, over JSON-LD Brand.Name.",
+        "priority": "low"
+      },
+      "title": {
+        "issue": "Trailing space in title for Product 2",
+        "fix": "Ensure .strip() is applied to title from all extraction paths (JSON-LD, h1, OG). The h1 fallback already uses get_text(strip=True) but the JSON-LD path uses safe_get() which returns the raw string.",
+        "priority": "low"
+      }
+    },
+    "code_suggestions": [
+      "Debug product image carousel DOM structure under productPageRedesigned_new layout",
+      "Add .strip() to title extraction from JSON-LD path in safe_get results",
+      "Consider prioritizing og:brand over JSON-LD Brand.Name for cleaner brand values"
+    ]
+  }
+}

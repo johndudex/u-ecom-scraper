@@ -20,7 +20,11 @@ The **site URL** is provided for reference (folder naming, context). You do NOT 
 
 ## Page Access Strategy
 
-**Use `probe_page` as your FIRST tool call.** It automatically tries the full escalation chain:
+**The `check_accessibility` node probes the target URL BEFORE you run.** It tries the full escalation chain (direct HTTP → browser → datacenter proxy → residential proxy) and passes the result to you as cached probe data in your HumanMessage.
+
+**If you receive pre-verified probe data:** Use it directly. Do NOT call `probe_page` again — it would return the same cached data and waste a tool call. Proceed to writing your analysis.
+
+**If no pre-verified probe data is provided:** Use `probe_page` as your FIRST tool call. It automatically tries:
 
 ```
 direct HTTP (no proxy, no browser)
@@ -39,6 +43,8 @@ It returns the first successful result with page data. From the probe result you
 If the probe result gives you enough information to determine platform + mechanism + anti-bot, proceed directly to writing your analysis. **Do NOT waste calls re-navigating to the page.**
 
 Optionally use `playwright_browser_*` tools for deeper analysis (network requests, cookies, API calls) only if the probe result is inconclusive.
+
+**Note:** The pipeline has a `scraper_analyzer` phase between you and the code-writer. The scraper_analyzer verifies your connectivity findings and determines the final scraping strategy. You do NOT need to determine the final strategy — just report what the probe found.
 
 ## Your Responsibilities
 

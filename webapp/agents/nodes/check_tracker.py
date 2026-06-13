@@ -219,8 +219,56 @@ def _handle_failed(site, slug: str) -> Command:
 
 
 def _handle_in_progress(site, slug: str, root: str) -> Command:
-    logger.info("check_tracker: site '%s' in_progress from a previous run, starting fresh", slug)
+    logger.info("check_tracker: site '%s' in_progress from a previous run, checking for existing artifacts", slug)
 
+    workspace_dir = os.path.join(root, "workspace", slug)
+    skip_site = os.path.isfile(os.path.join(workspace_dir, "site_analysis.json"))
+    skip_product = os.path.isfile(os.path.join(workspace_dir, "product_analysis.json"))
+    skip_code = os.path.isfile(os.path.join(workspace_dir, "scraper_draft.py"))
+
+    if skip_site and skip_product and skip_code:
+        logger.info(
+            "check_tracker: all artifacts exist for %s, skipping to testing (skip_site=%s, skip_product=%s, skip_code=%s)",
+            slug, skip_site, skip_product, skip_code,
+        )
+        return Command(
+            update={
+                "site_status": "in_progress",
+                "current_phase": "check_tracker",
+                "skip_site_analysis": True,
+                "skip_product_analysis": True,
+                "skip_code_generation": True,
+            },
+            goto="setup_workspace",
+        )
+
+    if skip_site and skip_product:
+        logger.info("check_tracker: site+product analysis exist for %s, skipping to code gen", slug)
+        return Command(
+            update={
+                "site_status": "in_progress",
+                "current_phase": "check_tracker",
+                "skip_site_analysis": True,
+                "skip_product_analysis": True,
+                "skip_code_generation": False,
+            },
+            goto="setup_workspace",
+        )
+
+    if skip_site:
+        logger.info("check_tracker: site analysis exists for %s, skipping to product analysis", slug)
+        return Command(
+            update={
+                "site_status": "in_progress",
+                "current_phase": "check_tracker",
+                "skip_site_analysis": True,
+                "skip_product_analysis": False,
+                "skip_code_generation": False,
+            },
+            goto="setup_workspace",
+        )
+
+    logger.info("check_tracker: no artifacts for %s, starting from scratch", slug)
     _clean_workspace(root, slug)
 
     return Command(

@@ -38,6 +38,7 @@ PHASE_MAP: dict[str, str] = {
     "accessibility_check": "Accessibility Check",
     "site_analysis": "Site Analysis",
     "product_analysis": "Product Analysis",
+    "scraper_analysis": "Scraper Analysis",
     "code_generation": "Code Generation",
     "testing": "Testing Loop",
     "field_confirmation": "Field Confirmation",
@@ -49,6 +50,7 @@ PHASE_MAP: dict[str, str] = {
 AGENT_PHASE_MAP: dict[str, str] = {
     "site-analyzer": "site_analysis",
     "product-analyzer": "product_analysis",
+    "scraper-analyzer": "scraper_analysis",
     "code-writer": "code_generation",
     "code-tester": "testing",
     "cleanup": "cleanup",
@@ -96,6 +98,7 @@ PIPELINE_PHASES = [
     "accessibility_check",
     "site_analysis",
     "product_analysis",
+    "scraper_analysis",
     "code_generation",
     "testing",
     "field_confirmation",
@@ -131,6 +134,15 @@ def _run_graph_job(job: ScrapeJob, rescrape: bool = False) -> None:
     if rescrape:
         initial_state["rescrape"] = True
 
+    # ── Attach RedisLogHandler for system log streaming ────────────────
+    from .log_handler import RedisLogHandler
+
+    syslog_handler = RedisLogHandler()
+    syslog_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s [%(name)s] %(message)s", datefmt="%H:%M:%S"))
+    RedisLogHandler.set_job_id(job.id)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(syslog_handler)
+
     # ── Stream graph events ─────────────────────────────────────────────
     try:
         service.stream_graph(graph, initial_state, config, job)
@@ -146,6 +158,10 @@ def _run_graph_job(job: ScrapeJob, rescrape: bool = False) -> None:
             _publish_job_status(job.id, ScrapeJob.STATUS_WAITING_APPROVAL)
             return
         raise
+    finally:
+        RedisLogHandler.clear_job_id()
+        root_logger.removeHandler(syslog_handler)
+        syslog_handler.close()
 
     # ── Check if the graph ended at an interrupt (stream_events may
     #    exit without raising). ───────────────────────────────────────────
@@ -184,6 +200,15 @@ def resume_scrape_task(job_id: int, human_response: Any) -> None:
     graph = service.build_graph()
     config = service.get_config(job.id)
 
+    # ── Attach RedisLogHandler for system log streaming ────────────────
+    from .log_handler import RedisLogHandler
+
+    syslog_handler = RedisLogHandler()
+    syslog_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s [%(name)s] %(message)s", datefmt="%H:%M:%S"))
+    RedisLogHandler.set_job_id(job.id)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(syslog_handler)
+
     try:
         from langgraph.types import Command
 
@@ -209,6 +234,10 @@ def resume_scrape_task(job_id: int, human_response: Any) -> None:
         job.save(update_fields=["status", "error_message", "completed_at"])
         _publish_job_status(job.id, ScrapeJob.STATUS_FAILED)
         return
+    finally:
+        RedisLogHandler.clear_job_id()
+        root_logger.removeHandler(syslog_handler)
+        syslog_handler.close()
 
     # Check for post-resume interrupt (stream_events may not raise).
     if _graph_is_interrupted(graph, config):

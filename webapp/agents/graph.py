@@ -226,6 +226,7 @@ def _agent_config(config: RunnableConfig, agent_name: str = "") -> RunnableConfi
 PHASE_MAP: dict[str, str] = {
     "site_analyzer": "site_analysis",
     "product_analyzer": "product_analysis",
+    "scraper_analyzer": "scraper_analysis",
     "code_writer": "code_generation",
     "code_tester": "testing",
     "cleanup": "cleanup",
@@ -485,6 +486,8 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
         "platform": "unknown",
         "captcha_verified": True,
     }
+
+    _persist_probe_summary(job_id, url, agent_probe_result, data)
 
     probe_state: dict[str, Any] = {
         "probe_result": agent_probe_result,
@@ -1135,6 +1138,46 @@ def _persist_agent_logs(
             )
     except Exception as exc:
         logger.warning("Failed to persist tool calls for %s: %s", agent_name, exc)
+
+
+def _persist_probe_summary(
+    job_id: int, url: str, probe_result: dict, raw_data: dict
+) -> None:
+    """Persist check_accessibility probe result as a SessionLog entry."""
+    if not job_id:
+        return
+    try:
+        from scraper.models import SessionLog
+
+        conn = probe_result.get("connectivity", {})
+        status_code = raw_data.get("status_code", "?")
+        method = conn.get("method_that_worked", "unknown")
+        proxy_tier = conn.get("proxy_tier", "none")
+        needs_browser = conn.get("js_rendering_needed", "?")
+        anti_bot = conn.get("anti_bot_detected", False)
+
+        summary_lines = [
+            f"Probe result for {url[:80]}",
+            f"  Method: {method} (proxy: {proxy_tier})",
+            f"  Status code: {status_code}",
+            f"  JS rendering needed: {needs_browser}",
+            f"  Anti-bot detected: {anti_bot}",
+        ]
+        if raw_data.get("captcha_type"):
+            summary_lines.append(f"  Captcha type: {raw_data['captcha_type']}")
+        if raw_data.get("methods_tried"):
+            summary_lines.append(f"  Methods tried: {', '.join(raw_data['methods_tried'])}")
+
+        seq = SessionLog.objects.filter(job_id=job_id).count()
+        SessionLog.objects.create(
+            job_id=job_id,
+            role=SessionLog.ROLE_SYSTEM,
+            agent="check_accessibility",
+            content="\n".join(summary_lines),
+            seq=seq,
+        )
+    except Exception as exc:
+        logger.warning("Failed to persist probe summary for job %s: %s", job_id, exc)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

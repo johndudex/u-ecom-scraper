@@ -336,6 +336,7 @@ class LangGraphService:
     NODE_PHASE_MAP: dict[str, str] = {
         "site_analyzer": "site_analysis",
         "product_analyzer": "product_analysis",
+        "scraper_analyzer": "scraper_analysis",
         "code_writer": "code_generation",
         "code_tester": "testing",
         "cleanup": "cleanup",

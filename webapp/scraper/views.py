@@ -164,11 +164,12 @@ def job_detail(request, job_id):
     sample_output = ""
     scraper_slug = ""
 
+    output_files = []
     slug_candidates = []
     if job.site_folder:
         slug_candidates.append(job.site_folder)
     if job.site_name:
-        name_slug = job.site_name.lower().replace(" ", "-").replace(".", "-")
+        name_slug = job.name.lower().replace(" ", "-").replace(".", "-")
         for char in name_slug:
             if not char.isalnum() and char != "-":
                 name_slug = name_slug.replace(char, "-")
@@ -185,6 +186,17 @@ def job_detail(request, job_id):
             except Exception:
                 pass
 
+    if scraper_slug:
+        site_dir = os.path.join(settings.PROJECT_ROOT, scraper_slug)
+        if os.path.isdir(site_dir):
+            output_files = sorted(
+                [
+                    f for f in os.listdir(site_dir)
+                    if f.startswith("output_") and f.endswith(".json")
+                ],
+                reverse=True,
+            )
+
     fc_approval = (
         job.approvals.filter(approval_type=Approval.TYPE_FIELD_CONFIRM)
         .order_by("-created_at")
@@ -197,6 +209,8 @@ def job_detail(request, job_id):
     tool_call_agents = list(
         job.tool_call_logs.values_list("agent", flat=True).distinct()
     )
+
+    db_site = Site.objects.filter(url=job.url.rstrip("/")).first() if job.url else None
 
     return render(
         request,
@@ -212,6 +226,8 @@ def job_detail(request, job_id):
             "agent_stack": agent_stack,
             "has_scraper_code": has_scraper_code,
             "scraper_code_display": scraper_code_display,
+            "output_files": output_files,
+            "site": db_site,
             "sample_output": sample_output,
             "tool_calls": tool_calls,
             "tool_call_agents": tool_call_agents,
@@ -514,6 +530,7 @@ def job_events(request, job_id):
                 pubsub = redis_client.pubsub()
                 pubsub.subscribe(f"job:{job_id}")
                 pubsub.subscribe(f"job:{job_id}:status")
+                pubsub.subscribe(f"job:{job_id}:syslog")
 
                 job = ScrapeJob.objects.get(pk=job_id)
                 data = json.dumps({"type": "status", "status": job.status})

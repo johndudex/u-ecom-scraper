@@ -155,7 +155,6 @@ Read the template file and use it as the base for your scraper.
 Read the selected template and both analysis JSON files. Understand:
 - What scraping mechanism to use
 - What fields to extract and how
-- What pagination to handle
 - What rate limiting to apply
 
 ### 2. Generate Field Extraction Code
@@ -205,28 +204,9 @@ def extract_variants(soup, variant_data):
     return variants
 ```
 
-### 4. Handle Pagination
+### 4. NO Pagination or Discovery
 
-Based on `site_analysis.pagination`:
-
-**URL-based:**
-```python
-for page in range(1, total_pages + 1):
-    url = f"{base_url}?page={page}"
-    # fetch and parse
-```
-
-**Infinite scroll / Load More (Playwright):**
-```python
-while True:
-    # scroll to bottom
-    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    page.wait_for_timeout(2000)
-    # check for new products
-    new_count = len(page.query_selector_all('.product-card'))
-    if new_count == prev_count:
-        break
-```
+The scraper reads product URLs from `input_urls.json`. It does NOT discover, crawl, or paginate to find products. All URLs are pre-provided by the user via the Site configuration.
 
 ### 5. Add Error Handling
 
@@ -325,15 +305,22 @@ with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
     json.dump(output, f, indent=2, ensure_ascii=False)
 ```
 
-The scraper MUST also generate `input_urls.json` with the discovered product URLs:
+## input_urls.json
 
-```python
-INPUT_FILE = os.path.join(SCRIPT_DIR, "input_urls.json")
+The scraper reads product URLs from `input_urls.json` in its own directory:
 
-input_data = {"urls": all_product_urls}
-with open(INPUT_FILE, 'w', encoding='utf-8') as f:
-    json.dump(input_data, f, indent=2)
+```json
+{
+  "urls": [
+    "https://www.nike.com/product/air-max-90",
+    "https://www.nike.com/product/air-force-1"
+  ]
+}
 ```
+
+When the user provides URLs via the Site configuration, they are pre-written to `workspace/{slug}/input_urls.json` by the pipeline. The scraper should read this file (after it's been copied to the site folder) and use the URLs as-is. Do NOT discover or add new URLs.
+
+If no URLs are provided by the user, the pipeline provides a single product URL. Write it to `input_urls.json`.
 
 ## Retry / Fix Mode
 

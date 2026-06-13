@@ -6,7 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY webapp/requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+COPY requirements.txt /tmp/scraper-requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt -r /tmp/scraper-requirements.txt
 
 RUN adduser --disabled-password --gecos "Scraper" scraper
 USER scraper

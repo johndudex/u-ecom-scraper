@@ -143,7 +143,20 @@ def field_confirmation(state: ScrapeState) -> Command:
     input_path = os.path.join(root, "workspace", slug, "input_urls.json")
 
     if state.get("sample_only", False):
+        job_id = state.get("job_id", 0)
         logger.info("field_confirmation: skipping (sample_only mode), going to execution")
+        try:
+            from django.utils.timezone import now as dj_now
+            from scraper.models import Step
+
+            Step.objects.filter(job_id=job_id, phase="field_confirmation").update(
+                status=Step.STATUS_DONE, completed_at=dj_now()
+            )
+            Step.objects.filter(job_id=job_id, phase="execution").update(
+                status=Step.STATUS_DONE, completed_at=dj_now()
+            )
+        except Exception:
+            pass
         return Command(goto="run_execution")
 
     if not os.path.isfile(scraper_path):
@@ -208,6 +221,8 @@ def field_confirmation(state: ScrapeState) -> Command:
         else:
             sample_text = _build_field_summary_from_analysis(slug, root)
 
+    _persist_field_confirmation_sample(state.get("job_id", 0), sample_text)
+
     human_response = interrupt(
         {
             "reason": "field_confirmation",
@@ -226,6 +241,8 @@ def field_confirmation(state: ScrapeState) -> Command:
 
     decision = _parse_decision(human_response)
     feedback = decision.get("feedback", "")
+
+    _persist_field_confirmation_decision(state.get("job_id", 0), decision, feedback)
 
     if decision.get("decision") == DECISION_APPROVE:
         logger.info("field_confirmation: user approved samples")
@@ -305,3 +322,43 @@ def _run_sample_via_queue(scraper_path: str, args: list[str]) -> str:
         return data.get("stdout", "")[:5000]
     except Exception as exc:
         return f"[queue error] {exc}"
+
+
+def _persist_field_confirmation_sample(job_id: int, sample_text: str) -> None:
+    if not job_id:
+        return
+    try:
+        from scraper.models import SessionLog
+
+        seq = SessionLog.objects.filter(job_id=job_id).count()
+        SessionLog.objects.create(
+            job_id=job_id,
+            role=SessionLog.ROLE_SYSTEM,
+            agent="field_confirmation",
+            content=f"Sample output presented for review:\n\n{sample_text[:4000]}",
+            seq=seq,
+        )
+    except Exception as exc:
+        logger.warning("Failed to persist field_confirmation sample for job %s: %s", job_id, exc)
+
+
+def _persist_field_confirmation_decision(job_id: int, decision: dict, feedback: str) -> None:
+    if not job_id:
+        return
+    try:
+        from scraper.models import SessionLog
+
+        choice = decision.get("decision", "unknown")
+        lines = [f"User decision: {choice}"]
+        if feedback:
+            lines.append(f"Feedback: {feedback[:500]}")
+        seq = SessionLog.objects.filter(job_id=job_id).count()
+        SessionLog.objects.create(
+            job_id=job_id,
+            role=SessionLog.ROLE_USER,
+            agent="field_confirmation",
+            content="\n".join(lines),
+            seq=seq,
+        )
+    except Exception as exc:
+        logger.warning("Failed to persist field_confirmation decision for job %s: %s", job_id, exc)
