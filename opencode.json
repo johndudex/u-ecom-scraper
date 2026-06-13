@@ -1,0 +1,92 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "zai-coding-plan/glm-5-turbo",
+  "small_model": "zai/glm-4.5-flash",
+  "mcp": {
+    "playwright": {
+      "type": "local",
+      "command": [
+        "bash", "/app/scripts/playwright-mcp-proxy.sh"
+      ],
+      "enabled": true
+    }
+  },
+  "permission": {
+    "skill": {
+      "*": "allow"
+    }
+  },
+  "agent": {
+    "scrape-site": {
+      "description": "Orchestrates complete ecommerce website scraping workflow. Manages site tracker, coordinates Site Analyzer, Product Analyzer, Code Writer, Code Tester, and Cleanup agents via Playwright MCP.",
+      "mode": "primary",
+      "temperature": 0.3,
+      "permission": {
+        "edit": "deny",
+        "bash": "deny",
+        "task": {
+          "site-analyzer": "allow",
+          "product-analyzer": "allow",
+          "code-writer": "allow",
+          "code-tester": "allow",
+          "cleanup": "allow",
+          "skill-learner": "allow"
+        }
+      }
+    },
+    "site-analyzer": {
+      "description": "Analyzes ecommerce websites to detect platform, anti-bot protection, product discovery method, and optimal scraping mechanism. Uses Playwright MCP for browser-based discovery.",
+      "mode": "subagent",
+      "temperature": 0.2,
+      "permission": {
+        "edit": "deny",
+        "bash": "ask"
+      }
+    },
+    "product-analyzer": {
+      "description": "Deep-dives into product pages to map all extractable fields (title, price, images, variants, structured data) with exact CSS selectors. Uses Playwright MCP for structured page analysis.",
+      "mode": "subagent",
+      "temperature": 0.2,
+      "permission": {
+        "edit": "deny",
+        "bash": "ask"
+      }
+    },
+    "code-writer": {
+      "description": "Generates Python scraper code based on site and product analysis. Writes complete, executable scraper scripts with error handling, rate limiting, and logging.",
+      "mode": "subagent",
+      "temperature": 0.4,
+      "permission": {
+        "edit": "allow",
+        "bash": "allow"
+      }
+    },
+    "code-tester": {
+      "description": "Tests generated scraper on sample products, validates field correctness (not just presence), and provides specific fix feedback. Feeds results back to code-writer for iterative fixes.",
+      "mode": "subagent",
+      "temperature": 0.1,
+      "permission": {
+        "edit": "allow",
+        "bash": "allow"
+      }
+    },
+    "cleanup": {
+      "description": "Finalizes scraping workflow by moving scraper to scrapers/ directory, updating site tracker, archiving old output files, and cleaning workspace. Runs after every scrape.",
+      "mode": "subagent",
+      "temperature": 0.1,
+      "permission": {
+        "edit": "allow",
+        "bash": "allow"
+      }
+    },
+    "skill-learner": {
+      "description": "Examines completed scrapes to identify new patterns worth learning. Proposes skill file additions or updates to make the system smarter. Always asks user before modifying skills.",
+      "mode": "subagent",
+      "temperature": 0.3,
+      "permission": {
+        "edit": "allow",
+        "bash": "deny"
+      }
+    }
+  }
+}

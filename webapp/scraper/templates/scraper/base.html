@@ -1,0 +1,126 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block page_title %}Ecommerce Scraper{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        brand: {
+                            900: '#0F172A',
+                            800: '#1E293B',
+                            700: '#334155',
+                            600: '#475569',
+                            500: '#64748B',
+                            400: '#94A3B8',
+                            300: '#CBD5E1',
+                            200: '#E2E8F0',
+                            100: '#F1F5F9',
+                            50: '#F8FAFC',
+                        },
+                        cta: {
+                            DEFAULT: '#22C55E',
+                            hover: '#16A34A',
+                            dark: '#15803D',
+                        },
+                        surface: {
+                            DEFAULT: '#1E293B',
+                            raised: '#273548',
+                            overlay: '#334155',
+                        }
+                    },
+                    fontFamily: {
+                        sans: ['Fira Sans', 'Inter', 'system-ui', 'sans-serif'],
+                        mono: ['Fira Code', 'JetBrains Mono', 'Consolas', 'monospace'],
+                    }
+                }
+            }
+        }
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: 'Fira Sans', system-ui, sans-serif; }
+        code, pre, .font-mono { font-family: 'Fira Code', 'JetBrains Mono', monospace; }
+        .status-pending { background-color: #475569; color: #CBD5E1; }
+        .status-running { background-color: #2563EB; color: #fff; }
+        .status-waiting_approval { background-color: #D97706; color: #fff; }
+        .status-completed { background-color: #22C55E; color: #fff; }
+        .status-failed { background-color: #EF4444; color: #fff; }
+        .status-cancelled { background-color: #475569; color: #CBD5E1; }
+        .status-captcha_blocked { background-color: #F59E0B; color: #000; }
+        @keyframes pulse-dot { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.85); } }
+        .animate-pulse-dot { animation: pulse-dot 1.5s ease-in-out infinite; }
+        .scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+        .scrollbar-thin::-webkit-scrollbar-track { background: #1E293B; }
+        .scrollbar-thin::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+        .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: #64748B; }
+        @media (prefers-reduced-motion: reduce) {
+            .animate-pulse-dot { animation: none; }
+            * { transition-duration: 0.01ms !important; }
+        }
+    </style>
+    {% block extra_head %}{% endblock %}
+</head>
+<body class="bg-brand-900 text-brand-50 min-h-screen antialiased">
+
+<nav class="sticky top-4 z-50 mx-4 mt-4">
+    <div class="max-w-7xl mx-auto bg-surface/80 backdrop-blur-xl border border-brand-700/50 rounded-2xl px-5 py-3 shadow-lg shadow-black/20">
+        <div class="flex items-center justify-between">
+            <a href="{% url 'home' %}" class="flex items-center gap-2.5 group">
+                <div class="w-8 h-8 bg-cta rounded-lg flex items-center justify-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="white" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" fill="none"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/></svg>
+                </div>
+                <span class="font-bold text-brand-50 text-sm tracking-tight group-hover:text-cta transition-colors duration-200">Ecommerce Scraper</span>
+            </a>
+            <div class="flex items-center gap-1">
+                <a href="{% url 'site_list' %}" class="px-3.5 py-1.5 text-xs font-medium text-brand-400 hover:text-brand-50 hover:bg-brand-700/50 rounded-lg transition-colors duration-200">Sites</a>
+                <a href="{% url 'job_list' %}" class="px-3.5 py-1.5 text-xs font-medium text-brand-400 hover:text-brand-50 hover:bg-brand-700/50 rounded-lg transition-colors duration-200">Jobs</a>
+                <a href="{% url 'approval_list' %}" class="px-3.5 py-1.5 text-xs font-medium text-brand-400 hover:text-brand-50 hover:bg-brand-700/50 rounded-lg transition-colors duration-200 relative">
+                    Approvals
+                    <span id="pending-count" class="ml-1 inline-flex items-center justify-center min-w-[16px] h-4 px-1 bg-cta text-[10px] font-bold text-white rounded-full"></span>
+                </a>
+                <a href="{% url 'probe_cache' %}" class="px-3.5 py-1.5 text-xs font-medium text-brand-400 hover:text-brand-50 hover:bg-brand-700/50 rounded-lg transition-colors duration-200">Cache</a>
+                <a href="{% url 'admin:index' %}" class="px-3.5 py-1.5 text-xs font-medium text-brand-400 hover:text-brand-50 hover:bg-brand-700/50 rounded-lg transition-colors duration-200">Admin</a>
+                {% if user.is_authenticated %}
+                <form method="post" action="{% url 'logout' %}" class="inline">
+                    {% csrf_token %}
+                    <button type="submit" class="px-3.5 py-1.5 text-xs font-medium text-brand-500 hover:text-red-400 hover:bg-brand-700/50 rounded-lg transition-colors duration-200 cursor-pointer">Logout</button>
+                </form>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</nav>
+
+<main class="max-w-7xl mx-auto px-4 pt-6 pb-12">
+    {% block content %}{% endblock %}
+</main>
+
+<script>
+(function() {
+    var badge = document.getElementById('pending-count');
+    if (badge) {
+        fetch('{% url "approval_count" %}')
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                if (d.count > 0) {
+                    badge.textContent = d.count;
+                } else {
+                    badge.style.display = 'none';
+                }
+            })
+            .catch(function() { badge.style.display = 'none'; });
+    }
+})();
+</script>
+{% block extra_js %}{% endblock %}
+</body>
+</html>

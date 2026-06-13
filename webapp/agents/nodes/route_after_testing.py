@@ -1,0 +1,74 @@
+"""Routing function after the code-tester phase.
+
+[ADP #6/#7 / HIP #6 / G2]
+"""
+
+import logging
+
+from ..state import ScrapeState
+
+logger = logging.getLogger(__name__)
+
+MIN_CONFIDENCE_PASS = 0.85
+MIN_CONFIDENCE_PARTIAL = 0.5
+
+
+def _scraper_produced_valid_output(state: ScrapeState) -> bool:
+    """Check whether the latest scraper run produced products with real data."""
+    report = state.get("test_report") or {}
+    sample_products = report.get("sample_products") or []
+    if not sample_products:
+        return False
+    valid = [p for p in sample_products if p.get("title") and p.get("price")]
+    return len(valid) > 0
+
+
+def route_after_testing(state: ScrapeState) -> str:
+    report = state.get("test_report")
+    retry_count = state.get("test_retry_count", 0)
+
+    if not report:
+        if retry_count < 3:
+            logger.warning("route_after_testing: no test_report, retry %d/3 via scraper_analyzer", retry_count + 1)
+            return "scraper_analyzer"
+        logger.error("route_after_testing: no test_report after %d retries → cleanup", retry_count)
+        return "cleanup"
+
+    assessment = report.get("overall_assessment", "FAIL")
+    confidence = float(report.get("confidence_score", 0.0))
+    issues = report.get("issues", [])
+    high_severity = any(i.get("severity") == "high" for i in issues)
+
+    if (
+        assessment == "PASS"
+        and confidence >= MIN_CONFIDENCE_PASS
+        and not high_severity
+    ):
+        logger.info("route_after_testing: PASS (confidence=%.2f)", confidence)
+        return "field_confirmation"
+
+    if retry_count < 3:
+        logger.info(
+            "route_after_testing: %s (confidence=%.2f, high_severity=%s), retry %d/3 via scraper_analyzer",
+            assessment, confidence, high_severity, retry_count + 1
+        )
+        return "scraper_analyzer"
+
+    # Retries exhausted — but if the scraper produced valid partial output,
+    # route to field_confirmation so the user can review and approve rather
+    # than discarding everything.
+    if confidence >= MIN_CONFIDENCE_PARTIAL and _scraper_produced_valid_output(state):
+        logger.warning(
+            "route_after_testing: retries exhausted (count=%d, assessment=%s, confidence=%.2f) "
+            "→ field_confirmation (partial output with valid products)",
+            retry_count, assessment, confidence,
+        )
+        return "field_confirmation"
+
+    logger.warning(
+        "route_after_testing: retries exhausted (count=%d, assessment=%s) → human_approval",
+        retry_count,
+        assessment,
+    )
+
+    return "human_approval"

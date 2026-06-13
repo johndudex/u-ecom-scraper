@@ -1,0 +1,78 @@
+{
+  "site": {
+    "url": "https://www.adairs.co.nz/",
+    "name": "Adairs New Zealand",
+    "platform": "custom",
+    "platform_details": "Episerver CMS with Unbxd search integration. Not Shopify, WooCommerce, Magento, or BigCommerce.",
+    "scraping_mechanism": "http_requests",
+    "mechanism_justification": "The NZ site (adairs.co.nz) currently redirects all pages to a 'maintenance/coming soon' page with no product data. However, the AU site (adairs.com.au) serves fully product pages via direct HTTP with complete server-rendered HTML including JSON-LD structured data (Product schema with name, SKU, images, prices, brand, offers, aggregateRating, reviews). The AU product pages contain extensive SSR HTML (314K+ chars) with no JS rendering needed. The NZ site shares the same platform — when NZ product pages become active, they will likely serve the same SSR content with NZD pricing. Use direct HTTP requests to fetch HTML and parse JSON-LD blocks (type='Product') for structured data extraction."
+  },
+  "anti_bot": {
+    "detected": false,
+    "type": "none",
+    "severity": "low",
+    "details": "No anti-bot protection detected on adairs.com.au (Cloudflare is used as CDN only — 'cdn-cgi/image' for image optimization). Direct HTTP requests return full page content with 200 status. No CAPTCHA, no JavaScript challenges, no rate limiting observed."
+  },
+  "connectivity": {
+    "method_that_worked": "direct_http",
+    "proxy_tier": "none",
+    "js_rendering_needed": false,
+    "anti_bot_detected": false,
+    "notes": "NZ site (adairs.co.nz) currently serves a maintenance page — probe succeeded via Playwright but the page only shows 'An Update for Our New Zealand Customers'. The AU site (adairs.com.au) works with direct HTTP (no proxy, no browser) and returns full SSR product pages. The NZ site uses the same Episerver CMS and will likely work the same way when active. Cloudflare is used only as CDN (image optimization), not as anti-bot shield."
+  },
+  "product_discovery": {
+    "method": "product_url_pattern",
+    "product_url_pattern": "/{category}/{subcategory}/{brand}/{product-slug}/",
+    "sample_product_urls": [
+      "https://www.adairs.co.nz/bedroom/sheets/adairs/stonewashed-cotton-chocolate-sheet-separates/"
+    ],
+    "url_pattern_notes": "Product URLs follow the pattern: /{category}/{subcategory}/{brand}/{product-slug}/. The product slug is a human-readable identifier. The SKU appears in the JSON-LD (e.g., '61297_chocolate'). Product pages have hreflang links between AU and NZ variants (en-AU and en-NZ)."
+  },
+  "product_page_structure": {
+    "jsonld_available": true,
+    "jsonld_types": ["Product", "BreadcrumbList"],
+    "jsonld_product_fields": {
+      "name": "Product name",
+      "image": "Array of image URLs from globalassets CDN",
+      "description": "Product description",
+      "brand": {"type": "Brand", "name": "Brand name"},
+      "sku": "Product SKU (e.g., 61297_chocolate)",
+      "offers": {
+        "type": "AggregateOffer",
+        "availability": "https://schema.org/InStock",
+        "url": "Product URL",
+        "priceCurrency": "AUD or NZD",
+        "lowPrice": "Lowest variant price",
+        "highPrice": "Highest variant price"
+      },
+      "aggregateRating": {
+        "type": "AggregateRating",
+        "ratingValue": "Average rating",
+        "bestRating": "5",
+        "worstRating": "1",
+        "reviewCount": "Number of reviews"
+      },
+      "review": "Array of Review objects with rating, date, author, publisher"
+    },
+    "open_graph_available": true,
+    "og_fields": ["og:type", "og:title", "og:url", "og:image", "og:description"],
+    "html_structure": "Server-side rendered HTML with React hydration (react_0HNM69Q4AJS4Q div). Product data embedded in JSON-LD scripts and HTML markup. Unbxd used for site search. Google Tag Manager for analytics. Application Insights (Azure) for monitoring."
+  },
+  "nz_site_status": {
+    "status": "maintenance",
+    "details": "As of analysis, adairs.co.nz redirects all pages (including product pages) to a maintenance/coming soon page. The page title is 'Adairs | New Zealand' and the h1 reads 'An Update for Our New Zealand Customers'. No product data, no JSON-LD, no navigation is available on the NZ site. The site uses Cloudflare for CDN/optimization.",
+    "au_site_works": true,
+    "au_site_notes": "adairs.com.au is fully operational with complete product pages, JSON-LD, and SSR HTML. When NZ site becomes active, expect same structure with NZD pricing."
+  },
+  "rate_limiting": {
+    "recommended_delay_seconds": 1.0,
+    "justification": "No anti-bot protection detected. Standard polite scraping delay. Could potentially go faster (0.5s) given no protection, but 1s is safe."
+  },
+  "additional_api_endpoints": {
+    "unbxd_search": {
+      "note": "Unbxd search integration detected (libraries.unbxdapi.com). The SDK script references 'ss-unbxd-ganz-adairs-auz-prod'. This could potentially be used for product discovery/search but the public API endpoint and credentials would need further investigation."
+    }
+  },
+  "confidence_score": 0.75,
+  "confidence_notes": "Platform identified as Episerver CMS + Unbxd search (custom) with high confidence. Scraping mechanism (http_requests with JSON-LD) verified on the AU site. However, NZ site is currently in maintenance mode, so actual NZ scraping cannot be verified. Confidence is moderate because the NZ site's behavior when active is inferred from AU site behavior. Currency on AU is AUD; NZ site will use NZD."
+}

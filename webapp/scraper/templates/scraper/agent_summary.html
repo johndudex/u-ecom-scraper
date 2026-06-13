@@ -1,0 +1,49 @@
+{% extends "scraper/base.html" %}
+
+{% block page_title %}Agent Summary — Job {{ job.id }}{% endblock %}
+
+{% block extra_head %}
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/github-markdown-css@5/github-markdown-light.min.css">
+<style>
+    .agent-section { border: 1px solid #334155; border-radius: 0.75rem; overflow: hidden; margin-bottom: 1.5rem; }
+    .agent-header { background: #273548; padding: 0.75rem 1rem; cursor: pointer; display: flex; justify-content: space-between; align-items: center; transition: background 0.2s; }
+    .agent-header:hover { background: #334155; }
+    .agent-body { padding: 1rem; }
+    .markdown-body { font-size: 14px; }
+    .markdown-body pre { max-height: 400px; overflow: auto; }
+    .markdown-body h1 { font-size: 1.25rem; }
+    .markdown-body h2 { font-size: 1.1rem; }
+    .markdown-body code { font-size: 12px; }
+</style>
+{% endblock %}
+
+{% block content %}
+
+<div class="flex items-center justify-between mb-6">
+    <div>
+        <h2 class="text-xl font-bold text-brand-50 mb-1">Agent Summary &mdash; Job {{ job.id }}</h2>
+        <p class="text-brand-500 text-sm">{{ job.url }} &middot; Status: <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider status-{{ job.status }}">{{ job.status }}</span></p>
+    </div>
+    <a href="{% url 'job_detail' job.id %}" class="flex items-center gap-1.5 text-xs text-brand-400 hover:text-brand-200 border border-brand-600/50 px-3 py-2 rounded-lg hover:border-brand-500 transition-colors cursor-pointer">
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M7.72 12.53a.75.75 0 010-1.06l7.5-7.5a.75.75 0 111.06 1.06L9.31 12l6.97 6.97a.75.75 0 11-1.06 1.06l-7.5-7.5z" clip-rule="evenodd"/></svg>
+        Back to Job
+    </a>
+</div>
+
+{% for s in summaries %}
+<div class="agent-section">
+    <div class="agent-header" onclick="this.nextElementSibling.classList.toggle('hidden')">
+        <strong class="text-brand-200 capitalize">{{ s.agent }}</strong>
+        <span class="text-brand-500 text-xs">click to expand</span>
+    </div>
+    <div class="agent-body markdown-body">
+        {{ s.summary|linebreaks }}
+    </div>
+</div>
+{% empty %}
+<div class="rounded-xl bg-surface border border-brand-700/30 py-8 text-center">
+    <p class="text-brand-500 text-sm">No agent logs available yet.</p>
+</div>
+{% endfor %}
+
+{% endblock %}

@@ -1,0 +1,264 @@
+{
+  "site_slug": "adidas-ie",
+  "test_timestamp": "2026-06-11T08:53:30.000Z",
+  "scraper_file": "scraper_draft.py",
+  "sample_size": 1,
+  "results": {
+    "successful_extractions": 1,
+    "failed_extractions": 0,
+    "field_coverage": {
+      "id": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": 1,
+        "expected_value": 1
+      },
+      "title": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "good",
+        "actual_value": "Superstar II shoes",
+        "expected_value": "adidas Superstar II shoes - Black (from JSON-LD, color suffix may be missing)"
+      },
+      "price": {
+        "count": 0,
+        "coverage": "0%",
+        "status": "MISSING",
+        "quality": "critical",
+        "actual_value": "",
+        "expected_value": "e.g. €120.00",
+        "note": "Price extraction failed entirely. __NEXT_DATA__ priceInfo path may not match actual structure. CSS fallback also returned empty."
+      },
+      "availability": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "PARTIAL",
+        "quality": "acceptable",
+        "actual_value": "Out of Stock",
+        "expected_value": "In Stock or Out of Stock",
+        "note": "The product page URL pre-selects size 11 via forceSelSize=11. If size 11 is unavailable, the scraper correctly reports Out of Stock. However, this reflects the SELECTED SIZE availability, not overall product availability."
+      },
+      "original_price": {
+        "count": 0,
+        "coverage": "0%",
+        "status": "MISSING",
+        "quality": "info",
+        "actual_value": "",
+        "expected_value": "empty (optional - product may not be on sale)",
+        "note": "Original price is optional. Since price extraction itself failed, this cannot be verified. Not flagged as critical since we can't confirm the product is on sale."
+      },
+      "currency": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "EUR",
+        "expected_value": "EUR"
+      },
+      "url": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "https://www.adidas.ie/superstar-ii-shoes/JI0079.html?forceSelSize=11",
+        "expected_value": "full product URL with scheme"
+      },
+      "src_url": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "https://www.adidas.ie/superstar-ii-shoes/JI0079.html?forceSelSize=11",
+        "note": "Correctly set to product URL (no listing page in test)"
+      },
+      "status_code": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": 200,
+        "expected_value": 200
+      },
+      "scraped_at": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "2026-06-11T08:53:00.293111+00:00",
+        "expected_value": "valid ISO-8601 timestamp"
+      },
+      "remarks": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "",
+        "expected_value": "empty string for clean extraction"
+      },
+      "description": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value_length": 905,
+        "note": "Long, meaningful product description extracted from JSON-LD. HTML cleaned properly."
+      },
+      "sku": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "WRONG_VALUE",
+        "quality": "medium",
+        "actual_value": "SuperII",
+        "expected_value": "JI0079 (the actual product/article number from the URL)",
+        "note": "JSON-LD 'productGroupID' returns 'SuperII' which is the product group name, not the specific article number. The actual product code 'JI0079' from the URL would be more useful."
+      },
+      "brand": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "adidas"
+      },
+      "size": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "good",
+        "actual_value": "11",
+        "expected_value": "11 (from forceSelSize URL param)"
+      },
+      "rating_value": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "4.9"
+      },
+      "review_count": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "342"
+      },
+      "images": {
+        "count": 15,
+        "coverage": "100%",
+        "status": "WRONG_VALUE",
+        "quality": "poor",
+        "note": "Only 1 of 15 images belongs to product JI0079. The other 14 images are PLP (product listing page) thumbnails for OTHER product variants (HQ2365, IH4172, IH4173, IH8659, IH9246, IH9247, IH9257, IH9298, IH9314, IH9315, IH9317, IH9320, IH9763, JI0080). The scraper captured cross-sell/variant thumbnails from the 'you may also like' or color variant selector section. The is_product_image() filter allowed these because the SKU field contains 'SuperII' which appears in all 'Superstar_II' filenames. Expected: 3-8 images ALL for JI0079 specifically."
+      },
+      "color": {
+        "count": 0,
+        "coverage": "0%",
+        "status": "MISSING",
+        "quality": "medium",
+        "actual_value": "",
+        "expected_value": "Black (from page title or color selector)",
+        "note": "Color not extracted. The page title includes 'Black' and the color selector should have a label."
+      }
+    }
+  },
+  "issues": [
+    {
+      "severity": "high",
+      "field": "price",
+      "status": "MISSING",
+      "problem": "Price is completely empty. __NEXT_DATA__ extraction path may not match the actual data structure, and CSS fallback also returned empty.",
+      "details": "Got: '' (empty string). Expected: e.g. '€120.00'. The scraper tries __NEXT_DATA__ path: productStore.products[key].data.priceInfo.currentPrice.value, then CSS selector [data-auto-id='product-price']. Both returned nothing. The __NEXT_DATA__ key may not be directly iterable as 'first key of products dict' — adidas may use the article number (JI0079) as the key, and the extraction path may need to traverse differently.",
+      "affected_samples": [0],
+      "suggested_fix": "Debug the __NEXT_DATA__ structure by logging the full productStore.products object. The product key might be JI0079 or a different identifier. Also try: priceInfo > currentPrice > withTax/value or the priceInfo > sellingPrice > value path. As a more robust approach, try matching the key against the article number from the URL (JI0079). Alternatively, try the CSS selector with different data-auto-id patterns like [data-auto-id='gl-price-item'] or the visible price text from .gl-price__value."
+    },
+    {
+      "severity": "high",
+      "field": "images",
+      "status": "WRONG_VALUE",
+      "problem": "14 out of 15 images belong to OTHER product variants, not the scraped product (JI0079). Only 1 image is actually for JI0079.",
+      "details": "The scraper's is_product_image() filter uses the SKU 'SuperII' (from JSON-LD productGroupID) to validate images. Since 'SuperII' appears in 'Superstar_II' filenames, ALL variant thumbnail images pass the filter. The images are PLP thumbnails (_plp_standard suffix) scraped from the color variant selector or 'also available in' section. URLs contain codes like HQ2365, IH4172, IH4173, IH8659, etc. — completely different products.",
+      "affected_samples": [0],
+      "suggested_fix": "1. Use the article number from the URL (e.g., JI0079) as the product_code for is_product_image() filtering instead of the JSON-LD productGroupID ('SuperII'). 2. Extract the article number from the URL pattern: re.search(r'/([A-Z0-9]{6})\\.html', url). 3. Filter images that contain this 6-char code in the URL, OR if product_code is not found in the image, require that it does NOT contain another 6-char code (to reject variant thumbnails). 4. Alternatively, only take images from the main product carousel/gallery element, not from the color variant selector."
+    },
+    {
+      "severity": "medium",
+      "field": "sku",
+      "status": "WRONG_VALUE",
+      "problem": "SKU value 'SuperII' is the product group name from JSON-LD productGroupID, not the actual product/article number.",
+      "details": "Got: 'SuperII'. Expected: 'JI0079' (the article number visible in the URL). The productGroupID from JSON-LD represents the product group, not the specific product variant.",
+      "affected_samples": [0],
+      "suggested_fix": "Extract the article number from the URL: re.search(r'/([A-Z0-9]{6})\\.html', url).group(1). Use this as the primary SKU. Alternatively, check __NEXT_DATA__ for a more specific product ID or article number field."
+    },
+    {
+      "severity": "medium",
+      "field": "color",
+      "status": "MISSING",
+      "problem": "Color was not extracted from the product page.",
+      "details": "Got: '' (empty). The product is 'Superstar II shoes - Black'. The page title from JSON-LD includes 'Black'. Color should be extractable from the color variant selector or page title.",
+      "affected_samples": [0],
+      "suggested_fix": "Try extracting color from the JSON-LD 'name' field which includes the color: e.g., parse 'Superstar II shoes - Black' to extract 'Black'. Or use the CSS selector [data-auto-id='color-variation-label'] more carefully — the current JS may not be waiting long enough for the color selector to render."
+    },
+    {
+      "severity": "medium",
+      "field": "availability",
+      "status": "PARTIAL",
+      "problem": "Availability reflects the pre-selected SIZE availability, not the overall product availability.",
+      "details": "The URL includes forceSelSize=11, which pre-selects size 11. If size 11 is unavailable, the scraper reports 'Out of Stock' even though the product may be available in other sizes. This is not necessarily wrong but may be misleading.",
+      "affected_samples": [0],
+      "suggested_fix": "Either: 1) Document that availability is size-specific, 2) Check if ANY size is available rather than just the selected one, or 3) Report 'In Stock' if the product exists and has at least one available size variant."
+    }
+  ],
+  "edge_case_results": {
+    "sale_product": "NOT_TESTED",
+    "out_of_stock": "TESTED",
+    "variants": "PARTIAL"
+  },
+  "script_checks": {
+    "syntax_valid": true,
+    "imports_valid": true,
+    "output_format_valid": true,
+    "logging_works": true,
+    "error_handling_works": true,
+    "uc_mode_works": true,
+    "cookie_consent_handled": true,
+    "akamai_bypass": true,
+    "warmup_completes": true,
+    "output_file_written": true,
+    "json_valid": true
+  },
+  "overall_assessment": "NEEDS_FIXES",
+  "confidence_score": 0.55,
+  "ready_for_execution": false,
+  "feedback_for_writer": {
+    "summary": "2 high-severity issues: PRICE is completely empty (0% extraction rate) and IMAGES include 14 wrong product variant thumbnails out of 15 total. 2 medium issues: SKU uses product group name instead of article number, and COLOR is missing. The scraper successfully bypasses Akamai and extracts most other fields correctly (title, description, brand, rating, size, etc.).",
+    "field_fixes": {
+      "price": {
+        "issue": "Price extraction returns empty string. Both __NEXT_DATA__ path and CSS fallback fail.",
+        "fix": "Debug __NEXT_DATA__ by logging the full productStore.products keys and structure. The key is likely the article number (JI0079), not an arbitrary first key. Try: iterate all keys in products dict and look for the one matching the URL's article code. Price path may be: data.priceInfo.currentPrice.value or data.priceInfo.sellingPrice.value or data.priceInfo.withTax. Also try CSS: document.querySelector('[data-auto-id=\"gl-price-item\"]') or textContent of visible price elements.",
+        "priority": "high"
+      },
+      "images": {
+        "issue": "14/15 images are PLP thumbnails for OTHER product variants (different article numbers: HQ2365, IH4172, etc.). Only 1/15 is for the scraped product JI0079.",
+        "fix": "Change is_product_image() to use the article number from the URL instead of the JSON-LD productGroupID. Extract article code via: re.search(r'/([A-Z0-9]{6})\\\\.html', url).group(1). Then filter: only include images whose URL contains this exact 6-char code. Alternatively, only scrape images from the main product image gallery element, not from color variant selectors. Also filter out images with '_plp_' in the URL as these are listing thumbnails, not product detail images.",
+        "priority": "high"
+      },
+      "sku": {
+        "issue": "SKU 'SuperII' is product group name, not the specific article number JI0079.",
+        "fix": "Extract article number from URL: sku = re.search(r'/([A-Z0-9]{6})\\\\.html', url).group(1). Use this as primary SKU. Fall back to JSON-LD productGroupID only if URL pattern doesn't match.",
+        "priority": "medium"
+      },
+      "color": {
+        "issue": "Color not extracted. Page title includes color name 'Black'.",
+        "fix": "Parse color from JSON-LD name field: 'Superstar II shoes - Black' → extract 'Black'. Use: re.search(r' - ([A-Za-z]+)$', jsonld_name).group(1). Or ensure the CSS selector [data-auto-id='color-variation-label'] is executed after the page fully renders.",
+        "priority": "medium"
+      }
+    },
+    "code_suggestions": [
+      "Extract article number from URL early and use it as product_code throughout (SKU, image filtering)",
+      "Debug __NEXT_DATA__ structure by dumping the full products dict keys to log",
+      "Filter out _plp_ images as they are listing thumbnails not product gallery images",
+      "Parse color from JSON-LD name field as a reliable fallback"
+    ]
+  }
+}

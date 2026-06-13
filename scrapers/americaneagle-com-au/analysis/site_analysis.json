@@ -1,0 +1,80 @@
+{
+  "site": {
+    "url": "https://americaneagle.com.au",
+    "name": "American Eagle Australia",
+    "platform": "localised",
+    "scraping_mechanism": "playwright",
+    "mechanism_justification": "Localised Inc. platform (localised-1.66) is a pure client-side SPA with no server-side rendering. The Product REST API (/api/v2/products/{code}) returns 401 without a session token. The SPA renders everything client-side via React, so Playwright is required to render the page and extract product data. Additionally, the Algolia Search API credentials are embedded in the metadata (account: 1ZEQOKJJX6, key: a7166f47083cb5ba718669c3e9a348a9) and can be used via browser fetch() to look up products by code in the prd-product_AU Algolia index as a faster alternative."
+  },
+  "anti_bot": {
+    "detected": false,
+    "type": "none",
+    "severity": "low",
+    "details": "No Cloudflare, Akamai, or PerimeterX detected. CAPTCHA is configured but only for paymentInitiate and storeCard actions (not browsing). The probe_page succeeded with Playwright (no proxy) with HTTP 200. No bot detection challenges observed."
+  },
+  "connectivity": {
+    "method_that_worked": "browser_none",
+    "proxy_tier": "none",
+    "js_rendering_needed": true,
+    "anti_bot_detected": false,
+    "notes": "Direct HTTP returns empty SPA shell (no SSR). Playwright with no proxy successfully loads the page. No proxy escalation needed. The site is a Localised Inc. React SPA that loads all content client-side."
+  },
+  "product_discovery": {
+    "method": "product_url_pattern",
+    "product_url_pattern": "/en-au/product/{product-slug}/{product_code}?color={color_code}",
+    "sample_product_urls": [
+      "https://americaneagle.com.au/en-au/product/ae-standard-fit-johnny-collar-knit-polo-shirt/1165_5323_131?color=chalk"
+    ],
+    "url_pattern_notes": "Product URLs follow the pattern: /en-au/product/{slug}/{style_id}_{color_id}_{sku_id}?color={color_name}. The critical identifier is the product code (e.g., 1165_5323_131). The slug is human-readable. Color query parameter is optional but sets the selected variant. The product code can be extracted from URLs and used to look up products via the Algolia Search API (index: prd-product_AU)."
+  },
+  "localised_platform": {
+    "version": "localised-1.66",
+    "site_tag": "AE_AU",
+    "country_code": "AU",
+    "currency_code": "AUD",
+    "currency_symbol": "A$",
+    "pricing_strategy": "FIXED_PRICE",
+    "rest_api_base": "https://americaneagle.com.au/api/v2",
+    "rest_api_needs_session": true,
+    "algolia": {
+      "account_id": "1ZEQOKJJX6",
+      "api_key": "a7166f47083cb5ba718669c3e9a348a9",
+      "product_index": "prd-product_AU",
+      "product_indices_prefix": "prd-product",
+      "index_suffix": "AU"
+    },
+    "metadata_url": "https://americaneagle.com.au/americaneagle.com.au-current/metadata-v2.json",
+    "auth": {
+      "type": "cognito",
+      "region": "us-east-1",
+      "app_client_id": "6at5g2n468ll57vd4nfmortgko",
+      "pool_id": "us-east-1_3cQQAAzNZ"
+    }
+  },
+  "scraping_strategy": {
+    "primary": "playwright_dom_extraction",
+    "description": "Use Playwright to navigate to each product URL, wait for the SPA to render, then extract product data from the DOM. Monitor network requests to capture API responses from /api/v2/products/ which contain structured product data.",
+    "extraction_methods": [
+      {
+        "method": "network_interception",
+        "description": "Intercept XHR/fetch requests to /api/v2/products/{code} during page load. The SPA makes this call after session creation and it returns structured JSON with all product data (price, variants, images, descriptions, availability).",
+        "priority": 1
+      },
+      {
+        "method": "algolia_lookup",
+        "description": "Use browser fetch() with Algolia credentials to search the prd-product_AU index using the product code (objectID). This bypasses session creation entirely and returns structured product data directly.",
+        "priority": 2
+      },
+      {
+        "method": "dom_extraction",
+        "description": "Extract product data from the rendered DOM using CSS selectors after the SPA has fully loaded. Fall back to this if network interception and Algolia both fail.",
+        "priority": 3
+      }
+    ]
+  },
+  "rate_limiting": {
+    "recommended_delay_seconds": 2,
+    "justification": "No anti-bot protection detected, but being respectful to avoid rate limits. Localised platform behind CloudFront CDN. Algolia has generous rate limits for search operations."
+  },
+  "confidence_score": 0.92
+}

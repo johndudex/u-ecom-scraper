@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# Environment & secrets
+.env
+config/proxy.json
+
+# Python caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Playwright temp snapshots
+.playwright-mcp/
+
+# Node
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+
+# Docker volume data (local only)
+pgdata/
+redisdata/
+
+# Workspace & logs (transient, regenerated per job)
+workspace/
+logs/
+*.log
+
+# Temp & downloads
+temp/
+downloaded_files/
+
+# Scraper output data (versioned locally, not tracked)
+scrapers/*/output_*.json
+scrapers/logs/
+
+# Sensitive session cookies
+data/akamai-cookies/
+
+# Django collected static
+webapp/staticfiles/
+
+# Databases
+*.db
+*.sqlite3
+
+# Binary
+opencode-binary
+
+# OS
+.DS_Store
+Thumbs.db

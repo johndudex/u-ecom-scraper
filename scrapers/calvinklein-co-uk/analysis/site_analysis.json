@@ -1,0 +1,44 @@
+{
+  "site": {
+    "url": "https://www.calvinklein.co.uk",
+    "name": "Calvin Klein UK",
+    "platform": "custom",
+    "scraping_mechanism": "stealth_browser",
+    "mechanism_justification": "Direct HTTP requests time out, and standard Playwright browser was blocked. Only UC Chrome (undetected browser) successfully loaded the page. The page is heavily JS-rendered — all common product selectors (h1, price, description, SKU) were NOT FOUND in raw HTML. JSON-LD Product block exists but has EMPTY offers (no price). A stealth browser (SeleniumBase UC Chrome) is required to render the full page and extract product data including prices from the DOM."
+  },
+  "anti_bot": {
+    "detected": true,
+    "type": "fingerprint",
+    "severity": "medium",
+    "details": "Direct HTTP requests time out completely. Standard Playwright browser appears blocked (probe escalated to UC Chrome). UC Chrome without proxy successfully loads the page with full content (880K chars). This suggests browser fingerprint-level detection (e.g., Cloudflare or similar) that blocks automated browsers but allows undetected Chrome profiles. No CAPTCHA was explicitly observed in the probe."
+  },
+  "connectivity": {
+    "method_that_worked": "uc_chrome_none",
+    "proxy_tier": "none",
+    "js_rendering_needed": true,
+    "anti_bot_detected": true,
+    "notes": "Direct HTTP times out. Playwright browser was blocked. Only UC Chrome (no proxy) successfully loaded the page. Residential proxy not needed — UC Chrome alone bypasses the fingerprint detection. The page is entirely JS-rendered (880K chars after JS execution, all selectors absent from static HTML)."
+  },
+  "product_discovery": {
+    "method": "product_url_pattern",
+    "product_url_pattern": "/{product-slug}-{product-code}",
+    "sample_product_urls": [
+      "https://www.calvinklein.co.uk/scoop-neck-ribbed-tank-top-lv047f832gxbs"
+    ],
+    "url_pattern_notes": "Product URLs follow the pattern: base_url + '/' + seo-friendly-slug + '-' + product-code. The product code (e.g., LV047F832GXBS) appears to be a fixed alphanumeric identifier. Note: the input URL has a double slash (//) which may be a data issue — the actual pattern uses single slash."
+  },
+  "product_data_extraction": {
+    "json_ld_available": true,
+    "json_ld_product": true,
+    "json_ld_offers": false,
+    "json_ld_notes": "Product JSON-LD block contains: name, sku, description, brand, image, color, mpn. However, Offers field is EMPTY — price data is NOT available in JSON-LD. Prices must be extracted from the rendered DOM.",
+    "dom_extraction_needed": true,
+    "dom_extraction_notes": "Price, availability, and possibly variant/size information must be extracted from the rendered page DOM. Since the page is fully JS-rendered, the scraper must wait for full page load before extracting data."
+  },
+  "rate_limiting": {
+    "recommended_delay_seconds": 3.0,
+    "justification": "Medium-severity anti-bot fingerprinting detected. Direct HTTP times out suggesting aggressive request filtering. Use UC Chrome with delays between 3-5 seconds per page to avoid triggering rate limits."
+  },
+  "currency": "EUR",
+  "confidence_score": 0.8
+}

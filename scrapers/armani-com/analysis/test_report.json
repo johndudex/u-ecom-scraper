@@ -1,0 +1,201 @@
+{
+  "site_slug": "armani-com",
+  "test_timestamp": "2026-06-11T18:52:45+00:00",
+  "scraper_file": "scraper_draft.py",
+  "sample_size": 1,
+  "results": {
+    "successful_extractions": 1,
+    "failed_extractions": 0,
+    "field_coverage": {
+      "id": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": 1,
+        "expected": "Sequential starting at 1"
+      },
+      "title": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": "Shiny viscose jersey bodysuit",
+        "expected": "Shiny viscose jersey bodysuit"
+      },
+      "price": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": "$1,795.00",
+        "expected": "$1,795.00 (from JSON-LD price=1795, currency=USD)"
+      },
+      "availability": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": "In Stock",
+        "expected": "In Stock (from schema.org/InStock)"
+      },
+      "original_price": {
+        "count": 0,
+        "coverage": "0%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": "",
+        "expected": "Empty (product not on sale, no highPrice in offers)"
+      },
+      "currency": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": "USD",
+        "expected": "USD"
+      },
+      "url": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": "https://www.armani.com/en-us/giorgio-armani/shiny-viscose-jersey-bodysuit-cod-GW003665-AF24627-U4153",
+        "expected": "Same as input URL"
+      },
+      "src_url": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": "https://www.armani.com/en-us/giorgio-armani/shiny-viscose-jersey-bodysuit-cod-GW003665-AF24627-U4153",
+        "expected": "Source listing URL"
+      },
+      "status_code": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": 200,
+        "expected": 200
+      },
+      "scraped_at": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": "2026-06-11T18:52:40.038817+00:00",
+        "expected": "Valid ISO-8601 timestamp"
+      },
+      "remarks": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": "",
+        "expected": "Empty (no extraction issues)"
+      },
+      "description": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": "Elegant bodysuit made of viscose jersey with a natural sheen. The style is distinguished by its straight neckline embellished with a knot detail that adds movement and uniqueness to the garment. A versatile and contemporary item that lends itself to completing numerous looks with a refined attitude.",
+        "expected": "Full product description text"
+      },
+      "brand": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": "Giorgio Armani",
+        "expected": "Giorgio Armani"
+      },
+      "sku": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": "GW003665-AF24627-U4153",
+        "expected": "GW003665-AF24627-U4153 (from URL regex cod-...)"
+      },
+      "images": {
+        "count": 5,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": 5,
+        "expected": "3-15 product images",
+        "details": "All 5 images from assets-cf.armani.com, all contain SKU GW003665_AF24627_U4153 in URL path. No non-product images captured."
+      },
+      "category": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": "Woman > Clothing > Shirts and Tops",
+        "expected": "Woman > Clothing > Shirts and Tops (positions 3-5 excluding last breadcrumb)"
+      },
+      "color": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "WRONG_VALUE",
+        "quality": "wrong",
+        "extracted": "$ 1,795",
+        "expected": "Pink",
+        "details": "CSS selector 'span.text-light-6' is matching the price display element instead of the color label. The extracted value '$ 1,795' is clearly a price, not a color."
+      },
+      "location": {
+        "count": 0,
+        "coverage": "0%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "extracted": "",
+        "expected": "Empty (optional field, not applicable)"
+      }
+    }
+  },
+  "issues": [
+    {
+      "severity": "medium",
+      "field": "color",
+      "status": "WRONG_VALUE",
+      "problem": "CSS selector 'span.text-light-6' captures price text instead of color name",
+      "details": "Extracted '$ 1,795' instead of 'Pink'. The selector 'span.text-light-6' is matching an element that contains the formatted price, not the product color. The analysis verified that color should be 'Pink' from this selector, but the actual page structure likely has multiple span.text-light-6 elements and the first one is the price, not the color.",
+      "affected_samples": [0],
+      "suggested_fix": "The color extraction needs a more specific CSS selector. Options: (1) Find the color label element more precisely — look for a parent container with 'color' or 'colour' text, then find the value within it. (2) Extract color from JSON-LD if available (check Product.color or Product.additionalProperty). (3) Use a more specific selector like a span near a 'Color' label, e.g., look for a container with text matching 'Color' and then extract the sibling/child value span. The current selector 'span.text-light-6' is too generic."
+    }
+  ],
+  "edge_case_results": {
+    "sale_product": "NOT_TESTED",
+    "out_of_stock": "NOT_TESTED",
+    "variants": "NOT_TESTED"
+  },
+  "script_checks": {
+    "syntax_valid": true,
+    "imports_valid": true,
+    "output_format_valid": true,
+    "logging_works": true,
+    "error_handling_works": true,
+    "output_file_created": true,
+    "json_parseable": true,
+    "rate_limiting_works": true
+  },
+  "overall_assessment": "PASS",
+  "confidence_score": 0.92,
+  "ready_for_execution": true,
+  "feedback_for_writer": {
+    "summary": "1 issue found: color field extracts price text instead of color name. All other 16 fields extract correctly.",
+    "field_fixes": {
+      "color": {
+        "issue": "CSS selector 'span.text-light-6' matches price element first, returning '$ 1,795' instead of 'Pink'",
+        "fix": "Make the color selector more specific. Option A: Look for JSON-LD Product.color or Product.additionalProperty where name='Color'. Option B: Find a container/parent with 'Color' label text and extract the value span from within it. Option C: Use a more targeted CSS selector like 'div[class*=color] span.text-light-6' or iterate all span.text-light-6 elements and pick the one that is NOT a price.",
+        "priority": "medium"
+      }
+    },
+    "code_suggestions": [
+      "Fix color extraction selector to avoid matching the price element",
+      "Consider extracting color from JSON-LD additionalProperty if available"
+    ]
+  }
+}

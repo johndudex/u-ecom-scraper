@@ -1,0 +1,118 @@
+{% extends "scraper/base.html" %}
+{% load scraper_tags %}
+
+{% block page_title %}Jobs — Ecommerce Scraper{% endblock %}
+
+{% block content %}
+
+<div class="flex items-center justify-between mb-6">
+    <div class="relative overflow-hidden rounded-2xl bg-gradient-to-br from-brand-800 via-brand-700 to-brand-600 px-6 py-4">
+        <div class="absolute top-0 right-0 w-40 h-40 bg-cta/5 rounded-full -translate-y-1/2 translate-x-1/2 blur-3xl"></div>
+        <h2 class="text-xl font-bold text-brand-50 relative">Scraping Jobs</h2>
+    </div>
+    <a href="{% url 'home' %}" class="inline-flex items-center gap-1.5 bg-cta hover:bg-cta-hover text-white text-xs font-semibold px-4 py-2.5 rounded-xl transition-all duration-200 hover:shadow-lg hover:shadow-cta/20 hover:-translate-y-0.5 cursor-pointer">
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12 2.25c-5.385 0-9.75 4.365-9.75 9.75s4.365 9.75 9.75 9.75 9.75-4.365 9.75-9.75S17.385 2.25 12 2.25zM12.75 9a.75.75 0 00-1.5 0v2.25H9a.75.75 0 000 1.5h2.25V15a.75.75 0 001.5 0v-2.25H15a.75.75 0 000-1.5h-2.25V9z" clip-rule="evenodd"/></svg>
+        New Job
+    </a>
+</div>
+
+{% if jobs %}
+<div class="flex gap-2 mb-5 flex-wrap" id="filter-bar">
+    <button class="filter-btn px-3.5 py-1.5 text-xs font-medium rounded-lg border border-brand-600/50 bg-cta text-white cursor-pointer transition-all duration-200" data-filter="all">All ({{ jobs|length }})</button>
+    <button class="filter-btn px-3.5 py-1.5 text-xs font-medium rounded-lg border border-brand-600/50 bg-transparent text-brand-400 hover:text-brand-200 hover:border-brand-500 cursor-pointer transition-all duration-200" data-filter="running">Running</button>
+    <button class="filter-btn px-3.5 py-1.5 text-xs font-medium rounded-lg border border-brand-600/50 bg-transparent text-brand-400 hover:text-brand-200 hover:border-brand-500 cursor-pointer transition-all duration-200" data-filter="waiting_approval">Waiting</button>
+    <button class="filter-btn px-3.5 py-1.5 text-xs font-medium rounded-lg border border-brand-600/50 bg-transparent text-brand-400 hover:text-brand-200 hover:border-brand-500 cursor-pointer transition-all duration-200" data-filter="completed">Completed</button>
+    <button class="filter-btn px-3.5 py-1.5 text-xs font-medium rounded-lg border border-brand-600/50 bg-transparent text-brand-400 hover:text-brand-200 hover:border-brand-500 cursor-pointer transition-all duration-200" data-filter="failed">Failed</button>
+    <button class="filter-btn px-3.5 py-1.5 text-xs font-medium rounded-lg border border-brand-600/50 bg-transparent text-brand-400 hover:text-brand-200 hover:border-brand-500 cursor-pointer transition-all duration-200" data-filter="captcha_blocked">Captcha</button>
+</div>
+
+<div class="space-y-3" id="jobs-list">
+    {% for job in jobs %}
+    <div class="job-card rounded-xl bg-surface border border-brand-700/30 overflow-hidden transition-all duration-200 hover:border-brand-600/50 hover:shadow-lg hover:shadow-black/10 hover:-translate-y-0.5" data-status="{{ job.status }}" data-job-id="{{ job.id }}">
+        <div class="px-5 py-4">
+            <div class="flex items-center justify-between gap-3">
+                <div class="min-w-0 flex-1">
+                    <a href="{% url 'job_detail' job_id=job.id %}" class="flex items-center gap-2 group">
+                        {% if is_active_dict|get_item:job.id %}
+                        <span class="w-2 h-2 rounded-full bg-blue-400 animate-pulse-dot flex-shrink-0"></span>
+                        {% endif %}
+                        <span class="text-sm font-semibold text-brand-100 group-hover:text-cta transition-colors duration-200 truncate">{{ job.url|truncatechars:60 }}</span>
+                    </a>
+                    <div class="flex items-center gap-2 mt-1.5 text-xs text-brand-500">
+                        <span>#{{ job.id }}</span>
+                        <span class="text-brand-700">·</span>
+                        <span>{% if job.site_name %}{{ job.site_name }}{% else %}{{ job.url|truncatechars:30 }}{% endif %}</span>
+                        <span class="text-brand-700">·</span>
+                        <span>{{ job.created_at|date:"M d, H:i" }}</span>
+                        {% if job.platform %}
+                        <span class="text-brand-700">·</span>
+                        <span>{{ job.platform }}</span>
+                        {% endif %}
+                    </div>
+                </div>
+                <div class="flex items-center gap-2.5 flex-shrink-0">
+                    {% if job.product_count %}
+                    <span class="text-xs font-semibold text-cta">{{ job.product_count }} products</span>
+                    {% endif %}
+                    <span class="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-semibold uppercase tracking-wider {% if job.full_extraction %}bg-blue-500/15 text-blue-400{% else %}bg-brand-700/50 text-brand-400{% endif %}">
+                        {% if job.full_extraction %}Full{% else %}Sample{% endif %}
+                    </span>
+                    <span class="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-semibold uppercase tracking-wider status-{{ job.status }}">{{ job.get_status_display }}</span>
+                    <div class="flex items-center gap-1.5">
+                        <a href="{% url 'job_detail' job_id=job.id %}" class="px-2.5 py-1.5 text-[11px] font-medium text-brand-400 hover:text-brand-200 border border-brand-600/50 rounded-lg hover:border-brand-500 transition-colors duration-150">View</a>
+                        {% if is_active_dict|get_item:job.id %}
+                        <a href="{% url 'job_cancel' job_id=job.id %}" class="px-2.5 py-1.5 text-[11px] font-medium text-red-400 hover:text-red-300 border border-red-500/30 rounded-lg hover:border-red-500/60 transition-colors duration-150">Cancel</a>
+                        {% elif is_terminal_dict|get_item:job.id %}
+                        <a href="{% url 'job_restart' job_id=job.id %}" class="px-2.5 py-1.5 text-[11px] font-medium text-brand-400 hover:text-brand-200 border border-brand-600/50 rounded-lg hover:border-brand-500 transition-colors duration-150">Re-run</a>
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+{% else %}
+<div class="rounded-2xl bg-surface border border-brand-700/30 py-16 text-center">
+    <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="#475569" class="mx-auto mb-4"><path stroke-linecap="round" stroke-linejoin="round" d="M2.25 13.5h3.86a2.25 2.25 0 012.012 1.244l.256.512a2.25 2.25 0 002.013 1.244h3.218a2.25 2.25 0 002.013-1.244l.256-.512a2.25 2.25 0 012.013-1.244h3.859m-19.5.338V18a2.25 2.25 0 002.25 2.25h15A2.25 2.25 0 0021.75 18v-4.162c0-.224-.034-.447-.1-.661L19.24 5.338a2.25 2.25 0 00-2.15-1.588H6.911a2.25 2.25 0 00-2.15 1.588L2.35 13.177a2.25 2.25 0 00-.1.661z"/></svg>
+    <h3 class="text-brand-400 font-semibold mb-1">No jobs yet</h3>
+    <p class="text-brand-500 text-sm mb-4">Create your first scraping job to get started.</p>
+    <a href="{% url 'home' %}" class="inline-flex items-center gap-1.5 bg-cta hover:bg-cta-hover text-white text-xs font-semibold px-4 py-2.5 rounded-xl transition-all duration-200 hover:shadow-lg hover:shadow-cta/20 cursor-pointer">
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12 2.25c-5.385 0-9.75 4.365-9.75 9.75s4.365 9.75 9.75 9.75 9.75-4.365 9.75-9.75S17.385 2.25 12 2.25zM12.75 9a.75.75 0 00-1.5 0v2.25H9a.75.75 0 000 1.5h2.25V15a.75.75 0 001.5 0v-2.25H15a.75.75 0 000-1.5h-2.25V9z" clip-rule="evenodd"/></svg>
+        Create Job
+    </a>
+</div>
+{% endif %}
+
+<script>
+document.querySelectorAll('.filter-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+        document.querySelectorAll('.filter-btn').forEach(function(b) {
+            b.classList.remove('bg-cta', 'text-white');
+            b.classList.add('bg-transparent', 'text-brand-400');
+        });
+        this.classList.remove('bg-transparent', 'text-brand-400');
+        this.classList.add('bg-cta', 'text-white');
+        var filter = this.dataset.filter;
+        document.querySelectorAll('.job-card').forEach(function(card) {
+            card.style.display = (filter === 'all' || card.dataset.status === filter) ? '' : 'none';
+        });
+    });
+});
+
+(function() {
+    var counts = {};
+    document.querySelectorAll('.job-card').forEach(function(card) {
+        var s = card.dataset.status;
+        counts[s] = (counts[s] || 0) + 1;
+    });
+    document.querySelectorAll('.filter-btn').forEach(function(btn) {
+        var f = btn.dataset.filter;
+        if (f !== 'all' && counts[f]) {
+            btn.textContent = btn.textContent.replace(/\(\d+\)/, '') + ' (' + counts[f] + ')';
+        }
+    });
+})();
+</script>
+{% endblock %}

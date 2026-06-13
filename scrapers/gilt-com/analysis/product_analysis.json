@@ -1,0 +1,307 @@
+{
+  "site_slug": "gilt-com",
+  "analyzed_products": 1,
+  "site_analysis_review": {
+    "platform_agreement": "agree",
+    "anti_bot_agreement": "agree",
+    "mechanism_agreement": "agree",
+    "corrections": [
+      "Site analysis correctly identified UC Chrome with residential proxy as the only working method — verified by probe result showing uc_chrome_residential success while direct HTTP and standard Playwright both fail.",
+      "Site analysis correctly noted all common selectors return NOT FOUND — confirmed by probe testing h1, price, availability, sku, brand, rating selectors.",
+      "Site analysis correctly identified JSON-LD has partial data (name, image, description, brand) but empty offers — confirmed by probe showing offers=EMPTY.",
+      "Note: Residential proxy connectivity is unstable — the same URL that succeeded on first probe later returned all_failed, suggesting rate limiting or proxy pool exhaustion. Scraper should implement robust retry logic."
+    ]
+  },
+  "connectivity": {
+    "method_that_worked": "uc_chrome_residential",
+    "proxy_tier": "residential",
+    "js_rendering_needed": true,
+    "notes": "Only UC Chrome with residential proxy can bypass anti-bot protection. Direct HTTP returns 403. Standard Playwright is blocked. Residential proxy access is intermittent — retries needed. Recommended delay: 3-5 seconds between requests."
+  },
+  "extraction_methods": {
+    "primary": "structured_data",
+    "structured_data_available": true,
+    "structured_data_fields": [
+      "name",
+      "image",
+      "description",
+      "brand"
+    ],
+    "structured_data_fields_missing": [
+      "price",
+      "availability",
+      "sku",
+      "rating",
+      "offers"
+    ],
+    "notes": "JSON-LD provides partial product data. Price, availability, and variant data are NOT in structured data and must be extracted from the rendered DOM. Since all common selectors return NOT FOUND, the scraper must discover custom selectors after UC Chrome renders the page. A two-pass strategy is recommended: (1) extract JSON-LD fields, (2) use DOM inspection/JS evaluation to find custom class names for price, availability, etc."
+  },
+  "fields": {
+    "url": {
+      "method": "constructed",
+      "selector": "window.location.href",
+      "js_extraction": "window.location.origin + window.location.pathname",
+      "tested": false,
+      "examples": [
+        "https://www.gilt.com/boutique/product/227053/309498967/"
+      ],
+      "notes": "URL should be cleaned to remove tracking parameters. Base URL pattern: /boutique/product/{boutique_id}/{product_id}/"
+    },
+    "src_url": {
+      "method": "set_by_scraper",
+      "selector": "N/A",
+      "js_extraction": null,
+      "tested": false,
+      "examples": [],
+      "notes": "Set by the scraper from input_urls.json"
+    },
+    "status_code": {
+      "method": "set_by_scraper",
+      "selector": "HTTP response status",
+      "js_extraction": null,
+      "tested": false,
+      "examples": [],
+      "notes": "Set by the scraper from the HTTP response."
+    },
+    "scraped_at": {
+      "method": "set_by_scraper",
+      "selector": "ISO-8601 timestamp",
+      "js_extraction": null,
+      "tested": false,
+      "examples": [],
+      "notes": "Set by the scraper as ISO-8601 timestamp."
+    },
+    "remarks": {
+      "method": "set_by_scraper",
+      "selector": "N/A",
+      "js_extraction": null,
+      "tested": false,
+      "examples": [],
+      "notes": "Set by the scraper for any warnings or notes about the extraction."
+    },
+    "title": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.name",
+      "css_fallback": "h1 (NOT FOUND in probe — likely uses custom React component class)",
+      "js_extraction": "document.querySelector('h1')?.textContent?.trim() || document.title.replace('Gilt - ', '').split(' - ').slice(1).join(' - ')",
+      "tested": true,
+      "examples": [
+        "Unisex OERI149 54mm Sunglasses"
+      ],
+      "notes": "JSON-LD Product.name is the most reliable source. Page title format is 'Gilt - {Brand} - {Product Name}'. Fallback: parse title from document.title."
+    },
+    "brand": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.brand.name",
+      "css_fallback": "unknown (brand selector NOT FOUND in probe)",
+      "js_extraction": "document.querySelector('script[type=\"application/ld+json\"]') && JSON.parse(document.querySelector('script[type=\"application/ld+json\"]').textContent).brand?.name",
+      "tested": true,
+      "examples": [
+        "Off-White™"
+      ],
+      "notes": "Available in JSON-LD. Brand can also be parsed from page title: second segment after 'Gilt - '."
+    },
+    "price": {
+      "method": "js_evaluation",
+      "selector": "unknown (all price selectors NOT FOUND in probe)",
+      "js_extraction": "document.body.innerText.match(/\\$[\\d,]+\\.\\d{2}/)?.[0] || Array.from(document.querySelectorAll('[class*=price], [class*=Price], [data-testid*=price], [data-testid*=Price]')).map(el => el.textContent.trim()).find(t => /\\$\\d/.test(t))",
+      "tested": false,
+      "examples": [],
+      "notes": "CRITICAL: Price is NOT in JSON-LD (offers is empty). All common price selectors return NOT FOUND. The page is heavily JS-rendered with obfuscated/custom class names. Price extraction requires DOM text search after full JS rendering. The scraper should use regex-based text extraction from the rendered body as a fallback if specific selectors cannot be discovered."
+    },
+    "original_price": {
+      "method": "js_evaluation",
+      "selector": "unknown (NOT FOUND in probe)",
+      "js_extraction": "Array.from(document.querySelectorAll('[class*=original], [class*=compare], [class*=was], [class*=strike], [class*=old]')).map(el => el.textContent.trim()).find(t => /\\$\\d/.test(t))",
+      "tested": false,
+      "examples": [],
+      "notes": "No structured data available. Must be extracted from rendered DOM. Gilt is a flash-sale site so original/compare prices are common but use unknown selectors."
+    },
+    "currency": {
+      "method": "inferred",
+      "selector": "URL param currency=USD",
+      "js_extraction": "new URLSearchParams(window.location.search).get('currency') || 'USD'",
+      "tested": false,
+      "examples": [
+        "USD"
+      ],
+      "notes": "Currency is set via URL parameter (currency=USD). Default to USD. Could also be extracted from price text prefix ($)."
+    },
+    "availability": {
+      "method": "js_evaluation",
+      "selector": "unknown (NOT FOUND in probe)",
+      "js_extraction": "document.body.innerText.match(/(?:in stock|out of stock|available|unavailable|sold out|only \\d+ left)/i)?.[0]?.toLowerCase()",
+      "tested": false,
+      "examples": [],
+      "notes": "Not in JSON-LD (offers empty). Gilt is a flash-sale site — availability changes frequently. DOM text search is the fallback approach."
+    },
+    "image": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.image",
+      "css_fallback": "img[src*='product'] (generic fallback)",
+      "js_extraction": "JSON.parse(document.querySelector('script[type=\"application/ld+json\"]')?.textContent)?.image",
+      "tested": true,
+      "examples": [],
+      "notes": "Available in JSON-LD Product.image. Image URL is likely a CDN-hosted product image."
+    },
+    "description": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.description",
+      "css_fallback": "unknown (description selector NOT FOUND in probe)",
+      "js_extraction": "JSON.parse(document.querySelector('script[type=\"application/ld+json\"]')?.textContent)?.description",
+      "tested": true,
+      "examples": [],
+      "notes": "Available in JSON-LD Product.description."
+    },
+    "sku": {
+      "method": "unknown",
+      "selector": "unknown (SKU selector NOT FOUND in probe)",
+      "js_extraction": "document.body.innerText.match(/(?:SKU|Style|Item)\\s*[:#]?\\s*[\\w-]+/i)?.[0]",
+      "tested": false,
+      "examples": [],
+      "notes": "Not in JSON-LD. SKU may be present in the product details section of the rendered DOM but uses unknown selectors. The model number 'OERI149 54mm' appears in the page title."
+    },
+    "category": {
+      "method": "url_inferred",
+      "selector": "URL path segment /boutique/product/",
+      "js_extraction": null,
+      "tested": false,
+      "examples": [],
+      "notes": "Category cannot be directly inferred from URL. The boutique_id (227053) maps to a category but requires additional lookup. BreadcrumbList JSON-LD was NOT found."
+    },
+    "rating": {
+      "method": "unknown",
+      "selector": "unknown (rating selector NOT FOUND in probe)",
+      "js_extraction": null,
+      "tested": false,
+      "examples": [],
+      "notes": "No rating data found in JSON-LD or common selectors. Gilt may not display ratings on product pages."
+    },
+    "review_count": {
+      "method": "unknown",
+      "selector": "not found",
+      "js_extraction": null,
+      "tested": false,
+      "examples": [],
+      "notes": "No review data found. Gilt typically doesn't show customer reviews."
+    },
+    "variants": {
+      "method": "js_evaluation",
+      "selector": "unknown — likely color/size swatches in rendered DOM",
+      "js_extraction": "Array.from(document.querySelectorAll('[class*=swatch], [class*=variant], [class*=color], [class*=size], button[role*=option]')).map(el => ({text: el.textContent.trim(), class: el.className, aria: el.getAttribute('aria-label')}))",
+      "tested": false,
+      "examples": [],
+      "notes": "Gilt products typically have size and color variants. These are JS-rendered interactive elements. Variant data is not in JSON-LD. The scraper should discover variant selectors from the rendered DOM."
+    },
+    "location": {
+      "method": "not_applicable",
+      "selector": "N/A",
+      "js_extraction": null,
+      "tested": false,
+      "examples": [],
+      "notes": "Gilt is an online-only flash-sale retailer. No physical store locations for product pickup."
+    }
+  },
+  "jsonld_extraction": {
+    "available": true,
+    "block_count": 1,
+    "type": "Product",
+    "fields_present": [
+      "name",
+      "image",
+      "description",
+      "brand"
+    ],
+    "fields_missing": [
+      "offers",
+      "price",
+      "priceCurrency",
+      "availability",
+      "sku",
+      "gtin",
+      "mpn",
+      "aggregateRating",
+      "review"
+    ],
+    "offers_status": "EMPTY_OBJECT",
+    "extraction_code": "const jsonld = JSON.parse(document.querySelector('script[type=\"application/ld+json\"]').textContent); const product = jsonld['@type'] === 'Product' ? jsonld : jsonld['@graph']?.find(item => item['@type'] === 'Product'); return product;",
+    "notes": "JSON-LD Product block has partial data. The offers field exists but is an empty object, meaning price and availability are NOT available via structured data and must come from the rendered DOM."
+  },
+  "variants": {
+    "detected": false,
+    "type": "unknown",
+    "variant_selectors": [],
+    "data_source": "rendered_dom",
+    "notes": "Variant detection was not possible — standard Playwright cannot access the page. Gilt products typically have size and color variants rendered as interactive swatches/buttons. The scraper should discover variant selectors from the rendered DOM after UC Chrome loads the page."
+  },
+  "page_structure": {
+    "title_pattern": "Gilt - {Brand} - {Product Name}",
+    "title_example": "Gilt - Off-White™ - Unisex OERI149 54mm Sunglasses",
+    "url_pattern": "/boutique/product/{boutique_id}/{product_id}/",
+    "url_example": "https://www.gilt.com/boutique/product/227053/309498967/",
+    "tracking_params": [
+      "campaignid",
+      "gclid",
+      "gbraid",
+      "gad_campaignid",
+      "gad_source",
+      "keyword",
+      "matchtype",
+      "network",
+      "partner",
+      "utm_source",
+      "dsi",
+      "lsi",
+      "country",
+      "currency",
+      "device",
+      "deeplink",
+      "adgroupid",
+      "adposition",
+      "subid"
+    ],
+    "body_length_rendered": 5311,
+    "is_spa": true,
+    "rendering_framework": "likely React (custom)",
+    "notes": "Page is a JavaScript-heavy SPA. The rendered body is only 5311 chars, suggesting the product data is loaded via API calls after initial page shell loads. The scraper should monitor network requests for XHR/fetch calls that load product data."
+  },
+  "mechanism_reassessment": {
+    "recommended_mechanism": "seleniumbase_uc",
+    "previous_recommendation": "seleniumbase_uc",
+    "changed": false,
+    "justification": "Confirmed: Only UC Chrome with residential proxy can bypass anti-bot. Direct HTTP returns 403, standard Playwright is blocked. The page is heavily JS-rendered — all common selectors return NOT FOUND, meaning the product data shell loads via JS. JSON-LD provides partial data (name, brand, image, description) but price/availability/variants require DOM extraction after full JS rendering. seleniumbase_uc with residential proxy is the correct mechanism."
+  },
+  "scraping_strategy": {
+    "approach": "two_pass",
+    "pass_1": {
+      "description": "Extract JSON-LD structured data for title, brand, image, description",
+      "method": "Parse script[type='application/ld+json'] after page load",
+      "fields": [
+        "title",
+        "brand",
+        "image",
+        "description"
+      ]
+    },
+    "pass_2": {
+      "description": "Extract price, availability, variants, and SKU from rendered DOM",
+      "method": "DOM inspection with discovered custom selectors + regex fallback",
+      "fields": [
+        "price",
+        "original_price",
+        "currency",
+        "availability",
+        "sku",
+        "variants"
+      ],
+      "fallback_strategy": "Since all common selectors return NOT FOUND, use regex-based text extraction from rendered body: (1) scan for price patterns ($X,XXX.XX), (2) scan for availability keywords, (3) discover variant buttons via generic attribute queries. Also consider monitoring XHR network requests for product data API endpoints."
+    },
+    "network_monitoring": {
+      "recommended": true,
+      "reason": "Body is only 5311 chars after JS rendering, suggesting product data may load via separate API calls. Monitor XHR/fetch requests for JSON product data endpoints that may contain price, availability, and variant information in structured format.",
+      "approach": "After page load, check network requests for URLs containing 'product', 'api', 'inventory', 'price', or 'variant'. Parse JSON responses for structured product data."
+    }
+  },
+  "confidence_score": 0.7,
+  "confidence_notes": "Medium confidence due to inability to directly inspect the rendered DOM (standard Playwright is blocked). JSON-LD fields (title, brand, image, description) are confidently mapped. Price, availability, variant, and SKU selectors are untested estimates — the scraper will need runtime DOM discovery. Network monitoring for API endpoints is recommended as a high-value discovery strategy. Connectivity via residential proxy is intermittent, requiring robust retry logic."
+}

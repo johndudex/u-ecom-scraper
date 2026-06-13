@@ -1,0 +1,242 @@
+{
+  "site_slug": "calvinklein-co-uk",
+  "test_timestamp": "2026-06-09T23:13:00+00:00",
+  "scraper_file": "scraper_draft.py",
+  "sample_size": 1,
+  "results": {
+    "successful_extractions": 1,
+    "failed_extractions": 0,
+    "field_coverage": {
+      "id": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": 1,
+        "expected_value": "Sequential from 1",
+        "notes": "Sequential numbering starting at 1, no gaps"
+      },
+      "title": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "Scoop Neck Ribbed Tank Top",
+        "expected_value": "Scoop Neck Ribbed Tank Top",
+        "notes": "Extracted from JSON-LD Product.name. Matches product analysis example exactly."
+      },
+      "price": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "£35.00",
+        "expected_value": "£xx.xx (GBP price)",
+        "notes": "Correctly extracted from DOM via pattern matching (£ symbol). JSON-LD offers were empty as expected. Has £ prefix and proper decimal format."
+      },
+      "availability": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "In Stock",
+        "expected_value": "In Stock",
+        "notes": "Correctly detected via DOM text pattern matching. 'Add to Bag' button was present and not disabled."
+      },
+      "original_price": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "£45.00",
+        "expected_value": "£xx.xx (higher than price)",
+        "notes": "Correctly detected strikethrough/compare price (£45.00 > £35.00 sale price). Product was on sale."
+      },
+      "currency": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "GBP",
+        "expected_value": "GBP",
+        "notes": "Correctly set to GBP (not EUR which site_analysis incorrectly stated). Hardcoded based on .co.uk TLD."
+      },
+      "url": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "https://www.calvinklein.co.uk/scoop-neck-ribbed-tank-top-lv047f832gxbs",
+        "expected_value": "https://www.calvinklein.co.uk/scoop-neck-ribbed-tank-top-lv047f832gxbs",
+        "notes": "Full URL with https scheme. Double-slash from input was correctly normalized."
+      },
+      "src_url": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "https://www.calvinklein.co.uk/scoop-neck-ribbed-tank-top-lv047f832gxbs",
+        "expected_value": "same as url (direct input)",
+        "notes": "Equals url since product was provided as direct URL, not discovered from listing."
+      },
+      "location": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "good",
+        "actual_value": "UK",
+        "expected_value": "UK",
+        "notes": "Inferred from .co.uk TLD. Optional field, correctly populated."
+      },
+      "status_code": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "good",
+        "actual_value": 200,
+        "expected_value": 200,
+        "notes": "Hardcoded to 200 for successful page loads. Browser-based scraper cannot get real HTTP status. For blocked pages, correctly uses 403."
+      },
+      "scraped_at": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "2026-06-09T23:12:25.777628+00:00",
+        "expected_value": "Valid ISO-8601 timestamp",
+        "notes": "Valid ISO-8601 with timezone offset. Timestamp is recent and accurate."
+      },
+      "remarks": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "Price extracted from DOM (JSON-LD offers empty)",
+        "expected_value": "Non-empty informative note",
+        "notes": "Correctly notes that price came from DOM fallback rather than JSON-LD. Useful for debugging."
+      },
+      "description": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "Calvin Klein for women. Refined classics for a curated wardrobe. Minimalist essentials in signature silhouettes. Highlights • cotton stretch jersey • fine ribbed texture • scoop neckline • monologo at the centre front Shape & Fit • slim fit • sleeveless Composition & Care 95% cotton 5% elastane machine wash country of origin: Vietnam",
+        "expected_value": "Full product description from JSON-LD",
+        "notes": "Complete description extracted from JSON-LD, HTML properly cleaned."
+      },
+      "sku": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "LV047F832GXBS",
+        "expected_value": "LV047F832GXBS",
+        "notes": "Extracted from JSON-LD Product.sku. Matches product analysis example exactly."
+      },
+      "brand": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "CALVIN KLEIN",
+        "expected_value": "Calvin Klein",
+        "notes": "Extracted from JSON-LD Product.brand.name. Uppercase format as provided by site."
+      },
+      "images": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": ["https://calvinklein-eu.scene7.com/is/image/CalvinKleinEU/LV047F832G_XBS_main?$main$"],
+        "expected_value": "Absolute image URL(s)",
+        "notes": "Absolute URL with https scheme, properly extracted from JSON-LD. Single main image."
+      },
+      "color": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "FRENCH VANILLA STRIPE",
+        "expected_value": "Color name string",
+        "notes": "Extracted from JSON-LD Product.color. Properly reflects the selected variant."
+      },
+      "mpn": {
+        "count": 1,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "actual_value": "LV047F832GXBS",
+        "expected_value": "Manufacturer part number",
+        "notes": "Extracted from JSON-LD Product.mpn. Matches SKU in this case."
+      },
+      "category": {
+        "count": 0,
+        "coverage": "0%",
+        "status": "MISSING",
+        "quality": "poor",
+        "actual_value": null,
+        "expected_value": "Category path from BreadcrumbList",
+        "notes": "Category field not present in output. BreadcrumbList JSON-LD may have been filtered to empty (only 'Home' and 'Calvin Klein' items, which the code excludes). This is a low-severity optional enriched field."
+      }
+    }
+  },
+  "issues": [
+    {
+      "severity": "low",
+      "field": "category",
+      "status": "MISSING",
+      "problem": "Category field not extracted from BreadcrumbList JSON-LD",
+      "details": "The BreadcrumbList extraction filters out 'Home' and 'Calvin Klein' items. If the BreadcrumbList only contains these two items, the category will be empty. The intermediate breadcrumb levels (e.g., Women > Tops > Tank Tops) may be missing or the selector may not capture all items.",
+      "affected_samples": [0],
+      "suggested_fix": "Debug by logging the full BreadcrumbList structure. The itemListElement items may have a different structure (e.g., nested 'item' object vs flat 'name'). Consider also extracting from the page URL path as a fallback (e.g., if the product was discovered from /womens/tops/tank-tops/...)."
+    },
+    {
+      "severity": "info",
+      "field": "code_quality",
+      "status": "INFO",
+      "problem": "Product dataclass is defined but never used",
+      "details": "The Product class with to_dict() method is defined but the scrape_product function returns a plain dict. The standard field ordering from to_dict() is not applied to the output. This is cosmetic only and does not affect data correctness.",
+      "affected_samples": [],
+      "suggested_fix": "Either use the Product dataclass in scrape_product() for consistent field ordering, or remove the unused class to reduce code complexity."
+    },
+    {
+      "severity": "info",
+      "field": "status_code",
+      "status": "INFO",
+      "problem": "status_code is hardcoded, not from actual HTTP response",
+      "details": "Browser-based scraper cannot access HTTP status codes. The value is set to 200 for successful loads and 403 for detected blocks. This is a known limitation noted in the product analysis.",
+      "affected_samples": [],
+      "suggested_fix": "No fix needed — this is a fundamental limitation of browser-based scraping. The current approach (200 for success, 403 for block) is reasonable."
+    }
+  ],
+  "edge_case_results": {
+    "sale_product": "PASS",
+    "out_of_stock": "NOT_TESTED",
+    "variants": "NOT_TESTED"
+  },
+  "script_checks": {
+    "syntax_valid": true,
+    "imports_valid": true,
+    "output_format_valid": true,
+    "logging_works": true,
+    "error_handling_works": true,
+    "notes": "Scraper starts without errors, produces valid JSON output, logging to both file and console works, rate limiting delay is applied."
+  },
+  "overall_assessment": "PASS",
+  "confidence_score": 0.85,
+  "ready_for_execution": true,
+  "feedback_for_writer": {
+    "summary": "Scraper works correctly for the available sample. All core fields extracted accurately. Only minor issue is the missing category field (optional enriched field). The product dataclass is defined but unused — cosmetic code quality note.",
+    "field_fixes": {
+      "category": {
+        "issue": "BreadcrumbList category extraction returns empty, possibly because all items are filtered out",
+        "fix": "Add debug logging for the raw BreadcrumbList structure. Check if itemListElement items have a different JSON structure. Consider relaxing the filter (keep 'Calvin Klein' but not 'Home') or using URL path segments as fallback.",
+        "priority": "low"
+      }
+    },
+    "code_suggestions": [
+      "Consider using the Product dataclass in scrape_product() for consistent output field ordering",
+      "Only 1 sample URL was available in input_urls.json — more URLs would increase confidence in extraction accuracy"
+    ]
+  }
+}

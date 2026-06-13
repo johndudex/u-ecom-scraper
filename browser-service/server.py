@@ -1,0 +1,348 @@
+import asyncio
+import logging
+import os
+import subprocess
+import sys
+import time
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+from .browser_pool import browser_pool
+from .config import get_proxy_config
+from .probe import run_probe
+from .scraper_runner import run_scraper_script
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+PROBE_LOCK = asyncio.Lock()
+AKAMAI_SEMAPHORE = asyncio.Semaphore(2)
+
+
+class ProbeRequest(BaseModel):
+    url: str
+    render_js: bool = True
+    timeout: int = Field(default=120, ge=10, le=300)
+    start_method: Optional[str] = Field(default=None)
+
+
+class AkamaiProbeRequest(BaseModel):
+    url: str
+    proxy_tier: str = Field(default="none")
+    timeout: int = Field(default=120, ge=10, le=300)
+
+
+class ScrapeRequest(BaseModel):
+    scraper_path: str
+    args: Optional[list[str]] = Field(default_factory=list)
+    timeout: int = Field(default=3600, ge=30, le=7200)
+    env_overrides: Optional[dict[str, str]] = Field(default_factory=dict)
+
+
+MCP_CDP_PORT = int(os.environ.get("MCP_CDP_PORT", "9222"))
+SCRAPER_CDP_PORT = int(os.environ.get("SCRAPER_CDP_PORT", "9223"))
+CDP_FORWARD_MCP = int(os.environ.get("CDP_FORWARD_MCP", "9222"))
+CDP_FORWARD_SCRAPER = int(os.environ.get("CDP_FORWARD_SCRAPER", "9223"))
+
+
+async def _tcp_proxy(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    try:
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except Exception:
+        pass
+    finally:
+        writer.close()
+
+
+async def _start_cdp_proxy(public_port: int, internal_port: int, label: str):
+    async def handle_client(client_reader, client_writer):
+        try:
+            upstream_reader, upstream_writer = await asyncio.open_connection("127.0.0.1", internal_port)
+            header_data = await client_reader.read(65536)
+            if header_data:
+                patched = header_data.replace(
+                    b"Host: browser-service:", b"Host: localhost:"
+                ).replace(
+                    b"Host: u-ecom-scraper-browser-service-1:", b"Host: localhost:"
+                )
+                if b"Host:" not in header_data and b"GET " in header_data:
+                    first_line = header_data.split(b"\r\n")[0]
+                    patched = header_data.replace(first_line, first_line, 1)
+                    patched = b"Host: localhost\r\n" + patched
+                upstream_writer.write(patched)
+                await upstream_writer.drain()
+            await asyncio.gather(
+                _tcp_proxy(client_reader, upstream_writer),
+                _tcp_proxy(upstream_reader, client_writer),
+            )
+        except Exception:
+            pass
+        finally:
+            client_writer.close()
+
+    server = await asyncio.start_server(handle_client, "0.0.0.0", public_port)
+    logger.info("CDP proxy: 0.0.0.0:%d -> 127.0.0.1:%d (%s)", public_port, internal_port, label)
+    return server
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting browser-service...")
+    startup_result = browser_pool.startup()
+    if startup_result.get("errors"):
+        logger.warning("Browser pool started with errors: %s", startup_result["errors"])
+    else:
+        logger.info("Browser pool started successfully")
+
+    proxy_servers = []
+    if MCP_CDP_PORT != CDP_FORWARD_MCP:
+        s = await _start_cdp_proxy(CDP_FORWARD_MCP, MCP_CDP_PORT, "MCP")
+        proxy_servers.append(s)
+    if SCRAPER_CDP_PORT != CDP_FORWARD_SCRAPER:
+        s = await _start_cdp_proxy(CDP_FORWARD_SCRAPER, SCRAPER_CDP_PORT, "Scraper")
+        proxy_servers.append(s)
+
+    mcp_process = None
+    try:
+        mcp_internal_port = os.environ.get("MCP_CDP_PORT", "19222")
+        mcp_cmd = [
+            "npx", "@playwright/mcp",
+            "--cdp-endpoint", f"http://127.0.0.1:{mcp_internal_port}",
+            "--port", "8111",
+            "--host", "0.0.0.0",
+            "--allowed-hosts", "*",
+        ]
+        logger.info("Starting Playwright MCP: %s", " ".join(mcp_cmd))
+        mcp_log = open("/tmp/mcp-stdout.log", "w")
+        mcp_process = subprocess.Popen(
+            mcp_cmd,
+            stdout=mcp_log,
+            stderr=mcp_log,
+        )
+        await asyncio.sleep(3)
+        if mcp_process.poll() is not None:
+            mcp_log.close()
+            try:
+                with open("/tmp/mcp-stdout.log") as f:
+                    stderr_output = f.read()
+            except Exception:
+                stderr_output = "(no log)"
+            logger.error("Playwright MCP failed to start (exit %d): %s", mcp_process.returncode, stderr_output[:500])
+            mcp_process = None
+        else:
+            logger.info("Playwright MCP started (PID %d) on 0.0.0.0:8111 -> CDP 127.0.0.1:%s", mcp_process.pid, mcp_internal_port)
+    except Exception as e:
+        logger.error("Failed to start Playwright MCP: %s", e)
+        mcp_process = None
+
+    yield
+
+    if mcp_process and mcp_process.poll() is None:
+        logger.info("Stopping Playwright MCP (PID %d)...", mcp_process.pid)
+        mcp_process.terminate()
+        try:
+            mcp_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            mcp_process.kill()
+    for s in proxy_servers:
+        s.close()
+    logger.info("Shutting down browser-service...")
+    browser_pool.shutdown()
+
+
+app = FastAPI(
+    title="Browser Service",
+    description="Unified browser automation service for ecommerce scraping",
+    version="2.0.0",
+    lifespan=lifespan,
+)
+
+
+@app.get("/health")
+async def health():
+    h = browser_pool.health()
+    config = get_proxy_config()
+    dc_available = bool(config.build_proxy_url("datacenter"))
+    res_available = bool(config.build_proxy_url("residential"))
+    return {
+        "status": "ok" if h["ready"] else "degraded",
+        **h,
+        "proxy_datacenter": "available" if dc_available else "not configured",
+        "proxy_residential": "available" if res_available else "not configured",
+        "uptime_seconds": time.monotonic(),
+    }
+
+
+@app.post("/probe")
+async def probe(request: ProbeRequest):
+    async with PROBE_LOCK:
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: run_probe(
+                    url=request.url,
+                    render_js=request.render_js,
+                    timeout=request.timeout,
+                    start_method=request.start_method,
+                ),
+            )
+            if result and result.get("needs_akamai_bypass"):
+                logger.info("Akamai detected for %s, releasing probe lock and escalating", request.url[:100])
+            return JSONResponse(content=result)
+        except Exception as exc:
+            logger.exception("Probe failed for %s", request.url[:200])
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "error": str(exc)[:500]},
+            )
+
+
+@app.post("/probe-akamai")
+async def probe_akamai(request: AkamaiProbeRequest):
+    from src.akamai_bypass.config import build_akamai_config_from_proxy_tier
+    from src.akamai_bypass.orchestrator import AkamaiOrchestrator
+    from src.page_analysis import extract_jsonld, extract_meta_tags, extract_title, is_blocked
+
+    async with AKAMAI_SEMAPHORE:
+        try:
+            cfg = build_akamai_config_from_proxy_tier(request.proxy_tier)
+            cfg.headless = True
+            orchestrator = AkamaiOrchestrator(cfg)
+
+            result = await asyncio.wait_for(
+                orchestrator.probe(request.url),
+                timeout=request.timeout,
+            )
+
+            if result and result.get("html"):
+                html = result["html"]
+                blocked = is_blocked(html[:5000])
+                jsonld = extract_jsonld(html)
+                meta = extract_meta_tags(html)
+                title = result.get("title", "") or extract_title(html)
+
+                selector_results = "Skipped — Akamai bypass probe"
+                has_content = len(html) > 5000 and not blocked
+
+                if has_content:
+                    try:
+                        import lxml.html
+
+                        tree = lxml.html.fromstring(html)
+                        results = []
+                        from src.page_analysis import COMMON_SELECTORS
+
+                        for name, selector in COMMON_SELECTORS.items():
+                            try:
+                                elements = tree.cssselect(selector)
+                                if not elements:
+                                    results.append(f"  {name} ({selector}): NOT FOUND")
+                                    continue
+                                first_text = ""
+                                for el in elements[:3]:
+                                    text = (el.text_content() or "").strip()[:100]
+                                    if text:
+                                        first_text = text
+                                        break
+                                if first_text:
+                                    results.append(f"  {name} ({selector}): \"{first_text}\" [found: {len(elements)}]")
+                                else:
+                                    results.append(f"  {name} ({selector}): EMPTY [found: {len(elements)}]")
+                            except Exception as exc:
+                                results.append(f"  {name} ({selector}): ERROR - {exc}")
+                        selector_results = "\n".join(results)
+                    except Exception as e:
+                        logger.warning("Selector testing failed for Akamai probe: %s", e)
+                        selector_results = f"Selector test error: {e}"
+
+                return JSONResponse(content={
+                    "success": has_content,
+                    "method": result.get("method", "akamai_bypass"),
+                    "proxy_tier": request.proxy_tier,
+                    "status_code": 200,
+                    "title": title[:200],
+                    "body_length": len(html),
+                    "needs_browser": True,
+                    "blocked": blocked,
+                    "jsonld": jsonld,
+                    "meta": meta,
+                    "selector_results": selector_results,
+                    "error": "" if has_content else "Akamai bypass succeeded but content still blocked or empty",
+                })
+
+            return JSONResponse(content={
+                "success": False,
+                "method": "akamai_bypass",
+                "proxy_tier": request.proxy_tier,
+                "status_code": 0,
+                "title": "",
+                "body_length": 0,
+                "needs_browser": True,
+                "blocked": True,
+                "jsonld": [],
+                "meta": {},
+                "selector_results": {},
+                "error": "All Akamai bypass layers failed",
+            })
+
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                status_code=504,
+                content={"success": False, "error": f"Akamai probe timed out after {request.timeout}s"},
+            )
+        except Exception as exc:
+            logger.exception("Akamai probe failed for %s", request.url[:200])
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "error": str(exc)[:500]},
+            )
+
+
+@app.post("/scrape")
+async def scrape(request: ScrapeRequest):
+    async with PROBE_LOCK:
+        if not os.path.isfile(request.scraper_path):
+            return JSONResponse(
+                status_code=404,
+                content={"returncode": -1, "stderr": f"Scraper not found: {request.scraper_path}",
+                         "stdout": "", "output_file": "", "product_count": 0, "duration": 0},
+            )
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: run_scraper_script(
+                    scraper_path=request.scraper_path,
+                    args=request.args,
+                    timeout=request.timeout,
+                    env_overrides=request.env_overrides,
+                ),
+            )
+            return JSONResponse(content=result)
+        except Exception as exc:
+            logger.exception("Scrape failed for %s", request.scraper_path)
+            return JSONResponse(
+                status_code=500,
+                content={"returncode": -1, "stderr": str(exc), "stdout": "",
+                         "output_file": "", "product_count": 0, "duration": 0},
+            )
+
+
+@app.get("/cdp-endpoint")
+async def cdp_endpoint():
+    return {
+        "mcp": f"http://127.0.0.1:{browser_pool.health().get('mcp_cdp_port', 9222)}",
+        "scraper": f"http://127.0.0.1:{browser_pool.health().get('scraper_cdp_port', 9223)}",
+    }

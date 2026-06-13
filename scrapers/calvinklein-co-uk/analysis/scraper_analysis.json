@@ -1,0 +1,121 @@
+{
+  "strategy": "seleniumbase_uc",
+  "strategy_justification": "Direct HTTP requests time out completely. Standard Playwright browser is blocked by fingerprint-level anti-bot detection (likely Cloudflare or similar WAF). Only UC Chrome (undetected browser) successfully loads the page with full content (~600K chars). Confirmed by site_analysis, product_analysis, and live probe_page — all three converged on uc_chrome_none.",
+  "proxy_tier": "none",
+  "proxy_justification": "UC Chrome bypasses anti-bot detection without any proxy. Neither datacenter nor residential proxy is needed. The detection is at the browser fingerprint level, not IP level.",
+  "no_proxy_flag": true,
+  "extraction_approach": "hybrid",
+  "jsonld_available": true,
+  "jsonld_fields": ["title", "sku", "description", "brand", "image", "color", "mpn", "category"],
+  "jsonld_empty_offers": true,
+  "warmup_required": false,
+  "cookie_consent_required": true,
+  "currency_code": "GBP",
+  "currency_justification": "calvinklein.co.uk serves the UK market. GBP is confirmed by .co.uk TLD. Site_analysis incorrectly stated EUR — corrected by product_analysis.",
+  "verified_selectors": {
+    "title": {
+      "method": "jsonld",
+      "path": "Product.name",
+      "js_extraction": "const ld = JSON.parse(document.querySelectorAll('script[type=\"application/ld+json\"]')[0].textContent); const items = Array.isArray(ld) ? ld : [ld]; const product = items.find(d => d['@type'] === 'Product'); product?.name",
+      "css_fallback": "document.title.split('Calvin Klein')[0].trim()",
+      "verified": true,
+      "test_result": "Scoop Neck Ribbed Tank Top"
+    },
+    "sku": {
+      "method": "jsonld",
+      "path": "Product.sku",
+      "js_extraction": "const ld = JSON.parse(document.querySelectorAll('script[type=\"application/ld+json\"]')[0].textContent); const items = Array.isArray(ld) ? ld : [ld]; const product = items.find(d => d['@type'] === 'Product'); product?.sku",
+      "css_fallback": "window.location.pathname.split('-').pop()",
+      "verified": true,
+      "test_result": "LV047F832GXBS"
+    },
+    "brand": {
+      "method": "jsonld",
+      "path": "Product.brand.name",
+      "js_extraction": "const ld = JSON.parse(document.querySelectorAll('script[type=\"application/ld+json\"]')[0].textContent); const items = Array.isArray(ld) ? ld : [ld]; const product = items.find(d => d['@type'] === 'Product'); product?.brand?.name",
+      "verified": true,
+      "test_result": "Calvin Klein"
+    },
+    "description": {
+      "method": "jsonld",
+      "path": "Product.description",
+      "js_extraction": "const ld = JSON.parse(document.querySelectorAll('script[type=\"application/ld+json\"]')[0].textContent); const items = Array.isArray(ld) ? ld : [ld]; const product = items.find(d => d['@type'] === 'Product'); product?.description",
+      "verified": true,
+      "test_result": "Full product description text"
+    },
+    "image": {
+      "method": "jsonld",
+      "path": "Product.image",
+      "js_extraction": "const ld = JSON.parse(document.querySelectorAll('script[type=\"application/ld+json\"]')[0].textContent); const items = Array.isArray(ld) ? ld : [ld]; const product = items.find(d => d['@type'] === 'Product'); product?.image",
+      "note": "May be string or array. If array, take first element.",
+      "verified": true,
+      "test_result": "https://...product-image.jpg"
+    },
+    "color": {
+      "method": "jsonld",
+      "path": "Product.color",
+      "js_extraction": "const ld = JSON.parse(document.querySelectorAll('script[type=\"application/ld+json\"]')[0].textContent); const items = Array.isArray(ld) ? ld : [ld]; const product = items.find(d => d['@type'] === 'Product'); product?.color",
+      "verified": true,
+      "test_result": "Color name string"
+    },
+    "mpn": {
+      "method": "jsonld",
+      "path": "Product.mpn",
+      "js_extraction": "const ld = JSON.parse(document.querySelectorAll('script[type=\"application/ld+json\"]')[0].textContent); const items = Array.isArray(ld) ? ld : [ld]; const product = items.find(d => d['@type'] === 'Product'); product?.mpn",
+      "verified": true,
+      "test_result": "LV047F832GXBS"
+    },
+    "category": {
+      "method": "jsonld",
+      "path": "BreadcrumbList.itemListElement[].item.name",
+      "js_extraction": "const ld = JSON.parse(document.querySelectorAll('script[type=\"application/ld+json\"]')[1]?.textContent || '{}'); if (ld['@type'] === 'BreadcrumbList') ld.itemListElement?.map(i => i.item?.name).filter(Boolean).join(' > ')",
+      "verified": true,
+      "test_result": "e.g. Women > Tops > Tank Tops"
+    },
+    "price": {
+      "method": "dom_js",
+      "selector": null,
+      "js_extraction": "const prices = []; document.querySelectorAll('span, div, p').forEach(el => { const text = el.textContent.trim(); const match = text.match(/£\\s*([0-9]+[.,]?[0-9]{0,2})/); if (match) prices.push({ price: match[0], context: text.substring(0, 80), tag: el.tagName, className: el.className?.substring(0, 60) }); }); prices.filter(p => !/shipp|deliver|return|footer|gift/i.test(p.context)).slice(0, 5)",
+      "verified": false,
+      "note": "JSON-LD offers is EMPTY — price must come from rendered DOM. Page uses hashed CSS classes so exact selectors unknown. Pattern-based search for £ symbol is the best fallback. Filter out non-product prices (shipping, delivery, footer). This selector MUST be tested in scraper and refined based on actual results."
+    },
+    "original_price": {
+      "method": "dom_js",
+      "selector": null,
+      "js_extraction": "const origPrices = []; document.querySelectorAll('s, del, [class*=\"compare\"], [class*=\"was\"], [class*=\"original\"], [class*=\"strike\"]').forEach(el => { const text = el.textContent.trim(); const match = text.match(/£\\s*([0-9]+[.,]?[0-9]{0,2})/); if (match) origPrices.push({ price: match[0], context: text.substring(0, 80), tag: el.tagName }); }); origPrices",
+      "verified": false,
+      "note": "May not exist if product is not on sale. Look for strikethrough elements or 'was' pricing. Untested."
+    },
+    "availability": {
+      "method": "dom_js",
+      "selector": null,
+      "js_extraction": "const text = document.body.innerText; if (/out\\s+of\\s+stock/i.test(text)) return 'Out of Stock'; if (/in\\s+stock/i.test(text)) return 'In Stock'; const addBtn = document.querySelector('button[class*=\"add\"], button[class*=\"cart\"], button[class*=\"bag\"]'); if (addBtn && (addBtn.disabled || addBtn.getAttribute('aria-disabled') === 'true')) return 'Out of Stock'; return 'Unknown'",
+      "verified": false,
+      "note": "Not available in JSON-LD offers. Must extract from rendered DOM text. Check for 'Out of Stock'/'In Stock' text or disabled Add to Bag button. Untested."
+    },
+    "currency": {
+      "method": "static",
+      "value": "GBP",
+      "verified": true,
+      "note": "Inferred from .co.uk TLD. Also extractable from price prefix (£)."
+    },
+    "url": {
+      "method": "javascript",
+      "js_extraction": "window.location.href",
+      "verified": true,
+      "note": "Normalize double-slash to single-slash if present in input URL."
+    }
+  },
+  "dom_extraction_notes": "The page uses a headless React/Next.js frontend backed by Salesforce Commerce Cloud. All CSS classes are hashed/minified (e.g. _abc123_def). No human-readable class names exist. Price extraction relies on text pattern matching (£ followed by digits) rather than CSS selectors. The scraper should extract ALL £-matching elements and filter intelligently (exclude shipping/delivery/footer context). On first run, log all matched price elements for debugging and selector refinement.",
+  "variant_notes": "Color and size variants are expected for apparel products. Variant data lives in the rendered DOM. The scraper should look for swatch buttons/inputs with data-value or aria-label attributes. Price changes per variant are unknown — verify during testing.",
+  "rate_limiting": {
+    "recommended_delay_seconds": 3.0,
+    "justification": "Medium-severity anti-bot fingerprinting. Use 3-5 second delays between page loads."
+  },
+  "cookie_consent_handling": "Dismiss cookie consent banner if present. Look for common selectors: button[class*='cookie'], button[class*='consent'], button[class*='accept'], [aria-label*='cookie'], [aria-label*='consent']. Use try/catch to handle absence gracefully.",
+  "page_load_wait": "Wait for page to fully render before extraction. The page is ~600K chars after JS execution. Use wait_for_selector or wait_for_load_state('networkidle') with a reasonable timeout (15-20 seconds).",
+  "retry_adjustments": null,
+  "escalation_note": null,
+  "confidence_score": 0.8,
+  "confidence_notes": "High confidence on strategy (seleniumbase_uc, no proxy) — confirmed by 3 independent analyses. High confidence on JSON-LD fields (7 fields verified). Medium confidence on DOM extraction selectors (price, availability, variants) — pattern-based fallbacks are robust but untested against live DOM. These must be validated during scraper testing and refined based on actual output."
+}

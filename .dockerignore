@@ -1,0 +1,17 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+node_modules
+.venv
+/tmp
+venv
+*.egg-info
+.env
+.webapp
+logs/
+scrapers/*/output_*.json
+workspace/
+.pytest_cache
+.ruff_cache
+.mypy_cache

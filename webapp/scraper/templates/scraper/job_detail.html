@@ -1,0 +1,433 @@
+{% extends "scraper/base.html" %}
+
+{% block page_title %}Job #{{ job.id }} — Ecommerce Scraper{% endblock %}
+
+{% block content %}
+
+<nav class="mb-5" aria-label="breadcrumb">
+    <ol class="flex items-center gap-1.5 text-xs">
+        <li><a href="{% url 'job_list' %}" class="text-brand-500 hover:text-brand-300 transition-colors">Jobs</a></li>
+        <li class="text-brand-700">/</li>
+        <li class="text-brand-300 font-medium">Job #{{ job.id }}</li>
+    </ol>
+</nav>
+
+<div class="rounded-2xl bg-gradient-to-br from-brand-800 via-brand-700 to-brand-600 p-5 mb-5">
+    <div class="flex items-start justify-between gap-4 flex-wrap">
+        <div>
+            <div class="flex items-center gap-2.5">
+                <h2 class="text-lg font-bold text-brand-50">Job #{{ job.id }}</h2>
+                <span class="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider bg-brand-600/50 text-brand-300 rounded-md">{% if job.full_extraction %}FULL{% else %}SAMPLE{% endif %}</span>
+            </div>
+            <p class="text-brand-400 text-sm mt-1">{{ job.url }}</p>
+            {% if job.product_url %}
+            <p class="text-brand-500 text-xs mt-0.5">Listing: {{ job.product_url|truncatechars:60 }}</p>
+            {% endif %}
+        </div>
+        <div class="flex items-center gap-2.5 flex-wrap">
+            <span class="inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-semibold uppercase tracking-wider status-{{ job.status }}" id="hero-status">{{ job.get_status_display }}</span>
+            {% if job.duration_seconds %}
+            <span class="px-2.5 py-1 rounded-lg text-xs font-medium bg-brand-600/40 text-brand-400">{{ job.duration_seconds }}s</span>
+            {% endif %}
+            <span id="live-indicator" class="hidden px-2.5 py-1 rounded-lg text-[10px] font-bold uppercase tracking-wider bg-cta text-white animate-pulse-dot">Live</span>
+            {% if is_active %}
+            <a href="{% url 'job_cancel' job_id=job.id %}" class="px-3 py-1.5 text-xs font-medium text-brand-300 border border-brand-500/30 rounded-lg hover:bg-brand-600/30 transition-colors cursor-pointer">Cancel</a>
+            {% elif is_terminal %}
+            <a href="{% url 'job_restart' job_id=job.id %}" class="px-3 py-1.5 text-xs font-medium text-brand-300 border border-brand-500/30 rounded-lg hover:bg-brand-600/30 transition-colors cursor-pointer">Re-run</a>
+            {% endif %}
+        </div>
+    </div>
+</div>
+
+{% if job.error_message %}
+<div class="mb-5 rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3">
+    <p class="text-red-300 text-sm mb-0"><span class="font-semibold text-red-200">Error:</span></p>
+    <pre class="mt-2 text-red-400 text-xs leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto scrollbar-thin font-mono">{{ job.error_message }}</pre>
+</div>
+{% endif %}
+
+{% if pending_approvals %}
+<div class="mb-5 rounded-xl bg-amber-500/10 border border-amber-500/20 p-4" id="approval-container">
+    <div class="flex items-center gap-2 mb-3">
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#D97706"><path stroke-linecap="round" stroke-linejoin="round" d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0"/></svg>
+        <span class="text-sm font-semibold text-amber-200">Pending Approval Required</span>
+    </div>
+    {% include "scraper/_approval_cards.html" with job_id=job.id %}
+</div>
+{% else %}
+<div class="mb-5 rounded-xl bg-amber-500/10 border border-amber-500/20 p-4 hidden" id="approval-container">
+    <div class="flex items-center gap-2 mb-3">
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#D97706"><path stroke-linecap="round" stroke-linejoin="round" d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0"/></svg>
+        <span class="text-sm font-semibold text-amber-200">Pending Approval Required</span>
+    </div>
+</div>
+{% endif %}
+
+<div class="grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-4">
+
+    <div class="space-y-4">
+
+        <!-- Pipeline Progress -->
+        <div class="rounded-xl bg-surface border border-brand-700/30 overflow-hidden" id="pipeline-panel">
+            <div class="px-4 py-3 border-b border-brand-700/30">
+                <h3 class="text-sm font-semibold text-brand-200">Pipeline</h3>
+            </div>
+            <div id="steps-container">
+                {% for step in steps %}
+                <div class="step-row flex items-center gap-3 px-4 py-2.5 border-b border-brand-700/15 hover:bg-brand-700/10 transition-colors cursor-pointer" data-phase="{{ step.phase }}">
+                    <div class="step-indicator w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 {% if step.status == 'done' %}bg-green-500{% elif step.status == 'running' %}bg-blue-500 animate-pulse-dot{% elif step.status == 'failed' %}bg-red-500{% else %}bg-brand-600 text-brand-500{% endif %}">
+                        {% if step.status == 'done' %}
+                            <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" fill="white" viewBox="0 0 16 16"><path d="M13.854 3.646a.5.5 0 0 1 0 .708l-7 7a.5.5 0 0 1-.708 0l-3.5-3.5a.5.5 0 1 1 .708-.708L6.5 10.293l6.646-6.647a.5.5 0 0 1 .708 0z"/></svg>
+                        {% elif step.status == 'running' %}
+                            <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" fill="white" viewBox="0 0 16 16"><path d="M8 4a.5.5 0 0 1 .5.5v3h3a.5.5 0 0 1 0 1h-3v3a.5.5 0 0 1-1 0v-3h-3a.5.5 0 0 1 0-1h3v-3A.5.5 0 0 1 8 4z"/></svg>
+                        {% elif step.status == 'failed' %}
+                            <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" fill="white" viewBox="0 0 16 16"><path d="M4.646 4.646a.5.5 0 0 1 .708 0L8 7.293l2.646-2.647a.5.5 0 0 1 .708.708L8.707 8l2.647 2.646a.5.5 0 0 1-.708.708L8 8.707l-2.646 2.647a.5.5 0 0 1-.708-.708L7.293 8 4.646 5.354a.5.5 0 0 1 0-.708z"/></svg>
+                        {% else %}
+                            &nbsp;
+                        {% endif %}
+                    </div>
+                    <span class="text-sm font-medium {% if step.status == 'pending' %}text-brand-500{% else %}text-brand-200{% endif %}">{{ step.get_phase_display }}</span>
+                    <span class="ml-auto text-[11px] font-semibold uppercase tracking-wider {% if step.status == 'done' %}text-green-400{% elif step.status == 'running' %}text-blue-400{% elif step.status == 'failed' %}text-red-400{% else %}text-brand-600{% endif %}">
+                        {% if step.status == 'done' %}Done{% elif step.status == 'running' %}Running{% elif step.status == 'failed' %}Failed{% else %}Pending{% endif %}
+                    </span>
+                    <span class="text-[11px] text-brand-600 whitespace-nowrap">
+                        {% if step.started_at %}{{ step.started_at|date:"H:i:s" }}{% endif %}
+                        {% if step.completed_at %} - {{ step.completed_at|date:"H:i:s" }}{% endif %}
+                    </span>
+                </div>
+                {% empty %}
+                <div class="px-4 py-6 text-brand-600 text-sm text-center">No steps recorded yet.</div>
+                {% endfor %}
+            </div>
+        </div>
+
+        <!-- Tool Calls -->
+        <div class="rounded-xl bg-surface border border-brand-700/30 overflow-hidden" id="tool-calls-card">
+            <div class="px-4 py-3 border-b border-brand-700/30 flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                    <h3 class="text-sm font-semibold text-brand-200">Tool Calls</h3>
+                    <span class="text-xs text-brand-500" id="tool-call-count">({{ tool_calls|length }} calls)</span>
+                </div>
+                <button class="text-[11px] text-brand-400 hover:text-brand-200 border border-brand-600/50 px-2 py-1 rounded-md hover:border-brand-500 transition-colors cursor-pointer" onclick="document.querySelectorAll('.tc-agent-body.collapsed').forEach(function(b){b.style.display='';b.classList.remove('collapsed');b.classList.add('open');b.previousElementSibling.classList.remove('collapsed');});">Expand All</button>
+            </div>
+            <div>
+                {% if tool_calls %}
+                <div id="tool-calls-container">
+                    {% regroup tool_calls by agent as agent_groups %}
+                    {% for group in agent_groups %}
+                    <div class="tc-agent-section border-b border-brand-700/20">
+                        <div class="tc-agent-header collapsed flex items-center gap-2 px-4 py-2.5 bg-brand-800/40 cursor-pointer text-xs font-semibold text-brand-300 hover:bg-brand-700/40 transition-colors select-none" onclick="var body=this.nextElementSibling;var isOpen=body.classList.contains('open');body.style.display=isOpen?'none':'';body.classList.toggle('open');body.classList.toggle('collapsed');this.classList.toggle('open');this.classList.toggle('collapsed');">
+                            <svg class="arrow collapsed w-3 h-3 text-brand-600 transition-transform" viewBox="0 0 24 24" fill="currentColor"><path d="M8.47 4.22a.75.75 0 011.06 0l8.25 8.25a.75.75 0 010 1.06l-8.25 8.25a.75.75 0 01-1.06-1.06L15.94 12 8.47 4.53a.75.75 0 010-1.06z"/></svg>
+                            <span class="capitalize">{{ group.grouper }}</span>
+                            <span class="ml-auto font-normal text-brand-500">{{ group.list|length }} calls</span>
+                        </div>
+                        <div class="tc-agent-body collapsed" style="display:none">
+                            <table class="w-full text-xs">
+                                <thead><tr class="bg-brand-800/30 text-brand-500 text-[10px] uppercase tracking-wider"><th class="px-3 py-2 text-left w-8">#</th><th class="px-3 py-2 text-left w-28">Tool</th><th class="px-3 py-2 text-left">Description</th><th class="px-3 py-2 text-left">Result</th></tr></thead>
+                                <tbody>
+                                {% for tc in group.list %}
+                                <tr class="tc-row border-t border-brand-700/10 hover:bg-brand-700/15 transition-colors" data-tc-id="{{ tc.id }}">
+                                    <td class="px-3 py-2 text-brand-500">{{ forloop.counter }}</td>
+                                    <td class="px-3 py-2"><code class="text-blue-400 bg-blue-500/10 px-1.5 py-0.5 rounded text-[11px]">{{ tc.tool_name }}</code></td>
+                                    <td class="px-3 py-2 text-brand-300 max-w-xs break-words">{{ tc.args_summary }}</td>
+                                    <td class="px-3 py-2 text-brand-500 max-w-xs break-words">
+                                        <span class="tc-result-preview">{{ tc.result_summary|truncatechars:120 }}</span>
+                                        {% if tc.result_summary|length > 120 %}
+                                        <span class="tc-result-full hidden">{{ tc.result_summary }}</span>
+                                        <a href="#" class="tc-expand-link text-blue-400 hover:text-blue-300" onclick="var row=this.closest('.tc-row');var full=row.querySelector('.tc-result-full');var preview=row.querySelector('.tc-result-preview');if(full.classList.contains('hidden')){full.classList.remove('hidden');preview.classList.add('hidden');this.textContent='less';}else{full.classList.add('hidden');preview.classList.remove('hidden');this.textContent='more';}return false;">more</a>
+                                        {% endif %}
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    {% endfor %}
+                </div>
+                {% else %}
+                <div class="px-4 py-6 text-brand-600 text-sm text-center">No tool calls recorded yet.</div>
+                {% endif %}
+            </div>
+        </div>
+
+        <!-- Agent Log -->
+        <div class="rounded-xl bg-surface border border-brand-700/30 overflow-hidden" id="log-card">
+            <div class="px-4 py-3 border-b border-brand-700/30 flex items-center justify-between">
+                <div class="flex items-center gap-2">
+                    <h3 class="text-sm font-semibold text-brand-200">Agent Log</h3>
+                    <span class="text-xs text-brand-500" id="log-count">({{ recent_logs|length }} entries)</span>
+                    <span id="live-indicator2" class="hidden px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-cta text-white animate-pulse-dot">Live</span>
+                </div>
+                <div class="flex items-center gap-1.5">
+                    <button id="refresh-logs-btn" class="text-[11px] text-brand-400 hover:text-brand-200 border border-brand-600/50 px-2 py-1 rounded-md hover:border-brand-500 transition-colors cursor-pointer">Refresh</button>
+                    <button class="text-[11px] text-brand-400 hover:text-brand-200 border border-brand-600/50 px-2 py-1 rounded-md hover:border-brand-500 transition-colors cursor-pointer" onclick="document.getElementById('log-container').scrollTo({top:document.getElementById('log-container').scrollHeight,behavior:'smooth'})">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M19.347 14.07a.75.75 0 01.093 1.056l-4.25 5a.75.75 0 11-1.149-.972l3.75-4.406-3.75-4.406a.75.75 0 01.976-1.133l4.25 5a.75.75 0 01.05.912zM4.75 14.07a.75.75 0 01.05.912l-4.25 5a.75.75 0 01-1.149-.972L3.15 14.6.4 10.195a.75.75 0 01.976-1.133l4.25 5a.75.75 0 01-.05.912z" clip-rule="evenodd"/></svg>
+                    </button>
+                </div>
+            </div>
+            <div id="log-container" class="log-stream bg-brand-900 max-h-[60vh] min-h-[200px] overflow-y-auto scrollbar-thin font-mono text-xs leading-relaxed">
+                {% for log in recent_logs %}
+                <div class="log-entry log-{{ log.role }} px-3.5 py-1.5 border-b border-brand-800/50 hover:bg-brand-800/40 transition-colors" data-seq="{{ log.seq }}" data-agent="{{ log.agent }}">
+                    <div class="log-body whitespace-pre-wrap break-words">{{ log.content }}</div>
+                </div>
+                {% empty %}
+                <div class="log-entry log-system px-6 py-8">
+                    <span style="color:#22C55E;">Waiting for agent activity...</span>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+    </div>
+
+    <!-- Sidebar -->
+    <div class="space-y-4">
+
+        <!-- Details -->
+        <div class="rounded-xl bg-surface border border-brand-700/30 overflow-hidden">
+            <div class="px-4 py-3 border-b border-brand-700/30">
+                <h3 class="text-sm font-semibold text-brand-200">Details</h3>
+            </div>
+            <div>
+                <table class="w-full text-sm">
+                    <tr class="border-b border-brand-700/15"><td class="px-4 py-2.5 text-brand-500 text-xs font-medium w-2/5">Platform</td><td class="px-4 py-2.5 text-brand-200 font-semibold text-xs">{{ job.platform|default:"-" }}</td></tr>
+                    <tr class="border-b border-brand-700/15"><td class="px-4 py-2.5 text-brand-500 text-xs font-medium">Method</td><td class="px-4 py-2.5 text-brand-200 font-semibold text-xs">{{ job.scraping_method|default:"-" }}</td></tr>
+                    <tr class="border-b border-brand-700/15"><td class="px-4 py-2.5 text-brand-500 text-xs font-medium">Currency</td><td class="px-4 py-2.5 text-brand-200 font-semibold text-xs">{{ job.currency|default:"-" }}</td></tr>
+                    <tr class="border-b border-brand-700/15"><td class="px-4 py-2.5 text-brand-500 text-xs font-medium">Products</td><td class="px-4 py-2.5 text-brand-200 font-semibold text-xs">{{ job.product_count|default:"-" }}</td></tr>
+                    <tr class="border-b border-brand-700/15"><td class="px-4 py-2.5 text-brand-500 text-xs font-medium">Mode</td><td class="px-4 py-2.5 text-brand-200 font-semibold text-xs">{% if job.full_extraction %}Full{% else %}Sample{% endif %}</td></tr>
+                    <tr class="border-b border-brand-700/15"><td class="px-4 py-2.5 text-brand-500 text-xs font-medium">Thread</td><td class="px-4 py-2.5"><code class="text-blue-400 bg-blue-500/10 px-1.5 py-0.5 rounded text-[10px]">{{ job.graph_thread_id|default:"-" }}</code></td></tr>
+                    <tr><td class="px-4 py-2.5 text-brand-500 text-xs font-medium">Started</td><td class="px-4 py-2.5 text-brand-200 font-semibold text-xs">{{ job.started_at|date:"M d, H:i" }}</td></tr>
+                    {% if job.completed_at %}
+                    <tr class="border-t border-brand-700/15"><td class="px-4 py-2.5 text-brand-500 text-xs font-medium">Completed</td><td class="px-4 py-2.5 text-brand-200 font-semibold text-xs">{{ job.completed_at|date:"M d, H:i" }}</td></tr>
+                    {% endif %}
+                </table>
+            </div>
+        </div>
+
+        {% if has_scraper_code %}
+        <div class="rounded-xl bg-surface border border-brand-700/30 overflow-hidden">
+            <div class="px-4 py-3 border-b border-brand-700/30 flex items-center justify-between">
+                <h3 class="text-sm font-semibold text-brand-200">Scraper Code</h3>
+                <a href="{% url 'scraper_code' job_id=job.id %}" class="text-[11px] text-blue-400 hover:text-blue-300 border border-blue-500/30 px-2 py-1 rounded-md hover:border-blue-500/50 transition-colors cursor-pointer">Download</a>
+            </div>
+            <pre class="bg-brand-900 text-brand-300 p-4 text-[11px] leading-relaxed whitespace-pre-wrap break-words max-h-96 overflow-y-auto scrollbar-thin font-mono"><code>{{ scraper_code_display }}</code></pre>
+        </div>
+        {% endif %}
+
+        {% if sample_output %}
+        <div class="rounded-xl bg-surface border border-brand-700/30 overflow-hidden">
+            <div class="px-4 py-3 border-b border-brand-700/30">
+                <h3 class="text-sm font-semibold text-brand-200">Sample Output</h3>
+            </div>
+            <pre class="bg-brand-900 text-brand-300 p-4 text-[11px] leading-relaxed whitespace-pre-wrap break-words max-h-80 overflow-y-auto scrollbar-thin font-mono"><code>{{ sample_output }}</code></pre>
+        </div>
+        {% endif %}
+
+        {% if all_approvals %}
+        <div class="rounded-xl bg-surface border border-brand-700/30 overflow-hidden">
+            <div class="px-4 py-3 border-b border-brand-700/30">
+                <h3 class="text-sm font-semibold text-brand-200">Approvals</h3>
+            </div>
+            <div class="divide-y divide-brand-700/15">
+                {% for approval in all_approvals %}
+                <div class="px-4 py-2.5">
+                    <div class="flex items-center justify-between mb-1">
+                        <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider status-{{ approval.status }}">{{ approval.get_status_display }}</span>
+                        {% if approval.resolved_at %}
+                        <span class="text-[10px] text-brand-600">{{ approval.resolved_at|date:"H:i:s" }}</span>
+                        {% endif %}
+                    </div>
+                    <p class="text-xs text-brand-500">{{ approval.question|truncatechars:80 }}</p>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<style>
+    .log-body { color: #CBD5E1; }
+    .log-user .log-body { color: #93C5FD; }
+    .log-tool .log-body { color: #FB923C; }
+    .log-system .log-body { color: #22C55E; font-style: italic; }
+    .log-assistant .log-body { color: #CBD5E1; }
+    .log-agent-header { display:flex;align-items:center;gap:0.5rem;padding:0.4rem 0.85rem;cursor:pointer;background:#1E293B;border-bottom:1px solid #334155;user-select:none;font-size:0.72rem;position:sticky;top:0;z-index:1; }
+    .log-agent-header:hover { background:#273548; }
+    .log-agent-header.open { background:#0d2240; border-bottom-color:#1f6feb; }
+    .log-agent-body { display:none; }
+    .log-agent-body.open { display:block; }
+    .log-badge { font-size:0.58rem;font-weight:700;padding:0.1rem 0.4rem;border-radius:3px;text-transform:uppercase;letter-spacing:0.04em; }
+</style>
+<script>
+(function() {
+    var jobId = {{ job.id }};
+    var statusEl = document.getElementById('hero-status');
+    var liveEl = document.getElementById('live-indicator');
+    var liveEl2 = document.getElementById('live-indicator2');
+    var stepsContainer = document.getElementById('steps-container');
+    var logContainer = document.getElementById('log-container');
+    var logCountEl = document.getElementById('log-count');
+    var isTerminal = {{ is_terminal|lower }};
+
+    var phaseLabels = {
+        'site_analysis': 'Site Analysis', 'product_analysis': 'Product Analysis',
+        'code_generation': 'Code Gen', 'testing': 'Testing',
+        'field_confirmation': 'Confirm', 'execution': 'Execution',
+        'cleanup': 'Cleanup', 'skill_learning': 'Learning'
+    };
+    var phaseToAgent = {
+        'site_analysis': 'site-analyzer', 'product_analysis': 'product-analyzer',
+        'code_generation': 'code-writer', 'testing': 'code-tester',
+        'field_confirmation': '', 'execution': '', 'cleanup': 'cleanup',
+        'skill_learning': 'skill-learner'
+    };
+    var totalLogs = 0;
+
+    function updateStatus(status) {
+        var labels = {'pending':'Pending','running':'Running','waiting_approval':'Waiting','completed':'Completed','failed':'Failed','cancelled':'Cancelled'};
+        if (statusEl) { statusEl.textContent = labels[status]||status; statusEl.className = 'inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-semibold uppercase tracking-wider status-'+status; }
+    }
+
+    function addStep(phase, status) {
+        var existing = stepsContainer.querySelector('[data-phase="'+phase+'"]');
+        if (existing) { var ind=existing.querySelector('.step-indicator'); if(ind){ind.className='step-indicator w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 '+(status==='done'?'bg-green-500':status==='running'?'bg-blue-500 animate-pulse-dot':status==='failed'?'bg-red-500':'bg-brand-600 text-brand-500');} return; }
+        var noSteps = stepsContainer.querySelector('[class*="text-center"]');
+        if (noSteps) noSteps.remove();
+        var div = document.createElement('div');
+        div.className = 'step-row flex items-center gap-3 px-4 py-2.5 border-b border-brand-700/15 hover:bg-brand-700/10 transition-colors cursor-pointer';
+        div.setAttribute('data-phase', phase);
+        var sl = status==='done'?'Done':status==='running'?'Running':status==='failed'?'Failed':'Pending';
+        var ic = status==='done'?'bg-green-500':status==='running'?'bg-blue-500 animate-pulse-dot':status==='failed'?'bg-red-500':'bg-brand-600 text-brand-500';
+        div.innerHTML = '<div class="step-indicator w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 '+ic+'">&nbsp;</div><span class="text-sm font-medium '+(status==='pending'?'text-brand-500':'text-brand-200')+'">'+(phaseLabels[phase]||phase)+'</span><span class="ml-auto text-[11px] font-semibold uppercase tracking-wider '+(status==='done'?'text-green-400':status==='running'?'text-blue-400':status==='failed'?'text-red-400':'text-brand-600')+'">'+sl+'</span><span class="text-[11px] text-brand-600 whitespace-nowrap">'+new Date().toLocaleTimeString()+'</span>';
+        stepsContainer.appendChild(div);
+    }
+
+    function scrollToAgent(agent) {
+        var header = logContainer.querySelector('.log-agent-header[data-agent="'+agent+'"]');
+        if (!header) return;
+        var body = header.nextElementSibling;
+        if (body && !body.classList.contains('open')) { header.classList.add('open'); body.classList.add('open'); header.classList.add('active'); }
+        header.scrollIntoView({behavior:'smooth',block:'start'});
+    }
+
+    function addLogs(logs) {
+        var waiting = logContainer.querySelector('[style*="22C55E"]');
+        if (waiting && waiting.parentElement) waiting.parentElement.remove();
+        var grouped = {};
+        logs.forEach(function(log) { var a=log.agent||'system'; if(!grouped[a])grouped[a]=[]; grouped[a].push(log); });
+        Object.keys(grouped).forEach(function(agent) {
+            grouped[agent].forEach(function(log) {
+                if (logContainer.querySelector('[data-seq="'+log.seq+'"]')) return;
+                var header = logContainer.querySelector('.log-agent-header[data-agent="'+agent+'"]');
+                if (!header) {
+                    var hd = document.createElement('div');
+                    hd.className = 'log-agent-header collapsed';
+                    hd.setAttribute('data-agent', agent);
+                    hd.innerHTML = '<svg class="arrow w-3 h-3 text-brand-600" viewBox="0 0 24 24" fill="currentColor"><path d="M8.47 4.22a.75.75 0 011.06 0l8.25 8.25a.75.75 0 010 1.06l-8.25 8.25a.75.75 0 01-1.06-1.06L15.94 12 8.47 4.53a.75.75 0 010-1.06z"/></svg><span class="log-badge bg-brand-700 text-brand-300">'+agent+'</span><span class="ml-auto text-brand-600 text-[10px]">'+grouped[agent].length+'</span>';
+                    var body = document.createElement('div');
+                    body.className = 'log-agent-body';
+                    hd.addEventListener('click', function() { body.classList.toggle('open'); hd.classList.toggle('open'); hd.classList.toggle('collapsed'); hd.classList.toggle('active'); });
+                    logContainer.appendChild(hd);
+                    logContainer.appendChild(body);
+                }
+                var agentBody = logContainer.querySelector('[data-agent="'+agent+'"] ~ .log-agent-body');
+                var div = document.createElement('div');
+                div.className = 'log-entry log-' + log.role;
+                div.setAttribute('data-seq', log.seq);
+                var content = log.content || '';
+                if (content.length > 3000) content = content.substring(0, 3000) + '\n... (truncated)';
+                div.innerHTML = '<div class="log-body">' + content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + '</div>';
+                agentBody.appendChild(div);
+                totalLogs++;
+            });
+        });
+        if (logCountEl) logCountEl.textContent = '(' + totalLogs + ' entries)';
+        logContainer.scrollTop = logContainer.scrollHeight;
+    }
+
+    function fetchToolCalls() {
+        fetch('/jobs/' + jobId + '/tool-calls/').then(function(r){return r.json();}).then(function(data) {
+            var calls=data.tool_calls||[]; if(!calls.length) return;
+            var container=document.getElementById('tool-calls-container');
+            var noData=container?container.querySelector('[class*="text-center"]'):null;
+            if(noData)noData.remove();
+            var tcCountEl=document.getElementById('tool-call-count');
+            if(tcCountEl)tcCountEl.textContent='('+calls.length+' calls)';
+            var grouped={};
+            calls.forEach(function(tc){if(!grouped[tc.agent])grouped[tc.agent]=[];grouped[tc.agent].push(tc);});
+            if(!container){container=document.createElement('div');container.id='tool-calls-container';var card=document.getElementById('tool-calls-card');var body=card.querySelector('[id^="tool-calls-container"]');if(body)body.parentElement.querySelector('.border-b+div')||card.insertAdjacentElement('beforeend',container);}
+            Object.keys(grouped).forEach(function(agent) {
+                var existing=container.querySelector('.tc-agent-section[data-tc-agent="'+agent+'"]');
+                var tbody;
+                if(!existing){
+                    var section=document.createElement('div');section.className='tc-agent-section border-b border-brand-700/20';section.setAttribute('data-tc-agent',agent);
+                    section.innerHTML='<div class="tc-agent-header collapsed flex items-center gap-2 px-4 py-2.5 bg-brand-800/40 cursor-pointer text-xs font-semibold text-brand-300 hover:bg-brand-700/40 transition-colors select-none" onclick="var body=this.nextElementSibling;body.style.display=body.classList.contains(\'open\')?\'none\':\'\';body.classList.toggle(\'open\');body.classList.toggle(\'collapsed\');this.classList.toggle(\'open\');this.classList.toggle(\'collapsed\');"><svg class="arrow w-3 h-3 text-brand-600" viewBox="0 0 24 24" fill="currentColor"><path d="M8.47 4.22a.75.75 0 011.06 0l8.25 8.25a.75.75 0 010 1.06l-8.25 8.25a.75.75 0 01-1.06-1.06L15.94 12 8.47 4.53a.75.75 0 010-1.06z"/></svg><span class="capitalize">'+agent+'</span><span class="ml-auto font-normal text-brand-500">'+grouped[agent].length+' calls</span></div><div class="tc-agent-body collapsed" style="display:none"><table class="w-full text-xs"><thead><tr class="bg-brand-800/30 text-brand-500 text-[10px] uppercase tracking-wider"><th class="px-3 py-2 text-left w-8">#</th><th class="px-3 py-2 text-left w-28">Tool</th><th class="px-3 py-2 text-left">Description</th><th class="px-3 py-2 text-left">Result</th></tr></thead><tbody></tbody></table></div>';
+                    container.appendChild(section);tbody=section.querySelector('tbody');
+                }else{tbody=existing.querySelector('tbody');}
+                grouped[agent].forEach(function(tc,idx){
+                    if(tbody.querySelector('[data-tc-id="'+tc.id+'"]'))return;
+                    var tr=document.createElement('tr');tr.className='tc-row border-t border-brand-700/10 hover:bg-brand-700/15 transition-colors';tr.setAttribute('data-tc-id',tc.id);
+                    var ea=(tc.args_summary||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+                    var er=(tc.result_summary||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+                    var rp=er.length>120?er.substring(0,120)+'...':er;
+                    var el=er.length>120?' <a href="#" class="tc-expand-link text-blue-400" onclick="var r=this.closest(\'.tc-row\');var f=r.querySelector(\'.tc-result-full\');var p=r.querySelector(\'.tc-result-preview\');if(f.classList.contains(\'hidden\')){f.classList.remove(\'hidden\');p.classList.add(\'hidden\');this.textContent=\'less\';}else{f.classList.add(\'hidden\');p.classList.remove(\'hidden\');this.textContent=\'more\';}return false;">more</a>':'';
+                    tr.innerHTML='<td class="px-3 py-2 text-brand-500">'+(idx+1)+'</td><td class="px-3 py-2"><code class="text-blue-400 bg-blue-500/10 px-1.5 py-0.5 rounded text-[11px]">'+tc.tool_name+'</code></td><td class="px-3 py-2 text-brand-300 max-w-xs break-words">'+ea+'</td><td class="px-3 py-2 text-brand-500 max-w-xs break-words"><span class="tc-result-preview">'+rp+'</span>'+(er.length>120?'<span class="tc-result-full hidden">'+er+'</span>':'')+el+'</td>';
+                    tbody.appendChild(tr);
+                });
+            });
+        });
+    }
+
+    function groupExistingLogs() {
+        var entries=logContainer.querySelectorAll('.log-entry[data-agent]');
+        if(!entries.length||logContainer.querySelector('.log-agent-header'))return;
+        var logs=[];
+        entries.forEach(function(e){var rm=e.className.match(/log-(\w+)/);logs.push({seq:parseInt(e.dataset.seq),agent:e.dataset.agent||'system',role:rm?rm[1]:'system',content:(e.querySelector('.log-body')||e).textContent});});
+        logContainer.innerHTML='';totalLogs=0;addLogs(logs);
+    }
+
+    function setupStepClicks() {
+        document.querySelectorAll('.step-row[data-phase]').forEach(function(el) {
+            el.addEventListener('click', function() { var a=phaseToAgent[this.dataset.phase]; if(a)scrollToAgent(a); });
+        });
+    }
+
+    groupExistingLogs();
+    setupStepClicks();
+
+    var refreshBtn = document.getElementById('refresh-logs-btn');
+    if (refreshBtn) {
+        refreshBtn.addEventListener('click', function() {
+            var sinceSeq=0; var allE=logContainer.querySelectorAll('.log-entry[data-seq]');
+            for(var i=0;i<allE.length;i++){var s=parseInt(allE[i].dataset.seq);if(s>sinceSeq)sinceSeq=s;}
+            refreshBtn.disabled=true;refreshBtn.textContent='Loading...';
+            fetch('/jobs/'+jobId+'/logs/?since_seq='+sinceSeq).then(function(r){return r.json();}).then(function(data){
+                if(data.logs&&data.logs.length>0)addLogs(data.logs);fetchToolCalls();refreshBtn.disabled=false;refreshBtn.textContent='Refresh';
+            }).catch(function(){refreshBtn.disabled=false;refreshBtn.textContent='Refresh';});
+        });
+    }
+
+    if (!isTerminal) { liveEl.classList.remove('hidden'); liveEl2.classList.remove('hidden'); } else { return; }
+
+    var es = new EventSource('/jobs/' + jobId + '/events/');
+    es.addEventListener('status', function(e) { updateStatus(JSON.parse(e.data).status); });
+    es.addEventListener('logs', function(e) { var d=JSON.parse(e.data); addLogs(d.logs); fetchToolCalls(); setupStepClicks(); });
+    es.addEventListener('done', function(e) { updateStatus(JSON.parse(e.data).status); liveEl.classList.add('hidden'); liveEl2.classList.add('hidden'); es.close(); });
+    es.addEventListener('message', function(e) {
+        var data=JSON.parse(e.data); if(!data||!data.type) return;
+        if(data.type==='logs'){addLogs(data.logs||[]);fetchToolCalls();setupStepClicks();}
+        else if(data.type==='step'){addStep(data.phase,data.status);}
+        else if(data.type==='status'){updateStatus(data.status);}
+        else if(data.type==='approval'){
+            var c=document.getElementById('approval-container');if(!c)return;
+            fetch('/jobs/'+jobId+'/pending-approvals/').then(function(r){return r.json();}).then(function(r){if(r.html){c.classList.remove('hidden');c.innerHTML='<div class="flex items-center gap-2 mb-3"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#D97706"><path stroke-linecap="round" stroke-linejoin="round" d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0"/></svg><span class="text-sm font-semibold text-amber-200">Pending Approval Required</span></div>'+r.html;}}).catch(function(){location.reload();});
+        }
+        else if(data.type==='done'){updateStatus(data.status);liveEl.classList.add('hidden');liveEl2.classList.add('hidden');es.close();}
+    });
+    es.onerror = function() { liveEl.classList.add('hidden'); liveEl2.classList.add('hidden'); es.close(); };
+})();
+</script>
+{% endblock %}

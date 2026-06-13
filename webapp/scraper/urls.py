@@ -1,0 +1,35 @@
+from django.urls import path
+
+from . import views
+
+urlpatterns = [
+    path("", views.home, name="home"),
+    path("sites/", views.site_list, name="site_list"),
+    path("sites/add/", views.site_add, name="site_add"),
+    path("sites/<int:site_id>/", views.site_detail, name="site_detail"),
+    path("sites/<int:site_id>/edit/", views.site_edit, name="site_edit"),
+    path("sites/<int:site_id>/delete/", views.site_delete, name="site_delete"),
+    path("sites/<int:site_id>/scrape/", views.site_scrape, name="site_scrape"),
+    path("sites/<int:site_id>/rerun/", views.site_rerun, name="site_rerun"),
+    path("sites/<int:site_id>/scraper-code/", views.site_scraper_code, name="site_scraper_code"),
+    path("sites/<int:site_id>/output/<str:filename>/", views.site_output_view, name="site_output_view"),
+    path("sites/<int:site_id>/output/<str:filename>/download/", views.site_output_download, name="site_output_download"),
+    path("sites/<int:site_id>/sync-urls/", views.site_sync_urls, name="site_sync_urls"),
+    path("probe-cache/", views.probe_cache, name="probe_cache"),
+    path("jobs/", views.job_list, name="job_list"),
+    path("jobs/<int:job_id>/", views.job_detail, name="job_detail"),
+    path("jobs/<int:job_id>/cancel/", views.job_cancel, name="job_cancel"),
+    path("jobs/<int:job_id>/restart/", views.job_restart, name="job_restart"),
+    path("jobs/<int:job_id>/api/", views.job_api, name="job_api"),
+    path("jobs/<int:job_id>/logs/", views.job_logs_api, name="job_logs_api"),
+    path("jobs/<int:job_id>/events/", views.job_events, name="job_events"),
+    path("jobs/<int:job_id>/resume/", views.job_resume, name="job_resume"),
+    path("jobs/<int:job_id>/pending-approvals/", views.pending_approvals_fragment, name="pending_approvals_fragment"),
+    path("approvals/", views.approval_list, name="approval_list"),
+    path("approvals/count/", views.approval_count, name="approval_count"),
+    path("approvals/<int:approval_id>/", views.approval_detail, name="approval_detail"),
+    path("jobs/<int:job_id>/approve/<int:approval_id>/", views.approval_inline, name="approval_inline"),
+    path("jobs/<int:job_id>/scraper-code/", views.scraper_code, name="scraper_code"),
+    path("jobs/<int:job_id>/tool-calls/", views.tool_calls_api, name="tool_calls_api"),
+    path("jobs/<int:job_id>/agent-summary/", views.agent_summary, name="agent_summary"),
+]

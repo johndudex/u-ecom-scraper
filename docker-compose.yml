@@ -1,0 +1,191 @@
+services:
+  postgres:
+    profiles: ["full"]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: scraper
+      POSTGRES_USER: scraper
+      POSTGRES_PASSWORD: scraper-password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scraper -d scraper"]
+      interval: 5s
+      retries: 5
+      timeout: 5s
+    mem_limit: 256m
+
+  redis:
+    profiles: ["full"]
+    image: redis:7-alpine
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+      timeout: 5s
+    mem_limit: 64m
+
+  django:
+    profiles: ["full"]
+    build: .
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             DJANGO_SUPERUSER_PASSWORD=${DJANGO_SUPERUSER_PASSWORD:-admin} python manage.py createsuperuser --noinput --username admin --email admin@example.com 2>/dev/null || true &&
+             python manage.py runserver 0.0.0.0:8000"
+    volumes:
+      - .:/app
+    environment:
+      DB_HOST: postgres
+      DB_NAME: scraper
+      DB_USER: scraper
+      DB_PASSWORD: scraper-password
+      DB_PORT: "5432"
+      REDIS_URL: redis://redis:6379/0
+      ZAI_API_KEY: ${ZAI_API_KEY:-}
+      ZAI_BASE_URL: ${ZAI_BASE_URL:-https://api.z.ai/api/coding/paas/v4/}
+      ZAI_MAIN_MODEL: ${ZAI_MAIN_MODEL:-glm-5-turbo}
+      ZAI_SMALL_MODEL: ${ZAI_SMALL_MODEL:-glm-5-turbo}
+      DJANGO_SUPERUSER_PASSWORD: ${DJANGO_SUPERUSER_PASSWORD:-admin}
+      PLAYWRIGHT_MCP_URL: http://browser-service:8111/sse
+      BROWSER_SERVICE_URL: http://browser-service:8001
+      DEBUG: "True"
+      DJANGO_SETTINGS_MODULE: config.settings
+      SECRET_KEY: dev-secret-key-change-in-production
+      PYTHONPATH: /app
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      browser-service:
+        condition: service_healthy
+    mem_limit: 512m
+
+  celery-worker:
+    profiles: ["full"]
+    build: .
+    command: celery -A config worker -l INFO --loglevel=INFO --concurrency=2 -Ofair
+    volumes:
+      - .:/app
+    environment:
+      DB_HOST: postgres
+      DB_NAME: scraper
+      DB_USER: scraper
+      DB_PASSWORD: scraper-password
+      DB_PORT: "5432"
+      REDIS_URL: redis://redis:6379/0
+      ZAI_API_KEY: ${ZAI_API_KEY:-}
+      ZAI_BASE_URL: ${ZAI_BASE_URL:-https://api.z.ai/api/coding/paas/v4/}
+      ZAI_MAIN_MODEL: ${ZAI_MAIN_MODEL:-glm-5-turbo}
+      ZAI_SMALL_MODEL: ${ZAI_SMALL_MODEL:-glm-5-turbo}
+      PLAYWRIGHT_MCP_URL: http://browser-service:8111/sse
+      BROWSER_SERVICE_URL: http://browser-service:8001
+      DJANGO_SETTINGS_MODULE: config.settings
+      SECRET_KEY: dev-secret-key-change-in-production
+      PYTHONPATH: /app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      browser-service:
+        condition: service_healthy
+    deploy:
+      replicas: 1
+    mem_limit: 512m
+
+  celery-beat:
+    profiles: ["full"]
+    build: .
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             celery -A config beat -l INFO --loglevel=INFO"
+    volumes:
+      - .:/app
+    environment:
+      DB_HOST: postgres
+      DB_NAME: scraper
+      DB_USER: scraper
+      DB_PASSWORD: scraper-password
+      DB_PORT: "5432"
+      REDIS_URL: redis://redis:6379/0
+      DJANGO_SETTINGS_MODULE: config.settings
+      SECRET_KEY: dev-secret-key-change-in-production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    mem_limit: 128m
+
+  flower:
+    profiles: ["full"]
+    build: .
+    command: celery -A config flower --port=5555
+    volumes:
+      - .:/app
+    environment:
+      DB_HOST: postgres
+      DB_NAME: scraper
+      DB_USER: scraper
+      DB_PASSWORD: scraper-password
+      DB_PORT: "5432"
+      REDIS_URL: redis://redis:6379/0
+      DJANGO_SETTINGS_MODULE: config.settings
+      SECRET_KEY: dev-secret-key-change-in-production
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+    mem_limit: 128m
+
+  browser-service:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: browser-service/Dockerfile
+    volumes:
+      - ./browser-service:/app/browser-service
+      - ./scrapers:/app/scrapers
+      - ./src:/app/src:ro
+      - ./config:/app/config:ro
+      - ./scripts:/app/scripts:ro
+      - ./templates:/app/templates:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./workspace:/app/workspace
+    environment:
+      DISPLAY: ":98"
+      BROWSER_SERVICE_PORT: "8001"
+      MCP_CDP_PORT: "19222"
+      SCRAPER_CDP_PORT: "19223"
+      PROXY_DATACENTER_HOST: ${PROXY_DATACENTER_HOST:-brd.superproxy.io}
+      PROXY_DATACENTER_PORT: ${PROXY_DATACENTER_PORT:-22225}
+      PROXY_DATACENTER_USER: ${PROXY_DATACENTER_USER:-}
+      PROXY_DATACENTER_PASS: ${PROXY_DATACENTER_PASS:-}
+      PROXY_RESIDENTIAL_HOST: ${PROXY_RESIDENTIAL_HOST:-brd.superproxy.io}
+      PROXY_RESIDENTIAL_PORT: ${PROXY_RESIDENTIAL_PORT:-22225}
+      PROXY_RESIDENTIAL_USER: ${PROXY_RESIDENTIAL_USER:-}
+      PROXY_RESIDENTIAL_PASS: ${PROXY_RESIDENTIAL_PASS:-}
+    ports:
+      - "8001:8001"
+      - "8111:8111"
+      - "9222:9222"
+      - "9223:9223"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 15s
+      retries: 3
+      timeout: 10s
+      start_period: 45s
+    restart: unless-stopped
+    mem_limit: 1536m
+
+volumes:
+  pgdata:
+  redisdata:

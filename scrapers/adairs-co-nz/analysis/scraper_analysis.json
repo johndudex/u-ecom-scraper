@@ -1,0 +1,160 @@
+{
+  "strategy": "http_requests",
+  "strategy_justification": "Direct HTTP (no browser, no proxy) successfully fetches the AU mirror site (adairs.com.au) returning 314K chars of fully SSR HTML with complete JSON-LD Product data. Both site_analysis and product_analysis confirm this. The NZ site (adairs.co.nz) is on the same Episerver CMS platform and will serve identical structure when it exits maintenance mode. No anti-bot protection detected on either site. No JS rendering needed.",
+  "proxy_tier": "none",
+  "proxy_justification": "Direct HTTP connection works fine on both sites. No anti-bot, no rate limiting, no blocking. Cloudflare is used only as CDN for image optimization, not as a security shield.",
+  "no_proxy_flag": true,
+  "extraction_approach": "jsonld_only",
+  "jsonld_available": true,
+  "jsonld_fields": [
+    "title",
+    "description",
+    "sku",
+    "brand",
+    "images",
+    "price_low",
+    "price_high",
+    "currency",
+    "availability",
+    "url",
+    "rating_value",
+    "review_count",
+    "best_rating",
+    "worst_rating",
+    "reviews",
+    "category (from BreadcrumbList)"
+  ],
+  "jsonld_empty_offers": false,
+  "warmup_required": false,
+  "cookie_consent_required": false,
+  "verified_selectors": {
+    "title": {
+      "method": "jsonld",
+      "path": "Product.name",
+      "css_fallback": "h1",
+      "og_fallback": "meta[property='og:title']",
+      "title_tag_fallback": "document.title (strip ' | Adairs' suffix)",
+      "verified": true,
+      "test_result": "Stonewashed Cotton Chocolate Sheet Separates"
+    },
+    "price": {
+      "method": "jsonld",
+      "path": "Product.offers.lowPrice",
+      "css_fallback": null,
+      "verified": true,
+      "test_result": "37.49",
+      "note": "AggregateOffer provides lowPrice (from price) and highPrice. Use lowPrice as the primary price. No 'was' price in JSON-LD."
+    },
+    "price_high": {
+      "method": "jsonld",
+      "path": "Product.offers.highPrice",
+      "verified": true,
+      "test_result": "59.99",
+      "note": "High end of AggregateOffer price range."
+    },
+    "original_price": {
+      "method": "not_detected",
+      "css_fallback": null,
+      "verified": false,
+      "note": "No original/was price in JSON-LD. May exist in HTML markup for sale items but not extractable via JSON-LD-only approach."
+    },
+    "currency": {
+      "method": "jsonld",
+      "path": "Product.offers.priceCurrency",
+      "verified": true,
+      "test_result": "AUD",
+      "note": "AU site returns 'AUD'. NZ site will return 'NZD' when active. Currency comes from JSON-LD so it will be correct for whichever site is scraped."
+    },
+    "availability": {
+      "method": "jsonld",
+      "path": "Product.offers.availability",
+      "verified": true,
+      "test_result": "https://schema.org/InStock",
+      "note": "Full schema.org URL. Parse last segment: 'InStock', 'OutOfStock', 'PreOrder', etc."
+    },
+    "sku": {
+      "method": "jsonld",
+      "path": "Product.sku",
+      "verified": true,
+      "test_result": "61297_chocolate"
+    },
+    "brand": {
+      "method": "jsonld",
+      "path": "Product.brand.name",
+      "verified": true,
+      "test_result": "Adairs"
+    },
+    "description": {
+      "method": "jsonld",
+      "path": "Product.description",
+      "css_fallback": "meta[name='description']",
+      "og_fallback": "meta[property='og:description']",
+      "verified": true,
+      "test_result": "Buy our Stonewashed Cotton Chocolate Brown Sheet Separates at Adairs. OEKO-TEX cotton sheets with a soft, textured finish. Shop online today."
+    },
+    "images": {
+      "method": "jsonld",
+      "path": "Product.image (array)",
+      "og_fallback": "meta[property='og:image']",
+      "verified": true,
+      "test_result": "Array of 9 image URLs from globalassets CDN",
+      "note": "JSON-LD provides array of all product images. First image matches og:image."
+    },
+    "category": {
+      "method": "jsonld",
+      "path": "BreadcrumbList.itemListElement[*].name",
+      "verified": true,
+      "test_result": "Fitted Sheets, Flat Sheets & Sheet Sets",
+      "note": "Extract from first JSON-LD block (type=BreadcrumbList). Position 2 (index 1) is typically the subcategory. Full breadcrumb: Home > Bedroom > Fitted Sheets, Flat Sheets & Sheet Sets > Adairs > Product."
+    },
+    "rating": {
+      "method": "jsonld",
+      "path": "Product.aggregateRating.ratingValue",
+      "verified": true,
+      "test_result": "0",
+      "note": "ratingValue is '0' but 7 reviews with 5-star ratings exist in the .review array. Data discrepancy in source — review array length is more reliable."
+    },
+    "review_count": {
+      "method": "jsonld",
+      "path": "Product.aggregateRating.reviewCount",
+      "verified": true,
+      "test_result": "0",
+      "note": "Same discrepancy — reviewCount=0 but 7 reviews in .review array. Use len(Product.review) as the actual review count."
+    },
+    "reviews": {
+      "method": "jsonld",
+      "path": "Product.review (array)",
+      "verified": true,
+      "test_result": "Array of 7 Review objects",
+      "note": "Each review has: name, reviewRating.ratingValue, reviewRating.bestRating, reviewRating.worstRating, datePublished, author.name, reviewBody (optional), publisher.name."
+    },
+    "url": {
+      "method": "jsonld",
+      "path": "Product.offers.url",
+      "css_fallback": "link[rel='canonical']",
+      "og_fallback": "meta[property='og:url']",
+      "verified": true,
+      "test_result": "https://www.adairs.com.au/bedroom/sheets/adairs/stonewashed-cotton-chocolate-sheet-separates/"
+    }
+  },
+  "critical_nz_site_note": {
+    "status": "maintenance_mode",
+    "details": "As of live verification (2025), the NZ site (adairs.co.nz) serves a maintenance/coming soon page with title 'Adairs | New Zealand' and h1 'An Update for Our New Zealand Customers'. No product data, no JSON-LD blocks (0 found), no OG tags, no navigation. HTTP status is 200 but body is only 45K chars of maintenance content.",
+    "scraper_impact": "The scraper MUST handle this gracefully. When fetching an NZ URL and no Product JSON-LD block is found, it should: (1) log a warning that the page appears to be in maintenance mode, (2) optionally check for the maintenance h1 text 'An Update for Our New Zealand Customers' to confirm, (3) set availability/error fields accordingly and continue to next URL.",
+    "au_mirror_confirmed": true,
+    "au_mirror_note": "The AU site (adairs.com.au) is fully operational with identical platform structure. The AU mirror of the same product returns 314K chars with complete JSON-LD. Hreflang links on AU pages point to NZ equivalents. When NZ exits maintenance, the same extraction will work."
+  },
+  "extraction_code_guidance": {
+    "jsonld_detection": "Parse all script[type='application/ld+json'] blocks. Find the one where type (or @type) == 'Product'. If none found, the page is likely a maintenance page or non-product page.",
+    "breadcrumb_detection": "First JSON-LD block is BreadcrumbList (type field present). Use itemListElement array for category hierarchy.",
+    "availability_parsing": "Product.offers.availability is a full URL like 'https://schema.org/InStock'. Extract last path segment for the status string.",
+    "price_handling": "AggregateOffer with lowPrice and highPrice. Use lowPrice as the primary 'from' price. Report as price_range if low != high.",
+    "currency": "Comes from Product.offers.priceCurrency. Will be 'AUD' for AU site, expected 'NZD' for NZ site when active.",
+    "review_handling": "Prefer len(Product.review) over aggregateRating.reviewCount due to data discrepancy in source.",
+    "image_handling": "Product.image is an array of strings (URLs). Use the full array."
+  },
+  "retry_adjustments": null,
+  "escalation_note": "No escalation needed. Direct HTTP works without proxy. NZ site is in maintenance mode — this is a content issue, not a connectivity/anti-bot issue. Escalating proxy tiers will not help since the maintenance page is intentional.",
+  "confidence_score": 0.85,
+  "confidence_notes": "High confidence on extraction method (http_requests + JSON-LD) verified on AU mirror. All 15+ fields mapped and tested against live AU product page. Confidence is reduced from 1.0 because: (1) NZ site is in maintenance mode so selectors NOT directly tested on live NZ HTML, (2) CSS fallback selectors unverified without Playwright, (3) exact timing of NZ site reactivation is unknown. When NZ exits maintenance, the identical Episerver CMS + JSON-LD structure is expected."
+}
