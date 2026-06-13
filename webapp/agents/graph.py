@@ -449,10 +449,15 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
             f"Methods tried: {', '.join(methods)}. "
             f"{reasoning}"
         )
-        logger.warning("check_accessibility: captcha blocked for job %s — %s", job_id, error_msg[:200])
+        logger.warning(
+            "check_accessibility: captcha blocked for job %s — %s",
+            job_id,
+            error_msg[:200],
+        )
 
         try:
             from scraper.models import ScrapeJob
+
             ScrapeJob.objects.filter(pk=job_id).update(
                 status=ScrapeJob.STATUS_CAPTCHA_BLOCKED,
                 error_message=error_msg[:2000],
@@ -495,6 +500,7 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
     }
 
     from .tools.context import update_probe_result
+
     update_probe_result(data)
 
     return Command(update=probe_state, goto="site_analyzer")
@@ -968,7 +974,17 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
 @_with_api_retry
 def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
     job_id = state.get("job_id", 0)
+    retry_count = state.get("test_retry_count", 0)
     _notify_phase(job_id, "code_tester", "running")
+    if retry_count > 0:
+        try:
+            from scraper.models import Step
+
+            Step.objects.filter(job_id=job_id, phase="testing").update(
+                notes=f"Retry cycle {retry_count}"
+            )
+        except Exception:
+            pass
     set_tool_context(dict(state), agent_name="code_tester")
     try:
         logger.info("_invoke_code_tester: starting (job %s)", job_id)
@@ -1166,7 +1182,9 @@ def _persist_probe_summary(
         if raw_data.get("captcha_type"):
             summary_lines.append(f"  Captcha type: {raw_data['captcha_type']}")
         if raw_data.get("methods_tried"):
-            summary_lines.append(f"  Methods tried: {', '.join(raw_data['methods_tried'])}")
+            summary_lines.append(
+                f"  Methods tried: {', '.join(raw_data['methods_tried'])}"
+            )
 
         seq = SessionLog.objects.filter(job_id=job_id).count()
         SessionLog.objects.create(
@@ -1193,6 +1211,15 @@ def route_from_human_approval(state: ScrapeState) -> str:
     """
     reason = state.get("interrupt_reason", "")
     response = state.get("human_response")
+
+    MAX_TOTAL_RESUMES = 5
+    total_resumes = state.get("test_retry_count", 0)
+    if total_resumes >= MAX_TOTAL_RESUMES:
+        logger.warning(
+            "route_from_human_approval: hard cap reached (%d resumes) → cleanup",
+            total_resumes,
+        )
+        return "cleanup"
 
     if isinstance(response, dict):
         choice = response.get("decision", response.get("choice", ""))
@@ -1223,7 +1250,9 @@ def route_from_human_approval(state: ScrapeState) -> str:
         if choice in cancel_values:
             logger.info("route_from_human_approval: testing_exhausted -> cancelled")
             return "__end__"
-        logger.info("route_from_human_approval: testing_exhausted -> field_confirmation")
+        logger.info(
+            "route_from_human_approval: testing_exhausted -> field_confirmation"
+        )
         return "field_confirmation"
 
     if reason == "low_confidence":
@@ -1282,7 +1311,7 @@ def route_from_human_approval(state: ScrapeState) -> str:
         logger.info("route_from_human_approval: missing_artifact_product -> cancelled")
         return "__end__"
 
-    next_node = routing.get(reason, "setup_workspace")
+    next_node = routing.get(reason, "cleanup")
     logger.info("route_from_human_approval: reason=%s -> %s", reason, next_node)
     return next_node
 

@@ -65,9 +65,20 @@ INTERRUPT_TO_APPROVAL_TYPE: dict[str, str] = {
 class _ScrapeCallbackHandler(BaseCallbackHandler):
     """Callback handler that captures LLM/tool/chain events into SessionLog."""
 
+    _NODE_DISPLAY: dict[str, str] = {
+        "site_analyzer": "site-analyzer",
+        "product_analyzer": "product-analyzer",
+        "scraper_analyzer": "scraper-analyzer",
+        "code_writer": "code-writer",
+        "code_tester": "code-tester",
+        "cleanup": "cleanup",
+        "skill_learner": "skill-learner",
+    }
+
     def __init__(self, job: Any) -> None:
         self.job = job
         self._pending_tool_name: str | None = None
+        self._current_node: str = ""
 
     def on_llm_end(self, response: Any, *, run_id: str, parent_run_id: str | None = None, **kwargs: Any) -> None:
         content = ""
@@ -81,11 +92,12 @@ class _ScrapeCallbackHandler(BaseCallbackHandler):
 
         from scraper.models import SessionLog
 
+        agent = self._NODE_DISPLAY.get(self._current_node, "")
         seq = SessionLog.objects.filter(job=self.job).count()
         SessionLog.objects.create(
             job=self.job,
             role=SessionLog.ROLE_ASSISTANT,
-            agent="",
+            agent=agent,
             content=content[:3000],
             seq=seq,
         )
@@ -95,7 +107,7 @@ class _ScrapeCallbackHandler(BaseCallbackHandler):
                 "type": "log",
                 "seq": seq,
                 "role": "assistant",
-                "agent": "",
+                "agent": agent,
                 "content": content[:500],
             },
         )
@@ -138,6 +150,7 @@ class _ScrapeCallbackHandler(BaseCallbackHandler):
 
     def on_chain_start(self, serialized: dict, inputs: dict, *, run_id: str, parent_run_id: str | None = None, tags: list[str] | None = None, metadata: dict | None = None, run_name: str | None = None, **kwargs: Any) -> None:
         node = run_name or serialized.get("name", "") if isinstance(serialized, dict) else ""
+        self._current_node = node
         phase = LangGraphService._node_to_phase(node)
         if phase:
             _upsert_step_from_event(self.job, phase, "running")

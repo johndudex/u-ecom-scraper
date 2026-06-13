@@ -30,6 +30,9 @@
             <span class="px-2.5 py-1 rounded-lg text-xs font-medium bg-brand-600/40 text-brand-400">{{ job.duration_seconds }}s</span>
             {% endif %}
             <span id="live-indicator" class="hidden px-2.5 py-1 rounded-lg text-[10px] font-bold uppercase tracking-wider bg-cta text-white animate-pulse-dot">Live</span>
+            {% if site %}
+            <a href="{% url 'site_detail' site_id=site.pk %}" class="px-3 py-1.5 text-xs font-medium text-brand-300 border border-brand-500/30 rounded-lg hover:bg-brand-600/30 transition-colors cursor-pointer">View Site</a>
+            {% endif %}
             {% if is_active %}
             <a href="{% url 'job_cancel' job_id=job.id %}" class="px-3 py-1.5 text-xs font-medium text-brand-300 border border-brand-500/30 rounded-lg hover:bg-brand-600/30 transition-colors cursor-pointer">Cancel</a>
             {% elif is_terminal %}
@@ -86,13 +89,14 @@
                             &nbsp;
                         {% endif %}
                     </div>
-                    <span class="text-sm font-medium {% if step.status == 'pending' %}text-brand-500{% else %}text-brand-200{% endif %}">{{ step.get_phase_display }}</span>
+                    <span class="text-sm font-medium {% if step.status == 'pending' %}text-brand-500{% else %}text-brand-200{% endif %}">{{ step.get_phase_display }}{% if step.notes %} <span class="text-[10px] text-amber-400 font-normal">({{ step.notes }})</span>{% endif %}</span>
                     <span class="ml-auto text-[11px] font-semibold uppercase tracking-wider {% if step.status == 'done' %}text-green-400{% elif step.status == 'running' %}text-blue-400{% elif step.status == 'failed' %}text-red-400{% else %}text-brand-600{% endif %}">
                         {% if step.status == 'done' %}Done{% elif step.status == 'running' %}Running{% elif step.status == 'failed' %}Failed{% else %}Pending{% endif %}
                     </span>
                     <span class="text-[11px] text-brand-600 whitespace-nowrap">
                         {% if step.started_at %}{{ step.started_at|date:"H:i:s" }}{% endif %}
                         {% if step.completed_at %} - {{ step.completed_at|date:"H:i:s" }}{% endif %}
+                        {% if step.duration_str %} <span class="text-brand-500">({{ step.duration_str }})</span>{% endif %}
                     </span>
                 </div>
                 {% empty %}

@@ -1,0 +1,398 @@
+{
+  "site_slug": "adameve-com",
+  "analyzed_products": 1,
+  "site_analysis_review": {
+    "platform_correct": true,
+    "platform_notes": "Custom ASP.NET platform confirmed by .aspx URLs, inline phe.config JavaScript object, and server-rendered HTML. Site analysis correctly identified the platform.",
+    "anti_bot_correct": true,
+    "anti_bot_notes": "No anti-bot protection detected. Direct HTTP returns full page content. Only OneTrust for cookie consent (compliance, not anti-bot). Confirmed by both probe and browser navigation.",
+    "scraping_mechanism_correct": true,
+    "mechanism_notes": "http_requests is the correct mechanism. Page is fully server-rendered. JSON-LD provides complete product data. No JavaScript rendering needed for any core field.",
+    "corrections": [],
+    "confidence_in_site_analysis": 0.98
+  },
+  "connectivity": {
+    "method_that_worked": "direct_http",
+    "proxy_tier": "none",
+    "js_rendering_needed": false,
+    "notes": "Direct HTTP works perfectly. Page is server-rendered ASP.NET with all product data in HTML source (JSON-LD, OG meta tags, inline serverSideEvents JavaScript, DOM). No proxy or browser needed."
+  },
+  "extraction_methods": {
+    "primary": "structured_data",
+    "structured_data_available": true,
+    "structured_data_fields": [
+      "title",
+      "price",
+      "currency",
+      "availability",
+      "brand",
+      "description",
+      "sku",
+      "rating",
+      "review_count",
+      "url",
+      "images",
+      "category",
+      "breadcrumbs"
+    ],
+    "structured_data_notes": "JSON-LD Product block is very rich with ALL core fields. Uses non-standard capitalized property names (Name, Mpn, Price, Description, Brand, Image, Offers) instead of standard schema.org lowercase. Code MUST use capitalized keys.",
+    "secondary": "og_meta_tags",
+    "og_meta_fields": [
+      "title",
+      "price",
+      "currency",
+      "brand",
+      "availability",
+      "image",
+      "url",
+      "description"
+    ],
+    "tertiary": "css_selectors"
+  },
+  "fields": {
+    "url": {
+      "method": "css",
+      "selector": "link[rel='canonical']",
+      "structured_data_fallback": "JSON-LD Product.Offers.Url",
+      "js_extraction": "document.querySelector('link[rel=\"canonical\"]')?.href",
+      "tested": true,
+      "examples": [
+        "https://www.adameve.com/lingerie/womens-wear/baby-dolls/sp-hypnotic-swirl-cupless-crotchless-babydoll-91407.aspx"
+      ],
+      "notes": "Canonical URL is always available."
+    },
+    "src_url": {
+      "method": "set_by_scraper",
+      "notes": "Set by scraper from input_urls.json. Not extractable from page."
+    },
+    "status_code": {
+      "method": "set_by_scraper",
+      "notes": "Set by scraper from HTTP response."
+    },
+    "scraped_at": {
+      "method": "set_by_scraper",
+      "notes": "Set by scraper as ISO-8601 timestamp."
+    },
+    "remarks": {
+      "method": "set_by_scraper",
+      "notes": "Set by scraper for any warnings or notes."
+    },
+    "title": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.Name",
+      "css_fallback": "h1.item_title",
+      "og_fallback": "meta[property='og:title']",
+      "js_extraction": "document.querySelector('h1.item_title')?.textContent.trim()",
+      "tested": true,
+      "examples": [
+        "Hypnotic Swirl Cupless & Crotchless Babydoll"
+      ],
+      "notes": "JSON-LD uses 'Name' (capital N), not standard 'name'. h1.item_title is the DOM source. OG title includes site suffix '- Women's Lingerie | Adam & Eve' that should be stripped."
+    },
+    "price": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.Offers.Price",
+      "css_fallback": ".ae-normal-price .ae-price--normal",
+      "og_fallback": "meta[property='og:price:amount']",
+      "js_extraction": "document.querySelector('.ae-normal-price .ae-price--normal')?.textContent.trim().replace(/[^\\d.]/g, '')",
+      "tested": true,
+      "examples": [
+        "49.99"
+      ],
+      "notes": "Regular/list price is in .ae-normal-price .ae-price--normal (visible when not on sale). When on sale, .ae-sale-price becomes visible and .ae-normal-price hides. There is also a .jcpoffer-pricerange showing a promotional coupon price ('Only $27.49') — this should NOT be extracted as the product price. JSON-LD Offers.Price gives the base price reliably."
+    },
+    "original_price": {
+      "method": "css",
+      "selector": ".ae-sale-price .ae-price--was",
+      "js_extraction": "document.querySelector('.ae-sale-price:not(.hide) .ae-price--was')?.textContent.trim().replace(/[^\\d.]/g, '')",
+      "tested": true,
+      "examples": [
+        "49.99"
+      ],
+      "notes": "Only available when product is on sale. The .ae-sale-price div is hidden (class 'hide') when there's no sale. The ae-price--was span inside shows the original/regular price. When .ae-sale-price is visible, ae-normal-price is hidden. Extract ONLY if .ae-sale-price does NOT have class 'hide'. This product is NOT on sale, so original_price equals price."
+    },
+    "currency": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.Offers.PriceCurrency",
+      "og_fallback": "meta[property='og:price:currency']",
+      "tested": true,
+      "examples": [
+        "USD"
+      ],
+      "notes": "Available in both JSON-LD and OG meta tags."
+    },
+    "availability": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.Offers.Availability",
+      "og_fallback": "meta[property='og:availability']",
+      "js_fallback": "document.querySelector('.ae-stock-indicator')?.textContent.trim()",
+      "tested": true,
+      "examples": [
+        "http://schema.org/InStock",
+        "instock"
+      ],
+      "notes": "JSON-LD uses full URL 'http://schema.org/InStock'. OG tag uses short form 'instock'. serverSideEvents.dimension11 has human-readable 'In Stock'."
+    },
+    "brand": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.Brand.Name",
+      "og_fallback": "meta[property='og:brand']",
+      "sse_fallback": "serverSideEvents[0].Brand",
+      "tested": true,
+      "examples": [
+        "Magic Silk"
+      ],
+      "notes": "Brand is available from JSON-LD (nested object Product.Brand.Name), OG meta tag, and serverSideEvents. All three sources agree."
+    },
+    "category": {
+      "method": "structured_data",
+      "selector": "JSON-LD BreadcrumbList items (positions 2-4)",
+      "sse_fallback": "serverSideEvents[0].ecommerce.detail.products[0].category",
+      "css_fallback": "nav.breadcrumb a (array)",
+      "tested": true,
+      "examples": [
+        "Lingerie/Women's Lingerie/Babydoll Lingerie"
+      ],
+      "notes": "Multiple sources available. BreadcrumbList JSON-LD has individual breadcrumb items. serverSideEvents has the full category path as a string."
+    },
+    "breadcrumbs": {
+      "method": "structured_data",
+      "selector": "JSON-LD BreadcrumbList",
+      "css_fallback": "nav.breadcrumb a",
+      "tested": true,
+      "examples": [
+        [
+          "Home",
+          "Lingerie",
+          "Women's Lingerie",
+          "Babydoll Lingerie"
+        ]
+      ],
+      "notes": "BreadcrumbList JSON-LD provides name and @id for each level. CSS fallback is nav.breadcrumb a elements."
+    },
+    "description": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.Description",
+      "css_fallback": ".ae-accordion__content.ae-product-description",
+      "js_extraction": "Array.from(document.querySelectorAll('.ae-accordion__content.ae-product-description')).map(el => el.textContent.trim()).join(' ')",
+      "tested": true,
+      "examples": [
+        "While scandalously exposed breasts do what they're best at, you'll cast a mesmerizing spell in hypnotic swirl patterned mesh! This babydoll's soft & stretchy, with satin bow detail and matching crotchless thong. Nylon & spandex. Imported."
+      ],
+      "notes": "JSON-LD has the full product description. DOM has it split across multiple accordion sections. JSON-LD is the cleanest source. JSON-LD uses 'Description' (capital D)."
+    },
+    "sku": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.Mpn",
+      "sse_fallback": "serverSideEvents[0].Sku",
+      "tested": true,
+      "examples": [
+        "143H"
+      ],
+      "notes": "JSON-LD uses 'Mpn' (capital M) for the SKU/MPN field. serverSideEvents has Sku field. No visible SKU in DOM text."
+    },
+    "images": {
+      "method": "css",
+      "selector": "img[alt*='Hypnotic'] within .ae-product-carousel .glider-slide",
+      "structured_data_fallback": "JSON-LD Product.Image",
+      "og_fallback": "meta[property='og:image']",
+      "js_extraction": "Array.from(document.querySelectorAll('.ae-product-carousel .glider-slide img')).map(img => img.src).filter(src => !src.includes('data:'))",
+      "tested": true,
+      "examples": [
+        "https://www.adameve.com/cms/image/591545-649265-500x500.jpg"
+      ],
+      "notes": "Multiple product images in a glider/carousel slider (.ae-product-carousel .glider .glider-slide img). JSON-LD has a single main image (250x250). OG image is the main product image. Main carousel image selector: .ae-product-carousel .glider-slide.active img or first glider-slide img."
+    },
+    "image_url": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.Image",
+      "og_fallback": "meta[property='og:image']",
+      "css_fallback": ".ae-product-carousel .glider-slide.active img",
+      "tested": true,
+      "examples": [
+        "https://www.adameve.com/cms/image/591545-649265-250x250.jpg"
+      ],
+      "notes": "Single primary image. JSON-LD provides 250x250 version. OG image is the full-size version."
+    },
+    "rating": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.AggregateRating.RatingValue",
+      "css_fallback": ".pdp-star-ratings .ae-star-rating__stars",
+      "sse_fallback": "serverSideEvents[0].dimension13",
+      "tested": true,
+      "examples": [
+        "4.2"
+      ],
+      "notes": "JSON-LD has AggregateRating with RatingValue (4.2) and RatingCount (637). DOM text shows '4.25 stars out of 5'. serverSideEvents.dimension13 has 4.25. JSON-LD truncates to 4.2. The DOM/serverSideEvents value (4.25) is more precise."
+    },
+    "review_count": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.AggregateRating.RatingCount",
+      "css_fallback": ".pdp-star-ratings text content (number in parentheses)",
+      "sse_fallback": "serverSideEvents[0].metric4",
+      "tested": true,
+      "examples": [
+        "637"
+      ],
+      "notes": "Available from JSON-LD (637) and serverSideEvents (637). DOM shows '(637)' in the rating section."
+    },
+    "color_variants": {
+      "method": "javascript",
+      "selector": "serverSideEvents[0].Colors",
+      "css_fallback": "select.product-variant-select options (parse color from text)",
+      "tested": true,
+      "examples": [
+        [
+          "Red",
+          "Purple",
+          "Blue",
+          "Black",
+          "Hot Pink"
+        ]
+      ],
+      "notes": "Colors array is in serverSideEvents JavaScript. The variant select dropdown only shows currently available combinations (7 options for this product, mixing color+size). serverSideEvents.Colors has all possible colors."
+    },
+    "size_variants": {
+      "method": "javascript",
+      "selector": "serverSideEvents[0].Sizes",
+      "css_fallback": "select.product-variant-select options (parse size from text like 'Small/Med', 'Queen', 'Large/Xlrg')",
+      "tested": true,
+      "examples": [
+        []
+      ],
+      "notes": "serverSideEvents.Sizes is empty for this product. Sizes are embedded within variant option text (e.g., 'Red/Small/Med ($49.99)'). Parse from select.product-variant-select options text."
+    },
+    "variants": {
+      "method": "css",
+      "selector": "select.product-variant-select option",
+      "js_extraction": "Array.from(document.querySelectorAll('select.product-variant-select option')).filter(o => o.value).map(o => ({ value: o.value, text: o.textContent.trim(), price: o.textContent.match(/\\$[\\d.]+/)?.[0] }))",
+      "tested": true,
+      "examples": [
+        {
+          "value": "290339",
+          "text": "Red/Small/Med ($49.99)",
+          "price": "$49.99"
+        }
+      ],
+      "notes": "Variant select dropdown (select.product-variant-select) with options containing color/size combo and price. First option is always 'Please make a selection' with empty value. Each variant option has a numeric value (internal variant ID) and text like 'Red/Small/Med ($49.99)'."
+    },
+    "location": {
+      "method": "set_by_scraper",
+      "notes": "Not extractable from page. No warehouse/store location information on product page."
+    }
+  },
+  "jsonld_extraction": {
+    "block_count": 2,
+    "block_1_type": "BreadcrumbList",
+    "block_2_type": "Product",
+    "product_jsonld_notes": "Very rich Product schema with non-standard capitalized property names. Fields: Name, Mpn, Image, Description, Brand (nested object with Name), AggregateRating (RatingValue, RatingCount, BestRating, WorstRating), Offers (Price, PriceCurrency, Availability, ItemCondition, Url, ShippingDetails), Review (array of reviews). Second JSON-LD block has parse issue due to concatenated JSON after the main object — extract by finding first { to last } brace pair.",
+    "non_standard_properties": {
+      "Name": "Standard schema.org uses 'name' (lowercase)",
+      "Mpn": "Standard schema.org uses 'mpn' (lowercase)",
+      "Description": "Standard schema.org uses 'description' (lowercase)",
+      "Brand.Name": "Brand object uses 'Name' instead of 'name'",
+      "Image": "Standard schema.org uses 'image' (lowercase)",
+      "Offers.Price": "Standard schema.org uses 'price' (lowercase)"
+    },
+    "key_jsonld_fields": {
+      "title": "Product.Name",
+      "price": "Product.Offers.Price",
+      "currency": "Product.Offers.PriceCurrency",
+      "availability": "Product.Offers.Availability",
+      "brand": "Product.Brand.Name",
+      "description": "Product.Description",
+      "sku": "Product.Mpn",
+      "image": "Product.Image",
+      "rating": "Product.AggregateRating.RatingValue",
+      "review_count": "Product.AggregateRating.RatingCount",
+      "url": "Product.Offers.Url",
+      "item_condition": "Product.Offers.ItemCondition",
+      "shipping_cost": "Product.Offers.ShippingDetails.ShippingRate.Value"
+    }
+  },
+  "variants": {
+    "has_variants": true,
+    "variant_type": "combined_color_size",
+    "selector": "select.product-variant-select",
+    "variant_data_source": "DOM select element with inline options",
+    "variant_id_attribute": "option value attribute (numeric internal ID like '290339')",
+    "variant_text_format": "{Color}/{Size} (${Price})",
+    "color_source": "serverSideEvents[0].Colors (JavaScript array)",
+    "size_source": "Parsed from select option text",
+    "note": "Variants are combined color+size in a single dropdown. serverSideEvents provides all possible colors separately. Size must be parsed from option text. Variant prices may differ per variant (though same for this product).",
+    "sample_variants": [
+      {
+        "value": "290339",
+        "text": "Red/Small/Med ($49.99)"
+      },
+      {
+        "value": "290341",
+        "text": "Red/Queen ($49.99)"
+      },
+      {
+        "value": "290340",
+        "text": "Red/Large/Xlrg ($49.99)"
+      },
+      {
+        "value": "277214",
+        "text": "Black/Queen ($49.99)"
+      },
+      {
+        "value": "250086",
+        "text": "Black/Large/Xlrg ($49.99)"
+      },
+      {
+        "value": "250085",
+        "text": "Black/Small/Med ($49.99)"
+      }
+    ]
+  },
+  "page_structure": {
+    "title_element": "h1.item_title",
+    "price_container": ".ae-price-pdp-main",
+    "price_regular_selector": ".ae-normal-price .ae-price--normal",
+    "price_sale_was_selector": ".ae-sale-price .ae-price--was",
+    "price_sale_now_selector": ".ae-sale-price .ae-price--now",
+    "price_promo_selector": ".jcpoffer-pricerange (promotional coupon price — do NOT extract)",
+    "image_carousel": ".ae-product-carousel .glider .glider-slide img",
+    "image_main_selector": ".ae-product-carousel .glider-slide.active img",
+    "variant_select": "select.product-variant-select",
+    "rating_section": ".pdp-star-ratings",
+    "rating_stars": ".pdp-star-ratings .ae-star-rating__stars",
+    "stock_indicator": ".ae-stock-indicator",
+    "description_accordion": ".ae-accordion__content.ae-product-description",
+    "breadcrumb_nav": "nav.breadcrumb",
+    "canonical_url": "link[rel='canonical']",
+    "product_id_from_url": "Numeric ID before .aspx (e.g., 91407)"
+  },
+  "server_side_events": {
+    "available": true,
+    "variable_name": "serverSideEvents",
+    "access_method": "Parse from inline JavaScript: var serverSideEvents = [{...}]",
+    "key_fields": {
+      "sku": "Sku",
+      "product_name": "ProductName",
+      "price": "Price",
+      "brand": "Brand",
+      "colors": "Colors (array)",
+      "sizes": "Sizes (array)",
+      "stock_status": "dimension11 (human-readable: 'In Stock')",
+      "rating": "dimension13 (numeric: 4.25)",
+      "review_count": "metric4 (numeric: 637)",
+      "category_path": "ecommerce.detail.products[0].category",
+      "product_id": "dimension1 (internal ID: '41')",
+      "subcategory_id": "dimension2 (internal ID: '10')"
+    },
+    "notes": "serverSideEvents is an inline JavaScript array pushed to dataLayer. Can be extracted by regex-parsing the script tag or evaluating in a JS context."
+  },
+  "promo_price_warning": {
+    "selector": ".jcpoffer-pricerange",
+    "example": "$27.49",
+    "explanation": "This is a promotional price shown with a coupon code (e.g., 'DOUBLE45'). It is NOT the actual product price. The regular/sale price structure is in .ae-normal-price and .ae-sale-price. Do NOT extract .jcpoffer-pricerange as the product price.",
+    "associated_elements": [
+      ".ae-discount-code__message-msg (shows 'Save Up to $22.50 (45%)')",
+      ".jcpoffer-bottom (shows coupon code details)"
+    ]
+  },
+  "confidence_score": 0.95
+}

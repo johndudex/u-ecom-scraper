@@ -3,7 +3,7 @@ import logging
 import os
 import subprocess
 import time
-from datetime import datetime, timezone as dt_timezone
+from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -135,6 +135,20 @@ def job_list(request):
 def job_detail(request, job_id):
     job = get_object_or_404(ScrapeJob, pk=job_id)
     steps = job.steps.all()
+    for step in steps:
+        if step.started_at and step.completed_at:
+            delta = (step.completed_at - step.started_at).total_seconds()
+            if delta < 60:
+                step.duration_str = f"{delta:.0f}s"
+            elif delta < 3600:
+                m, s = divmod(delta, 60)
+                step.duration_str = f"{m:.0f}m {s:.0f}s"
+            else:
+                h, rem = divmod(delta, 3600)
+                m, s = divmod(rem, 60)
+                step.duration_str = f"{h:.0f}h {m:.0f}m"
+        else:
+            step.duration_str = ""
     pending_approvals = job.approvals.filter(status=Approval.STATUS_PENDING).order_by(
         "-created_at"
     )
@@ -169,13 +183,13 @@ def job_detail(request, job_id):
     if job.site_folder:
         slug_candidates.append(job.site_folder)
     if job.site_name:
-        name_slug = job.name.lower().replace(" ", "-").replace(".", "-")
+        name_slug = job.site_name.lower().replace(" ", "-").replace(".", "-")
         for char in name_slug:
             if not char.isalnum() and char != "-":
                 name_slug = name_slug.replace(char, "-")
         slug_candidates.append(name_slug)
     for slug in slug_candidates:
-        scraper_path = f"/app/scrapers/{slug}/scraper.py"
+        scraper_path = os.path.join(settings.PROJECT_ROOT, "scrapers", slug, "scraper.py")
         if os.path.exists(scraper_path):
             try:
                 with open(scraper_path, "r") as f:
@@ -187,15 +201,25 @@ def job_detail(request, job_id):
                 pass
 
     if scraper_slug:
-        site_dir = os.path.join(settings.PROJECT_ROOT, scraper_slug)
+        site_dir = os.path.join(settings.PROJECT_ROOT, "scrapers", scraper_slug)
         if os.path.isdir(site_dir):
-            output_files = sorted(
-                [
-                    f for f in os.listdir(site_dir)
-                    if f.startswith("output_") and f.endswith(".json")
-                ],
-                reverse=True,
-            )
+            job_start = job.started_at
+            all_output = [
+                f for f in os.listdir(site_dir)
+                if f.startswith("output_") and f.endswith(".json")
+            ]
+            if job_start:
+                filtered = []
+                for f in all_output:
+                    try:
+                        ts = datetime.strptime(f, "output_%Y-%m-%d_%H%M%S.json").replace(tzinfo=dt_timezone.utc)
+                        if ts >= job_start - timedelta(seconds=120):
+                            filtered.append(f)
+                    except ValueError:
+                        filtered.append(f)
+                output_files = sorted(filtered, reverse=True)
+            else:
+                output_files = sorted(all_output, reverse=True)
 
     fc_approval = (
         job.approvals.filter(approval_type=Approval.TYPE_FIELD_CONFIRM)
@@ -271,7 +295,7 @@ def scraper_code(request, job_id):
                 name_slug = name_slug.replace(char, "-")
         slug_candidates.append(name_slug)
     for slug in slug_candidates:
-        scraper_path = f"/app/scrapers/{slug}/scraper.py"
+        scraper_path = os.path.join(settings.PROJECT_ROOT, "scrapers", slug, "scraper.py")
         if os.path.exists(scraper_path):
             with open(scraper_path, "r") as f:
                 content = f.read()

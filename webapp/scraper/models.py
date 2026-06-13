@@ -1,5 +1,15 @@
 from django.db import models
 from pathlib import Path
+import re
+from urllib.parse import urlparse
+
+
+def _normalize_url(url: str) -> str:
+    if not url:
+        return url
+    p = urlparse(url)
+    clean_path = re.sub(r"/{2,}", "/", p.path)
+    return p._replace(path=clean_path).geturl()
 
 
 def _sync_input_urls_file(instance):
@@ -8,9 +18,13 @@ def _sync_input_urls_file(instance):
         return
     try:
         from django.conf import settings
-        file_path = Path(settings.PROJECT_ROOT) / "scrapers" / instance.slug / "input_urls.json"
+
+        file_path = (
+            Path(settings.PROJECT_ROOT) / "scrapers" / instance.slug / "input_urls.json"
+        )
         file_path.parent.mkdir(parents=True, exist_ok=True)
         import json
+
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump({"urls": urls}, f, indent=2, ensure_ascii=False)
     except Exception:
@@ -99,7 +113,9 @@ class Step(models.Model):
 
     job = models.ForeignKey(ScrapeJob, related_name="steps", on_delete=models.CASCADE)
     phase = models.CharField(max_length=50, choices=PHASE_CHOICES)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING
+    )
     notes = models.TextField(blank=True, default="")
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
@@ -148,7 +164,9 @@ class Approval(models.Model):
     approval_type = models.CharField(max_length=30, choices=TYPE_CHOICES)
     question = models.TextField(blank=True, default="")
     response_data = models.JSONField(null=True, blank=True, default=dict)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING
+    )
     interrupt_value = models.JSONField(null=True, blank=True, default=dict)
     human_response = models.CharField(max_length=200, blank=True, default="")
     resolved_at = models.DateTimeField(null=True, blank=True)
@@ -244,6 +262,10 @@ class Site(models.Model):
         return f"{self.slug or self.url} ({self.status})"
 
     def save(self, **kwargs):
+        self.url = _normalize_url(self.url)
+        self.sample_url = _normalize_url(self.sample_url)
+        if self.input_urls:
+            self.input_urls = [_normalize_url(u) for u in self.input_urls]
         result = super().save(**kwargs)
         _sync_input_urls_file(self)
         return result
@@ -269,4 +291,5 @@ class ProbeCache(models.Model):
     def is_expired(self):
         from django.utils import timezone
         from datetime import timedelta
+
         return timezone.now() > self.cached_at + timedelta(hours=4)

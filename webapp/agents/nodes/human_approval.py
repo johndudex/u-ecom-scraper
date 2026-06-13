@@ -55,13 +55,18 @@ def human_approval(state: ScrapeState) -> dict:
             logger.info(
                 "human_approval: auto-detected testing_exhausted "
                 "(retries=%d, assessment=%s, confidence=%.2f)",
-                test_retries, assessment, confidence,
+                test_retries,
+                assessment,
+                confidence,
             )
 
     if not decisions and not options:
         logger.warning("human_approval: no decisions/options in state, using fallback")
         options = ["Continue", "Cancel"]
-        decisions = [{"type": "approve", "label": "Continue"}, {"type": "reject", "label": "Cancel"}]
+        decisions = [
+            {"type": "approve", "label": "Continue"},
+            {"type": "reject", "label": "Cancel"},
+        ]
 
     if not decisions:
         decisions = options_to_decisions(options)
@@ -95,4 +100,5 @@ def human_approval(state: ScrapeState) -> dict:
     return {
         "human_response": decision,
         "human_feedback": feedback,
+        "interrupt_reason": reason,
     }

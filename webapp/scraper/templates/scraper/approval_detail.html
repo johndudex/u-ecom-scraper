@@ -36,23 +36,24 @@
 
             <form method="post" action="{% url 'approval_detail' approval.id %}">
                 {% csrf_token %}
+
+                <textarea name="feedback" rows="2"
+                          placeholder="Optional feedback — this goes back to the agent..."
+                          class="w-full bg-brand-700/30 border border-brand-600/50 rounded-xl px-4 py-3 text-sm text-brand-50 placeholder-brand-500 focus:outline-none focus:border-cta/50 focus:ring-2 focus:ring-cta/20 resize-none mb-4"></textarea>
+
                 <div class="flex items-center gap-3 flex-wrap pt-5 border-t border-brand-700/30">
                     {% with decisions=approval.response_data.decisions %}
                     {% for dec in decisions %}
-                        {% if dec.type == 'reject' and dec.allow_feedback %}
-                            <button type="button" class="px-4 py-2.5 text-sm font-semibold rounded-xl bg-red-500/15 text-red-400 hover:bg-red-500/25 transition-colors cursor-pointer" onclick="document.getElementById('reject-section').classList.remove('hidden'); this.style.display='none';">{{ dec.label }}</button>
-                            <div class="hidden w-full mt-3" id="reject-section">
-                                <textarea name="feedback" rows="3" placeholder="What's wrong? This feedback goes back to the agent." class="w-full bg-brand-700/30 border border-brand-600/50 rounded-xl px-4 py-3 text-sm text-brand-50 placeholder-brand-500 focus:outline-none focus:border-red-500/50 focus:ring-2 focus:ring-red-500/20 resize-none mb-3"></textarea>
-                                <button type="submit" name="choice" value="{{ dec.label }}" class="px-4 py-2.5 text-sm font-semibold rounded-xl bg-red-500 text-white hover:bg-red-600 transition-colors cursor-pointer">Submit {{ dec.label }}</button>
-                            </div>
-                        {% else %}
-                            <button type="submit" name="choice" value="{{ dec.label }}" class="px-4 py-2.5 text-sm font-semibold rounded-xl transition-all duration-200 hover:-translate-y-0.5 cursor-pointer {% if dec.type == 'reject' %}bg-red-500/15 text-red-400 hover:bg-red-500/25{% elif dec.type == 'respond' %}bg-blue-500/15 text-blue-400 hover:bg-blue-500/25{% else %}bg-cta text-white hover:bg-cta-hover hover:shadow-lg hover:shadow-cta/20{% endif %}">
-                                {% if dec.type == 'approve' %}
-                                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" class="inline mr-1" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12.97 3.97a.75.75 0 011.06 0l7.5 7.5a.75.75 0 010 1.06l-7.5 7.5a.75.75 0 11-1.06-1.06l6.22-6.22H3a.75.75 0 010-1.5h16.19l-6.22-6.22a.75.75 0 010-1.06z" clip-rule="evenodd"/></svg>
-                                {% endif %}
-                                {{ dec.label }}
-                            </button>
-                        {% endif %}
+                        <button type="submit" name="choice" value="{{ dec.label }}"
+                                class="px-4 py-2.5 text-sm font-semibold rounded-xl transition-all duration-200 hover:-translate-y-0.5 cursor-pointer
+                                {% if dec.type == 'reject' %}bg-red-500/15 text-red-400 hover:bg-red-500/25
+                                {% elif dec.type == 'respond' %}bg-blue-500/15 text-blue-400 hover:bg-blue-500/25
+                                {% else %}bg-cta text-white hover:bg-cta-hover hover:shadow-lg hover:shadow-cta/20{% endif %}">
+                            {% if dec.type == 'approve' %}
+                            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" class="inline mr-1" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12.97 3.97a.75.75 0 011.06 0l7.5 7.5a.75.75 0 010 1.06l-7.5 7.5a.75.75 0 11-1.06-1.06l6.22-6.22H3a.75.75 0 010-1.5h16.19l-6.22-6.22a.75.75 0 010-1.06z" clip-rule="evenodd"/></svg>
+                            {% endif %}
+                            {{ dec.label }}
+                        </button>
                     {% empty %}
                         <button type="submit" name="choice" value="Approve" class="px-4 py-2.5 text-sm font-semibold rounded-xl bg-cta text-white hover:bg-cta-hover transition-all duration-200 hover:-translate-y-0.5 cursor-pointer hover:shadow-lg hover:shadow-cta/20">
                             <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" class="inline mr-1" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12.97 3.97a.75.75 0 011.06 0l7.5 7.5a.75.75 0 010 1.06l-7.5 7.5a.75.75 0 11-1.06-1.06l6.22-6.22H3a.75.75 0 010-1.5h16.19l-6.22-6.22a.75.75 0 010-1.06z" clip-rule="evenodd"/></svg>

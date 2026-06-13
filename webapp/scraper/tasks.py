@@ -15,8 +15,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import subprocess
-import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -75,7 +73,9 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False) -> None:
     job = ScrapeJob.objects.get(pk=job_id)
 
     if job.status in (ScrapeJob.STATUS_RUNNING, ScrapeJob.STATUS_WAITING_APPROVAL):
-        logger.warning("Job %d: skipping duplicate dispatch (status=%s)", job_id, job.status)
+        logger.warning(
+            "Job %d: skipping duplicate dispatch (status=%s)", job_id, job.status
+        )
         return
 
     try:
@@ -138,9 +138,15 @@ def _run_graph_job(job: ScrapeJob, rescrape: bool = False) -> None:
     from .log_handler import RedisLogHandler
 
     syslog_handler = RedisLogHandler()
-    syslog_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s [%(name)s] %(message)s", datefmt="%H:%M:%S"))
+    syslog_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)-5s [%(name)s] %(message)s", datefmt="%H:%M:%S"
+        )
+    )
     RedisLogHandler.set_job_id(job.id)
     root_logger = logging.getLogger()
+    _saved_root_level = root_logger.level
+    root_logger.setLevel(logging.INFO)
     root_logger.addHandler(syslog_handler)
 
     # ── Stream graph events ─────────────────────────────────────────────
@@ -150,9 +156,7 @@ def _run_graph_job(job: ScrapeJob, rescrape: bool = False) -> None:
         from langgraph.errors import GraphInterrupt
 
         if isinstance(exc, GraphInterrupt):
-            logger.info(
-                "Job %d: graph interrupted, waiting for human input", job.id
-            )
+            logger.info("Job %d: graph interrupted, waiting for human input", job.id)
             job.status = ScrapeJob.STATUS_WAITING_APPROVAL
             job.save(update_fields=["status"])
             _publish_job_status(job.id, ScrapeJob.STATUS_WAITING_APPROVAL)
@@ -160,15 +164,14 @@ def _run_graph_job(job: ScrapeJob, rescrape: bool = False) -> None:
         raise
     finally:
         RedisLogHandler.clear_job_id()
+        root_logger.setLevel(_saved_root_level)
         root_logger.removeHandler(syslog_handler)
         syslog_handler.close()
 
     # ── Check if the graph ended at an interrupt (stream_events may
     #    exit without raising). ───────────────────────────────────────────
     if _graph_is_interrupted(graph, config):
-        logger.info(
-            "Job %d: graph paused at interrupt, waiting for approval", job.id
-        )
+        logger.info("Job %d: graph paused at interrupt, waiting for approval", job.id)
         job.status = ScrapeJob.STATUS_WAITING_APPROVAL
         job.save(update_fields=["status"])
         _publish_job_status(job.id, ScrapeJob.STATUS_WAITING_APPROVAL)
@@ -193,7 +196,9 @@ def resume_scrape_task(job_id: int, human_response: Any) -> None:
     job = ScrapeJob.objects.get(pk=job_id)
 
     if job.status == ScrapeJob.STATUS_RUNNING:
-        logger.warning("Job %d: skipping duplicate resume dispatch (status=%s)", job_id, job.status)
+        logger.warning(
+            "Job %d: skipping duplicate resume dispatch (status=%s)", job_id, job.status
+        )
         return
 
     service = LangGraphService()
@@ -204,9 +209,15 @@ def resume_scrape_task(job_id: int, human_response: Any) -> None:
     from .log_handler import RedisLogHandler
 
     syslog_handler = RedisLogHandler()
-    syslog_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s [%(name)s] %(message)s", datefmt="%H:%M:%S"))
+    syslog_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)-5s [%(name)s] %(message)s", datefmt="%H:%M:%S"
+        )
+    )
     RedisLogHandler.set_job_id(job.id)
     root_logger = logging.getLogger()
+    _saved_root_level = root_logger.level
+    root_logger.setLevel(logging.INFO)
     root_logger.addHandler(syslog_handler)
 
     try:
@@ -236,6 +247,7 @@ def resume_scrape_task(job_id: int, human_response: Any) -> None:
         return
     finally:
         RedisLogHandler.clear_job_id()
+        root_logger.setLevel(_saved_root_level)
         root_logger.removeHandler(syslog_handler)
         syslog_handler.close()
 
@@ -344,15 +356,14 @@ def _finalize_job(job: ScrapeJob) -> None:
     job.product_count = final_state.get("product_count", job.product_count)
     job.output_file = final_state.get("output_file", job.output_file)
     job.site_name = final_state.get("site_name", job.site_name)
-    job.site_folder = (
-        f"scrapers/{site_slug}" if site_slug else job.site_folder
-    )
+    job.site_folder = f"scrapers/{site_slug}" if site_slug else job.site_folder
     job.error_message = final_state.get("error_message", job.error_message)
 
     # ── Override from output file (ground truth from scraper) ───────────
     if job.output_file:
         try:
             import pathlib
+
             root = pathlib.Path(settings.PROJECT_ROOT)
             p = pathlib.Path(job.output_file)
             scrapers_p = root / "scrapers" / site_slug / p.name if site_slug else p
@@ -371,7 +382,8 @@ def _finalize_job(job: ScrapeJob) -> None:
                 products = out_data.get("products", [])
                 if products:
                     successful = [
-                        prod for prod in products
+                        prod
+                        for prod in products
                         if prod.get("title") and prod.get("status_code", 0) > 0
                     ]
                     job.product_count = len(successful)
@@ -380,25 +392,39 @@ def _finalize_job(job: ScrapeJob) -> None:
                 job.output_file = str(p)
                 logger.info(
                     "Job %d: updated from output file — platform=%s, method=%s, products=%d",
-                    job.id, job.platform, job.scraping_method, job.product_count,
+                    job.id,
+                    job.platform,
+                    job.scraping_method,
+                    job.product_count,
                 )
         except Exception as exc:
-            logger.warning("Job %d: could not read output file for overrides: %s", job.id, exc)
+            logger.warning(
+                "Job %d: could not read output file for overrides: %s", job.id, exc
+            )
 
     # ── Move analysis artifacts to scrapers folder (preserve for debugging) ──
     if site_slug:
         try:
             import shutil
+
             ws = Path(settings.PROJECT_ROOT) / "workspace" / site_slug
-            analysis_dir = Path(settings.PROJECT_ROOT) / "scrapers" / site_slug / "analysis"
+            analysis_dir = (
+                Path(settings.PROJECT_ROOT) / "scrapers" / site_slug / "analysis"
+            )
             if ws.is_dir():
                 analysis_dir.mkdir(parents=True, exist_ok=True)
-                for artifact in ["site_analysis.json", "product_analysis.json",
-                                 "scraper_analysis.json", "test_report.json"]:
+                for artifact in [
+                    "site_analysis.json",
+                    "product_analysis.json",
+                    "scraper_analysis.json",
+                    "test_report.json",
+                ]:
                     src = ws / artifact
                     if src.is_file():
                         shutil.copy2(src, analysis_dir / artifact)
-                        logger.info("Job %d: preserved %s to analysis/", job.id, artifact)
+                        logger.info(
+                            "Job %d: preserved %s to analysis/", job.id, artifact
+                        )
                 shutil.rmtree(ws, ignore_errors=True)
                 logger.info("Job %d: cleaned workspace/%s/", job.id, site_slug)
         except Exception as exc:
@@ -424,12 +450,16 @@ def _finalize_job(job: ScrapeJob) -> None:
                 db_site.platform = job.platform or db_site.platform
                 db_site.scraping_method = job.scraping_method or db_site.scraping_method
                 db_site.product_count = job.product_count
-                db_site.status = "complete" if job.status == ScrapeJob.STATUS_COMPLETED else "failed"
+                db_site.status = (
+                    "complete" if job.status == ScrapeJob.STATUS_COMPLETED else "failed"
+                )
                 db_site.last_scraped_at = timezone.now()
                 if job.site_name:
                     db_site.name = job.site_name
 
-                scraper_path = os.path.join(settings.PROJECT_ROOT, "scrapers", site_slug, "scraper.py")
+                scraper_path = os.path.join(
+                    settings.PROJECT_ROOT, "scrapers", site_slug, "scraper.py"
+                )
                 if os.path.isfile(scraper_path):
                     db_site.has_scraper = True
                     db_site.default_scraper_path = scraper_path
@@ -437,19 +467,26 @@ def _finalize_job(job: ScrapeJob) -> None:
                 db_site.save()
                 logger.info(
                     "Job %d: updated Site (method=%s, products=%d, has_scraper=%s)",
-                    job.id, job.scraping_method, job.product_count, db_site.has_scraper,
+                    job.id,
+                    job.scraping_method,
+                    job.product_count,
+                    db_site.has_scraper,
                 )
         except Exception as exc:
             logger.warning("Job %d: Site update failed: %s", job.id, exc)
 
-    # ── Close any running steps ─────────────────────────────────────────
+    # ── Close any running or pending steps (graph finished but some
+    #    deterministic nodes like field_confirmation/execution never update
+    #    their own step status). ────────────────────────────────────────────
     try:
-        for step_obj in job.steps.filter(status=Step.STATUS_RUNNING):
+        for step_obj in job.steps.filter(
+            status__in=(Step.STATUS_RUNNING, Step.STATUS_PENDING)
+        ):
             step_obj.status = Step.STATUS_DONE
             step_obj.completed_at = timezone.now()
             step_obj.save()
     except Exception as exc:
-        logger.warning("Failed to close running steps for job %d: %s", job.id, exc)
+        logger.warning("Failed to close steps for job %d: %s", job.id, exc)
 
     job.completed_at = timezone.now()
     job.save(
@@ -507,9 +544,3 @@ def _graph_is_interrupted(graph: Any, config: dict[str, Any]) -> bool:
     except Exception as exc:
         logger.debug("Could not check interrupt state: %s", exc)
     return False
-    try:
-        with open(output_path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        return len(data.get("products", []))
-    except Exception:
-        return 0

@@ -1,0 +1,63 @@
+{
+  "site": {
+    "url": "https://www.adameve.com",
+    "name": "Adam & Eve",
+    "platform": "custom",
+    "platform_details": "Proprietary ASP.NET e-commerce platform with inline JavaScript configuration (phe.config), server-side rendering, HawkSearch integration for search/recommendations, and extensive dataLayer product data. Uses .aspx URL extensions.",
+    "scraping_mechanism": "http_requests",
+    "mechanism_justification": "Direct HTTP requests work without any anti-bot protection. Product pages are server-rendered with rich product data available in Open Graph meta tags, inline serverSideEvents JavaScript objects, and HTML DOM. No JavaScript rendering is needed."
+  },
+  "anti_bot": {
+    "detected": false,
+    "type": "none",
+    "severity": "low",
+    "details": "No anti-bot protection detected. Direct HTTP access returns full page content. Uses OneTrust for cookie consent (compliance, not anti-bot). Has ASP.NET anti-forgery tokens for form submissions but not for page reads."
+  },
+  "connectivity": {
+    "method_that_worked": "direct_http",
+    "proxy_tier": "none",
+    "js_rendering_needed": false,
+    "anti_bot_detected": false,
+    "notes": "Direct HTTP connection works perfectly. No proxy needed. No JavaScript rendering required. Page content is fully server-rendered."
+  },
+  "product_data_extraction": {
+    "primary_sources": [
+      {
+        "source": "og_meta_tags",
+        "description": "Open Graph meta tags contain price (og:price:amount), currency (og:price:currency), brand (og:brand), availability (og:availability), title, description, and product image URL."
+      },
+      {
+        "source": "serverSideEvents_dataLayer",
+        "description": "Inline JavaScript serverSideEvents array contains structured product data: Sku, ProductName, Price, Brand, Colors, Sizes, stock_status (dimension7), category path, product ID (dimension1), subcategory (dimension2), star rating (metric2), review count (metric4)."
+      },
+      {
+        "source": "html_dom",
+        "description": "Server-rendered HTML DOM contains product name, price, images, description, variants/colors, sizes, reviews, and breadcrumb navigation."
+      }
+    ],
+    "key_selectors": {
+      "og_price": "meta[property='og:price:amount']",
+      "og_currency": "meta[property='og:price:currency']",
+      "og_brand": "meta[property='og:brand']",
+      "og_availability": "meta[property='og:availability']",
+      "og_image": "meta[property='og:image']",
+      "og_title": "meta[property='og:title']",
+      "serverSideEvents": "script: serverSideEvents variable in inline JS",
+      "canonical": "link[rel='canonical']"
+    }
+  },
+  "product_discovery": {
+    "method": "product_url_pattern",
+    "product_url_pattern": "/{category-path}/{slug}-{product-id}.aspx",
+    "url_pattern_notes": "Product URLs follow the pattern: /{category}/{subcategory}/{sub-subcategory}/{sp-prefix}-{slug}-{numeric-id}.aspx. The numeric ID before .aspx is the product identifier. The 'sp-' prefix appears on all product slugs. Categories form a hierarchical path (e.g., /lingerie/womens-wear/baby-dolls/).",
+    "sample_product_urls": [
+      "https://www.adameve.com/lingerie/womens-wear/baby-dolls/sp-hypnotic-swirl-cupless-crotchless-babydoll-91407.aspx"
+    ],
+    "product_id_pattern": "Numeric ID at end of URL before .aspx (e.g., 91407). Also has internal SKU code like '143H' available in dataLayer."
+  },
+  "rate_limiting": {
+    "recommended_delay_seconds": 2,
+    "justification": "No anti-bot protection detected, but being a large retail site with standard ASP.NET infrastructure, moderate delays (1-2 seconds) are prudent to avoid triggering any server-side rate limits."
+  },
+  "confidence_score": 0.95
+}
