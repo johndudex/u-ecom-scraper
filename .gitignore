@@ -60,6 +60,9 @@ webapp/staticfiles/
 # Binary
 opencode-binary
 
+# Scripts data
+scripts/sites_fixture.json
+
 # OS
 .DS_Store
 Thumbs.db
