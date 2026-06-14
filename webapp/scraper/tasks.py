@@ -571,7 +571,7 @@ def cleanup_stuck_jobs() -> None:
     threshold = timezone.now() - timezone.timedelta(minutes=STUCK_JOB_ACTIVITY_TIMEOUT_MINUTES)
     stuck_jobs = ScrapeJob.objects.filter(
         status=ScrapeJob.STATUS_RUNNING,
-    ).select_related("site")
+    )
 
     if not stuck_jobs.exists():
         return
