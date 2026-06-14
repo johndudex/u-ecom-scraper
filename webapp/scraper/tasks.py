@@ -544,3 +544,72 @@ def _graph_is_interrupted(graph: Any, config: dict[str, Any]) -> bool:
     except Exception as exc:
         logger.debug("Could not check interrupt state: %s", exc)
     return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Stuck-job watchdog
+# ═══════════════════════════════════════════════════════════════════════════
+
+STUCK_JOB_ACTIVITY_TIMEOUT_MINUTES = 15
+
+
+@shared_task
+def cleanup_stuck_jobs() -> None:
+    """Detect and fail jobs whose worker has crashed (no recent activity).
+
+    A healthy running job continuously produces SessionLog entries (tool
+    calls, LLM responses).  If there are no new entries for longer than
+    ``STUCK_JOB_ACTIVITY_TIMEOUT_MINUTES``, the worker almost certainly
+    crashed (OOM, segfault, etc.) and the job must be manually marked
+    as failed — otherwise it stays RUNNING forever.
+
+    Jobs in WAITING_APPROVAL are untouched — they are genuinely waiting
+    for human input.
+    """
+    from scraper.models import SessionLog
+
+    threshold = timezone.now() - timezone.timedelta(minutes=STUCK_JOB_ACTIVITY_TIMEOUT_MINUTES)
+    stuck_jobs = ScrapeJob.objects.filter(
+        status=ScrapeJob.STATUS_RUNNING,
+    ).select_related("site")
+
+    if not stuck_jobs.exists():
+        return
+
+    failed = 0
+    for job in stuck_jobs:
+        latest_activity_qs = SessionLog.objects.filter(job=job).order_by("-created_at")
+        if latest_activity_qs.exists():
+            last_activity = latest_activity_qs.first().created_at
+        else:
+            last_activity = job.started_at
+
+        if last_activity >= threshold:
+            continue
+
+        idle_minutes = int((timezone.now() - last_activity).total_seconds() / 60)
+        error_msg = f"Worker process crashed (no activity for {idle_minutes} min). Likely OOM killed."
+
+        logger.error(
+            "Stuck job %d: no activity for %d min (last: %s), marking as failed",
+            job.id,
+            idle_minutes,
+            last_activity.isoformat(timespec="seconds"),
+        )
+        job.status = ScrapeJob.STATUS_FAILED
+        job.error_message = error_msg
+        job.completed_at = timezone.now()
+        job.save(update_fields=["status", "error_message", "completed_at"])
+
+        Step.objects.filter(
+            job=job, status__in=(Step.STATUS_RUNNING, Step.STATUS_PENDING)
+        ).update(
+            status=Step.STATUS_FAILED,
+            completed_at=timezone.now(),
+        )
+
+        _publish_job_status(job.id, ScrapeJob.STATUS_FAILED)
+        failed += 1
+
+    if failed:
+        logger.warning("Stuck-job watchdog: marked %d job(s) as failed", failed)

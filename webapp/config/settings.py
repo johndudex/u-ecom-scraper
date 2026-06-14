@@ -82,6 +82,12 @@ CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = "UTC"
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
+CELERY_BEAT_SCHEDULE = {
+    "cleanup-stuck-jobs": {
+        "task": "scraper.tasks.cleanup_stuck_jobs",
+        "schedule": 300.0,
+    },
+}
 
 ZAI_API_KEY = config("ZAI_API_KEY", default="")
 ZAI_BASE_URL = config("ZAI_BASE_URL", default="https://api.z.ai/api/coding/paas/v4/")
