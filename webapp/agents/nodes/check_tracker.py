@@ -118,15 +118,26 @@ def check_tracker(state: ScrapeState) -> Command:
 def _handle_new_site(url: str, slug: str) -> Command:
     try:
         from scraper.models import Site
-        Site.objects.create(
-            url=url.rstrip("/"),
-            name=slug,
-            slug=slug,
-            status="in_progress",
-        )
-        logger.info("check_tracker: new site created → %s", slug)
+
+        site = Site.objects.filter(url=url.rstrip("/")).first()
+        if site:
+            site.status = "in_progress"
+            site.save(update_fields=["status"])
+            logger.info(
+                "check_tracker: existing site '%s' updated to in_progress (was %s)",
+                slug,
+                site.status,
+            )
+        else:
+            Site.objects.create(
+                url=url.rstrip("/"),
+                name=slug,
+                slug=slug,
+                status="in_progress",
+            )
+            logger.info("check_tracker: new site created → %s", slug)
     except Exception as exc:
-        logger.warning("check_tracker: failed to create site: %s", exc)
+        logger.warning("check_tracker: failed to create/update site: %s", exc)
 
     return Command(
         update={

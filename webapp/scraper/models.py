@@ -66,6 +66,7 @@ class ScrapeJob(models.Model):
     output_file = models.CharField(max_length=500, blank=True, default="")
     site_folder = models.CharField(max_length=500, blank=True, default="")
     full_extraction = models.BooleanField(default=False)
+    auto_queued = models.BooleanField(default=False)
 
     error_message = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)

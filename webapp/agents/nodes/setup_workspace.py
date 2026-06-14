@@ -100,6 +100,22 @@ def setup_workspace(state: ScrapeState) -> dict[str, Any]:
     if removed:
         logger.info("setup_workspace: cleaned %d stale artifacts from %s", removed, slug)
 
+    if state.get("skip_code_generation"):
+        draft_in_ws = os.path.join(workspace_dir, "scraper_draft.py")
+        if not os.path.isfile(draft_in_ws):
+            scraper_in_final = os.path.join(scrapers_dir, "scraper.py")
+            if os.path.isfile(scraper_in_final):
+                try:
+                    shutil.copy2(scraper_in_final, draft_in_ws)
+                    logger.info(
+                        "setup_workspace: restored scraper_draft.py from %s (cleanup had moved it)",
+                        scraper_in_final,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "setup_workspace: failed to restore scraper_draft.py: %s", exc
+                    )
+
     input_urls = state.get("input_urls") or []
     if input_urls:
         input_path = os.path.join(workspace_dir, "input_urls.json")

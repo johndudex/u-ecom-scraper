@@ -140,7 +140,7 @@ def get_shell_tools(
     @tool
     def run_scraper(
         scraper_path: str,
-        args: str = "",
+        cli_args: str = "",
         timeout: int = 300,
         extra_args: Optional[list] = None,
     ) -> str:
@@ -153,18 +153,18 @@ def get_shell_tools(
 
         Args:
             scraper_path: Path to the scraper Python file.
-            args: Additional CLI arguments as a string (e.g. "--sample --limit 5").
+            cli_args: Additional CLI arguments as a string (e.g. "--sample --limit 5").
             timeout: Maximum execution time in seconds (default 300).
-            extra_args: Internal — do not use.  Alias for ``args`` accepted as a
-                list.  Some LLM providers emit ``extra_args`` instead of ``args``.
+            extra_args: Internal — do not use.  Alias for ``cli_args`` accepted as a
+                list.  Some LLM providers emit ``extra_args`` instead of ``cli_args``.
         """
         full_path = scraper_path if os.path.isabs(scraper_path) else os.path.join(cwd, scraper_path)
         needs_browser = _scraper_needs_browser(full_path)
-        if extra_args and not args:
-            logger.info("run_scraper: remapping extra_args=%s → args", extra_args)
+        if extra_args and not cli_args:
+            logger.info("run_scraper: remapping extra_args=%s → cli_args", extra_args)
             cmd_args = list(extra_args)
         else:
-            cmd_args = args.split() if args else []
+            cmd_args = cli_args.split() if cli_args else []
 
         if needs_browser:
             logger.info("run_scraper: browser-based, dispatching to browser-service: %s", scraper_path)

@@ -206,6 +206,7 @@ def _build_agent(agent_name: str, site_slug: str = "") -> object:
             )
             system_prompt += BROWSER_UNAVAILABLE_WARNING
 
+    tools = _strip_v_prefix_from_tools(tools)
     llm = get_main_llm(temperature)
 
     logger.info(
@@ -218,6 +219,40 @@ def _build_agent(agent_name: str, site_slug: str = "") -> object:
 
     agent = create_react_agent(llm, tools=tools, prompt=system_prompt)
     return agent
+
+
+def _strip_v_prefix_from_tools(tools: list) -> list:
+    """Monkey-patch ``BaseTool._parse_input`` to strip ``v__`` prefixes.
+
+    The GLM model emits tool-call arguments with a ``v__`` prefix (e.g.
+    ``v__command`` instead of ``command``).  LangChain's ``_parse_input``
+    validates via Pydantic but then checks the **original** raw input dict
+    to decide which fields to pass to the tool function — so a Pydantic
+    ``model_validator`` alone is insufficient.  We override
+    ``BaseTool._parse_input`` globally to strip prefixes from the raw
+    input before any validation occurs.
+
+    Idempotent — the patch is applied once on first call.
+    """
+    from langchain_core.tools import BaseTool
+
+    if getattr(BaseTool, "_v_prefix_patch_applied", False):
+        return tools
+
+    _original_parse_input = BaseTool._parse_input
+
+    def _patched_parse_input(self, tool_input, tool_call_id):
+        if isinstance(tool_input, dict):
+            tool_input = {
+                (k[3:] if k.startswith("v__") else k): v
+                for k, v in tool_input.items()
+            }
+        return _original_parse_input(self, tool_input, tool_call_id)
+
+    BaseTool._parse_input = _patched_parse_input
+    BaseTool._v_prefix_patch_applied = True
+
+    return tools
 
 
 def _has_playwright_tools(tools: list) -> bool:

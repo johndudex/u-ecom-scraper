@@ -613,3 +613,125 @@ def cleanup_stuck_jobs() -> None:
 
     if failed:
         logger.warning("Stuck-job watchdog: marked %d job(s) as failed", failed)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Periodic scheduler
+# ═══════════════════════════════════════════════════════════════════════════
+
+AUTO_APPROVE_MINUTES = 10
+
+
+@shared_task
+def schedule_next_site() -> None:
+    """Pick the next site to scrape and queue a job if nothing is running.
+
+    Priority order:
+    1. Sites with ``status="new"`` (oldest first — never scraped).
+    2. Sites with ``status="failed"`` (oldest failure first) — only when
+       no new sites remain.
+
+    Gate conditions:
+    - No jobs with status RUNNING or PENDING.
+    - Before queueing, auto-approve any WAITING_APPROVAL job that was
+      auto-queued and has been waiting longer than
+      ``AUTO_APPROVE_MINUTES`` minutes.
+    """
+    from scraper.models import Site
+
+    active_statuses = {ScrapeJob.STATUS_RUNNING, ScrapeJob.STATUS_PENDING}
+    if ScrapeJob.objects.filter(status__in=active_statuses).exists():
+        return
+
+    _auto_approve_stale_jobs()
+
+    if ScrapeJob.objects.filter(status__in=active_statuses).exists():
+        return
+
+    new_site = (
+        Site.objects.filter(status="new", input_urls__len__gt=0)
+        .order_by("created_at")
+        .first()
+    )
+
+    if new_site is None:
+        failed_site = (
+            Site.objects.filter(status="failed", input_urls__len__gt=0)
+            .order_by("updated_at")
+            .first()
+        )
+        if failed_site is None:
+            return
+        new_site = failed_site
+
+    slug = new_site.slug or _generate_slug(new_site.url)
+    scrapers_dir = os.path.join(settings.PROJECT_ROOT, "scrapers", slug)
+    os.makedirs(scrapers_dir, exist_ok=True)
+    input_urls_path = os.path.join(scrapers_dir, "input_urls.json")
+    if new_site.input_urls:
+        with open(input_urls_path, "w", encoding="utf-8") as f:
+            json.dump({"urls": new_site.input_urls}, f, indent=2, ensure_ascii=False)
+
+    job = ScrapeJob.objects.create(
+        url=new_site.url,
+        product_url=new_site.sample_url or "",
+        currency=new_site.currency or "",
+        full_extraction=True,
+        auto_queued=True,
+    )
+
+    new_site.status = "in_progress"
+    new_site.save(update_fields=["status"])
+
+    run_scrape_task.delay(job.id, rescrape=False)
+    job.celery_task_id = run_scrape_task.request.id
+    job.save(update_fields=["celery_task_id"])
+
+    logger.info(
+        "Scheduler: queued %s (%s, urls=%d) → job #%d",
+        new_site.url,
+        new_site.status,
+        len(new_site.input_urls),
+        job.id,
+    )
+
+
+def _auto_approve_stale_jobs() -> None:
+    """Auto-approve WAITING_APPROVAL jobs that were auto-queued.
+
+    Only affects jobs where ``auto_queued=True`` and the approval has been
+    pending for longer than ``AUTO_APPROVE_MINUTES`` minutes.
+    """
+    from scraper.models import Approval
+
+    threshold = timezone.now() - timezone.timedelta(minutes=AUTO_APPROVE_MINUTES)
+    stale_approvals = (
+        Approval.objects.filter(
+            status=Approval.STATUS_PENDING,
+            job__status=ScrapeJob.STATUS_WAITING_APPROVAL,
+            job__auto_queued=True,
+            created_at__lt=threshold,
+        )
+        .select_related("job")
+        .order_by("created_at")
+    )
+
+    approved = 0
+    for approval in stale_approvals:
+        job = approval.job
+        logger.info(
+            "Auto-approve: job #%d approval %s (waiting since %s)",
+            job.id,
+            approval.get_approval_type_display(),
+            approval.created_at.isoformat(timespec="seconds"),
+        )
+        approval.status = Approval.STATUS_APPROVED
+        approval.human_response = "auto-approved"
+        approval.resolved_at = timezone.now()
+        approval.save()
+
+        resume_scrape_task.delay(job.id, "approve")
+        approved += 1
+
+    if approved:
+        logger.info("Auto-approve: approved %d stale job(s)", approved)

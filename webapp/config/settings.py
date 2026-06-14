@@ -87,6 +87,10 @@ CELERY_BEAT_SCHEDULE = {
         "task": "scraper.tasks.cleanup_stuck_jobs",
         "schedule": 300.0,
     },
+    "schedule-next-site": {
+        "task": "scraper.tasks.schedule_next_site",
+        "schedule": 300.0,
+    },
 }
 
 ZAI_API_KEY = config("ZAI_API_KEY", default="")
