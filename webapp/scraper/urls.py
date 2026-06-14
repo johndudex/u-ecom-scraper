@@ -15,6 +15,7 @@ urlpatterns = [
     path("sites/<int:site_id>/output/<str:filename>/", views.site_output_view, name="site_output_view"),
     path("sites/<int:site_id>/output/<str:filename>/download/", views.site_output_download, name="site_output_download"),
     path("sites/<int:site_id>/sync-urls/", views.site_sync_urls, name="site_sync_urls"),
+    path("schedule-next/", views.schedule_next, name="schedule_next"),
     path("probe-cache/", views.probe_cache, name="probe_cache"),
     path("jobs/", views.job_list, name="job_list"),
     path("jobs/<int:job_id>/", views.job_detail, name="job_detail"),

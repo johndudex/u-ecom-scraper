@@ -85,6 +85,14 @@
         </form>
     </div>
 
+    <form method="post" action="{% url 'schedule_next' %}" class="mb-6">
+        {% csrf_token %}
+        <button type="submit" class="w-full bg-brand-700/50 hover:bg-brand-600/60 text-brand-200 hover:text-brand-100 font-semibold text-sm py-3 px-6 rounded-xl transition-all duration-200 border border-brand-600/40 hover:border-brand-500/50 flex items-center justify-center gap-2 cursor-pointer">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3 4.5h14.25M3 9h9.75M3 13.5h5.25m5.25-.75L17.25 9m0 0L21 12.75M17.25 9v3.75M21 12.75H16.5"/></svg>
+            Schedule Next Site
+        </button>
+    </form>
+
     {% if recent_jobs %}
     <div class="rounded-2xl bg-surface border border-brand-700/30 overflow-hidden">
         <div class="px-5 py-3.5 flex items-center justify-between border-b border-brand-700/30">

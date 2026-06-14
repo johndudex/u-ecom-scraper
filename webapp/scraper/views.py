@@ -1048,3 +1048,21 @@ def site_sync_urls(request, site_id):
         json.dump({"urls": urls}, f, indent=2, ensure_ascii=False)
     logger.info("Synced %d URLs to %s", len(urls), input_path)
     return redirect("site_detail", site_id=site.id)
+
+
+@login_required
+def schedule_next(request):
+    if request.method != "POST":
+        return redirect("home")
+
+    from .tasks import _do_schedule_next_site
+
+    result = _do_schedule_next_site()
+
+    if request.headers.get("x-requested-with") == "XMLHttpRequest":
+        return JsonResponse(result)
+
+    if result.get("action") == "queued":
+        return redirect("job_detail", job_id=result["job_id"])
+
+    return redirect("home")

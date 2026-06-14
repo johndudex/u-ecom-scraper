@@ -622,46 +622,55 @@ def cleanup_stuck_jobs() -> None:
 AUTO_APPROVE_MINUTES = 10
 
 
-@shared_task
-def schedule_next_site() -> None:
-    """Pick the next site to scrape and queue a job if nothing is running.
+def _do_schedule_next_site() -> dict:
+    """Core scheduling logic — pick next site and queue a scrape job.
 
-    Priority order:
-    1. Sites with ``status="new"`` (oldest first — never scraped).
-    2. Sites with ``status="failed"`` (oldest failure first) — only when
-       no new sites remain.
+    Returns a dict describing what happened, suitable for logging or
+    rendering in the UI::
 
-    Gate conditions:
-    - No jobs with status RUNNING or PENDING.
-    - Before queueing, auto-approve any WAITING_APPROVAL job that was
-      auto-queued and has been waiting longer than
-      ``AUTO_APPROVE_MINUTES`` minutes.
+        {"action": "queued", "site": "<slug>", "site_url": "<url>",
+         "job_id": 42, "url_count": 15}
+        {"action": "skipped", "reason": "..."}
+        {"action": "idle", "reason": "..."}
     """
     from scraper.models import Site
 
     active_statuses = {ScrapeJob.STATUS_RUNNING, ScrapeJob.STATUS_PENDING}
-    if ScrapeJob.objects.filter(status__in=active_statuses).exists():
-        return
+    active_count = ScrapeJob.objects.filter(status__in=active_statuses).count()
+    if active_count:
+        return {
+            "action": "skipped",
+            "reason": f"{active_count} RUNNING/PENDING job(s)",
+        }
 
     _auto_approve_stale_jobs()
 
-    if ScrapeJob.objects.filter(status__in=active_statuses).exists():
-        return
+    active_count = ScrapeJob.objects.filter(status__in=active_statuses).count()
+    if active_count:
+        return {
+            "action": "skipped",
+            "reason": f"auto-approved a WAITING job that resumed (now {active_count} active)",
+        }
 
     new_site = (
-        Site.objects.filter(status="new", input_urls__len__gt=0)
+        Site.objects.filter(status="new")
+        .exclude(input_urls=[])
         .order_by("created_at")
         .first()
     )
 
     if new_site is None:
         failed_site = (
-            Site.objects.filter(status="failed", input_urls__len__gt=0)
+            Site.objects.filter(status="failed")
+            .exclude(input_urls=[])
             .order_by("updated_at")
             .first()
         )
         if failed_site is None:
-            return
+            return {
+                "action": "idle",
+                "reason": "no new or failed sites with input_urls",
+            }
         new_site = failed_site
 
     slug = new_site.slug or _generate_slug(new_site.url)
@@ -687,13 +696,31 @@ def schedule_next_site() -> None:
     job.celery_task_id = run_scrape_task.request.id
     job.save(update_fields=["celery_task_id"])
 
-    logger.info(
-        "Scheduler: queued %s (%s, urls=%d) → job #%d",
-        new_site.url,
-        new_site.status,
-        len(new_site.input_urls),
-        job.id,
-    )
+    return {
+        "action": "queued",
+        "site": slug,
+        "site_url": new_site.url,
+        "job_id": job.id,
+        "url_count": len(new_site.input_urls),
+    }
+
+
+@shared_task
+def schedule_next_site() -> None:
+    """Periodic beat task — pick next site and queue a scrape job."""
+    result = _do_schedule_next_site()
+    action = result.get("action")
+    if action == "queued":
+        logger.info(
+            "Scheduler: queued %s (%d urls) → job #%d",
+            result["site_url"],
+            result["url_count"],
+            result["job_id"],
+        )
+    elif action == "skipped":
+        logger.info("Scheduler: skipped — %s", result["reason"])
+    else:
+        logger.info("Scheduler: idle — %s", result["reason"])
 
 
 def _auto_approve_stale_jobs() -> None:
