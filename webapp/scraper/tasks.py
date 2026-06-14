@@ -635,21 +635,14 @@ def _do_schedule_next_site() -> dict:
     """
     from scraper.models import Site
 
-    active_statuses = {ScrapeJob.STATUS_RUNNING, ScrapeJob.STATUS_PENDING}
-    active_count = ScrapeJob.objects.filter(status__in=active_statuses).count()
-    if active_count:
-        return {
-            "action": "skipped",
-            "reason": f"{active_count} RUNNING/PENDING job(s)",
-        }
-
     _auto_approve_stale_jobs()
 
+    active_statuses = {ScrapeJob.STATUS_RUNNING, ScrapeJob.STATUS_PENDING, ScrapeJob.STATUS_WAITING_APPROVAL}
     active_count = ScrapeJob.objects.filter(status__in=active_statuses).count()
     if active_count:
         return {
             "action": "skipped",
-            "reason": f"auto-approved a WAITING job that resumed (now {active_count} active)",
+            "reason": f"{active_count} active job(s) (RUNNING/PENDING/WAITING_APPROVAL)",
         }
 
     new_site = (
@@ -692,8 +685,8 @@ def _do_schedule_next_site() -> dict:
     new_site.status = "in_progress"
     new_site.save(update_fields=["status"])
 
-    run_scrape_task.delay(job.id, rescrape=False)
-    job.celery_task_id = run_scrape_task.request.id
+    celery_task = run_scrape_task.delay(job.id, rescrape=False)
+    job.celery_task_id = celery_task.id
     job.save(update_fields=["celery_task_id"])
 
     return {
