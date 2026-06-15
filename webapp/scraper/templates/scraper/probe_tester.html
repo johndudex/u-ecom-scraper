@@ -74,7 +74,14 @@
             </div>
 
             <div class="flex items-center gap-3">
-                <button type="submit" id="run-btn"
+                <div class="flex-1 max-w-xs">
+                    <label for="country" class="block text-xs font-semibold text-brand-400 mb-1.5">Country Code (auto)</label>
+                    <input type="text" id="country" name="country"
+                        class="w-full bg-brand-700/30 border border-brand-600/50 rounded-lg px-3 py-2.5 text-xs text-brand-50 placeholder-brand-500 focus:outline-none focus:border-cta/50 focus:ring-2 focus:ring-cta/20 transition-colors duration-200"
+                        placeholder="auto-detect" value="">
+                </div>
+                <div class="flex items-end gap-3">
+                    <button type="submit" id="run-btn"
                     class="bg-cta hover:bg-cta-hover text-white font-semibold text-sm py-3 px-6 rounded-xl transition-all duration-200 hover:shadow-lg hover:shadow-cta/20 hover:-translate-y-0.5 active:translate-y-0 cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
                     <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M5.636 5.636a9 9 0 1012 12.728M6.343 7.757a3 3 0 019-4.243 4.125 4.125M13.5 12.25a9 9 0 019-6.363 6.363m0 0 0-4.243 4.125L4.757 13.5m12.743 1.743a3 3 0 00-4.243-4.243m0 0 00-4.243 4.244"/></svg>
                     Run Tests
@@ -136,6 +143,29 @@
 
     function methodDisplayName(m) {
         return m.replace('playwright_', 'playwright ').replace('uc_chrome_', 'uc_chrome ');
+    }
+
+    const COUNTRY_REMAP = {"uk": "gb"};
+    const COUNTRY_CODES = new Set(["au","nz","ca","de","fr","br","mx","jp","sg","hk","in","ie","es","it","nl","tr","za","se","ch","at","be","dk","fi","no","pl","pt","ar","cl","pe","us","ru","cn","kr","th","id","my","ph","vn","ae","sa","il","eg","ng","ke","gh","co","cr"]);
+
+    function detectCountryCode(url) {
+        try {
+            const hostname = new URL(url).hostname;
+            const parts = hostname.split(".");
+            if (parts.length < 2) return '';
+            const tld = parts[parts.length - 1].toLowerCase();
+            if (COUNTRY_REMAP[tld]) return COUNTRY_REMAP[tld];
+            if (COUNTRY_CODES.has(tld)) return tld;
+            return '';
+        } catch(e) { return ''; }
+    }
+
+    function getCountry() {
+        const manual = document.getElementById('country').value.trim();
+        if (manual) return manual;
+        const url = document.getElementById('url').value.trim();
+        if (url) return detectCountryCode(url);
+        return '';
     }
 
     function getCsrfToken() {
@@ -220,6 +250,8 @@
     async function runSingleProbe(method, url) {
         setRowRunning(method);
         try {
+            const country = getCountry();
+            const body = 'url=' + encodeURIComponent(url) + '&method=' + encodeURIComponent(method) + (country ? '&country=' + encodeURIComponent(country) : '');
             const resp = await fetch('{% url "probe_tester" %}', {
                 method: 'POST',
                 headers: {
@@ -227,7 +259,7 @@
                     'X-CSRFToken': getCsrfToken(),
                     'Content-Type': 'application/x-www-form-urlencoded',
                 },
-                body: 'url=' + encodeURIComponent(url) + '&method=' + encodeURIComponent(method),
+                body: body,
             });
             const data = await resp.json();
             setRowResult(method, data);
@@ -319,6 +351,12 @@
     const urlInput = document.getElementById('url');
     urlInput.addEventListener('input', function() {
         const url = urlInput.value.trim();
+        const countryField = document.getElementById('country');
+        if (!countryField.value) {
+            const detected = detectCountryCode(url);
+            countryField.value = detected;
+            countryField.placeholder = detected ? detected : 'auto-detect';
+        }
         if (url) {
             fetch('{% url "probe_tester_cached_method" %}?domain=' + encodeURIComponent(new URL(url).hostname), {
                 headers: {'X-Requested-With': 'XMLHttpRequest'},

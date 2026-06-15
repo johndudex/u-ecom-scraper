@@ -7,6 +7,7 @@ from typing import Any, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from src.geo import detect_country
 from src.page_analysis import (
     extract_jsonld,
     extract_meta_tags,
@@ -39,23 +40,23 @@ ESCALATION_STEPS = [
 ]
 
 
-def _dispatch_step(method_name: str, url: str, timeout: int):
+def _dispatch_step(method_name: str, url: str, timeout: int, country: Optional[str] = None):
     if method_name == "direct_http":
         return _try_direct_http(url, timeout=timeout, proxy_tier="none")
     if method_name.startswith("direct_http_"):
         tier = method_name.replace("direct_http_", "")
-        return _try_direct_http(url, timeout=timeout, proxy_tier=tier)
+        return _try_direct_http(url, timeout=timeout, proxy_tier=tier, country=country)
     if method_name.startswith("playwright_"):
         tier = method_name.replace("playwright_", "")
         pw_timeout = 35 if tier != "none" else 25
-        return _try_playwright(url, tier, timeout=min(timeout, pw_timeout))
+        return _try_playwright(url, tier, timeout=min(timeout, pw_timeout), country=country)
     if method_name.startswith("uc_chrome_"):
         tier = method_name.replace("uc_chrome_", "")
-        return _try_uc_chrome(url, tier, timeout=min(timeout, 40))
+        return _try_uc_chrome(url, tier, timeout=min(timeout, 40), country=country)
     return None
 
 
-def run_probe(url: str, render_js: bool = True, timeout: int = 120, start_method: Optional[str] = None) -> dict[str, Any]:
+def run_probe(url: str, render_js: bool = True, timeout: int = 120, start_method: Optional[str] = None, country: Optional[str] = None) -> dict[str, Any]:
     steps_log = []
     debug_path = "/tmp/probe_debug.json"
 
@@ -64,6 +65,11 @@ def run_probe(url: str, render_js: bool = True, timeout: int = 120, start_method
         logger.info("PROBE [%s]: %s", url[:80], msg)
 
     _log_step(f"Starting probe: render_js={render_js}, timeout={timeout}, start_method={start_method}")
+
+    if country is None:
+        country = detect_country(url)
+        if country:
+            _log_step(f"Auto-detected country: {country}")
 
     skip_index = 0
     if start_method:
@@ -84,7 +90,7 @@ def run_probe(url: str, render_js: bool = True, timeout: int = 120, start_method
             continue
 
         _log_step(f"{step_name}: trying...")
-        result = _dispatch_step(step_name, url, timeout)
+        result = _dispatch_step(step_name, url, timeout, country=country)
         if result:
             _log_step(
                 f"{step_name}: method={result.get('method')}, success={result.get('success')}, "
@@ -109,14 +115,14 @@ def run_probe(url: str, render_js: bool = True, timeout: int = 120, start_method
     return _failure_result("all_failed", "none", "All probe methods failed")
 
 
-def _try_direct_http(url: str, timeout: int = 15, proxy_tier: str = "none") -> Optional[dict]:
+def _try_direct_http(url: str, timeout: int = 15, proxy_tier: str = "none", country: Optional[str] = None) -> Optional[dict]:
     try:
         import httpx
 
         from src.page_analysis import get_user_agent
 
         config = get_proxy_config()
-        proxy_url = config.build_proxy_url(proxy_tier) if proxy_tier != "none" else None
+        proxy_url = config.build_proxy_url(proxy_tier, country=country) if proxy_tier != "none" else None
 
         with httpx.Client(
             timeout=timeout,
@@ -189,7 +195,7 @@ def _try_direct_http(url: str, timeout: int = 15, proxy_tier: str = "none") -> O
         return None
 
 
-def _try_playwright(url: str, proxy_tier: str, timeout: int = 25) -> Optional[dict]:
+def _try_playwright(url: str, proxy_tier: str, timeout: int = 25, country: Optional[str] = None) -> Optional[dict]:
     pw = None
     browser = None
     try:
@@ -199,7 +205,7 @@ def _try_playwright(url: str, proxy_tier: str, timeout: int = 25) -> Optional[di
         launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
         launch_kwargs: dict[str, Any] = {"headless": True, "args": launch_args}
 
-        proxy = config.build_playwright_proxy(proxy_tier) if proxy_tier != "none" else None
+        proxy = config.build_playwright_proxy(proxy_tier, country=country) if proxy_tier != "none" else None
         if proxy:
             launch_kwargs["proxy"] = proxy
 
@@ -278,9 +284,9 @@ def _try_playwright(url: str, proxy_tier: str, timeout: int = 25) -> Optional[di
                 pass
 
 
-def _try_uc_chrome(url: str, proxy_tier: str, timeout: int = 40) -> Optional[dict]:
+def _try_uc_chrome(url: str, proxy_tier: str, timeout: int = 40, country: Optional[str] = None) -> Optional[dict]:
     config = get_proxy_config()
-    proxy_string = config.build_proxy_string(proxy_tier) if proxy_tier != "none" else None
+    proxy_string = config.build_proxy_string(proxy_tier, country=country) if proxy_tier != "none" else None
 
     sb_kwargs = {
         "uc": True,

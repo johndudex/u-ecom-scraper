@@ -11,6 +11,12 @@ CONFIG_PATH = os.environ.get(
 )
 
 
+def _apply_country(username: str, country: Optional[str]) -> str:
+    if country:
+        return f"{username}-country-{country}"
+    return username
+
+
 class ProxyConfig:
     _instance: Optional["ProxyConfig"] = None
 
@@ -78,7 +84,7 @@ class ProxyConfig:
     def get_tier(self, tier: str) -> dict:
         return self.config.get(tier, {})
 
-    def build_proxy_url(self, tier: str) -> Optional[str]:
+    def build_proxy_url(self, tier: str, country: Optional[str] = None) -> Optional[str]:
         tier_data = self.config.get(tier, {})
         host = tier_data.get("host")
         username = tier_data.get("username")
@@ -86,9 +92,10 @@ class ProxyConfig:
         port = tier_data.get("port")
         if not host or not username:
             return None
+        username = _apply_country(username, country)
         return f"http://{username}:{password}@{host}:{port}"
 
-    def build_proxy_string(self, tier: str) -> Optional[str]:
+    def build_proxy_string(self, tier: str, country: Optional[str] = None) -> Optional[str]:
         tier_data = self.config.get(tier, {})
         host = tier_data.get("host")
         username = tier_data.get("username")
@@ -96,15 +103,16 @@ class ProxyConfig:
         port = tier_data.get("port")
         if not host or not username:
             return None
+        username = _apply_country(username, country)
         return f"{username}:{password}@{host}:{port}"
 
-    def build_chrome_proxy_arg(self, tier: str) -> Optional[str]:
-        url = self.build_proxy_url(tier)
+    def build_chrome_proxy_arg(self, tier: str, country: Optional[str] = None) -> Optional[str]:
+        url = self.build_proxy_url(tier, country=country)
         if not url:
             return None
         return f"--proxy-server={url}"
 
-    def build_playwright_proxy(self, tier: str) -> Optional[dict]:
+    def build_playwright_proxy(self, tier: str, country: Optional[str] = None) -> Optional[dict]:
         tier_data = self.config.get(tier, {})
         host = tier_data.get("host")
         username = tier_data.get("username")
@@ -112,6 +120,7 @@ class ProxyConfig:
         port = tier_data.get("port")
         if not host or not username:
             return None
+        username = _apply_country(username, country)
         return {
             "server": f"http://{host}:{port}",
             "username": username,

@@ -33,8 +33,8 @@ from seleniumbase import SB
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.environ.get("PROJECT_ROOT", os.path.join(SCRIPT_DIR, ".."))
 sys.path.insert(0, PROJECT_ROOT)
-from src.proxy import ProxyConfig, build_proxy_url
-
+from src.proxy import ProxyConfig, build_proxy_url  # noqa: E402
+from src.geo import detect_country  # noqa: E402
 SITE_NAME = "{SITE_NAME}"
 SITE_URL = "{SITE_URL}"
 PLATFORM = "{PLATFORM}"
@@ -330,7 +330,7 @@ def main():
 
     proxy_server = None
     if not args.no_proxy:
-        proxy_server = build_proxy_url("datacenter", proxy_config) or None
+        proxy_server = build_proxy_url("datacenter", proxy_config, country=detect_country(SITE_URL)) or None
 
     sb_kwargs: dict[str, Any] = {
         "uc": True,

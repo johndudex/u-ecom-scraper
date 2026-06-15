@@ -1,6 +1,8 @@
 import asyncio
+import glob
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -24,12 +26,92 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 PROBE_LOCK = asyncio.Lock()
 AKAMAI_SEMAPHORE = asyncio.Semaphore(2)
 
+CLEANUP_INTERVAL = 1800
+
+PERSISTENT_CHROME_PIDS: set[int] = set()
+
+
+async def _periodic_cleanup():
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL)
+        try:
+            await _cleanup_chrome_artifacts()
+        except Exception:
+            logger.exception("Periodic cleanup failed")
+
+
+async def _cleanup_chrome_artifacts():
+    _collect_persistent_pids()
+    killed = _kill_orphan_chrome()
+    cleaned = _clean_chrome_profile_cache()
+    if killed or cleaned:
+        logger.info("Cleanup: killed %d orphan Chrome processes, cleaned %d profile dirs", killed, cleaned)
+
+
+def _collect_persistent_pids():
+    PERSISTENT_CHROME_PIDS.clear()
+    try:
+        h = browser_pool.health()
+        for key in ("mcp_pid", "scraper_pid"):
+            pid = h.get(key)
+            if pid:
+                PERSISTENT_CHROME_PIDS.add(pid)
+    except Exception:
+        pass
+
+
+def _kill_orphan_chrome() -> int:
+    killed = 0
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "chrome"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().split("\n"):
+                pid_str = line.strip()
+                if not pid_str:
+                    continue
+                pid = int(pid_str)
+                if pid in PERSISTENT_CHROME_PIDS or pid == 1:
+                    continue
+                try:
+                    os.kill(pid, 9)
+                    killed += 1
+                except (ProcessLookupError, PermissionError):
+                    pass
+    except Exception:
+        pass
+    return killed
+
+
+def _clean_chrome_profile_cache() -> int:
+    cleaned = 0
+    cache_dirs = [
+        "Default/Cache",
+        "Default/Code Cache",
+        "Default/GPUCache",
+        "Default/Service Worker/CacheStorage",
+        "Default/Service Worker/ScriptCache",
+    ]
+    for profile_root in glob.glob("/tmp/chrome-profiles/*/"):
+        for cache_dir in cache_dirs:
+            full_path = os.path.join(profile_root, cache_dir)
+            if os.path.isdir(full_path):
+                try:
+                    shutil.rmtree(full_path)
+                    cleaned += 1
+                except Exception:
+                    pass
+    return cleaned
+
 
 class ProbeRequest(BaseModel):
     url: str
     render_js: bool = True
     timeout: int = Field(default=120, ge=10, le=300)
     start_method: Optional[str] = Field(default=None)
+    country: Optional[str] = Field(default=None)
 
 
 class AkamaiProbeRequest(BaseModel):
@@ -42,6 +124,7 @@ class SingleProbeRequest(BaseModel):
     url: str
     method: str = Field(description="One of: direct_http, playwright_none, playwright_datacenter, playwright_residential, uc_chrome_none, uc_chrome_datacenter, uc_chrome_residential")
     timeout: int = Field(default=60, ge=10, le=120)
+    country: Optional[str] = Field(default=None)
 
 
 class ScrapeRequest(BaseModel):
@@ -152,7 +235,11 @@ async def lifespan(app: FastAPI):
         logger.error("Failed to start Playwright MCP: %s", e)
         mcp_process = None
 
-    yield
+    cleanup_task = asyncio.create_task(_periodic_cleanup())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
 
     if mcp_process and mcp_process.poll() is None:
         logger.info("Stopping Playwright MCP (PID %d)...", mcp_process.pid)
@@ -202,6 +289,7 @@ async def probe(request: ProbeRequest):
                     render_js=request.render_js,
                     timeout=request.timeout,
                     start_method=request.start_method,
+                    country=request.country,
                 ),
             )
             if result and result.get("needs_akamai_bypass"):
@@ -218,18 +306,20 @@ async def probe(request: ProbeRequest):
 @app.post("/probe-single")
 async def probe_single(request: SingleProbeRequest):
     from .probe import _try_direct_http, _try_playwright, _try_uc_chrome
+    from src.geo import detect_country as _detect_country
 
     method = request.method
+    country = request.country or _detect_country(request.url)
     method_map = {
         "direct_http": lambda: _try_direct_http(request.url, min(request.timeout, 15), "none"),
-        "direct_http_datacenter": lambda: _try_direct_http(request.url, min(request.timeout, 15), "datacenter"),
-        "direct_http_residential": lambda: _try_direct_http(request.url, min(request.timeout, 15), "residential"),
+        "direct_http_datacenter": lambda: _try_direct_http(request.url, min(request.timeout, 15), "datacenter", country=country),
+        "direct_http_residential": lambda: _try_direct_http(request.url, min(request.timeout, 15), "residential", country=country),
         "playwright_none": lambda: _try_playwright(request.url, "none", min(request.timeout, 25)),
-        "playwright_datacenter": lambda: _try_playwright(request.url, "datacenter", min(request.timeout, 35)),
-        "playwright_residential": lambda: _try_playwright(request.url, "residential", min(request.timeout, 35)),
+        "playwright_datacenter": lambda: _try_playwright(request.url, "datacenter", min(request.timeout, 35), country=country),
+        "playwright_residential": lambda: _try_playwright(request.url, "residential", min(request.timeout, 35), country=country),
         "uc_chrome_none": lambda: _try_uc_chrome(request.url, "none", min(request.timeout, 40)),
-        "uc_chrome_datacenter": lambda: _try_uc_chrome(request.url, "datacenter", min(request.timeout, 40)),
-        "uc_chrome_residential": lambda: _try_uc_chrome(request.url, "residential", min(request.timeout, 40)),
+        "uc_chrome_datacenter": lambda: _try_uc_chrome(request.url, "datacenter", min(request.timeout, 40), country=country),
+        "uc_chrome_residential": lambda: _try_uc_chrome(request.url, "residential", min(request.timeout, 40), country=country),
     }
 
     if method not in method_map:

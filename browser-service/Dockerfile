@@ -55,7 +55,9 @@ RUN mkdir -p /app/scrapers /app/logs /app/workspace /app/data/akamai-cookies
 EXPOSE 8001 8111 9222 9223
 
 CMD ["sh", "-c", "\
-    rm -f /tmp/.X98-lock /tmp/.X11-unix/X98 && \
+    rm -rf /tmp/.X98-lock /tmp/.X11-unix/X98 && \
+    rm -rf /tmp/chrome-profiles/mcp/SingletonLock /tmp/chrome-profiles/mcp/SingletonSocket /tmp/chrome-profiles/mcp/SingletonCookie && \
+    rm -rf /tmp/chrome-profiles/scraper/SingletonLock /tmp/chrome-profiles/scraper/SingletonSocket /tmp/chrome-profiles/scraper/SingletonCookie && \
     LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
     PYTHONPATH=/app exec uvicorn browser-service.server:app --host 0.0.0.0 --port 8001 --workers 1 --log-level info \
 "]

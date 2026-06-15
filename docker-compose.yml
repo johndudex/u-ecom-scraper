@@ -68,6 +68,7 @@ services:
   celery-worker:
     profiles: ["full"]
     build: .
+    init: true
     command: celery -A config worker -l INFO --loglevel=INFO --concurrency=2 -Ofair
     volumes:
       - .:/app
@@ -149,6 +150,8 @@ services:
     build:
       context: .
       dockerfile: browser-service/Dockerfile
+    init: true
+    shm_size: "256m"
     volumes:
       - ./browser-service:/app/browser-service
       - ./scrapers:/app/scrapers

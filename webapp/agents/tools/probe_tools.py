@@ -247,6 +247,9 @@ def run_probe_with_captcha_check(url: str, render_js: bool = True) -> dict:
     service_url = _get_browser_service_url()
     domain = _get_domain(url)
 
+    from src.geo import detect_country as _detect_country
+    country = _detect_country(url)
+
     cached = _get_cached_method(domain)
     skip_to = 0
     if cached and not cached.get("captcha_detected", False):
@@ -268,6 +271,7 @@ def run_probe_with_captcha_check(url: str, render_js: bool = True) -> dict:
             "render_js": render_js,
             "timeout": PROBE_TIMEOUT,
             "start_method": step_name,
+            "country": country,
         }
 
         logger.info(
@@ -431,6 +435,9 @@ def get_probe_tools() -> list:
         service_url = _get_browser_service_url()
         domain = _get_domain(url)
 
+        from src.geo import detect_country as _detect_country
+        country = _detect_country(url)
+
         cached = _get_cached_method(domain)
         start_method = None
         if cached:
@@ -443,6 +450,8 @@ def get_probe_tools() -> list:
         }
         if start_method:
             probe_payload["start_method"] = start_method
+        if country:
+            probe_payload["country"] = country
 
         logger.info(
             "probe_page: probing %s via %s (render_js=%s, cached_method=%s)",

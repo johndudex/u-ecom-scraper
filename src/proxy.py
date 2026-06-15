@@ -165,7 +165,7 @@ def get_proxy_config(config_path: str = CONFIG_PATH) -> ProxyConfig:
     return ProxyConfig.get_instance(config_path)
 
 
-def build_proxy_url(tier: str, config: Optional[ProxyConfig] = None) -> Optional[str]:
+def build_proxy_url(tier: str, config: Optional[ProxyConfig] = None, country: Optional[str] = None) -> Optional[str]:
     """Build a proxy URL string for the given tier."""
     if config is None:
         config = get_proxy_config()
@@ -176,6 +176,8 @@ def build_proxy_url(tier: str, config: Optional[ProxyConfig] = None) -> Optional
     port = tier_data.get("port")
     if not host or not username:
         return None
+    if country:
+        username = f"{username}-country-{country}"
     return f"http://{username}:{password}@{host}:{port}"
 
 

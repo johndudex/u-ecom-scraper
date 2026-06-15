@@ -30,6 +30,7 @@ from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from src.proxy import ProxyConfig, build_proxy_url
+from src.geo import detect_country
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION - Update these values
@@ -278,7 +279,7 @@ def main():
     results = []
     failed = 0
 
-    proxy_server = build_proxy_url("datacenter", proxy_config) or None
+    proxy_server = build_proxy_url("datacenter", proxy_config, country=detect_country(SITE_URL)) or None
     launch_args = {
         "headless": args.headless,
         "args": [
