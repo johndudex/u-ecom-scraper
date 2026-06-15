@@ -87,6 +87,7 @@
                     Approvals
                     <span id="pending-count" class="ml-1 inline-flex items-center justify-center min-w-[16px] h-4 px-1 bg-cta text-[10px] font-bold text-white rounded-full"></span>
                 </a>
+                <a href="{% url 'probe_tester' %}" class="px-3.5 py-1.5 text-xs font-medium text-brand-400 hover:text-brand-50 hover:bg-brand-700/50 rounded-lg transition-colors duration-200">Probe</a>
                 <a href="{% url 'probe_cache' %}" class="px-3.5 py-1.5 text-xs font-medium text-brand-400 hover:text-brand-50 hover:bg-brand-700/50 rounded-lg transition-colors duration-200">Cache</a>
                 <a href="{% url 'admin:index' %}" class="px-3.5 py-1.5 text-xs font-medium text-brand-400 hover:text-brand-50 hover:bg-brand-700/50 rounded-lg transition-colors duration-200">Admin</a>
                 {% if user.is_authenticated %}

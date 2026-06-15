@@ -38,6 +38,12 @@ class AkamaiProbeRequest(BaseModel):
     timeout: int = Field(default=120, ge=10, le=300)
 
 
+class SingleProbeRequest(BaseModel):
+    url: str
+    method: str = Field(description="One of: direct_http, playwright_none, playwright_datacenter, playwright_residential, uc_chrome_none, uc_chrome_datacenter, uc_chrome_residential")
+    timeout: int = Field(default=60, ge=10, le=120)
+
+
 class ScrapeRequest(BaseModel):
     scraper_path: str
     args: Optional[list[str]] = Field(default_factory=list)
@@ -207,6 +213,63 @@ async def probe(request: ProbeRequest):
                 status_code=500,
                 content={"success": False, "error": str(exc)[:500]},
             )
+
+
+@app.post("/probe-single")
+async def probe_single(request: SingleProbeRequest):
+    from .probe import _try_direct_http, _try_playwright, _try_uc_chrome
+
+    method = request.method
+    method_map = {
+        "direct_http": lambda: _try_direct_http(request.url, min(request.timeout, 15), "none"),
+        "direct_http_datacenter": lambda: _try_direct_http(request.url, min(request.timeout, 15), "datacenter"),
+        "direct_http_residential": lambda: _try_direct_http(request.url, min(request.timeout, 15), "residential"),
+        "playwright_none": lambda: _try_playwright(request.url, "none", min(request.timeout, 25)),
+        "playwright_datacenter": lambda: _try_playwright(request.url, "datacenter", min(request.timeout, 35)),
+        "playwright_residential": lambda: _try_playwright(request.url, "residential", min(request.timeout, 35)),
+        "uc_chrome_none": lambda: _try_uc_chrome(request.url, "none", min(request.timeout, 40)),
+        "uc_chrome_datacenter": lambda: _try_uc_chrome(request.url, "datacenter", min(request.timeout, 40)),
+        "uc_chrome_residential": lambda: _try_uc_chrome(request.url, "residential", min(request.timeout, 40)),
+    }
+
+    if method not in method_map:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "error": f"Unknown method: {method}. Valid: {list(method_map.keys())}"},
+        )
+
+    try:
+        loop = asyncio.get_event_loop()
+        start = time.monotonic()
+        result = await loop.run_in_executor(None, method_map[method])
+        elapsed = round(time.monotonic() - start, 2)
+
+        if result is None:
+            return JSONResponse(content={
+                "success": False,
+                "method": method,
+                "proxy_tier": "none",
+                "status_code": 0,
+                "title": "",
+                "body_length": 0,
+                "needs_browser": True,
+                "blocked": True,
+                "jsonld": [],
+                "meta": {},
+                "selector_results": {},
+                "error": "Method returned no result",
+                "elapsed": elapsed,
+            })
+
+        result["elapsed"] = elapsed
+        return JSONResponse(content=result)
+
+    except Exception as exc:
+        logger.exception("Single probe failed for %s method=%s", request.url[:80], method)
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "method": method, "error": str(exc)[:500], "elapsed": 0},
+        )
 
 
 @app.post("/probe-akamai")

@@ -1050,10 +1050,31 @@ def _invoke_skill_learner(state: ScrapeState, config: RunnableConfig) -> dict[st
         slug = state.get("site_slug", "")
         agent = create_skill_learner(site_slug=slug)
         result = agent.invoke(
-            {"messages": messages}, config=_agent_config(config, "skill_learner")
+            {"messages": messages}, config=_agent_config(config, "skill-learner")
         )
         _persist_agent_logs(state, result, "skill-learner", config)
         _notify_phase(job_id, "skill_learner", "done")
+
+        if slug:
+            try:
+                from django.conf import settings
+
+                ws = os.path.join(settings.PROJECT_ROOT, "workspace", slug)
+                report_src = os.path.join(ws, "learning_report.json")
+                dest_dir = os.path.join(settings.PROJECT_ROOT, "scrapers", slug, "analysis")
+                report_dst = os.path.join(dest_dir, "learning_report.json")
+                if os.path.isfile(report_src):
+                    os.makedirs(dest_dir, exist_ok=True)
+                    import shutil
+
+                    shutil.copy2(report_src, report_dst)
+                    logger.info(
+                        "_invoke_skill_learner: copied learning_report.json → scrapers/%s/analysis/",
+                        slug,
+                    )
+            except Exception as exc:
+                logger.debug("skill_learner: failed to preserve learning_report: %s", exc)
+
         return {"messages": result.get("messages", [])}
     except Exception:
         _notify_phase(job_id, "skill_learner", "failed")

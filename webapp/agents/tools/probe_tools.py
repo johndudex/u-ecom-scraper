@@ -28,12 +28,14 @@ PROBE_TIMEOUT = int(os.environ.get("PROBE_TIMEOUT", "180"))
 CACHE_EXPIRY_HOURS = 4
 
 ESCALATION_STEPS = [
-    ("direct_http", None),
+    ("direct_http", "none"),
     ("playwright_none", "none"),
-    ("playwright_datacenter", "datacenter"),
-    ("playwright_residential", "residential"),
     ("uc_chrome_none", "none"),
+    ("direct_http_datacenter", "datacenter"),
+    ("playwright_datacenter", "datacenter"),
     ("uc_chrome_datacenter", "datacenter"),
+    ("direct_http_residential", "residential"),
+    ("playwright_residential", "residential"),
     ("uc_chrome_residential", "residential"),
 ]
 
@@ -396,14 +398,16 @@ def get_probe_tools() -> list:
     def probe_page(url: str, render_js: bool = True) -> str:
         """Test page accessibility with automatic proxy escalation.
 
-        Delegates to browser-service which runs the full escalation chain:
-        1. Direct HTTP (no proxy, no browser)
-        2. Browser via Playwright (no proxy)
-        3. Browser via Playwright (datacenter proxy)
-        4. Browser via Playwright (residential proxy)
-        5. UC Chrome (no proxy)
+        Delegates to browser-service which runs the tier-first escalation chain:
+        1. Direct HTTP (no proxy)
+        2. Playwright (no proxy)
+        3. UC Chrome (no proxy)
+        4. Direct HTTP (datacenter proxy)
+        5. Playwright (datacenter proxy)
         6. UC Chrome (datacenter proxy)
-        7. UC Chrome (residential proxy)
+        7. Direct HTTP (residential proxy)
+        8. Playwright (residential proxy)
+        9. UC Chrome (residential proxy)
 
         If Akamai Bot Manager is detected, automatically escalates to
         the 3-layer Akamai bypass:

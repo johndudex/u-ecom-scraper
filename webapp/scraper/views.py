@@ -7,6 +7,9 @@ from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
+
+import httpx
+
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.http import (
@@ -19,7 +22,6 @@ from django.http import (
 )
 from django.shortcuts import get_object_or_404, redirect, render, reverse
 from django.utils import timezone
-from django.utils.decorators import method_decorator
 
 from .forms import SiteForm
 from .models import Approval, ProbeCache, ScrapeJob, SessionLog, Site
@@ -762,6 +764,109 @@ def probe_cache(request):
     entries = ProbeCache.objects.all().order_by("-cached_at")
 
     return render(request, "scraper/probe_cache.html", {"entries": entries})
+
+
+BROWSER_SERVICE_URL = os.environ.get("BROWSER_SERVICE_URL", "http://browser-service:8001")
+
+
+@login_required
+def probe_tester(request):
+    if request.method != "POST" or request.headers.get("x-requested-with") != "XMLHttpRequest":
+        return render(request, "scraper/probe_tester.html", {"initial_url": ""})
+
+    url = request.POST.get("url", "").strip()
+    method = request.POST.get("method", "")
+
+    if not url or not method:
+        return JsonResponse({"error": "url and method required"}, status=400)
+
+    try:
+        resp = httpx.post(
+            f"{BROWSER_SERVICE_URL}/probe-single",
+            json={"url": url, "method": method, "timeout": 60},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return JsonResponse(data)
+    except httpx.ReadTimeout:
+        return JsonResponse({"success": False, "error": "Probe timed out (120s)"})
+    except Exception as exc:
+        return JsonResponse({"success": False, "error": str(exc)[:500]}, status=500)
+
+
+@login_required
+def probe_tester_clear_cache(request):
+    if request.method != "POST" or request.headers.get("x-requested-with") != "XMLHttpRequest":
+        return JsonResponse({"error": "POST required"}, status=400)
+
+    domain = request.POST.get("domain", "").strip()
+    if not domain:
+        return JsonResponse({"error": "domain required"}, status=400)
+
+    from scraper.models import ProbeCache
+    deleted = ProbeCache.objects.filter(domain=domain).delete()
+    logger.info("Probe tester: cleared cache for %s (%d entries)", domain, deleted)
+    return JsonResponse({"domain": domain, "deleted": deleted})
+
+
+@login_required
+def probe_tester_update_cache(request):
+    if request.method != "POST" or request.headers.get("x-requested-with") != "XMLHttpRequest":
+        return JsonResponse({"error": "POST required"}, status=400)
+
+    try:
+        data = json.loads(request.body)
+    except (json.JSONDecodeError, Exception):
+        return JsonResponse({"error": "invalid JSON"}, status=400)
+
+    url = data.get("url", "")
+    method = data.get("method")
+    success = data.get("success", False)
+    needs_akamai_bypass = data.get("needs_akamai_bypass", False)
+
+    if not url or not method:
+        return JsonResponse({"error": "url and method required"}, status=400)
+
+
+    domain = urlparse(url).hostname or urlparse(url).netloc
+    if not domain:
+        return JsonResponse({"error": "invalid url"}, status=400)
+
+    from scraper.models import ProbeCache
+
+    if not success:
+        return JsonResponse({"error": "can only cache successful probes"})
+
+    entry, _ = ProbeCache.objects.update_or_create(
+        domain=domain,
+        defaults={
+            "method": method,
+            "needs_akamai_bypass": needs_akamai_bypass,
+        },
+    )
+    logger.info("Probe tester: updated cache %s → method=%s (id=%d)", domain, method, entry.id)
+    return JsonResponse({"domain": domain, "method": method, "cache_id": entry.id})
+
+
+@login_required
+def probe_tester_cached_method(request):
+    if request.headers.get("x-requested-with") != "XMLHttpRequest":
+        return JsonResponse({"error": "AJAX required"}, status=400)
+
+    domain = request.GET.get("domain", "").strip()
+    if not domain:
+        return JsonResponse({"method": None})
+
+    from scraper.models import ProbeCache
+
+    entry = ProbeCache.objects.filter(domain=domain).order_by("-cached_at").first()
+    if entry:
+        return JsonResponse({
+            "method": entry.method,
+            "needs_akamai_bypass": entry.needs_akamai_bypass,
+        })
+    return JsonResponse({"method": None})
 
 
 # ═══════════════════════════════════════════════════════════════════════════

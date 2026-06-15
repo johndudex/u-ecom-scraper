@@ -27,14 +27,32 @@ PROXY_TIERS = ["none", "datacenter", "residential"]
 
 
 ESCALATION_STEPS = [
-    ("direct_http", None),
+    ("direct_http", "none"),
     ("playwright_none", "none"),
-    ("playwright_datacenter", "datacenter"),
-    ("playwright_residential", "residential"),
     ("uc_chrome_none", "none"),
+    ("direct_http_datacenter", "datacenter"),
+    ("playwright_datacenter", "datacenter"),
     ("uc_chrome_datacenter", "datacenter"),
+    ("direct_http_residential", "residential"),
+    ("playwright_residential", "residential"),
     ("uc_chrome_residential", "residential"),
 ]
+
+
+def _dispatch_step(method_name: str, url: str, timeout: int):
+    if method_name == "direct_http":
+        return _try_direct_http(url, timeout=timeout, proxy_tier="none")
+    if method_name.startswith("direct_http_"):
+        tier = method_name.replace("direct_http_", "")
+        return _try_direct_http(url, timeout=timeout, proxy_tier=tier)
+    if method_name.startswith("playwright_"):
+        tier = method_name.replace("playwright_", "")
+        pw_timeout = 35 if tier != "none" else 25
+        return _try_playwright(url, tier, timeout=min(timeout, pw_timeout))
+    if method_name.startswith("uc_chrome_"):
+        tier = method_name.replace("uc_chrome_", "")
+        return _try_uc_chrome(url, tier, timeout=min(timeout, 40))
+    return None
 
 
 def run_probe(url: str, render_js: bool = True, timeout: int = 120, start_method: Optional[str] = None) -> dict[str, Any]:
@@ -61,55 +79,25 @@ def run_probe(url: str, render_js: bool = True, timeout: int = 120, start_method
             return result
         return result or _failure_result("all_failed", "none", "Direct HTTP failed and render_js=false")
 
-    if skip_index <= 0:
-        result = _try_direct_http(url, timeout=min(timeout, 15))
-        if result and result.get("success") and not result.get("needs_browser"):
-            _log_step(f"direct HTTP: success, body={result.get('body_length', 0)}")
-            return result
-        _log_step(f"direct HTTP: failed/blocked (body={result.get('body_length', 0) if result else 0}, blocked={result.get('blocked') if result else '?'})")
-
-        if result and result.get("needs_akamai_bypass"):
-            _log_step("Akamai detected — returning with needs_akamai_bypass=True")
-            return result
-
-    pw_steps = [
-        (1, "playwright_none", "none"),
-        (2, "playwright_datacenter", "datacenter"),
-        (3, "playwright_residential", "residential"),
-    ]
-    for step_idx, step_name, tier in pw_steps:
-        if step_idx < skip_index:
-            _log_step(f"Playwright {tier}: skipping (cache hint)")
+    for i, (step_name, proxy_tier) in enumerate(ESCALATION_STEPS):
+        if i < skip_index:
             continue
-        _log_step(f"Playwright {tier}: trying...")
-        result = _try_playwright(url, tier, timeout=min(timeout, 25))
+
+        _log_step(f"{step_name}: trying...")
+        result = _dispatch_step(step_name, url, timeout)
         if result:
-            _log_step(f"Playwright {tier}: method={result.get('method')}, success={result.get('success')}, body={result.get('body_length', 0)}, blocked={result.get('blocked')}, err={result.get('error', '')[:120]}")
+            _log_step(
+                f"{step_name}: method={result.get('method')}, success={result.get('success')}, "
+                f"body={result.get('body_length', 0)}, blocked={result.get('blocked')}, "
+                f"err={result.get('error', '')[:120]}"
+            )
+
         if result and result.get("needs_akamai_bypass"):
-            _log_step(f"Playwright {tier}: Akamai detected, stopping escalation")
-            return result
-        if result and result.get("success"):
-            _log_step(f"Playwright {tier}: SUCCEEDED")
+            _log_step(f"{step_name}: Akamai detected, stopping escalation")
             return result
 
-    uc_steps = [
-        (4, "uc_chrome_none", "none"),
-        (5, "uc_chrome_datacenter", "datacenter"),
-        (6, "uc_chrome_residential", "residential"),
-    ]
-    for step_idx, step_name, tier in uc_steps:
-        if step_idx < skip_index:
-            _log_step(f"UC Chrome {tier}: skipping (cache hint)")
-            continue
-        _log_step(f"UC Chrome {tier}: trying...")
-        result = _try_uc_chrome(url, tier, timeout=min(timeout, 40))
-        if result:
-            _log_step(f"UC Chrome {tier}: method={result.get('method')}, success={result.get('success')}, body={result.get('body_length', 0)}, blocked={result.get('blocked')}, err={result.get('error', '')[:120]}")
-        if result and result.get("needs_akamai_bypass"):
-            _log_step(f"UC Chrome {tier}: Akamai detected, stopping escalation")
-            return result
         if result and result.get("success"):
-            _log_step(f"UC Chrome {tier}: SUCCEEDED")
+            _log_step(f"{step_name}: SUCCEEDED")
             return result
 
     _log_step("ALL FAILED")
@@ -121,15 +109,19 @@ def run_probe(url: str, render_js: bool = True, timeout: int = 120, start_method
     return _failure_result("all_failed", "none", "All probe methods failed")
 
 
-def _try_direct_http(url: str, timeout: int = 15) -> Optional[dict]:
+def _try_direct_http(url: str, timeout: int = 15, proxy_tier: str = "none") -> Optional[dict]:
     try:
         import httpx
 
         from src.page_analysis import get_user_agent
 
+        config = get_proxy_config()
+        proxy_url = config.build_proxy_url(proxy_tier) if proxy_tier != "none" else None
+
         with httpx.Client(
             timeout=timeout,
             follow_redirects=True,
+            proxy=proxy_url,
             headers={"User-Agent": get_user_agent()},
         ) as client:
             resp = client.get(url)
@@ -148,7 +140,7 @@ def _try_direct_http(url: str, timeout: int = 15) -> Optional[dict]:
                 text = _re.sub(r"<[^>]+>", " ", raw)
                 body_text = _re.sub(r"\s+", " ", text).strip()[:1500]
 
-        if _detect_akamai(html, resp.status_code):
+        if proxy_tier == "none" and _detect_akamai(html, resp.status_code):
             return {
                 "success": False,
                 "method": "direct_http",
@@ -168,14 +160,16 @@ def _try_direct_http(url: str, timeout: int = 15) -> Optional[dict]:
         has_meaningful_content = len(html) > 2000 and not blocked
         has_price_in_jsonld = any(has_price(block) for block in jsonld)
 
+        method_name = f"direct_http_{proxy_tier}" if proxy_tier != "none" else "direct_http"
+
         if has_meaningful_content:
             selector_results = "Skipped — direct HTTP"
             needs_browser = not has_price_in_jsonld and len(jsonld) == 0
 
             return {
                 "success": True,
-                "method": "direct_http",
-                "proxy_tier": "none",
+                "method": method_name,
+                "proxy_tier": proxy_tier,
                 "status_code": resp.status_code,
                 "title": title,
                 "body_length": len(html),
@@ -191,7 +185,7 @@ def _try_direct_http(url: str, timeout: int = 15) -> Optional[dict]:
         return None
 
     except Exception as exc:
-        logger.info("Direct HTTP failed: %s", exc)
+        logger.info("Direct HTTP (%s) failed: %s", proxy_tier, exc)
         return None
 
 

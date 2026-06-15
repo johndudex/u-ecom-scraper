@@ -105,10 +105,18 @@ class ProxyConfig:
         return f"--proxy-server={url}"
 
     def build_playwright_proxy(self, tier: str) -> Optional[dict]:
-        url = self.build_proxy_url(tier)
-        if not url:
+        tier_data = self.config.get(tier, {})
+        host = tier_data.get("host")
+        username = tier_data.get("username")
+        password = tier_data.get("password")
+        port = tier_data.get("port")
+        if not host or not username:
             return None
-        return {"server": url}
+        return {
+            "server": f"http://{host}:{port}",
+            "username": username,
+            "password": password,
+        }
 
 
 def get_proxy_config() -> ProxyConfig:
