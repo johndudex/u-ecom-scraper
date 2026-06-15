@@ -60,7 +60,7 @@ def _get_browser_service_url() -> str:
 def _scraper_needs_browser(scraper_path: str) -> bool:
     try:
         with open(scraper_path, "r", encoding="utf-8") as fh:
-            head = fh.read(5000).lower()
+            head = fh.read().lower()
         for imp in BROWSER_IMPORTS:
             if f"import {imp}" in head or f"from {imp}" in head:
                 return True

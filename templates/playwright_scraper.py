@@ -26,6 +26,8 @@ from datetime import datetime, timezone
 from html import unescape
 from typing import Optional
 
+from playwright.sync_api import sync_playwright
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from src.proxy import ProxyConfig, build_proxy_url
 
@@ -235,8 +237,6 @@ def main():
     parser.add_argument("--urls", nargs="+", default=None, help="Product URLs as arguments")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode")
     args = parser.parse_args()
-
-    from playwright.sync_api import sync_playwright
 
     start_time = time.time()
 
