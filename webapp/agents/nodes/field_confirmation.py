@@ -114,43 +114,47 @@ def _find_latest_output(slug: str, root: str) -> str | None:
     return candidates[-1] if candidates else None
 
 
-def _format_output_products(output_path: str) -> str:
+def _format_output_products(output_path: str, output_key: str = "products") -> str:
     try:
         with open(output_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (json.JSONDecodeError, OSError) as exc:
         return f"(output file could not be read: {exc})"
 
-    products = data.get("products", [])
-    if not products:
-        return "(scraper produced 0 products)"
+    items = data.get(output_key, [])
+    if not items:
+        for key in ("products", "articles", "jobs", "threads", "results", "pages"):
+            items = data.get(key, [])
+            if items:
+                break
+    if not items:
+        return "(scraper produced 0 items)"
 
     meta = data.get("metadata", {})
+    label = output_key.rstrip("s")
     lines = [
-        f"Products extracted: {len(products)}",
+        f"{output_key.title()} extracted: {len(items)}",
         f"Duration: {meta.get('scraping_duration_seconds', '?')}s",
-        f"Failed: {meta.get('failed_products', '?')}",
+        f"Failed: {meta.get('failed_products', meta.get('failed_items', '?'))}",
         "",
     ]
 
-    for i, p in enumerate(products[:5], 1):
-        lines.append(f"--- Product {i} ---")
-        for field in [
-            "title",
-            "price",
-            "original_price",
-            "availability",
-            "currency",
-            "url",
-            "brand",
-            "sku",
-            "status_code",
-            "remarks",
-        ]:
+    universal_fields = ["title", "url", "status_code", "remarks"]
+    product_fields = ["price", "original_price", "availability", "currency", "brand", "sku"]
+    all_display_fields = universal_fields + product_fields
+
+    for i, p in enumerate(items[:5], 1):
+        lines.append(f"--- {label.title()} {i} ---")
+        for field in all_display_fields:
             val = p.get(field, "")
             if val:
                 val_str = str(val)[:120]
                 lines.append(f"  {field}: {val_str}")
+        for field in ["author", "company", "location", "salary", "publish_date", "content", "rank", "snippet", "description"]:
+            val = p.get(field, "")
+            if val:
+                val_str = str(val)[:120]
+                lines.append(f"  {field}: {val_str[:80]}")
         lines.append("")
 
     return "\n".join(lines)[:4000]
@@ -161,6 +165,9 @@ def field_confirmation(state: ScrapeState) -> Command:
     root = _get_project_root()
     scraper_path = os.path.join(root, "workspace", slug, "scraper_draft.py")
     input_path = os.path.join(root, "workspace", slug, "input_urls.json")
+
+    ct_config = state.get("content_type_config", {})
+    output_key = ct_config.get("output_key", "products") if ct_config else "products"
 
     if state.get("sample_only", False):
         job_id = state.get("job_id", 0)
@@ -210,12 +217,12 @@ def field_confirmation(state: ScrapeState) -> Command:
             output_file = _find_latest_output(slug, root)
             if output_file:
                 logger.info("field_confirmation: reading output file %s", output_file)
-                sample_text = _format_output_products(output_file)
+                sample_text = _format_output_products(output_file, output_key)
     else:
         logger.info(
-            "field_confirmation: input_urls.json not found, running scraper with initial product URL"
+            "field_confirmation: input_urls.json not found, running scraper with sample URL"
         )
-        product_url = state.get("product_url", "")
+        product_url = state.get("product_url", "") or state.get("sample_url", "")
         if product_url:
             cmd_args = ["--urls", product_url]
             scraping_method = state.get("scraping_method", "")
@@ -231,7 +238,7 @@ def field_confirmation(state: ScrapeState) -> Command:
                     logger.info(
                         "field_confirmation: reading output file %s", output_file
                     )
-                    sample_text = _format_output_products(output_file)
+                    sample_text = _format_output_products(output_file, output_key)
 
     if not sample_text:
         report = state.get("test_report")
@@ -342,7 +349,6 @@ def _run_sample_in_process(scraper_path: str, args: list[str], cwd: str) -> str:
 def _run_sample_via_queue(scraper_path: str, args: list[str]) -> str:
     try:
         import httpx
-        import json
         from django.conf import settings
 
         browser_service_url = getattr(

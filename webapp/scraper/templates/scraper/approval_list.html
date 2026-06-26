@@ -1,41 +1,40 @@
 {% extends "scraper/base.html" %}
 
-{% block page_title %}Approvals — Ecommerce Scraper{% endblock %}
+{% block page_title %}Approvals — Scraper Console{% endblock %}
 
 {% block content %}
 
-<div class="flex items-center justify-between mb-6">
-    <div class="relative overflow-hidden rounded-2xl bg-gradient-to-br from-brand-800 via-brand-700 to-brand-600 px-6 py-4">
-        <div class="absolute top-0 right-0 w-40 h-40 bg-amber-500/5 rounded-full -translate-y-1/2 translate-x-1/2 blur-3xl"></div>
-        <div class="flex items-center gap-3">
-            <h2 class="text-xl font-bold text-brand-50">Approval Queue</h2>
-            {% if approvals %}
-            <span class="px-2.5 py-1 bg-brand-600/40 text-brand-300 text-xs font-semibold rounded-lg">{{ approvals|length }} pending</span>
-            {% endif %}
-        </div>
+<div class="flex items-center justify-between mb-7">
+    <div>
+        <h2 class="text-2xl font-extrabold text-ink">Approval Queue</h2>
+        <p class="text-sm text-ink-secondary mt-0.5">Review and act on agent interrupts</p>
     </div>
+    {% if approvals %}
+    <span class="status-badge status-waiting_approval" style="font-size: 0.7rem; padding: 0.25rem 0.7rem;">{{ approvals|length }} pending</span>
+    {% endif %}
 </div>
 
 {% if approvals %}
 <div class="space-y-3">
     {% for approval in approvals %}
-    <div class="rounded-xl bg-surface border border-brand-700/30 border-l-4 border-l-amber-500 overflow-hidden transition-all duration-200 hover:border-brand-600/50 hover:shadow-lg hover:shadow-black/10 hover:-translate-y-0.5">
+    <div class="panel overflow-hidden stagger-item" style="--si:{{ forloop.counter0 }}; border-color: rgba(251,191,36,0.2);">
+        <div class="h-px" style="background: linear-gradient(90deg, transparent, rgba(251,191,36,0.3) 30%, rgba(251,191,36,0.3) 70%, transparent);"></div>
         <div class="p-5">
             <div class="flex items-start justify-between gap-3 mb-3">
                 <div class="flex items-center gap-2.5 flex-wrap">
-                    <span class="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-semibold uppercase tracking-wider {% if approval.approval_type == 'field_confirmation' %}bg-blue-500/15 text-blue-400{% elif approval.approval_type == 'pre_execution' %}bg-green-500/15 text-green-400{% elif approval.approval_type == 'human_approval' %}bg-amber-500/15 text-amber-400{% else %}bg-brand-700/50 text-brand-400{% endif %}">{{ approval.get_approval_type_display }}</span>
-                    <span class="text-xs text-brand-500">Job #{{ approval.job.id }} &middot; {{ approval.job.url|truncatechars:40 }}</span>
+                    <span class="status-badge {% if approval.approval_type == 'field_confirmation' %}status-in_progress{% elif approval.approval_type == 'pre_execution' %}status-completed{% elif approval.approval_type == 'human_approval' %}status-waiting_approval{% else %}status-pending{% endif %}">{{ approval.get_approval_type_display }}</span>
+                    <span class="text-xs text-ink-muted font-mono">Job #{{ approval.job.id }} &middot; {{ approval.job.url|truncatechars:40 }}</span>
                 </div>
-                <a href="{% url 'approval_detail' approval.id %}" class="flex items-center gap-1 text-xs text-brand-400 hover:text-brand-200 border border-brand-600/50 px-2.5 py-1.5 rounded-lg hover:border-brand-500 transition-colors cursor-pointer flex-shrink-0">
+                <a href="{% url 'approval_detail' approval.id %}" class="flex items-center gap-1 text-xs text-ink-secondary hover:text-accent border border-line-subtle px-2.5 py-1.5 rounded-md hover:bg-raised hover:border-accent/30 transition-all flex-shrink-0">
                     <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M3.75 3.75v4.5m0-4.5h4.5m-4.5 0L9 9M3.75 20.25v-4.5m0 4.5h4.5m-4.5 0L9 15M20.25 3.75h-4.5m4.5 0v4.5m0-4.5L15 9m5.25 11.25h-4.5m4.5 0v-4.5m0 4.5L15 15" clip-rule="evenodd"/></svg>
                     Full View
                 </a>
             </div>
 
-            <div class="rounded-lg bg-brand-800/40 px-4 py-3 text-sm text-brand-200 mb-3 leading-relaxed">{{ approval.question }}</div>
+            <div class="bg-raised/40 rounded-lg px-4 py-3 text-sm text-ink mb-3 leading-relaxed">{{ approval.question }}</div>
 
             {% if approval.response_data.sample_output %}
-            <pre class="rounded-lg bg-brand-900 p-4 text-xs text-brand-400 max-h-60 overflow-y-auto scrollbar-thin font-mono leading-relaxed mb-3"><code>{{ approval.response_data.sample_output }}</code></pre>
+            <pre class="bg-void border border-line-subtle rounded-lg p-4 text-xs text-ink-secondary max-h-60 overflow-y-auto scrollbar-thin font-mono leading-relaxed mb-3"><code>{{ approval.response_data.sample_output }}</code></pre>
             {% endif %}
 
             <form method="post" action="{% url 'approval_detail' approval.id %}">
@@ -44,17 +43,17 @@
                     {% with decisions=approval.response_data.decisions %}
                     {% for dec in decisions %}
                         {% if dec.type == 'reject' and dec.allow_feedback %}
-                            <button type="button" class="px-3.5 py-2 text-xs font-semibold rounded-lg bg-red-500/15 text-red-400 hover:bg-red-500/25 transition-colors cursor-pointer" onclick="document.getElementById('reject-{{ approval.id }}').classList.remove('hidden'); this.style.display='none';">{{ dec.label }}</button>
+                            <button type="button" class="btn-danger" onclick="document.getElementById('reject-{{ approval.id }}').classList.remove('hidden'); this.style.display='none';">{{ dec.label }}</button>
                             <div class="hidden flex items-end gap-2 w-full mt-2" id="reject-{{ approval.id }}">
-                                <textarea name="feedback" rows="2" placeholder="What needs fixing?" class="flex-1 bg-brand-700/30 border border-brand-600/50 rounded-lg px-3 py-2 text-xs text-brand-50 placeholder-brand-500 focus:outline-none focus:border-red-500/50 focus:ring-2 focus:ring-red-500/20 resize-none"></textarea>
-                                <button type="submit" name="choice" value="{{ dec.label }}" class="px-3.5 py-2 text-xs font-semibold rounded-lg bg-red-500 text-white hover:bg-red-600 transition-colors cursor-pointer flex-shrink-0">Submit</button>
+                                <textarea name="feedback" rows="2" placeholder="What needs fixing?" class="flex-1 input-field text-xs resize-none"></textarea>
+                                <button type="submit" name="choice" value="{{ dec.label }}" class="btn-danger flex-shrink-0">Submit</button>
                             </div>
                         {% else %}
-                            <button type="submit" name="choice" value="{{ dec.label }}" class="px-3.5 py-2 text-xs font-semibold rounded-lg transition-colors cursor-pointer hover:-translate-y-0.5 {% if dec.type == 'reject' %}bg-red-500/15 text-red-400 hover:bg-red-500/25{% elif dec.type == 'respond' %}bg-blue-500/15 text-blue-400 hover:bg-blue-500/25{% else %}bg-cta text-white hover:bg-cta-hover{% endif %}">{{ dec.label }}</button>
+                            <button type="submit" name="choice" value="{{ dec.label }}" class="px-3.5 py-2 text-xs font-semibold rounded-md transition-colors cursor-pointer {% if dec.type == 'reject' %}bg-danger/10 text-danger hover:bg-danger/20 border border-danger/20{% elif dec.type == 'respond' %}bg-info/10 text-info hover:bg-info/20 border border-info/20{% else %}bg-accent text-void hover:bg-accent-hover{% endif %}">{{ dec.label }}</button>
                         {% endif %}
                     {% empty %}
                         {% for opt in approval.response_data.options %}
-                        <button type="submit" name="choice" value="{{ opt }}" class="px-3.5 py-2 text-xs font-semibold rounded-lg transition-colors cursor-pointer hover:-translate-y-0.5 {% if opt in 'Proceed,Approve,Yes,Continue,Continue anyway' %}bg-cta text-white hover:bg-cta-hover{% elif opt in 'Cancel,Abort,Reject,No' %}bg-red-500/15 text-red-400 hover:bg-red-500/25{% else %}bg-blue-500/15 text-blue-400 hover:bg-blue-500/25{% endif %}">{{ opt }}</button>
+                        <button type="submit" name="choice" value="{{ opt }}" class="px-3.5 py-2 text-xs font-semibold rounded-md transition-colors cursor-pointer {% if opt in 'Proceed,Approve,Yes,Continue,Continue anyway' %}bg-accent text-void hover:bg-accent-hover{% elif opt in 'Cancel,Abort,Reject,No' %}bg-danger/10 text-danger hover:bg-danger/20 border border-danger/20{% else %}bg-info/10 text-info hover:bg-info/20 border border-info/20{% endif %}">{{ opt }}</button>
                         {% endfor %}
                     {% endfor %}
                     {% endwith %}
@@ -66,10 +65,12 @@
 </div>
 
 {% else %}
-<div class="rounded-2xl bg-surface border border-brand-700/30 py-16 text-center">
-    <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="#475569" class="mx-auto mb-4"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12c0 1.268-.63 2.39-1.593 3.068a3.745 3.745 0 01-1.043 3.296 3.745 3.745 0 01-3.296 1.043A3.745 3.745 0 0112 21c-1.268 0-2.39-.63-3.068-1.593a3.746 3.746 0 01-3.296-1.043 3.745 3.745 0 01-1.043-3.296A3.745 3.745 0 013 12c0-1.268.63-2.39 1.593-3.068a3.745 3.745 0 011.043-3.296 3.746 3.746 0 013.296-1.043A3.746 3.746 0 0112 3c1.268 0 2.39.63 3.068 1.593a3.746 3.746 0 013.296 1.043 3.746 3.746 0 011.043 3.296A3.745 3.745 0 0121 12z"/></svg>
-    <h3 class="text-brand-400 font-semibold mb-1">All clear!</h3>
-    <p class="text-brand-500 text-sm">No pending approvals. Everything is up to date.</p>
+<div class="panel py-20 text-center">
+    <div class="w-16 h-16 rounded-2xl bg-raised/50 border border-line-subtle flex items-center justify-center mx-auto mb-5">
+        <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="#475569"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12c0 1.268-.63 2.39-1.593 3.068a3.745 3.745 0 01-1.043 3.296 3.745 3.745 0 01-3.296 1.043A3.745 3.745 0 0112 21c-1.268 0-2.39-.63-3.068-1.593a3.746 3.746 0 01-3.296-1.043 3.745 3.745 0 01-1.043-3.296A3.745 3.745 0 013 12c0-1.268.63-2.39 1.593-3.068a3.745 3.745 0 011.043-3.296 3.746 3.746 0 013.296-1.043A3.746 3.746 0 0112 3c1.268 0 2.39.63 3.068 1.593a3.746 3.746 0 013.296 1.043 3.746 3.746 0 011.043 3.296A3.745 3.745 0 0121 12z"/></svg>
+    </div>
+    <h3 class="text-lg font-bold text-ink mb-1">All clear</h3>
+    <p class="text-ink-muted text-sm">No pending approvals. Everything is up to date.</p>
 </div>
 {% endif %}
 

@@ -1,0 +1,822 @@
+{% extends "admin/base_site.html" %}
+{% load i18n static %}
+
+{% block coltype %}colMS{% endblock %}
+{% block bodyclass %}{{ block.super }} dashboard{% endblock %}
+{% block nav-breadcrumbs %}{% endblock %}
+{% block nav-sidebar %}{% endblock %}
+
+{# Hide the default "Site administration" h1 — hero replaces it #}
+{% block content_title %}{% endblock %}
+
+{% block content %}
+<style>
+/* ================================================================
+   OPERATIONS DASHBOARD
+   Real operations console, not Django's default app list.
+   ================================================================ */
+.ops-dash {
+    max-width: 1200px;
+    margin: 0 auto;
+    animation: ops-fade-in 380ms var(--ease) both;
+}
+@keyframes ops-fade-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes ops-rise {
+    from { opacity: 0; transform: translateY(12px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Hide the default "Site administration" h1 — hero replaces it */
+body.dashboard #content > h1 { display: none !important; }
+
+/* Hero header */
+.ops-hero {
+    background:
+        linear-gradient(135deg, rgba(34,211,238,0.04) 0%, transparent 60%),
+        var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 22px 26px;
+    margin-bottom: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 18px;
+    position: relative;
+    overflow: hidden;
+}
+.ops-hero::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(34,211,238,0.35), transparent);
+}
+.ops-hero-left { flex: 1; min-width: 0; }
+.ops-hero h1 {
+    font-size: 1.5rem !important;
+    font-weight: 800 !important;
+    letter-spacing: -0.025em !important;
+    margin: 0 0 4px 0 !important;
+    color: var(--ink) !important;
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px !important;
+}
+.ops-hero h1 .live-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 8px;
+    font-size: 0.62rem;
+    font-weight: 700;
+    color: var(--green);
+    background: rgba(52, 211, 153, 0.1);
+    border: 1px solid rgba(52, 211, 153, 0.3);
+    border-radius: 999px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-left: 4px;
+    vertical-align: middle;
+}
+.ops-hero h1 .live-pill::before {
+    content: "";
+    width: 5px; height: 5px; border-radius: 50%;
+    background: var(--green);
+    animation: pulse-dot 2s ease-in-out infinite;
+}
+@keyframes pulse-dot {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.5; transform: scale(1.4); }
+}
+.ops-hero p {
+    margin: 0;
+    font-size: 0.82rem;
+    color: var(--ink-3);
+    line-height: 1.5;
+}
+.ops-hero-cta {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 9px 18px;
+    background-color: var(--accent) !important;
+    color: var(--void) !important;
+    border: 1px solid var(--accent);
+    border-radius: 7px;
+    font-size: 0.8rem;
+    font-weight: 700;
+    text-decoration: none !important;
+    transition: all 140ms var(--ease);
+    white-space: nowrap;
+    letter-spacing: -0.01em;
+}
+.ops-hero-cta:hover {
+    background-color: var(--accent-hover) !important;
+    border-color: var(--accent-hover);
+    box-shadow: 0 0 24px rgba(34, 211, 238, 0.25);
+    transform: translateY(-1px);
+}
+.ops-hero-cta::before {
+    content: "+";
+    font-size: 1.05rem;
+    line-height: 1;
+    margin-right: 2px;
+}
+
+/* Stats grid */
+.ops-stats {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 18px;
+}
+.ops-stat { animation: ops-rise 420ms var(--ease) both; }
+.ops-stat:nth-child(1) { animation-delay: 60ms; }
+.ops-stat:nth-child(2) { animation-delay: 120ms; }
+.ops-stat:nth-child(3) { animation-delay: 180ms; }
+.ops-stat:nth-child(4) { animation-delay: 240ms; }
+@media (max-width: 900px) { .ops-stats { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 540px) { .ops-stats { grid-template-columns: 1fr; } }
+.ops-stat {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 140ms var(--ease), transform 140ms var(--ease);
+}
+.ops-stat:hover { border-color: var(--border-strong); }
+.ops-stat::after {
+    content: "";
+    position: absolute;
+    top: 0; right: 0;
+    width: 56px; height: 56px;
+    border-radius: 50%;
+    opacity: 0.06;
+    background: var(--stat-color, var(--accent));
+    filter: blur(16px);
+    transform: translate(20px, -20px);
+}
+.ops-stat-icon {
+    width: 30px; height: 30px;
+    border-radius: 8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--stat-bg, rgba(34,211,238,0.08));
+    color: var(--stat-color, var(--accent));
+    margin-bottom: 12px;
+    position: relative;
+    z-index: 1;
+}
+.ops-stat-icon svg { width: 16px; height: 16px; }
+.ops-stat-label {
+    font-size: 0.65rem;
+    font-weight: 600;
+    color: var(--ink-3);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 6px;
+    position: relative;
+    z-index: 1;
+}
+.ops-stat-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1.85rem;
+    font-weight: 700;
+    line-height: 1;
+    color: var(--ink);
+    letter-spacing: -0.025em;
+    position: relative;
+    z-index: 1;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+}
+.ops-stat-value .stat-suffix {
+    font-size: 0.7rem;
+    color: var(--ink-3);
+    font-weight: 500;
+    letter-spacing: 0;
+}
+.ops-stat-sub {
+    margin-top: 4px;
+    font-size: 0.7rem;
+    color: var(--ink-4);
+    position: relative;
+    z-index: 1;
+}
+.ops-stat-sub .stat-up { color: var(--green); font-weight: 600; }
+.ops-stat-sub .stat-down { color: var(--red); font-weight: 600; }
+
+/* Stat variants */
+.ops-stat--accent { --stat-color: #22D3EE; --stat-bg: rgba(34,211,238,0.08); }
+.ops-stat--blue   { --stat-color: #60A5FA; --stat-bg: rgba(96,165,250,0.08); }
+.ops-stat--green  { --stat-color: #34D399; --stat-bg: rgba(52,211,153,0.08); }
+.ops-stat--yellow { --stat-color: #FBBF24; --stat-bg: rgba(251,191,36,0.08); }
+.ops-stat--red    { --stat-color: #F87171; --stat-bg: rgba(248,113,113,0.08); }
+.ops-stat--purple { --stat-color: #A78BFA; --stat-bg: rgba(167,139,250,0.08); }
+
+/* Two-column main grid */
+.ops-grid {
+    display: grid;
+    grid-template-columns: 1.4fr 1fr;
+    gap: 14px;
+    margin-bottom: 18px;
+}
+.ops-grid > * { animation: ops-rise 480ms var(--ease) both; }
+.ops-grid > *:nth-child(1) { animation-delay: 320ms; }
+.ops-grid > *:nth-child(2) { animation-delay: 380ms; }
+.ops-grid > *:nth-child(2) > *:nth-child(1) { animation: ops-rise 480ms var(--ease) 440ms both; }
+.ops-grid > *:nth-child(2) > *:nth-child(2) { animation: ops-rise 480ms var(--ease) 500ms both; }
+@media (max-width: 1100px) { .ops-grid { grid-template-columns: 1fr; } }
+
+/* Panel */
+.ops-panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+}
+.ops-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(11, 15, 23, 0.3);
+}
+.ops-panel-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--ink);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.ops-panel-title .panel-icon {
+    width: 18px; height: 18px;
+    color: var(--accent);
+}
+.ops-panel-action {
+    color: var(--ink-3) !important;
+    font-size: 0.72rem;
+    text-decoration: none !important;
+    padding: 3px 8px;
+    border-radius: 4px;
+    transition: all 120ms var(--ease);
+    font-weight: 500;
+}
+.ops-panel-action:hover { color: var(--accent) !important; background: rgba(34,211,238,0.06); }
+
+/* Recent jobs list */
+.ops-job-list { list-style: none; margin: 0; padding: 0; }
+.ops-job {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    transition: background 100ms var(--ease);
+    text-decoration: none !important;
+    color: var(--ink) !important;
+}
+.ops-job:last-child { border-bottom: 0; }
+.ops-job:hover { background: rgba(34, 211, 238, 0.04); }
+.ops-job-status {
+    width: 8px; height: 8px; border-radius: 50%;
+    flex-shrink: 0;
+    position: relative;
+}
+.ops-job-status.status-running,
+.ops-job-status.status-pending,
+.ops-job-status.status-waiting_approval {
+    animation: pulse-dot 2s ease-in-out infinite;
+}
+.ops-job-info { flex: 1; min-width: 0; }
+.ops-job-url {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.74rem;
+    color: var(--ink-2);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    margin-bottom: 2px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.ops-job-url .job-id {
+    color: var(--ink-4);
+    font-size: 0.68rem;
+    flex-shrink: 0;
+}
+.ops-job-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.68rem;
+    color: var(--ink-3);
+}
+.ops-job-meta .meta-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 6px;
+    background: rgba(148, 163, 184, 0.08);
+    border: 1px solid rgba(148, 163, 184, 0.15);
+    border-radius: 4px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.62rem;
+    color: var(--ink-2);
+    text-transform: lowercase;
+    letter-spacing: 0.02em;
+}
+.ops-job-time {
+    font-size: 0.68rem;
+    color: var(--ink-4);
+    font-family: 'JetBrains Mono', monospace;
+    flex-shrink: 0;
+}
+
+/* Status pills */
+.ops-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.6rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    line-height: 1.6;
+    white-space: nowrap;
+}
+.ops-pill::before {
+    content: "";
+    width: 4px; height: 4px; border-radius: 50%;
+    background: currentColor;
+}
+.ops-pill--success { color: var(--green); background: rgba(52,211,153,0.1); }
+.ops-pill--info    { color: var(--blue); background: rgba(96,165,250,0.1); }
+.ops-pill--warning { color: var(--yellow); background: rgba(251,191,36,0.1); }
+.ops-pill--error   { color: var(--red); background: rgba(248,113,113,0.1); }
+.ops-pill--idle    { color: var(--ink-3); background: rgba(148,163,184,0.1); }
+.ops-pill--purple  { color: #A78BFA; background: rgba(167,139,250,0.1); }
+
+/* Activity feed */
+.ops-activity { list-style: none; margin: 0; padding: 0; }
+.ops-activity-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    position: relative;
+}
+.ops-activity-item:last-child { border-bottom: 0; }
+.ops-activity-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    flex-shrink: 0;
+    margin-top: 5px;
+    position: relative;
+}
+.ops-activity-dot::after {
+    content: "";
+    position: absolute;
+    top: 14px; left: 50%;
+    width: 1px; height: calc(100% - 4px);
+    background: var(--border);
+    transform: translateX(-50%);
+}
+.ops-activity-item:last-child .ops-activity-dot::after { display: none; }
+.ops-activity-body { flex: 1; min-width: 0; }
+.ops-activity-text {
+    font-size: 0.76rem;
+    color: var(--ink-2);
+    line-height: 1.45;
+    margin-bottom: 2px;
+}
+.ops-activity-text strong { color: var(--ink); font-weight: 600; }
+.ops-activity-time {
+    font-size: 0.66rem;
+    color: var(--ink-4);
+    font-family: 'JetBrains Mono', monospace;
+}
+
+/* Quick actions */
+.ops-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    padding: 14px;
+}
+.ops-action {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px;
+    background: var(--raised);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    text-decoration: none !important;
+    color: var(--ink) !important;
+    transition: all 140ms var(--ease);
+}
+.ops-action:hover {
+    background: var(--overlay);
+    border-color: rgba(34,211,238,0.4);
+    transform: translateY(-1px);
+}
+.ops-action-icon {
+    width: 32px; height: 32px;
+    border-radius: 7px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(34,211,238,0.08);
+    color: var(--accent);
+    flex-shrink: 0;
+}
+.ops-action-icon svg { width: 16px; height: 16px; }
+.ops-action-body { min-width: 0; }
+.ops-action-title {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--ink);
+    margin-bottom: 2px;
+    line-height: 1.2;
+}
+.ops-action-sub {
+    font-size: 0.66rem;
+    color: var(--ink-3);
+    line-height: 1.2;
+}
+
+/* Empty state */
+.ops-empty {
+    padding: 36px 18px;
+    text-align: center;
+    color: var(--ink-4);
+}
+.ops-empty-icon {
+    width: 36px; height: 36px;
+    margin: 0 auto 10px;
+    color: var(--ink-4);
+    opacity: 0.5;
+}
+.ops-empty-title {
+    font-size: 0.82rem;
+    color: var(--ink-3);
+    margin-bottom: 4px;
+    font-weight: 600;
+}
+.ops-empty-sub {
+    font-size: 0.72rem;
+    color: var(--ink-4);
+}
+
+/* App index — small footer */
+.ops-apps {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    margin-top: 18px;
+}
+.ops-apps-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(11, 15, 23, 0.3);
+    font-size: 0.72rem;
+    font-weight: 700;
+    color: var(--ink-3);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+.ops-apps-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 0;
+}
+.ops-app {
+    padding: 14px 16px;
+    border-right: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+}
+.ops-app:last-child { border-right: 0; }
+.ops-app-name {
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--ink);
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.ops-app-name::before {
+    content: "";
+    width: 4px; height: 4px; border-radius: 50%;
+    background: var(--accent);
+}
+.ops-app-models { list-style: none; margin: 0; padding: 0; }
+.ops-app-models li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 0;
+    font-size: 0.72rem;
+}
+.ops-app-models a {
+    color: var(--ink-2) !important;
+    text-decoration: none !important;
+    flex: 1;
+}
+.ops-app-models a:hover { color: var(--accent) !important; }
+.ops-app-models .add-link {
+    color: var(--accent) !important;
+    opacity: 0.5;
+    font-size: 0.85rem;
+    text-decoration: none !important;
+    padding: 0 6px;
+}
+.ops-app-models .add-link:hover { opacity: 1; }
+
+/* Health strip */
+.ops-health {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 16px;
+    background: rgba(52, 211, 153, 0.04);
+    border-bottom: 1px solid var(--border);
+    font-size: 0.7rem;
+    color: var(--ink-3);
+}
+.ops-health-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green);
+    animation: pulse-dot 2.4s ease-in-out infinite;
+}
+.ops-health strong { color: var(--ink); font-weight: 600; }
+.ops-health-sep { color: var(--ink-4); }
+
+/* Responsive */
+@media (max-width: 768px) {
+    .ops-hero { flex-direction: column; align-items: stretch; padding: 18px; }
+    .ops-hero-cta { justify-content: center; }
+}
+</style>
+
+<div class="ops-dash">
+
+    {# ===== HERO ===== #}
+    <div class="ops-hero">
+        <div class="ops-hero-left">
+            <h1>
+                Operations Console
+                <span class="live-pill">Live</span>
+            </h1>
+            <p>Orchestrate scrapers, monitor active jobs, and approve AI-built pipelines across the entire fleet.</p>
+        </div>
+        <a href="/" class="ops-hero-cta">Start a new scrape</a>
+    </div>
+
+    {# ===== STATS GRID ===== #}
+    <div class="ops-stats">
+        <div class="ops-stat ops-stat--accent">
+            <div class="ops-stat-icon">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 017.843 4.582M12 3a8.997 8.997 0 00-7.843 4.582m15.686 0A11.953 11.953 0 0112 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0121 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0112 16.5c-3.162 0-6.133-.815-8.716-2.247m0 0A9.015 9.015 0 013 12c0-1.605.42-3.113 1.157-4.418"/></svg>
+            </div>
+            <div class="ops-stat-label">Tracked Sites</div>
+            <div class="ops-stat-value">{{ dash_total_sites }}</div>
+            <div class="ops-stat-sub">Across all content types</div>
+        </div>
+        <div class="ops-stat ops-stat--blue">
+            <div class="ops-stat-icon">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/></svg>
+            </div>
+            <div class="ops-stat-label">Active Jobs</div>
+            <div class="ops-stat-value">
+                {{ dash_active_jobs }}
+                <span class="stat-suffix">running</span>
+            </div>
+            <div class="ops-stat-sub">
+                <a href="/jobs/?status=running&status=pending&status=waiting_approval" style="color: var(--blue); text-decoration: none; font-weight: 500;">{{ dash_jobs_today }} new today</a>
+            </div>
+        </div>
+        <div class="ops-stat ops-stat--yellow">
+            <div class="ops-stat-icon">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+            </div>
+            <div class="ops-stat-label">Pending Approvals</div>
+            <div class="ops-stat-value">
+                {{ dash_pending_approvals }}
+                <span class="stat-suffix">awaiting</span>
+            </div>
+            <div class="ops-stat-sub">{% if dash_pending_approvals %}Review now →{% else %}All clear{% endif %}</div>
+        </div>
+        <div class="ops-stat ops-stat--green">
+            <div class="ops-stat-icon">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+            </div>
+            <div class="ops-stat-label">Completed Today</div>
+            <div class="ops-stat-value">
+                {{ dash_completed_today }}
+            </div>
+            <div class="ops-stat-sub">
+                {% if dash_failed_today %}
+                    <span class="stat-down">{{ dash_failed_today }} failed</span>
+                {% else %}
+                    <span class="stat-up">No failures</span>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    {# ===== MAIN GRID: Recent Jobs + Activity + Quick Actions ===== #}
+    <div class="ops-grid">
+
+        {# ----- Recent Jobs ----- #}
+        <div class="ops-panel">
+            <div class="ops-panel-header">
+                <div class="ops-panel-title">
+                    <svg class="panel-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/></svg>
+                    Recent Jobs
+                </div>
+                <a href="/jobs/" class="ops-panel-action">View all →</a>
+            </div>
+            {% if dash_recent_jobs %}
+            <ul class="ops-job-list">
+                {% for job in dash_recent_jobs %}
+                <a href="/jobs/{{ job.id }}/" class="ops-job">
+                    {% if job.status == 'completed' %}
+                        <span class="ops-job-status" style="background: var(--green);"></span>
+                    {% elif job.status == 'running' or job.status == 'pending' or job.status == 'waiting_approval' %}
+                        <span class="ops-job-status status-{{ job.status }}" style="background: var(--blue);"></span>
+                    {% elif job.status == 'failed' or job.status == 'captcha_blocked' %}
+                        <span class="ops-job-status" style="background: var(--red);"></span>
+                    {% else %}
+                        <span class="ops-job-status" style="background: var(--ink-3);"></span>
+                    {% endif %}
+                    <div class="ops-job-info">
+                        <div class="ops-job-url">
+                            <span class="job-id">#{{ job.id }}</span>
+                            <span>{{ job.url|truncatechars:48 }}</span>
+                        </div>
+                        <div class="ops-job-meta">
+                            <span class="ops-pill ops-pill--{% if job.status == 'completed' %}success{% elif job.status == 'running' or job.status == 'pending' or job.status == 'waiting_approval' %}info{% elif job.status == 'failed' or job.status == 'captcha_blocked' %}error{% else %}idle{% endif %}">
+                                {{ job.status|cut:'_'|title }}
+                            </span>
+                            {% if job.page_type %}
+                                <span class="meta-pill">{{ job.page_type }}</span>
+                            {% endif %}
+                            {% if job.auto_queued %}
+                                <span class="meta-pill" style="color: var(--accent); border-color: rgba(34,211,238,0.45); background: rgba(34,211,238,0.06); font-weight: 600;">auto</span>
+                            {% endif %}
+                        </div>
+                    </div>
+                    <div class="ops-job-time">{{ job.created_at|timesince }} ago</div>
+                </a>
+                {% endfor %}
+            </ul>
+            {% else %}
+            <div class="ops-empty">
+                <svg class="ops-empty-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/></svg>
+                <div class="ops-empty-title">No jobs yet</div>
+                <div class="ops-empty-sub">Start a new scrape from the console</div>
+            </div>
+            {% endif %}
+        </div>
+
+        {# ----- Right column: Quick Actions + Sites ----- #}
+        <div style="display: flex; flex-direction: column; gap: 14px;">
+
+            <div class="ops-panel">
+                <div class="ops-panel-header">
+                    <div class="ops-panel-title">
+                        <svg class="panel-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/></svg>
+                        Quick Actions
+                    </div>
+                </div>
+                <div class="ops-actions">
+                    <a href="/" class="ops-action">
+                        <div class="ops-action-icon">
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 4.5v15m7.5-7.5h-15"/></svg>
+                        </div>
+                        <div class="ops-action-body">
+                            <div class="ops-action-title">New Scrape</div>
+                            <div class="ops-action-sub">Configure &amp; launch</div>
+                        </div>
+                    </a>
+                    <a href="/sites/" class="ops-action">
+                        <div class="ops-action-icon">
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 017.843 4.582M12 3a8.997 8.997 0 00-7.843 4.582m15.686 0A11.953 11.953 0 0112 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0121 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0112 16.5c-3.162 0-6.133-.815-8.716-2.247m0 0A9.015 9.015 0 013 12c0-1.605.42-3.113 1.157-4.418"/></svg>
+                        </div>
+                        <div class="ops-action-body">
+                            <div class="ops-action-title">Manage Sites</div>
+                            <div class="ops-action-sub">View &amp; edit</div>
+                        </div>
+                    </a>
+                    <a href="/approvals/" class="ops-action">
+                        <div class="ops-action-icon">
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                        </div>
+                        <div class="ops-action-body">
+                            <div class="ops-action-title">Approvals</div>
+                            <div class="ops-action-sub">{{ dash_pending_approvals }} pending</div>
+                        </div>
+                    </a>
+                    <a href="/admin/django_celery_beat/periodictask/" class="ops-action">
+                        <div class="ops-action-icon">
+                            <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                        </div>
+                        <div class="ops-action-body">
+                            <div class="ops-action-title">Scheduled Tasks</div>
+                            <div class="ops-action-sub">Celery beat config</div>
+                        </div>
+                    </a>
+                </div>
+            </div>
+
+            <div class="ops-panel">
+                <div class="ops-panel-header">
+                    <div class="ops-panel-title">
+                        <svg class="panel-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 017.843 4.582M12 3a8.997 8.997 0 00-7.843 4.582m15.686 0A11.953 11.953 0 0112 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0121 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0112 16.5c-3.162 0-6.133-.815-8.716-2.247m0 0A9.015 9.015 0 013 12c0-1.605.42-3.113 1.157-4.418"/></svg>
+                        Recently Added Sites
+                    </div>
+                    <a href="/sites/" class="ops-panel-action">View all →</a>
+                </div>
+                {% if dash_recent_sites %}
+                <ul class="ops-job-list">
+                    {% for site in dash_recent_sites %}
+                    <a href="/sites/{{ site.id }}/" class="ops-job">
+                        <span class="ops-job-status" style="background: {% if site.status == 'complete' %}var(--green){% elif site.status == 'failed' %}var(--red){% elif site.status == 'in_progress' %}var(--blue){% else %}var(--ink-3){% endif %};"></span>
+                        <div class="ops-job-info">
+                            <div class="ops-job-url">
+                                <span style="color: var(--ink); font-weight: 600; font-family: 'Inter', sans-serif;">{{ site.name|default:site.slug|default:site.url|truncatechars:32 }}</span>
+                            </div>
+                            <div class="ops-job-meta">
+                                <span class="meta-pill">{{ site.site_type|default:'general' }}</span>
+                                {% if site.platform %}<span class="meta-pill">{{ site.platform }}</span>{% endif %}
+                            </div>
+                        </div>
+                        <div class="ops-job-time">
+                            <span class="ops-pill ops-pill--{% if site.status == 'complete' %}success{% elif site.status == 'failed' %}error{% elif site.status == 'in_progress' %}info{% else %}idle{% endif %}">
+                                {{ site.status }}
+                            </span>
+                        </div>
+                    </a>
+                    {% endfor %}
+                </ul>
+                {% else %}
+                <div class="ops-empty">
+                    <svg class="ops-empty-icon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 017.843 4.582M12 3a8.997 8.997 0 00-7.843 4.582m15.686 0A11.953 11.953 0 0112 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0121 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0112 16.5c-3.162 0-6.133-.815-8.716-2.247m0 0A9.015 9.015 0 013 12c0-1.605.42-3.113 1.157-4.418"/></svg>
+                    <div class="ops-empty-title">No sites tracked</div>
+                    <div class="ops-empty-sub">Sites will appear here as you scrape them</div>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    {# ===== APP INDEX (admin models, styled as cards) ===== #}
+    <div class="ops-apps">
+        <div class="ops-apps-header">Administered Models</div>
+        <div class="ops-apps-grid">
+        {% for app in app_list %}
+            <div class="ops-app">
+                <div class="ops-app-name">
+                    <a href="{{ app.app_url }}" style="color: var(--ink) !important; text-decoration: none !important;">{{ app.name }}</a>
+                </div>
+                <ul class="ops-app-models">
+                {% for model in app.models %}
+                    <li>
+                        {% if model.admin_url %}
+                            <a href="{{ model.admin_url }}">{{ model.name }}</a>
+                        {% else %}
+                            {{ model.name }}
+                        {% endif %}
+                        {% if model.add_url %}
+                            <a href="{{ model.add_url }}" class="add-link" title="Add new">+</a>
+                        {% endif %}
+                    </li>
+                {% endfor %}
+                </ul>
+            </div>
+        {% endfor %}
+        </div>
+    </div>
+
+</div>
+{% endblock %}
+
+{% block sidebar %}{% endblock %}

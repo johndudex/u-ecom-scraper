@@ -1,0 +1,166 @@
+{
+  "strategy": "seleniumbase_uc",
+  "strategy_justification": "UC Chrome (undetected-chromedriver) without proxy is the only confirmed working method for Bulgari.com. Standard Playwright MCP and direct HTTP are both blocked by browser fingerprinting/TLS detection. The probe_cache confirmed uc_chrome_none as the only successful access method. The first probe loaded 1.4M chars of HTML from a product page URL, confirming full page rendering works via UC Chrome.",
+  "proxy_tier": "none",
+  "proxy_justification": "UC Chrome with direct connection (no proxy) successfully accessed Bulgari.com. No proxy escalation needed for initial attempt.",
+  "no_proxy_flag": true,
+  "extraction_approach": "hybrid",
+  "jsonld_available": true,
+  "jsonld_fields": ["name", "description", "image", "sku", "brand", "offers", "url", "@type", "@context"],
+  "jsonld_empty_offers": true,
+  "warmup_required": true,
+  "warmup_instructions": "Visit homepage first (https://www.bulgari.com/en-us), wait 10-15 seconds for anti-bot challenge to resolve and session cookies to establish. Accept any cookie consent banner if present. Then navigate to product pages.",
+  "cookie_consent_required": true,
+  "cookie_consent_instructions": "Look for and click cookie consent/accept button before extracting data. Cookie consent walls may block content rendering on some LVMH sites.",
+  "critical_notes": [
+    "CRITICAL: Do NOT use driver.execute_script() for JSON-LD extraction. Use driver.page_source with BeautifulSoup/re to find <script type='application/ld+json'> tags. Previous scraper runs encountered SyntaxError with CDP JavaScript evaluation on this site.",
+    "CRITICAL: Use var-based top-level JavaScript in execute_script, NOT arrow function IIFEs (() => { ... })(). Undetected-chromedriver's execute_script cannot return values from IIFE patterns.",
+    "CRITICAL: Wait for specific elements to appear before extraction. Use WebDriverWait with expected conditions on product title (h1) or data-testid elements.",
+    "URL validation: The sample URL /en-us/products/bzero1-ring-360268 returned a 404 page. The code-writer should handle 404 pages gracefully by checking the page title for 'cannot be found' or 'page not found'.",
+    "Locale: Use locale from input URLs (e.g., en-us). The 'en-int' locale caused failures in previous runs."
+  ],
+  "verified_selectors": {
+    "title": {
+      "method": "css",
+      "selector": "h1, [data-testid*='product-name'], [data-testid*='productName'], [class*='product-title']",
+      "structured_data_fallback": "JSON-LD Product.name",
+      "verified": false,
+      "test_result": null,
+      "note": "Not tested against valid product page. LVMH sites typically use h1 or data-testid attributes. Extract after full JS render."
+    },
+    "price": {
+      "method": "css",
+      "selector": "[data-testid*='price'], [class*='price'], [class*='Price'], .product-price",
+      "structured_data_fallback": "JSON-LD Product.offers.price (may be empty for luxury)",
+      "verified": false,
+      "test_result": null,
+      "note": "NOT verified. Luxury brands often hide prices. JSON-LD offers.price may be empty '{}'. DOM extraction is primary. May need interaction to reveal price."
+    },
+    "original_price": {
+      "method": "css",
+      "selector": "[class*='compare'], [class*='original'], .was-price, [class*='strike']",
+      "verified": false,
+      "test_result": null,
+      "note": "Bulgari luxury products rarely have sale pricing. May not be present."
+    },
+    "availability": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.offers.availability",
+      "css_fallback": "[data-testid*='availability'], [class*='availability'], .stock-status",
+      "verified": false,
+      "test_result": null,
+      "note": "Check JSON-LD first. Availability status may be in structured data."
+    },
+    "currency": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.offers.priceCurrency",
+      "css_fallback": "Check price element text for currency symbol",
+      "verified": false,
+      "test_result": null,
+      "note": "Likely USD for en-us locale pages."
+    },
+    "description": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.description",
+      "css_fallback": "[data-testid*='description'], .product-description, [class*='description']",
+      "verified": false,
+      "test_result": null,
+      "note": "Product description from JSON-LD or DOM."
+    },
+    "image": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.image",
+      "css_fallback": "[data-testid*='image'] img, .product-image img, [class*='gallery'] img, img[class*='product']",
+      "verified": false,
+      "test_result": null,
+      "note": "Primary product image. May be array in JSON-LD. Extract first/high-quality URL."
+    },
+    "brand": {
+      "method": "static",
+      "value": "BULGARI",
+      "structured_data_fallback": "JSON-LD Product.brand.name",
+      "verified": true,
+      "test_result": "BULGARI",
+      "note": "Brand is consistently 'BULGARI' across all products."
+    },
+    "sku": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.sku",
+      "css_fallback": "[data-testid*='sku'], .sku, [class*='sku']",
+      "verified": false,
+      "test_result": null,
+      "note": "Product code from JSON-LD or DOM. URL may contain numeric product code as fallback."
+    },
+    "category": {
+      "method": "structured_data",
+      "selector": "JSON-LD BreadcrumbList items",
+      "css_fallback": ".breadcrumb, nav[aria-label='breadcrumb'], [class*='breadcrumb']",
+      "verified": false,
+      "test_result": null,
+      "note": "Category hierarchy from breadcrumb JSON-LD or DOM."
+    },
+    "rating": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.aggregateRating.ratingValue",
+      "css_fallback": "[class*='rating'], [data-testid*='rating']",
+      "verified": false,
+      "test_result": null,
+      "note": "Luxury sites often don't display customer ratings. May not be present."
+    },
+    "review_count": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.aggregateRating.reviewCount",
+      "verified": false,
+      "test_result": null,
+      "note": "May not be present."
+    },
+    "gtin": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.gtin",
+      "verified": false,
+      "test_result": null,
+      "note": "May be present for some products (watches)."
+    },
+    "url": {
+      "method": "javascript",
+      "selector": "driver.current_url (NOT execute_script)",
+      "verified": false,
+      "test_result": null,
+      "note": "Get current URL from driver.current_url attribute after any redirects."
+    },
+    "page_404_check": {
+      "method": "css",
+      "selector": "h1:contains('cannot be found'), title contains 'cannot be found'",
+      "verified": true,
+      "test_result": "The page you're looking for cannot be found. | Bvlgari Official Store",
+      "note": "Check page title after load. If it contains 'cannot be found', treat as 404 and skip the product."
+    }
+  },
+  "jsonld_extraction_method": {
+    "approach": "html_source_parsing",
+    "instructions": "Parse driver.page_source with BeautifulSoup or regex to find <script type='application/ld+json'> tags. Use json.loads() to parse each block. Do NOT use driver.execute_script('return document.querySelectorAll(\"script[type=\\\"application/ld+json\\\"]\")') due to observed SyntaxError issues with CDP evaluation on this site.",
+    "expected_types": ["Product", "BreadcrumbList", "Organization", "WebPage"],
+    "parse_code_example": "scripts = re.findall(r'<script[^>]*type=[\"\\']application/ld\\+json[\"\\'][^>]*>(.*?)</script>', driver.page_source, re.DOTALL); jsonld_blocks = [json.loads(s) for s in scripts]"
+  },
+  "page_structure": {
+    "framework": "Custom LVMH enterprise platform (likely React/Next.js or similar SPA)",
+    "key_sections": [
+      "Product gallery / images",
+      "Product title (h1)",
+      "Price display",
+      "Product description",
+      "Variant selectors (size, color, material)",
+      "Add to bag / CTA",
+      "Breadcrumb navigation"
+    ],
+    "wait_target": "Wait for h1 element or data-testid attribute containing 'product' to appear before extraction"
+  },
+  "variants": {
+    "detected": true,
+    "note": "Bulgari products have variants (size, color, material). Variant selectors likely in [class*='variant'], [class*='size'], [class*='color'], [data-testid*='variant']. Price and images may change per variant."
+  },
+  "retry_adjustments": null,
+  "escalation_note": null,
+  "confidence_score": 0.7,
+  "confidence_notes": "Strategy (seleniumbase_uc, proxy_tier: none) is firmly verified by probe_cache as the only working method. However, no selector has been tested against a valid product page — the only product page probed returned a 404. Selectors are based on general LVMH site structure knowledge and product_analysis.json recommendations. The code-writer should implement robust fallback chains and 404 detection. Confidence would increase to 0.85+ after a successful extraction from a valid product page."
+}

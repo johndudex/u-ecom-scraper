@@ -45,6 +45,16 @@ The probe result includes:
 
 From the probe result you can map 80-90% of fields immediately. Use `playwright_browser_evaluate` for additional selector testing only if the probe result is missing specific fields.
 
+### Akamai / UC Chrome Sites
+
+If `probe_page` returns a "BLOCKED" message saying UC Chrome is required, use `probe_html` instead:
+
+```
+probe_html(url="PRODUCT_URL")
+```
+
+`probe_html` fetches the full page HTML via browser-service using the correct access method. Extract JSON-LD from `<script type="application/ld+json">` tags and selectors from the HTML. You will NOT get pre-tested selector results — you must identify selectors manually from the HTML.
+
 ### Browser Unavailable Fallback
 
 If Playwright MCP tools are also unavailable, the probe_page result alone is sufficient. Write your analysis based on probe data.
@@ -113,7 +123,7 @@ Map these standard output fields (extract WHATEVER IS AVAILABLE):
 | `scraped_at` | timestamp | When scraped | Set by scraper (ISO-8601) |
 | `remarks` | text | Notes/warnings | Set by scraper |
 
-**Also extract if available:** brand, category, images, description, sku, rating, review_count, variants, gtin, mpn.
+**Also extract if available:** brand, category, images, description, sku, rating, review_count, variants, gtin, mpn. Add `expectations` blocks for every field you include.
 
 ### 6. Variant Analysis
 
@@ -139,6 +149,8 @@ Save to: `workspace/{site_slug}/product_analysis.json`
 
 **MANDATORY: The top-level `fields` key MUST contain a mapping for EVERY extractable field.** The coverage validator reads ONLY `fields`. Missing the `fields` key will cause a coverage failure.
 
+**MANDATORY: Every field in `fields` MUST include an `expectations` block.** The code-tester validates scraper output against these expectations. Missing `expectations` means the code-tester cannot validate that field, reducing scraping quality.
+
 ```json
 {
   "site_slug": "site-name",
@@ -162,20 +174,113 @@ Save to: `workspace/{site_slug}/product_analysis.json`
       "css_fallback": "h1.product-title",
       "js_extraction": "document.querySelector('h1.product-title')?.textContent.trim()",
       "tested": true,
-      "examples": ["Shiny Viscose Jersey Bodysuit"]
+      "examples": ["Shiny Viscose Jersey Bodysuit"],
+      "expectations": {
+        "type": "text",
+        "required": true,
+        "min_length": 3,
+        "should_not_match": ["^page not found", "^404", "^oops", "^error", "^not found", "^redirect"],
+        "sample_values": ["Shiny Viscose Jersey Bodysuit"],
+        "known_bad_values": ["undefined", "null", "", "Page Not Found"],
+        "format_hint": "Product name text, e.g. 'Nike Air Max 90'"
+      }
     },
     "price": {
       "method": "css",
       "selector": "[class*='_pdp_'] [data-testid='main-price']",
       "tested": true,
       "examples": ["€120"],
-      "notes": "JSON-LD offers is empty. Price loaded via JS. Must scope to PDP container."
+      "notes": "JSON-LD offers is empty. Price loaded via JS. Must scope to PDP container.",
+      "expectations": {
+        "type": "text",
+        "required": true,
+        "min_length": 1,
+        "should_not_match": ["^0(?!\.)", "^0\\.00$"],
+        "sample_values": ["€120"],
+        "known_bad_values": ["undefined", "null", "", "0", "0.00"],
+        "format_hint": "Price string with currency symbol or code, e.g. '$129.99' or '29.99 EUR'"
+      }
     },
-    "availability": { ... },
-    "currency": { ... },
-    "original_price": { ... },
-    "url": { ... },
-    "src_url": { ... }
+    "availability": {
+      "...": "...",
+      "expectations": {
+        "type": "text",
+        "required": true,
+        "should_not_match": [],
+        "known_bad_values": ["undefined", "null"],
+        "format_hint": "Stock status text, e.g. 'In Stock', 'Out of Stock', 'Available'"
+      }
+    },
+    "currency": {
+      "...": "...",
+      "expectations": {
+        "type": "currency_code",
+        "required": true,
+        "should_not_match": [],
+        "known_bad_values": ["undefined", "null", ""],
+        "format_hint": "ISO 4217 currency code (USD, EUR, GBP) or currency symbol ($, €, £)"
+      }
+    },
+    "original_price": {
+      "...": "...",
+      "expectations": {
+        "type": "text",
+        "required": false,
+        "should_not_match": [],
+        "known_bad_values": ["undefined", "null"],
+        "format_hint": "Higher-than-current price when on sale, empty string when not on sale"
+      }
+    },
+    "url": {
+      "...": "...",
+      "expectations": {
+        "type": "url",
+        "required": true,
+        "should_not_match": [],
+        "known_bad_values": ["undefined", "null", ""],
+        "format_hint": "Full HTTPS URL to the product page"
+      }
+    },
+    "src_url": {
+      "...": "...",
+      "expectations": {
+        "type": "url",
+        "required": true,
+        "should_not_match": [],
+        "known_bad_values": ["undefined", "null", ""],
+        "format_hint": "Full HTTPS URL where the product was discovered"
+      }
+    },
+    "status_code": {
+      "...": "...",
+      "expectations": {
+        "type": "number",
+        "required": true,
+        "should_not_match": [],
+        "known_bad_values": [0],
+        "format_hint": "HTTP status code (200 for success, 404 for not found)"
+      }
+    },
+    "scraped_at": {
+      "...": "...",
+      "expectations": {
+        "type": "iso_timestamp",
+        "required": true,
+        "should_not_match": [],
+        "known_bad_values": ["undefined", "null", ""],
+        "format_hint": "ISO-8601 timestamp, e.g. '2026-06-25T15:30:00Z'"
+      }
+    },
+    "remarks": {
+      "...": "...",
+      "expectations": {
+        "type": "text",
+        "required": false,
+        "should_not_match": [],
+        "known_bad_values": [],
+        "format_hint": "Empty string for clean extraction, notes for any issues"
+      }
+    }
   },
   "jsonld_extraction": { ... },
   "variants": { ... },
@@ -183,6 +288,26 @@ Save to: `workspace/{site_slug}/product_analysis.json`
   "confidence_score": 0.9
 }
 ```
+
+## Expectations Block (MANDATORY for every field)
+
+Every field in `fields` MUST have an `expectations` sub-object. This is the **validation contract** that code-tester uses to check scraper output without re-fetching pages.
+
+The expectations block tells code-tester:
+- What **type** the value should be (`text`, `number`, `url`, `iso_timestamp`, `currency_code`, `boolean`)
+- Whether it's **required** (must be non-empty) or **optional**
+- **min_length** for text fields (minimum character count)
+- **should_not_match** — regex patterns that indicate extraction failure (anti-bot pages, error pages, etc.)
+- **sample_values** — real values observed on the probed page (from `examples`)
+- **known_bad_values** — values that mean extraction failed (even if technically non-empty)
+- **format_hint** — human-readable description of what a correct value looks like
+
+Rules:
+- `required: true` for core fields: title, price, availability, currency, url, src_url, status_code, scraped_at
+- `required: false` for optional fields: original_price, location, remarks, brand, description, images, sku, rating, review_count
+- Always include `should_not_match` patterns for anti-bot detection: `^oops`, `^page not found`, `^error`, `^redirect`, `^access denied`, `^blocked`
+- `sample_values` MUST come from what you actually observed on the probed page — not fabricated guesses
+- For fields you couldn't verify (`tested: false`), set `format_hint` based on what the selector/method should return
 
 ## Confidence Score
 
@@ -229,3 +354,10 @@ Product analysis complete
   Connectivity: {method_that_worked} (proxy: {proxy_tier})
   Confidence: {confidence_score}
 ```
+
+## ⚠️ Budget Priority
+
+1. **Probe the PROVIDED product URL** — that's your target. Do not probe alternative domains (e.g., .com, .de, .eu when target is .co.uk).
+2. **Write product_analysis.json EARLY** — after 3-4 probe/evaluate calls, write what you have. You can overwrite later if budget allows.
+3. **Do NOT try competitor sites** as "fallbacks" — if the target URL fails, document the failure and move on.
+4. **Do NOT spend more than 5 calls probing** — if the page returns errors, note it and write your analysis with the data you have. The code-writer can handle unverified selectors with fallbacks.

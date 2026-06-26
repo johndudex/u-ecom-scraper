@@ -5,7 +5,6 @@ Uses the ``Site`` Django model as the single source of truth.
 
 import logging
 import os
-from typing import Optional
 
 from langgraph.types import Command, interrupt
 
@@ -83,12 +82,14 @@ def check_tracker(state: ScrapeState) -> Command:
     sample_only: bool = state.get("sample_only", False)
     full_extraction = not sample_only
     rescrape: bool = state.get("rescrape", False)
+    site_type: str = state.get("site_type", "shopping")
+    input_mode: str = state.get("input_mode", "")
 
     root = _get_project_root()
     site = _find_site(url)
 
     if site is None:
-        return _handle_new_site(url, slug)
+        return _handle_new_site(url, slug, site_type)
     if site.status == "complete" and rescrape:
         logger.info("check_tracker: rescrape=True for complete site '%s', starting fresh", slug)
         _clean_workspace(root, slug)
@@ -109,20 +110,22 @@ def check_tracker(state: ScrapeState) -> Command:
     if site.status == "failed":
         return _handle_failed(site, slug)
     if site.status == "in_progress":
-        return _handle_in_progress(site, slug, root)
+        return _handle_in_progress(site, slug, root, input_mode)
 
     logger.warning("check_tracker: unknown status '%s' for %s, treating as new", site.status, url)
-    return _handle_new_site(url, slug)
+    return _handle_new_site(url, slug, site_type)
 
 
-def _handle_new_site(url: str, slug: str) -> Command:
+def _handle_new_site(url: str, slug: str, site_type: str = "shopping") -> Command:
     try:
         from scraper.models import Site
 
         site = Site.objects.filter(url=url.rstrip("/")).first()
         if site:
+            if site_type and not site.site_type:
+                site.site_type = site_type
             site.status = "in_progress"
-            site.save(update_fields=["status"])
+            site.save(update_fields=["status", "site_type"])
             logger.info(
                 "check_tracker: existing site '%s' updated to in_progress (was %s)",
                 slug,
@@ -133,9 +136,10 @@ def _handle_new_site(url: str, slug: str) -> Command:
                 url=url.rstrip("/"),
                 name=slug,
                 slug=slug,
+                site_type=site_type,
                 status="in_progress",
             )
-            logger.info("check_tracker: new site created → %s", slug)
+            logger.info("check_tracker: new site created → %s (type=%s)", slug, site_type)
     except Exception as exc:
         logger.warning("check_tracker: failed to create/update site: %s", exc)
 
@@ -229,8 +233,26 @@ def _handle_failed(site, slug: str) -> Command:
     )
 
 
-def _handle_in_progress(site, slug: str, root: str) -> Command:
+def _handle_in_progress(site, slug: str, root: str, input_mode: str = "") -> Command:
     logger.info("check_tracker: site '%s' in_progress from a previous run, checking for existing artifacts", slug)
+
+    # For navigation mode, always start fresh — don't skip to product analysis
+    # based on cached artifacts from a previous url_list run
+    if input_mode == "navigation":
+        logger.info(
+            "check_tracker: navigation mode — starting fresh (ignoring cached artifacts)"
+        )
+        _clean_workspace(root, slug)
+        return Command(
+            update={
+                "site_status": "in_progress",
+                "current_phase": "check_tracker",
+                "skip_site_analysis": False,
+                "skip_product_analysis": False,
+                "skip_code_generation": False,
+            },
+            goto="setup_workspace",
+        )
 
     workspace_dir = os.path.join(root, "workspace", slug)
     skip_site = os.path.isfile(os.path.join(workspace_dir, "site_analysis.json"))

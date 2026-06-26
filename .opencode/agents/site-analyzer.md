@@ -24,6 +24,8 @@ The **site URL** is provided for reference (folder naming, context). You do NOT 
 
 **If you receive pre-verified probe data:** Use it directly. Do NOT call `probe_page` again — it would return the same cached data and waste a tool call. Proceed to writing your analysis.
 
+**CRITICAL — UC Chrome sites:** If your first tool call returns "BLOCKED: ... ALL browser and HTTP tools are blocked", STOP calling tools immediately. Use the pre-verified probe data from your HumanMessage to write site_analysis.json. Every blocked call wastes ~5 seconds and produces nothing.
+
 **If no pre-verified probe data is provided:** Use `probe_page` as your FIRST tool call. It automatically tries:
 
 ```
@@ -189,3 +191,5 @@ You can overwrite later if needed.
 - Do NOT read `input_urls.json` — that file is for the code-writer
 - Do NOT load skill files — detect from page content only
 - Do NOT spend more than 2-3 calls on any single sub-task
+- **Do NOT probe alternative domains** (e.g., calvinklein.com, .de, .eu when target is calvinklein.co.uk). Stay on the target domain. Probing other domains wastes budget and is blocked by the domain guard.
+- **Do NOT verify by fetching the same page with different tools** — one successful probe_page is enough. Move to writing site_analysis.json.

@@ -58,17 +58,21 @@ DIRECT_FIELDS = {
     },
 }
 
-MAPPING_SYSTEM_PROMPT = """You are a field name mapper for an ecommerce scraper pipeline.
-Your ONLY job is to map raw field names found in product data to standard output field names.
+CORE_FIELDS = [
+    "title",
+    "price",
+    "availability",
+    "original_price",
+    "currency",
+    "url",
+    "src_url",
+]
+
+DEFAULT_MAPPING_PROMPT = f"""You are a field name mapper for a scraper pipeline.
+Your ONLY job is to map raw field names found in data to standard output field names.
 
 ## Standard Output Fields
-- title: Product title/name
-- price: Current selling price
-- original_price: Price before discount (compare-at price). Only map if the raw data shows a separate "was" or "original" price.
-- availability: Stock status ("In Stock", "Out of Stock", etc.)
-- currency: Currency code (e.g. "USD", "EUR")
-- url: Product page URL
-- src_url: Source listing URL
+{chr(10).join(f"- {f}" for f in CORE_FIELDS)}
 - description: Product description text
 - brand: Brand name
 - images: Product image URL(s)
@@ -108,6 +112,8 @@ def _load_analysis(slug: str) -> dict | None:
     root = _get_project_root()
     path = os.path.join(root, "workspace", slug, "product_analysis.json")
     if not os.path.isfile(path):
+        path = os.path.join(root, "workspace", slug, "content_analysis.json")
+    if not os.path.isfile(path):
         return None
     try:
         with open(path, "r", encoding="utf-8") as fh:
@@ -127,11 +133,36 @@ def _save_analysis(slug: str, analysis: dict) -> None:
         logger.error("normalize_fields: cannot save product_analysis: %s", exc)
 
 
-def _core_fields_present(fields: dict) -> bool:
+def _build_mapping_prompt(content_type_config: dict) -> str:
+    if content_type_config and "fields" in content_type_config:
+        fields_list = content_type_config["fields"]
+        field_lines = []
+        for f in fields_list:
+            line = f"- {f['name']}: {f['label']}"
+            if f.get("required"):
+                line += " (required)"
+            field_lines.append(line)
+        field_section = "\n".join(field_lines)
+        return (
+            "You are a field name mapper for a scraper pipeline.\n"
+            "Your ONLY job is to map raw field names found in data to standard output field names.\n\n"
+            f"## Standard Output Fields\n{field_section}\n\n"
+            "## Rules\n"
+            "1. Output ONLY a JSON object. No explanation, no markdown, no code fences.\n"
+            "2. Each key is a standard output field name.\n"
+            '3. Each value is an object with: "method" (extraction method used), "selector" (path/key in the raw data to find this field), "examples" (one example value).\n'
+            "4. Only include fields that have corresponding data in the raw input.\n"
+            '5. If a raw field doesn\'t map to any standard field, include it with its original name and note it as "extra".\n'
+            '6. Be precise with "selector" — use the exact key path.\n'
+        )
+    return DEFAULT_MAPPING_PROMPT
+
+
+def _core_fields_present(fields: dict, core: list[str]) -> bool:
     if not fields:
         return False
     present = set(fields.keys())
-    return len(CORE_FIELDS) <= len(present & set(CORE_FIELDS))
+    return len(core) <= len(present & set(core))
 
 
 def _build_raw_data_summary(analysis: dict) -> str:
@@ -160,12 +191,12 @@ def _build_raw_data_summary(analysis: dict) -> str:
     return "\n".join(sections) if sections else "(no raw data sections found)"
 
 
-def _call_llm_for_mapping(raw_data: str, existing_fields: dict) -> dict | None:
+def _call_llm_for_mapping(raw_data: str, existing_fields: dict, mapping_prompt: str) -> dict | None:
     from ..llm import get_small_llm
 
     llm = get_small_llm(temperature=0.0)
     messages = [
-        SystemMessage(content=MAPPING_SYSTEM_PROMPT),
+        SystemMessage(content=mapping_prompt),
         HumanMessage(content=MAPPING_USER_PROMPT_TEMPLATE.format(
             raw_data_sections=raw_data,
             existing_fields=json.dumps(existing_fields, indent=2, ensure_ascii=False) if existing_fields else "{}",
@@ -217,8 +248,14 @@ def normalize_fields(state: ScrapeState) -> dict[str, Any]:
     slug = state["site_slug"]
     analysis = _load_analysis(slug)
 
+    content_type_config = state.get("content_type_config", {})
+    core = CORE_FIELDS
+    if content_type_config and "core_field_names" in content_type_config:
+        core = list(content_type_config["core_field_names"])
+    mapping_prompt = _build_mapping_prompt(content_type_config)
+
     if analysis is None:
-        logger.error("normalize_fields: product_analysis.json not found for %s", slug)
+        logger.error("normalize_fields: analysis not found for %s", slug)
         return {
             "current_phase": "normalize_fields",
             "phases_completed": state.get("phases_completed", []) + ["normalize_fields"],
@@ -228,13 +265,14 @@ def normalize_fields(state: ScrapeState) -> dict[str, Any]:
     if not isinstance(existing_fields, dict):
         existing_fields = {}
 
-    if _core_fields_present(existing_fields):
+    if _core_fields_present(existing_fields, core):
         logger.info("normalize_fields: core fields already present, adding direct fields only")
         merged = _merge_fields(existing_fields, {}, DIRECT_FIELDS)
         analysis["fields"] = merged
         _save_analysis(slug, analysis)
         return {
             "product_analysis": analysis,
+            "content_analysis": analysis,
             "fields_extracted": list(merged.keys()),
             "current_phase": "normalize_fields",
             "phases_completed": state.get("phases_completed", []) + ["normalize_fields"],
@@ -243,7 +281,7 @@ def normalize_fields(state: ScrapeState) -> dict[str, Any]:
     raw_summary = _build_raw_data_summary(analysis)
     logger.info("normalize_fields: calling LLM to map raw fields for %s", slug)
 
-    mapped = _call_llm_for_mapping(raw_summary, existing_fields)
+    mapped = _call_llm_for_mapping(raw_summary, existing_fields, mapping_prompt)
 
     if mapped is None:
         logger.warning("normalize_fields: LLM mapping failed, using existing + direct fields only")
@@ -260,6 +298,7 @@ def normalize_fields(state: ScrapeState) -> dict[str, Any]:
 
     return {
         "product_analysis": analysis,
+        "content_analysis": analysis,
         "fields_extracted": list(merged.keys()),
         "current_phase": "normalize_fields",
         "phases_completed": state.get("phases_completed", []) + ["normalize_fields"],

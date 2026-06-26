@@ -1,0 +1,69 @@
+{
+  "site": {
+    "url": "https://www.amazon.com",
+    "name": "Amazon.com",
+    "platform": "amazon",
+    "scraping_mechanism": "playwright",
+    "mechanism_justification": "Amazon requires JavaScript rendering to load full product data (price, title, images, reviews). The pre-verified probe confirmed that Playwright (no proxy) successfully accesses product pages without captcha. Direct HTTP requests to Amazon product pages return incomplete HTML with bot-detection challenges. Playwright provides full DOM access to extract all product fields."
+  },
+  "anti_bot": {
+    "detected": false,
+    "type": "none",
+    "severity": "low",
+    "details": "Amazon has mild anti-bot protection (CAPTCHA challenges on suspicious traffic), but the probe returned captcha-free with Playwright. No Cloudflare, Akamai, or PerimeterX detected. Standard rate-limiting applies — excessive requests will trigger CAPTCHA."
+  },
+  "connectivity": {
+    "method_that_worked": "browser_none",
+    "proxy_tier": "none",
+    "js_rendering_needed": true,
+    "anti_bot_detected": false,
+    "notes": "Playwright without proxy works. Direct HTTP fails. If Playwright starts getting CAPTCHAs, escalate to datacenter or residential proxy."
+  },
+  "product_discovery": {
+    "method": "product_url_pattern",
+    "product_url_pattern": "/dp/{ASIN}",
+    "sample_product_urls": [
+      "https://www.amazon.com/dp/B09V3KXJPB",
+      "https://www.amazon.com/dp/B0BF1J7C7W",
+      "https://www.amazon.com/gp/product/B07VGRJDFY"
+    ],
+    "url_pattern_notes": "Amazon product URLs revolve around the ASIN (Amazon Standard Identification Number), a 10-character alphanumeric code. Common URL patterns: /dp/{ASIN}, /gp/product/{ASIN}, /product/{ASIN}. URLs may include referral tags after /ref=. The ASIN is always present and can be extracted from any product URL pattern. Input URLs may use any of these formats."
+  },
+  "extraction": {
+    "core_fields": {
+      "title": {
+        "selector": "#productTitle",
+        "type": "text"
+      },
+      "price": {
+        "selector": ".a-price .a-offscreen, #priceblock_ourprice, #priceblock_dealprice, #priceblock_saleprice",
+        "type": "text"
+      }
+    },
+    "additional_fields": {
+      "asin": {
+        "extraction": "Extract from URL or from input[name='ASIN'] or #ASIN"
+      },
+      "url": {
+        "extraction": "window.location.href"
+      },
+      "image": {
+        "selector": "#landingImage, #imgBlkFront",
+        "attribute": "src"
+      },
+      "rating": {
+        "selector": "#acrPopover .a-icon-alt, .a-star-medium .a-star-average-color",
+        "type": "text"
+      },
+      "breadcrumbs": {
+        "selector": "#wayfinding-breadcrumbs_container a",
+        "type": "texts"
+      }
+    }
+  },
+  "rate_limiting": {
+    "recommended_delay_seconds": 3.0,
+    "justification": "Amazon has mild but real rate limiting. Too many rapid requests will trigger CAPTCHA even on clean IPs. 3 second delay between requests is conservative but safe."
+  },
+  "confidence_score": 0.95
+}

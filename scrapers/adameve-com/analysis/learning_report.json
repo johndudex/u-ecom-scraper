@@ -1,0 +1,55 @@
+{
+  "site_slug": "adameve-com",
+  "learning_timestamp": "2025-07-11T12:00:00Z",
+  "potential_learnings": [
+    {
+      "title": "Google dataLayer extraction for product metadata via regex",
+      "category": "extraction",
+      "existing_skill": "jsonld-extraction",
+      "action": "update",
+      "reusability": "high",
+      "description": "Many ecommerce sites embed rich product data in Google Tag Manager's dataLayer (serverSideEvents objects). When no Product-type JSON-LD exists, the dataLayer can reliably provide rating (metric2), review count (metric4), SKU (item_id or Sku field), brand, price, category hierarchy, and availability. All extractable via regex on the raw HTML since dataLayer is rendered server-side in a <script> block.",
+      "evidence": [
+        "product_analysis.json documents dataLayer containing Sku (E194), ProductName, Price, Brand, category hierarchy, rating (metric2/dimension13), review count (metric4), Colors, Sizes, availability (dimension7)",
+        "scraper.py implements extract_rating_from_datalayer(), extract_review_count_from_datalayer(), and extract_sku_from_html() all using regex on dataLayer",
+        "test_report.json shows 5/5 products had rating and review_count extracted via this method"
+      ],
+      "proposed_change": "Add '## dataLayer / GTM Ecommerce Extraction' section to jsonld-extraction/SKILL.md documenting: regex patterns (metric2=rating, metric4=review_count, Sku/item_id=SKU), common dataLayer field names, when to use as fallback, and example Python functions.",
+      "status": "pending"
+    },
+    {
+      "title": "Multi-price text parsing — extracting clean prices from marketing garbage",
+      "category": "extraction",
+      "existing_skill": "jsonld-extraction",
+      "action": "update",
+      "reusability": "medium",
+      "description": "Many retailers concatenate marketing/promo text with prices in the DOM (e.g., '$39.99-$49.99Save Up to $35.02 (71%)' or '$59.99Excluded from promotion.Save $47.99 (80%)'). Two regex patterns handle this: '$[\\d,.]+' extracts the first dollar amount only, and '\\d+\\.\\d{2}' extracts the first numeric price. A comparison between extracted sale/base prices determines which becomes 'price' vs 'original_price'.",
+      "evidence": [
+        "product_analysis.json shows sale text like '$7.50 - $11.00' and marketing garbage in .ae-price--was elements",
+        "test_report.json documents this as a PREVIOUSLY HIGH-SEVERITY ISSUE — original_price was '$39.99-$49.99Save Up to $35.02 (71%)' before fix",
+        "scraper.py implements extract_first_dollar_amount() and extract_first_price_number() helper functions"
+      ],
+      "proposed_change": "Add '## Handling Marketing Garbage in Price Text' subsection to the '## Price Formatting' section in jsonld-extraction/SKILL.md, documenting regex patterns and sale-vs-base price comparison logic.",
+      "status": "pending"
+    },
+    {
+      "title": "HTML5 <details>/<summary> accordion extraction pattern",
+      "category": "extraction",
+      "existing_skill": "jsonld-extraction",
+      "action": "update",
+      "reusability": "medium",
+      "description": "Modern sites use HTML5 <details>/<summary> elements for accordion sections (Key Features, Specifications, Description). The heading is a <summary> element, NOT an <h2>. Using find(class_='accordion__title') (matches any tag type) instead of find('h2', class_='accordion__title') prevents extraction failures. This is becoming common as sites adopt semantic HTML5 elements.",
+      "evidence": [
+        "product_analysis.json originally documented h2.ae-h2 as the title selector but actual accordion headings are <summary class='ae-accordion__title'>",
+        "test_report.json documents this as a PREVIOUSLY LOW-SEVERITY ISSUE — key_features and specifications were empty before the fix",
+        "scraper.py fixed this by using accordion.find(class_='ae-accordion__title') instead of accordion.find('h2', class_='ae-accordion__title')"
+      ],
+      "proposed_change": "Add '## Accordion / <details> Extraction' subsection to jsonld-extraction/SKILL.md recommending find(class_=...) over tag-specific find for accordion headings, and documenting the <summary> element pattern.",
+      "status": "pending"
+    }
+  ],
+  "approved_count": 0,
+  "rejected_count": 0,
+  "skills_modified": [],
+  "skills_created": []
+}

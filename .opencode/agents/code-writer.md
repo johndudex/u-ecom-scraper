@@ -67,6 +67,10 @@ The `input_urls.json` format:
 }
 ```
 
+**CRITICAL for navigation/list_page mode:** If the scraper uses a two-phase architecture (Phase 1: discover product URLs from category/search pages, Phase 2: extract data from product pages), then `input_urls.json` should contain **CATEGORY or SEARCH URLs** as seeds for Phase 1. Do NOT put product URLs in `input_urls.json` for navigation scrapers — the scraper discovers products at runtime.
+
+If the scraper does NOT have Phase 1 discovery (single-phase, url_list mode), then `input_urls.json` MUST contain actual **product page URLs**. Category URLs will produce empty results because category pages don't have Product JSON-LD.
+
 ## Output Format
 
 The scraper writes `output_{YYYY-MM-DD_HHMMSS}.json` (UTC timestamp) to its own directory (`scrapers/{site_slug}/`). Each scrape run creates a new file, enabling price tracking over time.
@@ -393,3 +397,4 @@ Before returning, verify:
 4. **Test locally** - Run the scraper before returning
 5. **Handle encoding** - Use `ensure_ascii=False` for JSON output
 6. **Be defensive** - Wrap everything in try/except
+7. **BUDGET PRIORITY: Write the scraper file FIRST.** Do not spend tool calls searching for reference scrapers or reading multiple template files. Read the analysis files, then immediately write scraper_draft.py and input_urls.json. You can verify after writing if budget allows. Never leave without writing the output files.

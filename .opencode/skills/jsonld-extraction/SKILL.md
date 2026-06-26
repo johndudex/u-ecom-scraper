@@ -1,32 +1,116 @@
 ---
 name: jsonld-extraction
-description: Extract product data from JSON-LD structured data blocks on ecommerce pages, including price, availability, images, variants, and reviews from schema.org Product types.
+description: Extract structured data from JSON-LD blocks on web pages. Covers schema.org Product, Article, JobPosting, DiscussionForumPosting, WebPage, and other types for multi-content-type scraping.
 ---
 ## What I Do
 
-Provide patterns for extracting product data from JSON-LD `<script type="application/ld+json">` blocks on ecommerce pages. Covers standard schema.org Product types and common variations.
+Provide patterns for extracting structured data from JSON-LD `<script type="application/ld+json">` blocks on web pages. Covers schema.org Product, Article/NewsArticle/BlogPosting, JobPosting, DiscussionForumPosting, WebPage, and more.
 
 ## When to Use Me
 
 Use this when:
-- Product pages contain `<script type="application/ld+json">` blocks
-- JSON-LD Product blocks have structured data for name, price, availability, images
-- You need to distinguish between multiple JSON-LD blocks (product, reviews, breadcrumbs)
+- Pages contain `<script type="application/ld+json">` blocks
+- You need to extract product data (name, price, availability, images)
+- You need to extract article data (headline, author, datePublished, articleBody)
+- You need to extract job data (title, hiringOrganization, jobLocation, qualifications)
+- You need to extract forum data (DiscussionForumPosting, Question/Answer)
+- You need to distinguish between multiple JSON-LD blocks (product, reviews, breadcrumbs, articles)
 - You need to extract original_price (pre-discount price) from schema.org offers
 
-## JSON-LD Block Types
+## Multi-Content-Type JSON-LD Blocks
 
-A single product page may contain multiple JSON-LD blocks:
+### Product (Shopping)
 
 | Block | @type | Contains |
 |-------|-------|----------|
 | Product | `Product` | name, description, sku, mpn, image[], offers |
 | Reviews | `Product` (with aggregateRating) | aggregateRating, review[] |
 | Breadcrumbs | `BreadcrumbList` | itemListElement[] |
-| Website | `WebSite` | Site metadata |
-| Organization | `Organization` | Brand/company info |
 
-**Critical:** Always check `@type` AND check for distinguishing fields. Two blocks with `@type: "Product"` may coexist — one for core data, one for reviews.
+### Article (Articles/News/Blog)
+
+| Block | @type | Contains |
+|-------|-------|----------|
+| Article | `Article`, `NewsArticle`, `BlogPosting`, `TechArticle` | headline, author, datePublished, articleBody, image[], articleSection |
+| Author | `Person` or `Organization` | name, url |
+
+```python
+article_types = ("Article", "NewsArticle", "BlogPosting", "TechArticle")
+for block in json_ld_blocks:
+    if block.get("@type") in article_types:
+        return block
+```
+
+**Key fields:**
+- `headline` or `name` — Article title
+- `author.name` — Author (may be dict or list of dicts)
+- `datePublished` — ISO 8601 publish date
+- `articleBody` — Full article text
+- `articleSection` — Category/section
+- `keywords` — Tags (string or list)
+- `image` — Featured image (string or array)
+
+### Job Posting (Jobs)
+
+| Block | @type | Contains |
+|-------|-------|----------|
+| Job | `JobPosting` | title, hiringOrganization, jobLocation, baseSalary, qualifications, employmentType |
+
+```python
+for block in json_ld_blocks:
+    if block.get("@type") == "JobPosting":
+        return block
+```
+
+**Key fields:**
+- `title` — Job title
+- `hiringOrganization.name` — Company name
+- `jobLocation.address.addressLocality` — City
+- `jobLocation.address.addressRegion` — State
+- `baseSalary.value.value` — Salary amount
+- `baseSalary.value.unitText` — "YEAR", "MONTH", "HOUR"
+- `qualifications` — Requirements (string or list)
+- `employmentType` — "FULL_TIME", "PART_TIME", "CONTRACT"
+- `description` — Full job description
+- `datePosted` — Posting date
+
+### Forum Thread (Forum)
+
+| Block | @type | Contains |
+|-------|-------|----------|
+| Thread | `DiscussionForumPosting`, `Question` | headline, author, text, answer, interactionStatistic |
+
+```python
+forum_types = ("DiscussionForumPosting", "Question")
+for block in json_ld_blocks:
+    if block.get("@type") in forum_types:
+        return block
+```
+
+**Key fields:**
+- `headline` or `name` — Thread title
+- `author.name` — Thread starter
+- `text` — Initial post content
+- `answer[].text` — Reply content (for Question type)
+- `interactionStatistic` — View/reply counts
+
+### Web Page (Generic)
+
+| Block | @type | Contains |
+|-------|-------|----------|
+| Page | `WebPage`, `AboutPage`, `ContactPage` | name, description, mainContent |
+
+```python
+for block in json_ld_blocks:
+    if block.get("@type") in ("WebPage", "AboutPage", "ContactPage", "FAQPage"):
+        return block
+```
+
+**Key fields:**
+- `name` — Page title
+- `description` — Page description
+- `mainEntity` — Main content (varies)
+- `dateModified` — Last modified date
 
 ### Disambiguation Strategy
 

@@ -19,31 +19,42 @@ def parse_command(state: ScrapeState) -> Command:
     * Returns a ``Command`` routing to the next node (``check_tracker``).
     """
     url = _clean_url(state.get("url", ""))
-    product_url = _clean_url(state.get("product_url") or "")
+    sample_url = _clean_url(state.get("sample_url") or state.get("product_url") or "")
     if not url:
         raise ValueError("parse_command: state['url'] is required and empty")
 
     slug = _url_to_slug(url)
-    logger.info("parse_command: url=%s product_url=%s → site_slug=%s", url, product_url[:80], slug)
+    page_type = state.get("page_type", "product")
+    input_mode = state.get("input_mode", "url_list")
+    logger.info(
+        "parse_command: url=%s sample_url=%s page_type=%s → site_slug=%s",
+        url, sample_url[:80], page_type, slug,
+    )
 
     return Command(
         update={
             "url": url,
-            "product_url": product_url or None,
+            "sample_url": sample_url or None,
+            "product_url": sample_url or None,
             "site_slug": slug,
             "site_name": "",
             "site_status": "",
+            "page_type": page_type,
+            "input_mode": input_mode,
             "skip_site_analysis": False,
+            "skip_content_analysis": False,
             "skip_product_analysis": False,
             "skip_code_generation": False,
             "current_phase": "parse_command",
             "phases_completed": [],
             "site_analysis_retries": 0,
+            "content_analysis_retries": 0,
             "product_analysis_retries": 0,
             "test_retry_count": 0,
             "reanalyze_count": 0,
             "execution_status": "",
             "output_file": "",
+            "item_count": 0,
             "product_count": 0,
             "scraping_method": "",
             "platform": "",

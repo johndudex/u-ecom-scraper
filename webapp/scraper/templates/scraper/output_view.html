@@ -1,25 +1,23 @@
 {% extends "scraper/base.html" %}
 
-{% block page_title %}{{ filename }} — {{ site.slug }} — Ecommerce Scraper{% endblock %}
+{% block page_title %}{{ filename }} — {{ site.slug }} — Scraper Console{% endblock %}
 
 {% block content %}
 
 <div class="flex items-center justify-between mb-6">
     <div>
         <div class="flex items-center gap-3 mb-1">
-            <a href="{% url 'site_detail' site_id=site.id %}" class="text-xs text-brand-400 hover:text-brand-200 transition-colors">&larr; {{ site.slug }}</a>
-            <span class="text-brand-600">/</span>
-            <span class="text-sm font-medium text-brand-100">{{ filename }}</span>
+            <a href="{% url 'site_detail' site_id=site.id %}" class="text-xs text-ink-muted hover:text-ink-secondary transition-colors">&larr; {{ site.slug }}</a>
+            <span class="text-line-strong">/</span>
+            <span class="text-sm font-medium text-ink font-mono">{{ filename }}</span>
         </div>
-        <p class="text-xs text-brand-500">{{ product_count }} product{{ product_count|pluralize }}</p>
+        <p class="text-xs text-ink-muted">{{ product_count }} product{{ product_count|pluralize }}</p>
     </div>
-    <a href="{{ download_url }}" class="px-3.5 py-2 text-xs font-medium text-brand-400 hover:text-brand-200 border border-brand-600/50 rounded-lg hover:border-brand-500 transition-colors">Download</a>
+    <a href="{{ download_url }}" class="btn-secondary">Download</a>
 </div>
 
-<div class="rounded-2xl bg-surface border border-brand-700/30 overflow-hidden">
-    <div class="px-5 py-3 border-b border-brand-700/30">
-        <pre class="text-xs text-brand-300 font-mono whitespace-pre-wrap break-all leading-relaxed max-h-[75vh] overflow-y-auto scrollbar-thin p-2">{{ json_content }}</pre>
-    </div>
+<div class="panel overflow-hidden">
+    <pre class="text-xs text-ink-secondary font-mono whitespace-pre-wrap break-all leading-relaxed max-h-[75vh] overflow-y-auto scrollbar-thin p-4">{{ json_content }}</pre>
 </div>
 
 {% endblock %}

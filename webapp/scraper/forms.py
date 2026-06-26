@@ -37,20 +37,27 @@ class ScrapeJobForm(forms.ModelForm):
 
 class SiteForm(forms.ModelForm):
     input_urls_json = forms.CharField(
-        label="Product URLs",
+        label="Item URLs",
         required=False,
         widget=forms.Textarea(
             attrs={
                 "rows": 6,
-                "placeholder": '["https://www.example.com/product/1", "https://www.example.com/product/2"]',
+                "placeholder": '["https://www.example.com/item/1", "https://www.example.com/item/2"]',
             }
         ),
-        help_text="Paste a JSON array of product URLs, or upload a JSON file below.",
+        help_text="Paste a JSON array of URLs, or upload a JSON file below.",
     )
     input_urls_file = forms.FileField(
         label="Upload URLs JSON",
         required=False,
         help_text="JSON file containing an array of URLs.",
+    )
+    site_type = forms.ChoiceField(
+        label="Site Type",
+        required=False,
+        widget=forms.Select(attrs={
+            "class": "form-control",
+        }),
     )
 
     class Meta:
@@ -64,6 +71,11 @@ class SiteForm(forms.ModelForm):
             self.fields["input_urls_json"].initial = json.dumps(
                 instance.input_urls, indent=2
             )
+        try:
+            from src.content_types import SITE_TYPE_CHOICES
+            self.fields["site_type"].choices = SITE_TYPE_CHOICES
+        except ImportError:
+            pass
 
     def clean_input_urls_json(self):
         value = self.cleaned_data.get("input_urls_json", "").strip()

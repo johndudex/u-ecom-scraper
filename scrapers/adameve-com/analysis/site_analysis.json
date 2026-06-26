@@ -3,61 +3,48 @@
     "url": "https://www.adameve.com",
     "name": "Adam & Eve",
     "platform": "custom",
-    "platform_details": "Proprietary ASP.NET e-commerce platform with inline JavaScript configuration (phe.config), server-side rendering, HawkSearch integration for search/recommendations, and extensive dataLayer product data. Uses .aspx URL extensions.",
     "scraping_mechanism": "http_requests",
-    "mechanism_justification": "Direct HTTP requests work without any anti-bot protection. Product pages are server-rendered with rich product data available in Open Graph meta tags, inline serverSideEvents JavaScript objects, and HTML DOM. No JavaScript rendering is needed."
+    "mechanism_justification": "This is a custom ASP.NET-based platform (PHE, Inc.) with no major ecommerce framework detected. Product pages are server-rendered with full content available via direct HTTP — titles, prices, descriptions, specifications, reviews, and images are all present in the HTML without JavaScript rendering. The pre-verified probe confirmed direct HTTP access works without any anti-bot blocking."
   },
   "anti_bot": {
     "detected": false,
     "type": "none",
     "severity": "low",
-    "details": "No anti-bot protection detected. Direct HTTP access returns full page content. Uses OneTrust for cookie consent (compliance, not anti-bot). Has ASP.NET anti-forgery tokens for form submissions but not for page reads."
+    "details": "No anti-bot protection detected. Direct HTTP requests return full page content. No Cloudflare, Akamai, PerimeterX, or CAPTCHA challenges observed."
   },
   "connectivity": {
     "method_that_worked": "direct_http",
     "proxy_tier": "none",
     "js_rendering_needed": false,
     "anti_bot_detected": false,
-    "notes": "Direct HTTP connection works perfectly. No proxy needed. No JavaScript rendering required. Page content is fully server-rendered."
-  },
-  "product_data_extraction": {
-    "primary_sources": [
-      {
-        "source": "og_meta_tags",
-        "description": "Open Graph meta tags contain price (og:price:amount), currency (og:price:currency), brand (og:brand), availability (og:availability), title, description, and product image URL."
-      },
-      {
-        "source": "serverSideEvents_dataLayer",
-        "description": "Inline JavaScript serverSideEvents array contains structured product data: Sku, ProductName, Price, Brand, Colors, Sizes, stock_status (dimension7), category path, product ID (dimension1), subcategory (dimension2), star rating (metric2), review count (metric4)."
-      },
-      {
-        "source": "html_dom",
-        "description": "Server-rendered HTML DOM contains product name, price, images, description, variants/colors, sizes, reviews, and breadcrumb navigation."
-      }
-    ],
-    "key_selectors": {
-      "og_price": "meta[property='og:price:amount']",
-      "og_currency": "meta[property='og:price:currency']",
-      "og_brand": "meta[property='og:brand']",
-      "og_availability": "meta[property='og:availability']",
-      "og_image": "meta[property='og:image']",
-      "og_title": "meta[property='og:title']",
-      "serverSideEvents": "script: serverSideEvents variable in inline JS",
-      "canonical": "link[rel='canonical']"
-    }
+    "notes": "Direct HTTP fetch returns complete server-rendered HTML. No JavaScript rendering or proxy needed."
   },
   "product_discovery": {
     "method": "product_url_pattern",
-    "product_url_pattern": "/{category-path}/{slug}-{product-id}.aspx",
-    "url_pattern_notes": "Product URLs follow the pattern: /{category}/{subcategory}/{sub-subcategory}/{sp-prefix}-{slug}-{numeric-id}.aspx. The numeric ID before .aspx is the product identifier. The 'sp-' prefix appears on all product slugs. Categories form a hierarchical path (e.g., /lingerie/womens-wear/baby-dolls/).",
+    "product_url_pattern": "/{category-path}/sp-{product-name-slug}-{product-id}.aspx",
     "sample_product_urls": [
-      "https://www.adameve.com/lingerie/womens-wear/baby-dolls/sp-hypnotic-swirl-cupless-crotchless-babydoll-91407.aspx"
+      "https://www.adameve.com/adult-sex-toys/vibrators/clit-vibrators/sp-eves-petite-private-pleasure-wand-by-adam-eve-108069.aspx",
+      "https://www.adameve.com/adult-sex-toys/vibrators/rabbit-vibrators/sp-eves-rechargeable-thrusting-rabbit-by-adam-eve-106698.aspx",
+      "https://www.adameve.com/lubes-and-sexual-wellness/sex-lubes/water-based-sex-lubes/sp-adam-eve-lubricant-90245.aspx",
+      "https://www.adameve.com/adult-sex-toys/dildo-sex-toys/realistic-dildos/sp-adam-eve-sunrise-dreams-realistic-dildo-111733.aspx",
+      "https://www.adameve.com/adult-sex-toys/vibrators/bullet-eggs/sp-adam-eve-the-rumbler-x-power-bullet-111731.aspx"
     ],
-    "product_id_pattern": "Numeric ID at end of URL before .aspx (e.g., 91407). Also has internal SKU code like '143H' available in dataLayer."
+    "url_pattern_notes": "Product URLs follow the pattern: /{category}/{subcategory}/sp-{slug}-{numeric-product-id}.aspx. The product ID is a numeric value (e.g., 108069) embedded in the URL before the .aspx extension. SKU codes (e.g., E194, 115H) are also present in the page data attributes but not in the URL. Category paths can be 2-3 levels deep."
+  },
+  "product_page_structure": {
+    "title_selector": "h1",
+    "price_display": "HTML rendered with Reg price, Sale price, and promo code pricing (e.g., 'Reg $54.99', 'Only $27.50'). Prices are text in the DOM, not behind JS.",
+    "specifications": "Structured specification table with fields: Brand, Colors, Features, Length, Material, Toy Power Source, Width",
+    "reviews": "Inline reviews with star ratings, review text, dates, and verified buyer badges. Rating summary with count available.",
+    "breadcrumbs": "Breadcrumbs present: Home > Sex Toys > Vibrators > Clitoral Vibrators > Product Name",
+    "images": "Product images present in HTML",
+    "description": "Full product description in HTML along with 'Key Features' bullet list",
+    "json_ld_available": false,
+    "notes": "Product pages are fully server-rendered. All product data (title, price, description, specs, reviews, images) is available in the raw HTML response without JavaScript execution."
   },
   "rate_limiting": {
-    "recommended_delay_seconds": 2,
-    "justification": "No anti-bot protection detected, but being a large retail site with standard ASP.NET infrastructure, moderate delays (1-2 seconds) are prudent to avoid triggering any server-side rate limits."
+    "recommended_delay_seconds": 2.0,
+    "justification": "Custom platform with no anti-bot, but reasonable delay to avoid triggering rate limits on a custom ASP.NET site"
   },
-  "confidence_score": 0.95
+  "confidence_score": 0.9
 }

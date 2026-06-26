@@ -4,122 +4,549 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{% block page_title %}Ecommerce Scraper{% endblock %}</title>
+    <title>{% block page_title %}Scraper Console{% endblock %}</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
             theme: {
                 extend: {
                     colors: {
-                        brand: {
-                            900: '#0F172A',
-                            800: '#1E293B',
-                            700: '#334155',
-                            600: '#475569',
-                            500: '#64748B',
-                            400: '#94A3B8',
-                            300: '#CBD5E1',
-                            200: '#E2E8F0',
-                            100: '#F1F5F9',
-                            50: '#F8FAFC',
+                        void: '#0B0F17',
+                        panel: '#111827',
+                        raised: '#1A2332',
+                        overlay: '#232E42',
+                        line: {
+                            subtle: '#1E293B',
+                            strong: '#334155',
                         },
-                        cta: {
-                            DEFAULT: '#22C55E',
-                            hover: '#16A34A',
-                            dark: '#15803D',
+                        ink: {
+                            DEFAULT: '#F1F5F9',
+                            secondary: '#94A3B8',
+                            muted: '#64748B',
                         },
-                        surface: {
-                            DEFAULT: '#1E293B',
-                            raised: '#273548',
-                            overlay: '#334155',
-                        }
+                        accent: {
+                            DEFAULT: '#22D3EE',
+                            hover: '#06B6D4',
+                            muted: '#0E7490',
+                            glow: 'rgba(34, 211, 238, 0.15)',
+                        },
+                        success: {
+                            DEFAULT: '#34D399',
+                            bg: 'rgba(52, 211, 153, 0.12)',
+                        },
+                        warning: {
+                            DEFAULT: '#FBBF24',
+                            bg: 'rgba(251, 191, 36, 0.12)',
+                        },
+                        danger: {
+                            DEFAULT: '#F87171',
+                            bg: 'rgba(248, 113, 113, 0.12)',
+                        },
+                        info: {
+                            DEFAULT: '#60A5FA',
+                            bg: 'rgba(96, 165, 250, 0.12)',
+                        },
+                    },
+                    borderColor: {
+                        DEFAULT: '#1E293B',
                     },
                     fontFamily: {
-                        sans: ['Fira Sans', 'Inter', 'system-ui', 'sans-serif'],
-                        mono: ['Fira Code', 'JetBrains Mono', 'Consolas', 'monospace'],
-                    }
+                        sans: ['Inter', 'system-ui', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'Consolas', 'monospace'],
+                    },
+                    fontSize: {
+                        'xl-display': ['1.75rem', { lineHeight: '1.2' }],
+                        'lg-heading': ['1.375rem', { lineHeight: '1.3' }],
+                        'md-heading': ['1.125rem', { lineHeight: '1.4' }],
+                        'xs-label': ['0.75rem', { lineHeight: '1.4' }],
+                    },
                 }
             }
         }
     </script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+            --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+            --ease-in-out-quart: cubic-bezier(0.76, 0, 0.24, 1);
+        }
         * { box-sizing: border-box; }
-        body { font-family: 'Fira Sans', system-ui, sans-serif; }
-        code, pre, .font-mono { font-family: 'Fira Code', 'JetBrains Mono', monospace; }
-        .status-pending { background-color: #475569; color: #CBD5E1; }
-        .status-running { background-color: #2563EB; color: #fff; }
-        .status-waiting_approval { background-color: #D97706; color: #fff; }
-        .status-completed { background-color: #22C55E; color: #fff; }
-        .status-failed { background-color: #EF4444; color: #fff; }
-        .status-cancelled { background-color: #475569; color: #CBD5E1; }
-        .status-captcha_blocked { background-color: #F59E0B; color: #000; }
-        @keyframes pulse-dot { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.85); } }
-        .animate-pulse-dot { animation: pulse-dot 1.5s ease-in-out infinite; }
-        .scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
-        .scrollbar-thin::-webkit-scrollbar-track { background: #1E293B; }
-        .scrollbar-thin::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
-        .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: #64748B; }
+        html { scroll-behavior: smooth; }
+        body {
+            font-family: 'Inter', system-ui, sans-serif;
+            background-color: #0B0F17;
+            background-image:
+                radial-gradient(ellipse 1200px 500px at 30% -100px, rgba(34, 211, 238, 0.025), transparent 60%),
+                radial-gradient(circle at 1px 1px, rgba(255, 255, 255, 0.013) 1px, transparent 0);
+            background-size: 100% 100%, 22px 22px;
+            background-attachment: fixed;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+            letter-spacing: -0.006em;
+        }
+        code, pre, .font-mono { font-family: 'JetBrains Mono', 'Consolas', monospace; }
+        h1, h2, h3 { text-wrap: balance; letter-spacing: -0.025em; }
+        p { text-wrap: pretty; }
+
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #1E293B; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #334155; }
+        ::selection { background: rgba(34, 211, 238, 0.2); color: #F1F5F9; }
+        *:focus { outline: none; }
+        *:focus-visible { outline: 2px solid rgba(34, 211, 238, 0.4); outline-offset: 2px; border-radius: 3px; }
+
+        /* ---- Panels ---- */
+        .panel {
+            background-color: #111827;
+            border: 1px solid #1E293B;
+            border-radius: 10px;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+        }
+        .panel-header {
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid #1E293B;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        /* ---- Status badges ---- */
+        .status-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            padding: 0.15rem 0.55rem 0.15rem 0.5rem;
+            border-radius: 9999px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.625rem;
+            font-weight: 600;
+            line-height: 1.4;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            white-space: nowrap;
+            transition: background-color 250ms var(--ease-out-quart), color 250ms var(--ease-out-quart);
+        }
+        .status-badge::before {
+            content: "";
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: currentColor;
+            flex-shrink: 0;
+        }
+        .status-pending, .status-queued { background: rgba(100, 116, 139, 0.12); color: #94A3B8; }
+        .status-running, .status-in_progress, .status-auto_queued { background: rgba(96, 165, 250, 0.1); color: #60A5FA; }
+        .status-running::before, .status-in_progress::before, .status-auto_queued::before { animation: pulse-dot 2s ease-in-out infinite; }
+        .status-waiting_approval { background: rgba(251, 191, 36, 0.1); color: #FBBF24; }
+        .status-completed { background: rgba(52, 211, 153, 0.1); color: #34D399; }
+        .status-failed { background: rgba(248, 113, 113, 0.1); color: #F87171; }
+        .status-cancelled { background: rgba(100, 116, 139, 0.1); color: #64748B; }
+        .status-captcha_blocked { background: rgba(251, 191, 36, 0.1); color: #FBBF24; }
+        .status-new { background: rgba(100, 116, 139, 0.12); color: #94A3B8; }
+        .status-in_progress, .status-scraping { background: rgba(96, 165, 250, 0.1); color: #60A5FA; }
+        .status-in_progress::before, .status-scraping::before { animation: pulse-dot 2s ease-in-out infinite; }
+        .status-complete, .status-ready { background: rgba(52, 211, 153, 0.1); color: #34D399; }
+        .status-approved { background: rgba(52, 211, 153, 0.1); color: #34D399; }
+        .status-rejected { background: rgba(248, 113, 113, 0.1); color: #F87171; }
+
+        /* ---- Custom select (shared dropdown) ---- */
+        .custom-select { position: relative; }
+        .cs-trigger {
+            display: flex; align-items: center; justify-content: space-between;
+            text-align: left; width: 100%; cursor: pointer; user-select: none;
+        }
+        .cs-value-text {
+            font-size: 0.875rem; color: #F1F5F9;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .cs-arrow {
+            flex-shrink: 0; margin-left: 0.75rem; color: #64748B;
+            transition: transform 200ms var(--ease-out-expo), color 150ms var(--ease-out-quart);
+        }
+        .custom-select.open .cs-trigger .cs-arrow { transform: rotate(180deg); color: #22D3EE; }
+        .cs-panel {
+            position: absolute; top: calc(100% + 6px); left: 0; right: 0;
+            background: #1A2332; border: 1px solid #2D3B50; border-radius: 10px;
+            max-height: 340px; overflow-y: auto; z-index: 50;
+            opacity: 0; visibility: hidden;
+            transform: translateY(-6px) scale(0.99); transform-origin: top center;
+            transition: transform 180ms var(--ease-out-expo),
+                        opacity 140ms var(--ease-out-quart),
+                        visibility 0s linear 180ms;
+            box-shadow: 0 12px 32px rgba(0,0,0,0.5), 0 0 1px rgba(34,211,238,0.12);
+        }
+        .custom-select.open .cs-panel {
+            opacity: 1; visibility: visible; transform: translateY(0) scale(1);
+            transition: transform 180ms var(--ease-out-expo),
+                        opacity 140ms var(--ease-out-quart), visibility 0s;
+        }
+        .cs-panel::-webkit-scrollbar { width: 6px; }
+        .cs-panel::-webkit-scrollbar-track { background: transparent; }
+        .cs-panel::-webkit-scrollbar-thumb { background: #2D3B50; border-radius: 3px; }
+        .cs-group { padding: 4px 0; }
+        .cs-group:not(:last-child) { border-bottom: 1px solid #1A2332; }
+        .cs-group-label {
+            padding: 8px 12px 4px; font-size: 0.625rem; font-weight: 700;
+            color: #475569; text-transform: uppercase; letter-spacing: 0.1em;
+        }
+        .cs-option {
+            position: relative; padding: 7px 12px 7px 28px;
+            font-size: 0.8125rem; color: #CBD5E1; cursor: pointer;
+            transition: background-color 80ms var(--ease-out-quart), color 80ms var(--ease-out-quart);
+        }
+        .cs-option::before {
+            content: ""; position: absolute; left: 10px; top: 50%;
+            width: 5px; height: 9px; border: solid #22D3EE; border-width: 0 2px 2px 0;
+            transform: translateY(-60%) rotate(45deg) scale(0.6); opacity: 0;
+            transition: opacity 80ms var(--ease-out-quart);
+        }
+        .cs-option.selected::before { opacity: 1; }
+        .cs-option:hover { background: rgba(34, 211, 238, 0.06); color: #F1F5F9; }
+        .cs-option.selected { color: #F1F5F9; }
+        .cs-option.selected { background: rgba(34, 211, 238, 0.04); }
+
+        /* ---- Buttons ---- */
+        .btn-primary {
+            display: inline-flex; align-items: center; justify-content: center; gap: 0.5rem;
+            padding: 0.5625rem 1.125rem;
+            background: #22D3EE; color: #0B0F17;
+            font-size: 0.8125rem; font-weight: 600;
+            border-radius: 7px;
+            transition: background-color 150ms var(--ease-out-quart), transform 80ms var(--ease-out-quart), box-shadow 200ms var(--ease-out-quart);
+            cursor: pointer; will-change: transform; letter-spacing: -0.01em;
+        }
+        .btn-primary:hover { background: #06B6D4; box-shadow: 0 0 24px rgba(34, 211, 238, 0.2); }
+        .btn-primary:active { transform: scale(0.97); }
+        .btn-secondary {
+            display: inline-flex; align-items: center; justify-content: center; gap: 0.5rem;
+            padding: 0.5625rem 1.125rem;
+            background: #1A2332; color: #F1F5F9;
+            font-size: 0.8125rem; font-weight: 500;
+            border: 1px solid #2D3B50; border-radius: 7px;
+            transition: background-color 150ms var(--ease-out-quart), border-color 150ms var(--ease-out-quart), transform 80ms var(--ease-out-quart);
+            cursor: pointer; will-change: transform;
+        }
+        .btn-secondary:hover { background: #232E42; border-color: #3D4D63; }
+        .btn-secondary:active { transform: scale(0.97); }
+        .btn-danger {
+            display: inline-flex; align-items: center; justify-content: center; gap: 0.5rem;
+            padding: 0.5625rem 1.125rem;
+            background: rgba(248, 113, 113, 0.1); color: #F87171;
+            font-size: 0.8125rem; font-weight: 600;
+            border: 1px solid rgba(248, 113, 113, 0.25); border-radius: 7px;
+            transition: background-color 150ms var(--ease-out-quart), transform 80ms var(--ease-out-quart);
+            cursor: pointer; will-change: transform;
+        }
+        .btn-danger:hover { background: rgba(248, 113, 113, 0.18); border-color: rgba(248, 113, 113, 0.4); }
+        .btn-danger:active { transform: scale(0.97); }
+
+        /* ---- Form inputs ---- */
+        .input-field {
+            width: 100%;
+            background: #0B0F17; border: 1px solid #2D3B50; border-radius: 7px;
+            padding: 0.5625rem 0.875rem; font-size: 0.875rem; color: #F1F5F9;
+            transition: border-color 150ms var(--ease-out-quart), box-shadow 200ms var(--ease-out-quart), background-color 150ms var(--ease-out-quart);
+        }
+        .input-field::placeholder { color: #475569; }
+        .input-field:hover { border-color: #3D4D63; }
+        .input-field:focus { outline: none; border-color: #22D3EE; background: #0D1219; box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.08); }
+
+        select.input-field {
+            appearance: none; -webkit-appearance: none; -moz-appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' stroke='%2394A3B8' stroke-width='2' viewBox='0 0 24 24'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' d='M19 9l-7 7-7-7'/%3E%3C/svg%3E");
+            background-repeat: no-repeat; background-position: right 0.75rem center; background-size: 16px; padding-right: 2.5rem; cursor: pointer;
+        }
+        select.input-field:focus {
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' stroke='%2322D3EE' stroke-width='2' viewBox='0 0 24 24'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' d='M19 9l-7 7-7-7'/%3E%3C/svg%3E");
+        }
+        select.input-field option { background: #111827; color: #F1F5F9; padding: 0.5rem; }
+        select.input-field optgroup { background: #111827; color: #64748B; font-style: normal; font-weight: 600; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.06em; }
+        .input-label { display: block; font-size: 0.75rem; font-weight: 600; color: #94A3B8; margin-bottom: 0.4rem; letter-spacing: 0.01em; }
+
+        /* ---- Sidebar ---- */
+        .sidebar {
+            width: 232px; height: 100vh; position: sticky; top: 0;
+            background: rgba(11, 15, 23, 0.5);
+            border-right: 1px solid #1E293B;
+            display: flex; flex-direction: column; flex-shrink: 0;
+            backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+            z-index: 40; overflow: hidden;
+        }
+        .sidebar-logo {
+            background: rgba(34, 211, 238, 0.06);
+            border: 1px solid rgba(34, 211, 238, 0.12);
+            transition: box-shadow 200ms var(--ease-out-quart), border-color 200ms var(--ease-out-quart);
+        }
+        .sidebar-logo:hover { border-color: rgba(34, 211, 238, 0.25); box-shadow: 0 0 20px rgba(34, 211, 238, 0.1); }
+        .sidebar-link {
+            display: flex; align-items: center; gap: 0.625rem;
+            padding: 0.5rem 0.75rem; margin: 1px 10px;
+            border-radius: 6px; font-size: 0.8125rem; font-weight: 500;
+            color: #7D8DA6;
+            transition: color 150ms var(--ease-out-quart), background-color 150ms var(--ease-out-quart);
+            position: relative;
+        }
+        .sidebar-link svg { width: 16px; height: 16px; flex-shrink: 0; opacity: 0.6; transition: opacity 150ms var(--ease-out-quart), color 150ms var(--ease-out-quart); }
+        .sidebar-link:hover { color: #F1F5F9; background: rgba(255, 255, 255, 0.03); }
+        .sidebar-link:hover svg { opacity: 0.9; }
+        .sidebar-link { position: relative; }
+        .sidebar-link::before {
+            content: ''; position: absolute; left: 0; top: 50%; transform: translateY(-50%) scaleY(0);
+            width: 2px; height: 18px; background: #22D3EE; border-radius: 0 2px 2px 0;
+            transition: transform 200ms var(--ease-out-quart);
+        }
+        .sidebar-link.active::before { transform: translateY(-50%) scaleY(1); }
+        .sidebar-link.active { color: #F1F5F9; background: rgba(34, 211, 238, 0.06); }
+        .sidebar-link.active svg { opacity: 1; color: #22D3EE; }
+        .sidebar-sep { height: 1px; background: #1E293B; margin: 0.5rem 1.25rem; }
+
+        /* ---- Mobile nav ---- */
+        .mobile-nav {
+            background: rgba(11, 15, 23, 0.8);
+            backdrop-filter: blur(12px) saturate(180%);
+            -webkit-backdrop-filter: blur(12px) saturate(180%);
+            border-bottom: 1px solid #1E293B;
+        }
+
+        /* ---- Nav link (mobile) ---- */
+        .nav-link {
+            padding: 0.375rem 0.75rem; font-size: 0.75rem; font-weight: 500;
+            color: #8B9BB4; border-radius: 6px; white-space: nowrap;
+            transition: color 150ms var(--ease-out-quart), background-color 150ms var(--ease-out-quart);
+        }
+        .nav-link:hover { color: #F1F5F9; background: rgba(255, 255, 255, 0.04); }
+        .nav-link.active { color: #22D3EE; background: rgba(34, 211, 238, 0.06); }
+
+        /* ---- Custom checkbox ---- */
+        input[type="checkbox"] {
+            appearance: none; -webkit-appearance: none; -moz-appearance: none;
+            width: 18px; height: 18px; border: 1.5px solid #334155; border-radius: 4px;
+            background: #0B0F17; cursor: pointer; position: relative; flex-shrink: 0;
+            transition: border-color 150ms var(--ease-out-quart), background-color 150ms var(--ease-out-quart);
+        }
+        input[type="checkbox"]:hover { border-color: #22D3EE; }
+        input[type="checkbox"]:checked { background: #22D3EE; border-color: #22D3EE; }
+        input[type="checkbox"]:checked::after {
+            content: ""; position: absolute; left: 5px; top: 1px; width: 5px; height: 10px;
+            border: solid #0B0F17; border-width: 0 2px 2px 0; transform: rotate(45deg);
+            animation: checkmark-draw 200ms var(--ease-out-expo);
+        }
+        input[type="checkbox"]:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.15); }
+
+        /* ---- Accordion ---- */
+        .collapse-body { display: grid; grid-template-rows: 0fr; opacity: 0; transition: grid-template-rows 250ms var(--ease-out-quart), opacity 200ms var(--ease-out-quart); }
+        .collapse-body.open { grid-template-rows: 1fr; opacity: 1; }
+        .collapse-body > * { overflow: hidden; min-height: 0; }
+        .hover-row { transition: background-color 150ms var(--ease-out-quart); }
+
+        /* ---- Keyframes ---- */
+        @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+        .animate-pulse-dot { animation: pulse-dot 2s ease-in-out infinite; }
+        @keyframes phase-glow { 0%, 100% { box-shadow: 0 0 0 0 rgba(34, 211, 238, 0.4); } 50% { box-shadow: 0 0 0 5px rgba(34, 211, 238, 0); } }
+        .phase-active { animation: phase-glow 2s ease-in-out infinite; }
+        @keyframes slide-in { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+        .anim-slide-in { animation: slide-in 200ms var(--ease-out-quart); }
+        @keyframes fade-in-up { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        .anim-fade-in-up { animation: fade-in-up 250ms var(--ease-out-quart); }
+        @keyframes slide-down { from { opacity: 0; transform: translateY(-12px); max-height: 0; } to { opacity: 1; transform: translateY(0); max-height: 500px; } }
+        .anim-slide-down { animation: slide-down 300ms var(--ease-out-expo); overflow: hidden; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .anim-spin { animation: spin 0.8s linear infinite; }
+        @keyframes flash-success { 0% { background-color: rgba(52, 211, 153, 0.15); } 100% { background-color: transparent; } }
+        .anim-flash { animation: flash-success 600ms var(--ease-out-quart); }
+        @keyframes checkmark-draw { 0% { opacity: 0; transform: rotate(45deg) scale(0.3); } 100% { opacity: 1; transform: rotate(45deg) scale(1); } }
         @media (prefers-reduced-motion: reduce) {
-            .animate-pulse-dot { animation: none; }
+            input[type="checkbox"]:checked::after { animation: none; }
+        }
+
+        /* ---- Page + list animations ---- */
+        @keyframes page-reveal {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .anim-page { animation: page-reveal 400ms var(--ease-out-expo); }
+
+        @keyframes stagger-in {
+            from { opacity: 0; transform: translateY(6px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .stagger-item {
+            opacity: 0;
+            animation: stagger-in 350ms var(--ease-out-quart) forwards;
+            animation-delay: calc(var(--si, 0) * 35ms);
+        }
+
+        .panel-lift {
+            transition: transform 200ms var(--ease-out-quart), border-color 150ms var(--ease-out-quart), box-shadow 200ms var(--ease-out-quart);
+        }
+        .panel-lift:hover {
+            transform: translateY(-1px);
+            border-color: #334155;
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+        }
+
+        /* ---- Scrollbar thin ---- */
+        .scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+        .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+        .scrollbar-thin::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+        .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: #475569; }
+
+        @media (prefers-reduced-motion: reduce) {
+            .animate-pulse-dot, .phase-active, .anim-slide-in, .anim-fade-in-up, .anim-slide-down, .anim-spin, .anim-flash, .anim-page, .stagger-item { animation: none !important; }
+            .stagger-item { opacity: 1 !important; }
             * { transition-duration: 0.01ms !important; }
+            html { scroll-behavior: auto; }
         }
     </style>
     {% block extra_head %}{% endblock %}
 </head>
-<body class="bg-brand-900 text-brand-50 min-h-screen antialiased">
+<body class="bg-void text-ink min-h-screen antialiased">
 
-<nav class="sticky top-4 z-50 mx-4 mt-4">
-    <div class="max-w-7xl mx-auto bg-surface/80 backdrop-blur-xl border border-brand-700/50 rounded-2xl px-5 py-3 shadow-lg shadow-black/20">
-        <div class="flex items-center justify-between">
-            <a href="{% url 'home' %}" class="flex items-center gap-2.5 group">
-                <div class="w-8 h-8 bg-cta rounded-lg flex items-center justify-center">
-                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="white" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" fill="none"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/></svg>
+{% if user.is_authenticated %}
+<div class="flex min-h-screen">
+    <!-- Desktop sidebar -->
+    <aside class="sidebar hidden lg:flex">
+        <div class="px-4 pt-5 pb-4">
+            <a href="{% url 'home' %}" class="flex items-center gap-2.5">
+                <div class="sidebar-logo w-8 h-8 rounded-lg flex items-center justify-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#22D3EE"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/></svg>
                 </div>
-                <span class="font-bold text-brand-50 text-sm tracking-tight group-hover:text-cta transition-colors duration-200">Ecommerce Scraper</span>
+                <span class="font-bold text-sm text-ink tracking-tight">Scraper<span class="text-accent">.</span>console</span>
             </a>
-            <div class="flex items-center gap-1">
-                <a href="{% url 'site_list' %}" class="px-3.5 py-1.5 text-xs font-medium text-brand-400 hover:text-brand-50 hover:bg-brand-700/50 rounded-lg transition-colors duration-200">Sites</a>
-                <a href="{% url 'job_list' %}" class="px-3.5 py-1.5 text-xs font-medium text-brand-400 hover:text-brand-50 hover:bg-brand-700/50 rounded-lg transition-colors duration-200">Jobs</a>
-                <a href="{% url 'approval_list' %}" class="px-3.5 py-1.5 text-xs font-medium text-brand-400 hover:text-brand-50 hover:bg-brand-700/50 rounded-lg transition-colors duration-200 relative">
+        </div>
+
+        <nav class="flex-1 overflow-y-auto py-2">
+            <a href="{% url 'home' %}" class="sidebar-link" data-nav="home">
+                <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 3v11.25h7.5V3m0 0h8.25v6.75h-8.25M3 18h18M5.25 21h13.5"/></svg>
+                New Scrape
+            </a>
+            <a href="{% url 'site_list' %}" class="sidebar-link" data-nav="sites">
+                <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path stroke-linecap="round" stroke-linejoin="round" d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18"/></svg>
+                Sites
+            </a>
+            <a href="{% url 'job_list' %}" class="sidebar-link" data-nav="jobs">
+                <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+                Jobs
+            </a>
+            <div class="sidebar-sep"></div>
+            <a href="{% url 'approval_list' %}" class="sidebar-link" data-nav="approvals">
+                <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path stroke-linecap="round" stroke-linejoin="round" d="M8.5 12.5l2.5 2.5 4.5-5"/></svg>
+                Approvals
+                <span id="pending-count" class="ml-auto inline-flex items-center justify-center min-w-[18px] h-[18px] px-1.5 bg-warning/15 text-warning text-[10px] font-bold font-mono rounded-full border border-warning/20"></span>
+            </a>
+            <div class="sidebar-sep"></div>
+            <a href="{% url 'probe_tester' %}" class="sidebar-link" data-nav="probe">
+                <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path stroke-linecap="round" stroke-linejoin="round" d="M12 3v3M12 18v3M3 12h3M18 12h3"/></svg>
+                Probe Tester
+            </a>
+            <a href="{% url 'agent_playground' %}" class="sidebar-link" data-nav="playground">
+                <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/><path stroke-linecap="round" stroke-linejoin="round" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                Agent Playground
+            </a>
+            <a href="{% url 'probe_cache' %}" class="sidebar-link" data-nav="cache">
+                <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 3l9 5-9 5-9-5 9-5zM3 13l9 5 9-5"/></svg>
+                Cache
+            </a>
+        </nav>
+
+        <div class="py-2 px-0 border-t border-line-subtle">
+            <a href="{% url 'admin:index' %}" class="sidebar-link" data-nav="admin">
+                <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path stroke-linecap="round" stroke-linejoin="round" d="M12 1v3M12 20v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M1 12h3M20 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>
+                Admin
+            </a>
+            <form method="post" action="{% url 'logout' %}">
+                {% csrf_token %}
+                <button type="submit" class="sidebar-link w-full text-left cursor-pointer" style="background:none;border:none;font:inherit;color:inherit;">
+                    <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 4H6a2 2 0 00-2 2v12a2 2 0 002 2h3M16 17l5-5-5-5M21 12H9"/></svg>
+                    Logout
+                </button>
+            </form>
+        </div>
+    </aside>
+
+    <!-- Mobile nav -->
+    <div class="mobile-nav sticky top-0 z-50 lg:hidden">
+        <div class="flex items-center justify-between px-4 h-12">
+            <a href="{% url 'home' %}" class="flex items-center gap-2">
+                <div class="sidebar-logo w-7 h-7 rounded-md flex items-center justify-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#22D3EE"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/></svg>
+                </div>
+                <span class="font-bold text-xs text-ink">Scraper<span class="text-accent">.</span>console</span>
+            </a>
+            <div class="flex items-center gap-0.5 overflow-x-auto">
+                <a href="{% url 'home' %}" class="nav-link">New</a>
+                <a href="{% url 'site_list' %}" class="nav-link">Sites</a>
+                <a href="{% url 'job_list' %}" class="nav-link">Jobs</a>
+                <a href="{% url 'approval_list' %}" class="nav-link relative flex items-center gap-1">
                     Approvals
-                    <span id="pending-count" class="ml-1 inline-flex items-center justify-center min-w-[16px] h-4 px-1 bg-cta text-[10px] font-bold text-white rounded-full"></span>
+                    <span id="pending-count-mobile" class="inline-flex items-center justify-center min-w-[16px] h-4 px-1 bg-warning/15 text-warning text-[10px] font-bold font-mono rounded-full"></span>
                 </a>
-                <a href="{% url 'probe_tester' %}" class="px-3.5 py-1.5 text-xs font-medium text-brand-400 hover:text-brand-50 hover:bg-brand-700/50 rounded-lg transition-colors duration-200">Probe</a>
-                <a href="{% url 'probe_cache' %}" class="px-3.5 py-1.5 text-xs font-medium text-brand-400 hover:text-brand-50 hover:bg-brand-700/50 rounded-lg transition-colors duration-200">Cache</a>
-                <a href="{% url 'admin:index' %}" class="px-3.5 py-1.5 text-xs font-medium text-brand-400 hover:text-brand-50 hover:bg-brand-700/50 rounded-lg transition-colors duration-200">Admin</a>
-                {% if user.is_authenticated %}
-                <form method="post" action="{% url 'logout' %}" class="inline">
-                    {% csrf_token %}
-                    <button type="submit" class="px-3.5 py-1.5 text-xs font-medium text-brand-500 hover:text-red-400 hover:bg-brand-700/50 rounded-lg transition-colors duration-200 cursor-pointer">Logout</button>
-                </form>
-                {% endif %}
+                <a href="{% url 'probe_tester' %}" class="nav-link">Probe</a>
             </div>
         </div>
     </div>
-</nav>
 
-<main class="max-w-7xl mx-auto px-4 pt-6 pb-12">
-    {% block content %}{% endblock %}
+    <!-- Main content -->
+    <main class="flex-1 min-w-0 px-5 lg:px-8 pt-6 lg:pt-8 pb-12">
+        <div class="max-w-5xl mx-auto anim-page">
+            {% block content %}{% endblock %}
+        </div>
+    </main>
+</div>
+
+{% else %}
+<!-- Unauthenticated: no sidebar -->
+<main class="min-h-screen">
+    {% block content_unauth %}{% endblock %}
 </main>
+{% endif %}
 
 <script>
 (function() {
-    var badge = document.getElementById('pending-count');
-    if (badge) {
-        fetch('{% url "approval_count" %}')
-            .then(function(r) { return r.json(); })
-            .then(function(d) {
-                if (d.count > 0) {
-                    badge.textContent = d.count;
-                } else {
-                    badge.style.display = 'none';
-                }
-            })
-            .catch(function() { badge.style.display = 'none'; });
+    var path = window.location.pathname;
+
+    // Desktop sidebar active state
+    document.querySelectorAll('.sidebar-link').forEach(function(link) {
+        var href = link.getAttribute('href');
+        if (!href || href === '#') return;
+        if (path === href || (href !== '/' && path.startsWith(href))) {
+            link.classList.add('active');
+        }
+    });
+    // Special case: home is '/', need exact match
+    if (path === '/') {
+        document.querySelectorAll('.sidebar-link[data-nav="home"]').forEach(function(l) { l.classList.add('active'); });
     }
+
+    // Mobile nav active state
+    document.querySelectorAll('.nav-link').forEach(function(link) {
+        var href = link.getAttribute('href');
+        if (!href || href === '#') return;
+        if (path === href || (href !== '/' && path.startsWith(href))) {
+            if (link.id !== 'pending-count-mobile') link.classList.add('active');
+        }
+    });
+
+    // Pending count badge
+    function setBadge(id, count) {
+        var badge = document.getElementById(id);
+        if (badge && count > 0) { badge.textContent = count; }
+        else if (badge) { badge.style.display = 'none'; }
+    }
+    fetch('{% url "approval_count" %}')
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+            setBadge('pending-count', d.count);
+            setBadge('pending-count-mobile', d.count);
+        })
+        .catch(function() {
+            setBadge('pending-count', 0);
+            setBadge('pending-count-mobile', 0);
+        });
 })();
 </script>
 {% block extra_js %}{% endblock %}

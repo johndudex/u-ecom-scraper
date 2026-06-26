@@ -1,0 +1,240 @@
+{
+  "site_slug": "bulgari-com",
+  "analyzed_products": 0,
+  "site_analysis_review": {
+    "platform_agreement": true,
+    "platform_notes": "Site analysis correctly identifies Bulgari.com as a custom LVMH ecommerce platform. Confirmed as not Shopify, SFCC, or any standard platform.",
+    "anti_bot_agreement": true,
+    "anti_bot_notes": "Site analysis correctly identifies bot detection that blocks standard Playwright and direct HTTP. UC Chrome (undetected Chrome) is required. No CAPTCHA observed. The detection appears to be TLS fingerprinting or browser fingerprinting at the network level rather than a named anti-bot service like Cloudflare or Akamai.",
+    "mechanism_agreement": true,
+    "mechanism_notes": "stealth_browser (seleniumbase_uc) is correct. The site requires an undetected browser. UC Chrome without proxy successfully accesses the page.",
+    "connectivity_agreement": true,
+    "connectivity_notes": "Method uc_chrome_none confirmed working by previous scraper runs (logs show UC Chrome successfully loaded the homepage and category pages). The 'en-int' locale URLs produced errors, suggesting the correct locale is 'en-us' for US product pages.",
+    "corrections": [
+      "Product URL locale: The site analysis uses 'en-us' in sample URLs but the previous scraper used 'en-int'. The 'en-int' locale may be outdated or region-restricted. The code-writer should use the locale from the actual input URLs.",
+      "The site analysis notes 'anti_bot detected: false' which contradicts the 'detected: false' under anti_bot.type. Correct interpretation: No named anti-bot service (Cloudflare/Akamai) detected, but browser fingerprinting IS present that blocks standard browsers.",
+      "Previous scraper logs show SyntaxError in JavaScript evaluation for JSON-LD extraction and grid link extraction. This suggests the site's DOM structure or CSP may interfere with CDP-based JavaScript evaluation. The code-writer needs to use careful JS evaluation patterns."
+    ]
+  },
+  "connectivity": {
+    "method_that_worked": "uc_chrome_none",
+    "proxy_tier": "none",
+    "js_rendering_needed": true,
+    "notes": "UC Chrome without proxy is the only confirmed working method. Standard Playwright MCP and direct HTTP are both blocked. JS rendering is required for product data to appear. Previous scraper runs confirmed UC Chrome can load the homepage and category pages. Product pages should also load via UC Chrome with the correct locale (en-us)."
+  },
+  "extraction_methods": {
+    "primary": "dom_parsing",
+    "structured_data_available": true,
+    "structured_data_fields": [
+      "title",
+      "description",
+      "image",
+      "brand",
+      "sku",
+      "availability",
+      "url"
+    ],
+    "structured_data_limitations": "Previous scraper logs show JSON-LD extraction via CDP JavaScript evaluation threw SyntaxError. This may be a CSP issue or evaluation context issue. The code-writer should extract JSON-LD by parsing the page source HTML for <script type='application/ld+json'> tags rather than using document.querySelector-based JS evaluation.",
+    "notes": "Price may not be in JSON-LD (common for luxury brands that hide pricing). Price must be extracted from DOM CSS selectors. The primary extraction method is DOM parsing with CSS selectors via SeleniumBase/UC Chrome."
+  },
+  "fields": {
+    "url": {
+      "method": "javascript",
+      "selector": "window.location.href",
+      "structured_data_fallback": "JSON-LD Product.url or @id",
+      "tested": false,
+      "examples": [],
+      "notes": "Set to the final URL after any redirects."
+    },
+    "src_url": {
+      "method": "parameter",
+      "selector": "Set by scraper from input_urls.json",
+      "tested": false,
+      "examples": [],
+      "notes": "This is the source URL provided to the scraper."
+    },
+    "status_code": {
+      "method": "direct",
+      "selector": "HTTP response status code",
+      "notes": "Set by the scraper after fetching the page."
+    },
+    "scraped_at": {
+      "method": "direct",
+      "selector": "current ISO-8601 timestamp",
+      "notes": "Set by the scraper when extraction completes."
+    },
+    "remarks": {
+      "method": "direct",
+      "selector": "set by scraper",
+      "notes": "Notes or warnings from the extraction process."
+    },
+    "title": {
+      "method": "css",
+      "selector": "h1, [data-testid*='product-name'], .product-detail h1, .product-name",
+      "structured_data_fallback": "JSON-LD Product.name",
+      "tested": false,
+      "examples": [],
+      "notes": "LVMH sites typically use h1 for the product name. May also be in a data-testid attribute. Extract from DOM after JS render."
+    },
+    "price": {
+      "method": "css",
+      "selector": "[data-testid*='price'], .product-price, .price-value, [class*='price'], [class*='Price']",
+      "structured_data_fallback": "JSON-LD Product.offers.price (may be empty for luxury sites)",
+      "tested": false,
+      "examples": [],
+      "notes": "Luxury brands often hide prices or display them after interaction. Price may be in a specific data-testid attribute. The JSON-LD offers.price may be empty '{}'. DOM extraction is primary method."
+    },
+    "availability": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.offers.availability",
+      "css_fallback": "[data-testid*='availability'], .stock-status, .availability",
+      "tested": false,
+      "examples": [],
+      "notes": "Check JSON-LD first. LVMH sites typically indicate availability in structured data."
+    },
+    "original_price": {
+      "method": "css",
+      "selector": "[class*='compare'], [class*='original'], .was-price, [data-testid*='original-price']",
+      "tested": false,
+      "examples": [],
+      "notes": "May not be present if product is not on sale. Bulgari luxury products rarely have sale pricing."
+    },
+    "currency": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.offers.priceCurrency",
+      "css_fallback": "Check price element for currency symbol or data attribute",
+      "tested": false,
+      "examples": [],
+      "notes": "Should be in JSON-LD offers.priceCurrency. Likely USD for en-us locale."
+    },
+    "description": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.description",
+      "css_fallback": "[data-testid*='description'], .product-description, .description",
+      "tested": false,
+      "examples": [],
+      "notes": "Product description from JSON-LD or DOM."
+    },
+    "image": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.image",
+      "css_fallback": "[data-testid*='image'] img, .product-image img, [class*='gallery'] img",
+      "tested": false,
+      "examples": [],
+      "notes": "Primary product image. May be an array in JSON-LD. Extract first/high-quality image URL."
+    },
+    "brand": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.brand.name",
+      "tested": false,
+      "examples": [
+        "BULGARI"
+      ],
+      "notes": "Brand is typically 'BULGARI' across all products."
+    },
+    "sku": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.sku",
+      "css_fallback": "[data-testid*='sku'], .sku, [class*='sku']",
+      "tested": false,
+      "examples": [],
+      "notes": "Product SKU/code, often present in JSON-LD."
+    },
+    "category": {
+      "method": "structured_data",
+      "selector": "JSON-LD BreadcrumbList items",
+      "css_fallback": ".breadcrumb, nav[aria-label='breadcrumb']",
+      "tested": false,
+      "examples": [],
+      "notes": "Category hierarchy from breadcrumb JSON-LD or DOM breadcrumbs."
+    },
+    "rating": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.aggregateRating.ratingValue",
+      "css_fallback": "[class*='rating'], [data-testid*='rating']",
+      "tested": false,
+      "examples": [],
+      "notes": "May not be present. Luxury sites often don't display customer ratings."
+    },
+    "review_count": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.aggregateRating.reviewCount",
+      "tested": false,
+      "examples": [],
+      "notes": "May not be present."
+    },
+    "gtin": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.gtin",
+      "tested": false,
+      "examples": [],
+      "notes": "May be present for some products, particularly watches."
+    },
+    "mpn": {
+      "method": "structured_data",
+      "selector": "JSON-LD Product.mpn",
+      "tested": false,
+      "examples": [],
+      "notes": "Manufacturer Part Number, may be present."
+    },
+    "location": {
+      "method": "parameter",
+      "selector": "Not typically available on product page",
+      "tested": false,
+      "examples": [],
+      "notes": "Bulgari is an online-only luxury retailer. No warehouse/store location typically shown."
+    }
+  },
+  "jsonld_extraction": {
+    "available": true,
+    "notes": "JSON-LD structured data is expected on product pages. The previous scraper's SyntaxError when extracting JSON-LD via CDP suggests the JavaScript evaluation method needs adjustment. The code-writer should use page_source to find and parse <script type='application/ld+json'> tags rather than CDP Runtime.evaluate for JSON-LD extraction. Expected types: Product, BreadcrumbList, possibly Organization/WebPage.",
+    "extraction_approach": "Parse page HTML source with BeautifulSoup/re to find <script type='application/ld+json'> tags, then json.loads() each block. Do NOT use driver.execute_script() for this extraction due to observed SyntaxError issues with CDP evaluation on this site.",
+    "expected_product_fields": [
+      "name",
+      "description",
+      "image",
+      "sku",
+      "brand",
+      "offers",
+      "url",
+      "@type",
+      "@context"
+    ],
+    "expected_offer_fields": [
+      "price",
+      "priceCurrency",
+      "availability",
+      "@type"
+    ],
+    "warning": "JSON-LD offers.price may be empty object '{}' for some products. Always fall back to CSS selector for price extraction."
+  },
+  "variants": {
+    "detected": true,
+    "notes": "Bulgari products typically have variants (size, color, material) especially for jewelry and watches. Variant selectors are likely buttons/swatches in the product detail section. Variant data may be loaded in a DOM JSON object or may require clicking each variant to see updated data.",
+    "selector": "Variant swatches/buttons likely in [class*='variant'], [class*='size'], [class*='color'], [data-testid*='variant']",
+    "data_source": "Likely DOM JSON or JavaScript object. May need to click each variant.",
+    "variant_specific_data": "Price and availability may change per variant (different materials = different prices). Images definitely change per variant."
+  },
+  "page_structure": {
+    "notes": "Bulgari.com uses a custom LVMH enterprise platform. Product pages are JavaScript-rendered single-page applications. Key sections typically include: product gallery (image carousel), product title, price, description, variant selectors, add-to-bag button. The site uses React or similar framework with data-testid attributes on key elements.",
+    "key_sections": [
+      "Product gallery / images",
+      "Product title (h1)",
+      "Price display",
+      "Product description",
+      "Variant selectors (size, color)",
+      "Add to bag / CTA",
+      "Breadcrumb navigation"
+    ],
+    "crawl_approach": "The previous scraper tried category browsing (Phase 1) and direct URL scraping (Phase 2). Both phases failed to extract products. Phase 1 failed to find product links on category pages (JavaScript grid extraction error). Phase 2 failed with 'cannot unpack non-iterable NoneType object' suggesting the UC Chrome driver had issues with page loading. The code-writer should implement robust page load waiting (wait for specific elements/data-testid) and handle the JSON-LD extraction SyntaxError by using HTML source parsing instead of CDP evaluation."
+  },
+  "critical_recommendations": {
+    "jsonld_via_html_source": "Do NOT use driver.execute_script() for JSON-LD extraction. Use driver.page_source and BeautifulSoup/re to find <script type='application/ld+json'> tags. This avoids the SyntaxError observed in previous runs.",
+    "wait_strategy": "Wait for specific elements to appear before extraction. Use WebDriverWait with expected conditions on product title, price, or data-testid elements.",
+    "locale_handling": "Use the locale from the input URL (e.g., en-us). Do not hardcode en-int as that locale caused failures.",
+    "product_code_in_url": "Product URLs include a numeric product code (e.g., 360268). This can serve as a SKU fallback.",
+    "error_handling": "The previous scraper failed with 'cannot unpack non-iterable NoneType object'. Ensure the page has fully loaded before attempting to extract data. Use try/except around all element interactions."
+  },
+  "confidence_score": 0.6,
+  "confidence_notes": "Could not directly probe a valid product page due to probe cache blocking all access methods after the first UC Chrome determination. Analysis is based on: (1) site_analysis.json findings, (2) previous scraper logs showing UC Chrome connectivity, (3) general knowledge of LVMH/Bulgari site structure. Selectors are estimated and may need adjustment. The critical finding about JSON-LD extraction needing HTML source parsing (not CDP JS evaluation) is important for the code-writer."
+}

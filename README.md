@@ -188,6 +188,28 @@ u-ecom-scraper/
 
 ## Development
 
+### UI Design System
+
+The web UI uses a dark "operations console" theme with no static file build step:
+
+- **Tailwind CSS** is loaded via CDN (`cdn.tailwindcss.com`) with a custom inline config in `webapp/scraper/templates/scraper/base.html`
+- **Design tokens** (colors, spacing, typography) are defined inline in the `<style>` block of `base.html` — no separate CSS files to compile
+- **Fonts**: Inter (UI) and JetBrains Mono (data/code) from Google Fonts
+- **Django admin** is themed via `webapp/scraper/templates/admin/base_site.html`, which overrides `{% block extrastyle %}` with the same dark palette — no static file configuration needed
+
+To customize the theme, edit the CSS variables and Tailwind config in `base.html`. All pages inherit from this base template. Key tokens:
+
+| Token | Hex | Purpose |
+|-------|-----|---------|
+| `bg-void` | `#0B0F17` | Page background |
+| `bg-base` | `#111827` | Panel/card surfaces |
+| `bg-raised` | `#1A2332` | Hover/elevated |
+| `accent` | `#22D3EE` | Primary actions, links, live states |
+| `border-subtle` | `#1E293B` | Default borders |
+| `text-primary` | `#F1F5F9` | Body text |
+
+See `DESIGN.md` for the complete design system specification.
+
 ### Linting & Formatting
 
 ```bash

@@ -89,7 +89,14 @@ def is_anti_bot_detected() -> bool:
 def get_target_url() -> str:
     state = get_state()
     if state:
-        return state.get("product_url", "") or state.get("url", "")
+        url = state.get("product_url") or ""
+        if url:
+            return url
+        nav_findings = state.get("navigation_findings") or {}
+        product_links = nav_findings.get("listing_page", {}).get("product_links") or []
+        if product_links:
+            return product_links[0]
+        return state.get("url", "")
     return ""
 
 

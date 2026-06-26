@@ -1,273 +1,217 @@
 {
   "strategy": "http_requests",
-  "strategy_justification": "Direct HTTP returns full server-rendered page content. No anti-bot protection detected. All product data is available in JSON-LD (with non-standard capitalized keys), OG meta tags, inline serverSideEvents JavaScript, and static HTML DOM. No JavaScript rendering needed. This strategy worked for 3/5 products in the previous attempt; the 2 failures were discontinued products that redirect to homepage, not connectivity issues.",
+  "strategy_justification": "Direct HTTP returns complete server-rendered HTML with all product data (500K+ chars). No JavaScript rendering needed. No anti-bot protection detected. OG meta tags provide structured data (title, price, currency, brand, availability, image, description). CSS selectors provide additional data (sale price, specifications, ratings, review count, SKU, breadcrumbs, images).",
   "proxy_tier": "none",
-  "proxy_justification": "Direct HTTP connection works perfectly without any proxy. No blocking or rate limiting observed. Previous test showed 3/5 products fetched successfully; the 2 failures were server-side redirects to homepage (discontinued products), not proxy/blocking issues.",
+  "proxy_justification": "Direct HTTP connection works perfectly (HTTP 200, full page content). No anti-bot blocking observed. No proxy needed.",
   "no_proxy_flag": true,
   "extraction_approach": "hybrid",
   "jsonld_available": true,
-  "jsonld_fields": ["title", "description", "sku", "brand", "image", "price", "currency", "availability", "rating", "review_count", "url", "breadcrumbs", "item_condition", "shipping_cost"],
-  "jsonld_empty_offers": false,
+  "jsonld_fields": ["breadcrumbs"],
+  "jsonld_empty_offers": true,
+  "jsonld_notes": "JSON-LD exists but is only BreadcrumbList and VideoObject — no Product-type JSON-LD. Open Graph meta tags compensate fully for the missing Product JSON-LD.",
+  "og_tags_available": true,
+  "og_tags_fields": ["title", "description", "url", "image", "price:amount", "price:currency", "price:standard_amount", "brand", "availability", "type"],
+  "datalayer_available": true,
+  "datalayer_notes": "serverSideEvents JS variable in the HTML contains rich ecommerce data: SKU, ProductName, Price, Brand, rating (metric2), review_count (metric4), Colors, Sizes, availability, category hierarchy. Extractable via regex from the raw HTML without JS execution.",
   "warmup_required": false,
   "cookie_consent_required": false,
-  "jsonld_parsing_notes": "CRITICAL: The Product JSON-LD uses NON-STANDARD CAPITALIZED property names. Code MUST access: Product.Name (not name), Product.Mpn (not mpn), Product.Description (not description), Product.Image (not image), Product.Brand.Name (not brand.name), Product.Offers.Price (not offers.price), Product.Offers.PriceCurrency (not offers.priceCurrency), Product.Offers.Availability (not offers.availability), Product.AggregateRating.RatingValue (not aggregateRating.ratingValue). The JSON-LD raw content may have concatenated JSON after the main object — parse by finding first '{' to last '}' brace pair. There are exactly 2 JSON-LD blocks: BreadcrumbList (index 0) and Product (index 1).",
-  "server_side_events": {
-    "available": true,
-    "variable_name": "serverSideEvents",
-    "access_method": "Regex parse from inline script: var serverSideEvents = [{...}];",
-    "key_fields": {
-      "sku": "serverSideEvents[0].Sku → '143H'",
-      "product_name": "serverSideEvents[0].ProductName",
-      "price": "serverSideEvents[0].Price → '49.99'",
-      "brand": "serverSideEvents[0].Brand → 'Magic Silk'",
-      "colors": "serverSideEvents[0].Colors → ['Red','Purple','Blue','Black','Hot Pink']",
-      "sizes": "serverSideEvents[0].Sizes → [] (empty for this product)",
-      "stock_status": "serverSideEvents[0].dimension11 → 'In Stock'",
-      "rating": "serverSideEvents[0].dimension13 → 4.25",
-      "review_count": "serverSideEvents[0].metric4 → 637",
-      "category_path": "serverSideEvents[0].ecommerce.detail.products[0].category → 'Lingerie/Women\\'s Lingerie/Babydoll Lingerie'"
-    },
-    "rating_warning": "CRITICAL: serverSideEvents.dimension13 is a JavaScript float that may have floating-point precision issues (e.g., 4.099999904632568 instead of 4.1). MUST round to 1 decimal place: format(round(float(value), 1), '.1f'). Prefer JSON-LD AggregateRating.RatingValue which is already rounded (4.2), or use serverSideEvents with rounding."
-  },
-  "promo_price_warning": {
-    "selector": ".jcpoffer-pricerange",
-    "example_value": "$27.49",
-    "explanation": "This is a promotional coupon price (e.g., 'DOUBLE45' code). It is NOT the actual product price. Do NOT extract this as the product price. Extract only from JSON-LD Product.Offers.Price, .ae-normal-price .ae-price--normal (when not on sale), or .ae-sale-price .ae-price--now (when on sale).",
-    "original_price_logic": "When .ae-sale-price does NOT have class 'hide', the product is on sale: .ae-sale-price .ae-price--was = original price, .ae-sale-price .ae-price--now = sale price. When .ae-sale-price HAS class 'hide' (current state for this product), use .ae-normal-price .ae-price--normal as the price (which equals the original price since there's no sale)."
-  },
-  "page_validation": {
-    "required": true,
-    "description": "MUST validate that the fetched page is actually a product page before extracting data. Some product URLs redirect to the homepage (200 OK but homepage content). Without validation, homepage data gets extracted as product data.",
-    "checks": [
-      {
-        "method": "jsonld",
-        "check": "Find a JSON-LD block with @type='Product'",
-        "priority": 1,
-        "description": "Most reliable check. Homepage will NOT have a Product JSON-LD block."
-      },
-      {
-        "method": "regex",
-        "check": "Match 'pageType: \"Product\"' in inline phe JavaScript config",
-        "priority": 2,
-        "description": "phe.page.pageType is set to 'Product' on product pages, 'Home' on homepage."
-      },
-      {
-        "method": "css",
-        "check": "Check canonical URL contains '.aspx'",
-        "priority": 3,
-        "description": "Product canonical URLs always end in .aspx. Homepage canonical is just the domain."
-      },
-      {
-        "method": "meta",
-        "check": "Check og:type equals 'product'",
-        "priority": 4,
-        "description": "OG type meta tag is 'product' on product pages, may differ on other pages."
-      }
-    ],
-    "on_failure_action": "If page validation fails, set remarks to 'Received non-product page (possibly discontinued/redirected). URL may be invalid or product removed.' Do NOT overwrite product.url from the canonical link. Keep the original src_url as the url."
-  },
+  "user_agent_required": false,
   "verified_selectors": {
+    "url": {
+      "method": "meta_tag",
+      "selector": "meta[property='og:url']",
+      "css_fallback": "link[rel='canonical']",
+      "verified": true,
+      "test_result": "https://www.adameve.com/adult-sex-toys/vibrators/clit-vibrators/sp-eves-petite-private-pleasure-wand-by-adam-eve-108069.aspx"
+    },
     "title": {
-      "method": "jsonld",
-      "path": "Product.Name",
-      "css_fallback": "h1.item_title",
+      "method": "css",
+      "selector": "h1.ae-h1",
+      "css_fallback": "h1",
       "og_fallback": "meta[property='og:title']",
       "verified": true,
-      "test_result": "Hypnotic Swirl Cupless & Crotchless Babydoll",
-      "note": "JSON-LD uses 'Name' (capital N). OG title includes site suffix that should be stripped if used as fallback."
+      "test_result": "Eve's Petite Private Pleasure Wand - Vibrators | Adam & Eve",
+      "note": "Page has 2 h1 elements (duplicate in sticky CTA). Use the first one or scope to .ae-product-details h1.ae-h1. The og:title includes a ' - Vibrators | Adam & Eve' suffix — strip it when using as fallback."
     },
     "price": {
-      "method": "jsonld",
-      "path": "Product.Offers.Price",
+      "method": "meta_tag",
+      "selector": "meta[property='og:price:amount']",
       "css_fallback": ".ae-normal-price .ae-price--normal",
-      "og_fallback": "meta[property='og:price:amount']",
       "verified": true,
-      "test_result": "49.99",
-      "note": "JSON-LD returns numeric 49.99. CSS returns '$49.99' string. OG returns '49.99' string. JSON-LD is cleanest source. NOTE: There is a promo price '$27.49' in .jcpoffer-pricerange that MUST be ignored."
+      "test_result": "54.99",
+      "note": "og:price:amount gives the base/regular price. No JS rendering needed."
     },
     "original_price": {
-      "method": "css",
-      "selector": ".ae-sale-price:not(.hide) .ae-price--was",
+      "method": "meta_tag",
+      "selector": "meta[property='og:price:standard_amount']",
+      "css_fallback": ".ae-sale-price .ae-price--was.v1",
       "verified": true,
-      "test_result": null,
-      "note": "Only available when .ae-sale-price does NOT have class 'hide'. For this product, sale price div is hidden (class 'hide'), meaning no sale is active, so original_price equals price.",
-      "fix_required": "CRITICAL FIX: After extracting text from .ae-price--was with .get_text(strip=True), the text may contain extraneous promotional text like '89.99Excluded from promotion.Save 58.49 (65%)'. MUST apply regex to extract ONLY the price number: re.search(r'[\\d.]+', was_text).group(0). Then format with format_price(). Do NOT use the raw text directly. Also consider: og:price:standard_amount meta tag may exist on sale products (not verified on this product since it's not on sale)."
+      "test_result": "49.99",
+      "note": "CRITICAL FIX: Use og:price:standard_amount as PRIMARY source — it's clean and always available on sale products. If not available, use .ae-sale-price .ae-price--was.v1 (note the .v1 modifier — the non-v1 .ae-price--was element contains marketing garbage like '$39.99-$49.99Save Up to $35.02 (71%)'). For the .v1 fallback, the text may still be a price RANGE ('$39.99-$49.99') — extract only the FIRST dollar amount using re.search(r'\\$[\\d,.]+', text). Do NOT use plain .ae-price--was without .v1 — it includes appended promotional text."
+    },
+    "sale_price": {
+      "method": "css",
+      "selector": ".jcpoffer-pricerange.v1",
+      "verified": true,
+      "test_result": "$7.50 - $11.00",
+      "note": "CRITICAL FIX: For multi-size products, this element contains a PRICE RANGE ('$7.50 - $11.00'), not a single price. The scraper must extract only the FIRST price using re.search(r'\\d+\\.\\d{2}', sale_text) instead of re.sub(r'[^\\d.]', '', sale_text) which merges all numbers into one invalid string (e.g., '7.5011.00' causing ValueError crash). Wrap float conversion in try/except."
     },
     "currency": {
-      "method": "jsonld",
-      "path": "Product.Offers.PriceCurrency",
-      "og_fallback": "meta[property='og:price:currency']",
+      "method": "meta_tag",
+      "selector": "meta[property='og:price:currency']",
       "verified": true,
       "test_result": "USD"
     },
     "availability": {
-      "method": "jsonld",
-      "path": "Product.Offers.Availability",
-      "og_fallback": "meta[property='og:availability']",
+      "method": "meta_tag",
+      "selector": "meta[property='og:availability']",
       "verified": true,
-      "test_result": "http://schema.org/InStock",
-      "note": "JSON-LD returns full URL 'http://schema.org/InStock'. OG returns short form 'instock'. Normalize to standard values like 'InStock'."
+      "test_result": "instock"
     },
-    "brand": {
-      "method": "jsonld",
-      "path": "Product.Brand.Name",
-      "og_fallback": "meta[property='og:brand']",
-      "sse_fallback": "serverSideEvents[0].Brand",
+    "image": {
+      "method": "meta_tag",
+      "selector": "meta[property='og:image']",
+      "css_fallback": ".ae-product-carousel img",
       "verified": true,
-      "test_result": "Magic Silk"
-    },
-    "description": {
-      "method": "jsonld",
-      "path": "Product.Description",
-      "css_fallback": ".ae-accordion__content.ae-product-description",
-      "verified": true,
-      "test_result": "While scandalously exposed breasts do what they're best at, you'll cast a mesmerizing spell in hypnotic swirl patterned mesh! This babydoll's soft & stretchy, with satin bow detail and matching crotchless thong. Nylon & spandex. Imported.",
-      "note": "JSON-LD has the clean full description. DOM version is split across multiple accordion sections. Prefer JSON-LD."
-    },
-    "sku": {
-      "method": "jsonld",
-      "path": "Product.Mpn",
-      "sse_fallback": "serverSideEvents[0].Sku",
-      "verified": true,
-      "test_result": "143H",
-      "note": "JSON-LD uses 'Mpn' (capital M) for the SKU field."
-    },
-    "image_url": {
-      "method": "jsonld",
-      "path": "Product.Image",
-      "og_fallback": "meta[property='og:image']",
-      "verified": true,
-      "test_result": "https://www.adameve.com/cms/image/591545-649265-250x250.jpg",
-      "note": "JSON-LD provides 250x250 version. OG provides 0x0 (full resolution). Prefer OG for higher quality."
+      "test_result": "https://www.adameve.com/cms/image/656921-745597-0x0.jpg"
     },
     "images": {
       "method": "css",
-      "selector": ".ae-product-carousel .glider-track > .glider-slide img",
-      "alt_selector": ".ae-product-carousel .glider-slide img",
+      "selector": ".ae-product-carousel img",
       "verified": true,
-      "test_result_count": 11,
-      "test_result_first": "https://www.adameve.com/cms/image/591545-649265-500x500.jpg",
-      "note": "VERIFIED via browser: 11 main images + 11 thumbnails = 22 total. Main images are in .glider-track > .glider-slide > img. The previous scraper used '.ae-product-carousel .glider-slide img' which should work. If images are empty, try the more specific selector '.ae-product-carousel .glider-track > .glider-slide img' to avoid thumbnail duplicates. Deduplicate by URL. Filter out any data: URI sources. IMPORTANT: The .ae-product-carousel__thumbs section also has .glider-slide img elements — to get unique gallery images only, prefer '.ae-main-product-carousel .glider-track .glider-slide img' or deduplicate by URL."
+      "test_result": [
+        "https://www.adameve.com/cms/image/656921-745597-500x500.jpg",
+        "https://www.adameve.com/cms/image/656919-745595-500x500.jpg"
+      ],
+      "note": "CRITICAL FIX: Every product has 2x duplicate images because the carousel has both a thumbnail strip and main display with identical img src values. MUST deduplicate with list(dict.fromkeys(carousel_imgs)) or similar before assigning to product.images."
     },
-    "rating": {
-      "method": "jsonld",
-      "path": "Product.AggregateRating.RatingValue",
-      "sse_fallback": "serverSideEvents[0].dimension13",
+    "description": {
+      "method": "meta_tag",
+      "selector": "meta[property='og:description']",
       "verified": true,
-      "test_result_jsonld": 4.2,
-      "test_result_sse": 4.25,
-      "note": "JSON-LD truncates to 4.2. serverSideEvents has more precise 4.25. CRITICAL: serverSideEvents.dimension13 can have floating-point precision errors (e.g., 4.099999904632568). MUST round: format(round(float(value), 1), '.1f').",
-      "fix_required": "MUST round rating value to 1 decimal place. If using serverSideEvents, apply rounding. If using JSON-LD, it's already rounded but less precise."
+      "test_result": "This petite & powerful wand massager is perfectly sized for your body. Enjoy 10 bed-rocking vibration modes. Order now for discreet shipping & free gift."
     },
-    "review_count": {
-      "method": "jsonld",
-      "path": "Product.AggregateRating.RatingCount",
-      "sse_fallback": "serverSideEvents[0].metric4",
+    "brand": {
+      "method": "meta_tag",
+      "selector": "meta[property='og:brand']",
       "verified": true,
-      "test_result": 637
+      "test_result": "Adam and Eve"
+    },
+    "sku": {
+      "method": "regex",
+      "pattern": "\"Sku\":\\s*\"([A-Z0-9]+)\"",
+      "verified": true,
+      "test_result": "115H",
+      "note": "CRITICAL FIX: The scraper's current regex 'serverSideEvents.*?\"Sku\":\"([A-Z0-9]+)\"' fails because the JSON has a space after colon (\"Sku\": \"115H\" not \"Sku\":\"115H\"). The prefix 'serverSideEvents.*?' with DOTALL causes greedy matching that also breaks. Replace with the simple regex '\"Sku\":\\s*\"([A-Z0-9]+)\"' which works correctly. The 'Quote item' regex also fails because the SKU is inside a <span> element: 'Quote item <span>E194</span>'. Use 'Quote item[^A-Z0-9]*([A-Z0-9]+)' as secondary fallback, but the Sku regex is primary."
     },
     "category": {
-      "method": "jsonld",
-      "path": "BreadcrumbList item positions 2-4 (names)",
-      "sse_fallback": "serverSideEvents[0].ecommerce.detail.products[0].category",
+      "method": "json_ld",
+      "selector": "JSON-LD BreadcrumbList itemListElement",
+      "css_fallback": ".ae-breadcrumbs a, .ae-breadcrumbs__link",
       "verified": true,
-      "test_result_breadcrumb": ["Lingerie", "Women's Lingerie", "Babydoll Lingerie"],
-      "test_result_sse": "Lingerie/Women's Lingerie/Babydoll Lingerie"
+      "test_result": ["Home", "Sex Toys", "Vibrators", "Clitoral Vibrators"]
     },
-    "breadcrumbs": {
-      "method": "jsonld",
-      "path": "BreadcrumbList itemListElement items (name field)",
-      "css_fallback": ".breadcrumb a, .breadcrumb span",
+    "rating": {
+      "method": "regex",
+      "pattern": "\"metric2\":([\\d.]+)",
       "verified": true,
-      "test_result": ["Home", "Lingerie", "Women's Lingerie", "Babydoll Lingerie"],
-      "note": "BreadcrumbList JSON-LD is available. CSS fallback uses '.breadcrumb a, .breadcrumb span'."
+      "test_result": "3.8"
     },
-    "variants": {
+    "review_count": {
+      "method": "regex",
+      "pattern": "\"metric4\":([\\d]+)",
+      "verified": true,
+      "test_result": "1271"
+    },
+    "key_features": {
       "method": "css",
-      "selector": "select.product-variant-select option[value]",
+      "selector": ".ae-accordion .ae-accordion__content (accordion with summary.ae-accordion__title containing 'Key Features')",
       "verified": true,
-      "test_result_count": 6,
-      "test_result_sample": [
-        {"value": "290339", "text": "Red/Small/Med ($49.99)"},
-        {"value": "290341", "text": "Red/Queen ($49.99)"},
-        {"value": "250085", "text": "Black/Small/Med ($49.99)"}
+      "test_result": ["The perfect size for personal & shared pleasure", "Feel 10 functions of powerful vibration, pulsation & escalation", "Velvety-smooth silicone head with flexible neck"],
+      "note": "CRITICAL FIX: The accordion heading is a <summary> element (not <h2>). The scraper uses acc.find('h2', class_=re.compile('ae-accordion__title')) which never matches. Fix: use acc.find(class_='ae-accordion__title') or acc.find('summary', class_=re.compile('ae-accordion__title')). Extract li items from the accordion content div."
+    },
+    "specifications": {
+      "method": "css",
+      "selector": "table.ae-table (inside accordion with summary.ae-accordion__title containing 'Specifications')",
+      "verified": true,
+      "test_result": [
+        {"key": "Brand", "value": "Adam and Eve"},
+        {"key": "Colors", "value": "Aqua"},
+        {"key": "Length", "value": "5.8 inches"}
       ],
-      "note": "First option is always 'Please make a selection' with empty value — skip it. Format: {Color}/{Size} (${Price}). Color and size are parsed from the text."
+      "note": "CRITICAL FIX: Same <summary> vs <h2> issue as key_features. The accordion heading is a <summary> element. Fix: use acc.find(class_='ae-accordion__title') instead of acc.find('h2', ...). The table class is 'ae-table' and can be found with acc.find('table', class_=re.compile('ae-table'))."
     },
     "color_variants": {
-      "method": "javascript",
-      "path": "serverSideEvents[0].Colors",
-      "verified": true,
-      "test_result": ["Red", "Purple", "Blue", "Black", "Hot Pink"],
-      "note": "All possible colors from serverSideEvents. The select dropdown only shows currently available combos."
-    },
-    "size_variants": {
-      "method": "javascript",
-      "path": "serverSideEvents[0].Sizes",
-      "verified": true,
-      "test_result": [],
-      "note": "Empty for this product. Sizes must be parsed from variant option text (e.g., 'Small/Med', 'Queen', 'Large/Xlrg')."
-    },
-    "url": {
       "method": "css",
-      "selector": "link[rel='canonical']",
+      "selector": ".ae-swatch-selector__colors .ae-swatch-selector__container",
       "verified": true,
-      "test_result": "https://www.adameve.com/lingerie/womens-wear/baby-dolls/sp-hypnotic-swirl-cupless-crotchless-babydoll-91407.aspx",
-      "fix_required": "CRITICAL FIX: Do NOT overwrite product.url from canonical if the canonical does not look like a product URL. If canonical does NOT contain '.aspx' or points to the homepage, keep the original input URL as product.url. This prevents homepage URL replacing the product URL for discontinued/redirected products."
+      "test_result": ["Aqua"]
     }
   },
   "page_structure": {
-    "title_element": "h1.item_title",
+    "pdp_container": ".ae-product-details",
     "price_container": ".ae-price-pdp-main",
-    "price_regular_selector": ".ae-normal-price .ae-price--normal",
-    "price_sale_was_selector": ".ae-sale-price .ae-price--was",
-    "price_sale_now_selector": ".ae-sale-price .ae-price--now",
-    "price_promo_selector": ".jcpoffer-pricerange (promotional — do NOT extract)",
-    "image_carousel": ".ae-product-carousel .glider-track > .glider-slide img",
-    "image_carousel_alt": ".ae-product-carousel .glider-slide img",
-    "variant_select": "select.product-variant-select",
-    "breadcrumb_selector": ".breadcrumb a, .breadcrumb span",
-    "canonical_url": "link[rel='canonical']",
-    "product_id_from_url": "Numeric ID before .aspx (e.g., 91407)",
-    "phe_page_type_check": "Regex match 'pageType:\\s*\"Product\"' in HTML source"
+    "image_gallery": ".ae-product-carousel",
+    "breadcrumbs": "nav.ae-breadcrumbs ol.breadcrumb > li > a.ae-breadcrumbs__link",
+    "title_element": "h1.ae-h1 (first occurrence in PDP)",
+    "accordion_heading_element": "summary.ae-accordion__title (NOT h2)",
+    "specifications_table": "table.ae-table",
+    "sku_element": "dataLayer serverSideEvents JSON in raw HTML"
   },
-  "recommended_extraction_priority": {
-    "primary": "jsonld",
-    "secondary": "og_meta_tags",
-    "tertiary": "css_selectors",
-    "supplementary": "server_side_events",
-    "rationale": "JSON-LD has the richest product data with all core fields. OG meta tags are a reliable fallback for price/currency/brand/availability. CSS selectors work for title, price, images, variants, and breadcrumbs. serverSideEvents provides additional data like colors array, precise rating (with rounding), stock status, and category path."
-  },
+  "product_url_pattern": "/{category-path}/sp-{product-name-slug}-{product-id}.aspx",
+  "product_id_in_url": true,
+  "product_id_pattern": "sp-(?:.*?)-(\\d+)\\.aspx",
+  "recommended_delay_seconds": 2.0,
   "retry_adjustments": {
-    "attempt": 2,
-    "proxy_tier": "none",
-    "previous_proxy_tier": "none",
-    "proxy_escalation_reason": "No proxy escalation needed. Previous failures were due to code bugs (missing page validation, text cleanup, float rounding), not connectivity issues. 3/5 products fetched successfully with direct HTTP.",
-    "changes_from_previous": [
-      {
-        "field": "images",
-        "change": "Selector verified as working. Changed recommended selector to more specific '.ae-product-carousel .glider-track > .glider-slide img' to get only main carousel images (avoiding thumbnail duplicates). Added deduplication by URL.",
-        "reason": "Previous test reported images empty for all products, but verification confirms the selector works. May have been a transient parsing issue or the code was filtering them out incorrectly."
-      },
+    "cycle": 2,
+    "previous_failure_summary": "4/5 products extracted but with 2 HIGH severity issues: (1) original_price contains marketing garbage, (2) sale_price parsing crashes on multi-price text. Plus medium issues with image duplicates and missing key_features/specifications/SKU.",
+    "fix_type": "selector_and_parsing_fixes",
+    "strategy_change": false,
+    "proxy_escalation": false,
+    "connectivity_still_valid": true,
+    "root_cause_analysis": {
+      "original_price_garbage": "The .ae-sale-price container has TWO .ae-price--was spans: the first (without .v1 class) contains appended promotional text ('$59.99Save $47.99 (80%)'), the second (with .v1 class) is clean but may still have price ranges. Solution: use og:price:standard_amount as primary, then .ae-price--was.v1 with regex for first dollar amount.",
+      "sale_price_crash": "re.sub(r'[^\\d.]', '', text) merges multiple prices into one invalid number (e.g., '$7.50 - $11.00' → '7.5011.00'). Solution: use re.search(r'\\d+\\.\\d{2}', text) to extract only the first price.",
+      "images_duplicates": "Carousel has duplicate img elements (thumbnail strip + main display). Solution: deduplicate with list(dict.fromkeys(list)).",
+      "sku_missing": "Regex 'serverSideEvents.*?\"Sku\":\"([A-Z0-9]+)\"' fails due to greedy DOTALL matching and missing space tolerance. Solution: '\"Sku\":\\s*\"([A-Z0-9]+)\"'.",
+      "key_features_missing": "Accordion heading is <summary> not <h2>. Scraper searches for h2.ae-accordion__title which never matches. Solution: use find(class_='ae-accordion__title') or find('summary', class_=...).",
+      "specifications_missing": "Same <summary> vs <h2> issue as key_features. Solution: same fix."
+    },
+    "code_fixes_required": [
       {
         "field": "original_price",
-        "change": "Added fix: apply regex re.search(r'[\\d.]+', was_text).group(0) to extract only the numeric price from .ae-price--was text, which may contain extraneous promotional text.",
-        "reason": "Product 1 original_price was '89.99Excluded from promotion.Save 58.49 (65%)' instead of '$89.99'."
+        "priority": "high",
+        "fix": "Use og:price:standard_amount as primary source. Fallback: .ae-sale-price .ae-price--was.v1 with regex r'\\$[\\d,.]+' to extract first dollar amount only."
       },
       {
-        "field": "page_validation",
-        "change": "NEW: Added page type validation checks. After fetch, verify page is a product page by checking: (1) Product JSON-LD exists, (2) phe.page.pageType is 'Product', (3) canonical URL contains '.aspx'. If validation fails, set remarks and skip extraction.",
-        "reason": "Products 3 and 4 returned homepage HTML (200 OK) instead of product page. Scraper extracted homepage data as product data."
+        "field": "sale_price",
+        "priority": "high",
+        "fix": "Replace re.sub(r'[^\\d.]', '', sale_text) with sale_match = re.search(r'\\d+\\.\\d{2}', sale_text). Wrap float() in try/except ValueError."
       },
       {
-        "field": "url",
-        "change": "Do NOT overwrite product.url from canonical if canonical does not contain '.aspx' or points to homepage. Keep original input URL.",
-        "reason": "Products 3 and 4 had url overwritten with homepage URL from canonical link."
+        "field": "images",
+        "priority": "medium",
+        "fix": "Deduplicate with list(dict.fromkeys(carousel_imgs)) before assigning."
       },
       {
-        "field": "rating",
-        "change": "Round serverSideEvents.dimension13 to 1 decimal place using format(round(float(value), 1), '.1f').",
-        "reason": "Product 2 rating was raw float '4.099999904632568' instead of '4.1'."
+        "field": "status_code",
+        "priority": "medium",
+        "fix": "In except block, preserve status_code from the crashed product object instead of hardcoding 0."
+      },
+      {
+        "field": "sku",
+        "priority": "low",
+        "fix": "Replace regex with '\"Sku\":\\s*\"([A-Z0-9]+)\"' (no prefix, no greedy DOTALL)."
+      },
+      {
+        "field": "key_features",
+        "priority": "low",
+        "fix": "Replace accordion.find('h2', class_=...) with accordion.find(class_='ae-accordion__title') or accordion.find('summary', class_=...). The heading element is <summary>, not <h2>."
+      },
+      {
+        "field": "specifications",
+        "priority": "low",
+        "fix": "Same <summary> fix as key_features."
       }
     ]
   },

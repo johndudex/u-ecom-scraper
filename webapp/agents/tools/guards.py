@@ -36,10 +36,11 @@ from .context import (
 logger = logging.getLogger(__name__)
 
 _BLOCKED_BY_UC_CHROME = (
-    "BLOCKED: The probe determined this site requires UC Chrome "
-    "({method}). Standard Playwright MCP Chrome cannot access this page "
-    "(it would be blocked by anti-bot). Use probe_page for all page "
-    "access — it handles UC Chrome internally via browser-service."
+    "BLOCKED: This site requires UC Chrome ({method}). "
+    "Playwright MCP browser tools are blocked — use probe_page for "
+    "page access. Do NOT use playwright_browser_navigate, snapshot, "
+    "click, or evaluate. Use probe_page (which routes through "
+    "browser-service UC Chrome) for any page inspection needed."
 )
 
 _BLOCKED_OFF_TARGET = (
@@ -51,6 +52,12 @@ _BLOCKED_DOMAIN_FETCH = (
     "BLOCKED: HTTP fetch to {domain} is blocked — anti-bot protection "
     "was detected. Direct HTTP requests to this domain return 403. "
     "Use probe_page for all page access."
+)
+
+_BLOCKED_WRONG_DOMAIN = (
+    "BLOCKED: URL {url} is on a different domain ({probe_domain}) than "
+    "the target site ({target_domain}). Stay on the target domain. "
+    "Probing unrelated domains wastes budget and produces irrelevant results."
 )
 
 
@@ -150,9 +157,38 @@ def _check_blocked_domain(func: Callable, args: tuple, kwargs: dict) -> str | No
     return _BLOCKED_DOMAIN_FETCH.format(domain=site_domain)
 
 
+def _check_same_domain(func: Callable, args: tuple, kwargs: dict) -> str | None:
+    url = kwargs.get("url", "")
+    if not url and args:
+        url = str(args[0]) if args[0] else ""
+    if not url:
+        return None
+    try:
+        probe_domain = urlparse(url).hostname or ""
+    except Exception:
+        return None
+    if not probe_domain:
+        return None
+    site_domain = get_site_domain()
+    if not site_domain:
+        return None
+    if probe_domain == site_domain:
+        return None
+    logger.info(
+        "Guard: blocking %s — wrong domain %s (target=%s)",
+        getattr(func, "__name__", "tool"),
+        probe_domain,
+        site_domain,
+    )
+    return _BLOCKED_WRONG_DOMAIN.format(
+        url=url[:200], probe_domain=probe_domain, target_domain=site_domain
+    )
+
+
 require_non_akamai_tool = _make_guard(_check_akamai)
 require_target_url = _make_guard(_check_target_url)
 require_non_blocked_domain = _make_guard(_check_blocked_domain)
+require_same_domain = _make_guard(_check_same_domain)
 
 
 def _urls_match(url_a: str, url_b: str) -> bool:

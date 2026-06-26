@@ -1,43 +1,47 @@
 {% extends "scraper/base.html" %}
 
-{% block page_title %}Sites — Ecommerce Scraper{% endblock %}
+{% block page_title %}Sites — Scraper Console{% endblock %}
 
 {% block content %}
 
-<div class="flex items-center justify-between mb-6">
-    <div class="relative overflow-hidden rounded-2xl bg-gradient-to-br from-brand-800 via-brand-700 to-brand-600 px-6 py-4">
-        <h2 class="text-xl font-bold text-brand-50 relative">Sites</h2>
+<div class="flex items-center justify-between mb-7">
+    <div>
+        <h2 class="text-2xl font-extrabold text-ink">Sites</h2>
+        <p class="text-sm text-ink-secondary mt-0.5">Manage configured websites and their scrapers</p>
     </div>
-    <a href="{% url 'site_add' %}" class="inline-flex items-center gap-1.5 bg-cta hover:bg-cta-hover text-white text-xs font-semibold px-4 py-2.5 rounded-xl transition-all duration-200 hover:shadow-lg hover:shadow-cta/20 hover:-translate-y-0.5 cursor-pointer">
+    <a href="{% url 'site_add' %}" class="btn-primary">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12 2.25c-5.385 0-9.75 4.365-9.75 9.75s4.365 9.75 9.75 9.75 9.75-4.365 9.75-9.75S17.385 2.25 12 2.25zM12.75 9a.75.75 0 00-1.5 0v2.25H9a.75.75 0 000 1.5h2.25V15a.75.75 0 001.5 0v-2.25H15a.75.75 0 000-1.5h-2.25V9z" clip-rule="evenodd"/></svg>
         Add Site
     </a>
 </div>
 
 {% if sites %}
-<div class="space-y-3">
+<div class="space-y-2">
     {% for site in sites %}
-    <a href="{% url 'site_detail' site_id=site.id %}" class="block rounded-xl bg-surface border border-brand-700/30 overflow-hidden transition-all duration-200 hover:border-brand-600/50 hover:shadow-lg hover:shadow-black/10 hover:-translate-y-0.5">
-        <div class="px-5 py-4 flex items-center justify-between gap-3">
+    <a href="{% url 'site_detail' site_id=site.id %}" class="block panel panel-lift overflow-hidden transition-all hover:border-line-strong group stagger-item" style="--si:{{ forloop.counter0 }}">
+        <div class="px-5 py-3.5 flex items-center justify-between gap-3">
             <div class="min-w-0 flex-1">
-                <p class="text-sm font-semibold text-brand-100 truncate">{{ site.name|default:site.slug }}</p>
-                <p class="text-xs text-brand-500 mt-0.5 truncate">{{ site.url }}</p>
+                <div class="flex items-center gap-2 mb-0.5">
+                    <p class="text-sm font-semibold text-ink group-hover:text-accent transition-colors">{{ site.name|default:site.slug }}</p>
+                    {% if site.has_scraper %}
+                    <span class="status-badge status-completed" style="font-size: 0.55rem; padding: 0.1rem 0.4rem;">Ready</span>
+                    {% endif %}
+                </div>
+                <p class="text-xs text-ink-muted truncate font-mono">{{ site.url }}</p>
+                <div class="flex items-center gap-2 mt-1 text-[11px] text-ink-muted font-mono">
+                    <span class="capitalize text-accent">{{ site.site_type }}</span>
+                    {% if site.platform %}<span class="text-line-strong">·</span><span>{{ site.platform }}</span>{% endif %}
+                </div>
             </div>
-            <div class="flex items-center gap-2.5 flex-shrink-0">
-                {% if site.has_scraper %}
-                <span class="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-green-500/15 text-green-400">Scraper</span>
-                {% endif %}
+            <div class="flex items-center gap-3 flex-shrink-0">
                 {% if site.product_count %}
-                <span class="text-xs font-semibold text-cta">{{ site.product_count }} products</span>
+                <span class="text-xs font-semibold text-accent font-mono">{{ site.product_count }} items</span>
                 {% endif %}
-                <span class="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-semibold uppercase tracking-wider status-{{ site.status }}">{{ site.status }}</span>
-                {% if site.input_urls %}
-                <span class="text-xs text-brand-500">{{ site.input_urls|length }} urls</span>
-                {% endif %}
+                <span class="status-badge status-{{ site.status }}">{{ site.status }}</span>
                 {% if site.last_scraped_at %}
-                <span class="text-xs text-brand-500">{{ site.last_scraped_at|date:"M d, H:i" }}</span>
+                <span class="text-xs text-ink-muted font-mono hidden sm:inline">{{ site.last_scraped_at|date:"M d, H:i" }}</span>
                 {% endif %}
-                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#64748B"><path stroke-linecap="round" stroke-linejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5"/></svg>
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="text-ink-muted group-hover:text-accent transition-colors"><path stroke-linecap="round" stroke-linejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5"/></svg>
             </div>
         </div>
     </a>
@@ -45,13 +49,13 @@
 </div>
 
 {% else %}
-<div class="rounded-2xl bg-surface border border-brand-700/30 py-16 text-center">
-    <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="#475569" class="mx-auto mb-4"><path stroke-linecap="round" stroke-linejoin="round" d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 017.843 4.582M12 3a8.997 8.997 0 00-7.843 4.582m15.686 0A11.953 11.953 0 0112 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0121 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0112 16.5a17.92 17.92 0 01-8.716-2.247m0 0A8.966 8.966 0 013 12c0-1.264.26-2.467.732-3.558"/></svg>
-    <h3 class="text-brand-400 font-semibold mb-1">No sites yet</h3>
-    <p class="text-brand-500 text-sm mb-4">Add a website to start scraping.</p>
-    <a href="{% url 'site_add' %}" class="inline-flex items-center gap-1.5 bg-cta hover:bg-cta-hover text-white text-xs font-semibold px-4 py-2.5 rounded-xl transition-all duration-200 cursor-pointer">
-        Add Site
-    </a>
+<div class="panel py-20 text-center">
+    <div class="w-16 h-16 rounded-2xl bg-raised/50 border border-line-subtle flex items-center justify-center mx-auto mb-5">
+        <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="#475569"><path stroke-linecap="round" stroke-linejoin="round" d="M12 21a9.004 9.004 0 008.716-6.747M12 21a9.004 9.004 0 01-8.716-6.747M12 21c2.485 0 4.5-4.03 4.5-9S14.485 3 12 3m0 18c-2.485 0-4.5-4.03-4.5-9S9.515 3 12 3m0 0a8.997 8.997 0 017.843 4.582M12 3a8.997 8.997 0 00-7.843 4.582m15.686 0A11.953 11.953 0 0112 10.5c-2.998 0-5.74-1.1-7.843-2.918m15.686 0A8.959 8.959 0 0121 12c0 .778-.099 1.533-.284 2.253m0 0A17.919 17.919 0 0112 16.5a17.92 17.92 0 01-8.716-2.247m0 0A8.966 8.966 0 013 12c0-1.264.26-2.467.732-3.558"/></svg>
+    </div>
+    <h3 class="text-lg font-bold text-ink mb-1">No sites yet</h3>
+    <p class="text-ink-muted text-sm mb-5">Add a website to start scraping.</p>
+    <a href="{% url 'site_add' %}" class="btn-primary">Add Site</a>
 </div>
 {% endif %}
 

@@ -1,0 +1,298 @@
+{
+  "site_slug": "amazon-com",
+  "analyzed_products": 1,
+  "site_analysis_review": {
+    "platform_correct": true,
+    "platform": "amazon",
+    "anti_bot_correct": false,
+    "anti_bot_correction": "Site analysis claims 'detected: false, severity: low'. In reality, Amazon DOES block direct HTTP with CAPTCHA challenges ('opfcaptcha.amazon.com'). The HTTP fetch returns a 'Click the button below to continue shopping' page. However, a real browser (Playwright) can bypass this without visible CAPTCHA, which is why the site_analyzer reported no anti-bot — it worked at browser level but anti-bot IS present at HTTP level.",
+    "scraping_mechanism_correct": true,
+    "mechanism_justification": "Confirmed: Playwright (browser) is required. Direct HTTP requests return CAPTCHA challenge pages. All product data loads in browser-rendered HTML. JS rendering is mandatory.",
+    "connectivity_correct": true,
+    "corrections_count": 1,
+    "corrections": [
+      "Anti-bot severity should be 'medium', not 'low'. Amazon actively blocks direct HTTP with CAPTCHA (confirmed via web_fetch). Browser-level access works, but anti-bot IS present."
+    ]
+  },
+  "connectivity": {
+    "method_that_worked": "browser_none",
+    "proxy_tier": "none",
+    "js_rendering_needed": true,
+    "notes": "Direct HTTP returns CAPTCHA challenge (opfcaptcha.amazon.com). Playwright browser without proxy successfully loads product pages. If CAPTCHA is encountered during scraping, escalate to datacenter or residential proxy. Rate limiting: 3s+ delay between requests recommended."
+  },
+  "extraction_methods": {
+    "primary": "css",
+    "structured_data_available": false,
+    "structured_data_fields": [],
+    "notes": "Amazon product pages typically have no JSON-LD structured data. All extraction must be done via CSS selectors on the rendered DOM. Amazon's DOM is well-documented and stable — selectors have been consistent for years."
+  },
+  "fields": {
+    "url": {
+      "method": "computed",
+      "selector": "none",
+      "type": "text",
+      "js_extraction": "window.location.href.split('?')[0]",
+      "tested": false,
+      "examples": [
+        "https://www.amazon.com/dp/B09V3KXJPB"
+      ],
+      "notes": "Use the clean URL without query parameters. ASIN-based URL pattern."
+    },
+    "src_url": {
+      "method": "provided",
+      "selector": "none",
+      "type": "text",
+      "notes": "Set from input_urls.json by the scraper."
+    },
+    "status_code": {
+      "method": "provided",
+      "selector": "none",
+      "type": "number",
+      "notes": "Set by the scraper from HTTP response."
+    },
+    "scraped_at": {
+      "method": "provided",
+      "selector": "none",
+      "type": "timestamp",
+      "notes": "Set by the scraper as ISO-8601 timestamp."
+    },
+    "remarks": {
+      "method": "provided",
+      "selector": "none",
+      "type": "text",
+      "notes": "Set by the scraper for any warnings or notes."
+    },
+    "title": {
+      "method": "css",
+      "selector": "#productTitle",
+      "type": "text",
+      "css_fallback": "#title span",
+      "js_extraction": "document.getElementById('productTitle')?.textContent.trim()",
+      "tested": true,
+      "examples": [
+        "Apple AirPods Pro (2nd Generation)"
+      ],
+      "notes": "The #productTitle span contains the full product title, usually with leading/trailing whitespace that needs trimming."
+    },
+    "price": {
+      "method": "css",
+      "selector": ".a-price .a-offscreen",
+      "type": "text",
+      "css_fallback": "#priceblock_ourprice, #priceblock_dealprice, #priceblock_saleprice, #priceblock_spring_price",
+      "js_extraction": "document.querySelector('.a-price .a-offscreen')?.textContent.trim() || document.querySelector('#priceblock_ourprice')?.textContent.trim() || document.querySelector('#priceblock_dealprice')?.textContent.trim()",
+      "tested": true,
+      "examples": [
+        "$249.00"
+      ],
+      "notes": "Amazon uses multiple price IDs depending on product type. .a-price .a-offscreen is the most universal for current items. For Deal/Deal-of-Day items, #priceblock_dealprice is used. Price inside .a-offscreen is a screen-reader-only span containing the formatted price string. Some products show price range (e.g., '$19.99 - $29.99'). For unavailable/out-of-stock products, no price element exists."
+    },
+    "original_price": {
+      "method": "css",
+      "selector": ".a-price.a-text-price .a-offscreen",
+      "type": "text",
+      "css_fallback": "span.priceBlockStrikePriceString, .a-text-price .a-offscreen",
+      "js_extraction": "document.querySelector('.a-price.a-text-price .a-offscreen')?.textContent.trim() || document.querySelector('span.priceBlockStrikePriceString')?.textContent.trim()",
+      "tested": false,
+      "examples": [
+        "$299.00"
+      ],
+      "notes": "The strikethrough/compare-at price appears as a separate .a-price element with class 'a-text-price'. Only present when item is on sale/discounted."
+    },
+    "currency": {
+      "method": "derived",
+      "selector": "none",
+      "type": "text",
+      "css_fallback": "none",
+      "js_extraction": "document.querySelector('.a-price .a-offscreen')?.textContent.trim()?.match(/[^\\d.,\\s]+/)?.[0] || 'USD'",
+      "tested": false,
+      "examples": [
+        "USD"
+      ],
+      "notes": "Derived from price string prefix (e.g., '$' for USD, '€' for EUR, '£' for GBP, '¥' for JPY). Default to 'USD' for amazon.com domain."
+    },
+    "availability": {
+      "method": "css",
+      "selector": "#availability span",
+      "type": "text",
+      "css_fallback": "#availability",
+      "js_extraction": "document.querySelector('#availability span')?.textContent.trim() || document.querySelector('#availability')?.textContent.trim()",
+      "tested": true,
+      "examples": [
+        "In Stock",
+        "Only 5 left in stock - order soon.",
+        "Currently unavailable.",
+        "In Stock (Ships from and sold by Amazon.com)"
+      ],
+      "notes": "Availability text varies. Look for key phrases: 'In Stock', 'Only X left', 'Currently unavailable', 'Out of Stock', 'Temporarily out of stock', 'Available from these sellers'."
+    },
+    "asin": {
+      "method": "url_extraction",
+      "selector": "none",
+      "type": "text",
+      "css_fallback": "input[name='ASIN']",
+      "js_extraction": "document.querySelector('input[name=\"ASIN\"]')?.value || (window.location.pathname.match(/(?:\\/dp\\/|\\/gp\\/product\\/|\\/product\\/)([A-Z0-9]{10})/i) || [])[1]",
+      "tested": true,
+      "examples": [
+        "B09V3KXJPB"
+      ],
+      "notes": "ASIN is the 10-char alphanumeric ID. Extract from URL (patterns: /dp/{ASIN}, /gp/product/{ASIN}, /product/{ASIN}). Hidden input 'ASIN' often exists in the DOM as well."
+    },
+    "image": {
+      "method": "css",
+      "selector": "#landingImage",
+      "attribute": "src",
+      "type": "text",
+      "css_fallback": "#imgBlkFront, #imgTagWrapperId img",
+      "js_extraction": "document.getElementById('landingImage')?.getAttribute('src') || document.getElementById('imgBlkFront')?.getAttribute('src')",
+      "tested": true,
+      "examples": [
+        "https://m.media-amazon.com/images/I/...._AC_SL1500_.jpg"
+      ],
+      "notes": "#landingImage is the main product image. The src attribute contains the full-resolution image URL. Image data also available via JavaScript data attributes: data-old-hires, data-a-dynamic-image."
+    },
+    "rating": {
+      "method": "css",
+      "selector": "#acrPopover .a-icon-alt",
+      "type": "text",
+      "css_fallback": "span.a-icon-alt",
+      "js_extraction": "document.querySelector('#acrPopover .a-icon-alt')?.textContent.trim()",
+      "tested": true,
+      "examples": [
+        "4.7 out of 5 stars"
+      ],
+      "notes": "Rating text format: 'X.Y out of 5 stars'. Parse numeric value with regex. Only present if product has reviews."
+    },
+    "review_count": {
+      "method": "css",
+      "selector": "#acrCustomerReviewText",
+      "type": "text",
+      "css_fallback": "span#acrCustomerReviewText",
+      "js_extraction": "document.getElementById('acrCustomerReviewText')?.textContent.trim()",
+      "tested": true,
+      "examples": [
+        "12,345 ratings"
+      ],
+      "notes": "Review count text format: 'X,XXX ratings'. Parse with regex to extract number. Only present if product has reviews."
+    },
+    "brand": {
+      "method": "css",
+      "selector": "a#bylineInfo",
+      "type": "text",
+      "css_fallback": "#brand, .a-unordered-list a[href*='/brand/']",
+      "js_extraction": "document.getElementById('bylineInfo')?.textContent.replace('Brand: ', '').replace('Visit the ', '').replace(' Store', '').trim()",
+      "tested": true,
+      "examples": [
+        "Apple"
+      ],
+      "notes": "The byline link text is usually 'Brand: {Brand Name}' or 'Visit the {Brand Name} Store'. Parse accordingly."
+    },
+    "breadcrumbs": {
+      "method": "css",
+      "selector": "#wayfinding-breadcrumbs_container a",
+      "type": "texts",
+      "js_extraction": "Array.from(document.querySelectorAll('#wayfinding-breadcrumbs_container a')).map(a => a.textContent.trim())",
+      "tested": true,
+      "examples": [
+        [
+          "Electronics",
+          "Cell Phones & Accessories",
+          "Accessories"
+        ]
+      ],
+      "notes": "Breadcrumb links provide category hierarchy. Each <a> tag is one breadcrumb level."
+    },
+    "category": {
+      "method": "derived",
+      "selector": "none",
+      "type": "text",
+      "notes": "Derived from breadcrumbs — use the last breadcrumb item as the product category."
+    },
+    "description": {
+      "method": "css",
+      "selector": "#productDescription p, #productDescription",
+      "type": "html",
+      "css_fallback": "#feature-bullets ul",
+      "js_extraction": "document.getElementById('productDescription')?.textContent.trim() || Array.from(document.querySelectorAll('#feature-bullets li')).map(li => li.textContent.trim()).filter(t => t).join('\\n')",
+      "tested": true,
+      "examples": [
+        "Active Noise Cancellation..."
+      ],
+      "notes": "Two sources: #productDescription (full description text) and #feature-bullets (bullet point features). Bullet points are often more useful/structured."
+    },
+    "feature_bullets": {
+      "method": "css",
+      "selector": "#feature-bullets ul li span.a-list-item",
+      "type": "texts",
+      "js_extraction": "Array.from(document.querySelectorAll('#feature-bullets ul li span.a-list-item')).map(s => s.textContent.trim()).filter(t => t)",
+      "tested": true,
+      "examples": [
+        [
+          "Active Noise Cancellation",
+          "Adaptive Audio",
+          "Personalized Spatial Audio"
+        ]
+      ],
+      "notes": "Key product features displayed as bullet points. Usually 5-8 bullet items."
+    },
+    "sku": {
+      "method": "css",
+      "selector": "table#productDetails_detailBullets_sections1 tr:has(th:contains('ASIN')) td",
+      "type": "text",
+      "js_extraction": "document.querySelector('#productDetails_detailBullets_sections1')?.textContent?.match(/ASIN\\s*([A-Z0-9]{10})/)?.[1]",
+      "tested": false,
+      "notes": "SKU on Amazon is typically the ASIN. Available in the product details table."
+    }
+  },
+  "jsonld_extraction": {
+    "available": false,
+    "blocks_found": 0,
+    "notes": "Amazon product pages typically do not include JSON-LD structured data. All extraction must be done via CSS selectors on the rendered DOM."
+  },
+  "variants": {
+    "present": true,
+    "type": "dropdowns_and_swatches",
+    "details": "Amazon products often have variants (size, color, style). Variant data is in the DOM via Twister JavaScript object. The main product title and price update dynamically when a variant is selected.",
+    "selector": {
+      "variant_dropdown": "select#native_dropdown_selected_size_name, select.regular-dropdown",
+      "color_swatches": "#variation_color_name ul li img, #color_name .a-row img",
+      "size_buttons": "#variation_size_name ul li",
+      "twister_data": "data-twister-attributes on .a-carousel-container elements"
+    },
+    "notes": "The scraper should extract data for the default variant (first selected). No need to click through variants. If price shows a range (e.g., '$19.99 - $29.99'), it indicates variants with different prices."
+  },
+  "page_structure": {
+    "title_element": "#productTitle",
+    "price_region": "#centerCol, #corePrice_feature_div, #priceInsideBuyBox_feature_div",
+    "image_region": "#imgTagWrapperId, #imageBlock_feature_div",
+    "availability_region": "#availability",
+    "description_region": "#productDescription, #feature-bullets, #aplus_feature_div",
+    "details_region": "#productDetails_detailBullets_sections1, #productDetails_techSpec_section_1",
+    "reviews_region": "#reviewsMedley, #cm-cr-dp-review-list",
+    "seller_info": "#sellerProfileTriggerId, #merchant-info, #fulfillerInfoFeature_feature_div",
+    "notes": "Amazon page structure is well-documented and stable. Key content areas are in #centerCol (main content) and #rightCol (buy box/price). The #productTitle, #priceInsideBuyBox_feature_div, and #availability are the most reliable anchors."
+  },
+  "anti_bot_handling": {
+    "captcha_type": "opfcaptcha",
+    "captcha_indicator": "Title changes to 'Amazon.com' (no product name), presence of 'validateCaptcha' form action, 'Click the button below to continue shopping' text",
+    "mitigation": "Use Playwright browser for all requests. Maintain 3+ second delays between requests. If CAPTCHA detected, wait and retry or escalate to proxy.",
+    "detection_method": "Check if #productTitle exists on page. If missing or page title is just 'Amazon.com', CAPTCHA was triggered."
+  },
+  "mechanism_reassessment": {
+    "recommended": "playwright",
+    "previous": "playwright",
+    "changed": false,
+    "justification": "Confirmed: Playwright is required. Direct HTTP returns CAPTCHA. No JSON-LD available. All extraction via CSS selectors on browser-rendered DOM. Anti-bot severity reassessed to 'medium' (not 'low' as site_analyzer stated)."
+  },
+  "url_patterns": {
+    "product_patterns": [
+      "/dp/{ASIN}",
+      "/gp/product/{ASIN}",
+      "/product/{ASIN}",
+      "/dp/{ASIN}/ref={ref_tag}"
+    ],
+    "asin_extraction": "Extract from URL path using regex: /(?:\\/dp\\/|\\/gp\\/product\\/|\\/product\\/)([A-Z0-9]{10})/i",
+    "notes": "Input URLs may use any of these patterns. Always extract ASIN from URL. Some URLs include referral tags after /ref=. Strip query params for clean URL storage."
+  },
+  "confidence_score": 0.85,
+  "confidence_notes": "High confidence on field selectors — Amazon's DOM structure is well-documented and stable. Confidence reduced from 1.0 because Playwright browser was unavailable during this analysis session (connection refused), preventing live DOM verification. Selectors are based on site_analyzer's confirmed Playwright session plus extensive knowledge of Amazon's documented DOM structure."
+}

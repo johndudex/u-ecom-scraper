@@ -1,0 +1,44 @@
+{
+  "site": {
+    "name": "Calvin Klein UK",
+    "url": "https://www.calvinklein.co.uk",
+    "platform": "sfcc",
+    "scraping_method": "seleniumbase_uc",
+    "scraped_at": "2026-06-25T07:50:18.345898+00:00"
+  },
+  "products": [
+    {
+      "id": 1,
+      "title": "",
+      "price": "",
+      "availability": "",
+      "original_price": "",
+      "currency": "GBP",
+      "url": "https://www.calvinklein.co.uk/en-uk/menswear/boxer-briefs/calvin-klein-modern-stretch-boxer-brief/p/387018890001",
+      "src_url": "https://www.calvinklein.co.uk/en-uk/menswear/boxer-briefs/calvin-klein-modern-stretch-boxer-brief/p/387018890001",
+      "location": "",
+      "status_code": 0,
+      "scraped_at": "2026-06-25T07:48:49.890785+00:00",
+      "remarks": "Soft 404: oops_page on product page"
+    },
+    {
+      "id": 2,
+      "title": "",
+      "price": "",
+      "availability": "",
+      "original_price": "",
+      "currency": "GBP",
+      "url": "https://www.calvinklein.co.uk/en-uk/womenswear/lingerie/calvin-klein-crossback-bralette/p/387028890001",
+      "src_url": "https://www.calvinklein.co.uk/en-uk/womenswear/lingerie/calvin-klein-crossback-bralette/p/387028890001",
+      "location": "",
+      "status_code": 0,
+      "scraped_at": "2026-06-25T07:49:34.357612+00:00",
+      "remarks": "Soft 404: oops_page on product page"
+    }
+  ],
+  "metadata": {
+    "scraping_duration_seconds": 88.48,
+    "failed_products": 2,
+    "rate_limit_delay": 3.0
+  }
+}

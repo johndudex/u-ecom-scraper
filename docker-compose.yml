@@ -51,6 +51,7 @@ services:
       PLAYWRIGHT_MCP_URL: http://browser-service:8111/sse
       BROWSER_SERVICE_URL: http://browser-service:8001
       DEBUG: "True"
+      DEBUG_AUTO_LOGIN: "True"
       DJANGO_SETTINGS_MODULE: config.settings
       SECRET_KEY: dev-secret-key-change-in-production
       PYTHONPATH: /app
@@ -97,7 +98,7 @@ services:
         condition: service_healthy
     deploy:
       replicas: 1
-    mem_limit: 1024m
+    mem_limit: 1536m
 
   celery-beat:
     profiles: ["full"]

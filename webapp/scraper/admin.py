@@ -3,19 +3,25 @@ from django.utils import timezone
 
 from .models import Approval, ScrapeJob, Site, Step, ToolCallLog
 
+# Unregister scraper models from Django admin — they have full management UI
+# in the main app at /, /jobs/, /sites/, /approvals/ etc. Keeping them here
+# would create duplicate pages that need to be maintained in two places.
+# Auth and celery_beat admin stay because they don't have a main-app UI.
+# We do the unregister at the END of this file (after the @admin.register
+# decorators below have run) by deferring it to module-end.
+_UNREGISTER_AT_END = (Site, ScrapeJob, Step, Approval, ToolCallLog)
+
 
 @admin.register(Site)
 class SiteAdmin(admin.ModelAdmin):
     list_display = (
         "id",
         "name",
-        "slug",
         "url",
         "status",
         "platform",
         "has_scraper",
         "product_count",
-        "last_scraped_at",
     )
     list_filter = ("status", "has_scraper", "platform")
     search_fields = ("url", "name", "slug")
@@ -144,3 +150,19 @@ class ToolCallLogAdmin(admin.ModelAdmin):
     list_filter = ("agent",)
     raw_id_fields = ("job",)
     search_fields = ("tool_name", "args_summary")
+
+
+# Defer unregister to here so it runs AFTER all @admin.register decorators.
+# This removes the scraper models from the Django admin index, leaving only
+# the auth and django_celery_beat admin which don't have a main-app UI.
+from django.contrib.admin import site as _default_site
+from django.contrib.admin.sites import NotRegistered as _NotRegistered
+
+for _model in _UNREGISTER_AT_END:
+    try:
+        _default_site.unregister(_model)
+    except _NotRegistered:
+        pass
+    except Exception:
+        pass
+

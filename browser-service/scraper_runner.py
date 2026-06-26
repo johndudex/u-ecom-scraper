@@ -21,6 +21,8 @@ def run_scraper_script(
     cmd = ["python3", scraper_path]
     if args:
         cmd.extend(args)
+    if "--xvfb" not in cmd:
+        cmd.append("--xvfb")
 
     env = {
         **os.environ,

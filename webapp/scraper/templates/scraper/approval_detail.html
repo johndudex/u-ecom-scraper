@@ -1,37 +1,39 @@
 {% extends "scraper/base.html" %}
 
-{% block page_title %}Approval #{{ approval.id }} — Ecommerce Scraper{% endblock %}
+{% block page_title %}Approval #{{ approval.id }} — Scraper Console{% endblock %}
 
 {% block content %}
 
 <nav class="mb-5" aria-label="breadcrumb">
     <ol class="flex items-center gap-1.5 text-xs">
-        <li><a href="{% url 'approval_list' %}" class="text-brand-500 hover:text-brand-300 transition-colors">Approvals</a></li>
-        <li class="text-brand-700">/</li>
-        <li class="text-brand-300 font-medium">#{{ approval.id }}</li>
+        <li><a href="{% url 'approval_list' %}" class="text-ink-muted hover:text-ink-secondary transition-colors">Approvals</a></li>
+        <li class="text-line-strong">/</li>
+        <li class="text-ink-secondary font-medium font-mono">#{{ approval.id }}</li>
     </ol>
 </nav>
 
 <div class="max-w-3xl mx-auto">
-    <div class="rounded-2xl bg-surface border border-brand-700/30 overflow-hidden">
-        <div class="bg-gradient-to-br from-brand-800 via-brand-700 to-brand-600 px-6 py-5">
-            <div class="flex items-center gap-2.5 mb-2">
-                <span class="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-semibold uppercase tracking-wider bg-brand-600/40 text-brand-300">{{ approval.get_approval_type_display }}</span>
-                <h2 class="text-lg font-bold text-brand-50">{{ approval.get_approval_type_display }}</h2>
+    <div class="panel overflow-hidden">
+        <div class="panel-header">
+            <div class="flex items-center gap-2.5">
+                <span class="status-badge status-pending">{{ approval.get_approval_type_display }}</span>
+                <h2 class="text-lg font-bold text-ink">{{ approval.get_approval_type_display }}</h2>
             </div>
-            <div class="text-sm text-brand-400">
+        </div>
+        <div class="px-6 pt-5">
+            <div class="text-sm text-ink-secondary">
                 Job #{{ approval.job.id }} &middot;
-                <a href="{% url 'job_detail' job_id=approval.job.id %}" class="text-brand-300 hover:text-brand-100 underline decoration-brand-600 underline-offset-2 transition-colors">{{ approval.job.url|truncatechars:50 }}</a>
+                <a href="{% url 'job_detail' job_id=approval.job.id %}" class="text-accent hover:text-accent-hover underline decoration-line-strong underline-offset-2 transition-colors font-mono text-xs">{{ approval.job.url|truncatechars:50 }}</a>
             </div>
         </div>
 
         <div class="p-6">
-            <div class="rounded-xl bg-brand-800/40 border-l-4 border-l-cta px-4 py-4 text-sm text-brand-200 leading-relaxed mb-5">{{ approval.question }}</div>
+            <div class="bg-raised/40 border border-accent/15 rounded-lg px-4 py-4 text-sm text-ink leading-relaxed mb-5">{{ approval.question }}</div>
 
             {% if approval.response_data.sample_output %}
-            <pre class="rounded-xl bg-brand-900 p-4 text-xs text-brand-400 max-h-96 overflow-y-auto scrollbar-thin font-mono leading-relaxed mb-5"><code>{{ approval.response_data.sample_output }}</code></pre>
+            <pre class="bg-void border border-line-subtle rounded-md p-4 text-xs text-ink-secondary max-h-96 overflow-y-auto scrollbar-thin font-mono leading-relaxed mb-5"><code>{{ approval.response_data.sample_output }}</code></pre>
             {% elif approval.response_data %}
-            <pre class="rounded-xl bg-brand-900 p-4 text-xs text-brand-400 max-h-96 overflow-y-auto scrollbar-thin font-mono leading-relaxed mb-5"><code>{{ approval.response_data|pprint }}</code></pre>
+            <pre class="bg-void border border-line-subtle rounded-md p-4 text-xs text-ink-secondary max-h-96 overflow-y-auto scrollbar-thin font-mono leading-relaxed mb-5"><code>{{ approval.response_data|pprint }}</code></pre>
             {% endif %}
 
             <form method="post" action="{% url 'approval_detail' approval.id %}">
@@ -39,27 +41,27 @@
 
                 <textarea name="feedback" rows="2"
                           placeholder="Optional feedback — this goes back to the agent..."
-                          class="w-full bg-brand-700/30 border border-brand-600/50 rounded-xl px-4 py-3 text-sm text-brand-50 placeholder-brand-500 focus:outline-none focus:border-cta/50 focus:ring-2 focus:ring-cta/20 resize-none mb-4"></textarea>
+                          class="input-field resize-none mb-4"></textarea>
 
-                <div class="flex items-center gap-3 flex-wrap pt-5 border-t border-brand-700/30">
+                <div class="flex items-center gap-3 flex-wrap pt-5 border-t border-line-subtle">
                     {% with decisions=approval.response_data.decisions %}
                     {% for dec in decisions %}
                         <button type="submit" name="choice" value="{{ dec.label }}"
-                                class="px-4 py-2.5 text-sm font-semibold rounded-xl transition-all duration-200 hover:-translate-y-0.5 cursor-pointer
-                                {% if dec.type == 'reject' %}bg-red-500/15 text-red-400 hover:bg-red-500/25
-                                {% elif dec.type == 'respond' %}bg-blue-500/15 text-blue-400 hover:bg-blue-500/25
-                                {% else %}bg-cta text-white hover:bg-cta-hover hover:shadow-lg hover:shadow-cta/20{% endif %}">
+                                class="px-4 py-2.5 text-sm font-semibold rounded-md transition-colors cursor-pointer
+                                {% if dec.type == 'reject' %}bg-danger/15 text-danger hover:bg-danger/25
+                                {% elif dec.type == 'respond' %}bg-info/15 text-info hover:bg-info/25
+                                {% else %}bg-accent text-void hover:bg-accent-hover{% endif %}">
                             {% if dec.type == 'approve' %}
                             <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" class="inline mr-1" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12.97 3.97a.75.75 0 011.06 0l7.5 7.5a.75.75 0 010 1.06l-7.5 7.5a.75.75 0 11-1.06-1.06l6.22-6.22H3a.75.75 0 010-1.5h16.19l-6.22-6.22a.75.75 0 010-1.06z" clip-rule="evenodd"/></svg>
                             {% endif %}
                             {{ dec.label }}
                         </button>
                     {% empty %}
-                        <button type="submit" name="choice" value="Approve" class="px-4 py-2.5 text-sm font-semibold rounded-xl bg-cta text-white hover:bg-cta-hover transition-all duration-200 hover:-translate-y-0.5 cursor-pointer hover:shadow-lg hover:shadow-cta/20">
+                        <button type="submit" name="choice" value="Approve" class="btn-primary">
                             <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" class="inline mr-1" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12.97 3.97a.75.75 0 011.06 0l7.5 7.5a.75.75 0 010 1.06l-7.5 7.5a.75.75 0 11-1.06-1.06l6.22-6.22H3a.75.75 0 010-1.5h16.19l-6.22-6.22a.75.75 0 010-1.06z" clip-rule="evenodd"/></svg>
                             Approve
                         </button>
-                        <button type="submit" name="choice" value="Cancel" class="px-4 py-2.5 text-sm font-semibold rounded-xl bg-red-500/15 text-red-400 hover:bg-red-500/25 transition-all duration-200 hover:-translate-y-0.5 cursor-pointer">
+                        <button type="submit" name="choice" value="Cancel" class="btn-danger">
                             Cancel
                         </button>
                     {% endfor %}

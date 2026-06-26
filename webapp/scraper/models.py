@@ -4,6 +4,35 @@ import re
 from urllib.parse import urlparse
 
 
+def _site_type_choices():
+    try:
+        from src.content_types import SITE_TYPE_CHOICES as choices
+
+        return choices
+    except ImportError:
+        return [
+            ("shopping", "Shopping"),
+            ("articles", "Articles"),
+            ("jobs", "Jobs"),
+            ("forum", "Forum"),
+            ("general", "General"),
+        ]
+
+
+def _input_mode_choices():
+    try:
+        from src.content_types import INPUT_MODE_CHOICES as choices
+
+        return choices
+    except ImportError:
+        return [
+            ("url_list", "URL List"),
+            ("list_page", "List Page"),
+            ("navigation", "Navigation"),
+            ("search_term", "Search Term"),
+        ]
+
+
 def _normalize_url(url: str) -> str:
     if not url:
         return url
@@ -39,6 +68,7 @@ class ScrapeJob(models.Model):
     STATUS_FAILED = "failed"
     STATUS_CANCELLED = "cancelled"
     STATUS_CAPTCHA_BLOCKED = "captcha_blocked"
+    STATUS_AKAMAI_BLOCKED = "akamai_blocked"
 
     STATUS_CHOICES = [
         (STATUS_PENDING, "Pending"),
@@ -48,11 +78,19 @@ class ScrapeJob(models.Model):
         (STATUS_FAILED, "Failed"),
         (STATUS_CANCELLED, "Cancelled"),
         (STATUS_CAPTCHA_BLOCKED, "Captcha Blocked"),
+        (STATUS_AKAMAI_BLOCKED, "Akamai Blocked"),
     ]
 
     url = models.URLField()
     product_url = models.URLField(max_length=1000, blank=True, default="")
     currency = models.CharField(max_length=10, blank=True, default="")
+    page_type = models.CharField(max_length=30, default="product")
+    input_mode = models.CharField(
+        max_length=15,
+        choices=_input_mode_choices(),
+        default="url_list",
+    )
+    search_criteria = models.CharField(max_length=500, blank=True, default="")
     status = models.CharField(
         max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING
     )
@@ -85,6 +123,23 @@ class ScrapeJob(models.Model):
             return (self.completed_at - self.started_at).total_seconds()
         return 0
 
+    @property
+    def page_type_display(self) -> str:
+        labels = {
+            "product": "Product",
+            "product_list": "Product List",
+            "product_navigation": "Product Navigation",
+            "article": "Article",
+            "article_list": "Article List",
+            "article_navigation": "Article Navigation",
+            "job_posting": "Job Posting",
+            "job_navigation": "Job Navigation",
+            "forum_thread": "Forum Thread",
+            "serp": "SERP",
+            "page_content": "Page Content",
+        }
+        return labels.get(self.page_type, self.page_type)
+
 
 class Step(models.Model):
     STATUS_PENDING = "pending"
@@ -102,6 +157,11 @@ class Step(models.Model):
     PHASE_CHOICES = [
         ("accessibility_check", "Accessibility Check"),
         ("site_analysis", "Site Analysis"),
+        ("navigation_explore", "Navigation Explore"),
+        ("navigation_synthesize", "Navigation Synthesis"),
+        ("navigation_skill_review", "Navigation Skill Review"),
+        ("navigation_analysis", "Navigation Analysis"),
+        ("content_analysis", "Content Analysis"),
         ("product_analysis", "Product Analysis"),
         ("scraper_analysis", "Scraper Analysis"),
         ("code_generation", "Code Generation"),
@@ -244,6 +304,13 @@ class Site(models.Model):
     input_urls = models.JSONField(default=list, blank=True)
     currency = models.CharField(max_length=10, blank=True, default="")
 
+    site_type = models.CharField(
+        max_length=20,
+        choices=_site_type_choices(),
+        default="shopping",
+    )
+    output_schema = models.JSONField(default=dict, blank=True)
+
     platform = models.CharField(max_length=100, blank=True, default="")
     scraping_method = models.CharField(max_length=100, blank=True, default="")
     status = models.CharField(max_length=20, default="new")
@@ -294,3 +361,73 @@ class ProbeCache(models.Model):
         from datetime import timedelta
 
         return timezone.now() > self.cached_at + timedelta(hours=4)
+
+
+class AgentPlayground(models.Model):
+    """Tracks individual agent runs from the Agent Playground UI.
+
+    Allows testing agents in isolation without creating a ScrapeJob or
+    running the full graph workflow.
+    """
+
+    STATUS_PENDING = "pending"
+    STATUS_RUNNING = "running"
+    STATUS_COMPLETED = "completed"
+    STATUS_FAILED = "failed"
+
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_RUNNING, "Running"),
+        (STATUS_COMPLETED, "Completed"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    # Available agents for testing (matches AGENT_TOOL_MAP keys)
+    AGENT_CHOICES = [
+        ("site_analyzer", "Site Analyzer"),
+        ("navigation_explore", "Navigation Explore"),
+        ("navigation_synthesize", "Navigation Synthesize"),
+        ("nav_skill_review", "Navigation Skill Review"),
+        ("product_analyzer", "Product Analyzer"),
+        ("scraper_analyzer", "Scraper Analyzer"),
+        ("code_writer", "Code Writer"),
+        ("code_tester", "Code Tester"),
+        ("cleanup", "Cleanup"),
+    ]
+
+    agent_name = models.CharField(max_length=50, choices=AGENT_CHOICES)
+    prompt = models.TextField(help_text="Custom prompt for the agent")
+    url = models.CharField(
+        max_length=500, blank=True, default="", help_text="Target URL (optional)"
+    )
+    search_criteria = models.CharField(
+        max_length=200, blank=True, default="",
+        help_text="Search criteria for navigation agents (optional)"
+    )
+    site_slug = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text="Site slug for workspace scoping",
+    )
+    celery_task_id = models.CharField(max_length=255, blank=True, default="")
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING
+    )
+    output_summary = models.TextField(blank=True, default="")
+    output_artifacts = models.JSONField(
+        default=list, blank=True, help_text="Files written by the agent"
+    )
+    tool_call_count = models.IntegerField(default=0)
+    error_message = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Agent Playground Run"
+        verbose_name_plural = "Agent Playground"
+
+    def __str__(self):
+        return f"#{self.id} {self.agent_name} ({self.status})"

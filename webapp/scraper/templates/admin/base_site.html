@@ -1,0 +1,2440 @@
+{% extends "admin/base.html" %}
+{% load static %}
+
+{% block title %}{{ title }} | Scraper Console Admin{% endblock %}
+
+{# === KILL Django's theme.js and dark_mode.css at the source === #}
+{# This is the root fix: no theme toggle button, no auto/light mode, no flashing #}
+{% block dark-mode-vars %}{% endblock %}
+
+{# === KILL responsive.css (16KB of float/layout overrides we don't want) === #}
+{# Keep only the viewport meta tag. Our own CSS handles responsiveness. #}
+{% block responsive %}
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+{% endblock %}
+
+{# === Branding: logo + brand + admin tag === #}
+{% block branding %}
+<div style="display:flex;align-items:center;gap:10px;">
+    <div style="width:32px;height:32px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;background:rgba(34,211,238,0.1);border:1px solid rgba(34,211,238,0.25);">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#22D3EE"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/></svg>
+    </div>
+    <span style="font-family:'Inter',system-ui,sans-serif;font-weight:700;font-size:1rem;color:#F1F5F9;letter-spacing:-0.03em;">Scraper<span style="color:#22D3EE;">.</span>console</span>
+    <span style="font-family:'Inter',system-ui,sans-serif;font-weight:600;font-size:0.62rem;color:var(--ink-3);padding:2px 8px;border:1px solid var(--border);border-radius:6px;text-transform:uppercase;letter-spacing:0.08em;">Admin</span>
+</div>
+{% endblock %}
+
+{# === User links: avatar + username + action links === #}
+{% block userlinks %}
+<div style="display:flex;align-items:center;gap:6px;">
+    {# User avatar with initial #}
+    <div style="width:30px;height:30px;border-radius:50%;background:rgba(34,211,238,0.12);border:1px solid rgba(34,211,238,0.25);display:inline-flex;align-items:center;justify-content:center;font-size:0.75rem;font-weight:600;color:var(--accent);margin-right:6px;">
+        {% firstof user.get_short_name user.get_username|slice:":1"|upper %}
+    </div>
+    {% if site_url %}
+        <a href="{{ site_url }}" class="admin-header-link">View Console</a>
+    {% endif %}
+    {% if user.has_usable_password %}
+        <a href="{% url 'admin:password_change' %}" class="admin-header-link">Password</a>
+    {% endif %}
+    <form id="logout-form" method="post" action="{% url 'admin:logout' %}">
+        {% csrf_token %}
+        <button type="submit" class="admin-logout-btn">Log out</button>
+    </form>
+</div>
+{% endblock %}
+
+{% block welcome-msg %}
+{% endblock %}
+
+{# === CSS: comprehensive dark theme from scratch === #}
+{% block extrastyle %}
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ================================================================
+   DESIGN SYSTEM TOKENS
+   Matching the main scraper console app exactly.
+   ================================================================ */
+:root {
+    /* Surfaces */
+    --void: #0B0F17;
+    --surface: #111827;
+    --raised: #1A2332;
+    --overlay: #232E42;
+
+    /* Borders */
+    --border: #1E293B;
+    --border-strong: #334155;
+    --border-input: #2D3B50;
+
+    /* Text */
+    --ink: #F1F5F9;
+    --ink-2: #94A3B8;
+    --ink-3: #64748B;
+    --ink-4: #475569;
+
+    /* Accent */
+    --accent: #22D3EE;
+    --accent-hover: #06B6D4;
+    --accent-muted: rgba(34, 211, 238, 0.08);
+
+    /* Status */
+    --green: #34D399;
+    --yellow: #FBBF24;
+    --red: #F87171;
+    --blue: #60A5FA;
+
+    /* Override Django's CSS variables */
+    --primary: #22D3EE;
+    --secondary: #0E7490;
+    --accent: #22D3EE;
+    --primary-fg: #0B0F17;
+    --body-fg: #F1F5F9;
+    --body-bg: #0B0F17;
+    --body-quiet-color: #94A3B8;
+    --body-loud-color: #F1F5F9;
+    --header-color: #F1F5F9;
+    --header-branding-color: #F1F5F9;
+    --header-bg: #0B0F17;
+    --header-link-color: #22D3EE;
+    --breadcrumbs-fg: #94A3B8;
+    --breadcrumbs-link-fg: #22D3EE;
+    --breadcrumbs-current-fg: #F1F5F9;
+    --breadcrumbs-bg: #0D111A;
+    --link-fg: #22D3EE;
+    --link-hover-color: #06B6D4;
+    --link-selected-fg: #22D3EE;
+    --hairline-color: #1E293B;
+    --border-color: #1E293B;
+    --button-fg: #F1F5F9;
+    --button-bg: #1A2332;
+    --button-hover-bg: #232E42;
+    --default-button-fg: #0B0F17;
+    --default-button-bg: #22D3EE;
+    --default-button-hover-bg: #06B6D4;
+    --close-button-bg: #334155;
+    --close-button-hover-bg: #475569;
+    --delete-button-bg: rgba(248,113,113,0.12);
+    --delete-button-hover-bg: rgba(248,113,113,0.2);
+    --delete-button-fg: #F87171;
+    --object-tools-fg: #F1F5F9;
+    --object-tools-bg: #1A2332;
+    --object-tools-hover-bg: #232E42;
+    --font-family-primary: 'Inter', system-ui, sans-serif;
+    --font-family-monospace: 'JetBrains Mono', monospace;
+
+    /* Easing */
+    --ease: cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+/* ================================================================
+   BASE
+   ================================================================ */
+*, *::before, *::after { box-sizing: border-box; }
+
+html { colorScheme: dark; }
+
+/* === LAYOUT RESET: kill Django's float-based layout from base.css === */
+#content-main, #content-related {
+    float: none !important;
+    margin: 0 !important;
+    width: auto !important;
+    position: static !important;
+}
+.colMS #content-related, .colM #content-related,
+.colSM #content-related, .colM #content-main {
+    float: none !important;
+    margin: 0 !important;
+    width: auto !important;
+}
+/* Kill Django's default module margins */
+.module { margin-bottom: 24px !important; }
+/* Kill Django's header padding override */
+#header { padding: 0 24px !important; }
+/* Reset #main to our layout */
+#main, .main { display: flex !important; align-items: flex-start; gap: 0; }
+
+body {
+    background: var(--void) !important;
+    background-image:
+        radial-gradient(ellipse 1200px 500px at 30% -100px, rgba(34, 211, 238, 0.025), transparent 60%),
+        radial-gradient(circle at 1px 1px, rgba(255, 255, 255, 0.013) 1px, transparent 0) !important;
+    background-size: 100% 100%, 22px 22px !important;
+    background-attachment: fixed !important;
+    color: var(--ink) !important;
+    font-family: 'Inter', system-ui, sans-serif !important;
+    font-size: 15px;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    letter-spacing: -0.006em;
+}
+
+::selection { background: rgba(34, 211, 238, 0.2); color: var(--ink); }
+
+::-webkit-scrollbar { width: 7px; height: 7px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
+
+a:link, a:visited { color: var(--accent); transition: color 120ms var(--ease); }
+a:hover, a:focus { color: var(--accent-hover); }
+
+code, pre, .mono, tt, kbd, samp {
+    font-family: 'JetBrains Mono', monospace !important;
+}
+code, pre {
+    background: var(--void) !important;
+    color: var(--ink) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 4px;
+    padding: 2px 5px;
+}
+
+.skip-to-content-link { background: var(--raised) !important; color: var(--ink) !important; border: 1px solid var(--border-input) !important; }
+
+/* ================================================================
+   HEADER  — matches the main app's clean top bar
+   ================================================================ */
+#header {
+    background: var(--void) !important;
+    color: var(--ink) !important;
+    border-bottom: 1px solid var(--border) !important;
+    box-shadow: none !important;
+    background-image: none !important;
+    padding: 0 24px !important;
+    height: 52px !important;
+    min-height: 52px !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: space-between !important;
+    gap: 16px;
+    line-height: 1 !important;
+}
+/* Ensure header stays correct on all admin pages */
+#header * { line-height: 1.2; }
+.change-form #header, .change-list #header, .dashboard #header, .delete-confirmation #header {
+    height: 52px !important;
+    min-height: 52px !important;
+}
+
+#branding { padding: 0 !important; display: flex; align-items: center; }
+
+#user-tools {
+    color: var(--ink-3) !important;
+    font-size: 0.75rem !important;
+    font-weight: 500 !important;
+    padding: 0 !important;
+    line-height: 1 !important;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border: 0 !important;
+}
+
+#user-tools a:link, #user-tools a:visited { color: var(--ink-2) !important; }
+
+.admin-header-link {
+    color: var(--ink-2) !important;
+    text-decoration: none !important;
+    font-size: 0.78rem !important;
+    font-weight: 500 !important;
+    padding: 5px 10px !important;
+    border-radius: 5px !important;
+    transition: all 100ms var(--ease) !important;
+}
+.admin-header-link:hover {
+    color: var(--ink) !important;
+    background: rgba(255, 255, 255, 0.04) !important;
+}
+
+#logout-form { display: inline-flex; margin: 0 !important; }
+.admin-logout-btn, #logout-form button {
+    color: var(--ink-2) !important;
+    background: none !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 5px !important;
+    cursor: pointer !important;
+    padding: 5px 10px !important;
+    font-size: 0.78rem !important;
+    font-weight: 500 !important;
+    transition: all 100ms var(--ease) !important;
+    line-height: 1 !important;
+}
+.admin-logout-btn:hover, #logout-form button:hover {
+    color: var(--red) !important;
+    border-color: rgba(248, 113, 113, 0.3) !important;
+    background: rgba(248, 113, 113, 0.05) !important;
+}
+
+/* Kill theme toggle completely */
+.theme-toggle, .base-svgs { display: none !important; }
+
+/* ================================================================
+   BREADCRUMBS
+   ================================================================ */
+div.breadcrumbs {
+    background: transparent !important;
+    color: var(--ink-4) !important;
+    border-bottom: 1px solid var(--border) !important;
+    font-family: 'Inter', sans-serif !important;
+    font-size: 0.78rem !important;
+    padding: 10px 28px !important;
+    background-image: none !important;
+    display: flex !important;
+    align-items: center !important;
+    gap: 2px !important;
+    letter-spacing: -0.01em !important;
+}
+div.breadcrumbs a:link, div.breadcrumbs a:visited {
+    color: var(--ink-2) !important;
+    text-decoration: none !important;
+    padding: 2px 6px !important;
+    border-radius: 4px !important;
+    transition: all 100ms var(--ease) !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    gap: 4px !important;
+}
+div.breadcrumbs a:hover {
+    color: var(--accent) !important;
+    background: rgba(34, 211, 238, 0.06) !important;
+}
+/* Chevron separators between breadcrumb items */
+div.breadcrumbs a + a::before,
+.breadcrumb-separator {
+    content: '›' !important;
+    color: var(--ink-4) !important;
+    margin: 0 6px !important;
+    font-size: 0.9rem !important;
+    opacity: 0.6 !important;
+}
+/* Home icon for first breadcrumb */
+div.breadcrumbs a[href="/admin/"]::before {
+    content: '⌂' !important;
+    margin-right: 4px !important;
+    font-size: 0.9rem !important;
+    opacity: 0.7 !important;
+}
+
+/* ================================================================
+   CONTAINER & CONTENT
+   ================================================================ */
+#container { min-width: 0 !important; }
+
+#content {
+    color: var(--ink) !important;
+    padding: 24px 28px !important;
+    max-width: 100% !important;
+    width: auto !important;
+}
+/* Kill Django's column width constraints */
+#content.colMS, #content.colM, #content.colMS #content-main {
+    max-width: 100% !important;
+    width: auto !important;
+    float: none !important;
+}
+#content h1 {
+    color: var(--ink) !important;
+    font-family: 'Inter', sans-serif !important;
+    font-size: 1.5rem !important;
+    font-weight: 800 !important;
+    letter-spacing: -0.025em;
+    line-height: 1.3 !important;
+    margin-bottom: 16px !important;
+    display: flex !important;
+    align-items: center !important;
+    gap: 10px !important;
+}
+#content h2, #content h3 {
+    color: var(--ink) !important;
+    font-family: 'Inter', sans-serif !important;
+}
+#content-main { padding-top: 0 !important; }
+
+/* ================================================================
+   MODULES / PANELS  — match the main app's .panel component
+   ================================================================ */
+.module {
+    background: rgba(11, 15, 23, 0.7) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 8px !important;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12) !important;
+    margin-bottom: 24px !important;
+    overflow: hidden;
+}
+/* Kill table zebra striping and highlights */
+/* Aggressive kill all table backgrounds */
+table, table tbody, table tr, table td, table th { background: transparent !important; color: var(--ink) !important; }
+table tr.row1, table tr.row2 { background: transparent !important; }
+table tr.current-model { background: transparent !important; }
+table tbody tr:hover, table tbody tr.selected { background: rgba(34, 211, 238, 0.04) !important; }
+
+/* Tone down section headers */
+.module h2, .module caption {
+    font-size: 0.75rem !important;
+    font-weight: 500 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.05em !important;
+    color: var(--ink-2) !important;
+    background: transparent !important;
+    border-bottom: 1px solid var(--border) !important;
+    padding: 12px 16px !important;
+}
+.module h2 a:link, .module h2 a:visited,
+.module caption a:link, .module caption a:visited { color: var(--accent) !important; }
+.module h2 a:hover, .module caption a:hover { color: var(--accent-hover) !important; }
+
+/* Dashboard app modules */
+.app-auth.module, .app-scraper.module, .app-django_celery_beat.module { padding: 0 !important; }
+.dashboard table { width: 100%; border-collapse: collapse; table-layout: fixed !important; }
+.dashboard table caption { padding: 12px 16px !important; }
+.dashboard #content-main .module table td,
+.dashboard #content-main .module table th { font-size: 0.85rem !important; padding: 8px 16px !important; }
+/* Force 3-column alignment: Name | Add | Change — table-layout:fixed uses first row to set widths */
+.dashboard table tbody tr:first-child th { width: 50% !important; }
+.dashboard table tbody tr:first-child td { width: 25% !important; }
+
+/* ================================================================
+   ADD / CHANGE LINKS  — proper buttons, not tiny text links
+   ================================================================ */
+td .addlink, th .addlink,
+td .changelink, th .changelink {
+    font-size: 0.78rem !important;
+    font-weight: 600 !important;
+    padding: 5px 14px !important;
+    border-radius: 6px !important;
+    text-decoration: none !important;
+    display: inline-block !important;
+    transition: all 120ms var(--ease) !important;
+    background-image: none !important;
+    padding-left: 14px !important;
+    line-height: 1.4 !important;
+}
+
+/* Add button: cyan accent */
+td .addlink, th .addlink {
+    color: var(--accent) !important;
+    background: rgba(34, 211, 238, 0.06) !important;
+    border: 1px solid rgba(34, 211, 238, 0.2) !important;
+}
+td .addlink:hover, th .addlink:hover {
+    background: rgba(34, 211, 238, 0.12) !important;
+    border-color: rgba(34, 211, 238, 0.4) !important;
+}
+
+/* Change button: neutral */
+td .changelink, th .changelink {
+    color: var(--ink-2) !important;
+    background: var(--raised) !important;
+    border: 1px solid var(--border-input) !important;
+}
+td .changelink:hover, th .changelink:hover {
+    color: var(--ink) !important;
+    background: var(--overlay) !important;
+    border-color: var(--border-strong) !important;
+}
+
+/* Remove Django's icon backgrounds */
+.addlink, .changelink { background-image: none !important; }
+a.addlink:before, a.changelink:before { display: none !important; content: none !important; }
+
+/* ================================================================
+   TABLES  — clean dark themed
+   ================================================================ */
+table {
+    background: transparent !important;
+    border-collapse: collapse !important;
+    box-shadow: none !important;
+    width: 100%;
+}
+table th, table td {
+    color: var(--ink) !important;
+    border-color: var(--border) !important;
+    font-family: 'Inter', sans-serif !important;
+    font-size: 0.82rem !important;
+}
+table thead th {
+    background: var(--raised) !important;
+    color: var(--ink-3) !important;
+    font-weight: 600 !important;
+    font-size: 0.7rem !important;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    border-color: var(--border) !important;
+    padding: 8px 12px !important;
+}
+table thead th a:link, table thead th a:visited { color: var(--ink-3) !important; }
+table thead th a:hover { color: var(--ink) !important; }
+table thead th.sorted a { color: var(--accent) !important; }
+table tbody th, table tbody td {
+    background: var(--surface) !important;
+    border-color: var(--border) !important;
+    padding: 8px 12px !important;
+    vertical-align: middle;
+}
+table tbody tr:hover td, table tbody tr:hover th { background: var(--raised) !important; }
+table tbody tr.selected td { background: rgba(34, 211, 238, 0.06) !important; }
+
+.sortoptions { font-size: 0.65rem !important; }
+.sortoptions a { color: var(--ink-4) !important; }
+thead th.sorted .sortoptions a { color: var(--accent) !important; }
+
+/* Dashboard tables: remove hover bg on header rows */
+.dashboard #content-main table tbody td,
+.dashboard #content-main table tbody th { background: transparent !important; }
+.dashboard #content-main .module table td { font-size: 0.85rem !important; padding: 8px 16px !important; }
+
+/* ================================================================
+   FORM INPUTS  — match .input-field from the main app
+   ================================================================ */
+input[type="text"], input[type="password"], input[type="email"], input[type="url"],
+input[type="number"], input[type="tel"], input[type="date"], input[type="time"],
+input[type="datetime-local"], input[type="search"], textarea, select {
+    background: var(--void) !important;
+    color: var(--ink) !important;
+    border: 1px solid var(--border-input) !important;
+    border-radius: 7px !important;
+    padding: 9px 14px !important;
+    font-family: 'JetBrains Mono', Consolas, monospace !important;
+    font-size: 0.75rem !important;
+    line-height: 1.4 !important;
+    transition: border-color 120ms var(--ease), box-shadow 150ms var(--ease) !important;
+    box-sizing: border-box;
+}
+input:hover, textarea:hover, select:hover { border-color: #3D4D63 !important; }
+input:focus, textarea:focus, select:focus, input:focus-visible {
+    outline: none !important;
+    border-color: var(--accent) !important;
+    box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.08) !important;
+}
+::placeholder { color: var(--ink-4) !important; }
+
+/* Select arrow */
+select {
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='none' stroke='%2394A3B8' stroke-width='2' viewBox='0 0 24 24'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' d='M19 9l-7 7-7-7'/%3E%3C/svg%3E") !important;
+    background-repeat: no-repeat !important;
+    background-position: right 8px center !important;
+    background-size: 12px !important;
+    padding-right: 28px !important;
+    cursor: pointer;
+}
+select option, select optgroup { background: var(--surface) !important; color: var(--ink) !important; }
+select optgroup { color: var(--ink-3) !important; font-style: normal !important; font-weight: 600 !important; font-size: 0.68rem !important; text-transform: uppercase; }
+
+/* Checkboxes */
+input[type="checkbox"], input[type="radio"] {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 16px;
+    height: 16px;
+    border: 1.5px solid var(--border-strong) !important;
+    border-radius: 4px;
+    background: var(--void) !important;
+    cursor: pointer;
+    position: relative;
+    flex-shrink: 0;
+    vertical-align: middle;
+    transition: border-color 120ms var(--ease), background-color 120ms var(--ease);
+}
+input[type="radio"] { border-radius: 50%; }
+input[type="checkbox"]:hover { border-color: var(--accent) !important; }
+input[type="checkbox"]:checked { background: var(--accent) !important; border-color: var(--accent) !important; }
+input[type="checkbox"]:checked::after {
+    content: ""; position: absolute; left: 4px; top: 1px; width: 4px; height: 8px;
+    border: solid var(--void); border-width: 0 2px 2px 0; transform: rotate(45deg);
+}
+input[type="radio"]:checked { background: var(--void) !important; border-color: var(--accent) !important; border-width: 4px !important; }
+.action-checkbox-cell input[type="checkbox"] { width: 15px; height: 15px; }
+.vCheckboxLabel { color: #CBD5E1 !important; font-size: 0.78rem !important; }
+
+/* Labels */
+label, .form-row label, .aligned label {
+    color: var(--ink-2) !important;
+    font-family: 'Inter', sans-serif !important;
+    font-size: 0.78rem !important;
+    font-weight: 600 !important;
+}
+label.required:after { color: var(--red) !important; }
+
+/* Help text */
+.help, .help-block, span.help, p.help {
+    color: var(--ink-3) !important;
+    font-size: 0.7rem !important;
+}
+
+/* Readonly */
+.readonly, div.readonly {
+    color: var(--ink) !important;
+    background: rgba(26, 35, 50, 0.35) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 5px !important;
+    padding: 6px 10px !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.78rem !important;
+}
+
+/* ================================================================
+   FIELDSETS  — match panel component
+   ================================================================ */
+fieldset {
+    background: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 10px !important;
+    margin-bottom: 14px !important;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12) !important;
+}
+fieldset.collapsed { border-radius: 10px !important; }
+fieldset h2, .module.collapse h2 {
+    background: var(--raised) !important;
+    color: var(--ink) !important;
+    border: 0 !important;
+    border-bottom: 1px solid var(--border) !important;
+    font-family: 'Inter', sans-serif !important;
+    font-weight: 600 !important;
+    font-size: 0.8rem !important;
+    padding: 10px 14px !important;
+    margin: 0 !important;
+    border-radius: 10px 10px 0 0 !important;
+}
+fieldset.collapsed h2 { border-bottom: 0 !important; border-radius: 10px !important; }
+.collapse-toggle {
+    color: var(--accent) !important;
+    font-size: 0.7rem !important;
+    background: transparent !important;
+    border: 0 !important;
+    cursor: pointer;
+    padding: 2px 8px !important;
+    border-radius: 4px;
+}
+.collapse-toggle:hover { color: var(--accent-hover) !important; background: rgba(34, 211, 238, 0.06) !important; }
+fieldset .description {
+    color: var(--ink-3) !important;
+    font-size: 0.75rem !important;
+    background: transparent !important;
+    border: 0 !important;
+    padding: 8px 14px 4px !important;
+}
+
+/* Form rows */
+.form-row {
+    border-color: var(--border) !important;
+    color: var(--ink) !important;
+    padding: 10px 14px !important;
+    border-bottom: 1px solid var(--border) !important;
+}
+.form-row:last-child { border-bottom: 0 !important; }
+
+/* ================================================================
+   BUTTONS  — match main app's .btn-primary / .btn-secondary
+   ================================================================ */
+input[type="submit"], button, .button, a.button {
+    font-family: 'Inter', sans-serif !important;
+    font-weight: 600 !important;
+    font-size: 0.78rem !important;
+    border-radius: 6px !important;
+    cursor: pointer !important;
+    transition: background-color 120ms var(--ease), border-color 120ms var(--ease), transform 60ms var(--ease) !important;
+    line-height: 1.4 !important;
+    text-decoration: none !important;
+}
+
+/* Primary (cyan) */
+.submit-row input.default, input[type="submit"].default, button.default,
+.submit-row input[type="submit"]:not([name*="delete"]):not(.cancel):not(.deletelink) {
+    background: var(--accent) !important;
+    color: var(--void) !important;
+    border: 1px solid var(--accent) !important;
+    padding: 7px 18px !important;
+}
+.submit-row input.default:hover, input[type="submit"].default:hover {
+    background: var(--accent-hover) !important;
+    border-color: var(--accent-hover) !important;
+    box-shadow: 0 0 20px rgba(34, 211, 238, 0.2) !important;
+}
+input[type="submit"]:active { transform: scale(0.97) !important; }
+
+/* Secondary (dark) */
+input[type="submit"]:not(.default):not(.deletelink):not(.cancel),
+button:not(.default):not(.deletelink):not(.cancel):not(.theme-toggle):not(.toggle-nav-sidebar):not(.collapse-toggle),
+.button, a.button {
+    background: var(--raised) !important;
+    color: var(--ink) !important;
+    border: 1px solid var(--border-input) !important;
+    padding: 7px 14px !important;
+}
+input[type="submit"]:not(.default):hover, button:not(.default):hover, .button:hover, a.button:hover {
+    background: var(--overlay) !important;
+    border-color: var(--border-strong) !important;
+}
+
+/* Cancel */
+.cancel, a.button.cancel {
+    color: var(--ink-2) !important;
+    background: transparent !important;
+    border: 1px solid var(--border-strong) !important;
+}
+.cancel:hover { color: var(--ink) !important; border-color: var(--ink-4) !important; }
+
+/* Delete */
+.deletelink, a.deletelink {
+    background: rgba(248, 113, 113, 0.08) !important;
+    color: var(--red) !important;
+    border: 1px solid rgba(248, 113, 113, 0.2) !important;
+    padding: 7px 14px !important;
+    border-radius: 6px !important;
+}
+.deletelink:hover, a.deletelink:hover {
+    background: rgba(248, 113, 113, 0.16) !important;
+    border-color: rgba(248, 113, 113, 0.35) !important;
+}
+
+/* Submit row */
+.submit-row {
+    background: var(--raised) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 10px !important;
+    padding: 10px 14px !important;
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.submit-row input, .submit-row a { float: none !important; }
+
+/* Object tools — standalone action bar for pages without search */
+.object-tools {
+    font-family: 'Inter', sans-serif !important;
+    margin: 0 0 12px 0 !important;
+    padding: 12px 14px !important;
+    background: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 8px !important;
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px !important;
+    list-style: none !important;
+}
+.object-tools li { list-style: none; }
+.object-tools a:link, .object-tools a:visited {
+    background: var(--accent) !important;
+    color: var(--void) !important;
+    border: 1px solid var(--accent) !important;
+    border-radius: 6px !important;
+    font-size: 0.78rem !important;
+    font-weight: 600 !important;
+    padding: 7px 16px !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    gap: 6px !important;
+    line-height: 1 !important;
+    height: 34px !important;
+    text-decoration: none !important;
+    white-space: nowrap !important;
+}
+.object-tools a::before {
+    content: '+' !important;
+    font-size: 1rem !important;
+    font-weight: 500 !important;
+    line-height: 1 !important;
+    margin-right: 2px !important;
+}
+.object-tools a:hover { background: var(--accent-hover) !important; border-color: var(--accent-hover) !important; }
+.object-tools a.addlink { background-image: none !important; padding-left: 16px !important; }
+
+/* ================================================================
+   PAGINATION
+   ================================================================ */
+.paginator {
+    background: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 10px !important;
+    color: var(--ink-3) !important;
+    font-size: 0.78rem !important;
+    padding: 8px 14px !important;
+}
+.paginator a:link, .paginator a:visited {
+    background: var(--raised) !important;
+    color: var(--ink) !important;
+    border: 1px solid var(--border-input) !important;
+    border-radius: 5px !important;
+    padding: 3px 8px !important;
+}
+.paginator a:hover { background: var(--overlay) !important; }
+.paginator .this-page {
+    color: var(--accent) !important;
+    background: rgba(34, 211, 238, 0.06) !important;
+    border: 1px solid rgba(34, 211, 238, 0.2) !important;
+}
+
+/* ================================================================
+   MESSAGES
+   ================================================================ */
+ul.messagelist { list-style: none !important; padding: 0 !important; margin: 0 0 12px 0 !important; }
+ul.messagelist li {
+    background: var(--surface) !important;
+    color: var(--ink) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 8px !important;
+    font-size: 0.8rem !important;
+    padding: 10px 14px !important;
+    margin-bottom: 6px !important;
+}
+ul.messagelist li.success { border-color: rgba(52, 211, 153, 0.3) !important; }
+ul.messagelist li.warning { border-color: rgba(251, 191, 36, 0.3) !important; }
+ul.messagelist li.error { border-color: rgba(248, 113, 113, 0.3) !important; }
+
+/* Errors */
+.errornote {
+    background: rgba(248, 113, 113, 0.1) !important;
+    color: var(--red) !important;
+    border: 1px solid rgba(248, 113, 113, 0.25) !important;
+    border-radius: 6px !important;
+    padding: 8px 14px !important;
+    font-size: 0.8rem !important;
+}
+ul.errorlist, ul.errorlist li {
+    color: var(--red) !important;
+    font-size: 0.78rem !important;
+    list-style: none !important;
+    padding: 2px 0 !important;
+    background: transparent !important;
+}
+
+/* ================================================================
+   NAV SIDEBAR (left) — match main app's sidebar
+   ================================================================ */
+#nav-sidebar {
+    background: var(--void) !important;
+    border-right: 1px solid var(--border) !important;
+    flex: 0 0 200px !important;
+    width: 200px !important;
+    position: sticky !important;
+    top: 52px !important;
+    height: calc(100vh - 52px) !important;
+    overflow-y: auto !important;
+    z-index: 100 !important;
+    padding: 8px 0 !important;
+}
+#nav-filter { display: none !important; }
+.toggle-nav-sidebar { display: none !important; }
+
+/* ================================================================
+   FINAL AUTHORITY OVERRIDES
+   ================================================================ */
+/* 1. Reset all table backgrounds to transparent */
+table, table tbody, table tr, table td, table th {
+    background: transparent !important;
+    background-color: transparent !important;
+    border-color: var(--border) !important;
+    color: var(--ink) !important;
+}
+/* Force panel background on all module-like structures */
+.module, .inline-group, #changelist, #result_list {
+    background: rgba(11, 15, 23, 0.7) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 8px !important;
+}
+
+/* 2. Remove all zebra striping and highlights */
+table tr.row1, table tr.row2, table tr.selected, table tr.current-model {
+    background: transparent !important;
+    background-color: transparent !important;
+}
+table tbody tr:hover {
+    background: rgba(34, 211, 238, 0.04) !important;
+}
+
+/* 3. Action bar consolidation (Add button / filters) */
+.actions {
+    background: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 8px !important;
+    padding: 12px !important;
+    margin-bottom: 16px !important;
+}
+#nav-sidebar .module {
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    margin: 0 !important;
+    border-radius: 0 !important;
+    padding: 0 !important;
+}
+#nav-sidebar .module h2, #nav-sidebar .module caption {
+    background: transparent !important;
+    color: var(--ink-4) !important;
+    border: 0 !important;
+    font-size: 0.58rem !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.1em !important;
+    padding: 12px 12px 3px !important;
+    margin: 0 !important;
+    border-bottom: 0 !important;
+    opacity: 0.6 !important;
+}
+#nav-sidebar table { width: 100% !important; border-collapse: collapse !important; }
+#nav-sidebar td, #nav-sidebar th {
+    background: transparent !important;
+    border: 0 !important;
+    padding: 0 !important;
+}
+#nav-sidebar tr { display: block !important; padding: 0 !important; margin: 0 !important; }
+#nav-sidebar th a:link, #nav-sidebar th a:visited {
+    color: var(--ink-2) !important;
+    font-weight: 400 !important;
+    font-size: 0.82rem !important;
+    padding: 5px 12px !important;
+    display: block !important;
+    border-radius: 0 !important;
+    transition: all 100ms var(--ease) !important;
+}
+#nav-sidebar th a:hover { color: var(--ink) !important; background: rgba(255, 255, 255, 0.03) !important; }
+#nav-sidebar td .addlink,
+#nav-sidebar td .changelink,
+#nav-sidebar .addlink,
+#nav-sidebar .changelink { display: none !important; }
+#nav-sidebar .current a:link, #nav-sidebar .current a:visited,
+#nav-sidebar tr.current a:link, #nav-sidebar tr.current a:visited {
+    color: var(--accent) !important;
+    background: rgba(34, 211, 238, 0.06) !important;
+    font-weight: 500 !important;
+}
+
+/* Nav toggle — hidden, sidebar always visible */
+.toggle-nav-sidebar { display: none !important; }
+
+/* ================================================================
+   CHANGELIST RESULTS — modern operations console style
+   ================================================================ */
+#changelist { overflow-x: auto !important; }
+#changelist table { min-width: 100% !important; }
+#changelist table tbody th, #changelist table tbody td { padding: 12px 16px !important; }
+
+/* Result list — wrapped in a card with shadow */
+#result_list {
+    border: 1px solid var(--border) !important;
+    border-radius: 10px !important;
+    overflow: hidden;
+    min-width: 100% !important;
+    background: var(--surface) !important;
+}
+
+/* Header — darker, gradient, sticky on scroll */
+#result_list thead th {
+    background: linear-gradient(180deg, rgba(26, 35, 50, 0.7) 0%, rgba(26, 35, 50, 0.4) 100%) !important;
+    color: var(--ink-3) !important;
+    font-size: 0.65rem !important;
+    font-weight: 700 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.07em !important;
+    padding: 12px 16px !important;
+    border-bottom: 1px solid var(--border-strong) !important;
+    border-top: 0 !important;
+    background-color: var(--raised) !important;
+    position: relative;
+    white-space: nowrap;
+}
+#result_list thead th a:link, #result_list thead th a:visited {
+    color: var(--ink-3) !important;
+    text-decoration: none !important;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+#result_list thead th a:hover { color: var(--ink) !important; }
+#result_list thead th.sorted a { color: var(--accent) !important; }
+
+/* Body cells — cleaner typography */
+#result_list tbody td {
+    padding: 12px 16px !important;
+    font-size: 0.78rem !important;
+    color: var(--ink-2) !important;
+    border-bottom: 1px solid var(--border) !important;
+    border-top: 0 !important;
+    vertical-align: middle !important;
+    background: transparent !important;
+    transition: background-color 100ms var(--ease) !important;
+}
+#result_list tbody tr:last-child td { border-bottom: 0 !important; }
+
+/* Row hover — cyan tint + left edge */
+#result_list tbody tr {
+    transition: background-color 120ms var(--ease) !important;
+    position: relative;
+}
+#result_list tbody tr:hover td,
+#result_list tbody tr:hover th {
+    background: rgba(34, 211, 238, 0.04) !important;
+}
+#result_list tbody tr:hover td a { color: var(--accent) !important; }
+#result_list tbody tr:hover td:first-child,
+#result_list tbody tr:hover th:first-child {
+    box-shadow: inset 2px 0 0 var(--accent);
+    padding-left: 14px !important;
+}
+
+/* First column (row link) — slightly emphasized */
+#result_list tbody th:first-child,
+#result_list tbody td:first-child {
+    color: var(--ink) !important;
+    font-weight: 500 !important;
+}
+#result_list tbody th:first-child a,
+#result_list tbody td:first-child a {
+    color: var(--ink) !important;
+    text-decoration: none !important;
+    font-weight: 500 !important;
+    transition: color 100ms var(--ease) !important;
+}
+#result_list tbody tr:hover th:first-child a,
+#result_list tbody tr:hover td:first-child a {
+    color: var(--accent) !important;
+}
+
+/* Alternating row colors for readability */
+#result_list tbody tr:nth-child(even) td,
+#result_list tbody tr.row1 td {
+    background: rgba(11, 15, 23, 0.3) !important;
+}
+
+/* Checkbox in row */
+#result_list .action-select {
+    width: 15px !important;
+    height: 15px !important;
+    cursor: pointer !important;
+}
+
+/* Compact URL/id cells */
+#result_list td.field-url {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.72rem !important;
+    color: var(--ink-2) !important;
+    white-space: nowrap !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 280px !important;
+}
+#result_list td.field-id, #result_list td.field-action_count {
+    font-family: 'JetBrains Mono', monospace !important;
+    color: var(--ink-3) !important;
+    font-size: 0.75rem !important;
+    text-align: center !important;
+    width: 50px !important;
+}
+#result_list td.field-product_count, #result_list td.field-fields_extracted,
+#result_list td.field-last_scraped_at, #result_list td.field-created_at {
+    font-family: 'JetBrains Mono', monospace !important;
+    color: var(--ink-2) !important;
+    text-align: right !important;
+    font-weight: 500 !important;
+    width: 110px !important;
+    white-space: nowrap !important;
+    font-size: 0.72rem !important;
+}
+#result_list td.field-name, #result_list td.field-site_name {
+    font-weight: 600 !important;
+    color: var(--ink) !important;
+    white-space: nowrap !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 150px !important;
+}
+#result_list td.field-slug {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.7rem !important;
+    color: var(--ink-3) !important;
+    white-space: nowrap !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 130px !important;
+}
+#result_list td.field-site_type, #result_list td.field-platform {
+    color: var(--ink-2) !important;
+    font-size: 0.7rem !important;
+    max-width: 90px !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap !important;
+}
+#result_list td.field-has_scraper {
+    text-align: center !important;
+    width: 80px !important;
+}
+
+/* Sort arrows */
+#result_list thead th .sortoptions a {
+    color: var(--ink-4) !important;
+    font-size: 0.65rem !important;
+    margin-left: 4px;
+}
+#result_list thead th.sorted .sortoptions a { color: var(--accent) !important; }
+#changelist .paginator {
+    background: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 0 0 10px 10px !important;
+    border-top: 0 !important;
+    margin-top: -8px !important;
+    padding: 8px 16px !important;
+    color: var(--ink-3) !important;
+    font-size: 0.75rem !important;
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px !important;
+}
+#changelist .paginator a {
+    background: var(--raised) !important;
+    color: var(--ink) !important;
+    border: 1px solid var(--border-input) !important;
+    border-radius: 5px !important;
+    padding: 3px 10px !important;
+    text-decoration: none !important;
+    font-size: 0.75rem !important;
+    transition: all 120ms var(--ease) !important;
+}
+#changelist .paginator a:hover {
+    background: var(--overlay) !important;
+    border-color: var(--accent) !important;
+    color: var(--accent) !important;
+}
+#changelist .paginator .this-page {
+    background: rgba(34, 211, 238, 0.08) !important;
+    color: var(--accent) !important;
+    border: 1px solid rgba(34, 211, 238, 0.3) !important;
+    font-weight: 600 !important;
+}
+
+/* ================================================================
+   CHANGELIST — full-width, no right sidebar
+   ================================================================ */
+#changelist {
+    display: block !important;
+}
+/* Kill the right sidebar — filters move inline */
+#changelist-filter {
+    display: none !important;
+}
+#changelist > .results { width: 100% !important; }
+
+/* Inline filter bar — in a container with proper spacing */
+.inline-filter-bar {
+    display: flex !important;
+    align-items: flex-start !important;
+    gap: 16px !important;
+    padding: 10px 14px !important;
+    margin-bottom: 12px !important;
+    background: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 8px !important;
+    flex-wrap: wrap !important;
+    overflow-x: auto !important;
+    scrollbar-width: thin !important;
+}
+.inline-filter-bar .filter-group {
+    display: flex !important;
+    align-items: center !important;
+    gap: 5px !important;
+    flex-shrink: 0 !important;
+    flex-wrap: wrap !important;
+    row-gap: 4px !important;
+}
+.inline-filter-bar .filter-group .filter-pill { flex-shrink: 0 !important; }
+.inline-filter-bar .filter-label {
+    color: var(--ink-3) !important;
+    font-size: 0.68rem !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.06em !important;
+    white-space: nowrap !important;
+    margin-right: 6px !important;
+    padding-right: 8px !important;
+    border-right: 1px solid var(--border) !important;
+    line-height: 1 !important;
+}
+.inline-filter-bar .filter-pill {
+    display: inline-flex !important;
+    align-items: center !important;
+    padding: 3px 10px !important;
+    font-size: 0.72rem !important;
+    font-weight: 500 !important;
+    color: var(--ink-2) !important;
+    background: transparent !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 12px !important;
+    text-decoration: none !important;
+    transition: all 100ms var(--ease) !important;
+    white-space: nowrap !important;
+    line-height: 1.4 !important;
+}
+.inline-filter-bar .filter-pill:hover {
+    color: var(--ink) !important;
+    border-color: var(--border-strong) !important;
+    background: rgba(255, 255, 255, 0.02) !important;
+}
+.inline-filter-bar .filter-pill.active {
+    color: var(--accent) !important;
+    background: rgba(34, 211, 238, 0.1) !important;
+    border-color: rgba(34, 211, 238, 0.35) !important;
+    font-weight: 600 !important;
+}
+/* Filter count badge inside a pill */
+.filter-pill .filter-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-left: 4px;
+    padding: 0 5px;
+    min-width: 18px;
+    height: 14px;
+    font-size: 0.6rem;
+    font-weight: 700;
+    color: var(--ink-3);
+    background: rgba(148, 163, 184, 0.12);
+    border-radius: 7px;
+    line-height: 1;
+}
+.filter-pill.active .filter-count {
+    color: var(--accent);
+    background: rgba(34, 211, 238, 0.15);
+}
+/* Clear all filters link */
+.inline-filter-bar .filter-clear-all {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+    padding: 4px 10px;
+    font-size: 0.7rem;
+    font-weight: 500;
+    color: var(--red) !important;
+    background: rgba(248, 113, 113, 0.06) !important;
+    border: 1px solid rgba(248, 113, 113, 0.2) !important;
+    border-radius: 5px;
+    text-decoration: none !important;
+    transition: all 100ms var(--ease) !important;
+    white-space: nowrap;
+    align-self: center;
+}
+.inline-filter-bar .filter-clear-all:hover {
+    color: var(--void) !important;
+    background: var(--red) !important;
+    border-color: var(--red) !important;
+}
+    font-weight: 600 !important;
+}
+
+/* ================================================================
+   INLINE GROUPS
+   ================================================================ */
+.inline-group {
+    background: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 10px !important;
+    overflow: hidden;
+}
+.inline-group h2, .inline-group .tabular tr.module td {
+    background: var(--raised) !important;
+    color: var(--ink) !important;
+    border-color: var(--border) !important;
+}
+.add-row a, .add-row a:link { color: var(--accent) !important; font-size: 0.78rem !important; padding: 8px 14px; display: inline-block; }
+.add-row a:hover { color: var(--accent-hover) !important; }
+
+/* Related widget */
+.related-widget-wrapper-link, .related-lookup { color: var(--accent) !important; opacity: 0.6; text-decoration: none !important; }
+.related-widget-wrapper-link:hover, .related-lookup:hover { opacity: 1; }
+.add-another { opacity: 0.6; }
+.add-another:hover { opacity: 1; }
+.add-another img, .related-lookup img { filter: invert(0.7) sepia(1) saturate(5) hue-rotate(155deg); }
+
+/* M2M selector */
+.selector { display: flex !important; gap: 10px !important; align-items: stretch !important; }
+.selector .selector-available, .selector .selector-chosen {
+    background: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 8px !important;
+    flex: 1 !important;
+    min-width: 0 !important;
+    display: flex !important;
+    flex-direction: column !important;
+    overflow: hidden;
+}
+.selector h2, .selector .selector-available-title, .selector .selector-chosen-title {
+    background: var(--raised) !important;
+    color: var(--ink-2) !important;
+    border-bottom: 1px solid var(--border) !important;
+    font-size: 0.75rem !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.05em !important;
+    padding: 8px 12px !important;
+    border-radius: 7px 7px 0 0 !important;
+}
+.selector select, .selector .selector-available select, .selector .selector-chosen select {
+    background: var(--void) !important;
+    color: var(--ink) !important;
+    border: 1px solid var(--border-input) !important;
+    border-radius: 0 0 7px 7px !important;
+    width: 100% !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.72rem !important;
+    padding: 8px !important;
+    min-height: 200px !important;
+    flex: 0 0 auto !important;
+}
+.selector select option { background: var(--void) !important; color: var(--ink) !important; padding: 4px 8px !important; }
+.selector select option:checked { background: rgba(34, 211, 238, 0.15) !important; color: var(--accent) !important; }
+.selector .selector-chooseall, .selector .selector-clearall {
+    background: var(--raised) !important;
+    color: var(--ink) !important;
+    border: 1px solid var(--border-input) !important;
+    border-radius: 5px !important;
+    font-size: 0.7rem !important;
+    font-weight: 600 !important;
+    padding: 7px 12px !important;
+    margin: 8px !important;
+    width: auto !important;
+    min-width: 130px !important;
+    display: block !important;
+    text-align: center !important;
+    line-height: 1.4 !important;
+    height: auto !important;
+    min-height: 30px !important;
+    flex-shrink: 0 !important;
+    transition: all 120ms var(--ease) !important;
+}
+.selector .selector-chooseall:hover:not(:disabled),
+.selector .selector-clearall:hover:not(:disabled) {
+    background: var(--overlay) !important;
+    border-color: var(--accent) !important;
+    color: var(--accent) !important;
+}
+.selector .selector-chooseall:disabled,
+.selector .selector-clearall:disabled {
+    opacity: 0.4 !important;
+    cursor: not-allowed !important;
+}
+/* Arrow selector buttons (Choose > and Remove <) */
+.selector .selector-chooser { display: flex !important; flex-direction: column !important; gap: 6px !important; padding: 50px 0 !important; align-items: center !important; }
+.selector .selector-chooser li { list-style: none !important; }
+.selector .selector-chooser button {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    min-width: 36px !important;
+    width: 36px !important;
+    height: 36px !important;
+    padding: 0 !important;
+    border-radius: 6px !important;
+    background-color: var(--raised) !important;
+    border: 1px solid var(--border-input) !important;
+    color: var(--ink) !important;
+    font-size: 0 !important;
+    text-indent: 0 !important;
+    cursor: pointer !important;
+    transition: all 120ms var(--ease) !important;
+    position: relative !important;
+}
+/* Render "›" arrow for add and "‹" for remove via pseudo-element */
+.selector .selector-chooser .selector-add::before {
+    content: "›" !important;
+    font-size: 1.4rem !important;
+    font-weight: 600 !important;
+    line-height: 1 !important;
+    color: var(--ink) !important;
+    text-indent: 0 !important;
+    display: block !important;
+}
+.selector .selector-chooser .selector-remove::before {
+    content: "‹" !important;
+    font-size: 1.4rem !important;
+    font-weight: 600 !important;
+    line-height: 1 !important;
+    color: var(--ink) !important;
+    text-indent: 0 !important;
+    display: block !important;
+}
+.selector .selector-chooser button:not(:disabled):hover {
+    background-color: var(--overlay) !important;
+    color: var(--accent) !important;
+    border-color: var(--accent) !important;
+}
+.selector .selector-chooser button:not(:disabled):hover::before { color: var(--accent) !important; }
+.selector .selector-chooser button:disabled {
+    opacity: 0.4 !important;
+    cursor: not-allowed !important;
+}
+.selector .selector-filtered { padding: 4px 8px !important; }
+.selector .selector-filtered input {
+    background: var(--void) !important;
+    border: 1px solid var(--border-input) !important;
+    border-radius: 5px !important;
+    color: var(--ink) !important;
+    padding: 5px 8px !important;
+    font-size: 0.72rem !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
+}
+.selector .selector-filtered input:focus { border-color: var(--accent) !important; outline: none !important; }
+
+/* Calendar */
+.calendarbox, .clockbox {
+    background: var(--overlay) !important;
+    border: 1px solid var(--border-strong) !important;
+    border-radius: 10px !important;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4) !important;
+    color: var(--ink) !important;
+}
+.calendarbox caption, .calendarbox h2, .clockbox h2 {
+    background: var(--raised) !important; color: var(--ink) !important; border-color: var(--border) !important;
+}
+.calendar td.today a { background: rgba(34, 211, 238, 0.1) !important; color: var(--accent) !important; }
+.calendar td.selected a { background: var(--accent) !important; color: var(--void) !important; }
+.datetimeshortcuts, .datetimeshortcuts a { color: var(--accent) !important; font-size: 0.7rem !important; }
+
+/* ================================================================
+   DASHBOARD LAYOUT  — 2-column grid
+   ================================================================ */
+.dashboard #content { display: grid; grid-template-columns: 1fr; gap: 16px; }
+@media (min-width: 900px) {
+    .dashboard #content { grid-template-columns: 1fr 280px; align-items: start; }
+}
+.dashboard #content > h1 { grid-column: 1 / -1; }
+#content-related {
+    grid-column: 1;
+    background: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 10px !important;
+}
+@media (min-width: 900px) { #content-related { grid-column: 2; } }
+
+/* Recent actions module */
+#recent-actions-module h2 { font-size: 0.78rem !important; }
+#recent-actions-module h3 {
+    font-size: 0.68rem !important; color: var(--ink-4) !important;
+    text-transform: uppercase; letter-spacing: 0.06em;
+    padding: 8px 14px 4px !important;
+}
+#recent-actions-module .actionlist-action {
+    padding: 6px 14px;
+    border-bottom: 1px solid var(--border);
+}
+#recent-actions-module .actionlist-action:last-child { border-bottom: 0; }
+#recent-actions-module li { border-color: var(--border) !important; padding: 6px 14px !important; }
+#recent-actions-module li a:link { color: var(--accent) !important; font-size: 0.78rem !important; }
+#recent-actions-module p { padding: 6px 14px !important; color: var(--ink-3) !important; font-size: 0.78rem !important; }
+#recent-actions-module .placeholder {
+    padding: 20px 14px !important;
+    color: var(--ink-4) !important;
+    font-size: 0.78rem !important;
+    text-align: center;
+}
+
+/* ================================================================
+   LOGIN PAGE
+   ================================================================ */
+body.login {
+    background: var(--void) !important;
+    min-height: 100vh !important;
+    display: flex !important;
+    justify-content: center !important;
+    align-items: center !important;
+    padding: 20px !important;
+    background-image:
+        radial-gradient(ellipse 1200px 500px at 30% -100px, rgba(34, 211, 238, 0.03), transparent 60%),
+        radial-gradient(circle at 1px 1px, rgba(255, 255, 255, 0.013) 1px, transparent 0) !important;
+    background-size: 100% 100%, 22px 22px !important;
+}
+body.login #container {
+    max-width: 400px !important;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5) !important;
+    border-radius: 14px !important;
+    border: 1px solid var(--border) !important;
+    background: var(--surface) !important;
+    overflow: hidden;
+}
+body.login #header {
+    background: var(--void) !important;
+    border-bottom: 1px solid var(--border) !important;
+    padding: 18px !important;
+    display: flex !important;
+    justify-content: center !important;
+    height: auto !important;
+}
+body.login #content { padding: 28px !important; }
+body.login #content h1 {
+    color: var(--ink-3) !important;
+    font-size: 0.85rem !important;
+    font-weight: 500 !important;
+    text-align: center !important;
+}
+body.login input[type="text"], body.login input[type="password"] {
+    width: 100% !important;
+    padding: 10px 14px !important;
+    font-size: 0.9rem !important;
+}
+body.login .submit-row { background: transparent !important; border: 0 !important; padding: 0 !important; }
+body.login input[type="submit"] {
+    width: 100% !important;
+    background: var(--accent) !important;
+    color: var(--void) !important;
+    padding: 11px !important;
+    font-size: 0.85rem !important;
+}
+body.login #footer { display: none !important; }
+
+/* ================================================================
+   MISC
+   ================================================================ */
+.description, .quiet, .small, .meta { color: var(--ink-3) !important; }
+.empty-form, .empty-form td { color: var(--ink-4) !important; }
+.viewsitelink, .viewsitelink a { color: var(--accent) !important; }
+a:focus-visible, button:focus-visible {
+    outline: 2px solid rgba(34, 211, 238, 0.4) !important;
+    outline-offset: 1px !important;
+}
+#footer { background: transparent !important; color: var(--ink-4) !important; border: 0 !important; }
+
+/* Form layout */
+form .aligned p, form .aligned ul { color: var(--ink-2); }
+.form-row.field-url input { font-family: 'JetBrains Mono', monospace !important; font-size: 0.78rem !important; }
+
+/* Responsive */
+@media (max-width: 768px) {
+    #content { padding: 16px !important; }
+    #header { padding: 0 16px !important; }
+    #changelist-filter { width: 100% !important; }
+}
+
+@media print { body { background: #fff !important; color: #000 !important; } }
+@media (prefers-reduced-motion: reduce) { * { transition-duration: 0.01ms !important; } }
+
+/* ================================================================
+   FINAL NUCLEAR OVERRIDE — kill ALL remaining Django white patches
+   ================================================================ */
+*, *::before, *::after {
+    background-color: initial !important;
+}
+/* Restore ONLY the backgrounds we actually want */
+body { background-color: var(--void) !important; }
+.module { background-color: rgba(11, 15, 23, 0.7) !important; }
+#header { background-color: var(--void) !important; }
+#nav-sidebar { background-color: var(--void) !important; }
+#content { background-color: transparent !important; }
+#content-related { background-color: var(--surface) !important; }
+#changelist-filter { background-color: var(--surface) !important; }
+#changelist .actions { background-color: var(--surface) !important; }
+#result_list { background-color: transparent !important; }
+table { background-color: transparent !important; }
+table thead th { background-color: var(--raised) !important; }
+table tbody td, table tbody th { background-color: var(--surface) !important; }
+table tbody tr:hover td, table tbody tr:hover th { background-color: var(--raised) !important; }
+input, textarea, select { background-color: var(--void) !important; }
+.object-tools .addlink { background-color: var(--raised) !important; }
+.object-tools .addlink:hover { background-color: var(--overlay) !important; }
+#changelist-search input[type="submit"] { background-color: var(--raised) !important; }
+#changelist-search input[type="submit"]:hover { background-color: var(--overlay) !important; }
+#changelist .actions button { background-color: var(--raised) !important; }
+#changelist .actions button:hover { background-color: var(--overlay) !important; }
+.toggle-nav-sidebar { background-color: var(--raised) !important; }
+.toggle-nav-sidebar:hover { background-color: var(--overlay) !important; }
+.paginator { background-color: var(--surface) !important; }
+.paginator a { background-color: var(--raised) !important; }
+.paginator .this-page { background-color: rgba(34, 211, 238, 0.06) !important; }
+.submit-row { background-color: var(--raised) !important; }
+fieldset { background-color: var(--surface) !important; }
+fieldset h2 { background-color: var(--raised) !important; }
+.inline-group { background-color: var(--surface) !important; }
+.inline-group h2 { background-color: var(--raised) !important; }
+.selector .selector-available, .selector .selector-chosen { background-color: var(--surface) !important; }
+.selector h2 { background-color: var(--raised) !important; }
+.selector select { background-color: var(--void) !important; }
+.selector .selector-chooser a { background-color: var(--raised) !important; }
+.selector .selector-chooser a:hover { background-color: var(--overlay) !important; }
+.selector .selector-filtered input { background-color: var(--void) !important; }
+.changelist-filter-selected { background-color: rgba(34, 211, 238, 0.06) !important; }
+#nav-sidebar tr.current { background-color: rgba(34, 211, 238, 0.08) !important; }
+#nav-sidebar tr:hover { background-color: rgba(255, 255, 255, 0.03) !important; }
+.calendarbox, .clockbox { background-color: var(--overlay) !important; }
+.errornote { background-color: rgba(248, 113, 113, 0.1) !important; }
+ul.messagelist li { background-color: var(--surface) !important; }
+/* Kill Django's default selected-row highlight */
+.selected-row, tr.selected-row td { background-color: rgba(34, 211, 238, 0.06) !important; }
+/* Kill any remaining white/light backgrounds on hover */
+a:hover, button:hover, input[type="submit"]:hover { background-color: inherit !important; }
+/* Ensure no element gets a white background ever */
+[style*="background-color: white"], [style*="background: white"],
+[style*="background-color:#fff"], [style*="background:#fff"],
+[style*="background-color: #fff"], [style*="background: #fff"] {
+    background-color: var(--surface) !important;
+    background: var(--surface) !important;
+}
+
+/* ================================================================
+   STATUS BADGE SYSTEM
+   ================================================================ */
+.badge, .status-badge {
+    display: inline-flex !important;
+    align-items: center !important;
+    gap: 4px !important;
+    padding: 2px 8px !important;
+    font-size: 0.68rem !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.04em !important;
+    border-radius: 10px !important;
+    white-space: nowrap !important;
+    line-height: 1.4 !important;
+}
+.badge::before, .status-badge::before {
+    content: '' !important;
+    width: 6px !important;
+    height: 6px !important;
+    border-radius: 50% !important;
+    flex-shrink: 0 !important;
+}
+.badge--success, .status-badge--success {
+    color: var(--green) !important;
+    background: rgba(52, 211, 153, 0.1) !important;
+    border: 1px solid rgba(52, 211, 153, 0.2) !important;
+}
+.badge--success::before, .status-badge--success::before { background: var(--green) !important; }
+.badge--warning, .status-badge--warning {
+    color: var(--yellow) !important;
+    background: rgba(251, 191, 36, 0.1) !important;
+    border: 1px solid rgba(251, 191, 36, 0.2) !important;
+}
+.badge--warning::before, .status-badge--warning::before { background: var(--yellow) !important; }
+.badge--error, .status-badge--error {
+    color: var(--red) !important;
+    background: rgba(248, 113, 113, 0.1) !important;
+    border: 1px solid rgba(248, 113, 113, 0.2) !important;
+}
+.badge--error::before, .status-badge--error::before { background: var(--red) !important; }
+.badge--info, .status-badge--info {
+    color: var(--blue) !important;
+    background: rgba(96, 165, 250, 0.1) !important;
+    border: 1px solid rgba(96, 165, 250, 0.2) !important;
+}
+.badge--info::before, .status-badge--info::before { background: var(--blue) !important; }
+.badge--idle, .status-badge--idle {
+    color: var(--ink-3) !important;
+    background: rgba(148, 163, 184, 0.1) !important;
+    border: 1px solid rgba(148, 163, 184, 0.2) !important;
+}
+.badge--idle::before, .status-badge--idle::before { background: var(--ink-3) !important; }
+
+/* ================================================================
+   KILL DJANGO LEGACY PATTERNS
+   ================================================================ */
+/* Kill the action bar — bulk actions go to row-level menus */
+#changelist .actions { display: none !important; }
+/* Kill the "0 of N selected" counter */
+.action-counter { display: none !important; }
+/* Kill the show-counts link */
+#changelist-filter-extra-actions { display: none !important; }
+/* Kill the verbose "1 user" / "6 sites" footer — move to header via JS */
+.paginator + .module, .paginator { display: none !important; }
+/* Actually just hide the bottom paginator's count text but keep pagination */
+.paginator .paginator-info, .paginator .total { display: none !important; }
+
+/* Demote cyan — links should be muted, not bright */
+.module a, table a, .breadcrumbs a, td a:not(.addlink):not(.changelink) {
+    color: var(--ink-2) !important;
+}
+.module a:hover, table a:hover, td a:hover {
+    color: var(--accent) !important;
+}
+/* Cyan only for: primary actions, active nav, current model */
+.object-tools .addlink,
+.submit-row input.default,
+a.addlink,
+.search-row .addlink { color: var(--void) !important; }
+#nav-sidebar tr.current a { color: var(--accent) !important; }
+
+/* Form fieldsets look like panels */
+fieldset.module {
+    border-radius: 8px !important;
+    margin-bottom: 16px !important;
+    overflow: hidden !important;
+}
+fieldset.module > h2, fieldset.collapse > h2 {
+    padding: 10px 16px !important;
+    font-size: 0.75rem !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.04em !important;
+    color: var(--ink-2) !important;
+}
+
+/* Hide the raw password hash dump on user edit */
+fieldset.module fieldset h2,
+.module .form-row.field-password .readonly {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.72rem !important;
+    color: var(--ink-3) !important;
+    word-break: break-all !important;
+}
+
+/* Hide "Save and add another" and "Save and continue editing" — keep only Save */
+.submit-row input[name="_addanother"],
+.submit-row input[name="_continue"] { display: none !important; }
+/* Make the remaining Save button prominent */
+.submit-row {
+    display: flex !important;
+    align-items: center !important;
+    gap: 12px !important;
+    padding: 12px 16px !important;
+}
+.submit-row .deletelink { margin-left: auto !important; }
+
+/* ================================================================
+   CHANGELIST — clean stack
+   ================================================================ */
+#content-main {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 0 !important;
+}
+
+/* ================================================================
+   SEARCH ROW — ADD button + search bar unified
+   ================================================================ */
+.search-row {
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px !important;
+    padding: 12px 14px !important;
+    margin-bottom: 12px !important;
+    background: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 10px !important;
+    position: relative;
+}
+.search-row .addlink,
+.object-tools .addlink {
+    background: var(--accent) !important;
+    color: var(--void) !important;
+    border: 1px solid var(--accent) !important;
+    border-radius: 6px !important;
+    padding: 7px 16px !important;
+    font-size: 0.78rem !important;
+    font-weight: 600 !important;
+    text-decoration: none !important;
+    white-space: nowrap !important;
+    transition: all 120ms var(--ease) !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    gap: 6px !important;
+    line-height: 1 !important;
+    height: 34px !important;
+}
+.search-row .addlink::before,
+.object-tools .addlink::before {
+    content: '+' !important;
+    font-size: 1rem !important;
+    font-weight: 500 !important;
+    line-height: 1 !important;
+    margin-right: 2px !important;
+}
+.search-row .addlink:hover,
+.object-tools .addlink:hover {
+    background: var(--accent-hover) !important;
+    border-color: var(--accent-hover) !important;
+    box-shadow: 0 0 16px rgba(34, 211, 238, 0.25) !important;
+}
+.search-row #changelist-search {
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px !important;
+    flex: 1 !important;
+    margin-left: auto !important;
+}
+.search-row #searchbar {
+    background: var(--void) !important;
+    color: var(--ink) !important;
+    border: 1px solid var(--border-input) !important;
+    border-radius: 6px !important;
+    padding: 0 12px 0 32px !important;
+    font-size: 0.82rem !important;
+    height: 34px !important;
+    flex: 1 !important;
+    max-width: 400px !important;
+    box-sizing: border-box;
+    transition: border-color 120ms var(--ease), box-shadow 150ms var(--ease) !important;
+}
+.search-row #searchbar::placeholder {
+    color: var(--ink-4) !important;
+    opacity: 0.8 !important;
+}
+.search-row #searchbar:focus {
+    border-color: var(--accent) !important;
+    box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.08) !important;
+    outline: none !important;
+}
+.search-row #changelist-search input[type="submit"],
+#changelist-search input[type="submit"] {
+    background: var(--raised) !important;
+    color: var(--ink) !important;
+    border: 1px solid var(--border-input) !important;
+    border-radius: 6px !important;
+    padding: 0 16px !important;
+    height: 34px !important;
+    font-size: 0.78rem !important;
+    font-weight: 600 !important;
+    box-sizing: border-box;
+    cursor: pointer !important;
+    transition: all 120ms var(--ease) !important;
+}
+.search-row #changelist-search input[type="submit"]:hover,
+#changelist-search input[type="submit"]:hover {
+    background: var(--overlay) !important;
+    border-color: var(--border-strong) !important;
+    color: var(--accent) !important;
+}
+#changelist-search label { display: none !important; }
+
+/* ================================================================
+   CHANGELIST ACTIONS BAR
+   ================================================================ */
+#changelist .actions {
+    background: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 10px !important;
+    padding: 8px 12px !important;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+}
+#changelist .actions label {
+    color: var(--ink-3) !important;
+    font-size: 0.75rem !important;
+    font-weight: 500 !important;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+#changelist .actions select {
+    font-size: 0.78rem !important;
+    padding: 5px 26px 5px 10px !important;
+    height: 32px !important;
+    box-sizing: border-box;
+}
+#changelist .actions button, #changelist .actions input[type="submit"] {
+    background: var(--raised) !important;
+    color: var(--ink) !important;
+    border: 1px solid var(--border-input) !important;
+    border-radius: 6px !important;
+    padding: 5px 14px !important;
+    font-size: 0.75rem !important;
+    height: 32px !important;
+    box-sizing: border-box;
+}
+#changelist .actions button:hover { background: var(--overlay) !important; border-color: var(--border-strong) !important; }
+#changelist .actions .action-counter,
+#changelist .actions .all,
+#changelist .actions .clear { color: var(--ink-4) !important; font-size: 0.72rem !important; }
+.form-row > div { width: 100% !important; }
+.form-row label {
+    font-size: 0.72rem !important;
+    font-weight: 600 !important;
+    color: var(--ink-2) !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.04em !important;
+    width: auto !important;
+    float: none !important;
+    text-align: left !important;
+    padding: 0 !important;
+}
+.form-row .help, .form-row .helptext, .form-row p.help {
+    font-size: 0.68rem !important;
+    color: var(--ink-4) !important;
+    margin: 0 !important;
+}
+
+/* Hide the floating + icon in user permissions */
+.add-another, .related-widget-wrapper-link {
+    opacity: 0.5 !important;
+    color: var(--accent) !important;
+}
+
+/* Table cell width & wrapping */
+#result_list { table-layout: auto !important; width: 100% !important; }
+#result_list td { max-width: 220px; word-wrap: break-word; }
+#result_list td.field-name, #result_list td.field-site_name {
+    font-weight: 600 !important;
+    color: var(--ink) !important;
+    white-space: nowrap !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 150px !important;
+}
+#result_list td.field-slug {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.7rem !important;
+    color: var(--ink-3) !important;
+    white-space: nowrap !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 130px !important;
+}
+#result_list td.field-url {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.7rem !important;
+    color: var(--ink-2) !important;
+    white-space: nowrap !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 220px !important;
+}
+#result_list td.field-id, #result_list td.field-action_count {
+    font-family: 'JetBrains Mono', monospace !important;
+    color: var(--ink-3) !important;
+    font-size: 0.75rem !important;
+    text-align: center !important;
+    width: 50px !important;
+}
+#result_list td.field-product_count, #result_list td.field-fields_extracted,
+#result_list td.field-last_scraped_at, #result_list td.field-created_at {
+    font-family: 'JetBrains Mono', monospace !important;
+    color: var(--ink-2) !important;
+    text-align: right !important;
+    font-weight: 500 !important;
+    width: 110px !important;
+    white-space: nowrap !important;
+    font-size: 0.72rem !important;
+}
+#result_list td.field-site_type, #result_list td.field-platform {
+    color: var(--ink-2) !important;
+    font-size: 0.7rem !important;
+    max-width: 90px !important;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap !important;
+}
+#result_list td.field-has_scraper {
+    text-align: center !important;
+    width: 80px !important;
+}
+
+/* Compact status column — make status text into badges */
+table#result_list td.field-status,
+table#result_list td.field-state,
+table#result_list td.field-status_display,
+.module table td.field-status,
+.module table td.field-state {
+    font-size: 0 !important;
+}
+table#result_list td.field-status *,
+table#result_list td.field-state *,
+.module table td.field-status *,
+.module table td.field-state * {
+    font-size: 0.68rem !important;
+}
+
+/* Make the "1 user" / "6 sites" count into a header badge via JS-added element */
+.count-badge {
+    display: inline-flex !important;
+    align-items: center !important;
+    padding: 2px 10px !important;
+    margin-left: 4px !important;
+    font-size: 0.72rem !important;
+    font-weight: 700 !important;
+    color: var(--accent) !important;
+    background: rgba(34, 211, 238, 0.08) !important;
+    border: 1px solid rgba(34, 211, 238, 0.25) !important;
+    border-radius: 12px !important;
+}
+}
+
+/* Empty state for changelist tables */
+.change-list #changelist table#result_list tbody:empty::after {
+    content: "No results to display";
+    display: block;
+    color: var(--ink-3);
+    text-align: center;
+    padding: 60px 16px;
+    font-size: 0.9rem;
+    font-style: italic;
+}
+.change-list #changelist .empty-result {
+    color: var(--ink-3) !important;
+    text-align: center !important;
+    padding: 48px 16px !important;
+    font-size: 0.85rem !important;
+}
+/* When a single td spans all columns, style as empty state */
+#result_list tbody td[colspan] {
+    text-align: center !important;
+    padding: 60px 16px !important;
+    color: var(--ink-3) !important;
+    font-size: 0.9rem !important;
+    font-style: italic;
+}
+
+/* ================================================================
+   FORM PAGE IMPROVEMENTS
+   ================================================================ */
+.change-form #content { padding-top: 20px !important; }
+
+/* Form field categories — visual hint via left border */
+.aligned .form-row.field-url,
+.aligned .form-row.field-product_url,
+.aligned .form-row.field-input_urls {
+    border-left: 2px solid var(--accent) !important;
+}
+.aligned .form-row.field-status,
+.aligned .form-row.field-page_type,
+.aligned .form-row.field-site_type {
+    border-left: 2px solid var(--yellow) !important;
+}
+.aligned .form-row.field-error,
+.aligned .form-row.field-error_message {
+    border-left: 2px solid var(--red) !important;
+}
+
+/* Required indicator */
+.aligned label.required,
+.form-row label.required {
+    color: var(--ink) !important;
+}
+.aligned label.required::after,
+.form-row label.required::after {
+    content: " *";
+    color: var(--accent) !important;
+    font-weight: 700 !important;
+}
+
+/* Error state on form fields */
+.aligned .form-row.errors input,
+.aligned .form-row.errors select,
+.aligned .form-row.errors textarea,
+.aligned .form-row.error input,
+.aligned .form-row.error select {
+    border-color: var(--red) !important;
+    box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.1) !important;
+}
+.aligned .form-row.errors > label,
+.aligned .form-row.error > label {
+    color: var(--red) !important;
+}
+.aligned .form-row.errors {
+    background: rgba(248, 113, 113, 0.04) !important;
+}
+
+/* Tabular inline rows */
+.tabular td,
+.tabular th {
+    border-color: var(--border) !important;
+    padding: 8px 12px !important;
+}
+.tabular thead th {
+    background: var(--raised) !important;
+    color: var(--ink-3) !important;
+    font-size: 0.68rem !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.05em !important;
+    font-weight: 600 !important;
+}
+
+/* Read-only field — make it look more like a "value display" */
+.aligned .form-row .readonly {
+    padding: 10px 14px !important;
+    background: rgba(34, 211, 238, 0.05) !important;
+    border: 1px solid rgba(34, 211, 238, 0.15) !important;
+    color: var(--ink) !important;
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.75rem !important;
+    border-radius: 6px !important;
+    word-break: break-all !important;
+    white-space: pre-wrap !important;
+    line-height: 1.5 !important;
+}
+
+/* Stacked form rows on change_form: better spacing */
+.aligned .form-row {
+    padding: 14px 18px !important;
+}
+.aligned .form-row > div { margin-top: 2px !important; }
+
+/* Improve checkbox/radio rows — compact pill style */
+.aligned .form-row.field-is_active,
+.aligned .form-row.field-is_staff,
+.aligned .form-row.field-is_superuser {
+    flex-direction: row !important;
+    align-items: center !important;
+    gap: 10px !important;
+    background: rgba(34, 211, 238, 0.04) !important;
+    border-radius: 6px !important;
+    margin: 4px 12px !important;
+    padding: 10px 12px !important;
+    border-bottom: 0 !important;
+}
+.aligned .form-row.field-is_active > label,
+.aligned .form-row.field-is_staff > label,
+.aligned .form-row.field-is_superuser > label {
+    color: var(--ink) !important;
+    font-weight: 500 !important;
+    text-transform: none !important;
+    letter-spacing: 0 !important;
+    font-size: 0.78rem !important;
+    margin: 0 !important;
+    padding: 0 !important;
+}
+.aligned .form-row.field-is_active > div,
+.aligned .form-row.field-is_staff > div,
+.aligned .form-row.field-is_superuser > div {
+    margin: 0 !important;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.aligned .form-row.field-is_active .help,
+.aligned .form-row.field-is_staff .help,
+.aligned .form-row.field-is_superuser .help {
+    margin-top: 0 !important;
+    margin-left: auto !important;
+    flex: 1;
+}
+
+/* Make inline groups look like cards */
+.inline-group {
+    border-radius: 8px !important;
+    margin-bottom: 16px !important;
+    overflow: hidden !important;
+}
+.inline-group h2 {
+    padding: 10px 16px !important;
+    font-size: 0.75rem !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.04em !important;
+}
+
+/* Make the "Change" button look like the Add button (cyan outline) */
+.module .row1 .changelink,
+.module .row2 .changelink,
+.module td .changelink,
+.module th .changelink {
+    color: var(--ink-2) !important;
+    background: transparent !important;
+    border: 1px solid var(--border-input) !important;
+    font-weight: 500 !important;
+}
+.module .row1 .changelink:hover,
+.module .row2 .changelink:hover,
+.module td .changelink:hover,
+.module th .changelink:hover {
+    color: var(--ink) !important;
+    border-color: var(--border-strong) !important;
+}
+
+/* Make all column headers in changelist results table muted */
+#result_list thead th {
+    color: var(--ink-3) !important;
+    font-size: 0.68rem !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.06em !important;
+    padding: 10px 16px !important;
+    background: var(--raised) !important;
+    border-bottom: 1px solid var(--border) !important;
+}
+    border-bottom: 1px solid var(--border) !important;
+}
+#result_list thead th a { color: var(--ink-3) !important; }
+#result_list thead th a:hover { color: var(--ink) !important; }
+
+/* Make table body cells clean */
+#result_list tbody td {
+    padding: 12px 16px !important;
+    font-size: 0.78rem !important;
+    color: var(--ink-2) !important;
+    border-bottom: 1px solid var(--border) !important;
+    border-top: 0 !important;
+    vertical-align: middle !important;
+    background: transparent !important;
+    transition: background-color 80ms var(--ease) !important;
+}
+#result_list tbody tr:last-child td { border-bottom: 0 !important; }
+#result_list tbody tr { transition: background-color 80ms var(--ease) !important; }
+#result_list tbody tr:hover td,
+#result_list tbody tr:hover { background: rgba(34, 211, 238, 0.04) !important; }
+#result_list tbody tr:hover td a { color: var(--accent) !important; }
+#result_list tbody tr:hover td:first-child { border-left: 2px solid var(--accent) !important; padding-left: 14px !important; }
+
+/* Checkbox styling in table */
+#result_list .action-select {
+    width: 15px !important;
+    height: 15px !important;
+    cursor: pointer !important;
+}
+
+/* Make URLs in cells look like URLs (monospace, muted) */
+#result_list td.field-url, #result_list td a {
+    font-family: 'JetBrains Mono', monospace !important;
+    font-size: 0.72rem !important;
+    color: var(--ink-2) !important;
+}
+
+/* Keep row striping uniform */
+#result_list tbody tr:nth-child(even) td,
+#result_list tbody tr.row1 td,
+#result_list tbody tr.row2 td {
+    background: var(--surface) !important;
+}
+
+/* Module headers in dashboard — subtle */
+.module h2, .module caption {
+    font-size: 0.7rem !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.06em !important;
+    color: var(--ink-3) !important;
+    padding: 10px 16px !important;
+    background: transparent !important;
+    border-bottom: 1px solid var(--border) !important;
+}
+
+/* Make the dashboard app modules look like unified cards */
+.app-auth.module, .app-scraper.module, .app-django_celery_beat.module {
+    background: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 8px !important;
+    margin-bottom: 16px !important;
+    overflow: hidden !important;
+}
+.dashboard .module table th, .dashboard .module table td {
+    padding: 8px 16px !important;
+    font-size: 0.8rem !important;
+}
+
+/* Remove the "Recent Actions" sidebar — it's admin meta, not user data */
+#content-related { display: none !important; }
+.dashboard #content { grid-template-columns: 1fr !important; max-width: 100% !important; }
+
+/* Login page: full-screen centered card */
+body.login { display: flex !important; align-items: center !important; justify-content: center !important; min-height: 100vh !important; }
+body.login #container { width: 100% !important; max-width: 380px !important; }
+</style>
+{% endblock %}
+
+{# === Force dark theme + remove any theme artifacts === #}
+{% block extrahead %}
+<script>
+// Set dark mode before anything renders.
+(function() {
+    var html = document.documentElement;
+    html.setAttribute('data-theme', 'dark');
+    html.style.colorScheme = 'dark';
+    try { localStorage.setItem('theme', 'dark'); } catch(e) {}
+
+    document.addEventListener('DOMContentLoaded', function() {
+        document.documentElement.setAttribute('data-theme', 'dark');
+        document.documentElement.style.colorScheme = 'dark';
+        var toggle = document.querySelector('.theme-toggle');
+        if (toggle) toggle.remove();
+
+        // Improve breadcrumbs — inject chevron separators
+        var breadcrumbs = document.querySelector('div.breadcrumbs');
+        if (breadcrumbs) {
+            var links = breadcrumbs.querySelectorAll('a');
+            links.forEach(function(link, i) {
+                if (i > 0) {
+                    // Separator is handled by CSS ::before
+                }
+            });
+        }
+
+        // Relocate filters from hidden sidebar into inline bar
+        var filter = document.getElementById('changelist-filter');
+        var container = document.querySelector('.changelist-form-container');
+        if (filter && container) {
+            var bar = document.createElement('div');
+            bar.className = 'inline-filter-bar';
+            var details = filter.querySelectorAll('details');
+            details.forEach(function(d) {
+                var group = document.createElement('div');
+                group.className = 'filter-group';
+                var summary = d.querySelector('summary');
+                if (summary) {
+                    var label = document.createElement('span');
+                    label.className = 'filter-label';
+                    label.textContent = summary.textContent.trim();
+                    group.appendChild(label);
+                }
+                var items = d.querySelectorAll('li');
+                items.forEach(function(li) {
+                    var a = li.querySelector('a');
+                    if (a) {
+                        var pill = document.createElement('a');
+                        pill.className = 'filter-pill' + (li.classList.contains('selected') ? ' active' : '');
+                        pill.href = a.href;
+                        pill.textContent = a.textContent.trim();
+                        // Add count from sibling span if available
+                        var countSpan = a.querySelector('.count');
+                        if (countSpan) {
+                            var count = document.createElement('span');
+                            count.className = 'filter-count';
+                            count.textContent = countSpan.textContent;
+                            pill.appendChild(count);
+                        }
+                        group.appendChild(pill);
+                    }
+                });
+                bar.appendChild(group);
+            });
+            // Add "Clear all" link if any filter is active (other than "All")
+            var allPills = bar.querySelectorAll('.filter-pill');
+            var hasActiveFilter = false;
+            for (var i = 0; i < allPills.length; i++) {
+                var p = allPills[i];
+                if (p.classList.contains('active')) {
+                    // Skip the first "All" pill in each group
+                    var prev = p.previousElementSibling;
+                    if (prev && prev.classList.contains('filter-label')) {
+                        // This is the first pill in a group, skip if text is "All"
+                        if (p.textContent.trim().toLowerCase().startsWith('all') ||
+                            p.textContent.trim().toLowerCase() === 'any date') {
+                            continue;
+                        }
+                    }
+                    hasActiveFilter = true;
+                    break;
+                }
+            }
+            if (hasActiveFilter) {
+                var clearLink = document.createElement('a');
+                clearLink.href = window.location.pathname;
+                clearLink.className = 'filter-clear-all';
+                clearLink.textContent = '✕ Clear all filters';
+                bar.appendChild(clearLink);
+            }
+            container.insertBefore(bar, container.firstChild);
+        }
+
+        // Put ADD USER + Search on same row (or ADD button alone if no search)
+        var objTools = document.querySelector('.object-tools');
+        var searchForm = document.getElementById('changelist-search');
+        if (objTools && container) {
+            var row = document.createElement('div');
+            row.className = 'search-row';
+            row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:0 0 8px 0;';
+            // Move ADD USER button into row
+            var addBtn = objTools.querySelector('.addlink');
+            if (addBtn) row.appendChild(addBtn);
+            // Move search bar into row if it exists
+            if (searchForm) {
+                row.appendChild(searchForm);
+            }
+            container.insertBefore(row, container.firstChild);
+            // Remove original object-tools completely to avoid empty space
+            objTools.remove();
+        }
+
+        // Add placeholder to search input
+        var searchInput = document.getElementById('searchbar');
+        if (searchInput && !searchInput.placeholder) {
+            searchInput.placeholder = 'Search by username, email, name...';
+        }
+
+        // Add a search icon inside the search input
+        if (searchInput) {
+            var searchWrap = searchInput.parentElement;
+            if (searchWrap && !searchWrap.querySelector('.search-icon')) {
+                var icon = document.createElement('span');
+                icon.className = 'search-icon';
+                icon.textContent = '⌕';
+                icon.style.cssText = 'position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--ink-4);font-size:0.9rem;pointer-events:none;';
+                searchWrap.style.position = 'relative';
+                searchWrap.style.display = 'flex';
+                searchWrap.style.alignItems = 'center';
+                searchInput.style.paddingLeft = '28px';
+                searchWrap.appendChild(icon);
+            }
+        }
+
+        // Convert status text to badges
+        var statusMap = {
+            'completed': 'success', 'complete': 'success', 'active': 'success',
+            'true': 'success', 'yes': 'success', 'running': 'info',
+            'pending': 'idle', 'waiting for approval': 'warning',
+            'failed': 'error', 'cancelled': 'idle', 'canceled': 'idle',
+            'captcha blocked': 'error', 'false': 'idle', 'no': 'idle',
+            'in progress': 'info', 'paused': 'warning'
+        };
+        document.querySelectorAll('#result_list td, .module table td').forEach(function(td) {
+            var text = td.textContent.trim().toLowerCase();
+            if (statusMap[text] && td.children.length === 0) {
+                var badge = document.createElement('span');
+                badge.className = 'badge badge--' + statusMap[text];
+                badge.textContent = td.textContent.trim();
+                td.textContent = '';
+                td.appendChild(badge);
+            }
+        });
+
+        // Add count badge to page header
+        var h1 = document.querySelector('#content h1');
+        var resultCount = document.querySelectorAll('#result_list tbody tr').length;
+        if (h1 && resultCount > 0) {
+            var badge = document.createElement('span');
+            badge.className = 'count-badge';
+            badge.textContent = resultCount;
+            h1.appendChild(badge);
+        }
+
+        // Compact verbose dates to relative format
+        function compactDate(text) {
+            // Normalize "a.m." / "p.m." to "AM" / "PM" for Date parsing
+            var normalized = text.replace(/\./g, '').replace(/(\d)\s*(am|pm)/i, '$1 $2');
+            var d = new Date(normalized);
+            if (isNaN(d.getTime())) {
+                // Try parsing just the date part
+                var dateOnly = text.match(/([A-Z][a-z]+)\s+(\d+),\s+(\d+)/);
+                if (dateOnly) {
+                    d = new Date(normalized);
+                }
+                if (isNaN(d.getTime())) return null;
+            }
+            var now = new Date();
+            var diffMs = now - d;
+            var diffH = diffMs / 3600000;
+            var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+            var time = d.toLocaleTimeString('en-US', {hour: 'numeric', minute: '2-digit'});
+            if (diffH < 0) return months[d.getMonth()] + ' ' + d.getDate() + ', ' + time;
+            if (diffH < 24) return time;
+            if (diffH < 24*7) return months[d.getMonth()] + ' ' + d.getDate() + ', ' + time;
+            return months[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear();
+        }
+        document.querySelectorAll('#result_list td').forEach(function(td) {
+            if (td.children.length > 0) return;
+            var text = td.textContent.trim();
+            // Match dates like "June 15, 2026, 11:25 p.m." or "June 12, 2026, 2:19 a.m."
+            if (text.match(/[A-Z][a-z]+\s+\d+,\s+\d{4}/)) {
+                var compact = compactDate(text);
+                if (compact && compact !== text) td.textContent = compact;
+            }
+        });
+
+        // Hide password hash dump on user edit — replace with simple badge
+        var pwField = document.getElementById('id_password');
+        if (pwField) {
+            pwField.innerHTML = '<span class="badge badge--success">Password set</span>';
+        }
+        // Also compact Last login / Date joined verbose dates
+        document.querySelectorAll('.form-row.field-last_login .readonly, .form-row.field-date_joined .readonly').forEach(function(el) {
+            var txt = el.textContent.trim();
+            var compact = compactDate(txt);
+            if (compact) el.textContent = compact;
+        });
+    });
+})();
+</script>
+{% endblock %}

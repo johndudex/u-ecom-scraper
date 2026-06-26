@@ -25,6 +25,8 @@ CORE_FIELDS = {
     "src_url",
 }
 
+DEFAULT_CORE_FIELDS = CORE_FIELDS
+
 
 def _get_project_root() -> str:
     try:
@@ -40,11 +42,15 @@ def _get_project_root() -> str:
 def _load_product_analysis(slug: str) -> dict | None:
     root = _get_project_root()
     path = os.path.join(root, "workspace", slug, "product_analysis.json")
+    if not os.path.isfile(path):
+        path = os.path.join(root, "workspace", slug, "content_analysis.json")
+    if not os.path.isfile(path):
+        return None
     try:
         with open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError) as exc:
-        logger.warning("validate_coverage: cannot load product_analysis: %s", exc)
+        logger.warning("validate_coverage: cannot load analysis: %s", exc)
         return None
 
 
@@ -71,7 +77,7 @@ def _extract_covered_fields(analysis: dict) -> set[str]:
 
 
 def validate_coverage(state: ScrapeState) -> Command:
-    """Read ``product_analysis.json`` and check field coverage.
+    """Read analysis and check field coverage.
 
     * Coverage >= 80% of core fields → continue to ``code_writer``.
     * Coverage < 80% → interrupt for human decision (HIP #5).
@@ -83,11 +89,16 @@ def validate_coverage(state: ScrapeState) -> Command:
         logger.info("validate_coverage: skipping (code generation already done)")
         return Command(goto="code_tester")
 
+    content_type_config = state.get("content_type_config", {})
+    core = DEFAULT_CORE_FIELDS
+    if content_type_config and "core_field_names" in content_type_config:
+        core = set(content_type_config["core_field_names"])
+
     analysis = _load_product_analysis(slug)
     if analysis is None:
         product_retries = state.get("product_analysis_retries", 0) + 1
         logger.error(
-            "validate_coverage: no product_analysis.json found (attempt %d), interrupting",
+            "validate_coverage: no analysis found (attempt %d), interrupting",
             product_retries,
         )
         if product_retries >= MAX_VALIDATE_RETRIES:
@@ -99,12 +110,12 @@ def validate_coverage(state: ScrapeState) -> Command:
                 update={"product_analysis_retries": product_retries},
                 goto="scraper_analyzer",
             )
-        options = ["Retry product analysis", "Continue without analysis", "Cancel"]
+        options = ["Retry content analysis", "Continue without analysis", "Cancel"]
         return Command(
             update={
-                "error_message": "product_analysis.json not found in workspace",
+                "error_message": "analysis not found in workspace",
                 "interrupt_reason": "low_coverage",
-                "interrupt_message": "product_analysis.json not found in workspace. The product analyzer may not have completed successfully.",
+                "interrupt_message": "analysis not found in workspace. The content analyzer may not have completed successfully.",
                 "interrupt_options": options,
                 "interrupt_decisions": options_to_decisions(options),
                 "product_analysis_retries": product_retries,
@@ -112,22 +123,22 @@ def validate_coverage(state: ScrapeState) -> Command:
             goto="human_approval",
         )
 
-    state_update: dict[str, Any] = {"product_analysis": analysis}
+    state_update: dict[str, Any] = {"product_analysis": analysis, "content_analysis": analysis}
 
     extracted_fields = _extract_covered_fields(analysis)
 
-    covered = extracted_fields & CORE_FIELDS
-    coverage_ratio = len(covered) / len(CORE_FIELDS) if CORE_FIELDS else 1.0
+    covered = extracted_fields & core
+    coverage_ratio = len(covered) / len(core) if core else 1.0
 
     logger.info(
         "validate_coverage: covered %d/%d core fields (%.0f%%) [all extracted: %s]",
         len(covered),
-        len(CORE_FIELDS),
+        len(core),
         coverage_ratio * 100,
         ", ".join(sorted(extracted_fields)) if extracted_fields else "(none)",
     )
 
-    missing = CORE_FIELDS - covered
+    missing = core - covered
     state_update["fields_extracted"] = list(extracted_fields)
 
     if coverage_ratio < MIN_COVERAGE:
@@ -136,7 +147,7 @@ def validate_coverage(state: ScrapeState) -> Command:
         covered_str = ", ".join(sorted(covered)) if covered else "(none)"
         options = [
             "Continue anyway",
-            "Retry product analysis",
+            "Retry content analysis",
             "Cancel",
         ]
         return Command(
@@ -144,7 +155,7 @@ def validate_coverage(state: ScrapeState) -> Command:
                 **state_update,
                 "interrupt_reason": "low_coverage",
                 "interrupt_message": (
-                    f"Field coverage is low: {len(covered)}/{len(CORE_FIELDS)} core fields covered "
+                    f"Field coverage is low: {len(covered)}/{len(core)} core fields covered "
                     f"({coverage_ratio:.0%}). "
                     f"Covered: {covered_str}. "
                     f"Missing: {missing_str}."

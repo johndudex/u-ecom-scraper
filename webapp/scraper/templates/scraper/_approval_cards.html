@@ -1,36 +1,36 @@
 {% for approval in pending_approvals %}
-<div class="rounded-xl bg-brand-800/40 border border-brand-700/30 mb-2.5 overflow-hidden" data-approval-id="{{ approval.id }}">
+<div class="panel mb-2.5 overflow-hidden" data-approval-id="{{ approval.id }}">
     <div class="p-4">
         <div class="flex items-center gap-2 mb-2">
-            <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider status-{{ approval.status }}">{{ approval.get_approval_type_display }}</span>
+            <span class="status-badge status-{{ approval.status }}">{{ approval.get_approval_type_display }}</span>
         </div>
-        <p class="text-sm text-brand-200 mb-2.5 leading-relaxed">{{ approval.question }}</p>
-        <a href="{% url 'agent_summary' job_id %}" target="_blank" class="inline-flex items-center gap-1 text-xs text-brand-400 hover:text-brand-200 border border-brand-600/50 px-2.5 py-1.5 rounded-lg hover:border-brand-500 transition-colors cursor-pointer mb-2.5">
+        <p class="text-sm text-ink mb-2.5 leading-relaxed">{{ approval.question }}</p>
+        <a href="{% url 'agent_summary' job_id %}" target="_blank" class="inline-flex items-center gap-1 text-xs text-ink-secondary hover:text-ink border border-line-strong px-2.5 py-1.5 rounded-md hover:bg-raised transition-colors mb-2.5">
             <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M3.75 3.75v4.5m0-4.5h4.5m-4.5 0L9 9M3.75 20.25v-4.5m0 4.5h4.5m-4.5 0L9 15M20.25 3.75h-4.5m4.5 0v4.5m0-4.5L15 9m5.25 11.25h-4.5m4.5 0v-4.5m0 4.5L15 15" clip-rule="evenodd"/></svg>
             View Details
         </a>
         {% if approval.response_data.sample_output %}
-        <pre class="rounded-lg bg-brand-900 p-3 text-xs text-brand-400 max-h-60 overflow-y-auto scrollbar-thin font-mono leading-relaxed mb-2.5"><code>{{ approval.response_data.sample_output }}</code></pre>
+        <pre class="bg-void border border-line-subtle rounded-md p-3 text-xs text-ink-secondary max-h-60 overflow-y-auto scrollbar-thin font-mono leading-relaxed mb-2.5"><code>{{ approval.response_data.sample_output }}</code></pre>
         {% endif %}
         {% with decisions=approval.response_data.decisions %}
         <form method="post" action="{% url 'approval_inline' approval_id=approval.id job_id=job_id %}" class="flex items-end gap-2 flex-wrap">
             {% csrf_token %}
             <textarea name="feedback" rows="1"
                       placeholder="Optional feedback..."
-                      class="w-full bg-brand-700/30 border border-brand-600/50 rounded-lg px-3 py-2 text-xs text-brand-50 placeholder-brand-500 focus:outline-none focus:border-cta/50 resize-none mb-1.5"></textarea>
+                      class="w-full input-field text-xs resize-none mb-1.5"></textarea>
             {% for dec in decisions %}
                 <button type="submit" name="choice" value="{{ dec.label }}"
-                        class="px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors cursor-pointer
-                        {% if dec.type == 'reject' %}bg-red-500/15 text-red-400 hover:bg-red-500/25
-                        {% elif dec.type == 'respond' %}bg-blue-500/15 text-blue-400 hover:bg-blue-500/25
-                        {% else %}bg-cta text-white hover:bg-cta-hover{% endif %}">{{ dec.label }}</button>
+                        class="px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer
+                        {% if dec.type == 'reject' %}bg-danger/15 text-danger hover:bg-danger/25
+                        {% elif dec.type == 'respond' %}bg-info/15 text-info hover:bg-info/25
+                        {% else %}bg-accent text-void hover:bg-accent-hover{% endif %}">{{ dec.label }}</button>
             {% empty %}
                 {% for opt in approval.response_data.options %}
                 <button type="submit" name="choice" value="{{ opt }}"
-                        class="px-3 py-1.5 text-xs font-semibold rounded-lg transition-colors cursor-pointer
-                        {% if opt in 'Proceed,Approve,Yes,Continue,Continue anyway' %}bg-cta text-white hover:bg-cta-hover
-                        {% elif opt in 'Cancel,Abort,Reject,No' %}bg-red-500/15 text-red-400 hover:bg-red-500/25
-                        {% else %}bg-blue-500/15 text-blue-400 hover:bg-blue-500/25{% endif %}">{{ opt }}</button>
+                        class="px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer
+                        {% if opt in 'Proceed,Approve,Yes,Continue,Continue anyway' %}bg-accent text-void hover:bg-accent-hover
+                        {% elif opt in 'Cancel,Abort,Reject,No' %}bg-danger/15 text-danger hover:bg-danger/25
+                        {% else %}bg-info/15 text-info hover:bg-info/25{% endif %}">{{ opt }}</button>
                 {% endfor %}
             {% endfor %}
         </form>

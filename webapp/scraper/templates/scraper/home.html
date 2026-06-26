@@ -1,120 +1,409 @@
 {% extends "scraper/base.html" %}
 
-{% block page_title %}New Scrape — Ecommerce Scraper{% endblock %}
+{% block page_title %}New Scrape — Scraper Console{% endblock %}
+
+{% block extra_head %}
+<style>
+.custom-select { position: relative; }
+
+.cs-trigger {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    text-align: left;
+    width: 100%;
+    cursor: pointer;
+    user-select: none;
+}
+.cs-value-text {
+    font-size: 0.875rem;
+    color: #F1F5F9;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.cs-arrow {
+    flex-shrink: 0;
+    margin-left: 0.75rem;
+    color: #64748B;
+    transition: transform 200ms var(--ease-out-expo), color 150ms var(--ease-out-quart);
+}
+.custom-select.open .cs-trigger .cs-arrow {
+    transform: rotate(180deg);
+    color: #22D3EE;
+}
+
+.cs-panel {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    right: 0;
+    background: #1A2332;
+    border: 1px solid #2D3B50;
+    border-radius: 10px;
+    max-height: 340px;
+    overflow-y: auto;
+    z-index: 50;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(-6px) scale(0.99);
+    transform-origin: top center;
+    transition: transform 180ms var(--ease-out-expo),
+                opacity 140ms var(--ease-out-quart),
+                visibility 0s linear 180ms;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.5), 0 0 1px rgba(34,211,238,0.12);
+}
+.custom-select.open .cs-panel {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0) scale(1);
+    transition: transform 180ms var(--ease-out-expo),
+                opacity 140ms var(--ease-out-quart),
+                visibility 0s;
+}
+
+.cs-panel::-webkit-scrollbar { width: 6px; }
+.cs-panel::-webkit-scrollbar-track { background: transparent; }
+.cs-panel::-webkit-scrollbar-thumb { background: #2D3B50; border-radius: 3px; }
+.cs-panel::-webkit-scrollbar-thumb:hover { background: #3D4D63; }
+
+.cs-group { padding: 4px 0; }
+.cs-group:not(:last-child) { border-bottom: 1px solid #1A2332; }
+
+.cs-group-label {
+    padding: 8px 12px 4px;
+    font-size: 0.625rem;
+    font-weight: 700;
+    color: #475569;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+}
+
+.cs-option {
+    position: relative;
+    padding: 7px 12px 7px 28px;
+    font-size: 0.8125rem;
+    color: #CBD5E1;
+    cursor: pointer;
+    transition: background-color 80ms var(--ease-out-quart), color 80ms var(--ease-out-quart);
+}
+.cs-option::before {
+    content: "";
+    position: absolute;
+    left: 10px;
+    top: 50%;
+    width: 5px;
+    height: 9px;
+    border: solid #22D3EE;
+    border-width: 0 2px 2px 0;
+    transform: translateY(-60%) rotate(45deg) scale(0.6);
+    opacity: 0;
+    transition: opacity 140ms var(--ease-out-quart), transform 200ms var(--ease-out-expo);
+}
+.cs-option:hover,
+.cs-option.highlighted {
+    background: rgba(34, 211, 238, 0.06);
+    color: #F1F5F9;
+}
+.cs-option.selected { color: #22D3EE; }
+.cs-option.selected::before {
+    opacity: 1;
+    transform: translateY(-60%) rotate(45deg) scale(1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .cs-panel, .cs-arrow, .cs-option, .cs-option::before { transition: none; }
+}
+</style>
+{% endblock %}
 
 {% block content %}
-<div class="max-w-3xl mx-auto">
+<div class="mb-7">
+    <h1 class="text-2xl font-extrabold text-ink mb-1.5">New Scrape</h1>
+    <p class="text-sm text-ink-secondary">Extract structured data from any website — products, articles, jobs, forums, and more.</p>
+</div>
 
-    <div class="relative overflow-hidden rounded-2xl bg-gradient-to-br from-brand-800 via-brand-700 to-brand-600 p-8 mb-8">
-        <div class="absolute top-0 right-0 w-64 h-64 bg-cta/5 rounded-full -translate-y-1/2 translate-x-1/2 blur-3xl"></div>
-        <div class="absolute bottom-0 left-0 w-48 h-48 bg-blue-500/5 rounded-full translate-y-1/2 -translate-x-1/2 blur-3xl"></div>
-        <div class="relative">
-            <h1 class="text-2xl font-bold text-brand-50 mb-1.5">Ecommerce Scraper</h1>
-            <p class="text-brand-300 text-sm">Extract product data from any ecommerce site with AI-powered scraping</p>
-        </div>
-    </div>
+<div class="grid lg:grid-cols-3 gap-5 items-start">
+
+    <div class="lg:col-span-2 space-y-4">
 
     {% if error %}
-    <div class="mb-6 rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3 flex items-start gap-3">
-        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#EF4444" class="flex-shrink-0 mt-0.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
-        <p class="text-red-300 text-sm">{{ error }}</p>
+    <div class="mb-5 panel border-danger/25 px-4 py-3 flex items-start gap-3" style="background:rgba(248,113,113,0.06)">
+        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#F87171" class="flex-shrink-0 mt-0.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+        <p class="text-sm text-danger">{{ error }}</p>
     </div>
     {% endif %}
 
     {% if site_exists %}
-    <div class="mb-6 rounded-xl bg-amber-500/10 border border-amber-500/20 px-4 py-3.5">
+    <div class="mb-6 panel border-warning/25 px-4 py-3.5" style="background:rgba(251,191,36,0.04)">
         <div class="flex items-start gap-3">
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#D97706" class="flex-shrink-0 mt-0.5"><path stroke-linecap="round" stroke-linejoin="round" d="M11.25 11.25l.041-.02a.75.75 0 011.063.852l-.708 2.836a.75.75 0 001.063.853l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z"/></svg>
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#FBBF24" class="flex-shrink-0 mt-0.5"><path stroke-linecap="round" stroke-linejoin="round" d="M11.25 11.25l.041-.02a.75.75 0 011.063.852l-.708 2.836a.75.75 0 001.063.853l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z"/></svg>
             <div>
-                <p class="text-amber-200 text-sm font-semibold mb-1.5">Scraper already exists for this site</p>
+                <p class="text-sm font-semibold text-warning mb-1.5">Scraper already exists for this site</p>
                 <div class="flex items-center gap-2 mb-2">
-                    <span class="inline-flex items-center gap-1.5 px-2.5 py-1 bg-brand-700/50 rounded-lg text-xs font-medium text-brand-200">
-                        <span class="w-2 h-2 rounded-full {% if site_status_dot == 'complete' %}bg-green-400{% elif site_status_dot == 'failed' %}bg-red-400{% else %}bg-blue-400 animate-pulse-dot{% endif %}"></span>
+                    <span class="inline-flex items-center gap-1.5 px-2 py-1 bg-raised rounded text-xs font-medium text-ink-secondary font-mono">
+                        <span class="w-1.5 h-1.5 rounded-full {% if site_status_dot == 'complete' %}bg-success{% elif site_status_dot == 'failed' %}bg-danger{% else %}bg-info animate-pulse-dot{% endif %}"></span>
                         {{ site_exists_url }} — {{ site_status }}
                     </span>
                 </div>
-                <p class="text-amber-300/70 text-xs">Check <strong class="text-amber-200">Re-scrape</strong> below to re-run all steps. Otherwise only the existing scraper will be re-tested.</p>
+                <p class="text-ink-muted text-xs">Check <strong class="text-warning">Re-scrape</strong> to re-run all steps. Otherwise only the existing scraper will be re-tested.</p>
             </div>
         </div>
     </div>
     {% endif %}
 
-    <div class="rounded-2xl bg-surface border border-brand-700/30 p-6 mb-6">
+    <div class="panel p-7 mb-3">
         <form method="post" action="{% url 'home' %}" id="scrape-form">
             {% csrf_token %}
 
             <div class="mb-5">
-                <label for="id_url" class="block text-sm font-semibold text-brand-200 mb-2">Website URL</label>
+                <label class="input-label">What do you want to scrape?</label>
+                <div class="custom-select" id="page-type-select">
+                    <input type="hidden" name="page_type" id="id_page_type" value="{{ form_page_type|default:'product' }}">
+                    <button type="button" class="cs-trigger input-field" aria-haspopup="listbox" aria-expanded="false">
+                        <span class="cs-value-text" id="cs-selected-label"></span>
+                        <svg class="cs-arrow" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/></svg>
+                    </button>
+                    <div class="cs-panel" role="listbox">
+                        <div class="cs-group">
+                            <div class="cs-group-label">Shopping</div>
+                            <div class="cs-option" data-value="product" data-label="Product (URL list)">Product (URL list)</div>
+                            <div class="cs-option" data-value="product_list" data-label="Product List (listing page)">Product List (listing page)</div>
+                            <div class="cs-option" data-value="product_navigation" data-label="Product Navigation (search/browse)">Product Navigation (search/browse)</div>
+                        </div>
+                        <div class="cs-group">
+                            <div class="cs-group-label">Articles</div>
+                            <div class="cs-option" data-value="article" data-label="Article (URL list)">Article (URL list)</div>
+                            <div class="cs-option" data-value="article_list" data-label="Article List (listing page)">Article List (listing page)</div>
+                            <div class="cs-option" data-value="article_navigation" data-label="Article Navigation">Article Navigation</div>
+                        </div>
+                        <div class="cs-group">
+                            <div class="cs-group-label">Jobs</div>
+                            <div class="cs-option" data-value="job_posting" data-label="Job Posting (URL list)">Job Posting (URL list)</div>
+                            <div class="cs-option" data-value="job_navigation" data-label="Job Navigation">Job Navigation</div>
+                        </div>
+                        <div class="cs-group">
+                            <div class="cs-group-label">Forum</div>
+                            <div class="cs-option" data-value="forum_thread" data-label="Forum Thread (URL list)">Forum Thread (URL list)</div>
+                        </div>
+                        <div class="cs-group">
+                            <div class="cs-group-label">Search</div>
+                            <div class="cs-option" data-value="serp" data-label="SERP (search engine results)">SERP (search engine results)</div>
+                        </div>
+                        <div class="cs-group">
+                            <div class="cs-group-label">Generic</div>
+                            <div class="cs-option" data-value="page_content" data-label="Page Content (URL list)">Page Content (URL list)</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="mb-5">
+                <label for="id_url" class="input-label">Website URL</label>
                 <input type="url" name="url" id="id_url"
-                    class="w-full bg-brand-700/30 border border-brand-600/50 rounded-xl px-4 py-3 text-sm text-brand-50 placeholder-brand-500 focus:outline-none focus:border-cta/50 focus:ring-2 focus:ring-cta/20 transition-colors duration-200"
-                    placeholder="https://www.example-store.com" required value="{{ form_url|default:'' }}">
+                    class="input-field font-mono text-xs"
+                    placeholder="https://www.example.com" required value="{{ form_url|default:'' }}">
             </div>
 
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-5">
-                <div>
-                    <label for="id_product_url" class="block text-xs font-medium text-brand-400 mb-1.5">Product Listing URL <span class="text-brand-500">(optional)</span></label>
-                    <input type="url" name="product_url" id="id_product_url"
-                        class="w-full bg-brand-700/30 border border-brand-600/50 rounded-xl px-4 py-2.5 text-sm text-brand-50 placeholder-brand-500 focus:outline-none focus:border-cta/50 focus:ring-2 focus:ring-cta/20 transition-colors duration-200"
-                        placeholder="Auto-discovered if empty" value="{{ form_product_url|default:'' }}">
-                </div>
-                <div>
-                    <label for="id_currency" class="block text-xs font-medium text-brand-400 mb-1.5">Currency <span class="text-brand-500">(optional)</span></label>
-                    <input type="text" name="currency" id="id_currency"
-                        class="w-full bg-brand-700/30 border border-brand-600/50 rounded-xl px-4 py-2.5 text-sm text-brand-50 placeholder-brand-500 focus:outline-none focus:border-cta/50 focus:ring-2 focus:ring-cta/20 transition-colors duration-200"
-                        placeholder="Auto-detect" maxlength="3" value="{{ form_currency|default:'' }}">
-                </div>
+            <div id="field-search-criteria" class="mb-5" style="display:none;">
+                <label for="id_search_criteria" class="input-label">Search Criteria</label>
+                <input type="text" name="search_criteria" id="id_search_criteria"
+                    class="input-field"
+                    placeholder='e.g., "footwear sneakers" or "Python developer jobs"' value="{{ form_search_criteria|default:'' }}">
+                <p class="text-xs text-ink-muted mt-1.5">Describe what to search for. The scraper will discover and scrape matching items.</p>
             </div>
 
-            <div class="rounded-xl bg-brand-800/50 border border-brand-700/30 p-4 mb-5 space-y-3">
+            <div id="field-sample-url" class="mb-5">
+                <label for="id_product_url" class="input-label">Sample / Listing URL <span class="text-ink-muted font-normal">(optional)</span></label>
+                <input type="url" name="product_url" id="id_product_url"
+                    class="input-field font-mono text-xs"
+                    placeholder="Auto-discovered if empty" value="{{ form_product_url|default:'' }}">
+            </div>
+
+            <div id="field-currency" class="mb-5">
+                <label for="id_currency" class="input-label">Currency <span class="text-ink-muted font-normal">(optional)</span></label>
+                <input type="text" name="currency" id="id_currency"
+                    class="input-field"
+                    placeholder="Auto-detect" maxlength="3" value="{{ form_currency|default:'' }}">
+            </div>
+
+            <div id="field-checkboxes" class="bg-void/70 border border-line-subtle rounded-lg p-4 mb-6 space-y-3">
                 <label class="flex items-center gap-3 cursor-pointer group">
-                    <input type="checkbox" name="full_extraction" id="id_full_extraction"
-                        class="w-4 h-4 rounded border-brand-600 bg-brand-700 text-cta focus:ring-cta/30 cursor-pointer">
-                    <span class="text-sm text-brand-300 group-hover:text-brand-200 transition-colors">Full extraction <span class="text-brand-500">(scrape all products)</span></span>
+                    <input type="checkbox" name="full_extraction" id="id_full_extraction">
+                    <span class="text-sm text-ink-secondary group-hover:text-ink transition-colors">Full extraction <span class="text-ink-muted">(scrape all items)</span></span>
                 </label>
+                <div class="h-px bg-line-subtle"></div>
                 <label class="flex items-center gap-3 cursor-pointer group">
-                    <input type="checkbox" name="rescrape" id="id_rescrape"
-                        class="w-4 h-4 rounded border-brand-600 bg-brand-700 text-cta focus:ring-cta/30 cursor-pointer">
-                    <span class="text-sm text-brand-300 group-hover:text-brand-200 transition-colors"><span class="text-amber-400 font-semibold">Re-scrape</span> <span class="text-brand-500">— re-run all steps (analyze, generate, test, scrape)</span></span>
+                    <input type="checkbox" name="rescrape" id="id_rescrape">
+                    <span class="text-sm text-ink-secondary group-hover:text-ink transition-colors"><span class="text-warning font-semibold">Re-scrape</span> <span class="text-ink-muted">— re-run all steps (analyze, generate, test, scrape)</span></span>
                 </label>
             </div>
 
-            <button type="submit" class="w-full bg-cta hover:bg-cta-hover text-white font-semibold text-sm py-3 px-6 rounded-xl transition-all duration-200 hover:shadow-lg hover:shadow-cta/20 hover:-translate-y-0.5 active:translate-y-0 cursor-pointer flex items-center justify-center gap-2">
-                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M4.5 5.653c0-1.426 1.529-2.33 2.779-1.643l11.54 6.348c1.295.712 1.295 2.573 0 3.285L7.28 19.991c-1.25.687-2.779-.217-2.779-1.643V5.653z" clip-rule="evenodd"/></svg>
+            <button type="submit" class="btn-primary w-full py-3 text-sm">
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M4.5 5.653c0-1.426 1.529-2.33 2.779-1.643l11.54 6.348c1.295.712 1.295 2.573 0 3.285L7.28 19.991c-1.25.687-2.779-.217-2.779-1.643V5.653z" clip-rule="evenodd"/></svg>
                 Start Scrape
             </button>
         </form>
     </div>
 
-    <form method="post" action="{% url 'schedule_next' %}" class="mb-6">
-        {% csrf_token %}
-        <button type="submit" class="w-full bg-brand-700/50 hover:bg-brand-600/60 text-brand-200 hover:text-brand-100 font-semibold text-sm py-3 px-6 rounded-xl transition-all duration-200 border border-brand-600/40 hover:border-brand-500/50 flex items-center justify-center gap-2 cursor-pointer">
-            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3 4.5h14.25M3 9h9.75M3 13.5h5.25m5.25-.75L17.25 9m0 0L21 12.75M17.25 9v3.75M21 12.75H16.5"/></svg>
-            Schedule Next Site
-        </button>
-    </form>
+    </div><!-- end left column -->
+
+    <!-- Right column: activity sidebar -->
+    <div class="space-y-4">
 
     {% if recent_jobs %}
-    <div class="rounded-2xl bg-surface border border-brand-700/30 overflow-hidden">
-        <div class="px-5 py-3.5 flex items-center justify-between border-b border-brand-700/30">
-            <h3 class="text-xs font-bold text-brand-400 uppercase tracking-wider">Recent Jobs</h3>
-            <a href="{% url 'job_list' %}" class="text-xs text-cta hover:text-cta-hover transition-colors duration-200">View all</a>
+    <div class="panel overflow-hidden">
+        <div class="panel-header">
+            <h3 class="text-xs font-semibold text-ink-secondary uppercase tracking-wider">Recent Jobs</h3>
+            <a href="{% url 'job_list' %}" class="text-xs text-accent hover:text-accent-hover transition-colors font-medium">View all</a>
         </div>
-        <div class="divide-y divide-brand-700/20">
+        <div>
             {% for job in recent_jobs %}
-            <a href="{% url 'job_detail' job_id=job.id %}" class="flex items-center justify-between px-5 py-3 hover:bg-brand-700/20 transition-colors duration-150 cursor-pointer">
+            <a href="{% url 'job_detail' job_id=job.id %}" class="flex items-center justify-between px-4 py-2.5 border-b border-line-subtle last:border-0 hover:bg-raised/50 transition-colors cursor-pointer group stagger-item" style="--si:{{ forloop.counter0 }}">
                 <div class="min-w-0 flex-1">
-                    <p class="text-sm font-medium text-brand-100 truncate max-w-md">{{ job.url }}</p>
-                    <p class="text-xs text-brand-500 mt-0.5">
-                        {% if job.site_name %}{{ job.site_name }} &middot; {% endif %}{{ job.created_at|date:"M d, H:i" }}
-                        {% if job.product_count %} &middot; {{ job.product_count }} products{% endif %}
+                    <p class="text-xs font-medium text-ink-secondary group-hover:text-ink truncate font-mono transition-colors">{{ job.url|truncatechars:38 }}</p>
+                    <p class="text-[11px] text-ink-muted mt-0.5 font-mono">
+                        {{ job.created_at|date:"M d, H:i" }}{% if job.page_type %} · <span class="text-accent">{{ job.page_type_display }}</span>{% endif %}{% if job.product_count %} · {{ job.product_count }} items{% endif %}
                     </p>
                 </div>
-                <span class="ml-3 inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-semibold uppercase tracking-wider status-{{ job.status }}">{{ job.get_status_display }}</span>
+                <span class="ml-2 status-badge status-{{ job.status }}">{{ job.get_status_display }}</span>
             </a>
             {% endfor %}
         </div>
     </div>
+    {% else %}
+    <div class="panel py-8 text-center">
+        <p class="text-xs text-ink-muted">No jobs yet. Launch your first scrape to see activity here.</p>
+    </div>
     {% endif %}
 
-</div>
+    <form method="post" action="{% url 'schedule_next' %}">
+        {% csrf_token %}
+        <button type="submit" class="btn-secondary w-full py-2.5 text-xs">
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3 4.5h14.25M3 9h9.75M3 13.5h5.25m5.25-.75L17.25 9m0 0L21 12.75M17.25 9v3.75M21 12.75H16.5"/></svg>
+            Schedule Next Site
+        </button>
+    </form>
+
+    </div><!-- end right column -->
+
+</div><!-- end grid -->
+
+<script>
+function onPageTypeChange() {
+    var sel = document.getElementById('id_page_type').value;
+    var searchCriteria = document.getElementById('field-search-criteria');
+    var sampleUrl = document.getElementById('field-sample-url');
+    var currency = document.getElementById('field-currency');
+
+    var navTypes = ['product_navigation', 'article_navigation', 'job_navigation'];
+    var serpTypes = ['serp'];
+    var listTypes = ['product_list', 'article_list'];
+
+    if (navTypes.indexOf(sel) >= 0 || serpTypes.indexOf(sel) >= 0) {
+        searchCriteria.style.display = '';
+        sampleUrl.style.display = 'none';
+        currency.style.display = 'none';
+    } else if (listTypes.indexOf(sel) >= 0) {
+        searchCriteria.style.display = 'none';
+        sampleUrl.style.display = '';
+        currency.style.display = '';
+    } else {
+        searchCriteria.style.display = 'none';
+        sampleUrl.style.display = '';
+        currency.style.display = '';
+    }
+}
+
+(function() {
+    var container = document.getElementById('page-type-select');
+    var trigger = container.querySelector('.cs-trigger');
+    var panel = container.querySelector('.cs-panel');
+    var hiddenInput = document.getElementById('id_page_type');
+    var labelEl = document.getElementById('cs-selected-label');
+    var options = Array.prototype.slice.call(container.querySelectorAll('.cs-option'));
+    var highlightIdx = -1;
+
+    function setSelected(value, label, fireChange) {
+        hiddenInput.value = value;
+        labelEl.textContent = label;
+        options.forEach(function(o) {
+            o.classList.toggle('selected', o.dataset.value === value);
+        });
+        if (fireChange) onPageTypeChange();
+    }
+
+    function open() {
+        container.classList.add('open');
+        trigger.setAttribute('aria-expanded', 'true');
+        var sel = container.querySelector('.cs-option.selected');
+        highlightIdx = sel ? options.indexOf(sel) : 0;
+        updateHighlight();
+        requestAnimationFrame(function() {
+            if (options[highlightIdx]) options[highlightIdx].scrollIntoView({ block: 'nearest' });
+        });
+    }
+    function close() {
+        container.classList.remove('open');
+        trigger.setAttribute('aria-expanded', 'false');
+        highlightIdx = -1;
+        updateHighlight();
+    }
+    function toggle() { container.classList.contains('open') ? close() : open(); }
+    function updateHighlight() {
+        options.forEach(function(o, i) { o.classList.toggle('highlighted', i === highlightIdx); });
+    }
+
+    trigger.addEventListener('click', function(e) { e.stopPropagation(); toggle(); });
+
+    options.forEach(function(opt) {
+        opt.addEventListener('click', function() {
+            setSelected(opt.dataset.value, opt.dataset.label, true);
+            close();
+            trigger.focus();
+        });
+    });
+
+    document.addEventListener('click', function(e) {
+        if (!container.contains(e.target)) close();
+    });
+
+    trigger.addEventListener('keydown', function(e) {
+        var isOpen = container.classList.contains('open');
+        switch (e.key) {
+            case 'Enter': case ' ':
+                e.preventDefault();
+                if (isOpen && highlightIdx >= 0) {
+                    var opt = options[highlightIdx];
+                    setSelected(opt.dataset.value, opt.dataset.label, true);
+                    close();
+                } else { open(); }
+                break;
+            case 'Escape': if (isOpen) close(); break;
+            case 'ArrowDown':
+                e.preventDefault();
+                if (!isOpen) { open(); }
+                else {
+                    highlightIdx = Math.min(highlightIdx + 1, options.length - 1);
+                    updateHighlight();
+                    options[highlightIdx].scrollIntoView({ block: 'nearest' });
+                }
+                break;
+            case 'ArrowUp':
+                e.preventDefault();
+                if (isOpen) {
+                    highlightIdx = Math.max(highlightIdx - 1, 0);
+                    updateHighlight();
+                    options[highlightIdx].scrollIntoView({ block: 'nearest' });
+                }
+                break;
+        }
+    });
+
+    var initVal = hiddenInput.value || 'product';
+    var initOpt = container.querySelector('.cs-option[data-value="' + initVal + '"]');
+    if (initOpt) setSelected(initOpt.dataset.value, initOpt.dataset.label, true);
+    else setSelected('product', 'Product (URL list)', true);
+})();
+</script>
 {% endblock %}

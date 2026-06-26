@@ -1,34 +1,34 @@
 {% extends "scraper/base.html" %}
 
-{% block page_title %}Probe Cache — Ecommerce Scraper{% endblock %}
+{% block page_title %}Probe Cache — Scraper Console{% endblock %}
 
 {% block content %}
 
 <div class="flex items-start justify-between gap-4 mb-6">
     <div>
-        <h2 class="text-xl font-bold text-brand-50 mb-1">Probe Cache</h2>
-        <p class="text-brand-500 text-sm">Domain-level escalation method cached for 4 hours. Probes still fetch fresh page data; cache just skips to the known-working method.</p>
+        <h2 class="text-2xl font-extrabold text-ink mb-1">Probe Cache</h2>
+        <p class="text-ink-muted text-sm">Domain-level escalation method cached for 4 hours. Probes still fetch fresh page data; cache just skips to the known-working method.</p>
     </div>
     <div class="flex gap-2 flex-shrink-0">
         <form method="POST" onsubmit="return confirm('Clear all expired entries?')">
             {% csrf_token %}
             <input type="hidden" name="action" value="clear_expired">
-            <button type="submit" class="px-3 py-1.5 text-xs font-medium text-amber-400 border border-amber-500/30 rounded-lg hover:bg-amber-500/10 transition-colors cursor-pointer">Clear Expired</button>
+            <button type="submit" class="px-3 py-1.5 text-xs font-medium text-warning border border-warning/30 rounded-md hover:bg-warning/10 transition-colors cursor-pointer">Clear Expired</button>
         </form>
         <form method="POST" onsubmit="return confirm('Clear ALL cache entries?')">
             {% csrf_token %}
             <input type="hidden" name="action" value="clear_all">
-            <button type="submit" class="px-3 py-1.5 text-xs font-medium text-red-400 border border-red-500/30 rounded-lg hover:bg-red-500/10 transition-colors cursor-pointer">Clear All</button>
+            <button type="submit" class="px-3 py-1.5 text-xs font-medium text-danger border border-danger/30 rounded-md hover:bg-danger/10 transition-colors cursor-pointer">Clear All</button>
         </form>
     </div>
 </div>
 
 {% if entries %}
-<div class="rounded-xl bg-surface border border-brand-700/30 overflow-hidden">
+<div class="panel overflow-hidden">
     <div class="overflow-x-auto">
         <table class="w-full text-sm">
             <thead>
-                <tr class="bg-brand-800/50 text-brand-400 text-[11px] font-semibold uppercase tracking-wider">
+                <tr class="bg-raised/30 text-ink-muted text-[11px] font-semibold uppercase tracking-wider">
                     <th class="px-4 py-3 text-left">Domain</th>
                     <th class="px-4 py-3 text-left">Method</th>
                     <th class="px-4 py-3 text-left">Akamai Bypass</th>
@@ -38,35 +38,35 @@
                     <th class="px-4 py-3 text-right">Action</th>
                 </tr>
             </thead>
-            <tbody class="divide-y divide-brand-700/15">
+            <tbody>
                 {% for entry in entries %}
-                <tr class="{% if entry.is_expired %}opacity-40{% endif %} hover:bg-brand-700/15 transition-colors">
-                    <td class="px-4 py-3 font-medium text-brand-200 whitespace-nowrap">{{ entry.domain }}</td>
-                    <td class="px-4 py-3"><code class="text-blue-400 bg-blue-500/10 px-1.5 py-0.5 rounded text-xs">{{ entry.method }}</code></td>
+                <tr class="border-t border-line-subtle {% if entry.is_expired %}opacity-40{% endif %} hover:bg-raised/50 transition-colors">
+                    <td class="px-4 py-3 font-medium text-ink whitespace-nowrap">{{ entry.domain }}</td>
+                    <td class="px-4 py-3"><code class="text-accent bg-accent/10 px-1.5 py-0.5 rounded text-xs font-mono">{{ entry.method }}</code></td>
                     <td class="px-4 py-3">
                         {% if entry.needs_akamai_bypass %}
-                            <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider bg-red-500/15 text-red-400">Yes</span>
+                            <span class="status-badge status-failed">Yes</span>
                         {% else %}
-                            <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider bg-brand-700/50 text-brand-500">No</span>
+                            <span class="status-badge status-pending">No</span>
                         {% endif %}
                     </td>
                     <td class="px-4 py-3">
                         {% if entry.is_expired %}
-                            <span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider bg-brand-700/50 text-brand-500">Expired</span>
+                            <span class="status-badge status-cancelled">Expired</span>
                         {% else %}
-                            <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wider bg-green-500/15 text-green-400">
-                                <span class="w-1.5 h-1.5 rounded-full bg-green-400"></span>Active
+                            <span class="status-badge status-completed">
+                                <span class="w-1.5 h-1.5 rounded-full bg-success"></span>Active
                             </span>
                         {% endif %}
                     </td>
-                    <td class="px-4 py-3 text-brand-500 text-xs whitespace-nowrap">{{ entry.cached_at|date:"M d, H:i" }}</td>
-                    <td class="px-4 py-3 text-brand-500 text-xs whitespace-nowrap">{{ entry.last_used_at|date:"M d, H:i" }}</td>
+                    <td class="px-4 py-3 text-ink-muted text-xs whitespace-nowrap font-mono">{{ entry.cached_at|date:"M d, H:i" }}</td>
+                    <td class="px-4 py-3 text-ink-muted text-xs whitespace-nowrap font-mono">{{ entry.last_used_at|date:"M d, H:i" }}</td>
                     <td class="px-4 py-3 text-right">
                         <form method="POST" class="inline">
                             {% csrf_token %}
                             <input type="hidden" name="action" value="delete">
                             <input type="hidden" name="entry_id" value="{{ entry.id }}">
-                            <button type="submit" class="p-1.5 text-brand-500 hover:text-red-400 hover:bg-red-500/10 rounded-md transition-colors cursor-pointer" onclick="return confirm('Delete cache for {{ entry.domain }}?')">
+                            <button type="submit" class="p-1.5 text-ink-muted hover:text-danger hover:bg-danger/10 rounded-md transition-colors cursor-pointer" onclick="return confirm('Delete cache for {{ entry.domain }}?')">
                                 <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"/></svg>
                             </button>
                         </form>
@@ -77,13 +77,13 @@
         </table>
     </div>
 </div>
-<p class="text-brand-600 text-xs mt-2">{{ entries|length }} entries</p>
+<p class="text-ink-muted text-xs mt-2 font-mono">{{ entries|length }} entries</p>
 
 {% else %}
-<div class="rounded-2xl bg-surface border border-brand-700/30 py-16 text-center">
-    <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="#475569" class="mx-auto mb-4"><path stroke-linecap="round" stroke-linejoin="round" d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375m16.5 0v3.75m-16.5-3.75v3.75m16.5 0v3.75C20.25 16.153 16.556 18 12 18s-8.25-1.847-8.25-4.125v-3.75m16.5 0c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125"/></svg>
-    <h3 class="text-brand-400 font-semibold mb-1">No cached probe results</h3>
-    <p class="text-brand-500 text-sm">Probe results will appear here after successful site analysis runs.</p>
+<div class="panel py-16 text-center">
+    <svg xmlns="http://www.w3.org/2000/svg" width="40" height="40" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="#334155" class="mx-auto mb-4"><path stroke-linecap="round" stroke-linejoin="round" d="M20.25 6.375c0 2.278-3.694 4.125-8.25 4.125S3.75 8.653 3.75 6.375m16.5 0c0-2.278-3.694-4.125-8.25-4.125S3.75 4.097 3.75 6.375m16.5 0v11.25c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125V6.375m16.5 0v3.75m-16.5-3.75v3.75m16.5 0v3.75C20.25 16.153 16.556 18 12 18s-8.25-1.847-8.25-4.125v-3.75m16.5 0c0 2.278-3.694 4.125-8.25 4.125s-8.25-1.847-8.25-4.125"/></svg>
+    <h3 class="text-ink-secondary font-semibold mb-1">No cached probe results</h3>
+    <p class="text-ink-muted text-sm">Probe results will appear here after successful site analysis runs.</p>
 </div>
 {% endif %}
 

@@ -35,7 +35,12 @@ logger = logging.getLogger(__name__)
 PHASE_MAP: dict[str, str] = {
     "accessibility_check": "Accessibility Check",
     "site_analysis": "Site Analysis",
-    "product_analysis": "Product Analysis",
+    "navigation_explore": "Navigation Explore",
+    "navigation_synthesize": "Navigation Synthesis",
+    "navigation_skill_review": "Navigation Skill Review",
+    "navigation_analysis": "Navigation Analysis",
+    "content_analysis": "Content Analysis",
+    "product_analysis": "Content Analysis",
     "scraper_analysis": "Scraper Analysis",
     "code_generation": "Code Generation",
     "testing": "Testing Loop",
@@ -47,6 +52,10 @@ PHASE_MAP: dict[str, str] = {
 
 AGENT_PHASE_MAP: dict[str, str] = {
     "site-analyzer": "site_analysis",
+    "navigation-agent": "navigation_explore",
+    "navigation-explore": "navigation_explore",
+    "navigation-synthesize": "navigation_synthesize",
+    "nav-skill-review": "navigation_skill_review",
     "product-analyzer": "product_analysis",
     "scraper-analyzer": "scraper_analysis",
     "code-writer": "code_generation",
@@ -97,6 +106,9 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False) -> None:
 PIPELINE_PHASES = [
     "accessibility_check",
     "site_analysis",
+    "navigation_explore",
+    "navigation_synthesize",
+    "navigation_skill_review",
     "product_analysis",
     "scraper_analysis",
     "code_generation",
@@ -277,36 +289,90 @@ def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
     handle correctly.
     """
     site_input_urls: list[str] = []
+    output_schema: dict[str, Any] = {}
+    site_type = ""
     try:
         from scraper.models import Site
 
         db_site = Site.objects.filter(url=job.url.rstrip("/")).first()
-        if db_site and db_site.input_urls:
-            site_input_urls = list(db_site.input_urls)
+        if db_site:
+            if db_site.input_urls:
+                site_input_urls = list(db_site.input_urls)
+            if db_site.output_schema:
+                output_schema = db_site.output_schema
+            if db_site.site_type:
+                site_type = db_site.site_type
     except Exception as exc:
-        logger.warning("Could not load Site input_urls for %s: %s", job.url, exc)
+        logger.warning("Could not load Site for %s: %s", job.url, exc)
+
+    page_type = job.page_type or "product"
+    search_criteria = job.search_criteria or ""
+
+    content_type_config: dict[str, Any] = {}
+    try:
+        from src.content_types import get_content_type, resolve_page_type
+
+        # Derive canonical (content_type_name, input_mode) from page_type so
+        # navigation/list page types route correctly even if job.input_mode
+        # was not set when the job was created (backward compatibility).
+        resolved_content_type, resolved_input_mode = resolve_page_type(page_type)
+        # Prefer explicit job.input_mode if it matches a valid mode, else use
+        # the mode derived from page_type.
+        if job.input_mode and job.input_mode in (
+            "url_list",
+            "list_page",
+            "navigation",
+            "search_term",
+        ):
+            input_mode = job.input_mode
+        else:
+            input_mode = resolved_input_mode
+
+        ct = get_content_type(page_type)
+        if ct:
+            content_type_config = ct.output_schema
+            if not output_schema:
+                output_schema = ct.output_schema
+            if not site_type:
+                site_type = ct.site_type
+    except Exception:
+        input_mode = job.input_mode or "url_list"
+
+    sample_url = job.product_url or ""
+    skip_content = input_mode in ("navigation", "list_page")
+    skip_product = False
 
     return {
         "job_id": job.id,
         "url": job.url,
-        "product_url": job.product_url or "",
+        "sample_url": sample_url,
+        "product_url": sample_url,
         "currency": job.currency or "",
         "sample_only": not job.full_extraction,
         "rescrape": False,
+        "page_type": page_type,
+        "input_mode": input_mode,
+        "site_type": site_type,
+        "content_type_config": content_type_config,
+        "search_criteria": search_criteria,
+        "output_schema": output_schema,
         "site_slug": _generate_slug(job.url),
         "site_name": "",
         "site_status": "new",
         "skip_site_analysis": False,
-        "skip_product_analysis": False,
+        "skip_content_analysis": skip_content,
+        "skip_product_analysis": skip_product,
         "skip_code_generation": False,
         "current_phase": "",
         "phases_completed": [],
         "site_analysis_retries": 0,
+        "content_analysis_retries": 0,
         "product_analysis_retries": 0,
         "test_retry_count": 0,
         "reanalyze_count": 0,
         "execution_status": "",
         "output_file": "",
+        "item_count": 0,
         "product_count": 0,
         "scraping_method": "",
         "platform": "",
@@ -331,12 +397,15 @@ def _finalize_job(job: ScrapeJob) -> None:
     from the graph state.  Closes any still-running Step rows and sets
     the job to COMPLETED or FAILED.
 
-    Skipped entirely for captcha_blocked jobs (already finalized in
-    check_accessibility).
+    Skipped entirely for captcha_blocked and akamai_blocked jobs (already
+    finalized in check_accessibility).
     """
     job.refresh_from_db()
-    if job.status == ScrapeJob.STATUS_CAPTCHA_BLOCKED:
-        logger.info("Job %d: captcha_blocked, skipping _finalize_job", job.id)
+    if job.status in (
+        ScrapeJob.STATUS_CAPTCHA_BLOCKED,
+        ScrapeJob.STATUS_AKAMAI_BLOCKED,
+    ):
+        logger.info("Job %d: %s, skipping _finalize_job", job.id, job.status)
         return
     service = LangGraphService()
     graph = service.build_graph()
@@ -415,6 +484,7 @@ def _finalize_job(job: ScrapeJob) -> None:
                 analysis_dir.mkdir(parents=True, exist_ok=True)
                 for artifact in [
                     "site_analysis.json",
+                    "navigation_analysis.json",
                     "product_analysis.json",
                     "scraper_analysis.json",
                     "test_report.json",
@@ -431,7 +501,10 @@ def _finalize_job(job: ScrapeJob) -> None:
             logger.warning("Job %d: workspace cleanup failed: %s", job.id, exc)
 
     # ── Determine final status ──────────────────────────────────────────
-    if job.status == ScrapeJob.STATUS_CAPTCHA_BLOCKED:
+    if job.status in (
+        ScrapeJob.STATUS_CAPTCHA_BLOCKED,
+        ScrapeJob.STATUS_AKAMAI_BLOCKED,
+    ):
         pass
     elif job.error_message:
         job.status = ScrapeJob.STATUS_FAILED
@@ -568,7 +641,9 @@ def cleanup_stuck_jobs() -> None:
     """
     from scraper.models import SessionLog
 
-    threshold = timezone.now() - timezone.timedelta(minutes=STUCK_JOB_ACTIVITY_TIMEOUT_MINUTES)
+    threshold = timezone.now() - timezone.timedelta(
+        minutes=STUCK_JOB_ACTIVITY_TIMEOUT_MINUTES
+    )
     stuck_jobs = ScrapeJob.objects.filter(
         status=ScrapeJob.STATUS_RUNNING,
     )
@@ -637,7 +712,11 @@ def _do_schedule_next_site() -> dict:
 
     _auto_approve_stale_jobs()
 
-    active_statuses = {ScrapeJob.STATUS_RUNNING, ScrapeJob.STATUS_PENDING, ScrapeJob.STATUS_WAITING_APPROVAL}
+    active_statuses = {
+        ScrapeJob.STATUS_RUNNING,
+        ScrapeJob.STATUS_PENDING,
+        ScrapeJob.STATUS_WAITING_APPROVAL,
+    }
     active_count = ScrapeJob.objects.filter(status__in=active_statuses).count()
     if active_count:
         return {
@@ -755,3 +834,153 @@ def _auto_approve_stale_jobs() -> None:
 
     if approved:
         logger.info("Auto-approve: approved %d stale job(s)", approved)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Agent Playground — run individual agents in isolation
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@shared_task(bind=True)
+def run_agent_task(self, playground_id: int) -> None:
+    """Run a single agent in isolation for the Agent Playground.
+
+    Creates a minimal state dict, builds the agent, invokes it with the
+    user-provided prompt, and records tool calls + messages.
+    """
+    from scraper.models import AgentPlayground
+
+    pg = AgentPlayground.objects.get(pk=playground_id)
+    pg.status = AgentPlayground.STATUS_RUNNING
+    pg.started_at = timezone.now()
+    pg.celery_task_id = self.request.id or ""
+    pg.save(update_fields=["status", "started_at", "celery_task_id"])
+
+    logger.info(
+        "Agent Playground #%d: running %s (slug=%s, url=%s)",
+        pg.id,
+        pg.agent_name,
+        pg.site_slug,
+        pg.url,
+    )
+
+    try:
+        # Build minimal state
+        slug = pg.site_slug or _generate_slug(pg.url) if pg.url else "playground"
+        state: dict[str, Any] = {
+            "job_id": 0,  # No job — playground mode
+            "url": pg.url,
+            "site_slug": slug,
+            "site_name": "",
+            "input_mode": "navigation" if "navigation" in pg.agent_name else "url_list",
+            "search_criteria": pg.search_criteria or "",
+            "page_type": "product",
+            "sample_url": pg.url,
+            "product_url": pg.url,
+            "messages": [],
+        }
+
+        # Create workspace dir
+        root = getattr(settings, "PROJECT_ROOT", os.getcwd())
+        ws_dir = os.path.join(root, "workspace", slug)
+        os.makedirs(ws_dir, exist_ok=True)
+
+        # Set tool context for guards
+        from agents.tools.context import set_tool_context, clear_tool_context
+
+        set_tool_context(state, agent_name=pg.agent_name)
+
+        try:
+            result = None
+
+            if pg.agent_name == "navigation_explore":
+                # Deterministic explore — no LLM
+                from agents.nodes.navigate_explore import navigate_explore
+
+                result = navigate_explore(state)
+            elif pg.agent_name == "navigation_synthesize":
+                from agents.nodes.navigate_synthesize import navigate_synthesize
+
+                result = navigate_synthesize(state)
+            else:
+                # Standard LLM agent
+                from agents.subagents import _build_agent
+                from langchain_core.messages import HumanMessage
+
+                agent = _build_agent(pg.agent_name, site_slug=slug)
+                messages = [HumanMessage(content=pg.prompt)]
+                budget = AGENT_MAX_ITERATIONS_LOOKUP.get(pg.agent_name, 25)
+                agent_cfg: dict[str, Any] = {"recursion_limit": budget}
+                agent_result = agent.invoke({"messages": messages}, config=agent_cfg)
+                result = {"messages": agent_result.get("messages", [])}
+
+            # Collect output artifacts
+            artifacts: list[str] = []
+            ws_path = os.path.join(root, "workspace", slug)
+            if os.path.isdir(ws_path):
+                for fname in sorted(os.listdir(ws_path)):
+                    fpath = os.path.join(ws_path, fname)
+                    if os.path.isfile(fpath) and fname.endswith(".json"):
+                        artifacts.append(f"workspace/{slug}/{fname}")
+
+            pg.output_artifacts = artifacts
+            pg.output_summary = _summarize_agent_result(result)
+            pg.tool_call_count = _count_tool_calls(result)
+            pg.status = AgentPlayground.STATUS_COMPLETED
+            logger.info(
+                "Agent Playground #%d: completed (%d artifacts, %d tool calls)",
+                pg.id,
+                len(artifacts),
+                pg.tool_call_count,
+            )
+        finally:
+            clear_tool_context()
+
+    except Exception as exc:
+        logger.exception("Agent Playground #%d failed: %s", pg.id, exc)
+        pg.status = AgentPlayground.STATUS_FAILED
+        pg.error_message = str(exc)[:2000]
+    finally:
+        pg.completed_at = timezone.now()
+        pg.save()
+
+
+AGENT_MAX_ITERATIONS_LOOKUP: dict[str, int] = {
+    "site_analyzer": 20,
+    "product_analyzer": 15,
+    "navigation_agent": 40,
+    "navigation_explore": 20,
+    "navigation_synthesize": 15,
+    "nav_skill_review": 25,
+    "scraper_analyzer": 10,
+    "code_writer": 30,
+    "code_tester": 15,
+    "cleanup": 10,
+    "skill_learner": 15,
+}
+
+
+def _summarize_agent_result(result: dict | None) -> str:
+    """Extract a short text summary from an agent result."""
+    if not result:
+        return "(no result)"
+    parts: list[str] = []
+    messages = result.get("messages") or []
+    for msg in messages[-5:]:
+        cls = msg.__class__.__name__
+        content = str(getattr(msg, "content", ""))[:300]
+        if content.strip():
+            parts.append(f"[{cls}] {content}")
+    if not parts:
+        for key in ("navigation_findings", "navigation_analysis"):
+            if key in result:
+                return f"Produced {key}"
+    return "\n".join(parts[-5:]) if parts else "(completed)"
+
+
+def _count_tool_calls(result: dict | None) -> int:
+    """Count ToolMessage entries in result."""
+    if not result:
+        return 0
+    messages = result.get("messages") or []
+    return sum(1 for m in messages if m.__class__.__name__ == "ToolMessage")

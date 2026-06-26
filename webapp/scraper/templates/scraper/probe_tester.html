@@ -1,93 +1,87 @@
 {% extends "scraper/base.html" %}
 
-{% block page_title %}Probe Tester — Ecommerce Scraper{% endblock %}
+{% block page_title %}Probe Tester — Scraper Console{% endblock %}
 
 {% block content %}
 <div class="max-w-4xl mx-auto">
 
-    <div class="relative overflow-hidden rounded-2xl bg-gradient-to-br from-brand-800 via-brand-700 to-brand-600 p-8 mb-6">
-        <div class="absolute top-0 right-0 w-64 h-64 bg-cta/5 rounded-full -translate-y-1/2 translate-x-1/2 blur-3xl"></div>
-        <div class="relative">
-            <h1 class="text-2xl font-bold text-brand-50 mb-1.5">Probe Tester</h1>
-            <p class="text-brand-300 text-sm">Test individual probe methods against a URL without caching. Find out which method actually works.</p>
-        </div>
+    <div class="mb-6">
+        <h1 class="text-2xl font-extrabold text-ink mb-1">Probe Tester</h1>
+        <p class="text-sm text-ink-secondary">Test individual probe methods against a URL without caching. Find out which method actually works.</p>
     </div>
 
-    <div class="rounded-2xl bg-surface border border-brand-700/30 p-6 mb-6">
+    <div class="panel p-6 mb-6">
         <form id="probe-form" class="space-y-4">
             <div>
-                <label for="url" class="block text-sm font-semibold text-brand-200 mb-2">URL to test</label>
+                <label for="url" class="input-label">URL to test</label>
                 <input type="url" id="url" name="url"
-                    class="w-full bg-brand-700/30 border border-brand-600/50 rounded-xl px-4 py-3 text-sm text-brand-50 placeholder-brand-500 focus:outline-none focus:border-cta/50 focus:ring-2 focus:ring-cta/20 transition-colors duration-200"
+                    class="input-field font-mono text-xs"
                     placeholder="https://www.example-store.com/product-page" required value="{{ initial_url }}">
             </div>
 
             <div>
-                <label class="block text-sm font-semibold text-brand-200 mb-2">Methods to test</label>
+                <label class="input-label">Methods to test</label>
                 <div class="grid grid-cols-2 md:grid-cols-3 gap-2">
 
-                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-lg bg-brand-700/20 border border-brand-600/30 px-3 py-2 hover:bg-brand-600/30 transition-colors">
-                        <input type="checkbox" name="methods" value="direct_http" checked class="w-4 h-4 rounded border-brand-600 bg-brand-700 text-cta focus:ring-cta/30 cursor-pointer">
-                        <span class="text-xs font-medium text-brand-300 group-hover:text-brand-100 transition-colors">direct_http</span>
+                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-md bg-void border border-line-subtle px-3 py-2 hover:bg-raised/50 transition-colors">
+                        <input type="checkbox" name="methods" value="direct_http" checked>
+                        <span class="text-xs font-medium text-ink-secondary group-hover:text-ink transition-colors font-mono">direct_http</span>
                     </label>
 
-                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-lg bg-brand-700/20 border border-brand-600/30 px-3 py-2 hover:bg-brand-600/30 transition-colors">
-                        <input type="checkbox" name="methods" value="playwright_none" checked class="w-4 h-4 rounded border-brand-600 bg-brand-700 text-cta focus:ring-cta/30 cursor-pointer">
-                        <span class="text-xs font-medium text-brand-300 group-hover:text-brand-100 transition-colors">playwright_none</span>
+                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-md bg-void border border-line-subtle px-3 py-2 hover:bg-raised/50 transition-colors">
+                        <input type="checkbox" name="methods" value="playwright_none" checked>
+                        <span class="text-xs font-medium text-ink-secondary group-hover:text-ink transition-colors font-mono">playwright_none</span>
                     </label>
 
-                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-lg bg-brand-700/20 border border-brand-600/30 px-3 py-2 hover:bg-brand-600/30 transition-colors">
-                        <input type="checkbox" name="methods" value="uc_chrome_none" checked class="w-4 h-4 rounded border-brand-600 bg-brand-700 text-cta focus:ring-cta/30 cursor-pointer">
-                        <span class="text-xs font-medium text-brand-300 group-hover:text-brand-100 transition-colors">uc_chrome_none</span>
+                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-md bg-void border border-line-subtle px-3 py-2 hover:bg-raised/50 transition-colors">
+                        <input type="checkbox" name="methods" value="uc_chrome_none" checked>
+                        <span class="text-xs font-medium text-ink-secondary group-hover:text-ink transition-colors font-mono">uc_chrome_none</span>
                     </label>
 
-                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-lg bg-brand-700/20 border border-brand-600/30 px-3 py-2 hover:bg-brand-600/30 transition-colors">
-                        <input type="checkbox" name="methods" value="direct_http_datacenter" class="w-4 h-4 rounded border-brand-600 bg-brand-700 text-cta focus:ring-cta/30 cursor-pointer">
-                        <span class="text-xs font-medium text-brand-300 group-hover:text-brand-100 transition-colors">direct_http_datacenter</span>
+                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-md bg-void border border-line-subtle px-3 py-2 hover:bg-raised/50 transition-colors">
+                        <input type="checkbox" name="methods" value="direct_http_datacenter">
+                        <span class="text-xs font-medium text-ink-secondary group-hover:text-ink transition-colors font-mono">direct_http_datacenter</span>
                     </label>
 
-                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-lg bg-brand-700/20 border border-brand-600/30 px-3 py-2 hover:bg-brand-600/30 transition-colors">
-                        <input type="checkbox" name="methods" value="playwright_datacenter" class="w-4 h-4 rounded border-brand-600 bg-brand-700 text-cta focus:ring-cta/30 cursor-pointer">
-                        <span class="text-xs font-medium text-brand-300 group-hover:text-brand-100 transition-colors">playwright_datacenter</span>
+                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-md bg-void border border-line-subtle px-3 py-2 hover:bg-raised/50 transition-colors">
+                        <input type="checkbox" name="methods" value="playwright_datacenter">
+                        <span class="text-xs font-medium text-ink-secondary group-hover:text-ink transition-colors font-mono">playwright_datacenter</span>
                     </label>
 
-                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-lg bg-brand-700/20 border border-brand-600/30 px-3 py-2 hover:bg-brand-600/30 transition-colors">
-                        <input type="checkbox" name="methods" value="uc_chrome_datacenter" class="w-4 h-4 rounded border-brand-600 bg-brand-700 text-cta focus:ring-cta/30 cursor-pointer">
-                        <span class="text-xs font-medium text-brand-300 group-hover:text-brand-100 transition-colors">uc_chrome_datacenter</span>
+                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-md bg-void border border-line-subtle px-3 py-2 hover:bg-raised/50 transition-colors">
+                        <input type="checkbox" name="methods" value="uc_chrome_datacenter">
+                        <span class="text-xs font-medium text-ink-secondary group-hover:text-ink transition-colors font-mono">uc_chrome_datacenter</span>
                     </label>
 
-                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-lg bg-brand-700/20 border border-brand-600/30 px-3 py-2 hover:bg-brand-600/30 transition-colors">
-                        <input type="checkbox" name="methods" value="direct_http_residential" class="w-4 h-4 rounded border-brand-600 bg-brand-700 text-cta focus:ring-cta/30 cursor-pointer">
-                        <span class="text-xs font-medium text-brand-300 group-hover:text-brand-100 transition-colors">direct_http_residential</span>
+                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-md bg-void border border-line-subtle px-3 py-2 hover:bg-raised/50 transition-colors">
+                        <input type="checkbox" name="methods" value="direct_http_residential">
+                        <span class="text-xs font-medium text-ink-secondary group-hover:text-ink transition-colors font-mono">direct_http_residential</span>
                     </label>
 
-                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-lg bg-brand-700/20 border border-brand-600/30 px-3 py-2 hover:bg-brand-600/30 transition-colors">
-                        <input type="checkbox" name="methods" value="playwright_residential" class="w-4 h-4 rounded border-brand-600 bg-brand-700 text-cta focus:ring-cta/30 cursor-pointer">
-                        <span class="text-xs font-medium text-brand-300 group-hover:text-brand-100 transition-colors">playwright_residential</span>
+                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-md bg-void border border-line-subtle px-3 py-2 hover:bg-raised/50 transition-colors">
+                        <input type="checkbox" name="methods" value="playwright_residential">
+                        <span class="text-xs font-medium text-ink-secondary group-hover:text-ink transition-colors font-mono">playwright_residential</span>
                     </label>
 
-                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-lg bg-brand-700/20 border border-brand-600/30 px-3 py-2 hover:bg-brand-600/30 transition-colors">
-                        <input type="checkbox" name="methods" value="uc_chrome_residential" class="w-4 h-4 rounded border-brand-600 bg-brand-700 text-cta focus:ring-cta/30 cursor-pointer">
-                        <span class="text-xs font-medium text-brand-300 group-hover:text-brand-100 transition-colors">uc_chrome_residential</span>
+                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-md bg-void border border-line-subtle px-3 py-2 hover:bg-raised/50 transition-colors">
+                        <input type="checkbox" name="methods" value="uc_chrome_residential">
+                        <span class="text-xs font-medium text-ink-secondary group-hover:text-ink transition-colors font-mono">uc_chrome_residential</span>
                     </label>
                 </div>
             </div>
 
-            <div class="flex items-center gap-3">
+            <div class="flex items-end gap-3">
                 <div class="flex-1 max-w-xs">
-                    <label for="country" class="block text-xs font-semibold text-brand-400 mb-1.5">Country Code (auto)</label>
+                    <label for="country" class="input-label">Country Code (auto)</label>
                     <input type="text" id="country" name="country"
-                        class="w-full bg-brand-700/30 border border-brand-600/50 rounded-lg px-3 py-2.5 text-xs text-brand-50 placeholder-brand-500 focus:outline-none focus:border-cta/50 focus:ring-2 focus:ring-cta/20 transition-colors duration-200"
+                        class="input-field"
                         placeholder="auto-detect" value="">
                 </div>
-                <div class="flex items-end gap-3">
-                    <button type="submit" id="run-btn"
-                    class="bg-cta hover:bg-cta-hover text-white font-semibold text-sm py-3 px-6 rounded-xl transition-all duration-200 hover:shadow-lg hover:shadow-cta/20 hover:-translate-y-0.5 active:translate-y-0 cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
+                <button type="submit" id="run-btn" class="btn-primary py-3 flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed">
                     <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M5.636 5.636a9 9 0 1012 12.728M6.343 7.757a3 3 0 019-4.243 4.125 4.125M13.5 12.25a9 9 0 019-6.363 6.363m0 0 0-4.243 4.125L4.757 13.5m12.743 1.743a3 3 0 00-4.243-4.243m0 0 00-4.243 4.244"/></svg>
                     Run Tests
                 </button>
-                <button type="button" id="clear-cache-btn"
-                    class="px-4 py-3 rounded-xl bg-brand-700/50 hover:bg-brand-600/60 text-brand-200 font-medium text-sm transition-all duration-200 cursor-pointer border border-brand-600/40 flex items-center gap-2">
+                <button type="button" id="clear-cache-btn" class="btn-secondary py-3 flex items-center gap-2">
                     <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M14.74 9l-.346 9m-4.788 0A9.965 9.965 0 010.788 0m-9.788 0A9.965 9.965 0 017.512 0M5.25 4.236V19.5"/></svg>
                     Clear Cache
                 </button>
@@ -96,26 +90,28 @@
     </div>
 
     <!-- Cached method indicator -->
-    <div id="cache-status" class="hidden mb-6 rounded-xl bg-brand-800/50 border border-brand-700/30 px-4 py-3 flex items-center gap-3">
-        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M9.568 3H5.25A2.25 2.25 0 003 5.25m9.228 9.228a3 3 0 00-2.12-0.88M12 15v-1.5m0 0 1.5H3M12 9v-6"/></svg>
-        <span id="cache-status-text" class="text-xs text-brand-400"></span>
+    <div id="cache-status" class="hidden mb-6 panel px-4 py-3 flex items-center gap-3">
+        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="text-ink-secondary"><path stroke-linecap="round" stroke-linejoin="round" d="M9.568 3H5.25A2.25 2.25 0 003 5.25m9.228 9.228a3 3 0 00-2.12-0.88M12 15v-1.5m0 0 1.5H3M12 9v-6"/></svg>
+        <span id="cache-status-text" class="text-xs text-ink-secondary"></span>
     </div>
 
     <!-- Results table -->
-    <div id="results-container" class="hidden rounded-2xl bg-surface border border-brand-700/30 overflow-hidden">
-        <table class="w-full text-sm">
+    <div id="results-container" class="hidden panel overflow-hidden">
+     <div class="overflow-x-auto scrollbar-thin">
+        <table class="w-full text-sm" style="min-width: 600px;">
             <thead>
-                <tr class="bg-brand-700/50 border-b border-brand-600/40">
-                    <th class="px-4 py-2.5 text-left text-xs font-bold text-brand-400 uppercase tracking-wider">Method</th>
-                    <th class="px-4 py-2.5 text-center text-xs font-bold text-brand-400 uppercase tracking-wider">Result</th>
-                    <th class="px-4 py-2.5 text-center text-xs font-bold text-brand-400 uppercase tracking-wider">Status</th>
-                    <th class="px-4 py-2.5 text-center text-xs font-bold text-brand-400 uppercase tracking-wider">Body</th>
-                    <th class="px-4 py-2.5 text-center text-xs font-bold text-brand-400 uppercase tracking-wider">Time</th>
-                    <th class="px-4 py-2.5 text-center text-xs font-bold text-brand-400 uppercase tracking-wider">Action</th>
+                <tr class="bg-raised/30 border-b border-line-subtle">
+                    <th class="px-4 py-2.5 text-left text-xs-label text-ink-muted uppercase tracking-wider">Method</th>
+                    <th class="px-4 py-2.5 text-center text-xs-label text-ink-muted uppercase tracking-wider">Result</th>
+                    <th class="px-4 py-2.5 text-center text-xs-label text-ink-muted uppercase tracking-wider">Status</th>
+                    <th class="px-4 py-2.5 text-center text-xs-label text-ink-muted uppercase tracking-wider">Body</th>
+                    <th class="px-4 py-2.5 text-center text-xs-label text-ink-muted uppercase tracking-wider">Time</th>
+                    <th class="px-4 py-2.5 text-center text-xs-label text-ink-muted uppercase tracking-wider">Action</th>
                 </tr>
             </thead>
             <tbody id="results-body"></tbody>
         </table>
+     </div>
     </div>
 
 </div>
@@ -185,21 +181,21 @@
     }
 
     function resultBadge(success, blocked) {
-        if (success) return '<span class="inline-flex px-2 py-0.5 rounded-md bg-green-500/20 text-green-400 text-[10px] font-semibold uppercase">Pass</span>';
-        if (blocked) return '<span class="inline-flex px-2 py-0.5 rounded-md bg-amber-500/20 text-amber-400 text-[10px] font-semibold uppercase">Blocked</span>';
-        return '<span class="inline-flex px-2 py-0.5 rounded-md bg-red-500/20 text-red-400 text-[10px] font-semibold uppercase">Fail</span>';
+        if (success) return '<span class="inline-flex px-2 py-0.5 rounded-md bg-success/20 text-success text-[10px] font-semibold uppercase font-mono">Pass</span>';
+        if (blocked) return '<span class="inline-flex px-2 py-0.5 rounded-md bg-warning/20 text-warning text-[10px] font-semibold uppercase font-mono">Blocked</span>';
+        return '<span class="inline-flex px-2 py-0.5 rounded-md bg-danger/20 text-danger text-[10px] font-semibold uppercase font-mono">Fail</span>';
     }
 
     function createRow(method) {
         const tr = document.createElement('tr');
         tr.id = 'row-' + method;
-        tr.className = 'border-b border-brand-700/20 hover:bg-brand-700/20 transition-colors';
+        tr.className = 'border-b border-line-subtle last:border-0 hover:bg-raised/50 transition-colors';
         tr.innerHTML = `
             <td class="px-4 py-2.5">
-                <span class="font-mono text-xs text-brand-200">${methodDisplayName(method)}</span>
+                <span class="font-mono text-xs text-ink">${methodDisplayName(method)}</span>
             </td>
             <td class="px-4 py-2.5 text-center" id="result-${method}">—</td>
-            <td class="px-4 py-2.5 text-center" id="status-${method}">—</td>
+            <td class="px-4 py-2.5 text-center font-mono text-xs" id="status-${method}">—</td>
             <td class="px-4 py-2.5 text-center font-mono text-xs" id="body-${method}">—</td>
             <td class="px-4 py-2.5 text-center font-mono text-xs" id="time-${method}">—</td>
             <td class="px-4 py-2.5 text-center" id="action-${method}">—</td>
@@ -221,14 +217,14 @@
 
         const actionId = 'action-' + method;
         if (success) {
-            document.getElementById(actionId).innerHTML = `<button onclick="updateCache('${data.url || ''}', '${method}')" class="px-2 py-1 rounded-lg bg-blue-500/20 text-blue-400 text-[10px] font-medium hover:bg-blue-500/30 transition-colors cursor-pointer">Cache</button>`;
+            document.getElementById(actionId).innerHTML = `<button onclick="updateCache('${data.url || ''}', '${method}')" class="px-2 py-1 rounded-md bg-accent/15 text-accent text-[10px] font-medium hover:bg-accent/25 transition-colors cursor-pointer font-mono">Cache</button>`;
         } else {
             document.getElementById(actionId).textContent = '—';
         }
     }
 
     function setRowRunning(method) {
-        document.getElementById('result-' + method).innerHTML = '<span class="inline-flex items-center gap-1.5 text-brand-400 text-xs"><svg class="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" opacity="0.25"><path fill="currentColor" d="M4 12a8 8 0 018-8V12" stroke-opacity="0.25"/></svg></span>Running...</span>';
+        document.getElementById('result-' + method).innerHTML = '<span class="inline-flex items-center gap-1.5 text-ink-secondary text-xs font-mono"><svg class="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" opacity="0.25"/><path fill="currentColor" d="M4 12a8 8 0 018-8V12" stroke-opacity="0.25"/></svg>Running...</span>';
         ['status', 'body', 'time'].forEach(f => {
             const el = document.getElementById(f + '-' + method);
             if (el) el.textContent = '...';
@@ -237,7 +233,7 @@
     }
 
     function setRowError(method, errorMsg) {
-        document.getElementById('result-' + method).innerHTML = '<span class="inline-flex px-2 py-0.5 rounded-md bg-red-500/20 text-red-400 text-[10px] font-semibold uppercase">Error</span>';
+        document.getElementById('result-' + method).innerHTML = '<span class="inline-flex px-2 py-0.5 rounded-md bg-danger/20 text-danger text-[10px] font-semibold uppercase font-mono">Error</span>';
         document.getElementById('status-' + method).textContent = 'error';
         const actionId = 'action-' + method;
         document.getElementById(actionId).textContent = '—';
@@ -363,9 +359,9 @@
             }).then(r => r.json()).then(data => {
                 if (data.method) {
                     cacheStatus.classList.remove('hidden');
-                    cacheText.innerHTML = 'Cached method: <strong>' + data.method.replace(/_/g, ' ') + '</strong>' +
-                        (data.needs_akamai_bypass ? ' (Akamai detected)' : '') +
-                        ' — <button onclick="clearCacheDomain()" class="text-cta hover:text-blue-400 underline ml-1 cursor-pointer">clear</button>';
+                    cacheText.innerHTML = 'Cached method: <strong class="text-accent">' + data.method.replace(/_/g, ' ') + '</strong>' +
+                        (data.needs_akamai_bypass ? ' <span class="text-warning">(Akamai detected)</span>' : '') +
+                        ' — <button onclick="clearCacheDomain()" class="text-accent hover:text-accent-hover underline ml-1 cursor-pointer">clear</button>';
                 }
             }).catch(() => {});
         }

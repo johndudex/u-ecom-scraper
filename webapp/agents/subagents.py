@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 AGENT_TEMPERATURES: dict[str, float] = {
     "site-analyzer": 0.2,
     "product-analyzer": 0.2,
+    "navigation-agent": 0.2,
+    "navigation-synthesize": 0.2,
+    "nav-skill-review": 0.2,
     "scraper-analyzer": 0.2,
     "code-writer": 0.4,
     "code-tester": 0.1,
@@ -45,6 +48,10 @@ AGENT_TEMPERATURES: dict[str, float] = {
 AGENT_PROMPT_MAP: dict[str, str] = {
     "site_analyzer": "site-analyzer",
     "product_analyzer": "product-analyzer",
+    "navigation_agent": "navigation-agent",
+    "navigation_explore": "navigation-agent",
+    "navigation_synthesize": "navigation-synthesize",
+    "nav_skill_review": "nav-skill-review",
     "scraper_analyzer": "scraper-analyzer",
     "code_writer": "code-writer",
     "code_tester": "code-tester",
@@ -56,6 +63,10 @@ AGENT_PROMPT_MAP: dict[str, str] = {
 AGENT_MAX_ITERATIONS: dict[str, int] = {
     "site_analyzer": 30,
     "product_analyzer": 30,
+    "navigation_agent": 40,
+    "navigation_explore": 20,
+    "navigation_synthesize": 15,
+    "nav_skill_review": 15,
     "scraper_analyzer": 30,
     "code_writer": 20,
     "code_tester": 20,
@@ -70,6 +81,29 @@ BROWSER_UNAVAILABLE_WARNING = (
     "automatically. If probe_page also fails, write analysis based on "
     "URL structure and any existing workspace artifacts."
 )
+
+
+def _build_content_type_context(state: dict) -> str:
+    """Build a concise content-type context block for agent messages."""
+    content_type_config = state.get("content_type_config", {})
+    if not content_type_config:
+        return ""
+    ct_name = content_type_config.get("content_type", "")
+    output_key = content_type_config.get("output_key", "products")
+    fields = content_type_config.get("fields", [])
+    if not ct_name and not fields:
+        return ""
+    lines = ["### Content Type Context\n"]
+    if ct_name:
+        lines.append(f"- Scraping content type: **{ct_name}**")
+    if output_key:
+        lines.append(f"- Output key in JSON: `{output_key}`")
+    if fields:
+        core = [f for f in fields if f.get("required")]
+        if core:
+            field_names = ", ".join(f["name"] for f in core)
+            lines.append(f"- Core fields to expect: {field_names}")
+    return "\n".join(lines) + "\n\n"
 
 
 def _get_skill_descriptions() -> str:
@@ -161,6 +195,18 @@ def create_scraper_analyzer(site_slug: str = "") -> object:
     return _build_agent("scraper_analyzer", site_slug=site_slug)
 
 
+def create_navigation_agent(site_slug: str = "") -> object:
+    return _build_agent("navigation_agent", site_slug=site_slug)
+
+
+def create_navigation_synthesize(site_slug: str = "") -> object:
+    return _build_agent("navigation_synthesize", site_slug=site_slug)
+
+
+def create_nav_skill_review(site_slug: str = "") -> object:
+    return _build_agent("nav_skill_review", site_slug=site_slug)
+
+
 def create_code_writer(site_slug: str = "") -> object:
     return _build_agent("code_writer", site_slug=site_slug)
 
@@ -244,8 +290,7 @@ def _strip_v_prefix_from_tools(tools: list) -> list:
     def _patched_parse_input(self, tool_input, tool_call_id):
         if isinstance(tool_input, dict):
             tool_input = {
-                (k[3:] if k.startswith("v__") else k): v
-                for k, v in tool_input.items()
+                (k[3:] if k.startswith("v__") else k): v for k, v in tool_input.items()
             }
         return _original_parse_input(self, tool_input, tool_call_id)
 
@@ -372,11 +417,22 @@ def _apply_guards(tools: list, agent_name: str) -> list:
         apply_guard,
         require_non_akamai_tool,
         require_non_blocked_domain,
+        require_same_domain,
         require_target_url,
     )
 
-    guarded_agents = {"site_analyzer", "product_analyzer", "scraper_analyzer"}
-    url_locked_agents = {"site_analyzer", "product_analyzer"}
+    guarded_agents = {
+        "site_analyzer",
+        "product_analyzer",
+        "scraper_analyzer",
+        "navigation_agent",
+    }
+    url_locked_agents = {"site_analyzer", "product_analyzer", "navigation_agent"}
+    domain_locked_agents = {
+        "site_analyzer",
+        "product_analyzer",
+        "scraper_analyzer",
+    }
 
     if agent_name not in guarded_agents:
         return tools
@@ -389,19 +445,31 @@ def _apply_guards(tools: list, agent_name: str) -> list:
                 t = apply_guard(t, require_non_akamai_tool)
             if agent_name in url_locked_agents and "navigate" in name:
                 t = apply_guard(t, require_target_url)
+            if agent_name in domain_locked_agents:
+                t = apply_guard(t, require_same_domain)
             tools[i] = t
 
         elif name == "web_fetch":
             if agent_name in guarded_agents:
                 t = apply_guard(t, require_non_akamai_tool)
                 t = apply_guard(t, require_non_blocked_domain)
+                if agent_name in domain_locked_agents:
+                    t = apply_guard(t, require_same_domain)
+            elif agent_name == "code_tester":
+                t = apply_guard(t, require_non_akamai_tool)
+            tools[i] = t
+
+        elif name == "probe_page":
+            if agent_name in domain_locked_agents:
+                t = apply_guard(t, require_same_domain)
             tools[i] = t
 
     logger.info(
-        "Guards applied for '%s': non_akamai=%s, target_url=%s",
+        "Guards applied for '%s': non_akamai=%s, target_url=%s, same_domain=%s",
         agent_name,
         agent_name in guarded_agents,
         agent_name in url_locked_agents,
+        agent_name in domain_locked_agents,
     )
     return tools
 
@@ -413,12 +481,13 @@ def build_site_analyzer_message(state: dict) -> list:
     """Build the initial HumanMessage for the site-analyzer agent."""
     slug = state.get("site_slug", "unknown")
     url = state.get("url", "")
-    product_url = state.get("product_url") or "auto-discover"
+    product_url = state.get("product_url") or state.get("sample_url") or "auto-discover"
     currency = state.get("currency") or "auto-detect"
 
-    cached_probe = ""
+    content_type_context = _build_content_type_context(state)
     probe_result = state.get("probe_result")
     has_verified_probe = False
+    cached_probe = ""
     if probe_result and probe_result.get("connectivity"):
         conn = probe_result["connectivity"]
         verified = probe_result.get("captcha_verified", False)
@@ -429,27 +498,32 @@ def build_site_analyzer_message(state: dict) -> list:
             f"Do NOT call probe_page again — use this data directly:\n"
             f"```\n"
             f"method_that_worked: {conn.get('method_that_worked', 'unknown')}\n"
+            f"http_method: {conn.get('http_method', 'none')}\n"
+            f"browser_method: {conn.get('browser_method', 'none')}\n"
             f"proxy_tier: {conn.get('proxy_tier', 'none')}\n"
             f"js_rendering_needed: {conn.get('js_rendering_needed', True)}\n"
             f"anti_bot_detected: {conn.get('anti_bot_detected', False)}\n"
             f"```\n"
-            f"**IMPORTANT**: The connectivity method above is the ONLY one that bypasses "
-            f"captcha/anti-bot. Use it in your site_analysis.json connectivity section.\n"
+            f"**IMPORTANT**: The connectivity methods above bypass captcha/anti-bot. "
+            f"Use `method_that_worked` in your site_analysis.json connectivity section. "
+            f"If `http_method` is available, HTTP requests may also work. "
+            f"If `browser_method` is available but different from `method_that_worked`, "
+            f"prefer `method_that_worked` for scraping.\n"
         )
 
     if has_verified_probe:
         access_strategy = (
-            f"### Page Access Strategy\n\n"
-            f"The page has already been probed (see Pre-verified Probe Result above). "
-            f"**Do NOT call probe_page** — it would waste a tool call and return the same cached data.\n\n"
-            f"Use `playwright_browser_*` tools directly if you need deeper analysis "
-            f"(network requests, cookies, DOM inspection). Otherwise, proceed directly to "
-            f"writing site_analysis.json with the connectivity data from the pre-verified probe.\n\n"
+            "### Page Access Strategy\n\n"
+            "The page has already been probed (see Pre-verified Probe Result above). "
+            "**Do NOT call probe_page** — it would waste a tool call and return the same cached data.\n\n"
+            "Use `playwright_browser_*` tools directly if you need deeper analysis "
+            "(network requests, cookies, DOM inspection). Otherwise, proceed directly to "
+            "writing site_analysis.json with the connectivity data from the pre-verified probe.\n\n"
         )
         call_allocation = (
-            f"### Call Allocation (target: 3-5 calls)\n"
-            f"1. Optional: playwright_browser_* for deeper analysis (0-2 calls)\n"
-            f"2. write_file to save analysis (1 call)\n\n"
+            "### Call Allocation (target: 3-5 calls)\n"
+            "1. Optional: playwright_browser_* for deeper analysis (0-2 calls)\n"
+            "2. write_file to save analysis (1 call)\n\n"
         )
     else:
         access_strategy = (
@@ -470,20 +544,21 @@ def build_site_analyzer_message(state: dict) -> list:
             f"(network requests, cookies) if the probe result is inconclusive.\n\n"
         )
         call_allocation = (
-            f"### Call Allocation (target: 5-8 calls)\n"
-            f"1. probe_page on product URL (1 call)\n"
-            f"2. Optional: playwright_browser_* for deeper analysis (1-3 calls)\n"
-            f"3. write_file to save analysis (1 call)\n\n"
+            "### Call Allocation (target: 5-8 calls)\n"
+            "1. probe_page on product URL (1 call)\n"
+            "2. Optional: playwright_browser_* for deeper analysis (1-3 calls)\n"
+            "3. write_file to save analysis (1 call)\n\n"
         )
 
     content = (
         f"## OBJECTIVE\n"
-        f"Building a product scraper for {url}. The scraper reads product URLs "
-        f"from `input_urls.json` and extracts data from each product page.\n\n"
+        f"Building a scraper for {url}. The scraper reads URLs "
+        f"from `input_urls.json` and extracts data from each page.\n\n"
+        f"{content_type_context}"
         f"## Your Task: Site Analysis\n\n"
-        f"Analyze the **product page** below to determine platform, anti-bot "
+        f"Analyze the **page** below to determine platform, anti-bot "
         f"protection, and the best scraping mechanism.\n\n"
-        f"**Product URL (analyze this page):** {product_url}\n"
+        f"**Page URL (analyze this page):** {product_url}\n"
         f"**Site URL (for reference):** {url}\n"
         f"**Currency:** {currency}\n"
         f"**Site slug:** {slug}\n"
@@ -525,7 +600,28 @@ def build_site_analyzer_message(state: dict) -> list:
 def build_product_analyzer_message(state: dict) -> list:
     slug = state.get("site_slug", "unknown")
     url = state.get("url", "")
-    product_url = state.get("product_url") or "auto-discover"
+    product_url = state.get("product_url") or state.get("sample_url") or ""
+
+    if not product_url:
+        nav_findings = state.get("navigation_findings") or {}
+        listing = nav_findings.get("listing_page", {})
+        product_links = listing.get("product_links", [])
+        if product_links:
+            from urllib.parse import urlparse
+            candidate = product_links[0].get("href", "") if isinstance(product_links[0], dict) else str(product_links[0])
+            parsed = urlparse(candidate)
+            path_parts = [p for p in parsed.path.split("/") if p]
+            if len(path_parts) >= 3 and not candidate.endswith("/"):
+                product_url = candidate
+            else:
+                logger.warning(
+                    "build_product_analyzer_message: skipping nav product link "
+                    "(looks like a category page, not product): %s", candidate[:120]
+                )
+    if not product_url:
+        product_url = "auto-discover"
+
+    content_type_context = _build_content_type_context(state)
 
     cached_probe = ""
     probe_result = state.get("probe_result")
@@ -539,6 +635,8 @@ def build_product_analyzer_message(state: dict) -> list:
             f"The site_analyzer already probed this page{verified}. Use this data instead of calling probe_page again:\n"
             f"```\n"
             f"method_that_worked: {conn.get('method_that_worked', 'unknown')}\n"
+            f"http_method: {conn.get('http_method', 'none')}\n"
+            f"browser_method: {conn.get('browser_method', 'none')}\n"
             f"proxy_tier: {conn.get('proxy_tier', 'none')}\n"
             f"js_rendering_needed: {conn.get('js_rendering_needed', True)}\n"
             f"anti_bot_detected: {conn.get('anti_bot_detected', False)}\n"
@@ -548,18 +646,18 @@ def build_product_analyzer_message(state: dict) -> list:
 
     if has_verified_probe:
         access_strategy = (
-            f"### Page Access Strategy\n\n"
-            f"The page has already been probed (see Cached Probe Result above). "
-            f"**Do NOT call probe_page** — it would waste a tool call and return the same data.\n\n"
-            f"Use `playwright_browser_*` tools directly for deeper analysis (DOM inspection, "
-            f"additional selectors, network requests) if needed.\n\n"
+            "### Page Access Strategy\n\n"
+            "The page has already been probed (see Cached Probe Result above). "
+            "**Do NOT call probe_page** — it would waste a tool call and return the same data.\n\n"
+            "Use `playwright_browser_*` tools directly for deeper analysis (DOM inspection, "
+            "additional selectors, network requests) if needed.\n\n"
         )
         workflow = (
-            f"### Workflow\n"
-            f"1. Read site_analysis.json (1 call)\n"
-            f"2. Map all fields from cached probe result — JSON-LD, selectors, meta tags\n"
-            f"3. Optionally use playwright_browser_* for additional selector testing (2-5 calls)\n"
-            f"4. write_file to save field mapping (1 call)\n\n"
+            "### Workflow\n"
+            "1. Read site_analysis.json (1 call)\n"
+            "2. Map all fields from cached probe result — JSON-LD, selectors, meta tags\n"
+            "3. Optionally use playwright_browser_* for additional selector testing (2-5 calls)\n"
+            "4. write_file to save field mapping (1 call)\n\n"
         )
     else:
         access_strategy = (
@@ -577,22 +675,23 @@ def build_product_analyzer_message(state: dict) -> list:
             f"- Which connection method and proxy tier worked\n\n"
         )
         workflow = (
-            f"### Workflow\n"
-            f"1. Read site_analysis.json (1 call)\n"
-            f"2. Call probe_page on the product URL (1 call)\n"
-            f"3. Map all fields from probe result — JSON-LD, selectors, meta tags\n"
-            f"4. Optionally use playwright_browser_evaluate for additional selector testing (2-5 calls)\n"
-            f"5. write_file to save field mapping (1 call)\n\n"
+            "### Workflow\n"
+            "1. Read site_analysis.json (1 call)\n"
+            "2. Call probe_page on the product URL (1 call)\n"
+            "3. Map all fields from probe result — JSON-LD, selectors, meta tags\n"
+            "4. Optionally use playwright_browser_evaluate for additional selector testing (2-5 calls)\n"
+            "5. write_file to save field mapping (1 call)\n\n"
         )
 
     content = (
         f"## OBJECTIVE\n"
-        f"Building a product scraper for {url}. The scraper reads product URLs "
-        f"from `input_urls.json` and extracts data from each product page.\n\n"
-        f"## Your Task: Product Field Mapping\n\n"
-        f"Critically review the site analysis, then analyze the **ONE product page** "
+        f"Building a scraper for {url}. The scraper reads URLs "
+        f"from `input_urls.json` and extracts data from each page.\n\n"
+        f"{content_type_context}"
+        f"## Your Task: Content Field Mapping\n\n"
+        f"Critically review the site analysis, then analyze the **page** "
         f"below to map every extractable field with exact selectors.\n\n"
-        f"**Product URL (analyze this page):** {product_url}\n"
+        f"**Page URL (analyze this page):** {product_url}\n"
         f"**Site URL:** {url}\n"
         f"**Site slug:** {slug}\n"
         f"**Site analysis:** workspace/{slug}/site_analysis.json\n"
@@ -632,27 +731,250 @@ def build_product_analyzer_message(state: dict) -> list:
     return [HumanMessage(content=content)]
 
 
+def build_navigation_agent_message(state: dict) -> list:
+    slug = state.get("site_slug", "unknown")
+    url = state.get("url", "")
+    input_mode = state.get("input_mode", "navigation")
+    search_criteria = state.get("search_criteria", "")
+
+    content_type_context = _build_content_type_context(state)
+
+    probe_result = state.get("probe_result")
+    connectivity_section = ""
+    if probe_result and probe_result.get("connectivity"):
+        conn = probe_result["connectivity"]
+        connectivity_section = (
+            f"\n### Pre-verified Connectivity (from site_analyzer)\n"
+            f"```\n"
+            f"method_that_worked: {conn.get('method_that_worked', 'unknown')}\n"
+            f"http_method: {conn.get('http_method', 'none')}\n"
+            f"browser_method: {conn.get('browser_method', 'none')}\n"
+            f"proxy_tier: {conn.get('proxy_tier', 'none')}\n"
+            f"js_rendering_needed: {conn.get('js_rendering_needed', True)}\n"
+            f"anti_bot_detected: {conn.get('anti_bot_detected', False)}\n"
+            f"```\n"
+            f"Use this connectivity method for all page access. Do NOT call probe_page.\n\n"
+        )
+
+    mode_section = ""
+    if input_mode == "list_page":
+        sample_url = state.get("sample_url") or state.get("product_url") or ""
+        mode_section = (
+            f"\n### Input Mode: List Page Analysis\n"
+            f"The user has provided a listing page URL. Analyze THIS page:\n"
+            f"**Listing page URL:** {sample_url}\n\n"
+            f"Focus on:\n"
+            f"- Item link pattern (how to extract content page URLs from this listing)\n"
+            f"- Pagination (how to get more pages)\n"
+            f"- Skip search and category analysis — the user already has the listing page\n\n"
+        )
+    else:
+        mode_section = (
+            f"\n### Input Mode: Navigation Analysis\n"
+            f'**Search criteria:** "{search_criteria}"\n\n'
+            f"Analyze:\n"
+            f"- Search functionality (search box, URL-based search, or both)\n"
+            f"- Category navigation (menus, dropdowns, category links)\n"
+            f"- Pagination (next button, page params, infinite scroll)\n"
+            f"- Item link patterns from search/category results\n\n"
+        )
+
+    content = (
+        f"## OBJECTIVE\n"
+        f"Analyze the navigation patterns of {url} to enable a self-navigating scraper.\n\n"
+        f"{content_type_context}"
+        f"## Your Task: Navigation Pattern Analysis\n\n"
+        f"**Site URL:** {url}\n"
+        f"**Site slug:** {slug}\n"
+        f"**Input mode:** {input_mode}\n"
+        f"**Site analysis:** workspace/{slug}/site_analysis.json\n"
+        f"**Save artifact to:** workspace/{slug}/navigation_analysis.json\n"
+        f"{connectivity_section}"
+        f"{mode_section}"
+        f"### Workflow\n"
+        f"1. Read site_analysis.json (1 call)\n"
+        f"2. Navigate to the site homepage or listing page (1 call)\n"
+        f"3. Explore navigation patterns: search, categories, pagination, item links (5-15 calls)\n"
+        f"4. Write navigation_analysis.json (1 call)\n\n"
+        f"### BUDGET: {'40' if input_mode == 'navigation' else '20'} tool calls maximum.\n\n"
+        f"### WRITE EARLY — CRITICAL\n"
+        f"Write navigation_analysis.json as soon as you have the key patterns "
+        f"(search + item_links minimum). Overwrite later if you find more.\n\n"
+        f"### What NOT to Do\n"
+        f"- Do NOT collect individual content URLs — analyze patterns only\n"
+        f"- Do NOT scrape content from individual pages\n"
+        f"- Do NOT call probe_page — use connectivity info from site_analysis\n"
+        f"- Do NOT crawl more than 2-3 pages\n"
+        f"- Do NOT explore related search terms beyond the given criteria\n"
+        f"- Do NOT write scraper code\n\n"
+        f"**CRITICAL: You MUST call write_file to save the analysis as JSON to "
+        f"workspace/{slug}/navigation_analysis.json. Do NOT just print the analysis as text.**"
+    )
+    return [HumanMessage(content=content)]
+
+
+def build_navigation_synthesize_message(state: dict) -> list:
+    """Build the prompt for the navigation synthesis agent.
+
+    This agent reads raw findings (from navigate_explore) and produces
+    the structured navigation_analysis.json. It has NO browser/web tools —
+    it can only read files and write files.
+    """
+    slug = state.get("site_slug", "unknown")
+    url = state.get("url", "")
+    search_criteria = state.get("search_criteria", "")
+    input_mode = state.get("input_mode", "navigation")
+
+    content = (
+        f"## OBJECTIVE\n"
+        f"Convert raw navigation exploration data into structured navigation_analysis.json.\n\n"
+        f"## Context\n"
+        f"**Site URL:** {url}\n"
+        f"**Site slug:** {slug}\n"
+        f"**Input mode:** {input_mode}\n"
+        f"**Search criteria:** {search_criteria}\n\n"
+        f"## Your Task\n\n"
+        f"You have TWO files to read:\n"
+        f"1. `workspace/{slug}/navigation_findings.json` — raw data extracted by the "
+        f"deterministic explorer (category links, search form, pagination, item links)\n"
+        f"2. `workspace/{slug}/site_analysis.json` — site platform info, connectivity, "
+        f"product URL patterns\n\n"
+        f"Read both files, then **write** `workspace/{slug}/navigation_analysis.json` "
+        f"with this exact structure:\n\n"
+        f"```json\n"
+        f"{{\n"
+        f'  "discovery_method": "search | category | url_pattern",\n'
+        f'  "search": {{\n'
+        f'    "has_search": true/false,\n'
+        f'    "input_selector": "CSS selector for search input",\n'
+        f'    "submit_selector": "CSS selector for submit button",\n'
+        f'    "url_pattern": "URL pattern with {{query}} placeholder",\n'
+        f'    "has_url_search": true/false,\n'
+        f'    "search_url_pattern": "/search?q={{query}}"\n'
+        f"  }},\n"
+        f'  "categories": {{\n'
+        f'    "menu_selector": "CSS selector for category menu",\n'
+        f'    "category_links": ["url1", "url2"],\n'
+        f'    "url_patterns": ["/category/{{slug}}"]\n'
+        f"  }},\n"
+        f'  "pagination": {{\n'
+        f'    "type": "next_button | page_param | infinite_scroll | load_more",\n'
+        f'    "next_button_selector": "CSS selector",\n'
+        f'    "page_param_name": "page | pnum | p",\n'
+        f'    "max_pages": null,\n'
+        f'    "total_count_selector": "CSS selector for item count text"\n'
+        f"  }},\n"
+        f'  "item_links": {{\n'
+        f'    "container_selector": "CSS selector for item grid container",\n'
+        f'    "link_selector": "CSS selector for item links",\n'
+        f'    "url_pattern": "URL pattern for items",\n'
+        f'    "url_examples": ["url1", "url2"]\n'
+        f"  }}\n"
+        f"}}\n"
+        f"```\n\n"
+        f"## Rules\n\n"
+        f"- READ the findings file FIRST (1 call)\n"
+        f"- READ site_analysis.json if you need platform/URL info (1 call)\n"
+        f"- WRITE navigation_analysis.json (1 call)\n"
+        f"- That's 2-3 calls total. Do NOT do anything else.\n"
+        f"- If the findings have 0 category links AND 0 product links, the "
+        f"exploration FAILED. Write discovery_method: 'failed' and leave all "
+        f"selectors and url_examples as empty strings. Do NOT fabricate URLs, "
+        f"selectors, or platform-specific details. Empty is better than wrong.\n"
+        f"- Only include url_examples that appear verbatim in the findings JSON. "
+        f"Never invent URLs or selectors that are not grounded in the data.\n"
+        f"- Choose `discovery_method` based on what's available: prefer 'search' if "
+        f"the site has a working search and criteria was provided; use 'category' if "
+        f"categories were found; use 'failed' if both are empty.\n"
+        f"- Check the top-level `search_attempted` field in navigation_findings.json. "
+        f"If it is `true`, the explorer tried searching even if `homepage_nav.search_form` "
+        f"is null or absent. In that case, set `search.has_search: true` and "
+        f"`search.has_url_search: true`.\n"
+        f"- For selectors, use the most specific CSS selector you can derive from the "
+        f"raw data (parent classes, element types, attributes). If no data, leave empty.\n\n"
+        f"**You MUST call write_file to save the output. Do NOT just print the JSON as text.**\n"
+    )
+    return [HumanMessage(content=content)]
+
+
+def build_nav_skill_review_message(state: dict) -> list:
+    """Build the initial HumanMessage for the nav-skill-review agent.
+
+    This agent reads raw navigation findings, compares them against existing
+    skills, and auto-applies reusable learnings by appending ``## Learned:``
+    sections to skill files. It runs after navigation_synthesize and is
+    non-blocking (failures don't halt the pipeline).
+    """
+    slug = state.get("site_slug", "unknown")
+    url = state.get("url", "")
+    platform = state.get("platform", "custom")
+
+    content = (
+        f"## OBJECTIVE\n"
+        f"Review navigation findings for {url} against existing skills and "
+        f"auto-apply any new reusable patterns.\n\n"
+        f"## Your Task: Navigation Skill Review\n\n"
+        f"**Site URL:** {url}\n"
+        f"**Site slug:** {slug}\n"
+        f"**Detected platform:** {platform}\n\n"
+        f"## Files to Read\n"
+        f"1. `workspace/{slug}/navigation_findings.json` — raw explorer data "
+        f"(category links, search form, pagination, item links, platform signals)\n"
+        f"2. `workspace/{slug}/site_analysis.json` — platform info, connectivity\n"
+        f"3. `workspace/{slug}/navigation_analysis.json` — structured analysis "
+        f"from synthesize (optional, for reference)\n\n"
+        f"## Workflow\n"
+        f"1. READ navigation_findings.json (1 call)\n"
+        f"2. READ site_analysis.json (1 call)\n"
+        f"3. LIST existing skills (1 call)\n"
+        f"4. LOAD 'navigation-patterns' skill — this is the PRIMARY skill to "
+        f"compare against (1 call)\n"
+        f"5. Optionally LOAD platform-specific skills if the site matches "
+        f"(shopify-detection, sfcc-detection, etc.) — 0-2 calls\n"
+        f"6. COMPARE findings against skills — identify 0-3 genuinely new patterns\n"
+        f"7. APPLY learnings: for each new pattern, use edit_file to APPEND a "
+        f"'## Learned:' section to the relevant skill. Use write_file ONLY to "
+        f"create a new skill file (rare).\n"
+        f"8. WRITE your report to workspace/{slug}/nav_learning_report.json "
+        f"(1 call — your LAST action)\n\n"
+        f"## BUDGET: 15 tool calls maximum.\n\n"
+        f"## ⚠️ Safe Auto-Apply Rules\n"
+        f"- You MAY append '## Learned: {{title}}' sections to existing skills\n"
+        f"- You MUST NOT remove or modify existing skill content\n"
+        f"- You MUST NOT overwrite entire skill files\n"
+        f"- You MUST NOT modify YAML frontmatter (the --- block at top)\n"
+        f"- When in doubt, append rather than create a new skill\n"
+        f"- Quality over quantity — ZERO learnings is better than wrong ones\n\n"
+        f"## When NOT to Apply\n"
+        f"- Pattern already documented in any skill (check carefully!)\n"
+        f"- Pattern is site-specific (e.g., a unique CSS class for one site)\n"
+        f"- Pattern is trivial (e.g., standard <nav> links)\n"
+        f"- Findings are incomplete (don't guess patterns from partial data)\n\n"
+        f"## Output Format for nav_learning_report.json\n"
+        f"```json\n"
+        f"{{\n"
+        f'  "site_slug": "{slug}",\n'
+        f'  "site_url": "{url}",\n'
+        f'  "platform": "{platform}",\n'
+        f'  "review_timestamp": "ISO-8601",\n'
+        f'  "patterns_reviewed": 0,\n'
+        f'  "new_patterns_found": 0,\n'
+        f'  "skills_updated": [],\n'
+        f'  "skills_created": [],\n'
+        f'  "patterns_skipped": [],\n'
+        f'  "status": "applied|no_new_patterns"\n'
+        f"}}\n"
+        f"```\n\n"
+        f"**CRITICAL: You MUST call write_file to save your report to "
+        f"workspace/{slug}/nav_learning_report.json as your LAST action. "
+        f"Even if you found no new patterns, write a report saying so.**"
+    )
+    return [HumanMessage(content=content)]
+
+
 def build_scraper_analyzer_message(state: dict) -> list:
     slug = state.get("site_slug", "unknown")
     url = state.get("url", "")
-    product_url = state.get("product_url") or ""
-
-    cached_probe = ""
-    probe_result = state.get("probe_result")
-    has_verified_probe = False
-    cached_proxy_tier = "none"
-    if probe_result and probe_result.get("connectivity"):
-        conn = probe_result["connectivity"]
-        verified = " (captcha-verified)" if probe_result.get("captcha_verified") else ""
-        has_verified_probe = True
-        cached_proxy_tier = conn.get("proxy_tier", "none")
-        cached_probe = (
-            f"\n### Cached Probe Result{verified}\n"
-            f"Page was already probed{verified}. Method that worked: `{conn.get('method_that_worked', 'unknown')}` "
-            f"with proxy tier `{conn.get('proxy_tier', 'none')}`. "
-            f"Anti-bot detected: {conn.get('anti_bot_detected', False)}.\n"
-            f"**Use this method and proxy tier — do NOT re-probe unless the analysis contradicts it.**\n"
-        )
 
     retry_section = ""
     scraper_draft_path = f"workspace/{slug}/scraper_draft.py"
@@ -660,86 +982,47 @@ def build_scraper_analyzer_message(state: dict) -> list:
     if state.get("test_report"):
         retry_section = (
             f"\n{_summarize_test_report(state)}\n"
-            f"Read the broken scraper at: {scraper_draft_path}\n"
             f"Read the previous analysis at: {scraper_analysis_path}\n"
-            f"Adjust the strategy, proxy tier, and selectors based on the failures above.\n"
-            f"Escalate proxy tier if connection was blocked.\n"
+            f"Adjust strategy and proxy tier based on failures. Escalate ONE proxy tier.\n"
         )
+
+    navigation_context = state.get("navigation_analysis")
+    nav_line = ""
+    nav_read = ""
+    if navigation_context:
+        nav_line = "This job uses a two-phase navigation scraper. Read navigation_analysis.json for discovery patterns.\n"
+        nav_read = "3. Read navigation_analysis.json (1 call)\n"
 
     content = (
         f"## OBJECTIVE\n"
-        f"Determine the **working** scraping strategy for {url} by verifying "
-        f"what upstream analyses found. Produce verified instructions for the code-writer.\n\n"
-        f"## Your Task: Strategy Verification\n\n"
-        f"**Product URL (test against this):** {product_url}\n"
-        f"**Site URL:** {url}\n"
+        f"Read upstream analyses and determine the scraping strategy for {url}.\n\n"
+        f"## Your Task: Strategy Analysis\n\n"
         f"**Site slug:** {slug}\n"
         f"**Site analysis:** workspace/{slug}/site_analysis.json\n"
         f"**Product analysis:** workspace/{slug}/product_analysis.json\n"
-        f"**Save artifact to:** workspace/{slug}/scraper_analysis.json\n"
-        f"{retry_section}{cached_probe}\n"
-        f"### Strategy Verification\n\n"
-        f"Site and product analyzers already probed the page using `probe_page`. "
-        f"Read their `connectivity` sections to understand what worked:\n"
-        f"- What method accessed the page (direct_http, browser_none, browser_datacenter, uc_chrome_none, uc_chrome_datacenter, etc.)\n"
-        f"- What proxy tier worked\n"
-        f"- Whether JS rendering was needed\n"
-        f"- Whether anti-bot was detected\n\n"
-        f"**Method → Strategy mapping (CRITICAL):**\n"
-        f"- `direct_http` → strategy `http_requests`, proxy_tier `none`\n"
-        f"- `browser_*` → strategy `playwright`, proxy_tier from suffix\n"
-        f"- `uc_chrome_*` → strategy `seleniumbase_uc`, proxy_tier from suffix\n"
-        f"  (means standard Playwright was blocked by anti-bot, but UC Chrome bypassed it)\n"
-        f"- `uc_chrome_none` → strategy `seleniumbase_uc`, proxy_tier `none`\n"
-        f"- `uc_chrome_datacenter` → strategy `seleniumbase_uc`, proxy_tier `datacenter`\n"
-        f"- `uc_chrome_residential` → strategy `seleniumbase_uc`, proxy_tier `residential`\n\n"
-        f"If connectivity info is missing or seems unreliable, call `probe_page` yourself:\n"
-        f"```\n"
-        f'probe_page(url="{product_url}", render_js=True)\n'
-        f"```\n\n"
+        f"**Save to:** workspace/{slug}/scraper_analysis.json\n\n"
+        f"{nav_line}{retry_section}"
         f"### Workflow\n"
-        f"1. Read site_analysis.json and product_analysis.json (1-2 calls)\n"
-        f"2. Check connectivity info from upstream analyses\n"
-        f"3. Optionally call probe_page to verify (1 call)\n"
-        f"4. Determine best strategy + proxy_tier based on connectivity\n"
-        f"5. Verify selectors from product_analysis against probe results\n"
-        f"6. write_file to save scraper_analysis.json (1 call)\n\n"
-    )
-
-    if has_verified_probe and cached_proxy_tier != "none":
-        content += (
-            f"### Proxy Configuration (PRE-VERIFIED)\n"
-            f"The pre-verified probe already determined that `{cached_proxy_tier}` proxy tier is required. "
-            f"Use **exactly** this proxy tier in the scraper strategy. Do NOT downgrade to 'none' — "
-            f"the site blocks direct connections.\n"
-            f"- Use proxy_tier = '{cached_proxy_tier}' in the strategy\n"
-            f"- On retry: escalate one level from `{cached_proxy_tier}` if still blocked\n\n"
-        )
-    else:
-        content += (
-            f"### Proxy Escalation (start with no proxy)\n"
-            f"- First attempt: proxy_tier = 'none' (direct connection)\n"
-            f"- If blocked: escalate to 'datacenter'\n"
-            f"- If still blocked: escalate to 'residential'\n"
-            f"- On retry: start from previous tier and escalate one level\n\n"
-        )
-
-    content += (
-        f"### Strategy Selection\n"
-        f"- If direct HTTP got full data → 'http_requests'\n"
-        f"- If direct HTTP got JSON-LD but no price → 'http_requests' with CSS fallback\n"
-        f"- If browser_* method worked (no anti-bot) → 'playwright'\n"
-        f"- If uc_chrome_* method worked (anti-bot bypassed) → 'seleniumbase_uc'\n"
-        f"- Always prefer simpler strategies over complex ones\n\n"
-        f"### BUDGET: 30 tool calls maximum.\n\n"
+        f"1. Read site_analysis.json (1 call)\n"
+        f"2. Read product_analysis.json (1 call)\n"
+        f"{nav_read}"
+        f"3. Determine strategy from `connectivity.method_that_worked`:\n"
+        f"   - `direct_http` → `http_requests`, proxy `none`\n"
+        f"   - `browser_none` → `playwright`, proxy `none`\n"
+        f"   - `uc_chrome_none` → `seleniumbase_uc`, proxy `none`\n"
+        f"   - `uc_chrome_datacenter` → `seleniumbase_uc`, proxy `datacenter`\n"
+        f"   - `uc_chrome_residential` → `seleniumbase_uc`, proxy `residential`\n"
+        f"   - SPA detected → MUST use browser strategy, NOT http_requests\n"
+        f"4. write_file to save scraper_analysis.json (1 call)\n\n"
+        f"### BUDGET: 8 tool calls maximum.\n\n"
         f"### What NOT to Do\n"
-        f"- Do NOT use Wayback Machine, archive.org, cached snapshots, or any archived version\n"
-        f"- Do NOT generate scraper code — that's code_writer's job\n"
-        f"- Do NOT assume product_analysis selectors are correct — verify them\n"
-        f"- Do NOT skip testing — if you can't verify, say so explicitly\n"
-        f"- Do NOT read or modify input_urls.json — that's code_writer's concern\n\n"
+        f"- Do NOT probe the site — site_analyzer already confirmed connectivity\n"
+        f"- Do NOT fetch pages or test selectors\n"
+        f"- Do NOT override site_analysis proxy findings without evidence\n"
+        f"- Do NOT generate scraper code\n"
+        f"- Do NOT read or modify input_urls.json\n\n"
         f"**CRITICAL: You MUST call write_file to save your analysis as JSON to "
-        f"workspace/{slug}/scraper_analysis.json. Do NOT just print it.**"
+        f"workspace/{slug}/scraper_analysis.json.**"
     )
     return [HumanMessage(content=content)]
 
@@ -753,11 +1036,11 @@ def _url_discovery_rules(site_input_urls: list[str]) -> str:
             f"provided by the user, NOT discovered links\n"
         )
     return (
-        f"- Do NOT read an existing input_urls.json from a previous run — write a fresh one\n"
-        f"- Do NOT add discovered/related product URLs to input_urls.json — "
-        f"only include the URL(s) provided by the user\n"
-        f"- input_urls.json MUST contain ONLY the Product URL(s) listed above, "
-        f"NOT discovered links\n"
+        "- Do NOT read an existing input_urls.json from a previous run — write a fresh one\n"
+        "- Do NOT add discovered/related product URLs to input_urls.json — "
+        "only include the URL(s) provided by the user\n"
+        "- input_urls.json MUST contain ONLY the Product URL(s) listed above, "
+        "NOT discovered links\n"
     )
 
 
@@ -805,7 +1088,7 @@ def build_code_writer_message(state: dict) -> list:
     """
     slug = state.get("site_slug", "unknown")
     url = state.get("url", "")
-    product_url = state.get("product_url", "")
+    product_url = state.get("product_url") or state.get("sample_url") or ""
     site_analysis = state.get("site_analysis") or {}
     scraper_analysis = state.get("scraper_analysis") or {}
     mechanism = scraper_analysis.get("strategy") or site_analysis.get(
@@ -814,12 +1097,18 @@ def build_code_writer_message(state: dict) -> list:
     algolia = site_analysis.get("algolia", {})
     site_input_urls = state.get("input_urls") or []
 
+    content_type_context = _build_content_type_context(state)
+    output_schema = state.get("output_schema", {})
+    _template_family = ""
+    if output_schema and "template_family" in output_schema:
+        _template_family = output_schema["template_family"]
+
     provided_urls_section = ""
     if site_input_urls:
         count = len(site_input_urls)
         provided_urls_section = (
-            f"\n### PROVIDED PRODUCT URLs (FROM SITE MODEL)\n"
-            f"The user has provided {count} product URLs via the Site configuration. "
+            f"\n### PROVIDED URLs (FROM SITE MODEL)\n"
+            f"The user has provided {count} URLs via the Site configuration. "
             f"These URLs are already saved to `workspace/{slug}/input_urls.json`.\n\n"
             f"**You MUST use these URLs exactly as provided.** Do NOT discover new URLs, "
             f"do NOT crawl categories or sitemaps, do NOT modify the URL list. "
@@ -942,24 +1231,159 @@ def build_code_writer_message(state: dict) -> list:
                 "\n### Additional Requirements\n" + "\n".join(extras) + "\n"
             )
 
+        seleniumbase_section = ""
+        if mechanism in (
+            "stealth_browser",
+            "undetected_chromedriver",
+            "seleniumbase_uc",
+        ):
+            seleniumbase_section = (
+                "\n### SeleniumBase UC Mode — MANDATORY API Constraints\n"
+                "The scraper MUST use SeleniumBase with UC Mode. Follow these rules EXACTLY:\n\n"
+"**SB() constructor — ONLY valid kwargs:**\n"
+            "```python\n"
+            "with SB(uc=True, xvfb=args.xvfb, locale_code='en-gb') as sb:\n"
+            "    driver = sb.driver\n"
+            "```\n"
+            "Valid kwargs: `uc`, `xvfb`, `locale_code`, `proxy`, `browser_args`, "
+            "`page_load_strategy`, `driver_type`, `use_auto_ext`\n"
+            "The run_scraper tool auto-injects `--xvfb` CLI flag. "
+            "Your argparse MUST accept `--xvfb` (action='store_true') and use "
+            "`args.xvfb` in SESSION_KWARGS — otherwise argparse rejects the flag and the scraper crashes.\n\n"
+            "**INVALID kwargs (NEVER use):** `chrome_args` (wrong → use `browser_args`), "
+            "`headless=True` with `uc=True` (unreliable → use `xvfb=True`), "
+            "`driver_kwargs` (doesn't exist)\n\n"
+                "**Page navigation — ALWAYS use driver.uc_open_with_reconnect():**\n"
+                "```python\n"
+                "driver.uc_open_with_reconnect(url, reconnect_time=4)\n"
+                "time.sleep(3)\n"
+                "```\n"
+                "Do NOT use `sb.open()` — it triggers EMPTY_PAGE_BLOCK detection that kills the session.\n\n"
+                "**JS execution — ALWAYS use driver.execute_script() directly:**\n"
+                "```python\n"
+                "data = driver.execute_script('return document.title')\n"
+                "```\n"
+                "Do NOT use `sb.execute_script()` (CDP Mode limitations) or "
+                "`sb.driver.execute_script()` (can crash CDP). "
+                "Just `driver.execute_script()` — it's the raw WebDriver API.\n\n"
+                "**Pattern summary:**\n"
+"```python\n"
+            "with SB(uc=True, xvfb=args.xvfb) as sb:\n"
+                "    driver = sb.driver\n"
+                "    driver.uc_open_with_reconnect(url, reconnect_time=4)\n"
+                "    time.sleep(3)\n"
+                "    data = driver.execute_script('return document.title')\n"
+                "```\n"
+            )
+
         scraper_analysis_section = (
             f"\n### Scraper Analysis (VERIFIED — follow these instructions)\n"
             f"**Strategy:** {mechanism}\n"
             f"**Proxy tier:** {proxy_tier}\n"
             f"**Strategy justification:** {scraper_analysis.get('strategy_justification', '')}\n"
             f"{proxy_instructions}{approach_section}{verified_section}{extras_section}"
+            f"{seleniumbase_section}"
             f"\n**Read the full scraper analysis:** workspace/{slug}/scraper_analysis.json\n"
         )
 
+    navigation_section = ""
+    navigation_analysis = state.get("navigation_analysis") or {}
+    if navigation_analysis:
+        input_mode = state.get("input_mode", "url_list")
+        discovery = navigation_analysis.get("discovery_method", "unknown")
+        search_info = navigation_analysis.get("search", {})
+        pagination_info = navigation_analysis.get("pagination", {})
+        item_links_info = navigation_analysis.get("item_links", {})
+        search_criteria = state.get("search_criteria", "")
+
+        nav_lines = [
+            "\n### Navigation Analysis (TWO-PHASE SCRAPER REQUIRED)\n",
+            f"**Discovery method:** {discovery}",
+            f"**Input mode:** {input_mode}",
+        ]
+
+        if search_info.get("has_search") or search_info.get("has_url_search"):
+            nav_lines.append("**Search:** supported")
+            if search_info.get("url_pattern"):
+                nav_lines.append(f"  - URL pattern: `{search_info['url_pattern']}`")
+            if search_info.get("input_selector"):
+                nav_lines.append(f"  - Search input: `{search_info['input_selector']}`")
+            if search_criteria:
+                nav_lines.append(f'  - Search criteria: "{search_criteria}"')
+
+        if pagination_info.get("type"):
+            nav_lines.append(f"**Pagination:** {pagination_info['type']}")
+            if pagination_info.get("next_button_selector"):
+                nav_lines.append(
+                    f"  - Next button: `{pagination_info['next_button_selector']}`"
+                )
+            if pagination_info.get("page_param_name"):
+                nav_lines.append(
+                    f"  - Page param: `{pagination_info['page_param_name']}`"
+                )
+            if pagination_info.get("max_pages"):
+                nav_lines.append(f"  - Max pages: {pagination_info['max_pages']}")
+
+        if item_links_info.get("container_selector"):
+            nav_lines.append(
+                f"**Item links:** container `{item_links_info['container_selector']}` "
+                f"→ link `{item_links_info.get('link_selector', 'a')}`"
+            )
+        if item_links_info.get("url_pattern"):
+            nav_lines.append(f"  - URL pattern: `{item_links_info['url_pattern']}`")
+
+        nav_lines.append(
+            "\n**Read the full navigation analysis:** "
+            f"workspace/{slug}/navigation_analysis.json\n"
+        )
+        nav_lines.append(
+            "\n### Two-Phase Architecture (REQUIRED for this scraper)\n"
+            "This scraper must implement TWO phases:\n\n"
+            "**Phase 1: Discover item URLs**\n"
+            "- Navigate to the site using the search/category patterns above\n"
+            "- Paginate through all result pages\n"
+            "- Collect item page URLs (NOT content — just URLs)\n"
+            "- Store discovered URLs in a list\n\n"
+            "**Phase 2: Scrape each item page**\n"
+            "- For each discovered URL, extract field data\n"
+            "- Map raw data to output fields\n"
+            "- Write results to output file\n\n"
+        )
+
+        _template_family = "navigation"
+        nav_template_hint = (
+            "\n### Template\nRead the template at: templates/navigation_scraper.py "
+            "and use it as your base for the two-phase architecture. "
+            "Adapt the Phase 1 (navigation) and Phase 2 (extraction) logic "
+            "to match this site's patterns.\n"
+        )
+
+        navigation_section = "\n".join(nav_lines)
+
+    if navigation_section:
+        if mechanism in (
+            "stealth_browser",
+            "undetected_chromedriver",
+            "seleniumbase_uc",
+        ):
+            template_hint = (
+                "\n### Template\nRead the template at: templates/undetected_chromedriver_scraper.py "
+                f"and use it as your base (SeleniumBase UC Mode). Adapt it for TWO-PHASE "
+                f"architecture: Phase 1 discovers product URLs via site navigation patterns from "
+                f"navigation_analysis.json, Phase 2 scrapes each discovered product page.\n"
+            )
+        else:
+            template_hint = _template_family and nav_template_hint or ""
+
     content = (
         f"## OBJECTIVE\n"
-        f"Build a **product scraper** for {url}. The scraper reads product URLs "
-        f"from `input_urls.json` (in its own directory) and extracts data from "
-        f"each product page.\n\n"
+        f"Build a **scraper** for {url}. "
+        f"{'The scraper discovers content via site navigation and extracts data from each page.' if navigation_section else 'The scraper reads URLs from `input_urls.json` (in its own directory) and extracts data from each page.'}\n\n"
+        f"{content_type_context}"
         f"## Your Task: Write the Scraper\n\n"
         f"**Site URL:** {url}\n"
         f"**Site slug:** {slug}\n"
-        f"**Product URL:** {product_url}\n"
+        f"**Sample URL:** {product_url}\n"
         f"**Scraping mechanism:** {mechanism or 'auto-detect'}\n"
         f"**Site analysis:** workspace/{slug}/site_analysis.json\n"
         f"**Product analysis:** workspace/{slug}/product_analysis.json\n"
@@ -967,31 +1391,53 @@ def build_code_writer_message(state: dict) -> list:
         f"**Save scraper to:** workspace/{slug}/scraper_draft.py\n"
         f"**Save input URLs to:** workspace/{slug}/input_urls.json"
         f"{provided_urls_section}"
-        f"{retry_section}{algolia_section}{template_hint}{scraper_analysis_section}\n\n"
+        f"{retry_section}{algolia_section}{navigation_section}{template_hint}{scraper_analysis_section}\n\n"
         f"### Architecture\n"
-        f"The scraper reads URLs from `input_urls.json` in SCRIPT_DIR and "
-        f"extracts data from EACH product page. For each URL:\n"
-        f"1. Extract product ID/codes from the URL\n"
-        f"2. Fetch product data (via API lookup, HTTP request, or page scrape)\n"
-        f"3. Map raw data to output fields\n"
-        f"4. Write results to `output_{{datetime}}.json`\n\n"
+    )
+    if navigation_section:
+        content += (
+            "The scraper has TWO phases:\n"
+            "**Phase 1: Navigate and discover item URLs.** "
+            "Use the search/category/pagination patterns from navigation_analysis.json. "
+            "Collect all item page URLs into a list.\n"
+            "**Phase 2: Scrape each discovered URL.** "
+            "Extract field data from each item page and map to output fields.\n"
+            "Write results to `output_{datetime}.json`.\n\n"
+            "### DO NOT (Navigation Scraper)\n"
+            "- Hardcode URLs — discover them dynamically using the navigation patterns\n"
+            "- Skip pagination — scrape ALL pages up to max_pages\n"
+            "- Use input_urls.json — the scraper discovers its own URLs\n"
+            "- Deviate from the navigation_analysis.json patterns\n\n"
+        )
+    else:
+        content += (
+            f"The scraper reads URLs from `input_urls.json` in SCRIPT_DIR and "
+            f"extracts data from EACH page. For each URL:\n"
+            f"1. Extract ID/codes from the URL\n"
+            f"2. Fetch data (via API lookup, HTTP request, or page scrape)\n"
+            f"3. Map raw data to output fields\n"
+            f"4. Write results to `output_{{datetime}}.json`\n\n"
+            f"### DO NOT\n"
+            f"- Add 'discover mode', catalog crawling, or site-wide discovery\n"
+            f"- Add pagination logic (items come from input_urls.json)\n"
+            f"- Add bulk extraction via APIs (Algolia partitioning, etc.)\n"
+            f"- Add multiple modes of operation\n"
+            f"- Use `Accept-Encoding: gzip, deflate, br` — use only `gzip, deflate` "
+            f"(requests library may not support Brotli)\n"
+            f"{_url_discovery_rules(site_input_urls)}\n"
+            f"- Deviate from the template's input/output structure\n\n"
+        )
+
+    content += (
         f"### Field Formatting Rules (CRITICAL)\n"
         f'- **price**: Must include the currency symbol, e.g. `"$1,795.00"` not `"1,795.00"`\n'
-        f"- **src_url**: Set to the URL where the product was discovered. "
-        f"If input comes from input_urls.json, src_url equals the product URL.\n"
+        f"- **src_url**: Set to the URL where the item was discovered. "
+        f"If input comes from input_urls.json, src_url equals the item URL. "
+        f"For navigation scrapers, src_url is the listing/search page URL.\n"
         f'- **original_price**: Empty string `""` if not on sale, otherwise include '
         f'currency symbol like `"$2,000.00"`\n'
         f'- **availability**: Normalize to `"In Stock"` or `"Out of Stock"`\n'
         f'- **currency**: ISO 4217 code e.g. `"USD"`, `"EUR"`\n\n'
-        f"### DO NOT\n"
-        f"- Add 'discover mode', catalog crawling, or site-wide discovery\n"
-        f"- Add pagination logic (products come from input_urls.json)\n"
-        f"- Add bulk extraction via APIs (Algolia partitioning, etc.)\n"
-        f"- Add multiple modes of operation\n"
-        f"- Use `Accept-Encoding: gzip, deflate, br` — use only `gzip, deflate` "
-        f"(requests library may not support Brotli)\n"
-        f"{_url_discovery_rules(site_input_urls)}\n"
-        f"- Deviate from the template's input/output structure\n\n"
         f"### Soft 404 Detection (CRITICAL)\n"
         f"Many e-commerce sites return HTTP 200 for deleted/expired products but show "
         f"'Product Not Found', 'No Longer Available', or redirect to a search page.\n\n"
@@ -1048,24 +1494,24 @@ def build_code_tester_message(state: dict) -> list:
 
     content = (
         f"## OBJECTIVE\n"
-        f"Building a product scraper for {slug}. Validate the generated scraper "
-        f"extracts correct field values from product pages.\n\n"
+        f"Validate the generated scraper for {slug}.\n\n"
         f"{retry_context}"
         f"## Your Task: Test the Scraper\n\n"
-        f"**Site slug:** {slug}\n"
         f"**Scraper path:** workspace/{slug}/scraper_draft.py\n"
-        f"**Site analysis:** workspace/{slug}/site_analysis.json\n"
         f"**Product analysis:** workspace/{slug}/product_analysis.json\n"
         f"**Save test report to:** workspace/{slug}/test_report.json\n\n"
-        f"### Workflow\n"
-        f"1. Read the scraper source (1 call)\n"
-        f"2. Run the scraper using `run_scraper` tool with path `workspace/{slug}/scraper_draft.py` "
-        f"and args `--sample` (1-3 calls). "
-        f"The run_scraper tool automatically routes browser-based scrapers (Playwright, "
-        f"SeleniumBase) to the uc-scraper-worker container which has Chrome + Xvfb.\n"
-        f"3. Read the output file and validate each field against product_analysis.json\n"
-        f"4. write_file to save test report (1 call)\n\n"
-        f"### BUDGET: 20 tool calls maximum.\n\n"
+        f"### Workflow (5 steps)\n"
+        f"1. Read `workspace/{slug}/scraper_draft.py` (1 call)\n"
+        f"2. Read `workspace/{slug}/product_analysis.json` (1 call)\n"
+        f"3. Run scraper: `run_scraper(path=\"workspace/{slug}/scraper_draft.py\", "
+        f"args=[\"--sample\"])` (1-2 calls)\n"
+        f"4. Read the output JSON (1 call)\n"
+        f"5. Write test_report.json (1 call)\n\n"
+        f"### Validation Method\n"
+        f"Compare scraper output against `product_analysis.json > fields > {{field}} > expectations`. "
+        f"Each field has a validation contract (type, required, min_length, should_not_match, "
+        f"sample_values, known_bad_values, format_hint). Do NOT re-fetch live pages.\n\n"
+        f"### BUDGET: 10 tool calls maximum.\n\n"
         f"### How Scraper Execution Works\n"
         f"The `run_scraper` tool automatically detects browser-based scrapers (Playwright, "
         f"SeleniumBase, etc.) and dispatches them to a remote `browser-service` container "
@@ -1073,50 +1519,17 @@ def build_code_tester_message(state: dict) -> list:
         f"HTTP-based scrapers run locally. You NEVER need to install packages.\n\n"
         f"### What NOT to Do\n"
         f"- Do NOT modify or fix the scraper — only report issues\n"
-        f"- Do NOT re-run the scraper more than 3 times\n"
-        f"- Do NOT explore the live product page in a browser\n"
-        f"- Do NOT write a new scraper\n"
-        f"- Do NOT read or modify input_urls.json — that file is not your concern\n"
-        f"- Do NOT use run_bash to run the scraper — use run_scraper instead\n"
-        f"- Do NOT run `pip install`, `pip3 install`, or any package installation commands — "
-        f"all required packages are pre-installed in the execution environment\n"
-        f"- Do NOT do manual bash probing, web_fetch, or inline python scripts — "
-        f"just run the scraper and read its output\n\n"
+        f"- Do NOT re-fetch live product pages — validate against product_analysis expectations\n"
+        f"- Do NOT run the scraper more than 2 times\n"
+        f"- Do NOT install packages, run bash commands, or load skills\n"
+        f"- Do NOT read input_urls.json — that file is not your concern\n\n"
+        f"### Dead URLs\n"
+        f"Products with status_code in [301, 302, 303, 307, 308, 404, 410, 451] are dead URLs "
+        f"— exclude from quality assessment. If ALL are dead, set PASS with confidence 1.0.\n\n"
         f"### Optional Fields\n"
-        f"Fields `original_price` and `location` are optional — they may not exist on "
-        f"every product. Only flag as a high-severity issue if the product is clearly on "
-        f"sale (e.g., there's a strikethrough price or 'was' price visible) but the "
-        f"field is still empty. Missing optional fields should be severity 'low' or 'info'.\n\n"
-        f"### Dead URLs (404s and Redirects)\n"
-        f"Some product URLs may no longer be valid — they return 404, redirect to a "
-        f"different page, or show 'product not found'. These are NOT scraper bugs.\n\n"
-        f"When evaluating scraper output:\n"
-        f"- Check the `status_code` field per product. Status codes 301, 302, 303, 307, "
-        f"308, 404, 410, or 451 indicate dead/expired product pages — EXCLUDE these "
-        f"from your quality assessment entirely.\n"
-        f"- Only flag missing `title` or `price` as issues for products with `status_code` "
-        f"200 that are clearly real product pages.\n"
-        f"- If a product has `status_code` 200 but shows a 'product not found' message, "
-        f"check the `remarks` field — the scraper may have noted this.\n"
-        f"- When calculating `confidence_score`, count dead URLs as 'skipped' (excluded "
-        f"from denominator), NOT as failures.\n"
-        f"- If ALL sampled URLs are dead (all non-200), set `overall_assessment` to PASS "
-        f"with `confidence_score` 1.0 and note 'all sampled URLs are dead — cannot assess "
-        f"scraper quality, but no scraper errors detected'.\n\n"
-        f"- Soft 404s: If a product has `status_code` 200 but the `remarks` field "
-        f"mentions 'soft 404', 'product not found', or similar, treat it the same as "
-        f"a dead URL — exclude from quality assessment.\n\n"
-        f"### Image Validation\n"
-        f"Check the `images` field for these common problems:\n"
-        f"- Too many images (>20) likely means the scraper captured banners, nav images, "
-        f"recommended products, or emojis — flag as high severity\n"
-        f"- URLs containing `/brand.assets/`, `/emoji/`, `/flags/`, `/icon/`, "
-        f"`/navigation/` are NOT product images\n"
-        f"- Images should contain the product SKU/code in their URL\n"
-        f"- Expected count: 3-15 product images per product\n\n"
+        f"Fields `original_price` and `location` are optional — missing = severity low, never high.\n\n"
         f"**CRITICAL: You MUST call write_file to save your test report to "
-        f"workspace/{slug}/test_report.json as your LAST action. "
-        f"Include pass/fail per field, with actual vs expected values.**"
+        f"workspace/{slug}/test_report.json as your LAST action.**"
     )
     return [HumanMessage(content=content)]
 
@@ -1158,6 +1571,19 @@ def build_skill_learner_message(state: dict) -> list:
     url = state.get("url", "")
     platform = state.get("platform", "custom")
 
+    nav_review_note = ""
+    nav_report = state.get("nav_learning_report")
+    if nav_report:
+        updated = nav_report.get("skills_updated", [])
+        nav_review_note = (
+            f"\n### nav-skill-review already applied (do NOT duplicate)\n"
+            f"The nav-skill-review agent ran during this pipeline and auto-applied "
+            f"{len(updated)} navigation learnings. Read "
+            f"`workspace/{slug}/nav_learning_report.json` for details. "
+            f"Focus your analysis on NON-navigation learnings (product extraction, "
+            f"code patterns, anti-bot) and skip anything already covered.\n"
+        )
+
     content = (
         f"## OBJECTIVE\n"
         f"Capture reusable knowledge from the completed scrape of {url}.\n\n"
@@ -1166,16 +1592,24 @@ def build_skill_learner_message(state: dict) -> list:
         f"**Site slug:** {slug}\n"
         f"**Detected platform:** {platform}\n"
         f"**Scraper:** scrapers/{slug}/scraper.py\n"
-        f"**Save learning report to:** workspace/{slug}/learning_report.json\n\n"
+        f"**Save learning report to:** workspace/{slug}/learning_report.json\n"
+        f"{nav_review_note}\n"
         f"### Workflow\n"
-        f"1. Read the scraper and analysis files (2-4 calls)\n"
+        f"1. Read the scraper and analysis files (2-4 calls):\n"
+        f"   - scrapers/{slug}/scraper.py\n"
+        f"   - workspace/{slug}/site_analysis.json\n"
+        f"   - workspace/{slug}/product_analysis.json\n"
+        f"   - workspace/{slug}/test_report.json (if present)\n"
+        f"   - workspace/{slug}/navigation_findings.json (if present — raw nav data)\n"
+        f"   - workspace/{slug}/nav_learning_report.json (if present — already-applied nav learnings)\n"
         f"2. Check existing skills in .opencode/skills/ (1-2 calls)\n"
         f"3. write_file to save learning report (1 call)\n\n"
-        f"### BUDGET: 10 tool calls maximum.\n\n"
+        f"### BUDGET: 15 tool calls maximum.\n\n"
         f"### What NOT to Do\n"
         f"- Do NOT modify any skill files — only report proposals\n"
         f"- Do NOT modify the scraper\n"
-        f"- Do NOT run anything\n\n"
+        f"- Do NOT run anything\n"
+        f"- Do NOT propose navigation learnings already applied by nav-skill-review\n\n"
         f"**CRITICAL: You MUST call write_file to save your learning report to "
         f"workspace/{slug}/learning_report.json as your LAST action.**"
     )
@@ -1190,6 +1624,7 @@ __all__ = [
     "create_code_tester",
     "create_cleanup_agent",
     "create_skill_learner",
+    "create_nav_skill_review",
     "build_site_analyzer_message",
     "build_product_analyzer_message",
     "build_scraper_analyzer_message",
@@ -1197,4 +1632,5 @@ __all__ = [
     "build_code_tester_message",
     "build_cleanup_message",
     "build_skill_learner_message",
+    "build_nav_skill_review_message",
 ]

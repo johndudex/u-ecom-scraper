@@ -27,6 +27,9 @@ Provided by the orchestrator:
 
 Read these files:
 - `workspace/{site_slug}/site_analysis.json` - Platform, mechanism, anti-bot findings
+- `workspace/{site_slug}/navigation_findings.json` - Raw navigation patterns from explorer (if present)
+- `workspace/{site_slug}/navigation_analysis.json` - Structured navigation analysis (if present)
+- `workspace/{site_slug}/nav_learning_report.json` - Skill review report from nav-skill-review agent (if present — shows what was already auto-applied during navigation)
 - `workspace/{site_slug}/product_analysis.json` - Field extraction techniques
 - `workspace/{site_slug}/test_report.json` - What worked, what didn't, fixes applied
 - `workspace/{site_slug}/cleanup_report.json` - Final results
@@ -58,6 +61,13 @@ Examine the workspace artifacts and final scraper for novel patterns:
 - New API endpoint patterns
 - URL construction patterns for product pages
 
+**Navigation Patterns (if navigation_analysis.json exists):**
+- Search box detection and URL patterns (e.g., "/search?q={query}")
+- Category navigation structures (menu selectors, URL patterns)
+- Pagination implementations (next button, page params, infinite scroll, load more)
+- Item link extraction patterns (container + link selectors)
+- Two-phase scraper architectures that proved effective
+
 **Field Extraction Patterns:**
 - New structured data formats (e.g., custom JSON-LD extensions)
 - New CSS selector patterns that are platform-specific
@@ -76,6 +86,13 @@ Read all existing skill files and check if the new knowledge is:
 - **Already covered** by an existing skill → Skip, no learning needed
 - **Partially covered** → Propose an update/extension to the existing skill
 - **Not covered at all** → Propose a new skill or an addition to the closest existing skill
+
+**IMPORTANT — Coordination with nav-skill-review:**
+If `nav_learning_report.json` exists, the nav-skill-review agent already
+auto-applied navigation-related learnings during the pipeline. Read that
+report to see what was already applied, and **skip proposing duplicates**.
+Focus your analysis on non-navigation learnings (product extraction, code
+patterns, anti-bot techniques, etc.) that nav-skill-review doesn't cover.
 
 ### 3. Evaluate Reusability
 
@@ -211,6 +228,7 @@ Save learning report to: `workspace/{site_slug}/learning_report.json`
 5. **Don't over-propose** - 1-2 quality learnings is better than 10 trivial ones
 6. **Track what was learned from where** - Metadata helps trace origins
 7. **Quality over quantity** - Only propose learnings that will genuinely help future scrapes
+8. **BUDGET PRIORITY: Write learning_report.json FIRST.** Analyze artifacts, then immediately write your findings to workspace/{site_slug}/learning_report.json. Do not spend tool calls reading excessive reference material. The report file is mandatory output.
 
 ## Completion
 

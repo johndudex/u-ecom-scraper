@@ -30,26 +30,122 @@ class BrowserPool:
 
         if not errors:
             self._ready = True
-            logger.info("Browser pool ready: Xvfb=%s, MCP Chrome=:%d, Scraper Chrome=:%d",
-                         DISPLAY, MCP_CDP_PORT, SCRAPER_CDP_PORT)
+            logger.info(
+                "Browser pool ready: Xvfb=%s, MCP Chrome=:%d, Scraper Chrome=:%d",
+                DISPLAY,
+                MCP_CDP_PORT,
+                SCRAPER_CDP_PORT,
+            )
         else:
             logger.error("Browser pool startup errors: %s", errors)
 
-        return {"xvfb_running": self._xvfb_proc is not None,
-                "mcp_chrome_running": self._mcp_chrome_proc is not None,
-                "scraper_chrome_running": self._scraper_chrome_proc is not None,
-                "errors": errors}
+        return {
+            "xvfb_running": self._xvfb_proc is not None,
+            "mcp_chrome_running": self._mcp_chrome_proc is not None,
+            "scraper_chrome_running": self._scraper_chrome_proc is not None,
+            "errors": errors,
+        }
 
     def health(self) -> dict:
+        mcp_alive = (
+            self._mcp_chrome_proc is not None and self._mcp_chrome_proc.poll() is None
+        )
+        scraper_alive = (
+            self._scraper_chrome_proc is not None
+            and self._scraper_chrome_proc.poll() is None
+        )
         return {
             "ready": self._ready,
-            "xvfb_running": self._xvfb_proc is not None and self._xvfb_proc.poll() is None,
-            "mcp_chrome_running": self._mcp_chrome_proc is not None and self._mcp_chrome_proc.poll() is None,
-            "scraper_chrome_running": self._scraper_chrome_proc is not None and self._scraper_chrome_proc.poll() is None,
+            "xvfb_running": self._xvfb_proc is not None
+            and self._xvfb_proc.poll() is None,
+            "mcp_chrome_running": mcp_alive,
+            "scraper_chrome_running": scraper_alive,
             "mcp_cdp_port": MCP_CDP_PORT,
             "scraper_cdp_port": SCRAPER_CDP_PORT,
             "display": DISPLAY,
+            "mcp_pid": self._mcp_chrome_proc.pid if self._mcp_chrome_proc else None,
+            "scraper_pid": self._scraper_chrome_proc.pid
+            if self._scraper_chrome_proc
+            else None,
         }
+
+    def check_cdp_liveness(self) -> dict:
+        """Actually probe CDP endpoints via HTTP (process alive != CDP responsive).
+
+        Returns dict with ``mcp_cdp_alive`` / ``scraper_cdp_alive`` booleans and
+        the response times in ms (``-1`` on failure).
+        """
+        import httpx
+
+        def _probe(port: int) -> tuple[bool, int]:
+            try:
+                t0 = time.monotonic()
+                resp = httpx.get(f"http://127.0.0.1:{port}/json/version", timeout=3)
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                return (resp.status_code == 200, elapsed_ms)
+            except Exception:
+                return (False, -1)
+
+        mcp_ok, mcp_ms = _probe(MCP_CDP_PORT)
+        scraper_ok, scraper_ms = _probe(SCRAPER_CDP_PORT)
+        return {
+            "mcp_cdp_alive": mcp_ok,
+            "scraper_cdp_alive": scraper_ok,
+            "mcp_cdp_latency_ms": mcp_ms,
+            "scraper_cdp_latency_ms": scraper_ms,
+        }
+
+    def restart_chrome(self, label: str = "all") -> dict:
+        """Restart one or both Chrome instances without killing Xvfb or the
+        FastAPI server.
+
+        Args:
+            label: ``"mcp"``, ``"scraper"``, or ``"all"``.
+
+        Returns a summary dict describing the action taken.
+        """
+        logger.warning("restart_chrome(label=%s) invoked — recovering CDP", label)
+
+        result: dict = {"label": label, "restarted": [], "errors": []}
+        errors: list = result["errors"]
+
+        def _do_restart(proc_attr: str, starter_name: str, display_label: str):
+            proc = getattr(self, proc_attr)
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                except Exception:
+                    pass
+            setattr(self, proc_attr, None)
+            # small grace period for socket cleanup
+            time.sleep(1)
+            starter = getattr(self, starter_name)
+            starter(errors)
+            if not errors or display_label not in " ".join(errors):
+                result["restarted"].append(display_label.lower())
+
+        # Always run restarts off the event loop thread so async callers
+        # (FastAPI handlers) don't block on the multi-second Chrome startup.
+        if label in ("mcp", "all"):
+            _do_restart("_mcp_chrome_proc", "_start_mcp_chrome", "MCP")
+        if label in ("scraper", "all"):
+            _do_restart("_scraper_chrome_proc", "_start_scraper_chrome", "Scraper")
+
+        if not result["errors"]:
+            logger.info(
+                "restart_chrome(%s) completed successfully: %s",
+                label,
+                result["restarted"],
+            )
+        else:
+            logger.error(
+                "restart_chrome(%s) finished with errors: %s", label, result["errors"]
+            )
+
+        return result
 
     def shutdown(self):
         for proc in [self._scraper_chrome_proc, self._mcp_chrome_proc, self._xvfb_proc]:
@@ -78,7 +174,9 @@ class BrowserPool:
             )
             time.sleep(1)
             if self._xvfb_proc.poll() is not None:
-                errors.append(f"Xvfb exited immediately with code {self._xvfb_proc.returncode}")
+                errors.append(
+                    f"Xvfb exited immediately with code {self._xvfb_proc.returncode}"
+                )
                 self._xvfb_proc = None
         except FileNotFoundError:
             errors.append("Xvfb binary not found")
@@ -130,8 +228,14 @@ class BrowserPool:
             )
             time.sleep(3)
             if self._mcp_chrome_proc.poll() is not None:
-                stdout = self._mcp_chrome_proc.stdout.read().decode()[:500] if self._mcp_chrome_proc.stdout else ""
-                errors.append(f"MCP Chrome exited immediately with code {self._mcp_chrome_proc.returncode}: {stdout}")
+                stdout = (
+                    self._mcp_chrome_proc.stdout.read().decode()[:500]
+                    if self._mcp_chrome_proc.stdout
+                    else ""
+                )
+                errors.append(
+                    f"MCP Chrome exited immediately with code {self._mcp_chrome_proc.returncode}: {stdout}"
+                )
                 self._mcp_chrome_proc = None
             else:
                 self._wait_for_cdp(MCP_CDP_PORT, errors, "MCP Chrome")
@@ -177,8 +281,14 @@ class BrowserPool:
             )
             time.sleep(3)
             if self._scraper_chrome_proc.poll() is not None:
-                stdout = self._scraper_chrome_proc.stdout.read().decode()[:500] if self._scraper_chrome_proc.stdout else ""
-                errors.append(f"Scraper Chrome exited immediately with code {self._scraper_chrome_proc.returncode}: {stdout}")
+                stdout = (
+                    self._scraper_chrome_proc.stdout.read().decode()[:500]
+                    if self._scraper_chrome_proc.stdout
+                    else ""
+                )
+                errors.append(
+                    f"Scraper Chrome exited immediately with code {self._scraper_chrome_proc.returncode}: {stdout}"
+                )
                 self._scraper_chrome_proc = None
             else:
                 self._wait_for_cdp(SCRAPER_CDP_PORT, errors, "Scraper Chrome")
@@ -187,6 +297,7 @@ class BrowserPool:
 
     def _wait_for_cdp(self, port: int, errors: list, label: str):
         import httpx
+
         deadline = time.monotonic() + STARTUP_TIMEOUT
         while time.monotonic() < deadline:
             try:

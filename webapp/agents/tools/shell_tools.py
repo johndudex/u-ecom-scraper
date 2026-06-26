@@ -7,6 +7,7 @@ browser-service via HTTP.  HTTP-based scrapers run locally as subprocesses.
 
 import logging
 import os
+import shlex
 import subprocess
 from typing import Optional
 
@@ -160,11 +161,31 @@ def get_shell_tools(
         """
         full_path = scraper_path if os.path.isabs(scraper_path) else os.path.join(cwd, scraper_path)
         needs_browser = _scraper_needs_browser(full_path)
+
+        # Write a heartbeat SessionLog entry so the watchdog sees activity
+        # during long scraper runs (UC Chrome + residential proxy can take 5+ min)
+        try:
+            from agents.tools.context import get_state
+            tool_state = get_state()
+            job_id = (tool_state or {}).get("job_id", 0)
+            if job_id:
+                from scraper.models import SessionLog
+                seq = SessionLog.objects.filter(job_id=job_id).count()
+                SessionLog.objects.create(
+                    job_id=job_id,
+                    role=SessionLog.ROLE_SYSTEM,
+                    agent="code-tester",
+                    content=f"[RUN_SCRAPER] Starting: {scraper_path} {cli_args}",
+                    seq=seq,
+                )
+        except Exception:
+            pass
+
         if extra_args and not cli_args:
             logger.info("run_scraper: remapping extra_args=%s → cli_args", extra_args)
             cmd_args = list(extra_args)
         else:
-            cmd_args = cli_args.split() if cli_args else []
+            cmd_args = shlex.split(cli_args) if cli_args else []
 
         if needs_browser:
             logger.info("run_scraper: browser-based, dispatching to browser-service: %s", scraper_path)

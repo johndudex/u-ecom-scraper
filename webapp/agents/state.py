@@ -1,4 +1,4 @@
-"""LangGraph state definition for the Universal Ecommerce Scraper graph."""
+"""LangGraph state definition for the Universal Scraper graph."""
 
 from __future__ import annotations
 
@@ -23,10 +23,19 @@ class ScrapeState(TypedDict, total=False):
     # ── Input ──────────────────────────────────────────────────────────
     job_id: int
     url: str
+    sample_url: Optional[str]
     product_url: Optional[str]
     currency: str
     sample_only: bool
     rescrape: bool
+
+    # ── Content type ──────────────────────────────────────────────────
+    page_type: str
+    input_mode: str
+    site_type: str
+    content_type_config: dict[str, Any]
+    search_criteria: str
+    output_schema: dict[str, Any]
 
     # ── Tracker ────────────────────────────────────────────────────────
     site_slug: str
@@ -35,6 +44,7 @@ class ScrapeState(TypedDict, total=False):
 
     # ── Resume / skip flags (for resuming an in-progress job) ───────────
     skip_site_analysis: bool
+    skip_content_analysis: bool
     skip_product_analysis: bool
     skip_code_generation: bool
 
@@ -44,6 +54,7 @@ class ScrapeState(TypedDict, total=False):
 
     # ── Retry counters ─────────────────────────────────────────────────
     site_analysis_retries: int
+    content_analysis_retries: int
     product_analysis_retries: int
     test_retry_count: int
     reanalyze_count: int
@@ -52,6 +63,7 @@ class ScrapeState(TypedDict, total=False):
 
     # ── Phase artifacts (JSON / code produced by each phase) ────────────
     site_analysis: Annotated[dict[str, Any], _last_write_wins]
+    content_analysis: Annotated[dict[str, Any], _last_write_wins]
     product_analysis: Annotated[dict[str, Any], _last_write_wins]
     scraper_analysis: Annotated[dict[str, Any], _last_write_wins]
     scraper_code: Annotated[str, _last_write_wins]
@@ -59,6 +71,8 @@ class ScrapeState(TypedDict, total=False):
     test_report: Annotated[dict[str, Any], _last_write_wins]
     cleanup_report: Annotated[dict[str, Any], _last_write_wins]
     learning_report: Annotated[dict[str, Any], _last_write_wins]
+    nav_learning_report: Annotated[dict[str, Any], _last_write_wins]
+    navigation_analysis: Annotated[dict[str, Any], _last_write_wins]
 
     # ── Probe cache ────────────────────────────────────────────────────
     probe_result: Annotated[Optional[dict[str, Any]], _last_write_wins]
@@ -67,6 +81,7 @@ class ScrapeState(TypedDict, total=False):
     # ── Execution metadata ─────────────────────────────────────────────
     execution_status: Annotated[str, _last_write_wins]
     output_file: Annotated[str, _last_write_wins]
+    item_count: int
     product_count: int
     scraping_method: Annotated[str, _last_write_wins]
     platform: Annotated[str, _last_write_wins]
@@ -83,6 +98,10 @@ class ScrapeState(TypedDict, total=False):
     # ── Routing decisions (set by routing nodes, read by conditional edges) ─
     next_node_after_testing: Annotated[str, _last_write_wins]
     next_node_after_cleanup: Annotated[str, _last_write_wins]
+
+    # ── Navigation ──────────────────────────────────────────────────────
+    navigation_findings: Annotated[Optional[dict[str, Any]], _last_write_wins]
+    playwright_unavailable: bool
 
     # ── Error ───────────────────────────────────────────────────────────
     error_message: Annotated[str, _last_write_wins]

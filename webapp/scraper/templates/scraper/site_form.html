@@ -1,77 +1,94 @@
 {% extends "scraper/base.html" %}
 
-{% block page_title %}{{ site.name|default:"Add Site" }} — Ecommerce Scraper{% endblock %}
+{% block page_title %}{{ site.name|default:"Add Site" }} — Scraper Console{% endblock %}
 
 {% block content %}
 <div class="max-w-2xl mx-auto">
 
-    <div class="relative overflow-hidden rounded-2xl bg-gradient-to-br from-brand-800 via-brand-700 to-brand-600 p-6 mb-6">
-        <h2 class="text-lg font-bold text-brand-50 relative">{{ site.name|default:"Add New Site" }}</h2>
-    </div>
+    <h2 class="text-2xl font-extrabold text-ink mb-6">{{ site.name|default:"Add New Site" }}</h2>
 
     {% if form.errors %}
-    <div class="mb-4 rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3">
+    <div class="mb-4 panel border-danger/30 px-4 py-3" style="background:rgba(248,113,113,0.06)">
         {% for field in form %}{% for error in field.errors %}
-        <p class="text-red-300 text-sm">{{ field.label }}: {{ error }}</p>
+        <p class="text-danger text-sm">{{ field.label }}: {{ error }}</p>
         {% endfor %}{% endfor %}
         {% for error in form.non_field_errors %}
-        <p class="text-red-300 text-sm">{{ error }}</p>
+        <p class="text-danger text-sm">{{ error }}</p>
         {% endfor %}
     </div>
     {% endif %}
 
-    <div class="rounded-2xl bg-surface border border-brand-700/30 p-6">
+    <div class="panel p-6">
         <form method="post" action="{% url 'site_add' %}" enctype="multipart/form-data">
             <input type="hidden" name="site_id" value="{{ site.id|default:'' }}">
             {% csrf_token %}
 
             <div class="mb-5">
-                <label for="id_url" class="block text-sm font-semibold text-brand-200 mb-2">Website URL</label>
+                <label for="id_url" class="input-label">Website URL</label>
                 <input type="url" name="url" id="id_url" value="{{ form.url.value|default:'' }}"
-                    class="w-full bg-brand-700/30 border border-brand-600/50 rounded-xl px-4 py-3 text-sm text-brand-50 placeholder-brand-500 focus:outline-none focus:border-cta/50 focus:ring-2 focus:ring-cta/20"
-                    placeholder="https://www.example-store.com" required>
-                <p class="text-xs text-brand-500 mt-1">The main domain URL of the site.</p>
+                    class="input-field font-mono text-xs"
+                    placeholder="https://www.example.com" required>
+                <p class="text-xs text-ink-muted mt-1">The main domain URL of the site.</p>
             </div>
 
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-5">
                 <div>
-                    <label for="id_sample_url" class="block text-xs font-medium text-brand-400 mb-1.5">Sample / Product Listing URL <span class="text-brand-500">(optional)</span></label>
+                    <label for="id_sample_url" class="input-label">Sample / Listing URL <span class="text-ink-muted font-normal">(optional)</span></label>
                     <input type="url" name="sample_url" id="id_sample_url" value="{{ form.sample_url.value|default:'' }}"
-                        class="w-full bg-brand-700/30 border border-brand-600/50 rounded-xl px-4 py-2.5 text-sm text-brand-50 placeholder-brand-500 focus:outline-none focus:border-cta/50 focus:ring-2 focus:ring-cta/20"
+                        class="input-field font-mono text-xs"
                         placeholder="https://www.example.com/products/shoes">
                 </div>
                 <div>
-                    <label for="id_currency" class="block text-xs font-medium text-brand-400 mb-1.5">Currency <span class="text-brand-500">(optional, auto-detect)</span></label>
+                    <label for="id_currency" class="input-label">Currency <span class="text-ink-muted font-normal">(optional, auto-detect)</span></label>
                     <input type="text" name="currency" id="id_currency" value="{{ form.currency.value|default:'' }}"
-                        class="w-full bg-brand-700/30 border border-brand-600/50 rounded-xl px-4 py-2.5 text-sm text-brand-50 placeholder-brand-500 focus:outline-none focus:border-cta/50 focus:ring-2 focus:ring-cta/20"
+                        class="input-field"
                         placeholder="USD" maxlength="3">
                 </div>
             </div>
 
             <div class="mb-5">
-                <label for="id_input_urls_json" class="block text-sm font-semibold text-brand-200 mb-2">Product URLs</label>
+                <label class="input-label">Site Type</label>
+                <div class="custom-select input-field" id="site-type-select" data-name="site_type" style="padding:0;">
+                    <input type="hidden" name="site_type" id="id_site_type_hidden" value="{{ form.site_type.value|default:'shopping' }}">
+                    <button type="button" class="cs-trigger" style="padding: 0.5625rem 0.75rem;" onclick="document.getElementById('site-type-select').classList.toggle('open')">
+                        <span class="cs-value-text" id="site-type-label">Shopping</span>
+                        <svg class="cs-arrow" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+                    </button>
+                    <div class="cs-panel">
+                        <div class="cs-group">
+                            <div class="cs-option{% if form.site_type.value == 'shopping' or not form.site_type.value %} selected{% endif %}" data-value="shopping" data-label="Shopping" onclick="window._pickSiteType(this)">Shopping</div>
+                            <div class="cs-option{% if form.site_type.value == 'articles' %} selected{% endif %}" data-value="articles" data-label="Articles" onclick="window._pickSiteType(this)">Articles</div>
+                            <div class="cs-option{% if form.site_type.value == 'jobs' %} selected{% endif %}" data-value="jobs" data-label="Jobs" onclick="window._pickSiteType(this)">Jobs</div>
+                            <div class="cs-option{% if form.site_type.value == 'forum' %} selected{% endif %}" data-value="forum" data-label="Forum" onclick="window._pickSiteType(this)">Forum</div>
+                            <div class="cs-option{% if form.site_type.value == 'general' %} selected{% endif %}" data-value="general" data-label="General" onclick="window._pickSiteType(this)">General</div>
+                        </div>
+                    </div>
+                </div>
+                <p class="text-xs text-ink-muted mt-1">Determines which fields and schema to use when scraping.</p>
+            </div>
+
+            <div class="mb-5">
+                <label for="id_input_urls_json" class="input-label">Item URLs</label>
                 <textarea name="input_urls_json" id="id_input_urls_json" rows="6"
-                    class="w-full bg-brand-700/30 border border-brand-600/50 rounded-xl px-4 py-3 text-sm text-brand-50 placeholder-brand-500 focus:outline-none focus:border-cta/50 focus:ring-2 focus:ring-cta/20 font-mono text-xs"
-                    placeholder='["https://example.com/product/1", "https://example.com/product/2"]'>{{ form.input_urls_json.value|default:'' }}</textarea>
-                <p class="text-xs text-brand-500 mt-1">Paste a JSON array of product URLs, or upload a file below.</p>
+                    class="input-field font-mono text-xs"
+                    placeholder='["https://example.com/item/1", "https://example.com/item/2"]'>{{ form.input_urls_json.value|default:'' }}</textarea>
+                <p class="text-xs text-ink-muted mt-1">Paste a JSON array of URLs, or upload a file below.</p>
             </div>
 
             <div class="mb-6">
-                <label for="id_input_urls_file" class="block text-xs font-medium text-brand-400 mb-1.5">Upload URLs JSON <span class="text-brand-500">(optional)</span></label>
+                <label for="id_input_urls_file" class="input-label">Upload URLs JSON <span class="text-ink-muted font-normal">(optional)</span></label>
                 <input type="file" name="input_urls_file" id="id_input_urls_file" accept=".json"
-                    class="w-full text-sm text-brand-300 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-brand-700 file:text-brand-200 hover:file:bg-brand-600">
+                    class="w-full text-sm text-ink-secondary file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-xs file:font-semibold file:bg-raised file:text-ink hover:file:bg-overlay file:cursor-pointer file:transition-colors">
             </div>
 
             <div class="flex items-center gap-3">
-                <button type="submit" class="bg-cta hover:bg-cta-hover text-white font-semibold text-sm py-3 px-6 rounded-xl transition-all duration-200 cursor-pointer">
-                    Save Site
-                </button>
+                <button type="submit" class="btn-primary py-3">Save Site</button>
                 {% if site.id %}
-                <a href="{% url 'site_detail' site_id=site.id %}" class="text-sm text-brand-400 hover:text-brand-200 px-4 py-3 rounded-xl transition-colors">
+                <a href="{% url 'site_detail' site_id=site.id %}" class="text-sm text-ink-muted hover:text-ink-secondary px-4 py-3 transition-colors">
                     Cancel
                 </a>
                 {% else %}
-                <a href="{% url 'site_list' %}" class="text-sm text-brand-400 hover:text-brand-200 px-4 py-3 rounded-xl transition-colors">
+                <a href="{% url 'site_list' %}" class="text-sm text-ink-muted hover:text-ink-secondary px-4 py-3 transition-colors">
                     Cancel
                 </a>
                 {% endif %}
@@ -79,4 +96,28 @@
         </form>
     </div>
 </div>
+
+<script>
+(function() {
+    var cs = document.getElementById('site-type-select');
+    var hidden = document.getElementById('id_site_type_hidden');
+    var label = document.getElementById('site-type-label');
+
+    window._pickSiteType = function(opt) {
+        hidden.value = opt.dataset.value;
+        label.textContent = opt.dataset.label;
+        cs.querySelectorAll('.cs-option').forEach(function(o) { o.classList.remove('selected'); });
+        opt.classList.add('selected');
+        cs.classList.remove('open');
+    };
+
+    document.addEventListener('click', function(e) {
+        if (!cs.contains(e.target)) cs.classList.remove('open');
+    });
+
+    cs.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') cs.classList.remove('open');
+    });
+})();
+</script>
 {% endblock %}

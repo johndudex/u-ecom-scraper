@@ -339,3 +339,39 @@ When protection is detected, report in `site_analysis.json`:
 - Site has no protection (waste of time)
 - Protection is handled by the platform (Shopify's built-in)
 - Simple rate limiting that just needs delay adjustment
+
+## Learned: TLS Fingerprinting Silent Block (No Visible Challenge)
+**Source:** https://bulgari.com (2025-07-10)
+**Applicability:** Luxury brand sites, LVMH group sites, and other enterprises that block based on browser TLS fingerprint without showing any challenge page
+
+Some sites silently reject non-authentic browsers (standard Playwright, direct HTTP) without showing any visible challenge page, CAPTCHA, or "Just a moment..." message. Instead of serving a challenge, they simply return empty or error responses to browsers that fail TLS/JA3 fingerprint checks. The page loads fine only with undetected Chrome (seleniumbase UC mode).
+
+**Detection indicators:**
+- Direct HTTP requests fail (no response, timeout, or empty body)
+- Standard Playwright gets blocked (page doesn't render content)
+- `uc_chrome_none` or `seleniumbase_uc` connectivity method succeeds
+- No anti-bot cookies (`__cf_bm`, `_abck`, etc.) are present
+- No challenge page text ("Just a moment", "Checking your browser")
+- No CAPTCHA iframes
+
+**Strategy:** Use `seleniumbase_uc` (undetected Chrome) as the scraping mechanism. Standard Playwright and HTTP requests will not work. No proxy escalation needed — the block is purely fingerprint-based.
+
+**site_analysis.json pattern:**
+```json
+{
+  "anti_bot": {
+    "detected": false,
+    "type": "none",
+    "severity": "low",
+    "details": "No explicit anti-bot challenge detected. Site only responds to undetected Chrome browsers — likely TLS fingerprinting."
+  },
+  "connectivity": {
+    "method_that_worked": "uc_chrome_none",
+    "js_rendering_needed": true
+  }
+}
+```
+
+**Key distinction from Akamai/Cloudflare:** This pattern has `anti_bot.detected: false` because there's no visible protection system. The block happens at the TLS layer, not via a JavaScript challenge. This means the site_analyzer will NOT trigger anti-bot handling, but connectivity will indicate only UC Chrome works.
+
+**Sites observed:** bulgari.com (LVMH)

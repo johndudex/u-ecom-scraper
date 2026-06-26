@@ -1,0 +1,13 @@
+{
+  "active": true,
+  "iteration": 1,
+  "minIterations": 1,
+  "maxIterations": 20,
+  "completionPromise": "COMPLETE",
+  "tasksMode": false,
+  "taskPromise": "READY_FOR_NEXT_TASK",
+  "prompt": "I have all these agents in langgrahp which are connected as documented in docs/scraper_agents.md and I am trying to get them to work on https://www.calvinklein.co.uk and navigate to watches and scrape all the watches . theres a playground avaialbe that allows to invoke each of the agents independently though they are meant to be invoked in a sequence . look at each agent and run each agent independently give it enough context and make it work as I need it to make a checklist of every agent you fix , fail early to fix eacch agent properly",
+  "startedAt": "2026-06-26T07:52:12.572Z",
+  "model": "",
+  "agent": "opencode"
+}

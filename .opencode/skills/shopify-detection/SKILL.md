@@ -1,6 +1,6 @@
 ---
 name: shopify-detection
-description: Detect Shopify ecommerce sites and leverage their product.json API, Storefront GraphQL API, and collection JSON endpoints for fast, structured product data extraction.
+description: Detect Shopify ecommerce sites and leverage their product.json API, Storefront GraphQL API, and collection JSON endpoints for fast, structured product and article data extraction.
 license: MIT
 compatibility: opencode
 metadata:
@@ -12,7 +12,7 @@ metadata:
 
 ## What I Do
 
-Detect Shopify-powered ecommerce sites and use their public APIs to extract product data without browser automation. This is the fastest scraping method available when applicable.
+Detect Shopify-powered ecommerce sites and use their public APIs to extract product and article data without browser automation. This is the fastest scraping method available when applicable.
 
 ## When to Use Me
 
@@ -20,6 +20,7 @@ Use this when:
 - The Site Analyzer agent is analyzing a website
 - Platform detection phase is running
 - A potential Shopify site has been identified
+- Scraping product OR article/blog content from a Shopify store
 
 ## Detection Methods
 
@@ -220,6 +221,78 @@ curl -s -X POST "https://www.example.com/api/2024-01/graphql.json" \
 ```bash
 curl -s "https://www.example.com/search/suggest.json?q=&resources[type]=product&resources[limit]=250"
 ```
+
+## Article/Blog Extraction
+
+Shopify stores often have blogs at `/blogs/{blog-handle}` with articles at `/blogs/{blog-handle}/{article-handle}`. Shopify blogs support public JSON APIs similar to products.
+
+### Article JSON API
+
+```bash
+# All articles in a blog
+curl -s "https://www.example.com/blogs/news.json?limit=250&page=1"
+
+# Articles by tag
+curl -s "https://www.example.com/blogs/news/tagged/announcement.json"
+
+# List all blogs
+curl -s "https://www.example.com/blogs.json"
+```
+
+**Response structure:**
+```json
+{
+  "articles": [
+    {
+      "id": 123456789,
+      "title": "Our New Collection Launch",
+      "handle": "new-collection-launch",
+      "body_html": "<p>Full article content...</p>",
+      "summary": "Short excerpt...",
+      "author": "John Doe",
+      "blog_id": 567890123,
+      "user_id": 234567890,
+      "published_at": "2024-06-01T10:00:00-04:00",
+      "created_at": "2024-05-30T08:00:00-04:00",
+      "updated_at": "2024-06-01T10:30:00-04:00",
+      "tags": ["announcement", "collection"],
+      "image": {
+        "src": "https://cdn.shopify.com/s/files/1/.../article-image.jpg",
+        "alt": "Collection Launch"
+      },
+      "template_suffix": ""
+    }
+  ]
+}
+```
+
+### Article JSON-LD (On Article Pages)
+
+Shopify article pages may also include Article JSON-LD:
+
+```json
+{
+  "@type": "Article",
+  "headline": "Our New Collection Launch",
+  "author": {"@type": "Person", "name": "John Doe"},
+  "datePublished": "2024-06-01T10:00:00-04:00",
+  "articleBody": "Full article content...",
+  "image": "https://cdn.shopify.com/..."
+}
+```
+
+### Field Mapping: Shopify Article JSON → Article Output
+
+| Shopify Field | Output Field | Notes |
+|--------------|-------------|-------|
+| `title` | `title` | Direct |
+| `author` | `author` | Direct string |
+| `published_at` | `publish_date` | ISO format |
+| `body_html` | `content` | Strip HTML tags |
+| `summary` | `content` (fallback) | If body_html is empty |
+| `tags` | `tags` | Array to list |
+| `image.src` | `images` | Wrap in array |
+| `handle` | `url` | Construct: `{site}/blogs/{blog_handle}/{handle}` |
 
 ## Field Mapping: Shopify JSON → Output
 

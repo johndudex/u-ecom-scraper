@@ -1,25 +1,25 @@
 {% extends "scraper/base.html" %}
 
-{% block page_title %}Log In — Ecommerce Scraper{% endblock %}
+{% block page_title %}Log In — Scraper Console{% endblock %}
 
-{% block content %}
-<div class="max-w-md mx-auto mt-16">
-    <div class="relative overflow-hidden rounded-2xl bg-gradient-to-br from-brand-800 via-brand-700 to-brand-600 p-8 mb-6 text-center">
-        <div class="w-14 h-14 bg-cta rounded-2xl flex items-center justify-center mx-auto mb-4">
-            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="white" viewBox="0 0 24 24" stroke-width="2.5" stroke="currentColor" fill="none"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/></svg>
+{% block content_unauth %}
+<div class="max-w-md mx-auto pt-12 lg:pt-20 min-h-screen flex flex-col justify-center anim-page">
+    <div class="text-center mb-8">
+        <div class="w-14 h-14 rounded-xl bg-accent/8 border border-accent/15 flex items-center justify-center mx-auto mb-5" style="box-shadow: 0 0 32px rgba(34, 211, 238, 0.08);">
+            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#22D3EE"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"/></svg>
         </div>
-        <h1 class="text-xl font-bold text-brand-50 mb-1">Ecommerce Scraper</h1>
-        <p class="text-brand-300 text-sm">Sign in to continue</p>
+        <h1 class="text-2xl font-extrabold text-ink mb-1">Scraper<span class="text-accent">.</span>console</h1>
+        <p class="text-ink-secondary text-sm">Sign in to continue</p>
     </div>
 
-    <div class="rounded-2xl bg-surface border border-brand-700/30 p-6">
+    <div class="panel p-7">
         {% if form.errors %}
-        <div class="mb-4 rounded-xl bg-red-500/10 border border-red-500/20 px-4 py-3">
+        <div class="mb-4 rounded-lg border border-danger/25 px-4 py-3" style="background:rgba(248,113,113,0.05)">
             {% for field in form %}{% for error in field.errors %}
-            <p class="text-red-300 text-sm">{{ error }}</p>
+            <p class="text-danger text-sm">{{ error }}</p>
             {% endfor %}{% endfor %}
             {% for error in form.non_field_errors %}
-            <p class="text-red-300 text-sm">{{ error }}</p>
+            <p class="text-danger text-sm">{{ error }}</p>
             {% endfor %}
         </div>
         {% endif %}
@@ -29,18 +29,18 @@
             <input type="hidden" name="next" value="{{ next }}">
 
             <div class="mb-4">
-                <label for="id_username" class="block text-sm font-semibold text-brand-200 mb-1.5">Username</label>
+                <label for="id_username" class="input-label">Username</label>
                 <input type="text" name="username" id="id_username" autofocus autocomplete="username"
-                    class="w-full bg-brand-700/30 border border-brand-600/50 rounded-xl px-4 py-3 text-sm text-brand-50 placeholder-brand-500 focus:outline-none focus:border-cta/50 focus:ring-2 focus:ring-cta/20 transition-colors" required>
+                    class="input-field" required>
             </div>
 
             <div class="mb-6">
-                <label for="id_password" class="block text-sm font-semibold text-brand-200 mb-1.5">Password</label>
+                <label for="id_password" class="input-label">Password</label>
                 <input type="password" name="password" id="id_password" autocomplete="current-password"
-                    class="w-full bg-brand-700/30 border border-brand-600/50 rounded-xl px-4 py-3 text-sm text-brand-50 placeholder-brand-500 focus:outline-none focus:border-cta/50 focus:ring-2 focus:ring-cta/20 transition-colors" required>
+                    class="input-field" required>
             </div>
 
-            <button type="submit" class="w-full bg-cta hover:bg-cta-hover text-white font-semibold text-sm py-3 px-6 rounded-xl transition-all duration-200 hover:shadow-lg hover:shadow-cta/20 cursor-pointer">
+            <button type="submit" class="btn-primary w-full py-3">
                 Sign In
             </button>
         </form>

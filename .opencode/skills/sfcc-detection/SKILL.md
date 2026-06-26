@@ -1,6 +1,6 @@
 ---
 name: sfcc-detection
-description: Detect Salesforce Commerce Cloud (Demandware) ecommerce sites and leverage their server-rendered HTML, JSON-LD structured data, and predictable URL patterns for efficient product data extraction.
+description: Detect Salesforce Commerce Cloud (Demandware) ecommerce sites and leverage their server-rendered HTML, JSON-LD structured data, and predictable URL patterns for efficient product, article, and content page data extraction.
 license: MIT
 compatibility: opencode
 metadata:
@@ -14,7 +14,7 @@ metadata:
 
 ## What I Do
 
-Detect Salesforce Commerce Cloud (formerly Demandware) ecommerce sites and use their server-rendered HTML, JSON-LD structured data, and predictable URL patterns for efficient product data extraction. SFCC is one of the most common enterprise ecommerce platforms, used by major fashion, beauty, and lifestyle brands worldwide.
+Detect Salesforce Commerce Cloud (formerly Demandware) ecommerce sites and use their server-rendered HTML, JSON-LD structured data, and predictable URL patterns for efficient product, article, and content page data extraction. SFCC is one of the most common enterprise ecommerce platforms, used by major fashion, beauty, and lifestyle brands worldwide.
 
 ## When to Use Me
 
@@ -649,6 +649,60 @@ SFCC is a hosted platform. Be respectful to the brand's production instance:
 - JSON-LD is missing AND HTML elements are insufficient
 - Site has Cloudflare or other anti-bot blocking that requires browser automation
 - Product data is loaded via AJAX after page load (rare for SFCC, but possible)
+
+## Article & Content Page Extraction
+
+SFCC sites often include editorial content (articles, lookbooks, press releases). These pages use the same server-rendered HTML approach as product pages but with different URL patterns and JSON-LD types.
+
+### Content Page URL Patterns
+
+```
+/{locale}/content/{content-id}-slug.html
+/{locale}/magazine/{slug}.html
+/{locale}/stories/{slug}.html
+/{locale}/journal/{slug}.html
+```
+
+Content pages also end with `.html` (same as products). Use JSON-LD `@type` to distinguish.
+
+### Article JSON-LD
+
+SFCC content pages may embed Article JSON-LD:
+
+```json
+{
+  "@type": "Article",
+  "headline": "Summer 2026 Collection",
+  "author": {"@type": "Person", "name": "Editor Name"},
+  "datePublished": "2026-06-01T00:00:00Z",
+  "articleBody": "Full article text...",
+  "image": "https://cdn.example.com/..."
+}
+```
+
+### Field Mapping: SFCC Article JSON-LD → Article Output
+
+| JSON-LD Path | Output Field | Notes |
+|-------------|-------------|-------|
+| `headline` or `name` | `title` | Article headline |
+| `author.name` | `author` | May be string or dict |
+| `datePublished` | `publish_date` | ISO 8601 |
+| `articleBody` | `content` | Full text |
+| `articleSection` | `category` | Section name |
+| `image` | `images` | String or array |
+| `keywords` | `tags` | Comma-separated string |
+
+### Fallback: HTML Extraction for Articles
+
+When JSON-LD is missing, use HTML selectors:
+
+| Field | Selector |
+|-------|----------|
+| title | `h1.article-title`, `h1.content-title` |
+| author | `.article-author`, `.content-author` |
+| date | `time[datetime]`, `.article-date[datetime]` |
+| content | `.article-content`, `.content-body`, `.rte-content` |
+| images | `.article-content img[src]` |
 
 ## Known SFCC Sites
 

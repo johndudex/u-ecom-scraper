@@ -48,7 +48,7 @@ def route_after_testing(state: ScrapeState) -> str:
     retry_count = state.get("test_retry_count", 0)
 
     if not report:
-        if retry_count < 3:
+        if retry_count < 2:
             logger.warning(
                 "route_after_testing: no test_report, retry %d/3 via scraper_analyzer",
                 retry_count + 1,
@@ -69,7 +69,7 @@ def route_after_testing(state: ScrapeState) -> str:
         logger.info("route_after_testing: PASS (confidence=%.2f)", confidence)
         return "field_confirmation"
 
-    if retry_count < 3:
+    if retry_count < 2:
         logger.info(
             "route_after_testing: %s (confidence=%.2f, high_severity=%s), retry %d/3 via scraper_analyzer",
             assessment,

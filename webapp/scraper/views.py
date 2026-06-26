@@ -48,6 +48,22 @@ def _check_site_tracker(url: str) -> dict | None:
     return None
 
 
+def _ordered_steps(job):
+    """Return job's steps sorted by canonical pipeline phase order.
+
+    Dynamically-created phases (e.g. ``navigation_analysis`` created on-the-fly
+    by ``_notify_phase``) would otherwise appear at the end of the list when
+    ordered by step ID, confusing the UI.
+    """
+    try:
+        from .tasks import PIPELINE_PHASES
+
+        order = {phase: i for i, phase in enumerate(PIPELINE_PHASES)}
+    except Exception:
+        order = {}
+    return sorted(job.steps.all(), key=lambda s: order.get(s.phase, 999))
+
+
 @login_required
 def home(request):
     if request.method == "POST":
@@ -55,13 +71,27 @@ def home(request):
         url = form_data.get("url", "").strip()
         product_url = form_data.get("product_url", "").strip()
         currency = form_data.get("currency", "").strip().upper()
+        page_type = form_data.get("page_type", "product").strip()
+        search_criteria = form_data.get("search_criteria", "").strip()
         full_extraction = form_data.get("full_extraction") == "on"
         rescrape = form_data.get("rescrape") == "on"
+
+        # Derive the canonical input_mode from the chosen page_type so that
+        # navigation / list_page jobs route through the navigation agent.
+        input_mode = "url_list"
+        try:
+            from src.content_types import resolve_page_type
+
+            _, input_mode = resolve_page_type(page_type)
+        except Exception:
+            pass
 
         context = {
             "form_url": url,
             "form_product_url": product_url,
             "form_currency": currency,
+            "form_page_type": page_type,
+            "form_search_criteria": search_criteria,
             "recent_jobs": ScrapeJob.objects.all()[:10],
         }
 
@@ -94,6 +124,9 @@ def home(request):
             product_url=product_url,
             currency=currency,
             full_extraction=full_extraction,
+            page_type=page_type,
+            input_mode=input_mode,
+            search_criteria=search_criteria,
         )
 
         from .tasks import run_scrape_task
@@ -136,7 +169,7 @@ def job_list(request):
 @login_required
 def job_detail(request, job_id):
     job = get_object_or_404(ScrapeJob, pk=job_id)
-    steps = job.steps.all()
+    steps = _ordered_steps(job)
     for step in steps:
         if step.started_at and step.completed_at:
             delta = (step.completed_at - step.started_at).total_seconds()
@@ -191,7 +224,9 @@ def job_detail(request, job_id):
                 name_slug = name_slug.replace(char, "-")
         slug_candidates.append(name_slug)
     for slug in slug_candidates:
-        scraper_path = os.path.join(settings.PROJECT_ROOT, "scrapers", slug, "scraper.py")
+        scraper_path = os.path.join(
+            settings.PROJECT_ROOT, "scrapers", slug, "scraper.py"
+        )
         if os.path.exists(scraper_path):
             try:
                 with open(scraper_path, "r") as f:
@@ -207,14 +242,17 @@ def job_detail(request, job_id):
         if os.path.isdir(site_dir):
             job_start = job.started_at
             all_output = [
-                f for f in os.listdir(site_dir)
+                f
+                for f in os.listdir(site_dir)
                 if f.startswith("output_") and f.endswith(".json")
             ]
             if job_start:
                 filtered = []
                 for f in all_output:
                     try:
-                        ts = datetime.strptime(f, "output_%Y-%m-%d_%H%M%S.json").replace(tzinfo=dt_timezone.utc)
+                        ts = datetime.strptime(
+                            f, "output_%Y-%m-%d_%H%M%S.json"
+                        ).replace(tzinfo=dt_timezone.utc)
                         if ts >= job_start - timedelta(seconds=120):
                             filtered.append(f)
                     except ValueError:
@@ -297,7 +335,9 @@ def scraper_code(request, job_id):
                 name_slug = name_slug.replace(char, "-")
         slug_candidates.append(name_slug)
     for slug in slug_candidates:
-        scraper_path = os.path.join(settings.PROJECT_ROOT, "scrapers", slug, "scraper.py")
+        scraper_path = os.path.join(
+            settings.PROJECT_ROOT, "scrapers", slug, "scraper.py"
+        )
         if os.path.exists(scraper_path):
             with open(scraper_path, "r") as f:
                 content = f.read()
@@ -496,7 +536,7 @@ def job_api(request, job_id):
                     if s.completed_at
                     else None,
                 }
-                for s in job.steps.all()
+                for s in _ordered_steps(job)
             ],
             "approvals": [
                 {
@@ -766,12 +806,17 @@ def probe_cache(request):
     return render(request, "scraper/probe_cache.html", {"entries": entries})
 
 
-BROWSER_SERVICE_URL = os.environ.get("BROWSER_SERVICE_URL", "http://browser-service:8001")
+BROWSER_SERVICE_URL = os.environ.get(
+    "BROWSER_SERVICE_URL", "http://browser-service:8001"
+)
 
 
 @login_required
 def probe_tester(request):
-    if request.method != "POST" or request.headers.get("x-requested-with") != "XMLHttpRequest":
+    if (
+        request.method != "POST"
+        or request.headers.get("x-requested-with") != "XMLHttpRequest"
+    ):
         return render(request, "scraper/probe_tester.html", {"initial_url": ""})
 
     url = request.POST.get("url", "").strip()
@@ -797,7 +842,10 @@ def probe_tester(request):
 
 @login_required
 def probe_tester_clear_cache(request):
-    if request.method != "POST" or request.headers.get("x-requested-with") != "XMLHttpRequest":
+    if (
+        request.method != "POST"
+        or request.headers.get("x-requested-with") != "XMLHttpRequest"
+    ):
         return JsonResponse({"error": "POST required"}, status=400)
 
     domain = request.POST.get("domain", "").strip()
@@ -805,6 +853,7 @@ def probe_tester_clear_cache(request):
         return JsonResponse({"error": "domain required"}, status=400)
 
     from scraper.models import ProbeCache
+
     deleted = ProbeCache.objects.filter(domain=domain).delete()
     logger.info("Probe tester: cleared cache for %s (%d entries)", domain, deleted)
     return JsonResponse({"domain": domain, "deleted": deleted})
@@ -812,7 +861,10 @@ def probe_tester_clear_cache(request):
 
 @login_required
 def probe_tester_update_cache(request):
-    if request.method != "POST" or request.headers.get("x-requested-with") != "XMLHttpRequest":
+    if (
+        request.method != "POST"
+        or request.headers.get("x-requested-with") != "XMLHttpRequest"
+    ):
         return JsonResponse({"error": "POST required"}, status=400)
 
     try:
@@ -827,7 +879,6 @@ def probe_tester_update_cache(request):
 
     if not url or not method:
         return JsonResponse({"error": "url and method required"}, status=400)
-
 
     domain = urlparse(url).hostname or urlparse(url).netloc
     if not domain:
@@ -845,7 +896,9 @@ def probe_tester_update_cache(request):
             "needs_akamai_bypass": needs_akamai_bypass,
         },
     )
-    logger.info("Probe tester: updated cache %s → method=%s (id=%d)", domain, method, entry.id)
+    logger.info(
+        "Probe tester: updated cache %s → method=%s (id=%d)", domain, method, entry.id
+    )
     return JsonResponse({"domain": domain, "method": method, "cache_id": entry.id})
 
 
@@ -862,10 +915,12 @@ def probe_tester_cached_method(request):
 
     entry = ProbeCache.objects.filter(domain=domain).order_by("-cached_at").first()
     if entry:
-        return JsonResponse({
-            "method": entry.method,
-            "needs_akamai_bypass": entry.needs_akamai_bypass,
-        })
+        return JsonResponse(
+            {
+                "method": entry.method,
+                "needs_akamai_bypass": entry.needs_akamai_bypass,
+            }
+        )
     return JsonResponse({"method": None})
 
 
@@ -922,10 +977,16 @@ def site_detail(request, site_id):
         scrapers_dir = Path(settings.PROJECT_ROOT) / "scrapers" / site.slug
         if scrapers_dir.is_dir():
             for f in sorted(scrapers_dir.iterdir(), reverse=True):
-                if f.name.startswith("output_") and f.name.endswith(".json") and f.is_file():
+                if (
+                    f.name.startswith("output_")
+                    and f.name.endswith(".json")
+                    and f.is_file()
+                ):
                     try:
                         size = f.stat().st_size
-                        output_files.append({"name": f.name, "size": size, "path": str(f)})
+                        output_files.append(
+                            {"name": f.name, "size": size, "path": str(f)}
+                        )
                     except Exception:
                         pass
 
@@ -1109,14 +1170,20 @@ def site_output_view(request, site_id, filename):
         raise Http404("Could not read file")
 
     products = data.get("products", [])
-    download_url = reverse("site_output_download", kwargs={"site_id": site.id, "filename": safe_name})
-    return render(request, "scraper/output_view.html", {
-        "site": site,
-        "filename": safe_name,
-        "json_content": pretty,
-        "product_count": len(products),
-        "download_url": download_url,
-    })
+    download_url = reverse(
+        "site_output_download", kwargs={"site_id": site.id, "filename": safe_name}
+    )
+    return render(
+        request,
+        "scraper/output_view.html",
+        {
+            "site": site,
+            "filename": safe_name,
+            "json_content": pretty,
+            "product_count": len(products),
+            "download_url": download_url,
+        },
+    )
 
 
 @login_required
@@ -1171,3 +1238,142 @@ def schedule_next(request):
         return redirect("job_detail", job_id=result["job_id"])
 
     return redirect("home")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Agent Playground
+# ═══════════════════════════════════════════════════════════════════════════
+
+_DEFAULT_PROMPTS: dict[str, str] = {
+    "site_analyzer": "Analyze the site structure of {url}. Detect the platform, scraping mechanism, anti-bot protection, and product discovery method. Write your findings to workspace/{slug}/site_analysis.json.",
+    "navigation_explore": "This is a deterministic exploration node — it will navigate to {url}, extract navigation structure, visit a category page, and write navigation_findings.json. No custom prompt needed.",
+    "navigation_synthesize": "Read workspace/{slug}/navigation_findings.json and site_analysis.json, then write the structured navigation_analysis.json. Choose the best discovery method and fill in all fields.",
+    "nav_skill_review": "Read workspace/{slug}/navigation_findings.json, compare against existing skills, and apply any new reusable navigation patterns. Write your report to workspace/{slug}/nav_learning_report.json.",
+    "product_analyzer": "Analyze the product page structure at {url}. Map all extractable fields with exact CSS selectors, JSON-LD paths, and meta tag fallbacks. Write to workspace/{slug}/product_analysis.json.",
+    "scraper_analyzer": "Verify the scraping strategy for {url}. Read existing analysis files and confirm the extraction approach. Write to workspace/{slug}/scraper_analysis.json.",
+}
+
+
+def _default_prompt(agent_name: str, url: str = "", slug: str = "") -> str:
+    template = _DEFAULT_PROMPTS.get(agent_name, "Run the {agent_name} agent on {url}.")
+    return template.format(
+        url=url or "https://example.com",
+        slug=slug or "test-site",
+        agent_name=agent_name,
+    )
+
+
+@login_required
+def agent_playground(request):
+    """Agent Playground — test individual agents in isolation."""
+    from .models import AgentPlayground
+
+    if (
+        request.method == "POST"
+        and request.headers.get("x-requested-with") == "XMLHttpRequest"
+    ):
+        agent_name = request.POST.get("agent_name", "").strip()
+        prompt = request.POST.get("prompt", "").strip()
+        url = request.POST.get("url", "").strip()
+        search_criteria = request.POST.get("search_criteria", "").strip()
+
+        if not agent_name or not prompt:
+            return JsonResponse({"error": "agent_name and prompt required"}, status=400)
+
+        from .tasks import _generate_slug
+
+        slug = _generate_slug(url) if url else "playground"
+        pg = AgentPlayground.objects.create(
+            agent_name=agent_name,
+            prompt=prompt,
+            url=url,
+            search_criteria=search_criteria,
+            site_slug=slug,
+        )
+
+        from .tasks import run_agent_task
+
+        task = run_agent_task.delay(pg.id)
+        pg.celery_task_id = task.id
+        pg.save(update_fields=["celery_task_id"])
+
+        return JsonResponse({"playground_id": pg.id, "status": pg.status})
+
+    recent_runs = AgentPlayground.objects.all()[:10]
+    return render(
+        request,
+        "scraper/agent_playground.html",
+        {
+            "recent_runs": recent_runs,
+            "default_prompts": json.dumps(_DEFAULT_PROMPTS),
+        },
+    )
+
+
+@login_required
+def agent_playground_detail(request, playground_id):
+    """View results of a specific playground run."""
+    from .models import AgentPlayground
+
+    pg = get_object_or_404(AgentPlayground, pk=playground_id)
+
+    # Read artifact contents
+    artifacts: list[dict] = []
+    for path in pg.output_artifacts or []:
+        full_path = os.path.join(settings.PROJECT_ROOT, path)
+        if os.path.isfile(full_path):
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                artifacts.append(
+                    {
+                        "path": path,
+                        "name": os.path.basename(path),
+                        "content": content[:50000],
+                        "size": len(content),
+                    }
+                )
+            except Exception:
+                pass
+
+    return JsonResponse(
+        {
+            "id": pg.id,
+            "agent_name": pg.agent_name,
+            "status": pg.status,
+            "url": pg.url,
+            "site_slug": pg.site_slug,
+            "tool_call_count": pg.tool_call_count,
+            "output_summary": pg.output_summary,
+            "error_message": pg.error_message,
+            "artifacts": artifacts,
+            "created_at": pg.created_at.isoformat() if pg.created_at else None,
+            "completed_at": pg.completed_at.isoformat() if pg.completed_at else None,
+        }
+    )
+
+
+@login_required
+def agent_playground_list(request):
+    """Return recent playground runs as JSON for polling."""
+    from .models import AgentPlayground
+
+    runs = AgentPlayground.objects.all()[:20]
+    return JsonResponse(
+        {
+            "runs": [
+                {
+                    "id": r.id,
+                    "agent_name": r.agent_name,
+                    "status": r.status,
+                    "url": r.url,
+                    "tool_call_count": r.tool_call_count,
+                    "created_at": r.created_at.isoformat() if r.created_at else "",
+                    "completed_at": r.completed_at.isoformat()
+                    if r.completed_at
+                    else "",
+                }
+                for r in runs
+            ]
+        }
+    )

@@ -17,22 +17,28 @@ The LangGraph pipeline runs automatically after a job is created. The graph is c
 ### Pipeline Phases
 
 ```
-check_accessibility → site_analysis → product_analysis → scraper_analysis
+check_accessibility → site_analysis → [navigation_explore → navigation_synthesize
+→ nav_skill_review → scraper_analyzer] → product_analysis → scraper_analysis
 → code_generation → testing → field_confirmation → execution → cleanup → skill_learning
 ```
+
+Navigation phases (in brackets) run only for `input_mode=navigation|list_page`.
 
 ### Phase Details
 
 1. **check_accessibility** — Probes the target URL with proxy escalation (direct → browser → datacenter → residential). Verifies no captcha/anti-bot. If captcha detected, ends job immediately.
 2. **site_analysis** — LLM agent detects platform (Shopify, SFCC, custom, etc.), anti-bot type, scraping mechanism. Uses pre-verified probe data.
-3. **product_analysis** — LLM agent maps extractable fields with exact CSS/XPath/JSON-LD selectors on product pages.
-4. **scraper_analysis** — LLM agent verifies upstream analyses, determines working strategy + proxy tier, produces verified instructions for code-writer.
-5. **code_generation** — LLM agent writes the Python scraper using analysis artifacts and verified selectors.
-6. **testing** — LLM agent runs the scraper on samples, validates field CORRECTNESS. Up to 3 retry cycles (code-writer ↔ code-tester).
-7. **field_confirmation** — Runs scraper on sample products, presents extracted data to user for approval. On rejection, loops back to product_analyzer (max 2 cycles).
-8. **execution** — Runs the scraper on all URLs from `input_urls.json`. HTTP scrapers run in celery-worker, browser scrapers dispatch to browser-service.
-9. **cleanup** — LLM agent copies scraper to `scrapers/{site_slug}/`, preserves analysis artifacts. Site model updated automatically.
-10. **skill_learning** — LLM agent examines the scrape for reusable patterns, proposes updates to `.opencode/skills/`.
+3. **navigation_explore** — (navigation mode only) Deterministic node navigates homepage + category page, extracts raw navigation structure to `navigation_findings.json`.
+4. **navigation_synthesize** — (navigation mode only) LLM agent converts raw findings to structured `navigation_analysis.json` with selectors and patterns.
+5. **nav_skill_review** — (navigation mode only) LLM agent compares raw navigation findings against existing skills, **auto-applies** new reusable patterns by appending `## Learned:` sections. Non-blocking.
+6. **product_analysis** — LLM agent maps extractable fields with exact CSS/XPath/JSON-LD selectors on product pages.
+7. **scraper_analysis** — LLM agent verifies upstream analyses, determines working strategy + proxy tier, produces verified instructions for code-writer.
+8. **code_generation** — LLM agent writes the Python scraper using analysis artifacts and verified selectors.
+9. **testing** — LLM agent runs the scraper on samples, validates field CORRECTNESS. Up to 3 retry cycles (code-writer ↔ code-tester).
+10. **field_confirmation** — Runs scraper on sample products, presents extracted data to user for approval. On rejection, loops back to product_analyzer (max 2 cycles).
+11. **execution** — Runs the scraper on all URLs from `input_urls.json`. HTTP scrapers run in celery-worker, browser scrapers dispatch to browser-service.
+12. **cleanup** — LLM agent copies scraper to `scrapers/{site_slug}/`, preserves analysis artifacts. Site model updated automatically.
+13. **skill_learning** — LLM agent examines the scrape for reusable patterns, proposes updates to `.opencode/skills/`. Reads `nav_learning_report.json` to avoid duplicating nav-skill-review's work.
 
 ### Human-in-the-Loop Points
 

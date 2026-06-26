@@ -30,6 +30,12 @@ _MAX_TOOL_OUTPUT_CHARS = 3000
 
 _SNAPSHOT_TOOLS = {"browser_snapshot", "browser_accessibility", "browser_full_snapshot"}
 
+# Evaluate tools return structured programmatic data (e.g. JSON from
+# extraction scripts).  These should NOT be truncated or the JSON becomes
+# unparseable.  Use a much larger limit for these.
+_EVALUATE_TOOLS = {"browser_evaluate", "playwright_browser_evaluate"}
+_MAX_EVALUATE_OUTPUT_CHARS = 200000
+
 _cached_tools: list[BaseTool] | None = None
 _PREFIX = "playwright_"
 
@@ -64,7 +70,11 @@ def _classify_error(exc: Exception) -> str:
     name = type(exc).__name__
     msg = str(exc).lower()
 
-    if "connection refused" in msg or "connectionreseterror" in msg or "connecterror" in msg:
+    if (
+        "connection refused" in msg
+        or "connectionreseterror" in msg
+        or "connecterror" in msg
+    ):
         return "connection_refused"
     if "timeout" in msg or "timed out" in msg:
         return "timeout"
@@ -106,7 +116,10 @@ async def _call_mcp_tool(mcp_url: str, tool_name: str, arguments: dict) -> str:
                 else:
                     output = str(result)
 
-                if tool_name in _SNAPSHOT_TOOLS and len(output) > _MAX_TOOL_OUTPUT_CHARS:
+                if (
+                    tool_name in _SNAPSHOT_TOOLS
+                    and len(output) > _MAX_TOOL_OUTPUT_CHARS
+                ):
                     try:
                         from headroom import compress as _compress
 
@@ -125,10 +138,17 @@ async def _call_mcp_tool(mcp_url: str, tool_name: str, arguments: dict) -> str:
                     except Exception:
                         pass
 
-                if len(output) > _MAX_TOOL_OUTPUT_CHARS:
+                # Truncate large outputs — but use a much higher limit for
+                # evaluate calls (structured JSON data must remain valid)
+                max_chars = (
+                    _MAX_EVALUATE_OUTPUT_CHARS
+                    if tool_name in _EVALUATE_TOOLS
+                    else _MAX_TOOL_OUTPUT_CHARS
+                )
+                if len(output) > max_chars:
                     output = (
-                        output[:_MAX_TOOL_OUTPUT_CHARS]
-                        + f"\n\n[... truncated {len(output)} → {_MAX_TOOL_OUTPUT_CHARS} chars]"
+                        output[:max_chars]
+                        + f"\n\n[... truncated {len(output)} → {max_chars} chars]"
                     )
                 return output
     except Exception:

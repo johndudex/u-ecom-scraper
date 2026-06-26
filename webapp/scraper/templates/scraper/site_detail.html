@@ -1,99 +1,106 @@
 {% extends "scraper/base.html" %}
 
-{% block page_title %}{{ site.name|default:site.slug }} — Ecommerce Scraper{% endblock %}
+{% block page_title %}{{ site.name|default:site.slug }} — Scraper Console{% endblock %}
 
 {% block content %}
 
 <div class="flex items-center justify-between mb-6">
-    <div class="relative overflow-hidden rounded-2xl bg-gradient-to-br from-brand-800 via-brand-700 to-brand-600 px-6 py-4">
-        <h2 class="text-lg font-bold text-brand-50 relative">{{ site.name|default:site.slug }}</h2>
-        <p class="text-xs text-brand-300 mt-0.5">{{ site.url }}</p>
+    <div>
+        <h2 class="text-2xl font-extrabold text-ink">{{ site.name|default:site.slug }}</h2>
+        <p class="text-xs text-ink-secondary mt-0.5 font-mono">{{ site.url }}</p>
     </div>
     <div class="flex items-center gap-2">
-        <a href="{% url 'site_edit' site_id=site.id %}" class="px-3.5 py-2 text-xs font-medium text-brand-400 hover:text-brand-200 border border-brand-600/50 rounded-lg hover:border-brand-500 transition-colors">Edit</a>
-        <a href="{% url 'site_add' %}" class="px-3.5 py-1.5 text-xs font-medium text-brand-400 hover:text-brand-50 hover:bg-brand-700/50 rounded-lg transition-colors">+ New</a>
+        <a href="{% url 'site_edit' site_id=site.id %}" class="btn-secondary">Edit</a>
+        <a href="{% url 'site_add' %}" class="nav-link">+ New</a>
     </div>
 </div>
 
-<div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+<div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
 
     <div class="lg:col-span-2 space-y-4">
 
-        <div class="rounded-2xl bg-surface border border-brand-700/30 p-5">
-            <h3 class="text-xs font-bold text-brand-400 uppercase tracking-wider mb-3">Site Info</h3>
+        <div class="panel p-5">
+            <h3 class="text-xs-label text-ink-secondary uppercase tracking-wider mb-3">Site Info</h3>
             <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
                 <div>
-                    <p class="text-brand-500 text-xs">Status</p>
-                    <span class="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-semibold uppercase tracking-wider mt-1 status-{{ site.status }}">{{ site.status }}</span>
+                    <p class="text-ink-muted text-xs">Status</p>
+                    <span class="status-badge status-{{ site.status }} mt-1">{{ site.status }}</span>
                 </div>
                 <div>
-                    <p class="text-brand-500 text-xs">Platform</p>
-                    <p class="text-brand-100 mt-1">{{ site.platform|default:"—" }}</p>
+                    <p class="text-ink-muted text-xs">Site Type</p>
+                    <p class="text-ink mt-1 capitalize">{{ site.site_type|default:"—" }}</p>
                 </div>
                 <div>
-                    <p class="text-brand-500 text-xs">Scraping Method</p>
-                    <p class="text-brand-100 mt-1">{{ site.scraping_method|default:"—" }}</p>
+                    <p class="text-ink-muted text-xs">Platform</p>
+                    <p class="text-ink mt-1">{{ site.platform|default:"—" }}</p>
                 </div>
                 <div>
-                    <p class="text-brand-500 text-xs">Products</p>
-                    <p class="text-brand-100 mt-1">{{ site.product_count }}</p>
+                    <p class="text-ink-muted text-xs">Scraping Method</p>
+                    <p class="text-ink mt-1">{{ site.scraping_method|default:"—" }}</p>
                 </div>
                 <div>
-                    <p class="text-brand-500 text-xs">Currency</p>
-                    <p class="text-brand-100 mt-1">{{ site.currency|default:"auto" }}</p>
+                    <p class="text-ink-muted text-xs">Products</p>
+                    <p class="text-ink mt-1 font-mono">{{ site.product_count }}</p>
                 </div>
                 <div>
-                    <p class="text-brand-500 text-xs">Scraper</p>
-                    <p class="mt-1">{% if site.has_scraper %}<span class="text-green-400 text-xs font-semibold">Ready</span>{% else %}<span class="text-brand-500 text-xs">None</span>{% endif %}</p>
+                    <p class="text-ink-muted text-xs">Currency</p>
+                    <p class="text-ink mt-1">{{ site.currency|default:"auto" }}</p>
                 </div>
                 <div>
-                    <p class="text-brand-500 text-xs">URLs</p>
-                    <p class="text-brand-100 mt-1">{{ site.input_urls|length }} loaded</p>
+                    <p class="text-ink-muted text-xs">Scraper</p>
+                    <p class="mt-1">{% if site.has_scraper %}<span class="text-success text-xs font-semibold">Ready</span>{% else %}<span class="text-ink-muted text-xs">None</span>{% endif %}</p>
                 </div>
                 <div>
-                    <p class="text-brand-500 text-xs">Last Scraped</p>
-                    <p class="text-brand-100 mt-1">{{ site.last_scraped_at|date:"M d, H:i"|default:"—" }}</p>
+                    <p class="text-ink-muted text-xs">URLs</p>
+                    <p class="text-ink mt-1 font-mono">{{ site.input_urls|length }} loaded</p>
+                </div>
+                <div>
+                    <p class="text-ink-muted text-xs">Last Scraped</p>
+                    <p class="text-ink mt-1 font-mono">{{ site.last_scraped_at|date:"M d, H:i"|default:"—" }}</p>
                 </div>
             </div>
         </div>
 
-        <div class="rounded-2xl bg-surface border border-brand-700/30 overflow-hidden">
-            <div class="px-5 py-3.5 border-b border-brand-700/30 flex items-center justify-between">
-                <h3 class="text-xs font-bold text-brand-400 uppercase tracking-wider">Actions</h3>
+        <div class="panel overflow-hidden">
+            <div class="panel-header">
+                <h3 class="text-xs-label text-ink-secondary uppercase tracking-wider">Actions</h3>
             </div>
             <div class="p-5 flex flex-wrap gap-3">
                 <form method="post" action="{% url 'site_scrape' site_id=site.id %}">
                     {% csrf_token %}
-                    <div class="flex items-center gap-2 mb-2">
-                        <label class="flex items-center gap-2 cursor-pointer text-xs text-brand-300">
-                            <input type="checkbox" name="rescrape" id="id_rescrape" class="w-3.5 h-3.5 rounded border-brand-600 bg-brand-700 text-cta cursor-pointer">
+                    <div class="flex items-center gap-4 mb-3">
+                        <label class="flex items-center gap-2 cursor-pointer text-xs text-ink-secondary">
+                            <input type="checkbox" name="rescrape" id="id_rescrape" class="mt-0.5">
                             Re-scrape
                         </label>
-                        <label class="flex items-center gap-2 cursor-pointer text-xs text-brand-300">
-                            <input type="checkbox" name="full_extraction" id="id_full_extraction" class="w-3.5 h-3.5 rounded border-brand-600 bg-brand-700 text-cta cursor-pointer">
+                        <label class="flex items-center gap-2 cursor-pointer text-xs text-ink-secondary">
+                            <input type="checkbox" name="full_extraction" id="id_full_extraction" class="mt-0.5">
                             Full extraction
                         </label>
                     </div>
-                    <button type="submit" class="bg-cta hover:bg-cta-hover text-white text-xs font-semibold px-4 py-2 rounded-xl transition-all duration-200 cursor-pointer">
-                        <span class="inline-flex items-center gap-1.5">
-                            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M4.5 5.653c0-1.426 1.529-2.33 2.779-1.643l11.54 6.348c1.295.712 1.295 2.573 0 3.285L7.28 19.991c-1.25.687-2.779-.217-2.779-1.643V5.653z" clip-rule="evenodd"/></svg>
-                            Run Full Pipeline
-                        </span>
+                    <button type="submit" class="btn-primary">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M4.5 5.653c0-1.426 1.529-2.33 2.779-1.643l11.54 6.348c1.295.712 1.295 2.573 0 3.285L7.28 19.991c-1.25.687-2.779-.217-2.779-1.643V5.653z" clip-rule="evenodd"/></svg>
+                        Run Full Pipeline
                     </button>
                 </form>
                 {% if site.has_scraper %}
                 <form method="post" action="{% url 'site_rerun' site_id=site.id %}">
                     {% csrf_token %}
-                    <button type="submit" class="bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold px-4 py-2 rounded-xl transition-all duration-200 cursor-pointer">
-                        <span class="inline-flex items-center gap-1.5">
-                            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M4.755 10.059a7.5 7.5 0 0112.548-3.364l1.903 1.903h-3.183a.75.75 0 110-1.5h4.992a.75.75 0 01.75.75v4.992a.75.75 0 11-1.5 0v-3.182l-1.903 1.903a9 9 0 00-15.059 4.035 8.97 8.97 0 01-3.548-2.637z" clip-rule="evenodd"/></svg>
-                            Quick Re-run Scraper
-                        </span>
+                    <button type="submit" class="btn-secondary">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M4.755 10.059a7.5 7.5 0 0112.548-3.364l1.903 1.903h-3.183a.75.75 0 110-1.5h4.992a.75.75 0 01.75.75v4.992a.75.75 0 11-1.5 0v-3.182l-1.903 1.903a9 9 0 00-15.059 4.035 8.97 8.97 0 01-3.548-2.637z" clip-rule="evenodd"/></svg>
+                        Quick Re-run Scraper
                     </button>
                 </form>
                 {% endif %}
+                <form method="post" action="{% url 'site_sync_urls' site_id=site.id %}" class="inline">
+                    {% csrf_token %}
+                    <button type="submit" class="btn-secondary" title="Write Site URLs to input_urls.json file">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 21 3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5"/></svg>
+                        Sync URLs
+                    </button>
+                </form>
                 {% if scraper_code %}
-                <a href="{% url 'site_scraper_code' site_id=site.id %}" class="inline-flex items-center gap-1.5 text-xs font-medium text-brand-400 hover:text-brand-200 border border-brand-600/50 px-4 py-2 rounded-xl transition-colors">
+                <a href="{% url 'site_scraper_code' site_id=site.id %}" class="btn-secondary">
                     <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"/></svg>
                     Download Scraper
                 </a>
@@ -101,17 +108,17 @@
             </div>
         </div>
 
-        <div class="rounded-2xl bg-surface border border-brand-700/30 overflow-hidden">
-            <div class="px-5 py-3.5 border-b border-brand-700/30">
-                <h3 class="text-xs font-bold text-brand-400 uppercase tracking-wider">Scrape Jobs ({{ jobs|length }})</h3>
+        <div class="panel overflow-hidden">
+            <div class="panel-header">
+                <h3 class="text-xs-label text-ink-secondary uppercase tracking-wider">Scrape Jobs ({{ jobs|length }})</h3>
             </div>
             {% if jobs %}
-            <div class="divide-y divide-brand-700/20 max-h-96 overflow-y-auto scrollbar-thin">
+            <div class="max-h-96 overflow-y-auto scrollbar-thin">
                 {% for job in jobs %}
-                <a href="{% url 'job_detail' job_id=job.id %}" class="flex items-center justify-between px-5 py-3 hover:bg-brand-700/20 transition-colors">
+                <a href="{% url 'job_detail' job_id=job.id %}" class="flex items-center justify-between px-5 py-3 border-b border-line-subtle last:border-0 hover:bg-raised transition-colors">
                     <div class="min-w-0 flex-1">
-                        <p class="text-sm font-medium text-brand-100 truncate">#{{ job.id }}</p>
-                        <p class="text-xs text-brand-500 mt-0.5">
+                        <p class="text-sm font-medium text-ink font-mono">#{{ job.id }}</p>
+                        <p class="text-xs text-ink-muted mt-0.5 font-mono">
                             {{ job.created_at|date:"M d, H:i" }}
                             {% if job.platform %} · {{ job.platform }}{% endif %}
                             {% if job.product_count %} · {{ job.product_count }} products{% endif %}
@@ -119,28 +126,19 @@
                     </div>
                     <div class="flex items-center gap-2 ml-3">
                         {% if job.product_count %}
-                        <span class="text-xs font-semibold text-cta">{{ job.product_count }}</span>
-                {% endif %}
-                <form method="post" action="{% url 'site_sync_urls' site_id=site.id %}" class="inline">
-                    {% csrf_token %}
-                    <button type="submit" class="bg-brand-700 hover:bg-brand-600 text-brand-200 text-xs font-semibold px-4 py-2 rounded-xl transition-all duration-200 cursor-pointer" title="Write Site URLs to input_urls.json file">
-                        <span class="inline-flex items-center gap-1.5">
-                            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M7.5 21 3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5"/></svg>
-                            Sync URLs
-                        </span>
-                    </button>
-                </form>
-                        <span class="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-semibold uppercase tracking-wider {% if job.full_extraction %}bg-blue-500/15 text-blue-400{% else %}bg-brand-700/50 text-brand-400{% endif %}">
+                        <span class="text-xs font-semibold text-accent font-mono">{{ job.product_count }}</span>
+                        {% endif %}
+                        <span class="status-badge {% if job.full_extraction %}status-auto_queued{% else %}status-pending{% endif %}">
                             {% if job.full_extraction %}Full{% else %}Sample{% endif %}
                         </span>
-                        <span class="inline-flex items-center px-2.5 py-1 rounded-lg text-[11px] font-semibold uppercase tracking-wider status-{{ job.status }}">{{ job.get_status_display }}</span>
+                        <span class="status-badge status-{{ job.status }}">{{ job.get_status_display }}</span>
                     </div>
                 </a>
                 {% endfor %}
             </div>
             {% else %}
             <div class="px-5 py-8 text-center">
-                <p class="text-brand-500 text-sm">No scrape jobs for this site yet.</p>
+                <p class="text-ink-muted text-sm">No scrape jobs for this site yet.</p>
             </div>
             {% endif %}
         </div>
@@ -149,29 +147,29 @@
     <div class="space-y-4">
 
         {% if scraper_code %}
-        <div class="rounded-2xl bg-surface border border-brand-700/30 overflow-hidden">
-            <div class="px-5 py-3.5 border-b border-brand-700/30 flex items-center justify-between">
-                <h3 class="text-xs font-bold text-brand-400 uppercase tracking-wider">Scraper Code</h3>
-                <a href="{% url 'site_scraper_code' site_id=site.id %}" class="text-[11px] text-cta hover:text-cta-hover">Download</a>
+        <div class="panel overflow-hidden">
+            <div class="panel-header">
+                <h3 class="text-xs-label text-ink-secondary uppercase tracking-wider">Scraper Code</h3>
+                <a href="{% url 'site_scraper_code' site_id=site.id %}" class="text-xs text-accent hover:text-accent-hover">Download</a>
             </div>
-            <div class="p-4 max-h-[500px] overflow-y-auto scrollbar-thin">
-                <pre class="text-xs text-brand-300 font-mono whitespace-pre-wrap break-all leading-relaxed">{{ scraper_code }}</pre>
+            <div class="p-4 max-h-[500px] overflow-y-auto scrollbar-thin border-t border-line-subtle">
+                <pre class="text-xs text-ink-secondary font-mono whitespace-pre-wrap break-all leading-relaxed">{{ scraper_code }}</pre>
             </div>
         </div>
         {% endif %}
 
         {% if output_files %}
-        <div class="rounded-2xl bg-surface border border-brand-700/30 overflow-hidden">
-            <div class="px-5 py-3.5 border-b border-brand-700/30">
-                <h3 class="text-xs font-bold text-brand-400 uppercase tracking-wider">Output Files ({{ output_files|length }})</h3>
+        <div class="panel overflow-hidden">
+            <div class="panel-header">
+                <h3 class="text-xs-label text-ink-secondary uppercase tracking-wider">Output Files ({{ output_files|length }})</h3>
             </div>
-            <div class="divide-y divide-brand-700/20 max-h-64 overflow-y-auto scrollbar-thin">
+            <div class="max-h-64 overflow-y-auto scrollbar-thin">
                 {% for f in output_files %}
-                <a href="{% url 'site_output_view' site_id=site.id filename=f.name %}" class="flex items-center justify-between px-5 py-2.5 hover:bg-brand-700/20 transition-colors group">
-                    <p class="text-xs text-brand-300 font-mono truncate max-w-[200px] group-hover:text-brand-100 transition-colors">{{ f.name }}</p>
+                <a href="{% url 'site_output_view' site_id=site.id filename=f.name %}" class="flex items-center justify-between px-5 py-2.5 border-b border-line-subtle last:border-0 hover:bg-raised transition-colors group">
+                    <p class="text-xs text-ink-secondary font-mono truncate max-w-[200px] group-hover:text-ink transition-colors">{{ f.name }}</p>
                     <div class="flex items-center gap-2">
-                        <p class="text-xs text-brand-500">{{ f.size|filesizeformat }}</p>
-                        <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="text-brand-600 opacity-0 group-hover:opacity-100 transition-opacity"><path stroke-linecap="round" stroke-linejoin="round" d="m8.25 4.5 7.5 7.5-7.5 7.5"/></svg>
+                        <p class="text-xs text-ink-muted">{{ f.size|filesizeformat }}</p>
+                        <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" class="text-ink-muted opacity-0 group-hover:opacity-100 transition-opacity"><path stroke-linecap="round" stroke-linejoin="round" d="m8.25 4.5 7.5 7.5-7.5 7.5"/></svg>
                     </div>
                 </a>
                 {% endfor %}
@@ -179,21 +177,21 @@
         </div>
         {% endif %}
 
-        <div class="rounded-2xl bg-surface border border-brand-700/30 overflow-hidden">
-            <div class="px-5 py-3.5 border-b border-brand-700/30">
-                <h3 class="text-xs font-bold text-brand-400 uppercase tracking-wider">Loaded URLs ({{ site.input_urls|length }})</h3>
+        <div class="panel overflow-hidden">
+            <div class="panel-header">
+                <h3 class="text-xs-label text-ink-secondary uppercase tracking-wider">Loaded URLs ({{ site.input_urls|length }})</h3>
             </div>
             {% if site.input_urls %}
-            <div class="p-4 max-h-64 overflow-y-auto scrollbar-thin">
+            <div class="p-4 max-h-64 overflow-y-auto scrollbar-thin border-t border-line-subtle">
                 <ul class="space-y-1">
                     {% for url in site.input_urls %}
-                    <li class="text-xs text-brand-300 font-mono truncate">{{ url }}</li>
+                    <li class="text-xs text-ink-secondary font-mono truncate">{{ url }}</li>
                     {% endfor %}
                 </ul>
             </div>
             {% else %}
             <div class="px-5 py-6 text-center">
-                <p class="text-brand-500 text-sm">No URLs loaded. Edit the site to add URLs.</p>
+                <p class="text-ink-muted text-sm">No URLs loaded. Edit the site to add URLs.</p>
             </div>
             {% endif %}
         </div>
