@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 import functools
 from typing import Any, Optional
@@ -116,6 +117,53 @@ def _with_api_retry(func):
         raise last_exc
 
     return wrapper
+
+
+def _fix_json_artifact(slug: str, filename: str) -> None:
+    if not slug:
+        return
+    try:
+        root = _get_project_root()
+    except Exception:
+        return
+    path = os.path.join(root, "workspace", slug, filename)
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        json.loads(content)
+    except json.JSONDecodeError:
+        try:
+            fixed = re.sub(r'(?<=[^\\])\\(?!["\\/bfnrtu])', r"\\\\", content)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(fixed)
+            json.loads(fixed)
+            logger.info("_fix_json_artifact: fixed bad escapes in %s", path)
+        except Exception as exc:
+            logger.warning("_fix_json_artifact: could not fix %s: %s", path, exc)
+
+
+def _patch_scraper_xvfb(slug: str) -> None:
+    if not slug:
+        return
+    try:
+        root = _get_project_root()
+    except Exception:
+        return
+    scraper_path = os.path.join(root, "workspace", slug, "scraper_draft.py")
+    if not os.path.isfile(scraper_path):
+        return
+    try:
+        with open(scraper_path, "r", encoding="utf-8") as f:
+            code = f.read()
+        patched = code.replace("SB(uc=True, xvfb=True,", "SB(uc=True, xvfb=args.xvfb,")
+        if patched != code:
+            with open(scraper_path, "w", encoding="utf-8") as f:
+                f.write(patched)
+            logger.info("_patch_scraper_xvfb: patched hardcoded xvfb=True → args.xvfb")
+    except Exception as exc:
+        logger.warning("_patch_scraper_xvfb: %s", exc)
 
 
 def _load_test_report(slug: str) -> dict | None:
@@ -324,8 +372,8 @@ def _notify_phase(job_id: int, node_name: str, status: str) -> None:
         pass
 
 
-SITE_ANALYSIS_BUDGET = 30
-SITE_ANALYSIS_BUDGET_EXTENDED = 50
+SITE_ANALYSIS_BUDGET = 10
+SITE_ANALYSIS_BUDGET_EXTENDED = 20
 SITE_ANALYSIS_MAX_BUDGET = 50
 PRODUCT_ANALYSIS_BUDGET = 50
 PRODUCT_ANALYSIS_BUDGET_EXTENDED = 70
@@ -842,6 +890,8 @@ def _invoke_product_analyzer(
         _persist_agent_logs(state, result, "product-analyzer", config)
         _notify_phase(job_id, "product_analyzer", "done")
 
+        _fix_json_artifact(slug, "product_analysis.json")
+
         output_exists = os.path.isfile(
             os.path.join(
                 _get_project_root(), "workspace", slug, "product_analysis.json"
@@ -890,6 +940,8 @@ def _invoke_product_analyzer(
             result = agent.invoke({"messages": retry_messages}, config=agent_cfg2)
             _persist_agent_logs(state, result, "product-analyzer", config)
             _notify_phase(job_id, "product_analyzer", "done")
+
+            _fix_json_artifact(slug, "product_analysis.json")
 
             output_exists = os.path.isfile(
                 os.path.join(
@@ -1299,6 +1351,20 @@ def _invoke_scraper_analyzer(
                 ):
                     penalties += 0.05
                     logger.info("confidence_adj: -0.05 (no JSON-LD detected)")
+
+            session_gated = any("oops" in e.lower() for e in nav_findings.get("errors", []))
+            if session_gated and not analysis.get("warmup_required"):
+                analysis["warmup_required"] = True
+                analysis["warmup_url"] = state.get("url", "")
+                analysis["warmup_wait_seconds"] = 5
+                analysis["warmup_details"] = (
+                    "Session gating detected — interior pages return 'oops!' "
+                    "without visiting homepage first. Navigate to homepage, wait, "
+                    "accept cookies, then proceed to product pages."
+                )
+                logger.info(
+                    "scraper_analyzer: overriding warmup_required=True (session gated)"
+                )
             adjusted = max(0.1, min(1.0, raw_conf - penalties))
             if adjusted < raw_conf:
                 analysis["confidence_score"] = adjusted
@@ -1357,6 +1423,8 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "code-writer", config)
         _notify_phase(job_id, "code_writer", "done")
+        slug = state.get("site_slug", "")
+        _patch_scraper_xvfb(slug)
         update["messages"] = []
         scraper_analysis = state.get("scraper_analysis") or {}
         strategy = scraper_analysis.get("strategy", "")
@@ -1744,6 +1812,20 @@ def route_from_human_approval(state: ScrapeState) -> str:
         if choice in cancel_values:
             logger.info("route_from_human_approval: testing_exhausted -> cancelled")
             return "__end__"
+        feedback = state.get("human_feedback", "")
+        if label == "Provide feedback" and feedback:
+            logger.info(
+                "route_from_human_approval: testing_exhausted -> scraper_analyzer "
+                "(user feedback: %s)",
+                feedback[:200],
+            )
+            return Command(
+                update={
+                    "test_retry_count": 0,
+                    "human_feedback": feedback,
+                },
+                goto="scraper_analyzer",
+            )
         logger.info(
             "route_from_human_approval: testing_exhausted -> field_confirmation"
         )
@@ -2059,8 +2141,9 @@ def route_from_setup_workspace(state: ScrapeState) -> str:
     """
     input_mode = state.get("input_mode", "url_list")
 
-    # Navigation/list_page jobs always need navigation_explore, even on re-scrape
-    if input_mode in ("navigation", "list_page") and not state.get(
+    # Navigation/list_page/search_term jobs always need navigation_explore,
+    # even on re-scrape, because navigation discovers the product URLs.
+    if input_mode in ("navigation", "list_page", "search_term") and not state.get(
         "navigation_analysis"
     ):
         return "site_analyzer"  # → _route_after_site_analyzer → navigation_explore
@@ -2079,11 +2162,11 @@ def route_from_setup_workspace(state: ScrapeState) -> str:
 def _route_after_site_analyzer(state: ScrapeState) -> str:
     """Route after site_analyzer based on input_mode.
 
-    - navigation/list_page → navigation_explore (deterministic exploration + LLM synthesis)
-    - url_list/search_term → update_tracker_analysis (existing product/content analysis flow)
+    - navigation/list_page/search_term → navigation_explore (deterministic exploration + LLM synthesis)
+    - url_list → update_tracker_analysis (existing product/content analysis flow)
     """
     input_mode = state.get("input_mode", "url_list")
-    if input_mode in ("navigation", "list_page"):
+    if input_mode in ("navigation", "list_page", "search_term"):
         logger.info(
             "_route_after_site_analyzer: input_mode=%s → navigation_explore",
             input_mode,

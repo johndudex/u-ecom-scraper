@@ -398,3 +398,4 @@ Before returning, verify:
 5. **Handle encoding** - Use `ensure_ascii=False` for JSON output
 6. **Be defensive** - Wrap everything in try/except
 7. **BUDGET PRIORITY: Write the scraper file FIRST.** Do not spend tool calls searching for reference scrapers or reading multiple template files. Read the analysis files, then immediately write scraper_draft.py and input_urls.json. You can verify after writing if budget allows. Never leave without writing the output files.
+8. **PRODUCT URL REGEX: Use `[A-Za-z0-9]` NOT `[A-Z0-9]`** for product code patterns. Many SFCC sites use mixed-case alphanumeric codes (e.g., `lv047g825g1fs`). Always check the actual URL format from scraper_analysis or verify_results before writing URL filter regexes. A case-sensitive regex like `[A-Z0-9]{10,}` will reject lowercase product codes and cause 0 products discovered.

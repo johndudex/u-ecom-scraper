@@ -198,10 +198,10 @@ async def create_playwright_tools(mcp_url: Optional[str] = None) -> list[BaseToo
     return tools
 
 
-def create_playwright_tools_sync(mcp_url: Optional[str] = None) -> list[BaseTool]:
+def create_playwright_tools_sync(mcp_url: Optional[str] = None, fresh: bool = False) -> list[BaseTool]:
     global _cached_tools, playwright_status
 
-    if _cached_tools is not None:
+    if _cached_tools is not None and not fresh:
         return _cached_tools
 
     resolved_url = _resolve_mcp_url(mcp_url)

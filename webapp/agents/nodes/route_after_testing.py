@@ -70,6 +70,14 @@ def route_after_testing(state: ScrapeState) -> str:
         return "field_confirmation"
 
     if retry_count < 2:
+        if retry_count >= 1 and confidence >= 0.80:
+            logger.warning(
+                "route_after_testing: problem well-diagnosed after %d retries "
+                "(confidence=%.2f) → human_approval for user guidance",
+                retry_count + 1,
+                confidence,
+            )
+            return "human_approval"
         logger.info(
             "route_after_testing: %s (confidence=%.2f, high_severity=%s), retry %d/3 via scraper_analyzer",
             assessment,

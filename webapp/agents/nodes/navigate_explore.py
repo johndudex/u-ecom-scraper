@@ -224,21 +224,18 @@ _HOMEPAGE_EXTRACTION_JS = r"""
   }
 
   // --- Detect URL-based search patterns from links ---
-  // Look for links containing search-related URL patterns
-  if (!result.search_form || !result.search_form.action) {
-    const searchUrlPatterns = [];
-    const searchLinkRegexes = [
-      /\/search\?/i, /\/search\//i, /search\.aspx/i,
-      /\?search=/i, /\?q=/i, /\?keyword=/i, /\?query=/i,
-    ];
-    result.all_links_sample.forEach(href => {
-      if (searchLinkRegexes.some(re => re.test(href))) {
-        if (searchUrlPatterns.length < 5) searchUrlPatterns.push(href);
-      }
-    });
-    if (searchUrlPatterns.length > 0) {
-      result.search_url_hints = searchUrlPatterns;
+  const searchUrlPatterns = [];
+  const searchLinkRegexes = [
+    /\/search\?/i, /\/search\//i, /search\.aspx/i,
+    /\?search=/i, /\?q=/i, /\?keyword=/i, /\?query=/i, /\?searchterm=/i,
+  ];
+  result.all_links_sample.forEach(href => {
+    if (searchLinkRegexes.some(re => re.test(href))) {
+      if (searchUrlPatterns.length < 5) searchUrlPatterns.push(href);
     }
+  });
+  if (searchUrlPatterns.length > 0) {
+    result.search_url_hints = searchUrlPatterns;
   }
 
   // --- Collect a sample of all links (for URL pattern detection) ---
@@ -462,6 +459,8 @@ _LISTING_PAGE_EXTRACTION_JS = r"""
       if (/\/item\//i.test(href) || /\/pd\//i.test(href) || /\/dp\//i.test(href)) return true;
       if (/\/book\//i.test(href)) return true;
       if (/-c\.aspx$/.test(href) || /-c\.html$/.test(href)) return true;
+      // Accept slug-based product URLs with embedded product codes (e.g. CK UK: /watch-ck-pulse-wf25100063000)
+      if (/\/[a-z]+-[a-z]+-[\w-]*\d{4,}[\w-]*$/.test(new URL(href).pathname)) return true;
       // Accept if text is long enough and URL has a product-like path (3+ segments)
       if (text.length > 15 && new URL(href).pathname.split('/').length >= 3) return true;
       return false;
@@ -1074,7 +1073,7 @@ def _build_search_urls(
 
                 params = up.parse_qs(hint_parsed.query)
                 for key in list(params.keys()):
-                    if key.lower() in ("q", "search", "keyword", "query", "kw"):
+                    if key.lower() in ("q", "search", "keyword", "query", "kw", "searchterm"):
                         params[key] = [term]
                 new_query = up.urlencode(params, doseq=True)
                 candidates.append(up.urlunparse(hint_parsed._replace(query=new_query)))
@@ -1083,8 +1082,12 @@ def _build_search_urls(
         common_patterns = [
             f"{origin}{base_path}/search?q={criteria_encoded}",
             f"{origin}{base_path}/search?search={criteria_encoded}",
+            f"{origin}{base_path}/search?searchterm={criteria_encoded}",
+            f"{origin}{base_path}/search?searchTerm={criteria_encoded}",
             f"{origin}/search?q={criteria_encoded}",
             f"{origin}/search?search={criteria_encoded}",
+            f"{origin}/search?searchterm={criteria_encoded}",
+            f"{origin}/search?searchTerm={criteria_encoded}",
             f"{origin}{base_path}/search.aspx?search={criteria_encoded}",
             f"{origin}{base_path}/search.asp?search={criteria_encoded}",
             f"{origin}{base_path}/search/?q={criteria_encoded}",
@@ -1326,10 +1329,12 @@ def _try_form_search(
     search_result = _invoke_tool(evaluate, function=eval_js)
     findings["homepage_nav"]["search_submit_result"] = search_result[:200]
 
-    # Wait for navigation
+    # Wait for content to render (handles CSR sites like Next.js, React, Vue)
     import time
 
-    time.sleep(3)
+    content_status = _wait_for_content(evaluate, timeout=12)
+    if not content_status.get("loaded"):
+        time.sleep(3)
 
     listing_data_raw = _invoke_tool(
         evaluate,
@@ -1354,7 +1359,16 @@ def _has_real_product_links(findings: dict) -> bool:
         p for p in product_links
         if not any(kw in (p.get("href", "") or "").lower() for kw in _PROMO_URL_KEYWORDS)
     ]
-    return len(real) >= 3
+    if len(real) < 3:
+        return False
+    cat_hrefs = {
+        (c.get("href", "") or "").lower()
+        for c in findings.get("homepage_nav", {}).get("category_links", [])
+    }
+    if cat_hrefs:
+        product_only = [p for p in real if (p.get("href", "") or "").lower() not in cat_hrefs]
+        return len(product_only) >= 3
+    return True
 
 
 def _try_interactive_pagination(evaluate, findings: dict) -> None:
@@ -1366,7 +1380,7 @@ def _try_interactive_pagination(evaluate, findings: dict) -> None:
     if not product_links:
         return
 
-    pagination_info = listing.get("pagination", {})
+    pagination_info = listing.get("pagination") or {}
     total_count = pagination_info.get("total_product_count", 0)
     current_count = len(product_links)
 
@@ -1610,13 +1624,21 @@ def _do_explore_via_browser(
     # ── STEP 3: Search (form-based PRIMARY, URL-based SECONDARY) ────────
     category_links = homepage_data.get("category_links", [])
     search_form = homepage_data.get("search_form")
-    effective_base_url = (
-        base_url.rstrip("/") + locale_prefix if locale_prefix else base_url
-    )
+    # Build effective base URL with locale prefix (avoid double-prefix)
+    if locale_prefix:
+        effective_base_url = base_url.rstrip("/")
+        # Strip existing locale suffix if present (base_url may already contain it)
+        if effective_base_url.endswith(locale_prefix):
+            pass  # Already has locale, no need to add
+        else:
+            effective_base_url = effective_base_url + locale_prefix
+    else:
+        effective_base_url = base_url
 
     found_products = False
 
     # 3a: PRIMARY — Interactive form-based search (type into search box + Enter)
+    form_search_count = 0
     if search_criteria and search_form and search_form.get("search_input_selector"):
         logger.info(
             "navigate_explore: STEP 3a — interactive form search for '%s'",
@@ -1624,43 +1646,75 @@ def _do_explore_via_browser(
         )
         _try_form_search(navigate, evaluate, search_form, search_criteria, findings)
         found_products = _has_real_product_links(findings)
+        form_search_count = len(
+            findings.get("listing_page", {}).get("product_links", [])
+        )
+        logger.info(
+            "navigate_explore: form search found %d products", form_search_count
+        )
 
-    # 3b: SECONDARY — URL-based search (only if form search didn't work or no form)
-    if search_criteria and not found_products:
+    # 3b: SECONDARY — URL-based search
+    # Also try when form search worked to compare — form search may use a
+    # different/lower-result endpoint (e.g. search.aspx vs /search?searchTerm=)
+    if search_criteria and (not found_products or form_search_count < 30):
         findings["search_attempted"] = True
         search_urls = _build_search_urls(
             search_form, search_criteria, effective_base_url, homepage_data
         )
         if not search_urls:
             logger.info("navigate_explore: no search URLs could be built")
-        for idx, surl in enumerate(search_urls[:4]):
+        for idx, surl in enumerate(search_urls[:6]):
             logger.info(
                 "navigate_explore: trying search URL %d/%d: %s",
                 idx + 1,
-                min(len(search_urls), 4),
+                min(len(search_urls), 6),
                 surl,
             )
+            prev_listing = findings.get("listing_page", {}).copy()
             findings["listing_page"] = {}
             _visit_and_extract(navigate, evaluate, surl, surl, findings)
-            if _has_real_product_links(findings):
+            new_count = len(
+                findings.get("listing_page", {}).get("product_links", [])
+            )
+            if new_count > form_search_count:
+                logger.info(
+                    "navigate_explore: URL search found %d products (better than form's %d)",
+                    new_count,
+                    form_search_count,
+                )
                 found_products = True
                 break
+            if new_count > 0 and not found_products:
+                found_products = True
 
     # 3c: Try clicking a search trigger button first, then form search
-    if search_criteria and not found_products and not search_form:
+    # Always attempt if 3a+3b failed — hidden inputs (e.g. CK UK) cause silent 3a failure
+    if search_criteria and not found_products:
+        # Navigate back to homepage for search trigger/form access
+        logger.info("navigate_explore: STEP 3c — navigating to homepage for search access")
+        homepage_url = effective_base_url if effective_base_url else base_url
+        _invoke_tool(navigate, url=homepage_url)
+        time.sleep(3)
+
         trigger_js = r"""() => {
             const triggers = document.querySelectorAll(
                 'button[aria-label*="search" i], a[aria-label*="search" i], '
                 + '.search-toggle, .search-trigger, [data-toggle="search"], '
-                + '[class*="search-icon" i], [class*="search-button" i]'
+                + '[class*="search-icon" i], [class*="search-button" i], '
+                + '[class*="SearchIcon" i]'
             );
+            let clicked = false;
             for (const t of triggers) {
                 t.click();
-                return 'clicked_search_trigger';
+                clicked = true;
             }
-            return 'no_trigger';
+            return clicked ? 'clicked_search_trigger' : 'no_trigger';
         }"""
         trigger_result = _invoke_tool(evaluate, function=trigger_js)
+        logger.info(
+            "navigate_explore: STEP 3c — trigger click result: %s",
+            repr(trigger_result)[:300],
+        )
         if "clicked" in str(trigger_result):
             time.sleep(2)
             # Re-extract homepage data to find the now-visible search form
@@ -1668,17 +1722,23 @@ def _do_explore_via_browser(
                 evaluate, function=_HOMEPAGE_EXTRACTION_JS
             )
             homepage_data2 = _parse_eval_json(homepage_data_raw2)
-            if homepage_data2:
-                search_form2 = homepage_data2.get("search_form")
-                if search_form2 and search_form2.get("search_input_selector"):
-                    logger.info(
-                        "navigate_explore: search trigger revealed form, trying interactive search"
-                    )
-                    _try_form_search(
-                        navigate, evaluate, search_form2, search_criteria, findings
-                    )
-                    if _has_real_product_links(findings):
-                        found_products = True
+            search_form2 = homepage_data2.get("search_form") if homepage_data2 else None
+            if not search_form2 or not search_form2.get("search_input_selector"):
+                logger.info(
+                    "navigate_explore: form re-extraction failed, trying known selectors"
+                )
+                search_form2 = {
+                    "search_input_selector": "input[name='searchTerm']",
+                }
+            logger.info(
+                "navigate_explore: STEP 3c — form selector: %s",
+                search_form2.get("search_input_selector"),
+            )
+            _try_form_search(
+                navigate, evaluate, search_form2, search_criteria, findings
+            )
+            if _has_real_product_links(findings):
+                found_products = True
 
     # ── STEP 4: Interactive pagination ──────────────────────────────────
     if found_products:
@@ -1935,6 +1995,7 @@ def _looks_like_product_url(url: str) -> bool:
         r'/p/\w',
         r'/\d{6,}$',
         r'/[a-z0-9]+-[a-z0-9]{6,}$',
+        r'/[a-z]+-[a-z]+-[\w-]*\d{4,}[\w-]*$',
     ]
     import re as _re
     for pat in product_patterns:
@@ -2315,15 +2376,17 @@ def _do_explore_via_http(
 
     # Verify locale — check <html lang="..."> matches expected locale
     html_tag = soup.find("html")
+    expected_locale = ""
+    html_locale = ""
     if html_tag and html_tag.get("lang"):
         html_locale = html_tag["lang"].lower()
-        expected_locale = ""
         parsed_base = urlparse(base_url)
         base_path = parsed_base.path.strip("/")
         if base_path and "-" in base_path:
             expected_locale = base_path.split("/")[0]
     if (
         expected_locale
+        and html_locale
         and html_locale != expected_locale
         and not html_locale.startswith(expected_locale + "-")
         and not html_locale == expected_locale.split("-")[0]
@@ -2451,6 +2514,9 @@ def _do_explore_via_http(
                 continue
             if "oops!" in search_html[:5000].lower():
                 logger.info("navigate_explore: search %s returned 'oops!' page", search_url[:100])
+                findings.setdefault("errors", []).append(
+                    f"Search {search_url} returned 'oops!' page — session gating likely"
+                )
                 continue
 
             logger.info(
@@ -2485,83 +2551,72 @@ def _do_explore_via_http(
             except Exception:
                 pass
 
-    # STEP 3b: If search failed, try common category URL patterns
+    # STEP 3b: If search failed, try categories matching search_criteria
     if not visited:
-        parsed_base = urlparse(base_url)
-        locale_prefix = parsed_base.path.strip("/")
-        origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
-        category_names = [
-            "watches",
-            "watches-jewellery",
-            "mens-watches-jewellery",
-            "womens-watches-jewellery",
-            "jewelry",
-            "jewellery",
-            "accessories",
-            "watches-accessories",
-            "fragrances",
-            "leather-goods",
-            "gifts",
-        ]
+        best_cat = _pick_category_to_visit(category_links, search_criteria, base_url)
+        if best_cat:
+            candidate_urls = [best_cat]
+        else:
+            candidate_urls = [link["href"] for link in category_links[:5]]
+
         seen_cat_urls: set[str] = set()
-        for cat in category_names:
-            for prefix in ("", f"/{locale_prefix}" if locale_prefix else ""):
-                cat_url = f"{origin}{prefix}/{cat}"
-                if cat_url in seen_cat_urls:
-                    continue
-                seen_cat_urls.add(cat_url)
-                logger.info(
-                    "navigate_explore: STEP 3b — trying category pattern %s",
+        for cat_url in candidate_urls:
+            if cat_url in seen_cat_urls:
+                continue
+            seen_cat_urls.add(cat_url)
+            logger.info(
+                "navigate_explore: STEP 3b — trying criteria-matched category %s",
+                cat_url,
+            )
+            cat_html = fetch_fn(cat_url)
+            if not cat_html or cat_html.startswith("RENDER FAILED"):
+                logger.warning(
+                    "navigate_explore: category fetch failed for %s",
                     cat_url,
                 )
-                cat_html = fetch_fn(cat_url)
-                if not cat_html or cat_html.startswith("RENDER FAILED"):
-                    logger.warning(
-                        "navigate_explore: category fetch failed for %s",
-                        cat_url,
-                    )
-                    continue
-                if "oops!" in cat_html[:5000].lower():
-                    logger.info(
-                        "navigate_explore: category %s returned 'oops!' page, skipping",
-                        cat_url,
-                    )
-                    continue
+                continue
+            if "oops!" in cat_html[:5000].lower():
                 logger.info(
-                    "navigate_explore: category HTML len=%d for %s",
-                    len(cat_html),
+                    "navigate_explore: category %s returned 'oops!' page, skipping",
                     cat_url,
                 )
-                try:
-                    cat_soup = BeautifulSoup(cat_html[:500000], "html.parser")
-                    cat_links = _extract_product_links_bs(cat_soup, base_url)
-                    cat_json_ld = _extract_json_ld(cat_soup, base_url)
-                    if cat_links or (cat_json_ld and cat_json_ld.get("products")):
-                        findings["listing_page"]["url"] = cat_url
+                findings.setdefault("errors", []).append(
+                    f"Category {cat_url} returned 'oops!' page — session gating likely"
+                )
+                continue
+            logger.info(
+                "navigate_explore: category HTML len=%d for %s",
+                len(cat_html),
+                cat_url,
+            )
+            try:
+                cat_soup = BeautifulSoup(cat_html[:500000], "html.parser")
+                cat_links = _extract_product_links_bs(cat_soup, base_url)
+                cat_json_ld = _extract_json_ld(cat_soup, base_url)
+                if cat_links or (cat_json_ld and cat_json_ld.get("products")):
+                    findings["listing_page"]["url"] = cat_url
+                    findings["listing_page"]["product_links"] = cat_links
+                    if cat_json_ld.get("products"):
+                        findings["listing_page"]["json_ld"] = cat_json_ld
+                        existing = set(p.get("href", "") for p in cat_links)
+                        for p in cat_json_ld["products"]:
+                            if p.get("href") and p["href"] not in existing:
+                                cat_links.append(p)
+                                existing.add(p["href"])
                         findings["listing_page"]["product_links"] = cat_links
-                        if cat_json_ld.get("products"):
-                            findings["listing_page"]["json_ld"] = cat_json_ld
-                            existing = set(p.get("href", "") for p in cat_links)
-                            for p in cat_json_ld["products"]:
-                                if p.get("href") and p["href"] not in existing:
-                                    cat_links.append(p)
-                                    existing.add(p["href"])
-                            findings["listing_page"]["product_links"] = cat_links
-                            logger.info(
-                                "navigate_explore: JSON-LD from category %s: %d products",
-                                cat,
-                                len(cat_json_ld["products"]),
-                            )
-                        if cat_json_ld.get("breadcrumbs"):
-                            findings["homepage_nav"]["breadcrumbs"] = cat_json_ld[
-                                "breadcrumbs"
-                            ]
-                        visited = True
-                        break
-                except Exception:
-                    pass
-            if visited:
-                break
+                        logger.info(
+                            "navigate_explore: JSON-LD from category %s: %d products",
+                            cat_url,
+                            len(cat_json_ld["products"]),
+                        )
+                    if cat_json_ld.get("breadcrumbs"):
+                        findings["homepage_nav"]["breadcrumbs"] = cat_json_ld[
+                            "breadcrumbs"
+                        ]
+                    visited = True
+                    break
+            except Exception:
+                pass
 
     if not visited:
         category_to_visit = _pick_category_to_visit(
@@ -2677,112 +2732,140 @@ def navigate_explore(state: dict, config=None) -> dict[str, Any]:
     # ── Route based on probe determination ──────────────────────────────
     playwright_unavailable = False
 
-    # If the site analysis determined that UC Chrome is required (Akamai,
-    # etc.), Playwright MCP Chrome cannot access the site.  Use probe_html
-    # (which delegates to browser-service /render using UC Chrome) instead.
-    # This is the general principle: no agent should use Playwright when
-    # the probe says something else.
-    if _needs_uc_chrome(site_analysis):
+    # STRATEGY: Always try Playwright MCP first (it maintains session cookies
+    # and can navigate interactive sites). Fall back to probe_html only
+    # when Playwright MCP is truly unavailable. Even for UC Chrome sites,
+    # Playwright MCP Chrome has often proven to work for navigation.
+    use_playwright_first = True
+
+    # Detect locale prefix from site_analysis product URL pattern
+    effective_url = url
+    prod_pattern = site_analysis.get("product_discovery", {}).get(
+        "product_url_pattern", ""
+    )
+    locale_match = re.match(r"^(/[a-z]{2}-[a-z]{2,4}/)", prod_pattern)
+    if locale_match:
+        parsed = urlparse(url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        effective_url = origin + locale_match.group(1).rstrip("/")
         logger.info(
-            "navigate_explore: UC Chrome required (method=%s), using probe_html",
-            site_analysis.get("connectivity", {}).get("method_that_worked", "?"),
+            "navigate_explore: detected locale %s from product URL pattern",
+            locale_match.group(1),
         )
-        # Detect locale prefix from site_analysis product URL pattern
-        # (e.g. "/en-us/{category}/..." → "/en-us")
-        effective_url = url
-        prod_pattern = site_analysis.get("product_discovery", {}).get(
-            "product_url_pattern", ""
-        )
-        locale_match = re.match(r"^(/[a-z]{2}-[a-z]{2,4}/)", prod_pattern)
-        if locale_match:
-            parsed = urlparse(url)
-            origin = f"{parsed.scheme}://{parsed.netloc}"
-            effective_url = origin + locale_match.group(1).rstrip("/")
-            logger.info(
-                "navigate_explore: detected locale %s from product URL pattern",
-                locale_match.group(1),
-            )
-        findings = _do_explore_via_http(
-            effective_url,
-            search_criteria,
-            site_analysis,
-            fetch_fn=_fetch_via_probe_html,
-        )
-    else:
-        # Standard path: Playwright MCP for JS-rendered sites, HTTP fallback
-        findings: dict[str, Any] = {}
-        browser_ok = False
-        try:
-            from agents.tools.playwright_tools import create_playwright_tools_sync
 
-            pw_tools = create_playwright_tools_sync()
-            if pw_tools:
-                browser_ok = True
-                from agents.tools.context import set_tool_context
+    # ── PHASE 1: Try Playwright MCP first (maintains session cookies) ────
+    findings: dict[str, Any] = {}
+    browser_ok = False
+    try:
+        from agents.tools.playwright_tools import create_playwright_tools_sync
 
-                set_tool_context(dict(state), agent_name="navigation_explore")
-                try:
-                    findings = _do_explore_via_browser(
-                        pw_tools,
-                        url,
-                        search_criteria,
-                        site_analysis,
-                        search_url=search_url,
-                    )
-                finally:
-                    from agents.tools.context import clear_tool_context
+        pw_tools = create_playwright_tools_sync(fresh=True)
+        if pw_tools:
+            browser_ok = True
+            from agents.tools.context import set_tool_context
 
-                    clear_tool_context()
-            else:
-                playwright_unavailable = True
-                logger.warning(
-                    "navigate_explore: Playwright unavailable, falling back to HTTP"
+            nav_state = dict(state)
+            nav_state["probe_result"] = {}
+            set_tool_context(nav_state, agent_name="navigation_explore")
+            try:
+                explore_url = effective_url if effective_url != url else url
+                findings = _do_explore_via_browser(
+                    pw_tools,
+                    explore_url,
+                    search_criteria,
+                    site_analysis,
+                    search_url=search_url,
                 )
-        except Exception as exc:
-            logger.exception("navigate_explore: browser exploration failed: %s", exc)
+            finally:
+                from agents.tools.context import clear_tool_context
 
-        # Retry browser once after clearing cache, then fall back to HTTP
-        if not browser_ok or not findings.get("homepage_nav", {}).get("category_links"):
-            if not browser_ok:
-                try:
-                    import agents.tools.playwright_tools as _pw
+                clear_tool_context()
+        else:
+            playwright_unavailable = True
+            logger.warning(
+                "navigate_explore: Playwright MCP unavailable, falling back to HTTP"
+            )
+    except Exception as exc:
+        logger.exception("navigate_explore: browser exploration failed: %s", exc)
 
-                    _pw._cached_tools = None  # type: ignore[attr-defined]
-                    pw_tools = create_playwright_tools_sync()
-                    if pw_tools:
-                        browser_ok = True
-                        playwright_unavailable = False
-                        from agents.tools.context import set_tool_context
+    # Retry browser once after clearing cache
+    if not browser_ok or not findings.get("homepage_nav", {}).get("category_links"):
+        if not browser_ok:
+            try:
+                import agents.tools.playwright_tools as _pw
 
-                        set_tool_context(dict(state), agent_name="navigation_explore")
-                        try:
-                            findings = _do_explore_via_browser(
-                                pw_tools,
-                                url,
-                                search_criteria,
-                                site_analysis,
-                                search_url=search_url,
-                            )
-                        finally:
-                            from agents.tools.context import clear_tool_context
+                _pw._cached_tools = None  # type: ignore[attr-defined]
+                pw_tools = create_playwright_tools_sync(fresh=True)
+                if pw_tools:
+                    browser_ok = True
+                    playwright_unavailable = False
+                    from agents.tools.context import set_tool_context
 
-                            clear_tool_context()
-                except Exception as exc:
-                    logger.warning("navigate_explore: browser retry failed: %s", exc)
+                    set_tool_context(dict(state), agent_name="navigation_explore")
+                    try:
+                        findings = _do_explore_via_browser(
+                            pw_tools,
+                            url,
+                            search_criteria,
+                            site_analysis,
+                            search_url=search_url,
+                        )
+                    finally:
+                        from agents.tools.context import clear_tool_context
 
-        # If browser path produced no category links, try HTTP as a last resort
-        if not findings or not findings.get("homepage_nav", {}).get("category_links"):
-            logger.info("navigate_explore: falling back to HTTP exploration")
+                        clear_tool_context()
+            except Exception as exc:
+                logger.warning("navigate_explore: browser retry failed: %s", exc)
+
+    # ── PHASE 2: Fall back to probe_html or HTTP if Playwright failed ───
+    if not findings or not findings.get("homepage_nav", {}).get("category_links"):
+        if _needs_uc_chrome(site_analysis):
+            logger.info(
+                "navigate_explore: Playwright failed for UC Chrome site, trying probe_html"
+            )
+            http_findings = _do_explore_via_http(
+                effective_url,
+                search_criteria,
+                site_analysis,
+                fetch_fn=_fetch_via_probe_html,
+            )
+        else:
             http_findings = _do_explore_via_http(url, search_criteria, site_analysis)
-            # Only use HTTP findings if they have more data than browser findings
-            http_cats = len(
-                http_findings.get("homepage_nav", {}).get("category_links", [])
+
+        http_cats = len(
+            http_findings.get("homepage_nav", {}).get("category_links", [])
+        )
+        http_prods = len(
+            http_findings.get("listing_page", {}).get("product_links", [])
+        )
+        browser_cats = len(
+            findings.get("homepage_nav", {}).get("category_links", [])
+        )
+        browser_prods = len(
+            findings.get("listing_page", {}).get("product_links", [])
+        )
+        http_is_better = (
+            (http_cats > browser_cats and http_cats > 0)
+            or (http_prods > browser_prods and http_prods > 0)
+        )
+        if http_is_better:
+            logger.info(
+                "navigate_explore: HTTP found %d cats/%d prods vs browser %d cats/%d prods — using HTTP",
+                http_cats, http_prods, browser_cats, browser_prods,
             )
-            browser_cats = len(
-                findings.get("homepage_nav", {}).get("category_links", [])
+            findings = http_findings
+        else:
+            http_cat_links = http_findings.get("homepage_nav", {}).get(
+                "category_links", []
             )
-            if http_cats > browser_cats:
-                findings = http_findings
+            if http_cat_links:
+                findings.setdefault("homepage_nav", {}).setdefault(
+                    "category_links", []
+                ).extend(http_cat_links)
+                logger.info(
+                    "navigate_explore: merged %d HTTP categories into browser findings",
+                    len(http_cat_links),
+                )
 
     # Write findings to workspace
     findings_path = os.path.join(root, "workspace", slug, "navigation_findings.json")

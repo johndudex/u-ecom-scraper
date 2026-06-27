@@ -158,11 +158,11 @@ def _handle_complete(site, slug: str, full_extraction: bool) -> Command:
     if full_extraction:
         return Command(
             update={
-                "site_status": "complete",
+                "site_status": "in_progress",
                 "current_phase": "check_tracker",
-                "skip_site_analysis": True,
-                "skip_product_analysis": True,
-                "skip_code_generation": True,
+                "skip_site_analysis": False,
+                "skip_product_analysis": False,
+                "skip_code_generation": False,
             },
             goto="setup_workspace",
         )

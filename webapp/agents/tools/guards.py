@@ -98,18 +98,21 @@ def _make_guard(check_fn: Callable[..., str | None]) -> Callable:
 
 def _check_akamai(func: Callable, args: tuple, kwargs: dict) -> str | None:
     method = get_probe_method()
+    func_name = getattr(func, "__name__", "tool")
     logger.debug(
         "Guard require_non_akamai_tool: checking %s, method=%s",
-        getattr(func, "__name__", "tool"),
+        func_name,
         method,
     )
     if method.startswith("uc_chrome"):
-        logger.info(
-            "Guard: blocking %s — UC Chrome required (method=%s)",
-            getattr(func, "__name__", "tool"),
-            method,
-        )
-        return _BLOCKED_BY_UC_CHROME.format(method=method)
+        if func_name in ("sync_call",):
+            logger.info(
+                "Guard: blocking %s — UC Chrome required (method=%s)",
+                func_name,
+                method,
+            )
+            return _BLOCKED_BY_UC_CHROME.format(method=method)
+        return None
     return None
 
 
@@ -130,6 +133,16 @@ def _check_target_url(func: Callable, args: tuple, kwargs: dict) -> str | None:
 
     if _urls_match(url, target):
         return None
+
+    if agent == "product_analyzer":
+        target_domain = get_site_domain()
+        url_domain = None
+        try:
+            url_domain = urlparse(url).hostname
+        except Exception:
+            pass
+        if url_domain and target_domain and url_domain == target_domain:
+            return None
 
     logger.info(
         "Guard: blocking %s — off-target URL %s (target=%s, agent=%s)",

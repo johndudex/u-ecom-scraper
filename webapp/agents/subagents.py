@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
@@ -324,6 +325,7 @@ def _get_tools_sync(agent_name: str, workspace_scope: str = "") -> list:
     }
     needs_fs = bool(fs_tool_names & set(requested))
     needs_bash = "run_bash" in requested
+    needs_scraper = "run_scraper" in requested
     needs_skill = "load_skill" in requested or "list_skills" in requested
 
     if needs_playwright:
@@ -385,11 +387,14 @@ def _get_tools_sync(agent_name: str, workspace_scope: str = "") -> list:
                 "Failed to load filesystem tools for '%s': %s", agent_name, exc
             )
 
-    if needs_bash:
+    if needs_bash or needs_scraper:
         try:
             from .tools.shell_tools import get_shell_tools as _gst
 
-            tools.extend(_gst())
+            all_shell = _gst()
+            if needs_scraper and not needs_bash:
+                all_shell = [t for t in all_shell if t.name == "run_scraper"]
+            tools.extend(all_shell)
         except Exception as exc:
             logger.error("Failed to load shell tools for '%s': %s", agent_name, exc)
 
@@ -550,15 +555,21 @@ def build_site_analyzer_message(state: dict) -> list:
             "3. write_file to save analysis (1 call)\n\n"
         )
 
+    url_is_homepage = product_url == url or product_url.rstrip("/") == url.rstrip("/")
+    page_label = (
+        "No specific product URL was provided — analyze the homepage "
+        "using the pre-verified probe data above."
+        if url_is_homepage
+        else f"Analyze this product page: {product_url}"
+    )
+
     content = (
         f"## OBJECTIVE\n"
         f"Building a scraper for {url}. The scraper reads URLs "
         f"from `input_urls.json` and extracts data from each page.\n\n"
         f"{content_type_context}"
         f"## Your Task: Site Analysis\n\n"
-        f"Analyze the **page** below to determine platform, anti-bot "
-        f"protection, and the best scraping mechanism.\n\n"
-        f"**Page URL (analyze this page):** {product_url}\n"
+        f"{page_label}\n\n"
         f"**Site URL (for reference):** {url}\n"
         f"**Currency:** {currency}\n"
         f"**Site slug:** {slug}\n"
@@ -566,7 +577,7 @@ def build_site_analyzer_message(state: dict) -> list:
         f"{cached_probe}"
         f"{access_strategy}"
         f"{call_allocation}"
-        f"### BUDGET: 30 tool calls maximum (target 5-8).\n\n"
+        f"### BUDGET: 10 tool calls maximum (target 3-5).\n\n"
         f"### WRITE EARLY — CRITICAL\n"
         f"Write site_analysis.json as soon as you have platform + mechanism + anti-bot.\n"
         f"You can overwrite the file later if you learn more. Do NOT wait until the end.\n"
@@ -583,10 +594,11 @@ def build_site_analyzer_message(state: dict) -> list:
         f"}}\n"
         f"```\n"
         f"Downstream agents (product_analyzer, scraper_analyzer) read this.\n\n"
-        f"### What NOT to Do\n"
+        f"### CRITICAL — URL Prohibition\n"
+        f"- **Do NOT probe any URL other than the one provided above.**\n"
+        f"- Do NOT guess product URLs, probe sitemap.xml, category pages, or variant URLs.\n"
         f"- Do NOT use Wayback Machine, archive.org, cached snapshots, or any archived version\n"
         f"- Do NOT enumerate all Algolia indices or test facet partitioning\n"
-        f"- Do NOT crawl categories, sitemaps, or other product pages\n"
         f"- Do NOT read `input_urls.json` — that file is for the code-writer\n"
         f"- Do NOT load skill files — detect from page content only\n"
         f"- Do NOT spend more than 2-3 calls on any single sub-task\n\n"
@@ -604,20 +616,35 @@ def build_product_analyzer_message(state: dict) -> list:
 
     if not product_url:
         nav_findings = state.get("navigation_findings") or {}
+        nav_analysis = state.get("navigation_analysis") or {}
         listing = nav_findings.get("listing_page", {})
         product_links = listing.get("product_links", [])
+
+        candidates = []
         if product_links:
+            candidates = [
+                p.get("href", "") if isinstance(p, dict) else str(p)
+                for p in product_links
+            ]
+        if not candidates:
+            item_links = nav_analysis.get("item_links", {})
+            for u in item_links.get("url_examples", []):
+                if u and u not in candidates:
+                    candidates.append(u)
+
+        for candidate in candidates:
             from urllib.parse import urlparse
-            candidate = product_links[0].get("href", "") if isinstance(product_links[0], dict) else str(product_links[0])
+
             parsed = urlparse(candidate)
-            path_parts = [p for p in parsed.path.split("/") if p]
-            if len(path_parts) >= 3 and not candidate.endswith("/"):
-                product_url = candidate
-            else:
-                logger.warning(
-                    "build_product_analyzer_message: skipping nav product link "
-                    "(looks like a category page, not product): %s", candidate[:120]
-                )
+            path = parsed.path.strip("/")
+            path_parts = [p for p in path.split("/") if p]
+            if path_parts and not candidate.endswith("/"):
+                if len(path_parts) >= 2 or re.search(r"[A-Z]\d{5,}", path):
+                    product_url = candidate
+                    break
+
+        if not product_url and candidates:
+            product_url = candidates[0]
     if not product_url:
         product_url = "auto-discover"
 
@@ -723,7 +750,9 @@ def build_product_analyzer_message(state: dict) -> list:
         f"- Do NOT check dataLayer, anti-bot, or load platform skills\n"
         f"- Do NOT examine newsletters, store locators, or site navigation\n"
         f"- Do NOT read `input_urls.json` — that file is for the code-writer\n"
-        f"- Do NOT revisit sections you've already analyzed\n\n"
+        f"- Do NOT revisit sections you've already analyzed\n"
+        f"- Do NOT guess or probe random URLs — only analyze the product URL provided above\n"
+        f"- Do NOT probe category pages or site sections unrelated to the product URL\n\n"
         f"**CRITICAL: You MUST call write_file to save the field mapping as JSON to "
         f"workspace/{slug}/product_analysis.json as your LAST action. "
         f"Do NOT just print the analysis as text.**"
@@ -1126,6 +1155,17 @@ def build_code_writer_message(state: dict) -> list:
             f"Focus on the HIGH severity issues above. Do NOT change parts that work.\n"
         )
 
+    human_feedback_section = ""
+    human_feedback = state.get("human_feedback", "")
+    if human_feedback:
+        human_feedback_section = (
+            f"\n\n### User Feedback (from approval)\n"
+            f"The user provided this feedback after reviewing the failed test:\n"
+            f"> {human_feedback}\n\n"
+            f"Address this feedback in your fix. The user's insight may identify "
+            f"the root cause that automated testing missed.\n"
+        )
+
     algolia_section = ""
     if algolia and algolia.get("detected"):
         algolia_section = (
@@ -1185,6 +1225,9 @@ def build_code_writer_message(state: dict) -> list:
         if verified:
             lines = []
             for field_name, field_info in verified.items():
+                if isinstance(field_info, str):
+                    lines.append(f"  - {field_name}: {field_info}")
+                    continue
                 method = field_info.get("method", "unknown")
                 verified_flag = field_info.get("verified", False)
                 note = field_info.get("note", "")
@@ -1306,6 +1349,10 @@ def build_code_writer_message(state: dict) -> list:
             nav_lines.append("**Search:** supported")
             if search_info.get("url_pattern"):
                 nav_lines.append(f"  - URL pattern: `{search_info['url_pattern']}`")
+            if search_info.get("search_url_pattern"):
+                nav_lines.append(f"  - Search URL pattern: `{search_info['search_url_pattern']}`")
+            if search_info.get("listing_url_used"):
+                nav_lines.append(f"  - Products found at: `{search_info['listing_url_used']}`")
             if search_info.get("input_selector"):
                 nav_lines.append(f"  - Search input: `{search_info['input_selector']}`")
             if search_criteria:
@@ -1339,15 +1386,46 @@ def build_code_writer_message(state: dict) -> list:
         nav_lines.append(
             "\n### Two-Phase Architecture (REQUIRED for this scraper)\n"
             "This scraper must implement TWO phases:\n\n"
-            "**Phase 1: Discover item URLs**\n"
-            "- Navigate to the site using the search/category patterns above\n"
+            "**Phase 1: Discover item URLs (use navigation_analysis — do NOT re-discover)\n"
+            "- Phase 1 MUST start from the listing URL in navigation_analysis.search\n"
+        )
+
+        if search_info.get("listing_url_used"):
+            nav_lines.append(
+                f"- First URL: `{search_info['listing_url_used']}` "
+                f"(this is where {len(item_links_info.get('url_examples', []))} products were found)\n"
+            )
+        elif search_info.get("search_url_pattern"):
+            nav_lines.append(
+                f"- First URL: `{search_info['search_url_pattern']}` (replace `{{criteria}}` with `{search_criteria}`)\n"
+            )
+        elif search_info.get("url_pattern"):
+            nav_lines.append(
+                f"- First URL: `{search_info['url_pattern']}`\n"
+            )
+
+        if item_links_info.get("link_selector") and item_links_info.get("link_selector") != "a[href]":
+            nav_lines.append(
+                f"- Extract product links using selector: `{item_links_info['link_selector']}` "
+                f"within container: `{item_links_info['container_selector']}`\n"
+            )
+        elif item_links_info.get("link_selector"):
+            nav_lines.append(
+                f"- Extract product links within container: `{item_links_info.get('container_selector', 'product grid')}`\n"
+            )
+
+        nav_lines.append(
             "- Paginate through all result pages\n"
             "- Collect item page URLs (NOT content — just URLs)\n"
+            "- Filter: only keep URLs matching the pattern from navigation_analysis\n"
             "- Store discovered URLs in a list\n\n"
             "**Phase 2: Scrape each item page**\n"
             "- For each discovered URL, extract field data\n"
             "- Map raw data to output fields\n"
             "- Write results to output file\n\n"
+            "**CRITICAL:** Do NOT write your own discovery logic from scratch. "
+            "The navigation_analysis has the exact URL and selectors that found "
+            f"{len(item_links_info.get('url_examples', []))} products. Use them.\n"
         )
 
         _template_family = "navigation"
@@ -1391,7 +1469,7 @@ def build_code_writer_message(state: dict) -> list:
         f"**Save scraper to:** workspace/{slug}/scraper_draft.py\n"
         f"**Save input URLs to:** workspace/{slug}/input_urls.json"
         f"{provided_urls_section}"
-        f"{retry_section}{algolia_section}{navigation_section}{template_hint}{scraper_analysis_section}\n\n"
+        f"{retry_section}{human_feedback_section}{algolia_section}{navigation_section}{template_hint}{scraper_analysis_section}\n\n"
         f"### Architecture\n"
     )
     if navigation_section:
@@ -1492,6 +1570,28 @@ def build_code_tester_message(state: dict) -> list:
             f"Read the previous test report at: workspace/{slug}/test_report.json\n\n"
         )
 
+    input_mode = state.get("input_mode", "url_list")
+    nav_validation = ""
+    if input_mode in ("navigation", "list_page", "search_term"):
+        nav_analysis = state.get("navigation_analysis") or {}
+        discovery = nav_analysis.get("discovery_method", "")
+        nav_validation = (
+            f"\n### Navigation Job Validation (input_mode={input_mode})\n"
+            f"This is a navigation job — the scraper discovers products via search/category.\n"
+        )
+        if discovery == "search":
+            nav_validation += (
+                f"- **Phase 1 MUST start from the search/listing URL in navigation_analysis.json** — "
+                f"not from a guessed category page\n"
+                f"- Validate that discovered URLs are PRODUCT pages, not category pages\n"
+            )
+        nav_validation += (
+            f"- `--sample` flag limits to 5 products — verify the scraper respects this\n"
+            f"- A FAIL is expected if Phase 1 discovers category/landing page URLs instead of product URLs\n"
+            f"- This is a navigation scraper — input_urls.json is NOT used. "
+            f"Products come from the scraper's own discovery.\n"
+        )
+
     content = (
         f"## OBJECTIVE\n"
         f"Validate the generated scraper for {slug}.\n\n"
@@ -1500,6 +1600,7 @@ def build_code_tester_message(state: dict) -> list:
         f"**Scraper path:** workspace/{slug}/scraper_draft.py\n"
         f"**Product analysis:** workspace/{slug}/product_analysis.json\n"
         f"**Save test report to:** workspace/{slug}/test_report.json\n\n"
+        f"{nav_validation}"
         f"### Workflow (5 steps)\n"
         f"1. Read `workspace/{slug}/scraper_draft.py` (1 call)\n"
         f"2. Read `workspace/{slug}/product_analysis.json` (1 call)\n"

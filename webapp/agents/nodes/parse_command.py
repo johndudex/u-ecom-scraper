@@ -26,9 +26,18 @@ def parse_command(state: ScrapeState) -> Command:
     slug = _url_to_slug(url)
     page_type = state.get("page_type", "product")
     input_mode = state.get("input_mode", "url_list")
+    search_criteria = state.get("search_criteria", "")
+
+    if search_criteria and input_mode == "url_list":
+        input_mode = "search_term"
+        logger.info(
+            "parse_command: search_criteria='%s' present, auto-setting input_mode=search_term",
+            search_criteria[:50],
+        )
+
     logger.info(
-        "parse_command: url=%s sample_url=%s page_type=%s → site_slug=%s",
-        url, sample_url[:80], page_type, slug,
+        "parse_command: url=%s sample_url=%s page_type=%s input_mode=%s → site_slug=%s",
+        url, sample_url[:80], page_type, input_mode, slug,
     )
 
     return Command(

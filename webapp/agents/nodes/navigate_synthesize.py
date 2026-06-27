@@ -56,7 +56,6 @@ def navigate_synthesize(state: dict, config=None) -> dict[str, Any]:
 
     cat_links = raw_findings.get("homepage_nav", {}).get("category_links", [])
     prod_links = raw_findings.get("listing_page", {}).get("product_links", [])
-    json_ld = raw_findings.get("listing_page", {}).get("json_ld", {})
     has_fatal_locale_error = any(
         "locale mismatch" in e.lower() and "compatible" not in e.lower()
         for e in raw_findings.get("errors", [])
@@ -85,13 +84,19 @@ def navigate_synthesize(state: dict, config=None) -> dict[str, Any]:
 
     real_prod_links = [p for p in prod_links if _is_real_product_link(p)]
 
-    if (not cat_links and not real_prod_links) or has_fatal_locale_error:
+    session_gated = (
+        raw_findings.get("search_attempted", False)
+        and not raw_findings.get("listing_page", {}).get("url")
+        and "oops" in str(raw_findings.get("errors", []))
+    )
+
+    if (not cat_links and not real_prod_links) or has_fatal_locale_error or session_gated:
         logger.warning(
-            "navigate_synthesize: findings empty or low-quality (%d cats, %d real prods, locale_err=%s), "
+            "navigate_synthesize: findings empty or low-quality (%d cats, %d real prods, session_gated=%s), "
             "skipping LLM agent to prevent hallucination",
             len(cat_links),
             len(real_prod_links),
-            has_locale_error,
+            session_gated,
         )
         return _fallback_synthesize(state, root, slug)
 
@@ -215,8 +220,6 @@ def _fallback_synthesize(state: dict, root: str, slug: str) -> dict[str, Any]:
 
     if has_fatal_locale_error and not real_product_links:
         discovery_method = "failed"
-    elif has_search and search_criteria and real_product_links and "search" in listing_url.lower():
-        discovery_method = "search"
     elif has_search and search_criteria and real_product_links:
         discovery_method = "search"
     elif has_categories and real_product_links:
@@ -241,14 +244,37 @@ def _fallback_synthesize(state: dict, root: str, slug: str) -> dict[str, Any]:
             "search_url_pattern": search_form.get("action", ""),
         }
     elif findings.get("search_attempted"):
+        listing_url_for_search = listing_url if listing_url else ""
+        if listing_url_for_search and search_criteria:
+            from urllib.parse import urlparse as _up, parse_qs as _pqs, urlencode as _ue
+
+            parsed = _up(listing_url_for_search)
+            params = _pqs(parsed.query)
+            search_param = ""
+            for key in list(params.keys()):
+                kl = key.lower()
+                if kl in ("search", "q", "searchterm", "keyword", "query"):
+                    search_param = key
+                    break
+            if search_param:
+                search_url_pattern = (
+                    f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                    f"?{search_param}={{criteria}}"
+                )
+            else:
+                search_url_pattern = listing_url_for_search
+        else:
+            search_url_pattern = ""
+
         search_section = {
             "has_search": True,
             "input_selector": "",
             "submit_selector": "",
-            "url_pattern": "",
+            "url_pattern": listing_url_for_search,
             "has_url_search": True,
-            "search_url_pattern": "",
-            "notes": "Search was attempted by navigate_explore but no search form was detected. The site likely has URL-based search (e.g., /search?q=term).",
+            "search_url_pattern": search_url_pattern,
+            "listing_url_used": listing_url_for_search,
+            "notes": f"Search was attempted by navigate_explore. Products found at: {listing_url_for_search}" if listing_url_for_search else "Search was attempted but no results found.",
         }
     else:
         search_section = {"has_search": False}
@@ -301,9 +327,18 @@ def _fallback_synthesize(state: dict, root: str, slug: str) -> dict[str, Any]:
             pattern = re.sub(r"\d+", "{id}", sample)
             url_pattern = pattern
 
+        link_selector = "a[href]"
+        if url_pattern:
+            path_segments = [s for s in url_pattern.split("/") if s and not s.startswith("{")]
+            for seg in path_segments:
+                if seg.startswith(("-", "_")):
+                    link_selector = f"a[href*='{seg}']"
+                    break
+
+        container_selector = ".product-grid, .product-list, [class*=product], [data-pid], .product-tile, .grid-item--product"
         item_links_section = {
-            "container_selector": ".product-grid, .product-list, [class*=product]",
-            "link_selector": "a[href]",
+            "container_selector": container_selector,
+            "link_selector": link_selector,
             "url_pattern": url_pattern,
             "url_examples": product_hrefs[:5],
         }

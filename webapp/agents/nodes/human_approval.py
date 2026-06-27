@@ -44,13 +44,16 @@ def human_approval(state: ScrapeState) -> dict:
                 f"The scraper failed testing after {test_retries} retries "
                 f"(last assessment: {assessment}, confidence: {confidence:.0%}). "
                 "The scraper may produce incomplete or incorrect data.\n\n"
-                "Continue anyway to proceed to field confirmation, "
-                "or Cancel to abort the job."
+                "Choose:\n"
+                "- **Continue anyway**: proceed to field confirmation\n"
+                "- **Provide feedback**: describe what's wrong so the code-writer can fix it\n"
+                "- **Cancel**: abort the job"
             )
-            options = ["Continue anyway", "Cancel"]
+            options = ["Continue anyway", "Provide feedback", "Cancel"]
             decisions = [
                 {"type": "approve", "label": "Continue anyway"},
-                {"type": "reject", "label": "Cancel"},
+                {"type": "approve", "label": "Provide feedback", "allow_feedback": True},
+                {"type": "reject", "label": "Cancel", "allow_feedback": False},
             ]
             logger.info(
                 "human_approval: auto-detected testing_exhausted "

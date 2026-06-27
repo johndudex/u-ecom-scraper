@@ -872,7 +872,11 @@ def run_agent_task(self, playground_id: int) -> None:
             "url": pg.url,
             "site_slug": slug,
             "site_name": "",
-            "input_mode": "navigation" if "navigation" in pg.agent_name else "url_list",
+            "input_mode": (
+                "search_term"
+                if pg.search_criteria
+                else ("navigation" if "navigation" in pg.agent_name else "url_list")
+            ),
             "search_criteria": pg.search_criteria or "",
             "page_type": "product",
             "sample_url": pg.url,
@@ -946,15 +950,15 @@ def run_agent_task(self, playground_id: int) -> None:
 
 
 AGENT_MAX_ITERATIONS_LOOKUP: dict[str, int] = {
-    "site_analyzer": 20,
-    "product_analyzer": 15,
+        "site_analyzer": 10,
+    "product_analyzer": 30,
     "navigation_agent": 40,
     "navigation_explore": 20,
     "navigation_synthesize": 15,
     "nav_skill_review": 25,
     "scraper_analyzer": 10,
-    "code_writer": 30,
-    "code_tester": 15,
+    "code_writer": 20,
+    "code_tester": 20,
     "cleanup": 10,
     "skill_learner": 15,
 }
