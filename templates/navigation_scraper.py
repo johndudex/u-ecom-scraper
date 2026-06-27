@@ -225,6 +225,16 @@ def _get_next_page_url(page, next_page_num: int) -> Optional[str]:
                     if href.startswith("/"):
                         href = SITE_URL.rstrip("/") + href
                     return href
+                # SPA-style: no href, click the element and return the new URL
+                try:
+                    btn.click()
+                    page.wait_for_load_state("networkidle")
+                    time.sleep(2)
+                    new_url = page.url
+                    if new_url:
+                        return new_url
+                except Exception:
+                    pass
         except Exception:
             pass
         return None

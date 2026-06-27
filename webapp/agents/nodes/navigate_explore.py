@@ -396,14 +396,14 @@ _LISTING_PAGE_EXTRACTION_JS = r"""
     "[data-productid]",
   ];
 
-  let detectedViaCardSelector = false;
-  for (const sel of cardSelectors) {
-    const cards = document.querySelectorAll(sel);
-    if (cards.length >= 3) {
-      detectedViaCardSelector = true;
-      const seen = new Set();
-      cards.forEach((card, i) => {
-        if (i >= 30) return;
+    let detectedViaCardSelector = false;
+    for (const sel of cardSelectors) {
+      const cards = document.querySelectorAll(sel);
+      if (cards.length >= 3) {
+        detectedViaCardSelector = true;
+        const seen = new Set();
+        cards.forEach((card, i) => {
+          if (i >= 200) return;
         const link = card.querySelector('a[href]');
         if (!link) return;
         const href = link.href;
@@ -495,7 +495,7 @@ _LISTING_PAGE_EXTRACTION_JS = r"""
       }
     }
     if (bestKey && bestCount >= 3) {
-      result.product_links = linkCounts[bestKey].slice(0, 30).map(l => ({
+      result.product_links = linkCounts[bestKey].slice(0, 200).map(l => ({
         href: l.href, text: l.text,
       }));
       result.grid_containers.push({
@@ -527,7 +527,7 @@ _LISTING_PAGE_EXTRACTION_JS = r"""
         }
       });
     }
-    result.product_links = result.product_links.slice(0, 30);
+    result.product_links = result.product_links.slice(0, 200);
   }
 
   // --- Detect pagination ---
@@ -541,7 +541,7 @@ _LISTING_PAGE_EXTRACTION_JS = r"""
     '.pagination a, .page-numbers a, .pager a, ' +
     '.pagination .page, [class*="pagenum"] a'
   );
-  const loadMoreBtn = document.querySelector(
+  let loadMoreBtn = document.querySelector(
     'button[class*="load-more" i], a[class*="load-more" i], ' +
     '.show-more, [class*="showmore" i], ' +
     '#load-more-component, #load-more-wrapper a, ' +
@@ -696,6 +696,52 @@ _LISTING_PAGE_EXTRACTION_JS = r"""
     result.framework_config.fredhopper = true;
   }
 
+  // Detect "next page" / "previous page" text links (CK UK, some SFCC sites)
+  // These are plain <a> or <span> elements with text like "next page", "previous page"
+  // Often accompanied by a page indicator like "01/02" or "1 of 2"
+  if (!result.pagination) {
+    const allLinks = document.querySelectorAll('a, span, button, div');
+    for (const el of allLinks) {
+      const t = (el.textContent || '').trim().toLowerCase();
+      if (t === 'next page' || t === 'next') {
+        result.pagination = {
+          type: 'next_button',
+          next_selector: 'a, span, button, div',
+          next_text: t,
+          next_href: el.href || '',
+          note: 'next page text link detected',
+        };
+        break;
+      }
+    }
+  }
+
+  // Detect page indicators like "01/02", "1 of 2", "1/2" near pagination
+  if (!result.pagination) {
+    const pageIndicatorRegex = /(\d{1,2})\s*(?:\/|of)\s*(\d{1,3})/;
+    const allTexts = document.querySelectorAll(
+      'a, span, div, p, li, [class*="pagination" i], [class*="pager" i], [class*="page" i]'
+    );
+    for (const el of allTexts) {
+      const t = (el.textContent || '').trim();
+      const match = t.match(pageIndicatorRegex);
+      if (match) {
+        const current = parseInt(match[1], 10);
+        const total = parseInt(match[2], 10);
+        if (total >= 2 && current < total) {
+          result.pagination = {
+            type: 'page_numbers',
+            current_page: current,
+            max_pages: total,
+            page_indicator_text: t.trim(),
+            note: 'Page indicator detected (e.g. 01/02)',
+          };
+          break;
+        }
+      }
+    }
+  }
+
   // --- Extract page count (total pages) ---
   const pageCountInput = document.querySelector(
     'input[name="page-count"], input[name="pageCount"], ' +
@@ -725,12 +771,33 @@ _LISTING_PAGE_EXTRACTION_JS = r"""
     }
   }
 
+  // Fallback: parse "N items" / "N results" / "N products" from body text
+  if (!result.total_products) {
+    const bodyText = (document.body ? document.body.innerText : '');
+    const countPatterns = [
+      /(\d+)\s*(?:items?|results?|products?|found|available)/i,
+      /(?:showing|displaying)\s*\d+(?:\s*[-–to]\s*\d+)?\s*(?:of)\s*(\d+)/i,
+      /(\d+)\s*(?:of)\s*(\d+)\s*(?:items?|results?|products?)/i,
+    ];
+    for (const pat of countPatterns) {
+      const m = bodyText.match(pat);
+      if (m) {
+        // Prefer the "of N" number (total), otherwise the first number
+        result.total_products = parseInt(m[m.length - 1], 10);
+        break;
+      }
+    }
+  }
+
   // --- Item count text ---
   const countElements = document.querySelectorAll(
     '.results-count, .product-count, .item-count, ' +
     '[class*="result-count"], [class*="product-count"], ' +
     '[class*="showing"], [class*="total"], ' +
-    '.ae-plp__counter'
+    '.ae-plp__counter, [class*="items-found" i], ' +
+    '[class*="search-results" i] h1, [class*="search-results" i] h2, ' +
+    'h1[class*="title" i], [class*="page-title" i], ' +
+    '[class*="listing-header" i], [class*="plp-header" i]'
   );
   countElements.forEach(el => {
     const text = (el.textContent || '').trim();
@@ -1381,7 +1448,11 @@ def _try_interactive_pagination(evaluate, findings: dict) -> None:
         return
 
     pagination_info = listing.get("pagination") or {}
-    total_count = pagination_info.get("total_product_count", 0)
+    total_count = (
+        listing.get("total_products", 0)
+        or pagination_info.get("total_product_count", 0)
+        or pagination_info.get("max_pages", 0)
+    )
     current_count = len(product_links)
 
     logger.info(
@@ -1409,7 +1480,7 @@ def _try_interactive_pagination(evaluate, findings: dict) -> None:
         return 'no_consent';
     }"""
 
-    max_rounds = 3
+    max_rounds = 5
     scroll_attempts = 0
     for round_num in range(max_rounds * 2):
         time.sleep(2)
@@ -1429,7 +1500,7 @@ def _try_interactive_pagination(evaluate, findings: dict) -> None:
                 return JSON.stringify({action: 'clicked_load_more'});
             }
 
-            // 2. Next page link
+            // 2. Next page link (standard)
             const next = document.querySelector(
                 'a[rel="next"], .pagination .next, button.next, '
                 + 'a[aria-label="Next" i], a[aria-label="next" i], '
@@ -1440,7 +1511,19 @@ def _try_interactive_pagination(evaluate, findings: dict) -> None:
                 return JSON.stringify({action: 'clicked_next_page'});
             }
 
-            // 3. Infinite scroll — scroll to bottom
+            // 3. "next page" text link (CK UK style and similar SFCC sites)
+            const allClickable = document.querySelectorAll(
+                'a, button, [role="button"], [tabindex="0"]'
+            );
+            for (const el of allClickable) {
+                const t = (el.textContent || '').trim().toLowerCase();
+                if (t === 'next page' || t === 'next >' || t === 'next ›') {
+                    el.click();
+                    return JSON.stringify({action: 'clicked_next_page_text'});
+                }
+            }
+
+            // 4. Infinite scroll — scroll to bottom
             window.scrollTo(0, document.body.scrollHeight);
             return JSON.stringify({action: 'scrolled_to_bottom'});
         }"""
@@ -2040,7 +2123,7 @@ def _extract_product_links_bs(soup, base_url: str) -> list[dict]:
                     if schema_type == "ItemList" or _looks_like_product_url(item_url):
                         seen.add(item_url)
                         product_links.append({"href": item_url, "text": item_name[:100]})
-                if len(product_links) >= 30:
+                if len(product_links) >= 200:
                     break
             except (json.JSONDecodeError, TypeError, AttributeError):
                 continue
@@ -2078,7 +2161,7 @@ def _extract_product_links_bs(soup, base_url: str) -> list[dict]:
     for sel in card_selectors:
         cards = soup.select(sel)
         if len(cards) >= 3:
-            for card in cards[:30]:
+            for card in cards[:200]:
                 link = card.find("a", href=True) if isinstance(card, Tag) else None
                 if not link:
                     continue
@@ -2172,7 +2255,7 @@ def _extract_product_links_bs(soup, base_url: str) -> list[dict]:
     # is worse than returning empty. If card selectors and URL patterns both
     # fail, the two-phase scraper discovers URLs at runtime.
 
-    return product_links[:30]
+    return product_links[:200]
 
 
 def _extract_pagination_bs(soup, base_url: str, listing_page: dict) -> None:

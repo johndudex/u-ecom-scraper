@@ -1360,9 +1360,19 @@ def build_code_writer_message(state: dict) -> list:
 
         if pagination_info.get("type"):
             nav_lines.append(f"**Pagination:** {pagination_info['type']}")
+        elif pagination_info and any(pagination_info.values()):
+            nav_lines.append("**Pagination:** detected (type not specified)")
             if pagination_info.get("next_button_selector"):
                 nav_lines.append(
                     f"  - Next button: `{pagination_info['next_button_selector']}`"
+                )
+            if pagination_info.get("next_text"):
+                nav_lines.append(
+                    f"  - Next button text: \"{pagination_info['next_text']}\""
+                )
+            if pagination_info.get("next_href"):
+                nav_lines.append(
+                    f"  - Next href: `{pagination_info['next_href']}`"
                 )
             if pagination_info.get("page_param_name"):
                 nav_lines.append(
@@ -1370,6 +1380,12 @@ def build_code_writer_message(state: dict) -> list:
                 )
             if pagination_info.get("max_pages"):
                 nav_lines.append(f"  - Max pages: {pagination_info['max_pages']}")
+            if pagination_info.get("note"):
+                nav_lines.append(f"  - Note: {pagination_info['note']}")
+            if pagination_info.get("page_indicator_text"):
+                nav_lines.append(
+                    f"  - Page indicator: \"{pagination_info['page_indicator_text']}\""
+                )
 
         if item_links_info.get("container_selector"):
             nav_lines.append(
@@ -1415,7 +1431,8 @@ def build_code_writer_message(state: dict) -> list:
             )
 
         nav_lines.append(
-            "- Paginate through all result pages\n"
+            "- Paginate through all result pages (click 'next page' links, "
+            "load more buttons, or scroll for infinite scroll)\n"
             "- Collect item page URLs (NOT content — just URLs)\n"
             "- Filter: only keep URLs matching the pattern from navigation_analysis\n"
             "- Store discovered URLs in a list\n\n"

@@ -305,11 +305,25 @@ def _fallback_synthesize(state: dict, root: str, slug: str) -> dict[str, Any]:
             "type": pagination.get("type", ""),
             "next_button_selector": pagination.get("next_selector", ""),
             "page_param_name": pagination.get("page_param", ""),
-            "max_pages": None,
+            "max_pages": pagination.get("max_pages"),
             "total_count_selector": "",
         }
         if pagination.get("sample_hrefs"):
             pagination_section["sample_hrefs"] = pagination["sample_hrefs"][:3]
+        for extra_key in ("next_text", "next_href", "note", "page_indicator_text",
+                          "current_page", "items_per_page"):
+            if pagination.get(extra_key):
+                pagination_section[extra_key] = pagination[extra_key]
+    # Fallback: if no pagination detected but we have total_products, infer pagination
+    total_products = listing_page.get("total_products", 0)
+    if not pagination_section and total_products and total_products > len(real_product_links):
+        pagination_section = {
+            "type": "unknown",
+            "max_pages": None,
+            "total_count_selector": "",
+            "inferred": True,
+            "note": f"Found {len(real_product_links)} of {total_products} products — pagination likely needed",
+        }
 
     # Build item_links section — use filtered real_product_links
     item_links_section: dict[str, Any] = {}
