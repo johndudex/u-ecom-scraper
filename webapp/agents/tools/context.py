@@ -59,6 +59,10 @@ def update_probe_result(result: dict) -> None:
     conn = result.get("connectivity") or {}
     if isinstance(conn, dict) and conn.get("method_that_worked"):
         method = conn["method_that_worked"]
+    if "error" in method or "failed" in method:
+        _ctx["probe_method"] = ""
+        _ctx["anti_bot"] = False
+        return
     _ctx["probe_method"] = method
     _ctx["anti_bot"] = bool(result.get("blocked", False))
 

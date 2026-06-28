@@ -753,11 +753,15 @@ def agent_summary(request, job_id: int):
     summaries = []
     agent_order = [
         "site-analyzer",
+        "navigation-explore",
+        "navigation-synthesize",
         "product-analyzer",
+        "scraper-analyzer",
         "code-writer",
         "code-tester",
         "cleanup",
         "skill-learner",
+        "nav-skill-review",
     ]
     for agent_name in agent_order:
         if agent_name not in agents:

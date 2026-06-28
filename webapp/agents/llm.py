@@ -23,6 +23,7 @@ def get_llm(model: Optional[str] = None, temperature: float = 0.3) -> ChatOpenAI
         openai_api_key=settings.ZAI_API_KEY,
         model=model or getattr(settings, "ZAI_MAIN_MODEL", "glm-5-turbo"),
         temperature=temperature,
+        truncation="left",
     )
 
 

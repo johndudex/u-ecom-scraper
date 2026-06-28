@@ -77,6 +77,25 @@ def _format_result(result: dict) -> str:
     if result.get("stderr"):
         parts.append(result["stderr"])
     output = "\n".join(parts) if parts else "(no output)"
+
+    if len(output) > 4000:
+        try:
+            from headroom import compress as _compress
+
+            cr = _compress(
+                [{"role": "tool", "content": output}],
+                model="glm-5-turbo",
+            )
+            compressed = cr.messages[0]["content"]
+            if len(output) - len(compressed) > 200:
+                logger.info(
+                    "run_scraper output compressed: %d → %d chars",
+                    len(output),
+                    len(compressed),
+                )
+                output = compressed
+        except Exception:
+            pass
     if len(output) > MAX_OUTPUT_CHARS:
         output = output[:MAX_OUTPUT_CHARS] + "\n... (truncated)"
     if result.get("returncode", 0) != 0:

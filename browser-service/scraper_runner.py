@@ -6,10 +6,30 @@ import sys
 import time
 from typing import Any, Optional
 
+import httpx
+
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = os.environ.get("PROJECT_ROOT", "/app")
 DISPLAY = os.environ.get("DISPLAY", ":98")
+BROWSER_SERVICE_URL = os.environ.get("BROWSER_SERVICE_URL", "http://127.0.0.1:8001")
+
+
+def _restart_scraper_chrome() -> None:
+    """Restart the scraper Chrome instance to free resources for the script."""
+    try:
+        resp = httpx.post(
+            f"{BROWSER_SERVICE_URL}/restart-cdp",
+            json={"label": "scraper"},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            logger.info("Restarted scraper Chrome before scraper run")
+            time.sleep(2)
+        else:
+            logger.warning("Failed to restart scraper Chrome: %s", resp.text[:200])
+    except Exception as exc:
+        logger.warning("Could not restart scraper Chrome: %s", exc)
 
 
 def run_scraper_script(

@@ -849,6 +849,55 @@ def _invoke_tool(tool, **kwargs) -> str:
         return f"ERROR: {exc}"
 
 
+def _persist_explore_summary(job_id: int, findings: dict) -> None:
+    """Write a summary SessionLog entry for the agent summary page."""
+    if not job_id:
+        return
+    try:
+        from scraper.models import SessionLog
+
+        cats = findings.get("homepage_nav", {}).get("category_links", [])
+        prods = findings.get("listing_page", {}).get("product_links", [])
+        errors = findings.get("errors", [])
+        search_form = findings.get("homepage_nav", {}).get("search_form")
+        url_patterns = findings.get("url_patterns", {})
+        pagination = findings.get("listing_page", {}).get("pagination", {})
+
+        method = findings.get("method", "unknown")
+        summary = (
+            f"Navigation exploration complete\n"
+            f"  Method: {method}\n"
+            f"  Categories found: {len(cats)}\n"
+            f"  Product links found: {len(prods)}\n"
+            f"  Errors: {len(errors)}\n"
+        )
+        if search_form:
+            summary += f"  Search form: action={search_form.get('action')}, input={search_form.get('search_input_selector')}\n"
+        if url_patterns:
+            for pattern, info in url_patterns.items():
+                summary += f"  URL pattern [{pattern}]: {info.get('count', '?')} matches\n"
+        if pagination:
+            summary += f"  Pagination: type={pagination.get('type', 'unknown')}, total={pagination.get('total_product_count', '?')}\n"
+        if errors:
+            summary += f"  Errors: {', '.join(str(e)[:80] for e in errors[:5])}\n"
+        if prods:
+            sample_urls = [p.get("href", "") for p in prods[:5]]
+            summary += f"  Sample product URLs:\n"
+            for u in sample_urls:
+                summary += f"    - {u}\n"
+
+        seq = SessionLog.objects.filter(job_id=job_id).count()
+        SessionLog.objects.create(
+            job_id=job_id,
+            role=SessionLog.ROLE_ASSISTANT,
+            agent="navigation-explore",
+            content=summary,
+            seq=seq,
+        )
+    except Exception as exc:
+        logger.warning("navigate_explore: failed to persist summary log: %s", exc)
+
+
 def _parse_eval_json(raw: str) -> dict:
     """Extract a JSON object from a Playwright MCP evaluate tool result.
 
@@ -1222,8 +1271,8 @@ _PRODUCT_PRESENCE_SELECTORS = [
 
 def _wait_for_content(
     evaluate,
-    timeout: int = 12,
-    poll_interval: float = 1.5,
+    timeout: int = 25,
+    poll_interval: float = 2.0,
 ) -> dict:
     """Poll the page until product content appears or timeout.
 
@@ -1271,14 +1320,16 @@ def _wait_for_content(
     # hashed CSS classes where named selectors don't match.
     generic_js = r"""
     () => {
-        const links = Array.from(document.querySelectorAll('a[href]'));
-        const urlSet = new Set();
-        for (const a of links) {
-            const href = a.href || '';
-            if (/\/product\/|\/item\/|cod-|\/sp-|\/pd\/|\/p\//i.test(href) ||
-                (/\d{4,}/.test(href) && href.split('/').length >= 4)) {
-                urlSet.add(href.split('?')[0].split('#')[0]);
-            }
+    const links = Array.from(document.querySelectorAll('a[href]'));
+    const urlSet = new Set();
+    for (const a of links) {
+        const href = a.href || '';
+        if (/\/product\/|\/item\/|cod-|\/sp-|\/p\//i.test(href) ||
+                (/\d{4,}/.test(href) && href.split('/').length >= 4) ||
+                /\/[a-z]+-[a-z]+-[\w-]*\d{4,}/i.test(href)) {
+            urlSet.add(href.split('?')[0].split('#')[0]);
+        }
+    }
         }
         const unique = urlSet.size;
         return JSON.stringify({present: unique >= 3, count: unique});
@@ -1325,7 +1376,7 @@ def _visit_and_extract(
         )
 
     # Wait for content to render (handles CSR sites like Next.js, React, Vue)
-    content_status = _wait_for_content(evaluate, timeout=12)
+    content_status = _wait_for_content(evaluate, timeout=25)
     if content_status.get("cloudflare"):
         findings["errors"].append("Cloudflare challenge blocked content extraction")
         # Still try extraction — sometimes the challenge auto-resolves
@@ -1333,7 +1384,7 @@ def _visit_and_extract(
         # Content not detected via selectors — try anyway after a brief wait
         import time
 
-        time.sleep(3)
+        time.sleep(5)
 
     listing_data_raw = _invoke_tool(
         evaluate,
@@ -1399,9 +1450,9 @@ def _try_form_search(
     # Wait for content to render (handles CSR sites like Next.js, React, Vue)
     import time
 
-    content_status = _wait_for_content(evaluate, timeout=12)
+    content_status = _wait_for_content(evaluate, timeout=25)
     if not content_status.get("loaded"):
-        time.sleep(3)
+        time.sleep(5)
 
     listing_data_raw = _invoke_tool(
         evaluate,
@@ -2900,7 +2951,58 @@ def navigate_explore(state: dict, config=None) -> dict[str, Any]:
             except Exception as exc:
                 logger.warning("navigate_explore: browser retry failed: %s", exc)
 
-    # ── PHASE 2: Fall back to probe_html or HTTP if Playwright failed ───
+    # ── PHASE 2: probe_html fallback for search page when Playwright finds
+    #    categories but 0 products (Cloudflare blocks JS rendering).  We keep
+    #    the browser homepage_nav but replace listing_page with UC Chrome data.
+    browser_cats = len(findings.get("homepage_nav", {}).get("category_links", []))
+    browser_prods = len(findings.get("listing_page", {}).get("product_links", []))
+    if search_criteria and browser_cats > 0 and browser_prods == 0:
+        if _needs_uc_chrome(site_analysis):
+            logger.info(
+                "navigate_explore: Playwright found %d categories but 0 search products "
+                "on UC Chrome site — fetching search page via probe_html",
+                browser_cats,
+            )
+            search_url = _build_search_url(
+                findings.get("homepage_nav", {}).get("search_form"),
+                search_criteria,
+                effective_url,
+                findings.get("homepage_nav", {}),
+            )
+            if search_url:
+                html = _fetch_via_probe_html(search_url)
+                if html and "RENDER FAILED" not in html:
+                    try:
+                        from bs4 import BeautifulSoup
+
+                        search_soup = BeautifulSoup(html[:500000], "html.parser")
+                        product_links = _extract_product_links_bs(
+                            search_soup, effective_url
+                        )
+                        json_ld = _extract_json_ld(search_soup, effective_url)
+                        existing = set(p.get("href", "") for p in product_links)
+                        if json_ld.get("products"):
+                            for p in json_ld["products"]:
+                                if p.get("href") and p["href"] not in existing:
+                                    product_links.append(p)
+                                    existing.add(p["href"])
+                        if product_links:
+                            listing = findings.setdefault("listing_page", {})
+                            listing["product_links"] = product_links
+                            listing["url"] = search_url
+                            listing["json_ld"] = json_ld
+                            browser_prods = len(product_links)
+                            logger.info(
+                                "navigate_explore: probe_html found %d product links "
+                                "on search page, merged into browser findings",
+                                browser_prods,
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "navigate_explore: probe_html search parse failed: %s", exc
+                        )
+
+    # ── PHASE 3: Fall back to probe_html or HTTP if entirely empty ───
     if not findings or not findings.get("homepage_nav", {}).get("category_links"):
         if _needs_uc_chrome(site_analysis):
             logger.info(
@@ -2977,6 +3079,8 @@ def navigate_explore(state: dict, config=None) -> dict[str, Any]:
         len(findings.get("listing_page", {}).get("product_links", [])),
         len(findings.get("errors", [])),
     )
+
+    _persist_explore_summary(job_id, findings)
 
     result: dict[str, Any] = {
         "navigation_findings": findings,

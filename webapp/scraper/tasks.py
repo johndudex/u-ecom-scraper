@@ -841,6 +841,51 @@ def _auto_approve_stale_jobs() -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _build_playground_messages(agent_name: str, state: dict, user_prompt: str) -> list:
+    """Build context-aware messages for playground agent runs.
+
+    Uses the same message builders as the pipeline (subagents.py) so
+    agents get connectivity info, workspace paths, budget limits, and
+    tool usage guidance. Appends the user's custom prompt as additional
+    context when provided.
+    """
+    from agents.subagents import (
+        build_code_writer_message,
+        build_code_tester_message,
+        build_navigation_agent_message,
+        build_navigation_synthesize_message,
+        build_product_analyzer_message,
+        build_scraper_analyzer_message,
+        build_site_analyzer_message,
+    )
+
+    builders = {
+        "site_analyzer": build_site_analyzer_message,
+        "product_analyzer": build_product_analyzer_message,
+        "scraper_analyzer": build_scraper_analyzer_message,
+        "navigation_agent": build_navigation_agent_message,
+        "navigation_synthesize": build_navigation_synthesize_message,
+        "code_writer": build_code_writer_message,
+        "code_tester": build_code_tester_message,
+    }
+    builder = builders.get(agent_name)
+    if builder:
+        messages = builder(state)
+    else:
+        from langchain_core.messages import HumanMessage
+
+        messages = [HumanMessage(content=user_prompt)]
+
+    if user_prompt and builder:
+        from langchain_core.messages import HumanMessage
+
+        existing = messages[0].content if messages else ""
+        augmented = f"{existing}\n\n### Additional User Instructions\n{user_prompt}"
+        messages = [HumanMessage(content=augmented)]
+
+    return messages
+
+
 @shared_task(bind=True)
 def run_agent_task(self, playground_id: int) -> None:
     """Run a single agent in isolation for the Agent Playground.
@@ -907,12 +952,11 @@ def run_agent_task(self, playground_id: int) -> None:
 
                 result = navigate_synthesize(state)
             else:
-                # Standard LLM agent
+                # Use context-aware message builder for LLM agents
                 from agents.subagents import _build_agent
-                from langchain_core.messages import HumanMessage
 
                 agent = _build_agent(pg.agent_name, site_slug=slug)
-                messages = [HumanMessage(content=pg.prompt)]
+                messages = _build_playground_messages(pg.agent_name, state, pg.prompt)
                 budget = AGENT_MAX_ITERATIONS_LOOKUP.get(pg.agent_name, 25)
                 agent_cfg: dict[str, Any] = {"recursion_limit": budget}
                 agent_result = agent.invoke({"messages": messages}, config=agent_cfg)

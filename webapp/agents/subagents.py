@@ -227,6 +227,89 @@ def create_skill_learner(site_slug: str = "") -> object:
 # ── Shared builder ────────────────────────────────────────────────────────
 
 
+def _truncate_messages(input_dict: dict) -> dict:
+    """Pre-model hook: compress then truncate messages when context is large.
+
+    Uses headroom.compress to intelligently summarize large tool messages,
+    then drops oldest messages if still over budget.  Prevents
+    ``Prompt exceeds max length`` errors in long-running agents.
+    """
+    messages = input_dict.get("messages", [])
+    if not messages:
+        return input_dict
+
+    max_chars = 60_000
+
+    def _total_chars(msgs):
+        return sum(len(str(m.content)) if hasattr(m, "content") else 0 for m in msgs)
+
+    total_chars = _total_chars(messages)
+    if total_chars <= max_chars:
+        return input_dict
+
+    # Step 1: Compress large tool messages with headroom
+    try:
+        from headroom import compress as _compress
+        from django.conf import settings
+
+        model_name = getattr(settings, "ZAI_MAIN_MODEL", "glm-5-turbo")
+        compressed_msgs = []
+        compressed_count = 0
+        for m in messages:
+            content = str(m.content) if hasattr(m, "content") else ""
+            if len(content) > 3000 and hasattr(m, "type") and m.type == "tool":
+                try:
+                    cr = _compress(
+                        [{"role": m.type, "content": content}],
+                        model=model_name,
+                    )
+                    new_content = cr.messages[0]["content"]
+                    if len(content) - len(new_content) > 200:
+                        compressed_msgs.append(type(m)(content=new_content))
+                        compressed_count += 1
+                        continue
+                except Exception:
+                    pass
+            compressed_msgs.append(m)
+
+        if compressed_count > 0:
+            messages = compressed_msgs
+            logger.info(
+                "headroom: compressed %d tool messages (%d → %d chars)",
+                compressed_count,
+                total_chars,
+                _total_chars(messages),
+            )
+    except ImportError:
+        pass
+
+    total_chars = _total_chars(messages)
+    if total_chars <= max_chars:
+        return {"messages": messages}
+
+    # Step 2: Drop oldest messages (keep system + recent)
+    system_msgs = [m for m in messages if hasattr(m, "type") and m.type == "system"]
+    other_msgs = [m for m in messages if not (hasattr(m, "type") and m.type == "system")]
+
+    kept = list(system_msgs)
+    budget = max_chars - sum(len(str(m.content)) for m in kept)
+    acc = 0
+
+    for msg in reversed(other_msgs):
+        msg_len = len(str(msg.content)) if hasattr(msg, "content") else 0
+        if acc + msg_len > budget:
+            break
+        kept.insert(len(kept), msg)
+        acc += msg_len
+
+    logger.info(
+        "Truncated messages: %d → %d (was %d chars, budget %d)",
+        len(messages), len(kept), total_chars, budget,
+    )
+
+    return {"messages": kept}
+
+
 def _build_agent(agent_name: str, site_slug: str = "") -> object:
     prompt_stem = AGENT_PROMPT_MAP[agent_name]
     temperature = AGENT_TEMPERATURES[prompt_stem]
@@ -264,7 +347,9 @@ def _build_agent(agent_name: str, site_slug: str = "") -> object:
         len(tools),
     )
 
-    agent = create_react_agent(llm, tools=tools, prompt=system_prompt)
+    agent = create_react_agent(
+        llm, tools=tools, prompt=system_prompt, pre_model_hook=_truncate_messages
+    )
     return agent
 
 

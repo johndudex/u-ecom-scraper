@@ -406,15 +406,18 @@ async def probe(request: ProbeRequest):
     async with PROBE_LOCK:
         try:
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: run_probe(
-                    url=request.url,
-                    render_js=request.render_js,
-                    timeout=request.timeout,
-                    start_method=request.start_method,
-                    country=request.country,
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: run_probe(
+                        url=request.url,
+                        render_js=request.render_js,
+                        timeout=request.timeout,
+                        start_method=request.start_method,
+                        country=request.country,
+                    ),
                 ),
+                timeout=request.timeout + 60,
             )
             if result and result.get("needs_akamai_bypass"):
                 logger.info(
@@ -422,6 +425,12 @@ async def probe(request: ProbeRequest):
                     request.url[:100],
                 )
             return JSONResponse(content=result)
+        except asyncio.TimeoutError:
+            logger.error("Probe timed out for %s (lock released)", request.url[:200])
+            return JSONResponse(
+                status_code=504,
+                content={"success": False, "error": "Probe timed out"},
+            )
         except Exception as exc:
             logger.exception("Probe failed for %s", request.url[:200])
             return JSONResponse(
@@ -651,17 +660,26 @@ async def render(request: RenderRequest):
     async with PROBE_LOCK:
         try:
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: render_page(
-                    url=request.url,
-                    timeout=request.timeout,
-                    start_method=request.start_method,
-                    country=request.country,
-                    accept_language=request.accept_language,
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: render_page(
+                        url=request.url,
+                        timeout=request.timeout,
+                        start_method=request.start_method,
+                        country=request.country,
+                        accept_language=request.accept_language,
+                    ),
                 ),
+                timeout=request.timeout + 60,
             )
             return JSONResponse(content=result)
+        except asyncio.TimeoutError:
+            logger.error("Render timed out for %s (lock released)", request.url[:200])
+            return JSONResponse(
+                status_code=504,
+                content={"success": False, "html": "", "error": "Render timed out"},
+            )
         except Exception as exc:
             logger.exception("Render failed for %s", request.url[:200])
             return JSONResponse(
@@ -672,22 +690,22 @@ async def render(request: RenderRequest):
 
 @app.post("/scrape")
 async def scrape(request: ScrapeRequest):
-    async with PROBE_LOCK:
-        if not os.path.isfile(request.scraper_path):
-            return JSONResponse(
-                status_code=404,
-                content={
-                    "returncode": -1,
-                    "stderr": f"Scraper not found: {request.scraper_path}",
-                    "stdout": "",
-                    "output_file": "",
-                    "product_count": 0,
-                    "duration": 0,
-                },
-            )
-        try:
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
+    if not os.path.isfile(request.scraper_path):
+        return JSONResponse(
+            status_code=404,
+            content={
+                "returncode": -1,
+                "stderr": f"Scraper not found: {request.scraper_path}",
+                "stdout": "",
+                "output_file": "",
+                "product_count": 0,
+                "duration": 0,
+            },
+        )
+    try:
+        loop = asyncio.get_event_loop()
+        result = await asyncio.wait_for(
+            loop.run_in_executor(
                 None,
                 lambda: run_scraper_script(
                     scraper_path=request.scraper_path,
@@ -695,21 +713,36 @@ async def scrape(request: ScrapeRequest):
                     timeout=request.timeout,
                     env_overrides=request.env_overrides,
                 ),
-            )
-            return JSONResponse(content=result)
-        except Exception as exc:
-            logger.exception("Scrape failed for %s", request.scraper_path)
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "returncode": -1,
-                    "stderr": str(exc),
-                    "stdout": "",
-                    "output_file": "",
-                    "product_count": 0,
-                    "duration": 0,
-                },
-            )
+            ),
+            timeout=request.timeout + 120,
+        )
+        return JSONResponse(content=result)
+    except asyncio.TimeoutError:
+        logger.error("Scraper timed out for %s (lock released)", request.scraper_path)
+        return JSONResponse(
+            status_code=504,
+            content={
+                "returncode": -1,
+                "stderr": f"Timed out after {request.timeout + 120}s",
+                "stdout": "",
+                "output_file": "",
+                "product_count": 0,
+                "duration": request.timeout + 120,
+            },
+        )
+    except Exception as exc:
+        logger.exception("Scrape failed for %s", request.scraper_path)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "returncode": -1,
+                "stderr": str(exc),
+                "stdout": "",
+                "output_file": "",
+                "product_count": 0,
+                "duration": 0,
+            },
+        )
 
 
 @app.get("/cdp-endpoint")

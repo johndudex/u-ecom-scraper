@@ -195,12 +195,31 @@ def _call_llm_for_mapping(raw_data: str, existing_fields: dict, mapping_prompt: 
     from ..llm import get_small_llm
 
     llm = get_small_llm(temperature=0.0)
+    human_content = MAPPING_USER_PROMPT_TEMPLATE.format(
+        raw_data_sections=raw_data,
+        existing_fields=json.dumps(existing_fields, indent=2, ensure_ascii=False) if existing_fields else "{}",
+    )
+
+    if len(human_content) > 4000:
+        try:
+            from headroom import compress as _compress
+
+            cr = _compress(
+                [{"role": "user", "content": human_content}],
+                model="glm-5-turbo",
+            )
+            human_content = cr.messages[0]["content"]
+            logger.info(
+                "normalize_fields: compressed user prompt %d → %d chars",
+                len(raw_data),
+                len(human_content),
+            )
+        except Exception:
+            pass
+
     messages = [
         SystemMessage(content=mapping_prompt),
-        HumanMessage(content=MAPPING_USER_PROMPT_TEMPLATE.format(
-            raw_data_sections=raw_data,
-            existing_fields=json.dumps(existing_fields, indent=2, ensure_ascii=False) if existing_fields else "{}",
-        )),
+        HumanMessage(content=human_content),
     ]
 
     try:

@@ -104,6 +104,12 @@ def _check_akamai(func: Callable, args: tuple, kwargs: dict) -> str | None:
         func_name,
         method,
     )
+    if "error" in method or "failed" in method:
+        logger.debug(
+            "Guard: probe errored (%s), not blocking — allow agent to retry",
+            method,
+        )
+        return None
     if method.startswith("uc_chrome"):
         if func_name in ("sync_call",):
             logger.info(
