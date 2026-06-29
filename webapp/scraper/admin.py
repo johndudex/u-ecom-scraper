@@ -1,15 +1,17 @@
 from django.contrib import admin
 from django.utils import timezone
 
-from .models import Approval, ContentType, ScrapeJob, Site, Step, ToolCallLog
-
-# Unregister scraper models from Django admin — they have full management UI
-# in the main app at /, /jobs/, /sites/, /approvals/ etc. Keeping them here
-# would create duplicate pages that need to be maintained in two places.
-# Auth and celery_beat admin stay because they don't have a main-app UI.
-# We do the unregister at the END of this file (after the @admin.register
-# decorators below have run) by deferring it to module-end.
-_UNREGISTER_AT_END = (Site, ScrapeJob, Step, Approval, ToolCallLog)
+from .models import (
+    Approval,
+    AgentPlayground,
+    ContentType,
+    ProbeCache,
+    ScrapeJob,
+    SessionLog,
+    Site,
+    Step,
+    ToolCallLog,
+)
 
 
 @admin.register(ContentType)
@@ -161,17 +163,40 @@ class ToolCallLogAdmin(admin.ModelAdmin):
     search_fields = ("tool_name", "args_summary")
 
 
-# Defer unregister to here so it runs AFTER all @admin.register decorators.
-# This removes the scraper models from the Django admin index, leaving only
-# the auth and django_celery_beat admin which don't have a main-app UI.
-from django.contrib.admin import site as _default_site
-from django.contrib.admin.sites import NotRegistered as _NotRegistered
+@admin.register(SessionLog)
+class SessionLogAdmin(admin.ModelAdmin):
+    list_display = ("id", "job", "role", "agent", "seq", "created_at")
+    list_filter = ("role", "agent")
+    raw_id_fields = ("job",)
+    search_fields = ("content", "agent")
 
-for _model in _UNREGISTER_AT_END:
-    try:
-        _default_site.unregister(_model)
-    except _NotRegistered:
-        pass
-    except Exception:
-        pass
+
+@admin.register(ProbeCache)
+class ProbeCacheAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "domain",
+        "method",
+        "needs_akamai_bypass",
+        "captcha_detected",
+        "cached_at",
+        "last_used_at",
+    )
+    list_filter = ("method", "needs_akamai_bypass", "captcha_detected")
+    search_fields = ("domain",)
+
+
+@admin.register(AgentPlayground)
+class AgentPlaygroundAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "agent_name",
+        "status",
+        "tool_call_count",
+        "created_at",
+        "completed_at",
+    )
+    list_filter = ("status", "agent_name")
+    search_fields = ("agent_name", "url", "prompt")
+    readonly_fields = ("created_at", "started_at", "completed_at")
 
