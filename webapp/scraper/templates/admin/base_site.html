@@ -1224,8 +1224,6 @@ table tbody tr:hover {
     background: var(--red) !important;
     border-color: var(--red) !important;
 }
-    font-weight: 600 !important;
-}
 
 /* ================================================================
    INLINE GROUPS
@@ -1631,10 +1629,6 @@ a:hover, button:hover, input[type="submit"]:hover { background-color: inherit !i
 /* ================================================================
    KILL DJANGO LEGACY PATTERNS
    ================================================================ */
-/* Kill the action bar — bulk actions go to row-level menus */
-#changelist .actions { display: none !important; }
-/* Kill the "0 of N selected" counter */
-.action-counter { display: none !important; }
 /* Kill the show-counts link */
 #changelist-filter-extra-actions { display: none !important; }
 /* Kill the verbose "1 user" / "6 sites" footer — move to header via JS */
@@ -1806,7 +1800,7 @@ fieldset.module fieldset h2,
     border: 1px solid var(--border) !important;
     border-radius: 10px !important;
     padding: 8px 12px !important;
-    display: flex;
+    display: flex !important;
     align-items: center;
     gap: 10px;
     flex-wrap: wrap;
