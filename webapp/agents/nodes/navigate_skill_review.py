@@ -64,7 +64,7 @@ def navigate_skill_review(state: dict, config=None) -> dict[str, Any]:
         _log_agent_context(state, "nav-skill-review", messages)
         agent = create_nav_skill_review(site_slug=slug)
 
-        agent_cfg: dict = {"recursion_limit": NAV_SKILL_REVIEW_BUDGET}
+        agent_cfg: dict = {}
         if config:
             agent_cfg.update(config)
 

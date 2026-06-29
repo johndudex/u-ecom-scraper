@@ -1,7 +1,7 @@
 from django.contrib import admin
 from django.utils import timezone
 
-from .models import Approval, ScrapeJob, Site, Step, ToolCallLog
+from .models import Approval, ContentType, ScrapeJob, Site, Step, ToolCallLog
 
 # Unregister scraper models from Django admin — they have full management UI
 # in the main app at /, /jobs/, /sites/, /approvals/ etc. Keeping them here
@@ -10,6 +10,15 @@ from .models import Approval, ScrapeJob, Site, Step, ToolCallLog
 # We do the unregister at the END of this file (after the @admin.register
 # decorators below have run) by deferring it to module-end.
 _UNREGISTER_AT_END = (Site, ScrapeJob, Step, Approval, ToolCallLog)
+
+
+@admin.register(ContentType)
+class ContentTypeAdmin(admin.ModelAdmin):
+    list_display = ("group", "value", "label", "enabled", "sort_order")
+    list_filter = ("group", "enabled")
+    list_editable = ("enabled", "sort_order")
+    ordering = ("sort_order", "group", "value")
+    search_fields = ("value", "label", "group")
 
 
 @admin.register(Site)

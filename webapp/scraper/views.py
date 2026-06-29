@@ -7,7 +7,6 @@ from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-
 import httpx
 
 from django.conf import settings
@@ -66,6 +65,9 @@ def _ordered_steps(job):
 
 @login_required
 def home(request):
+    from .models import ContentType
+
+    content_types = list(ContentType.objects.all())
     if request.method == "POST":
         form_data = request.POST
         url = form_data.get("url", "").strip()
@@ -93,6 +95,7 @@ def home(request):
             "form_page_type": page_type,
             "form_search_criteria": search_criteria,
             "recent_jobs": ScrapeJob.objects.all()[:10],
+            "content_types": content_types,
         }
 
         if not url:
@@ -137,7 +140,7 @@ def home(request):
         return redirect("job_detail", job_id=job.id)
 
     recent_jobs = ScrapeJob.objects.all()[:10]
-    return render(request, "scraper/home.html", {"recent_jobs": recent_jobs})
+    return render(request, "scraper/home.html", {"recent_jobs": recent_jobs, "content_types": content_types})
 
 
 @login_required
@@ -1381,3 +1384,151 @@ def agent_playground_list(request):
             ]
         }
     )
+
+
+def _check_db():
+    t0 = time.monotonic()
+    try:
+        from django.db import connections
+
+        conn = connections["default"]
+        conn.ensure_connection()
+        ms = int((time.monotonic() - t0) * 1000)
+        return {"status": "up", "latency_ms": ms, "detail": "Connected"}
+    except Exception as exc:
+        ms = int((time.monotonic() - t0) * 1000)
+        return {"status": "down", "latency_ms": ms, "detail": str(exc)[:200]}
+
+
+def _check_redis():
+    t0 = time.monotonic()
+    try:
+        import redis
+
+        url = getattr(settings, "REDIS_URL", "redis://redis:6379/0")
+        r = redis.from_url(url)
+        r.ping()
+        ms = int((time.monotonic() - t0) * 1000)
+        db_size = r.dbsize()
+        return {"status": "up", "latency_ms": ms, "detail": f"{db_size} keys"}
+    except Exception as exc:
+        ms = int((time.monotonic() - t0) * 1000)
+        return {"status": "down", "latency_ms": ms, "detail": str(exc)[:200]}
+
+
+def _check_celery_worker():
+    t0 = time.monotonic()
+    try:
+        from celery import current_app
+
+        inspect = current_app.control.inspect()
+        active = inspect.active()
+        if not active:
+            return {"status": "down", "latency_ms": 0, "detail": "No active workers"}
+        worker_count = len(active)
+        total_active = sum(len(tasks) for tasks in active.values())
+        ms = int((time.monotonic() - t0) * 1000)
+        return {
+            "status": "up" if worker_count > 0 else "down",
+            "latency_ms": ms,
+            "detail": f"{worker_count} worker(s), {total_active} active task(s)",
+        }
+    except Exception as exc:
+        ms = int((time.monotonic() - t0) * 1000)
+        return {"status": "down", "latency_ms": ms, "detail": str(exc)[:200]}
+
+
+def _check_celery_beat():
+    t0 = time.monotonic()
+    try:
+        from django_celery_beat.models import PeriodicTask
+        from django.utils import timezone as dj_tz
+
+        last_run = (
+            PeriodicTask.objects.filter(enabled=True)
+            .order_by("-last_run_at")
+            .first()
+        )
+        ms = int((time.monotonic() - t0) * 1000)
+        if last_run and last_run.last_run_at:
+            age = (dj_tz.now() - last_run.last_run_at).total_seconds()
+            if age < 300:
+                return {"status": "up", "latency_ms": ms, "detail": f"Last run {int(age)}s ago"}
+            return {"status": "degraded", "latency_ms": ms, "detail": f"Last run {int(age)}s ago"}
+        return {"status": "unknown", "latency_ms": ms, "detail": "No scheduled tasks"}
+    except Exception as exc:
+        ms = int((time.monotonic() - t0) * 1000)
+        return {"status": "down", "latency_ms": ms, "detail": str(exc)[:200]}
+
+
+def _check_browser_service():
+    t0 = time.monotonic()
+    try:
+        service_url = getattr(settings, "BROWSER_SERVICE_URL", "http://browser-service:8001")
+        resp = httpx.get(f"{service_url}/health", timeout=5)
+        ms = int((time.monotonic() - t0) * 1000)
+        if resp.status_code in (200, 503):
+            data = resp.json()
+            is_ok = resp.status_code == 200
+            result = {
+                "status": "up" if is_ok else "degraded",
+                "latency_ms": ms,
+                "detail": f"{'Ready' if is_ok else 'Degraded'} — {data.get('status', '?')}",
+                "components": {
+                    "mcp_chrome": data.get("mcp_chrome_running"),
+                    "scraper_chrome": data.get("scraper_chrome_running"),
+                    "xvfb": data.get("xvfb_running"),
+                    "mcp_process": data.get("mcp_process_alive"),
+                },
+                "cdp": {
+                    "mcp_port": data.get("mcp_cdp_port"),
+                    "scraper_port": data.get("scraper_cdp_port"),
+                    "mcp_latency_ms": data.get("mcp_cdp_latency_ms"),
+                    "scraper_latency_ms": data.get("scraper_cdp_latency_ms"),
+                    "mcp_cdp_alive": data.get("mcp_cdp_alive"),
+                    "scraper_cdp_alive": data.get("scraper_cdp_alive"),
+                },
+                "proxy": {
+                    "datacenter": data.get("proxy_datacenter"),
+                    "residential": data.get("proxy_residential"),
+                },
+                "uptime_seconds": data.get("uptime_seconds"),
+            }
+            return result
+        return {"status": "down", "latency_ms": ms, "detail": f"HTTP {resp.status_code}"}
+    except Exception as exc:
+        ms = int((time.monotonic() - t0) * 1000)
+        return {"status": "down", "latency_ms": ms, "detail": str(exc)[:200]}
+
+
+@login_required
+def health_api(request):
+    checks = {
+        "django": None,
+        "postgres": _check_db,
+        "redis": _check_redis,
+        "celery_worker": _check_celery_worker,
+        "celery_beat": _check_celery_beat,
+        "browser_service": _check_browser_service,
+    }
+    labels = {
+        "django": "Django",
+        "postgres": "PostgreSQL",
+        "redis": "Redis",
+        "celery_worker": "Celery Worker",
+        "celery_beat": "Celery Beat",
+        "browser_service": "Browser Service",
+    }
+    services = {}
+    for name, check_fn in checks.items():
+        if check_fn:
+            services[name] = check_fn()
+        else:
+            services[name] = {"status": "up", "latency_ms": 0, "detail": "OK"}
+        services[name]["label"] = labels[name]
+    return JsonResponse(services)
+
+
+@login_required
+def health_dashboard(request):
+    return render(request, "scraper/health.html")

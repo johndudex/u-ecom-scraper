@@ -1,0 +1,230 @@
+{% extends "scraper/base.html" %}
+
+{% block title %}System Health{% endblock %}
+
+{% block content %}
+<style>
+.health-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 0.75rem;
+}
+
+.health-card {
+    background: var(--bg-panel, #111827);
+    border: 1px solid var(--bg-line-subtle, #1E293B);
+    border-radius: 0.75rem;
+    padding: 1.25rem;
+    transition: border-color 200ms;
+}
+.health-card:hover {
+    border-color: rgba(34, 211, 238, 0.15);
+}
+
+.hc-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.75rem;
+}
+
+.hc-name {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    font-weight: 600;
+    font-size: 0.8125rem;
+    color: #F1F5F9;
+}
+
+.hc-icon {
+    width: 32px;
+    height: 32px;
+    border-radius: 0.5rem;
+    background: #1A2332;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+.hc-icon svg {
+    width: 16px;
+    height: 16px;
+    color: #94A3B8;
+}
+
+.hc-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    transition: background-color 300ms;
+}
+.hc-dot.up { background: #22C55E; box-shadow: 0 0 6px rgba(34,197,94,0.4); }
+.hc-dot.degraded { background: #F59E0B; box-shadow: 0 0 6px rgba(245,158,11,0.4); }
+.hc-dot.down { background: #EF4444; box-shadow: 0 0 6px rgba(239,68,68,0.4); }
+.hc-dot.unknown { background: #64748B; }
+.hc-dot.checking {
+    background: #22D3EE;
+    animation: pulse-dot 1s ease-in-out infinite;
+}
+
+.hc-status-text {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 2px 8px;
+    border-radius: 4px;
+}
+.hc-status-text.up { color: #22C55E; background: rgba(34,197,94,0.1); }
+.hc-status-text.degraded { color: #F59E0B; background: rgba(245,158,11,0.1); }
+.hc-status-text.down { color: #EF4444; background: rgba(239,68,68,0.1); }
+.hc-status-text.unknown { color: #64748B; background: rgba(100,116,139,0.1); }
+.hc-status-text.checking { color: #22D3EE; background: rgba(34,211,238,0.1); }
+
+.hc-detail {
+    font-size: 0.75rem;
+    color: #64748B;
+    font-family: 'JetBrains Mono', monospace;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.hc-sub {
+    font-size: 0.6875rem;
+    color: #94A3B8;
+    font-family: 'JetBrains Mono', monospace;
+    line-height: 1.6;
+}
+.hc-sub .check-up { color: #22C55E; }
+.hc-sub .check-down { color: #EF4444; }
+.hc-sub .check-off { color: #64748B; }
+.hc-latency {
+    font-size: 0.625rem;
+    color: #475569;
+    font-family: 'JetBrains Mono', monospace;
+}
+
+@keyframes pulse-dot {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+
+.hc-status-group {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+</style>
+
+<div class="flex items-center justify-between mb-5">
+    <h1 class="text-xl-heading font-bold text-ink">System Health</h1>
+    <div class="flex items-center gap-3">
+        <span id="last-checked" class="text-xs text-ink-muted font-mono"></span>
+        <button onclick="doRefresh()" id="refresh-btn" class="btn-secondary text-xs px-3 py-1.5 flex items-center gap-1.5" style="font-size:0.6875rem;">
+            <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.243 0m0 0V4m0 0h5.582M15.356 2H9.421m0 0a8.001 8.001 0 00-4.243 0"/></svg>
+            Refresh
+        </button>
+    </div>
+</div>
+
+<div id="health-grid" class="health-grid">
+    <div class="health-card"><div class="text-xs text-ink-muted">Loading...</div></div>
+</div>
+
+<script>
+const REFRESH_INTERVAL = 10000;
+let refreshTimer = null;
+
+const SERVICE_ICONS = {
+    django: '<svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>',
+    postgres: '<svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 4.418-4.03 8-9 8s-9-3.582-9-8"/><path d="M3 5c0 4.418 4.03 8 9 8s9-3.582 9-8"/></svg>',
+    redis: '<svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>',
+    celery_worker: '<svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3"/></svg>',
+    celery_beat: '<svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path stroke-linecap="round" stroke-linejoin="round" d="M12 7v5l3 3M12 7h.01"/></svg>',
+    browser_service: '<svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path stroke-linecap="round" stroke-linejoin="round" d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 014-10 15.3 15.3 0 01-4-10"/></svg>',
+};
+
+function renderCard(name, data) {
+    const status = data.status || 'unknown';
+    const icon = SERVICE_ICONS[name] || '';
+    let extra = '';
+    if (name === 'browser_service' && data.components) {
+        const c = data.components;
+        const cd = data.cdp || {};
+        const pr = data.proxy || {};
+        const up = '✓', down = '✗', off = '—';
+        const checkIcon = v => v ? up : off;
+        extra += '<div class="hc-sub">'
+            + checkIcon(c.mcp_chrome) + ' MCP Chrome <span style="opacity:0.5">:' + (cd.mcp_port || '?') + '</span>'
+            + ' <span class="' + (cd.mcp_cdp_alive ? 'check-up' : 'check-down') + '">' + (cd.mcp_cdp_latency_ms ?? '?') + 'ms</span><br>'
+            + checkIcon(c.scraper_chrome) + ' Scraper Chrome <span style="opacity:0.5">:' + (cd.scraper_port || '?') + '</span>'
+            + ' <span class="' + (cd.scraper_cdp_alive ? 'check-up' : 'check-down') + '">' + (cd.scraper_cdp_latency_ms ?? '?') + 'ms</span><br>'
+            + checkIcon(c.xvfb) + ' Xvfb'
+            + ' | ' + (pr.datacenter === 'available' ? up : off) + ' DC proxy'
+            + ' | ' + (pr.residential === 'available' ? up : off) + ' Residential proxy'
+            + '</div>';
+    }
+    return '<div class="health-card">'
+        + '<div class="hc-header">'
+        +   '<div class="hc-name">'
+        +     '<div class="hc-icon">' + icon + '</div>'
+        +     '<span>' + (data.label || name) + '</span>'
+        +   '</div>'
+        +   '<div class="hc-status-group">'
+        +     '<div class="hc-dot ' + status + '" id="dot-' + name + '"></div>'
+        +     '<span class="hc-status-text ' + status + '">' + status + '</span>'
+        +   '</div>'
+        + '</div>'
+        + '<div class="hc-detail" title="' + (data.detail || '') + '">' + (data.detail || '') + '</div>'
+        + extra
+        + (data.latency_ms ? '<div class="hc-latency">' + data.latency_ms + 'ms</div>' : '')
+        + '</div>';
+}
+
+function doRefresh() {
+    var btn = document.getElementById('refresh-btn');
+    btn.disabled = true;
+    btn.style.opacity = '0.5';
+
+    // Set all dots to checking state
+    var dots = document.querySelectorAll('.hc-dot');
+    dots.forEach(function(d) {
+        d.className = 'hc-dot checking';
+    });
+
+    fetch('{% url "health_api" %}')
+        .then(function(r) { return r.json(); })
+        .then(function(services) {
+            var grid = document.getElementById('health-grid');
+            var html = '';
+            var order = ['django', 'postgres', 'redis', 'celery_worker', 'celery_beat', 'browser_service'];
+            order.forEach(function(name) {
+                if (services[name]) {
+                    html += renderCard(name, services[name]);
+                }
+            });
+            grid.innerHTML = html;
+            document.getElementById('last-checked').textContent = 'Updated just now';
+        })
+        .catch(function(err) {
+            document.getElementById('health-grid').innerHTML =
+                '<div class="health-card"><div class="text-xs" style="color:#EF4444">Failed to fetch health data: ' + err.message + '</div></div>';
+        })
+        .finally(function() {
+            btn.disabled = false;
+            btn.style.opacity = '1';
+        });
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    doRefresh();
+    refreshTimer = setInterval(doRefresh, REFRESH_INTERVAL);
+});
+
+window.addEventListener('beforeunload', function() {
+    if (refreshTimer) clearInterval(refreshTimer);
+});
+</script>
+{% endblock %}

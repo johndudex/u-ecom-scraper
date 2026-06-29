@@ -110,7 +110,7 @@ def navigate_synthesize(state: dict, config=None) -> dict[str, Any]:
         _log_agent_context(state, "navigation-synthesize", messages)
         agent = create_navigation_synthesize(site_slug=slug)
 
-        agent_cfg: dict = {"recursion_limit": NAVIGATION_SYNTHESIZE_BUDGET}
+        agent_cfg: dict = {}
         if config:
             agent_cfg.update(config)
 
@@ -231,6 +231,10 @@ def _fallback_synthesize(state: dict, root: str, slug: str) -> dict[str, Any]:
     else:
         discovery_method = "category" if has_categories else "unknown"
 
+    working_url = ""
+    if listing_url and real_product_links:
+        working_url = listing_url
+
     # Build search section
     search_section: dict[str, Any] = {}
     search_form = homepage_nav.get("search_form")
@@ -242,6 +246,7 @@ def _fallback_synthesize(state: dict, root: str, slug: str) -> dict[str, Any]:
             "url_pattern": search_form.get("action", ""),
             "has_url_search": bool(search_form.get("action")),
             "search_url_pattern": search_form.get("action", ""),
+            "working_url": working_url,
         }
     elif findings.get("search_attempted"):
         listing_url_for_search = listing_url if listing_url else ""
@@ -274,6 +279,7 @@ def _fallback_synthesize(state: dict, root: str, slug: str) -> dict[str, Any]:
             "has_url_search": True,
             "search_url_pattern": search_url_pattern,
             "listing_url_used": listing_url_for_search,
+            "working_url": working_url,
             "notes": f"Search was attempted by navigate_explore. Products found at: {listing_url_for_search}" if listing_url_for_search else "Search was attempted but no results found.",
         }
     else:

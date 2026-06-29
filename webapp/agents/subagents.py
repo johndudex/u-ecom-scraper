@@ -964,7 +964,8 @@ def build_navigation_synthesize_message(state: dict) -> list:
         f'    "submit_selector": "CSS selector for submit button",\n'
         f'    "url_pattern": "URL pattern with {{query}} placeholder",\n'
         f'    "has_url_search": true/false,\n'
-        f'    "search_url_pattern": "/search?q={{query}}"\n'
+        f'    "search_url_pattern": "/search?q={{query}}",\n'
+        f'    "working_url": "ACTUAL URL where products were found (from listing_page.url in findings)"\n'
         f"  }},\n"
         f'  "categories": {{\n'
         f'    "menu_selector": "CSS selector for category menu",\n'
@@ -1004,6 +1005,12 @@ def build_navigation_synthesize_message(state: dict) -> list:
         f"If it is `true`, the explorer tried searching even if `homepage_nav.search_form` "
         f"is null or absent. In that case, set `search.has_search: true` and "
         f"`search.has_url_search: true`.\n"
+        f"- **CRITICAL: working_url.** Read `listing_page.url` from navigation_findings.json. "
+        f"If it exists AND `listing_page.product_links` is non-empty, set `search.working_url` "
+        f"to that exact URL. This is the actual browser URL where products were found — it is "
+        f"more reliable than the `url_pattern` or `search_url_pattern` (which are guessed from "
+        f"the homepage form's action attribute). Downstream agents use `working_url` as the "
+        f"authoritative search URL.\n"
         f"- For selectors, use the most specific CSS selector you can derive from the "
         f"raw data (parent classes, element types, attributes). If no data, leave empty.\n\n"
         f"**You MUST call write_file to save the output. Do NOT just print the JSON as text.**\n"
@@ -1309,8 +1316,11 @@ def build_code_writer_message(state: dict) -> list:
         verified_section = ""
         if verified:
             lines = []
-            for field_name, field_info in verified.items():
+            for field_name, field_info in verified.items() if isinstance(verified, dict) else []:
                 if isinstance(field_info, str):
+                    lines.append(f"  - {field_name}: {field_info}")
+                    continue
+                if not isinstance(field_info, dict):
                     lines.append(f"  - {field_name}: {field_info}")
                     continue
                 method = field_info.get("method", "unknown")
@@ -1368,19 +1378,25 @@ def build_code_writer_message(state: dict) -> list:
             seleniumbase_section = (
                 "\n### SeleniumBase UC Mode — MANDATORY API Constraints\n"
                 "The scraper MUST use SeleniumBase with UC Mode. Follow these rules EXACTLY:\n\n"
-"**SB() constructor — ONLY valid kwargs:**\n"
+                "**SB() constructor — ONLY valid kwargs (SeleniumBase 4.44+):**\n"
             "```python\n"
             "with SB(uc=True, xvfb=args.xvfb, locale_code='en-gb') as sb:\n"
             "    driver = sb.driver\n"
             "```\n"
-            "Valid kwargs: `uc`, `xvfb`, `locale_code`, `proxy`, `browser_args`, "
-            "`page_load_strategy`, `driver_type`, `use_auto_ext`\n"
+            "Valid kwargs: `uc`, `xvfb`, `locale_code`, `proxy`, `chromium_arg`, "
+            "`page_load_strategy`, `driver_type`, `extension_zip`, `extension_dir`, "
+            "`use_auto_ext`\n"
             "The run_scraper tool auto-injects `--xvfb` CLI flag. "
             "Your argparse MUST accept `--xvfb` (action='store_true') and use "
             "`args.xvfb` in SESSION_KWARGS — otherwise argparse rejects the flag and the scraper crashes.\n\n"
-            "**INVALID kwargs (NEVER use):** `chrome_args` (wrong → use `browser_args`), "
+            "**INVALID kwargs (NEVER use):** `browser_args` (wrong → use `chromium_arg`), "
+            "`chrome_args` (wrong → use `chromium_arg`), "
             "`headless=True` with `uc=True` (unreliable → use `xvfb=True`), "
             "`driver_kwargs` (doesn't exist)\n\n"
+            "**Proxy with auth:** Use `extension_zip=/path/to/auth.zip` kwarg "
+            "(NOT `use_auto_ext` — that enables Chrome's built-in automation extension). "
+            "The template already has `_make_proxy_auth_extension()` — call it and pass "
+            "the result as `extension_zip`. Use `chromium_arg` for `--proxy-server` flag.\n\n"
                 "**Page navigation — ALWAYS use driver.uc_open_with_reconnect():**\n"
                 "```python\n"
                 "driver.uc_open_with_reconnect(url, reconnect_time=4)\n"
@@ -1395,7 +1411,7 @@ def build_code_writer_message(state: dict) -> list:
                 "`sb.driver.execute_script()` (can crash CDP). "
                 "Just `driver.execute_script()` — it's the raw WebDriver API.\n\n"
                 "**Pattern summary:**\n"
-"```python\n"
+            "```python\n"
             "with SB(uc=True, xvfb=args.xvfb) as sb:\n"
                 "    driver = sb.driver\n"
                 "    driver.uc_open_with_reconnect(url, reconnect_time=4)\n"
@@ -1432,12 +1448,13 @@ def build_code_writer_message(state: dict) -> list:
 
         if search_info.get("has_search") or search_info.get("has_url_search"):
             nav_lines.append("**Search:** supported")
-            if search_info.get("url_pattern"):
-                nav_lines.append(f"  - URL pattern: `{search_info['url_pattern']}`")
-            if search_info.get("search_url_pattern"):
-                nav_lines.append(f"  - Search URL pattern: `{search_info['search_url_pattern']}`")
-            if search_info.get("listing_url_used"):
-                nav_lines.append(f"  - Products found at: `{search_info['listing_url_used']}`")
+            working_search_url = search_info.get("working_url") or search_info.get("listing_url_used")
+            if working_search_url:
+                nav_lines.append(f"  - **Working search URL (USE THIS):** `{working_search_url}`")
+            if search_info.get("url_pattern") and search_info.get("url_pattern") != working_search_url:
+                nav_lines.append(f"  - URL pattern (from form action — may be WRONG): `{search_info['url_pattern']}`")
+            if search_info.get("search_url_pattern") and search_info.get("search_url_pattern") != working_search_url:
+                nav_lines.append(f"  - Search URL pattern (may be WRONG): `{search_info['search_url_pattern']}`")
             if search_info.get("input_selector"):
                 nav_lines.append(f"  - Search input: `{search_info['input_selector']}`")
             if search_criteria:
@@ -1491,9 +1508,11 @@ def build_code_writer_message(state: dict) -> list:
             "- Phase 1 MUST start from the listing URL in navigation_analysis.search\n"
         )
 
-        if search_info.get("listing_url_used"):
+        working_first_url = search_info.get("working_url") or search_info.get("listing_url_used")
+
+        if working_first_url:
             nav_lines.append(
-                f"- First URL: `{search_info['listing_url_used']}` "
+                f"- First URL: `{working_first_url}` "
                 f"(this is where {len(item_links_info.get('url_examples', []))} products were found)\n"
             )
         elif search_info.get("search_url_pattern"):
@@ -1587,7 +1606,10 @@ def build_code_writer_message(state: dict) -> list:
             "- Hardcode URLs — discover them dynamically using the navigation patterns\n"
             "- Skip pagination — scrape ALL pages up to max_pages\n"
             "- Use input_urls.json — the scraper discovers its own URLs\n"
-            "- Deviate from the navigation_analysis.json patterns\n\n"
+            "- Deviate from the navigation_analysis.json patterns\n"
+            "- Add a fallback to read input_urls.json in the default (no-args) branch — "
+            "the scraper MUST default to Phase 1 search discovery (using `--query` or the "
+            "DEFAULT_QUERY constant), NEVER fall back to input_urls.json\n\n"
         )
     else:
         content += (
@@ -1652,7 +1674,7 @@ def build_code_writer_message(state: dict) -> list:
         f"- `--limit N` — Max products to scrape (type=int)\n\n"
         f"**CRITICAL: You MUST call write_file to save the scraper to "
         f"workspace/{slug}/scraper_draft.py"
-        f"{' AND call write_file to save input URLs to workspace/' + slug + '/input_urls.json' if not site_input_urls else ''}. "
+        f"{' AND call write_file to save input URLs to workspace/' + slug + '/input_urls.json' if not site_input_urls and not navigation_section else ''}. "
         f"Do NOT just print code.**"
     )
     return [HumanMessage(content=content)]
@@ -1673,6 +1695,7 @@ def build_code_tester_message(state: dict) -> list:
         )
 
     input_mode = state.get("input_mode", "url_list")
+    search_criteria = state.get("search_criteria", "")
     nav_validation = ""
     if input_mode in ("navigation", "list_page", "search_term"):
         nav_analysis = state.get("navigation_analysis") or {}
@@ -1688,7 +1711,9 @@ def build_code_tester_message(state: dict) -> list:
                 f"- Validate that discovered URLs are PRODUCT pages, not category pages\n"
             )
         nav_validation += (
-            f"- `--sample` flag limits to 5 products — verify the scraper respects this\n"
+            f"- `--sample --query \"{search_criteria}\"` — use these exact args so Phase 1 discovery runs\n"
+            f"- Do NOT run with only `--sample` — the scraper will fall back to input_urls.json "
+            f"instead of discovering products via search\n"
             f"- A FAIL is expected if Phase 1 discovers category/landing page URLs instead of product URLs\n"
             f"- This is a navigation scraper — input_urls.json is NOT used. "
             f"Products come from the scraper's own discovery.\n"
@@ -1707,7 +1732,7 @@ def build_code_tester_message(state: dict) -> list:
         f"1. Read `workspace/{slug}/scraper_draft.py` (1 call)\n"
         f"2. Read `workspace/{slug}/product_analysis.json` (1 call)\n"
         f"3. Run scraper: `run_scraper(path=\"workspace/{slug}/scraper_draft.py\", "
-        f"args=[\"--sample\"])` (1-2 calls)\n"
+        f'args={["--sample", "--query", search_criteria] if input_mode in ("navigation", "list_page", "search_term") and search_criteria else ["--sample"]})` (1-2 calls)\n'
         f"4. Read the output JSON (1 call)\n"
         f"5. Write test_report.json (1 call)\n\n"
         f"### Validation Method\n"

@@ -80,4 +80,6 @@ urlpatterns = [
         views.agent_playground_detail,
         name="agent_playground_detail",
     ),
+    path("health/", views.health_dashboard, name="health"),
+    path("api/health/", views.health_api, name="health_api"),
 ]

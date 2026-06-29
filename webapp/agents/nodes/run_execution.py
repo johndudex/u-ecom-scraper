@@ -73,6 +73,14 @@ def run_execution(state: ScrapeState) -> dict:
     if state.get("sample_only", False):
         args.append("--sample")
 
+    input_mode = state.get("input_mode", "")
+    search_criteria = state.get("search_criteria", "")
+    if input_mode in ("navigation", "list_page", "search_term") and search_criteria:
+        args.extend(["--query", search_criteria])
+        logger.info(
+            "run_execution: navigation job, passing --query '%s'", search_criteria
+        )
+
     if _needs_browser(state):
         logger.info("run_execution: browser-based scraper, dispatching to browser-service")
         return _run_via_browser_service(scraper_path, args, site_folder)

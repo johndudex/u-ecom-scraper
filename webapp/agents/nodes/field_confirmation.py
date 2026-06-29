@@ -197,7 +197,30 @@ def field_confirmation(state: ScrapeState) -> Command:
 
     sample_text = ""
 
-    if os.path.isfile(input_path):
+    input_mode = state.get("input_mode", "url_list")
+    search_criteria = state.get("search_criteria", "")
+
+    if input_mode in ("navigation", "list_page", "search_term") and search_criteria:
+        cmd_args = [
+            "--query",
+            search_criteria,
+            "--sample",
+        ]
+
+        scraping_method = state.get("scraping_method", "")
+        if _needs_browser_queue(scraper_path, scraping_method):
+            output = _run_sample_via_queue(scraper_path, cmd_args)
+        else:
+            output = _run_sample_in_process(scraper_path, cmd_args, root)
+
+        sample_text = output[:3000] if output.strip() else ""
+
+        if not sample_text:
+            output_file = _find_latest_output(slug, root)
+            if output_file:
+                logger.info("field_confirmation: reading output file %s", output_file)
+                sample_text = _format_output_products(output_file, output_key)
+    elif os.path.isfile(input_path):
         cmd_args = [
             "--input",
             input_path,

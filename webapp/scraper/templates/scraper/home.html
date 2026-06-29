@@ -105,6 +105,12 @@
     background: rgba(34, 211, 238, 0.06);
     color: #F1F5F9;
 }
+.cs-option.cs-disabled {
+    color: #475569;
+    cursor: not-allowed;
+    opacity: 0.5;
+    pointer-events: none;
+}
 .cs-option.selected { color: #22D3EE; }
 .cs-option.selected::before {
     opacity: 1;
@@ -165,35 +171,17 @@
                         <svg class="cs-arrow" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/></svg>
                     </button>
                     <div class="cs-panel" role="listbox">
+                        {% regroup content_types by group as groups %}
+                        {% for group in groups %}
                         <div class="cs-group">
-                            <div class="cs-group-label">Shopping</div>
-                            <div class="cs-option" data-value="product" data-label="Product (URL list)">Product (URL list)</div>
-                            <div class="cs-option" data-value="product_list" data-label="Product List (listing page)">Product List (listing page)</div>
-                            <div class="cs-option" data-value="product_navigation" data-label="Product Navigation (search/browse)">Product Navigation (search/browse)</div>
+                            <div class="cs-group-label">{{ group.grouper }}</div>
+                            {% for ct in group.list %}
+                            <div class="cs-option{% if not ct.enabled %} cs-disabled{% endif %}"
+                                 data-value="{{ ct.value }}"
+                                 data-label="{{ ct.label }}{% if not ct.enabled %} (unavailable){% endif %}">{{ ct.label }}{% if not ct.enabled %} <span style="font-size:0.7rem;opacity:0.6;margin-left:6px;">unavailable</span>{% endif %}</div>
+                            {% endfor %}
                         </div>
-                        <div class="cs-group">
-                            <div class="cs-group-label">Articles</div>
-                            <div class="cs-option" data-value="article" data-label="Article (URL list)">Article (URL list)</div>
-                            <div class="cs-option" data-value="article_list" data-label="Article List (listing page)">Article List (listing page)</div>
-                            <div class="cs-option" data-value="article_navigation" data-label="Article Navigation">Article Navigation</div>
-                        </div>
-                        <div class="cs-group">
-                            <div class="cs-group-label">Jobs</div>
-                            <div class="cs-option" data-value="job_posting" data-label="Job Posting (URL list)">Job Posting (URL list)</div>
-                            <div class="cs-option" data-value="job_navigation" data-label="Job Navigation">Job Navigation</div>
-                        </div>
-                        <div class="cs-group">
-                            <div class="cs-group-label">Forum</div>
-                            <div class="cs-option" data-value="forum_thread" data-label="Forum Thread (URL list)">Forum Thread (URL list)</div>
-                        </div>
-                        <div class="cs-group">
-                            <div class="cs-group-label">Search</div>
-                            <div class="cs-option" data-value="serp" data-label="SERP (search engine results)">SERP (search engine results)</div>
-                        </div>
-                        <div class="cs-group">
-                            <div class="cs-group-label">Generic</div>
-                            <div class="cs-option" data-value="page_content" data-label="Page Content (URL list)">Page Content (URL list)</div>
-                        </div>
+                        {% endfor %}
                     </div>
                 </div>
             </div>
@@ -358,6 +346,7 @@ function onPageTypeChange() {
 
     options.forEach(function(opt) {
         opt.addEventListener('click', function() {
+            if (opt.classList.contains('cs-disabled')) return;
             setSelected(opt.dataset.value, opt.dataset.label, true);
             close();
             trigger.focus();
@@ -384,7 +373,9 @@ function onPageTypeChange() {
                 e.preventDefault();
                 if (!isOpen) { open(); }
                 else {
-                    highlightIdx = Math.min(highlightIdx + 1, options.length - 1);
+                    var next = highlightIdx + 1;
+                    while (next < options.length && options[next].classList.contains('cs-disabled')) next++;
+                    highlightIdx = Math.min(next, options.length - 1);
                     updateHighlight();
                     options[highlightIdx].scrollIntoView({ block: 'nearest' });
                 }
@@ -392,7 +383,9 @@ function onPageTypeChange() {
             case 'ArrowUp':
                 e.preventDefault();
                 if (isOpen) {
-                    highlightIdx = Math.max(highlightIdx - 1, 0);
+                    var prev = highlightIdx - 1;
+                    while (prev >= 0 && options[prev].classList.contains('cs-disabled')) prev--;
+                    highlightIdx = Math.max(prev, 0);
                     updateHighlight();
                     options[highlightIdx].scrollIntoView({ block: 'nearest' });
                 }

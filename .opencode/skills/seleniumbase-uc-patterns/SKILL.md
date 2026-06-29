@@ -5,24 +5,49 @@ description: Patterns for writing SeleniumBase UC Mode scrapers. Covers SB() con
 
 # SeleniumBase UC Mode — Authoritative Reference
 
-## SB() Constructor — Valid Kwargs ONLY
+## SB() Constructor — Valid Kwargs ONLY (SeleniumBase 4.44+)
 
 ```python
 with SB(
     uc=True,              # Enable UC Mode (undetected-chromedriver)
     xvfb=True,           # Use Xvfb virtual display (REQUIRED for headless Linux/Docker — do NOT use headless=True with uc=True)
     locale_code="en-gb",  # Browser locale (optional)
-    proxy="host:port",    # Proxy server (optional)
-    browser_args=["--disable-blink-Features=AutomationControlled"],  # Extra Chrome flags (optional)
+    proxy="host:port",    # Proxy server (optional, no auth — auth requires extension_zip below)
+    chromium_arg=["--proxy-server=http://host:port", "--disable-blink-Features=AutomationControlled"],  # Extra Chrome flags (optional, list or comma-separated string)
+    extension_zip="/path/to/auth_ext.zip",  # Load Chrome extension ZIP (optional — for proxy auth)
     page_load_strategy="eager",  # Document readiness (optional)
 ) as sb:
     driver = sb.driver
 ```
 
 **INVALID kwargs the LLM keeps guessing (NEVER use these):**
-- `chrome_args` — WRONG, use `browser_args`
+- `browser_args` — WRONG, use `chromium_arg`
+- `chrome_args` — WRONG, use `chromium_arg`
 - `headless=True` with `uc=True` — UNRELIABLE on Linux, use `xvfb=True` instead
 - `driver_kwargs` — NOT a SB() parameter
+
+**Proxy with authentication (residential proxy):**
+SeleniumBase UC Mode cannot pass proxy credentials directly. Use a Chrome extension:
+
+```python
+# 1. Create proxy auth extension ZIP (the template has _make_proxy_auth_extension())
+ext_path = _make_proxy_auth_extension(proxy_host, proxy_port, proxy_user, proxy_pass)
+
+# 2. Pass both chromium_arg (for --proxy-server flag) and extension_zip (for auth)
+with SB(
+    uc=True, xvfb=True,
+    proxy=f"{host}:{port}",
+    chromium_arg=[f"--proxy-server=http://{host}:{port}"],
+    extension_zip=ext_path,
+) as sb:
+    driver = sb.driver
+```
+
+Do NOT use `use_auto_ext` for proxy auth — that enables Chrome's built-in automation extension,
+not custom extension loading. Use `extension_zip` instead.
+
+**NOTE:** The template (`templates/undetected_chromedriver_scraper.py`) already has the correct
+proxy pattern with `_make_proxy_auth_extension()` and `_make_sb_kwargs()`. Read and follow it.
 
 ## JavaScript Execution — Use driver.execute_script() Directly
 

@@ -47,12 +47,14 @@ docker compose exec django python manage.py createsuperuser
 
 | Service | Port | Purpose |
 |---------|------|---------|
-| Django Web UI | 8000 | Submit jobs, monitor progress, approve steps |
+| Django Web UI | 8000 | Submit jobs, monitor progress, approve steps, health dashboard |
 | Flower (Celery Monitor) | 5555 | Task queue monitoring |
-| Browser Service API | 8001 | Page probing, scraper execution |
-| Playwright MCP | 8111 | Agent interactive browsing (SSE) |
+| Browser Service API | 8001 | Page probing, scraper execution, Chrome/CDP management |
+| Playwright MCP | 8111 | Agent interactive browsing (SSE, internal) |
 | Chrome CDP (MCP) | 9222 | Playwright MCP browser |
 | Chrome CDP (Scraper) | 9223 | Remote CDP for generated scrapers |
+
+Service health is monitored at **/health/** in the dashboard, showing real-time status of all services including CDP liveness, proxy availability, and browser process health.
 
 ## Usage
 
@@ -76,19 +78,26 @@ From the site detail page you can:
 
 1. Open **http://localhost:8000**
 2. Enter a **site URL** (e.g. `https://www.nike.com`)
-3. Optionally enter a **product listing URL** to auto-discover products
-4. Click **Scrape**
+3. Select a **content type** from the dropdown (e.g. Products, Articles, Categories)
+4. Choose **input mode**:
+   - **URL List** — paste product URLs directly
+   - **Search Term** — enter a search query (e.g. "running shoes"); the pipeline discovers products automatically
+   - **List Page URL** — provide a category/collection URL to scrape
+5. Click **Scrape**
+
+For **Search Term** and **List Page** modes, the pipeline runs a navigation phase that browses the site, finds the working search/category URL, and encodes that discovery logic into the generated scraper. No manual URL list needed.
 
 ### Monitor Progress
 
 The pipeline runs through these stages:
 
 ```
-Accessibility Check → Site Analysis → Product Analysis → Scraper Analysis
-→ Code Generation → Testing → Field Confirmation → Execution → Cleanup
+Accessibility Check → Site Analysis → [Navigation Explore → Navigation Synthesize]
+→ Product Analysis → Scraper Analysis → Code Generation → Testing
+→ Field Confirmation → Execution → Cleanup → Nav Skill Review → Skill Learning
 ```
 
-Each stage shows in real-time on the job page, including tool calls and agent logs.
+Navigation phases only run for search/list-page jobs. Each stage shows in real-time on the job page, including tool calls and agent logs.
 
 ### Human Approval
 
@@ -119,6 +128,7 @@ All configuration is via environment variables. Copy `.env.example` to `.env` an
 | `SECRET_KEY` | No | dev default | Django secret key |
 | `DB_PASSWORD` | No | `scraper` | PostgreSQL password |
 | `DEBUG` | No | `False` | Django debug mode |
+| `DEBUG_AUTO_LOGIN` | No | `False` | Auto-login as first superuser (dev convenience) |
 | `DJANGO_SUPERUSER_PASSWORD` | No | `admin` | Password for auto-created admin user |
 | `PROXY_DATACENTER_USER` | No | — | Bright Data DC proxy username |
 | `PROXY_DATACENTER_PASS` | No | — | Bright Data DC proxy password |
@@ -155,17 +165,17 @@ u-ecom-scraper/
 ├── .env.example                  # Environment variable template
 ├── webapp/                       # Django application
 │   ├── agents/                   # LangGraph graph, agents, tools
-│   │   ├── graph.py              # Graph assembly (19 nodes)
+│   │   ├── graph.py              # Graph assembly (22 nodes)
 │   │   ├── state.py              # ScrapeState TypedDict
 │   │   ├── subagents.py          # Agent factories + message builders
 │   │   ├── llm.py                # LLM client setup
 │   │   ├── nodes/                # Deterministic graph nodes
 │   │   └── tools/                # Agent tools (probe_page, web_fetch, etc.)
 │   ├── scraper/                  # Django app: models, views, tasks
-│   │   ├── models.py             # ScrapeJob, Step, Approval, Site
+│   │   ├── models.py             # ScrapeJob, Step, Approval, Site, ContentType
 │   │   ├── tasks.py              # Celery tasks
 │   │   ├── services.py           # LangGraphService
-│   │   └── views.py              # Django views + SSE streaming
+│   │   └── views.py              # Django views + SSE streaming + health API
 │   └── config/                   # Django settings, Celery config, URLs
 ├── browser-service/              # Browser automation (FastAPI + Chrome)
 │   ├── Dockerfile                # Chrome + Xvfb + SeleniumBase + Playwright
@@ -176,11 +186,11 @@ u-ecom-scraper/
 ├── src/                          # Shared libraries
 │   ├── proxy.py                  # Proxy configuration + URL builder
 │   └── page_analysis.py          # Common selectors, JSON-LD extraction
-├── templates/                    # Scraper code templates (5 strategies)
+├── templates/                    # Scraper code templates (11 strategies)
 ├── scrapers/                     # Generated per-site scrapers + data
 ├── .opencode/                    # Agent prompts + skills
-│   ├── agents/                   # 8 agent definition files
-│   └── skills/                   # Platform detection + tool skills
+│   ├── agents/                   # 11 agent definition files
+│   └── skills/                   # 15 detection + technique skills
 ├── data/                         # Site tracker seed data
 ├── docs/                         # Architecture documentation
 └── tests/                        # Test suite
@@ -244,6 +254,18 @@ docker compose --profile full down
 # Reset database (destroys all data)
 docker compose down -v
 ```
+
+## Health Dashboard
+
+Navigate to **/health/** to see real-time status of all services:
+
+- **Django** — web server health
+- **PostgreSQL** — database connectivity
+- **Redis** — task queue backend
+- **Celery Worker / Beat** — task processor status
+- **Browser Service** — expanded card showing Chrome CDP liveness, Xvfb, MCP process, and proxy availability
+
+The dashboard auto-refreshes every 10 seconds.
 
 ## Output Format
 

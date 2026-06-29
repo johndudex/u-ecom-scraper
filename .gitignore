@@ -66,3 +66,30 @@ scripts/sites_fixture.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Agent loop state
+.ralph/
+
+# UI design screenshots
+screenshot/
+
+# Temp directories and scripts
+tmp/
+tmp_*.py
+
+# Webapp nested caches/debris
+webapp/workspace/
+webapp/downloaded_files/
+webapp/.pytest_cache/
+webapp/.ruff_cache/
+app/workspace/
+
+# Playground/test scrapers
+scrapers/playground-*/
+scrapers/test-*/
+
+# Inter-agent analysis artifacts inside scrapers
+scrapers/*/analysis/
+
+# Debug scripts
+scripts/test_nav_*.py

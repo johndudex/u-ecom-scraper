@@ -3,6 +3,7 @@ import glob
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -33,6 +34,76 @@ CDP_LIVENESS_INTERVAL = 60
 CDP_MAX_CONSECUTIVE_FAILURES = 2
 
 PERSISTENT_CHROME_PIDS: set[int] = set()
+mcp_process: Optional[subprocess.Popen] = None
+
+
+async def _start_mcp_process() -> bool:
+    """Start (or restart) the Playwright MCP server process.
+    Returns True on success, False on failure. Sets module-level ``mcp_process``."""
+    global mcp_process
+    try:
+        if mcp_process and mcp_process.poll() is None:
+            logger.info("Stopping stale MCP process (PID %d)...", mcp_process.pid)
+            try:
+                os.killpg(os.getpgid(mcp_process.pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                mcp_process.kill()
+            try:
+                mcp_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(mcp_process.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    mcp_process.kill()
+        mcp_process = None
+
+        mcp_internal_port = os.environ.get("MCP_CDP_PORT", "19222")
+        mcp_cmd = [
+            "npx",
+            "@playwright/mcp",
+            "--cdp-endpoint",
+            f"http://127.0.0.1:{mcp_internal_port}",
+            "--port",
+            "8111",
+            "--host",
+            "0.0.0.0",
+            "--allowed-hosts",
+            "*",
+        ]
+        logger.info("Starting Playwright MCP: %s", " ".join(mcp_cmd))
+        mcp_log = open("/tmp/mcp-stdout.log", "w")
+        mcp_process = subprocess.Popen(
+            mcp_cmd,
+            stdout=mcp_log,
+            stderr=mcp_log,
+            start_new_session=True,
+        )
+        await asyncio.sleep(3)
+        if mcp_process.poll() is not None:
+            mcp_log.close()
+            try:
+                with open("/tmp/mcp-stdout.log") as f:
+                    stderr_output = f.read()
+            except Exception:
+                stderr_output = "(no log)"
+            logger.error(
+                "Playwright MCP failed to start (exit %d): %s",
+                mcp_process.returncode,
+                stderr_output[:500],
+            )
+            mcp_process = None
+            return False
+        else:
+            logger.info(
+                "Playwright MCP started (PID %d) on 0.0.0.0:8111 -> CDP 127.0.0.1:%s",
+                mcp_process.pid,
+                mcp_internal_port,
+            )
+            return True
+    except Exception as e:
+        logger.error("Failed to start Playwright MCP: %s", e)
+        mcp_process = None
+        return False
 
 
 async def _periodic_cleanup():
@@ -90,11 +161,30 @@ async def _periodic_cdp_liveness():
                                 None, browser_pool.restart_chrome, label
                             )
                             logger.info("CDP auto-restart %s result: %s", label, res)
+                            # For MCP Chrome, also restart the Playwright MCP process
+                            # so it gets a fresh CDP WebSocket to the new Chrome instance.
+                            if label == "mcp" and not res.get("errors"):
+                                await asyncio.sleep(2)
+                                mcp_ok = await _start_mcp_process()
+                                if not mcp_ok:
+                                    logger.error("MCP process failed to restart after Chrome restart")
+                                    res.setdefault("errors", []).append("mcp_restart_failed")
                             # reset counter on successful restart (errors list empty)
                             if not res.get("errors"):
                                 failures[key] = 0
                         except Exception:
                             logger.exception("CDP auto-restart %s raised", label)
+
+            # Also check MCP process liveness independent of CDP.
+            # MCP node process can crash even when Chrome CDP is fine.
+            if mcp_process is not None and mcp_process.poll() is not None:
+                logger.error(
+                    "CDP liveness: MCP process (PID %d) exited with code %d, restarting...",
+                    mcp_process.pid, mcp_process.returncode,
+                )
+                await asyncio.sleep(1)
+                await _start_mcp_process()
+
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -283,51 +373,7 @@ async def lifespan(app: FastAPI):
         s = await _start_cdp_proxy(CDP_FORWARD_SCRAPER, SCRAPER_CDP_PORT, "Scraper")
         proxy_servers.append(s)
 
-    mcp_process = None
-    try:
-        mcp_internal_port = os.environ.get("MCP_CDP_PORT", "19222")
-        mcp_cmd = [
-            "npx",
-            "@playwright/mcp",
-            "--cdp-endpoint",
-            f"http://127.0.0.1:{mcp_internal_port}",
-            "--port",
-            "8111",
-            "--host",
-            "0.0.0.0",
-            "--allowed-hosts",
-            "*",
-        ]
-        logger.info("Starting Playwright MCP: %s", " ".join(mcp_cmd))
-        mcp_log = open("/tmp/mcp-stdout.log", "w")
-        mcp_process = subprocess.Popen(
-            mcp_cmd,
-            stdout=mcp_log,
-            stderr=mcp_log,
-        )
-        await asyncio.sleep(3)
-        if mcp_process.poll() is not None:
-            mcp_log.close()
-            try:
-                with open("/tmp/mcp-stdout.log") as f:
-                    stderr_output = f.read()
-            except Exception:
-                stderr_output = "(no log)"
-            logger.error(
-                "Playwright MCP failed to start (exit %d): %s",
-                mcp_process.returncode,
-                stderr_output[:500],
-            )
-            mcp_process = None
-        else:
-            logger.info(
-                "Playwright MCP started (PID %d) on 0.0.0.0:8111 -> CDP 127.0.0.1:%s",
-                mcp_process.pid,
-                mcp_internal_port,
-            )
-    except Exception as e:
-        logger.error("Failed to start Playwright MCP: %s", e)
-        mcp_process = None
+    await _start_mcp_process()
 
     cleanup_task = asyncio.create_task(_periodic_cleanup())
     liveness_task = asyncio.create_task(_periodic_cdp_liveness())
@@ -339,11 +385,17 @@ async def lifespan(app: FastAPI):
 
     if mcp_process and mcp_process.poll() is None:
         logger.info("Stopping Playwright MCP (PID %d)...", mcp_process.pid)
-        mcp_process.terminate()
+        try:
+            os.killpg(os.getpgid(mcp_process.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            mcp_process.terminate()
         try:
             mcp_process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            mcp_process.kill()
+            try:
+                os.killpg(os.getpgid(mcp_process.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                mcp_process.kill()
     for s in proxy_servers:
         s.close()
     logger.info("Shutting down browser-service...")
@@ -367,14 +419,19 @@ async def health():
     config = get_proxy_config()
     dc_available = bool(config.build_proxy_url("datacenter"))
     res_available = bool(config.build_proxy_url("residential"))
-    # Healthy requires ready + at least one CDP endpoint responding.
+    # Check MCP process is alive (not just Chrome CDP port).
+    mcp_pid = mcp_process.pid if mcp_process and mcp_process.poll() is None else None
+    mcp_process_alive = mcp_pid is not None
+    # Healthy requires ready + at least one CDP endpoint responding + MCP alive.
     cdp_ok = liveness.get("mcp_cdp_alive") or liveness.get("scraper_cdp_alive")
-    status = "ok" if (h["ready"] and cdp_ok) else "degraded"
+    status = "ok" if (h["ready"] and cdp_ok and mcp_process_alive) else "degraded"
     return JSONResponse(
         {
             "status": status,
             **h,
             **liveness,
+            "mcp_pid": mcp_pid,
+            "mcp_process_alive": mcp_process_alive,
             "proxy_datacenter": "available" if dc_available else "not configured",
             "proxy_residential": "available" if res_available else "not configured",
             "uptime_seconds": time.monotonic(),
@@ -397,6 +454,11 @@ async def restart_cdp(request: RestartCdpRequest):
     result = await loop.run_in_executor(
         None, browser_pool.restart_chrome, request.label
     )
+    if request.label in ("mcp", "all") and not result.get("errors"):
+        await asyncio.sleep(2)
+        mcp_ok = await _start_mcp_process()
+        if not mcp_ok:
+            result.setdefault("errors", []).append("mcp_restart_failed")
     status_code = 200 if not result.get("errors") else 500
     return JSONResponse(result, status_code=status_code)
 

@@ -994,17 +994,17 @@ def run_agent_task(self, playground_id: int) -> None:
 
 
 AGENT_MAX_ITERATIONS_LOOKUP: dict[str, int] = {
-        "site_analyzer": 10,
-    "product_analyzer": 30,
-    "navigation_agent": 40,
-    "navigation_explore": 20,
-    "navigation_synthesize": 15,
-    "nav_skill_review": 25,
-    "scraper_analyzer": 10,
-    "code_writer": 20,
-    "code_tester": 20,
-    "cleanup": 10,
-    "skill_learner": 15,
+        "site_analyzer": 25,
+    "product_analyzer": 50,
+    "navigation_agent": 50,
+    "navigation_explore": 30,
+    "navigation_synthesize": 25,
+    "nav_skill_review": 30,
+    "scraper_analyzer": 25,
+    "code_writer": 30,
+    "code_tester": 30,
+    "cleanup": 20,
+    "skill_learner": 20,
 }
 
 

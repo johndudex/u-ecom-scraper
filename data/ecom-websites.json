@@ -95,32 +95,6 @@
       "product_count": 1
     },
     {
-      "url": "https://www.calvinklein.co.uk",
-      "name": "Calvin Klein UK",
-      "status": "complete",
-      "site_folder": "scrapers/calvinklein-co-uk",
-      "fields": [
-        "title",
-        "price",
-        "original_price",
-        "currency",
-        "url",
-        "src_url",
-        "status_code",
-        "scraped_at",
-        "description",
-        "sku",
-        "brand",
-        "images",
-        "category",
-        "availability"
-      ],
-      "platform": "sfcc",
-      "scraping_method": "seleniumbase_uc",
-      "scraper_end": "2026-06-28T00:30:00.000000+00:00",
-      "product_count": 92
-    },
-    {
       "url": "https://alibaba.com",
       "name": "Alibaba.com",
       "status": "complete",

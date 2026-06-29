@@ -69,6 +69,8 @@ The `input_urls.json` format:
 
 **CRITICAL for navigation/list_page mode:** If the scraper uses a two-phase architecture (Phase 1: discover product URLs from category/search pages, Phase 2: extract data from product pages), then `input_urls.json` should contain **CATEGORY or SEARCH URLs** as seeds for Phase 1. Do NOT put product URLs in `input_urls.json` for navigation scrapers — the scraper discovers products at runtime.
 
+**Working search URL priority:** When the navigation analysis provides a `working_url` or `listing_url_used` in the search section, this is the **actual URL** that navigate_explore found products on. Use it as the `SEARCH_URL_BASE` or Phase 1 starting URL. Do NOT construct search URLs from the homepage form's `url_pattern` or `search_url_pattern` — those patterns are derived from the form's `action` attribute and are often wrong because JavaScript search handlers route to different URLs than the form action suggests.
+
 If the scraper does NOT have Phase 1 discovery (single-phase, url_list mode), then `input_urls.json` MUST contain actual **product page URLs**. Category URLs will produce empty results because category pages don't have Product JSON-LD.
 
 ## Output Format

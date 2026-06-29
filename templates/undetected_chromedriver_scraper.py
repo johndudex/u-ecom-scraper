@@ -29,7 +29,9 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import time
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -39,6 +41,8 @@ from seleniumbase import SB
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.environ.get("PROJECT_ROOT", os.path.join(SCRIPT_DIR, ".."))
 sys.path.insert(0, PROJECT_ROOT)
+
+from src.proxy import ProxyConfig
 
 SITE_NAME = "{SITE_NAME}"
 SITE_URL = "{SITE_URL}"
@@ -253,8 +257,94 @@ SESSION_KWARGS = {
 }
 
 
-def _make_sb_kwargs(extra: dict | None = None) -> dict[str, Any]:
+def _make_proxy_auth_extension(
+    proxy_host: str, proxy_port: str, proxy_user: str, proxy_pass: str
+) -> str:
+    """Create a Chrome extension ZIP for proxy authentication.
+
+    SeleniumBase UC Mode cannot pass proxy credentials directly to Chrome.
+    They must be handled via a Chrome extension loaded with the
+    ``extension_zip`` SB() kwarg.
+    """
+    manifest_json = """
+{
+    "version": "1.0.0",
+    "manifest_version": 2,
+    "name": "Proxy Auth",
+    "permissions": [
+        "proxy",
+        "tabs",
+        "unlimitedStorage",
+        "storage",
+        "<all_urls>",
+        "webRequest",
+        "webRequestBlocking"
+    ],
+    "background": {
+        "scripts": ["background.js"]
+    }
+}
+"""
+    background_js = """
+var config = {
+    mode: "fixed_servers",
+    rules: {
+        singleProxy: {
+            scheme: "http",
+            host: "%s",
+            port: parseInt(%s)
+        },
+        bypassList: ["localhost"]
+    }
+};
+chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
+function callbackFn(details) {
+    return {
+        authCredentials: {
+            username: "%s",
+            password: "%s"
+        }
+    };
+}
+chrome.webRequest.onAuthRequired.addListener(
+    callbackFn,
+    {urls: ["<all_urls>"]},
+    ['blocking']
+);
+""" % (proxy_host, proxy_port, proxy_user, proxy_pass)
+
+    tmp_dir = tempfile.mkdtemp(prefix="proxy_ext_")
+    ext_path = os.path.join(tmp_dir, "proxy_auth_extension.zip")
+    with zipfile.ZipFile(ext_path, "w") as zf:
+        zf.writestr("manifest.json", manifest_json)
+        zf.writestr("background.js", background_js)
+    return ext_path
+
+
+def _make_sb_kwargs(extra: dict | None = None, no_proxy: bool = False) -> dict[str, Any]:
     kwargs = dict(SESSION_KWARGS)
+
+    if not no_proxy:
+        _proxy_config = ProxyConfig()
+        tier = _proxy_config.config.get("residential") or {}
+        proxy_host = tier.get("host", "")
+        proxy_port = tier.get("port", "")
+        proxy_user = tier.get("username", "")
+        proxy_pass = tier.get("password", "")
+
+        if proxy_host and proxy_user:
+            kwargs["proxy"] = f"{proxy_host}:{proxy_port}"
+            kwargs["chromium_arg"] = [
+                f"--proxy-server=http://{proxy_host}:{proxy_port}",
+                "--disable-blink-Features=AutomationControlled",
+            ]
+            ext_path = _make_proxy_auth_extension(
+                proxy_host, str(proxy_port), proxy_user, proxy_pass
+            )
+            if ext_path:
+                kwargs["extension_zip"] = ext_path
+            logger.info(f"Proxy configured: {proxy_host}:{proxy_port}")
+
     if extra:
         kwargs.update(extra)
     return kwargs
@@ -298,10 +388,10 @@ def warmup_session(driver) -> bool:
     return True
 
 
-def scrape_product_per_session(url: str, src_url: str, index: int) -> dict[str, Any]:
+def scrape_product_per_session(url: str, src_url: str, index: int, no_proxy: bool = False) -> dict[str, Any]:
     """Create a fresh SB() session for each product page to avoid session-level anti-bot detection."""
     try:
-        with SB(**_make_sb_kwargs()) as sb:
+        with SB(**_make_sb_kwargs(no_proxy=no_proxy)) as sb:
             driver = sb.driver
             if not open_page(driver, url):
                 return {
@@ -422,14 +512,13 @@ def main():
     failed = 0
 
     extra = {}
-    if args.no_proxy:
-        extra["proxy"] = None
     if args.xvfb:
         extra["xvfb"] = True
+    no_proxy = getattr(args, "no_proxy", False)
 
     if not product_urls and args.category_url:
         logger.info(f"No input URLs provided, discovering from category: {args.category_url}")
-        with SB(**_make_sb_kwargs(extra)) as sb:
+        with SB(**_make_sb_kwargs(extra, no_proxy=no_proxy)) as sb:
             driver = sb.driver
             try:
                 if not warmup_session(driver):
@@ -454,7 +543,7 @@ def main():
 
     for i, url in enumerate(product_urls):
         try:
-            product = scrape_product_per_session(url, SRC_URL, i + 1)
+            product = scrape_product_per_session(url, SRC_URL, i + 1, no_proxy=no_proxy)
             if product.get("title"):
                 results.append(product)
                 logger.info(

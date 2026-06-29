@@ -60,6 +60,22 @@ def _sync_input_urls_file(instance):
         pass
 
 
+class ContentType(models.Model):
+    value = models.CharField(max_length=50, unique=True)
+    label = models.CharField(max_length=100)
+    group = models.CharField(max_length=50)
+    enabled = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=0)
+
+    class Meta:
+        ordering = ["sort_order", "group", "value"]
+        verbose_name = "Content Type"
+        verbose_name_plural = "Content Types"
+
+    def __str__(self):
+        return f"{self.group} > {self.label}"
+
+
 class ScrapeJob(models.Model):
     STATUS_PENDING = "pending"
     STATUS_RUNNING = "running"

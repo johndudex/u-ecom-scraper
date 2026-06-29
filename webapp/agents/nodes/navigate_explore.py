@@ -391,6 +391,9 @@ _LISTING_PAGE_EXTRACTION_JS = r"""
     '[class*="book-card"]',
     '[class*="BookCard"]',
     '[class*="BookTile"]',
+    // React data-testid patterns (PVH/CK, Next.js commerce)
+    '[data-testid*="GridItem"]',
+    '[data-testid*="product" i]',
     // NOTE: [data-productid] is intentionally last — on SFCC sites it matches
     // the TurnTo rating widget (.TTteaser), not the product card itself.
     "[data-productid]",
@@ -405,12 +408,15 @@ _LISTING_PAGE_EXTRACTION_JS = r"""
         cards.forEach((card, i) => {
           if (i >= 200) return;
         const link = card.querySelector('a[href]');
-        if (!link) return;
-        const href = link.href;
+        const isSelfLink = card.tagName === 'A' && card.href && !link;
+        const targetLink = isSelfLink ? card : link;
+        if (!targetLink) return;
+        const href = targetLink.href;
         if (!href || seen.has(href) || href.startsWith('#')) return;
         seen.add(href);
-        const text = (link.getAttribute('data-productname') ||
-                     link.getAttribute('title') ||
+        const text = (targetLink.getAttribute('data-productname') ||
+                     targetLink.getAttribute('title') ||
+                     targetLink.getAttribute('aria-label') ||
                      cleanText(card) || '').trim().substring(0, 120);
         // Extract data attributes for richer info
         const cardData = { href, text };
@@ -425,7 +431,7 @@ _LISTING_PAGE_EXTRACTION_JS = r"""
           "data-productcategoryid",
         ];
         for (const attr of dataAttrs) {
-          const val = link.getAttribute(attr) || card.getAttribute(attr);
+          const val = targetLink.getAttribute(attr) || card.getAttribute(attr);
           if (val) cardData[attr.replace("data-", "").replace(/-/g, "_")] = val;
         }
         // Also try the wishlist button inside the card (adameve pattern)
@@ -856,12 +862,12 @@ def _persist_explore_summary(job_id: int, findings: dict) -> None:
     try:
         from scraper.models import SessionLog
 
-        cats = findings.get("homepage_nav", {}).get("category_links", [])
-        prods = findings.get("listing_page", {}).get("product_links", [])
-        errors = findings.get("errors", [])
-        search_form = findings.get("homepage_nav", {}).get("search_form")
-        url_patterns = findings.get("url_patterns", {})
-        pagination = findings.get("listing_page", {}).get("pagination", {})
+        cats = (findings.get("homepage_nav") or {}).get("category_links", [])
+        prods = (findings.get("listing_page") or {}).get("product_links", [])
+        errors = findings.get("errors") or []
+        search_form = (findings.get("homepage_nav") or {}).get("search_form")
+        url_patterns = findings.get("url_patterns") or {}
+        pagination = (findings.get("listing_page") or {}).get("pagination") or {}
 
         method = findings.get("method", "unknown")
         summary = (
@@ -1266,6 +1272,10 @@ _PRODUCT_PRESENCE_SELECTORS = [
     'a[href*="/p/"]',
     'button[class*="add-to-cart" i]',
     'button[class*="addToCart" i]',
+    '[data-testid*="GridItem"]',
+    '[data-testid*="product" i]',
+    '[data-testid*="PriceDisplay"]',
+    '[data-testid*="PriceText"]',
 ]
 
 
@@ -1377,14 +1387,14 @@ def _visit_and_extract(
 
     # Wait for content to render (handles CSR sites like Next.js, React, Vue)
     content_status = _wait_for_content(evaluate, timeout=25)
+    content_loaded = content_status.get("loaded", False)
     if content_status.get("cloudflare"):
         findings["errors"].append("Cloudflare challenge blocked content extraction")
-        # Still try extraction — sometimes the challenge auto-resolves
-    elif not content_status.get("loaded"):
-        # Content not detected via selectors — try anyway after a brief wait
+    elif not content_loaded:
+        # Content not detected via selectors — give slow SPAs a bit more time
         import time
 
-        time.sleep(5)
+        time.sleep(10)
 
     listing_data_raw = _invoke_tool(
         evaluate,
@@ -1394,8 +1404,30 @@ def _visit_and_extract(
     if not listing_data:
         findings["errors"].append(f"Failed to parse listing extraction for {page_url}")
 
+    # If content wait timed out, extracted products are unreliable — likely
+    # stale DOM from a previous page. Discard them to prevent poisoning
+    # downstream steps (e.g. skipping step 3c due to phantom product count).
+    if not content_loaded:
+        stale_count = len(listing_data.get("product_links", []))
+        if stale_count > 0:
+            logger.warning(
+                "navigate_explore: content wait timed out, discarding %d stale product links from %s",
+                stale_count, page_url[:100],
+            )
+            listing_data["product_links"] = []
+            listing_data["total_products"] = None
+
     findings["listing_page"].update(listing_data)
     product_count = len(listing_data.get("product_links", []))
+
+    if product_count > 0:
+        actual_url_raw = _invoke_tool(
+            evaluate, function="() => window.location.href"
+        )
+        url_match = re.search(r'"(https?://[^"]+)"', actual_url_raw or "")
+        if url_match:
+            findings["listing_page"]["url"] = url_match.group(1)
+
     logger.info(
         "navigate_explore: extracted %d product links from %s",
         product_count,
@@ -1430,15 +1462,23 @@ def _try_form_search(
             input.value = '{escaped}';
             input.dispatchEvent(new Event('input', {{bubbles: true}}));
             input.dispatchEvent(new Event('change', {{bubbles: true}}));
-            const form = input.closest('form');
-            if (form) {{
-                form.submit();
-                return 'submitted';
-            }}
-            // Try pressing Enter
+            // Strategy 1: Enter keypress — triggers keydown handlers on the input
+            // (many sites like AdamEve use this to build search URLs via JS)
             input.dispatchEvent(new KeyboardEvent('keydown', {{
                 key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
             }}));
+            const form = input.closest('form');
+            if (form) {{
+                // Strategy 2: requestSubmit fires the submit event allowing JS
+                // // onsubmit handlers to run (unlike form.submit() which bypasses them).
+                // Falls back to form.submit() for older browsers.
+                if (typeof form.requestSubmit === 'function') {{
+                    form.requestSubmit();
+                }} else {{
+                    form.submit();
+                }}
+                return 'submitted';
+            }}
             return 'enter_pressed';
         }}
         return 'input not found';
@@ -1451,8 +1491,9 @@ def _try_form_search(
     import time
 
     content_status = _wait_for_content(evaluate, timeout=25)
-    if not content_status.get("loaded"):
-        time.sleep(5)
+    content_loaded = content_status.get("loaded", False)
+    if not content_loaded:
+        time.sleep(10)
 
     listing_data_raw = _invoke_tool(
         evaluate,
@@ -1460,7 +1501,61 @@ def _try_form_search(
     )
     listing_data = _parse_eval_json(listing_data_raw)
 
+    # If content wait timed out, discard stale products
+    if not content_loaded:
+        stale_count = len(listing_data.get("product_links", []))
+        if stale_count > 0:
+            logger.warning(
+                "navigate_explore: form search content wait timed out, discarding %d stale product links",
+                stale_count,
+            )
+            listing_data["product_links"] = []
+            listing_data["total_products"] = None
+
     findings["listing_page"].update(listing_data)
+
+    prod_count = len(findings.get("listing_page", {}).get("product_links", []))
+    logger.info(
+        "navigate_explore: _try_form_search extracted %d product_links",
+        prod_count,
+    )
+    if prod_count > 0:
+        actual_url_raw = _invoke_tool(
+            evaluate, function="() => window.location.href"
+        )
+        url_match = re.search(r'"(https?://[^"]+)"', actual_url_raw or "")
+        if url_match:
+            actual_url = url_match.group(1)
+            findings["listing_page"]["url"] = actual_url
+            # Validate the landing URL looks like a search/category results page.
+            # If form.submit() redirected to a promo/landing page (e.g. AdamEve),
+            # the products are from the wrong page — discard them.
+            url_lower = actual_url.lower()
+            search_lower = search_criteria.lower()
+            is_search_like = (
+                search_lower in url_lower
+                or "/search?" in url_lower
+                or "/search/" in url_lower
+                or re.search(r'-ch-\d+', url_lower)
+            )
+            is_promo = any(
+                kw in url_lower
+                for kw in ["promo", "landing", "clearance-sale", "/sale"]
+            )
+            if is_promo and not is_search_like:
+                discarded = len(findings["listing_page"].get("product_links", []))
+                findings["listing_page"]["product_links"] = []
+                findings["listing_page"]["total_products"] = None
+                logger.warning(
+                    "navigate_explore: form submit landed on promo page (%s), "
+                    "discarding %d products",
+                    actual_url[:100], discarded,
+                )
+            else:
+                logger.info(
+                    "navigate_explore: form search resolved to %s",
+                    actual_url,
+                )
 
 
 _PROMO_URL_KEYWORDS = [
@@ -1797,7 +1892,7 @@ def _do_explore_via_browser(
         )
         if not search_urls:
             logger.info("navigate_explore: no search URLs could be built")
-        for idx, surl in enumerate(search_urls[:6]):
+        for idx, surl in enumerate(search_urls[:10]):
             logger.info(
                 "navigate_explore: trying search URL %d/%d: %s",
                 idx + 1,
@@ -1823,7 +1918,10 @@ def _do_explore_via_browser(
 
     # 3c: Try clicking a search trigger button first, then form search
     # Always attempt if 3a+3b failed — hidden inputs (e.g. CK UK) cause silent 3a failure
-    if search_criteria and not found_products:
+    # Also attempt when URL search found very few products (<10) — the trigger-based
+    # form search often yields many more results (e.g. CK UK: URL=5, form=48+93)
+    current_count = len(findings.get("listing_page", {}).get("product_links", []))
+    if search_criteria and (not found_products or current_count < 10):
         # Navigate back to homepage for search trigger/form access
         logger.info("navigate_explore: STEP 3c — navigating to homepage for search access")
         homepage_url = effective_base_url if effective_base_url else base_url
@@ -2213,7 +2311,11 @@ def _extract_product_links_bs(soup, base_url: str) -> list[dict]:
         cards = soup.select(sel)
         if len(cards) >= 3:
             for card in cards[:200]:
-                link = card.find("a", href=True) if isinstance(card, Tag) else None
+                if not isinstance(card, Tag):
+                    continue
+                link = card.find("a", href=True)
+                if not link and card.name == "a" and card.get("href"):
+                    link = card
                 if not link:
                     continue
                 href = urljoin(base_url, link["href"])
@@ -2223,6 +2325,7 @@ def _extract_product_links_bs(soup, base_url: str) -> list[dict]:
                 text = (
                     link.get("data-productname", "")
                     or link.get("title", "")
+                    or link.get("aria-label", "")
                     or card.get_text(strip=True)[:120]
                     or link.get_text(strip=True)[:120]
                 )
@@ -2632,7 +2735,7 @@ def _do_explore_via_http(
 
     if search_criteria and search_urls:
         findings["search_attempted"] = True
-        for search_url in search_urls[:5]:
+        for search_url in search_urls[:10]:
             logger.info(
                 "navigate_explore: STEP 3 (html) — trying search %s",
                 search_url[:120],
@@ -2952,55 +3055,68 @@ def navigate_explore(state: dict, config=None) -> dict[str, Any]:
                 logger.warning("navigate_explore: browser retry failed: %s", exc)
 
     # ── PHASE 2: probe_html fallback for search page when Playwright finds
-    #    categories but 0 products (Cloudflare blocks JS rendering).  We keep
-    #    the browser homepage_nav but replace listing_page with UC Chrome data.
+    #    categories but 0 real products (Cloudflare/Akamai blocks JS rendering).
+    #    We keep the browser homepage_nav but replace listing_page with UC Chrome data.
     browser_cats = len(findings.get("homepage_nav", {}).get("category_links", []))
     browser_prods = len(findings.get("listing_page", {}).get("product_links", []))
-    if search_criteria and browser_cats > 0 and browser_prods == 0:
+    has_real_prods = _has_real_product_links(findings)
+    if search_criteria and browser_cats > 0 and not has_real_prods:
         if _needs_uc_chrome(site_analysis):
             logger.info(
-                "navigate_explore: Playwright found %d categories but 0 search products "
+                "navigate_explore: Playwright found %d categories but %d real products "
                 "on UC Chrome site — fetching search page via probe_html",
                 browser_cats,
+                len([p for p in findings.get("listing_page", {}).get("product_links", [])
+                     if not any(kw in (p.get("href", "") or "").lower()
+                                for kw in _PROMO_URL_KEYWORDS)]),
             )
-            search_url = _build_search_url(
+            search_urls = _build_search_urls(
                 findings.get("homepage_nav", {}).get("search_form"),
                 search_criteria,
                 effective_url,
                 findings.get("homepage_nav", {}),
             )
-            if search_url:
-                html = _fetch_via_probe_html(search_url)
-                if html and "RENDER FAILED" not in html:
-                    try:
-                        from bs4 import BeautifulSoup
+            for surl in search_urls[:10]:
+                html = _fetch_via_probe_html(surl)
+                if not html or "RENDER FAILED" in html:
+                    continue
+                if "oops!" in html[:5000].lower():
+                    continue
+                try:
+                    from bs4 import BeautifulSoup
 
-                        search_soup = BeautifulSoup(html[:500000], "html.parser")
-                        product_links = _extract_product_links_bs(
-                            search_soup, effective_url
+                    search_soup = BeautifulSoup(html[:500000], "html.parser")
+                    product_links = _extract_product_links_bs(
+                        search_soup, effective_url
+                    )
+                    json_ld = _extract_json_ld(search_soup, effective_url)
+                    existing = set(p.get("href", "") for p in product_links)
+                    if json_ld.get("products"):
+                        for p in json_ld["products"]:
+                            if p.get("href") and p["href"] not in existing:
+                                product_links.append(p)
+                                existing.add(p["href"])
+                    real_prods = [p for p in product_links
+                                  if not any(kw in (p.get("href", "") or "").lower()
+                                                     for kw in _PROMO_URL_KEYWORDS)]
+                    if real_prods:
+                        listing = findings.setdefault("listing_page", {})
+                        listing["product_links"] = product_links
+                        listing["url"] = surl
+                        listing["json_ld"] = json_ld
+                        browser_prods = len(real_prods)
+                        logger.info(
+                            "navigate_explore: probe_html found %d real product links "
+                            "at %s, merged into browser findings",
+                            browser_prods,
+                            surl[:100],
                         )
-                        json_ld = _extract_json_ld(search_soup, effective_url)
-                        existing = set(p.get("href", "") for p in product_links)
-                        if json_ld.get("products"):
-                            for p in json_ld["products"]:
-                                if p.get("href") and p["href"] not in existing:
-                                    product_links.append(p)
-                                    existing.add(p["href"])
-                        if product_links:
-                            listing = findings.setdefault("listing_page", {})
-                            listing["product_links"] = product_links
-                            listing["url"] = search_url
-                            listing["json_ld"] = json_ld
-                            browser_prods = len(product_links)
-                            logger.info(
-                                "navigate_explore: probe_html found %d product links "
-                                "on search page, merged into browser findings",
-                                browser_prods,
-                            )
-                    except Exception as exc:
-                        logger.warning(
-                            "navigate_explore: probe_html search parse failed: %s", exc
-                        )
+                        break
+                except Exception as exc:
+                    logger.warning(
+                        "navigate_explore: probe_html search parse failed for %s: %s",
+                        surl[:100], exc
+                    )
 
     # ── PHASE 3: Fall back to probe_html or HTTP if entirely empty ───
     if not findings or not findings.get("homepage_nav", {}).get("category_links"):

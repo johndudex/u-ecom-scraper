@@ -680,7 +680,6 @@ def _invoke_site_analyzer(
         _log_agent_context(state, "site-analyzer", messages)
         agent = create_site_analyzer(site_slug=slug)
         agent_cfg = _agent_config(config, "site_analyzer")
-        agent_cfg["recursion_limit"] = recursion_limit
         hb = _start_heartbeat(job_id, "site-analyzer")
         result = agent.invoke({"messages": messages}, config=agent_cfg)
         _stop_heartbeat(hb)
@@ -739,7 +738,6 @@ def _invoke_site_analyzer(
             original_content = build_site_analyzer_message(state)[0].content
             retry_messages = [HumanMessage(content=augmented + original_content)]
             agent_cfg2 = _agent_config(config, "site_analyzer")
-            agent_cfg2["recursion_limit"] = extended_limit
             result = agent.invoke({"messages": retry_messages}, config=agent_cfg2)
             _persist_agent_logs(state, result, "site-analyzer", config)
             _notify_phase(job_id, "site_analyzer", "done")
@@ -883,7 +881,6 @@ def _invoke_product_analyzer(
         _log_agent_context(state, "product-analyzer", messages)
         agent = create_product_analyzer(site_slug=slug)
         agent_cfg = _agent_config(config, "product_analyzer")
-        agent_cfg["recursion_limit"] = recursion_limit
         hb = _start_heartbeat(job_id, "product-analyzer")
         result = agent.invoke({"messages": messages}, config=agent_cfg)
         _stop_heartbeat(hb)
@@ -936,7 +933,6 @@ def _invoke_product_analyzer(
             original_content = build_product_analyzer_message(state)[0].content
             retry_messages = [HumanMessage(content=augmented + original_content)]
             agent_cfg2 = _agent_config(config, "product_analyzer")
-            agent_cfg2["recursion_limit"] = extended_limit
             result = agent.invoke({"messages": retry_messages}, config=agent_cfg2)
             _persist_agent_logs(state, result, "product-analyzer", config)
             _notify_phase(job_id, "product_analyzer", "done")
@@ -1087,7 +1083,6 @@ def _invoke_navigation_agent(
         _log_agent_context(state, "navigation-agent", messages)
         agent = create_navigation_agent(site_slug=slug)
         agent_cfg = _agent_config(config, "navigation_agent")
-        agent_cfg["recursion_limit"] = recursion_limit
         hb = _start_heartbeat(job_id, "navigation-agent")
         result = agent.invoke({"messages": messages}, config=agent_cfg)
         _stop_heartbeat(hb)
@@ -1137,7 +1132,6 @@ def _invoke_navigation_agent(
             original_content = build_navigation_agent_message(state)[0].content
             retry_messages = [HumanMessage(content=augmented + original_content)]
             agent_cfg2 = _agent_config(config, "navigation_agent")
-            agent_cfg2["recursion_limit"] = extended_limit
             result = agent.invoke({"messages": retry_messages}, config=agent_cfg2)
             _persist_agent_logs(state, result, "navigation-agent", config)
             _notify_phase(job_id, "navigation_agent", "done")
@@ -1806,6 +1800,7 @@ def route_from_human_approval(state: ScrapeState) -> str:
         "field_confirmation": "run_execution",
         "testing_exhausted": "field_confirmation",
         "playwright_unavailable": "navigation_synthesize",
+        "review": "run_execution",
     }
 
     if reason == "testing_exhausted":
