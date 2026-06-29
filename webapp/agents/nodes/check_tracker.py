@@ -110,6 +110,22 @@ def check_tracker(state: ScrapeState) -> Command:
     if site.status == "failed":
         return _handle_failed(site, slug)
     if site.status == "in_progress":
+        if rescrape:
+            logger.info(
+                "check_tracker: rescrape=True for in_progress site '%s', starting fresh",
+                slug,
+            )
+            _clean_workspace(root, slug)
+            return Command(
+                update={
+                    "site_status": "in_progress",
+                    "current_phase": "check_tracker",
+                    "skip_site_analysis": False,
+                    "skip_product_analysis": False,
+                    "skip_code_generation": False,
+                },
+                goto="setup_workspace",
+            )
         return _handle_in_progress(site, slug, root, input_mode)
 
     logger.warning("check_tracker: unknown status '%s' for %s, treating as new", site.status, url)

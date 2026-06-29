@@ -442,7 +442,7 @@ def job_restart(request, job_id):
 
         from .tasks import run_scrape_task
 
-        task = run_scrape_task.delay(new_job.id)
+        task = run_scrape_task.delay(new_job.id, rescrape=True)
         new_job.celery_task_id = task.id
         new_job.save(update_fields=["celery_task_id"])
         return redirect("job_detail", job_id=new_job.id)
