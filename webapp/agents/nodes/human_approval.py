@@ -46,13 +46,23 @@ def human_approval(state: ScrapeState) -> dict:
                 "The scraper may produce incomplete or incorrect data.\n\n"
                 "Choose:\n"
                 "- **Continue anyway**: proceed to field confirmation\n"
-                "- **Provide feedback**: describe what's wrong so the code-writer can fix it\n"
+                "- **Provide feedback for final retry**: describe what's wrong so the "
+                "code-writer can re-code and run one final test. If that also fails, "
+                "the job will end.\n"
                 "- **Cancel**: abort the job"
             )
-            options = ["Continue anyway", "Provide feedback", "Cancel"]
+            options = [
+                "Continue anyway",
+                "Provide feedback for final retry",
+                "Cancel",
+            ]
             decisions = [
                 {"type": "approve", "label": "Continue anyway"},
-                {"type": "approve", "label": "Provide feedback", "allow_feedback": True},
+                {
+                    "type": "approve",
+                    "label": "Provide feedback for final retry",
+                    "allow_feedback": True,
+                },
                 {"type": "reject", "label": "Cancel", "allow_feedback": False},
             ]
             logger.info(

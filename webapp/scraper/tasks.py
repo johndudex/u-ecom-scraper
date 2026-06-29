@@ -97,6 +97,19 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False) -> None:
         job.save(update_fields=["status", "error_message", "completed_at"])
         _publish_job_status(job_id, ScrapeJob.STATUS_FAILED)
 
+        try:
+            from scraper.models import Site
+
+            db_site = Site.objects.filter(url=job.url.rstrip("/")).first()
+            if db_site and db_site.status == "in_progress":
+                db_site.status = "failed"
+                db_site.save(update_fields=["status"])
+                logger.info(
+                    "Job %d: reset Site '%s' to failed", job_id, db_site.slug
+                )
+        except Exception:
+            pass
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Graph execution core

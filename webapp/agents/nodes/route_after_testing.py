@@ -22,6 +22,8 @@ SOFT_404_MARKERS = (
     "not a product page",
 )
 
+FINAL_RETRY_SENTINEL = 99
+
 
 def _is_dead_product(p: dict) -> bool:
     status = p.get("status_code", 200)
@@ -46,8 +48,14 @@ def _scraper_produced_valid_output(state: ScrapeState) -> bool:
 def route_after_testing(state: ScrapeState) -> str:
     report = state.get("test_report")
     retry_count = state.get("test_retry_count", 0)
+    is_final_attempt = retry_count == FINAL_RETRY_SENTINEL
 
     if not report:
+        if is_final_attempt:
+            logger.error(
+                "route_after_testing: FINAL attempt produced no test_report → cleanup"
+            )
+            return "cleanup"
         if retry_count < 2:
             logger.warning(
                 "route_after_testing: no test_report, retry %d/3 via scraper_analyzer",
@@ -69,6 +77,22 @@ def route_after_testing(state: ScrapeState) -> str:
         logger.info("route_after_testing: PASS (confidence=%.2f)", confidence)
         return "field_confirmation"
 
+    if is_final_attempt:
+        if confidence >= MIN_CONFIDENCE_PARTIAL and _scraper_produced_valid_output(state):
+            logger.warning(
+                "route_after_testing: FINAL attempt PARTIAL (confidence=%.2f) "
+                "→ field_confirmation",
+                confidence,
+            )
+            return "field_confirmation"
+        logger.error(
+            "route_after_testing: FINAL attempt FAILED (assessment=%s, confidence=%.2f) "
+            "→ cleanup",
+            assessment,
+            confidence,
+        )
+        return "cleanup"
+
     if retry_count < 2:
         if retry_count >= 1 and confidence >= 0.80:
             logger.warning(
@@ -87,9 +111,6 @@ def route_after_testing(state: ScrapeState) -> str:
         )
         return "scraper_analyzer"
 
-    # Retries exhausted — but if the scraper produced valid partial output,
-    # route to field_confirmation so the user can review and approve rather
-    # than discarding everything.
     if confidence >= MIN_CONFIDENCE_PARTIAL and _scraper_produced_valid_output(state):
         logger.warning(
             "route_after_testing: retries exhausted (count=%d, assessment=%s, confidence=%.2f) "

@@ -1173,9 +1173,13 @@ def _summarize_test_report(state: dict) -> str:
     confidence = report.get("confidence_score", 0.0)
     issues = report.get("issues", [])
     retry_count = state.get("test_retry_count", 0)
+    if retry_count == 99:
+        retry_label = "FINAL ATTEMPT"
+    else:
+        retry_label = f"Retry Cycle {retry_count + 1}"
 
     lines = [
-        f"### Previous Test Results (Retry Cycle {retry_count + 1})",
+        f"### Previous Test Results ({retry_label})",
         f"- **Assessment:** {assessment}",
         f"- **Confidence:** {confidence:.0%}",
     ]
@@ -1197,8 +1201,11 @@ def _summarize_test_report(state: dict) -> str:
             for i in medium[:3]:
                 field = i.get("field", i.get("description", "?"))
                 lines.append(f"  - `{field}`: {i.get('description', '')}")
-    if retry_count > 0:
+    if retry_count > 0 and retry_count != 99:
         lines.append(f"\n*{retry_count} previous attempt(s) failed.*")
+    elif retry_count == 99:
+        lines.append("\n*This is the FINAL retry attempt based on user feedback. "
+                      "If this does not pass, the job will end.*")
     return "\n".join(lines)
 
 
@@ -1686,7 +1693,14 @@ def build_code_tester_message(state: dict) -> list:
 
     retry_context = ""
     retry_count = state.get("test_retry_count", 0)
-    if retry_count > 0:
+    if retry_count == 99:
+        retry_context = (
+            f"\n### FINAL RETEST MODE (User-Initiated Final Retry)\n"
+            f"This is the FINAL test attempt based on user feedback. "
+            f"If the scraper does not pass this test, the job will end.\n"
+            f"Read the previous test report at: workspace/{slug}/test_report.json\n\n"
+        )
+    elif retry_count > 0:
         retry_context = (
             f"\n### RETEST MODE (Cycle {retry_count + 1})\n"
             f"The scraper was modified after previous test failures. "

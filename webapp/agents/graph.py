@@ -1421,12 +1421,19 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         logger.info("_invoke_code_writer: starting (job %s)", job_id)
         update = {}
         if state.get("test_report"):
-            update["test_retry_count"] = state.get("test_retry_count", 0) + 1
-            logger.info(
-                "_invoke_code_writer: retry cycle %d (job %s)",
-                update["test_retry_count"],
-                job_id,
-            )
+            current_count = state.get("test_retry_count", 0)
+            if current_count != 99:
+                update["test_retry_count"] = current_count + 1
+                logger.info(
+                    "_invoke_code_writer: retry cycle %d (job %s)",
+                    update["test_retry_count"],
+                    job_id,
+                )
+            else:
+                logger.info(
+                    "_invoke_code_writer: FINAL retry cycle (job %s)",
+                    job_id,
+                )
         messages = build_code_writer_message(state)
         _log_agent_context(state, "code-writer", messages)
         slug = state.get("site_slug", "")
@@ -1788,7 +1795,7 @@ def route_from_human_approval(state: ScrapeState) -> str:
 
     MAX_TOTAL_RESUMES = 5
     total_resumes = state.get("test_retry_count", 0)
-    if total_resumes >= MAX_TOTAL_RESUMES:
+    if total_resumes >= MAX_TOTAL_RESUMES and total_resumes != 99:
         logger.warning(
             "route_from_human_approval: hard cap reached (%d resumes) → cleanup",
             total_resumes,
@@ -1832,15 +1839,15 @@ def route_from_human_approval(state: ScrapeState) -> str:
             logger.info("route_from_human_approval: testing_exhausted -> cancelled")
             return "__end__"
         feedback = state.get("human_feedback", "")
-        if label == "Provide feedback" and feedback:
+        if label == "Provide feedback for final retry" and feedback:
             logger.info(
                 "route_from_human_approval: testing_exhausted -> scraper_analyzer "
-                "(user feedback: %s)",
+                "(FINAL retry with user feedback: %s)",
                 feedback[:200],
             )
             return Command(
                 update={
-                    "test_retry_count": 0,
+                    "test_retry_count": 99,
                     "human_feedback": feedback,
                 },
                 goto="scraper_analyzer",
