@@ -423,6 +423,10 @@ def job_output_download(request, job_id, filename):
         as_attachment=True,
         filename=safe_name,
     )
+
+
+@login_required
+def job_restart(request, job_id):
     job = get_object_or_404(ScrapeJob, pk=job_id)
     if job.status in [
         ScrapeJob.STATUS_COMPLETED,
