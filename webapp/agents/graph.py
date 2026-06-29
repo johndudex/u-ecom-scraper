@@ -403,6 +403,27 @@ def _get_project_root() -> str:
     return os.getcwd()
 
 
+def _archive_existing_scraper(slug: str) -> None:
+    """Archive the current scraper.py before cleanup overwrites it."""
+    if not slug:
+        return
+    try:
+        import shutil
+        from datetime import datetime, timezone as dt_timezone
+
+        root = _get_project_root()
+        scraper_path = os.path.join(root, "scrapers", slug, "scraper.py")
+        if not os.path.isfile(scraper_path):
+            return
+        ts = datetime.now(dt_timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+        archive_name = f"scraper-{slug}-{ts}.py"
+        archive_path = os.path.join(root, "scrapers", slug, archive_name)
+        shutil.copy2(scraper_path, archive_path)
+        logger.info("_archive_existing_scraper: archived → %s", archive_name)
+    except Exception as exc:
+        logger.warning("_archive_existing_scraper: failed: %s", exc)
+
+
 def _extract_previous_findings(
     result: dict, max_chars: int = MAX_RETRY_SUMMARY_CHARS
 ) -> str:
@@ -1487,9 +1508,12 @@ def _invoke_cleanup(state: ScrapeState, config: RunnableConfig) -> dict[str, Any
     set_tool_context(dict(state), agent_name="cleanup")
     try:
         logger.info("_invoke_cleanup: starting (job %s)", job_id)
+
+        slug = state.get("site_slug", "")
+        _archive_existing_scraper(slug)
+
         messages = build_cleanup_message(state)
         _log_agent_context(state, "cleanup", messages)
-        slug = state.get("site_slug", "")
         agent = create_cleanup_agent(site_slug=slug)
         result = agent.invoke(
             {"messages": messages}, config=_agent_config(config, "cleanup")

@@ -158,6 +158,27 @@
         </div>
         {% endif %}
 
+        {% if scraper_archives %}
+        <div class="panel overflow-hidden">
+            <div class="panel-header">
+                <h3 class="text-xs-label text-ink-secondary uppercase tracking-wider">Scraper Versions ({{ scraper_archives|length }})</h3>
+            </div>
+            <div class="max-h-64 overflow-y-auto scrollbar-thin">
+                {% for s in scraper_archives %}
+                <div class="flex items-center justify-between px-5 py-2.5 border-b border-line-subtle last:border-0 hover:bg-raised transition-colors group">
+                    <a href="{% url 'site_scraper_archive_view' site_id=site.id filename=s.name %}" class="text-xs text-accent hover:text-accent-hover font-mono truncate max-w-[200px] transition-colors">{{ s.name }}</a>
+                    <div class="flex items-center gap-2">
+                        <p class="text-xs text-ink-muted">{{ s.size|filesizeformat }}</p>
+                        <a href="{% url 'site_scraper_archive_download' site_id=site.id filename=s.name %}" class="text-ink-muted hover:text-ink-secondary opacity-0 group-hover:opacity-100 transition-opacity" title="Download">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3"/></svg>
+                        </a>
+                    </div>
+                </div>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+
         {% if output_files %}
         <div class="panel overflow-hidden">
             <div class="panel-header">

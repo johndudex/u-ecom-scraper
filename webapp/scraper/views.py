@@ -219,7 +219,7 @@ def job_detail(request, job_id):
     output_files = []
     slug_candidates = []
     if job.site_folder:
-        slug_candidates.append(job.site_folder)
+        slug_candidates.append(job.site_folder.removeprefix("scrapers/"))
     if job.site_name:
         name_slug = job.site_name.lower().replace(" ", "-").replace(".", "-")
         for char in name_slug:
@@ -330,7 +330,7 @@ def scraper_code(request, job_id):
 
     slug_candidates = []
     if job.site_folder:
-        slug_candidates.append(job.site_folder)
+        slug_candidates.append(job.site_folder.removeprefix("scrapers/"))
     if job.site_name:
         name_slug = job.site_name.lower().replace(" ", "-").replace(".", "-")
         for char in name_slug:
@@ -355,7 +355,7 @@ def scraper_code(request, job_id):
 def _resolve_job_slug(job):
     """Resolve the scraper folder slug for a job."""
     if job.site_folder:
-        return job.site_folder
+        return job.site_folder.removeprefix("scrapers/")
     if job.site_name:
         name_slug = job.site_name.lower().replace(" ", "-").replace(".", "-")
         for char in name_slug:
@@ -565,7 +565,7 @@ def scraper_code_json(request, job_id):
     job = get_object_or_404(ScrapeJob, pk=job_id)
     scraper_path = None
     if job.site_folder:
-        candidate = os.path.join("scrapers", job.site_folder, "scraper.py")
+        candidate = os.path.join("scrapers", job.site_folder.removeprefix("scrapers/"), "scraper.py")
         if os.path.isfile(candidate):
             scraper_path = candidate
 
@@ -850,11 +850,11 @@ def agent_summary(request, job_id: int):
         summaries.append({"agent": agent_name, "summary": summary_md})
 
     for agent_name, agent_data in agents.items():
-        if agent_name not in [s["agent"] for s in summaries]:
+        if agent_name not in [s["agent"] for s in summaries] and agent_data["assistant_msgs"]:
             summaries.append(
                 {
                     "agent": agent_name,
-                    "summary": f"# {agent_name}\n\n(No summary available)",
+                    "summary": f"# {agent_name.replace('-', ' ').title()}\n\n(No summary available)",
                 }
             )
 
@@ -1053,22 +1053,21 @@ def site_detail(request, site_id):
             pass
 
     output_files = []
+    scraper_archives = []
     if site.slug:
         scrapers_dir = Path(settings.PROJECT_ROOT) / "scrapers" / site.slug
         if scrapers_dir.is_dir():
             for f in sorted(scrapers_dir.iterdir(), reverse=True):
-                if (
-                    f.name.startswith("output_")
-                    and f.name.endswith(".json")
-                    and f.is_file()
-                ):
-                    try:
-                        size = f.stat().st_size
-                        output_files.append(
-                            {"name": f.name, "size": size, "path": str(f)}
-                        )
-                    except Exception:
-                        pass
+                if not f.is_file():
+                    continue
+                try:
+                    size = f.stat().st_size
+                except Exception:
+                    continue
+                if f.name.startswith("output_") and f.name.endswith(".json"):
+                    output_files.append({"name": f.name, "size": size})
+                elif f.name.startswith("scraper-") and f.name.endswith(".py"):
+                    scraper_archives.append({"name": f.name, "size": size})
 
     return render(
         request,
@@ -1078,6 +1077,7 @@ def site_detail(request, site_id):
             "jobs": jobs,
             "scraper_code": scraper_code,
             "output_files": output_files,
+            "scraper_archives": scraper_archives,
         },
     )
 
@@ -1219,6 +1219,57 @@ def site_scraper_code(request, site_id):
         content_type="text/x-python",
         as_attachment=True,
         filename=f"{site.slug}_scraper.py",
+    )
+
+
+@login_required
+def site_scraper_archive_view(request, site_id, filename):
+    site = get_object_or_404(Site, pk=site_id)
+    safe_name = os.path.basename(filename)
+    if not safe_name.endswith(".py"):
+        raise Http404("Only Python files can be viewed")
+    if "/" in safe_name or "\\" in safe_name:
+        raise Http404("Invalid filename")
+    file_path = os.path.join(settings.PROJECT_ROOT, "scrapers", site.slug, safe_name)
+    if not os.path.isfile(file_path):
+        raise Http404("File not found")
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            code = f.read()
+    except OSError:
+        raise Http404("Could not read file")
+    download_url = reverse(
+        "site_scraper_archive_download",
+        kwargs={"site_id": site.id, "filename": safe_name},
+    )
+    return render(
+        request,
+        "scraper/scraper_archive_view.html",
+        {
+            "site": site,
+            "filename": safe_name,
+            "code": code,
+            "download_url": download_url,
+        },
+    )
+
+
+@login_required
+def site_scraper_archive_download(request, site_id, filename):
+    site = get_object_or_404(Site, pk=site_id)
+    safe_name = os.path.basename(filename)
+    if not safe_name.endswith(".py"):
+        raise Http404("Only Python files can be downloaded")
+    if "/" in safe_name or "\\" in safe_name:
+        raise Http404("Invalid filename")
+    file_path = os.path.join(settings.PROJECT_ROOT, "scrapers", site.slug, safe_name)
+    if not os.path.isfile(file_path):
+        raise Http404("File not found")
+    return FileResponse(
+        open(file_path, "rb"),
+        content_type="text/x-python",
+        as_attachment=True,
+        filename=safe_name,
     )
 
 

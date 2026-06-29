@@ -17,6 +17,16 @@ urlpatterns = [
         name="site_scraper_code",
     ),
     path(
+        "sites/<int:site_id>/scraper-archive/<str:filename>/",
+        views.site_scraper_archive_view,
+        name="site_scraper_archive_view",
+    ),
+    path(
+        "sites/<int:site_id>/scraper-archive/<str:filename>/download/",
+        views.site_scraper_archive_download,
+        name="site_scraper_archive_download",
+    ),
+    path(
         "sites/<int:site_id>/output/<str:filename>/",
         views.site_output_view,
         name="site_output_view",

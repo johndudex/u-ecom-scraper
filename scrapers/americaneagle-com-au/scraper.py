@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-American Eagle Australia - Navigation Scraper (Two-Phase Architecture)
+American Eagle Australia - Navigation Scraper (Two-Phase)
 
-Phase 1: Discover product URLs via search/category pages (HTTP requests + BeautifulSoup)
-Phase 2: Extract product data from each URL via Shopify JSON API
+Phase 1: Discover product URLs via Shopify Collection JSON API
+Phase 2: Extract product data via Shopify /products/{handle}.json API
 
-Platform: Shopify (confirmed via cdn.shopify.com CDN, theme paths, shopify tags)
-Extraction: /products/{handle}.json Shopify public API
-Anti-bot: None detected - direct HTTP works without proxy
-Currency: AUD
+The search page (americaneagle.com.au/search?searchTerm=...) is client-side rendered,
+so HTML scraping of search results does NOT work. All discovery uses the Shopify
+Collection JSON API which returns structured product data via direct HTTP.
 
 Usage:
-    python3 scraper_draft.py                                    # default: search "pants"
-    python3 scraper_draft.py --query "jeans"                    # custom search query
-    python3 scraper_draft.py --category-url "https://americaneagle.com.au/collections/american-eagle-sale"
-    python3 scraper_draft.py --sample                           # scrape first 5 products
-    python3 scraper_draft.py --limit 50                         # max 50 products
-    python3 scraper_draft.py --urls URL1 URL2 ...               # scrape specific product URLs
-    python3 scraper_draft.py --input custom_urls.json            # read product URLs from file
+    python3 scraper.py                             # discover all products via /collections/all
+    python3 scraper.py --query "jeans"             # search via collection API
+    python3 scraper.py --category-url "https://americaneagle.com.au/collections/american-eagle-men"
+    python3 scraper.py --input urls.json           # scrape from URL list
+    python3 scraper.py --urls URL1 URL2            # scrape specific product URLs
+    python3 scraper.py --sample                    # scrape first 5 products only
+    python3 scraper.py --limit 50                  # max 50 products
+    python3 scraper.py --no-proxy                  # explicitly disable proxy (default)
 """
 
 import argparse
@@ -27,13 +27,12 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
-from urllib.parse import urlparse, parse_qs, urlencode
+from html.parser import HTMLParser
+from typing import Any, Optional
+from urllib.parse import urlparse
 
 import requests
-from bs4 import BeautifulSoup
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -43,63 +42,93 @@ SITE_NAME = "American Eagle Australia"
 SITE_URL = "https://americaneagle.com.au"
 PLATFORM = "shopify"
 SITE_SLUG = "americaneagle-com-au"
-SCRAPING_METHOD = "http_requests"
-CURRENCY_CODE = "AUD"
+OUTPUT_KEY = "products"
 CURRENCY_SYMBOL = "$"
+CURRENCY_CODE = "AUD"
 
-# Rate limiting
-DELAY = 1.0  # seconds between requests (Shopify API rate limit caution)
-
-# HTTP settings
-REQUEST_TIMEOUT = 15
-MAX_RETRIES = 3
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-AU,en-US;q=0.9,en;q=0.8",
-}
-
-# Phase 1: Navigation Configuration
+# Phase 1: Discovery via Shopify Collection JSON API
 DEFAULT_QUERY = "pants"
-SEARCH_URL_PATTERN = f"{SITE_URL}/search?q={{query}}&options%5Bprefix%5D=last"
-SEARCH_WORKING_URL = f"{SITE_URL}/search?q=pants&options%5Bprefix%5D=last"
-CATEGORY_URLS = [
+ALL_COLLECTIONS_API = "https://americaneagle.com.au/collections/all/products.json?limit=250&page={page}"
+
+# Category URLs and handles discovered during site analysis
+CATEGORY_URLS: list[str] = [
     "https://americaneagle.com.au/collections/american-eagle-sale",
     "https://americaneagle.com.au/collections/american-eagle-new-arrivals",
     "https://americaneagle.com.au/collections/american-eagle-men",
     "https://americaneagle.com.au/collections/american-eagle-men-jeans",
+    "https://americaneagle.com.au/collections/american-eagle-men-tops",
     "https://americaneagle.com.au/collections/american-eagle-men-bottoms",
     "https://americaneagle.com.au/collections/american-eagle-men-bottoms-pants",
-    "https://americaneagle.com.au/collections/american-eagle-men-tops",
+    "https://americaneagle.com.au/collections/american-eagle-men-bottoms-shorts",
+    "https://americaneagle.com.au/collections/american-eagle-men-underwear",
+    "https://americaneagle.com.au/collections/american-eagle-men-activewear",
     "https://americaneagle.com.au/collections/aerie-new-arrivals",
     "https://americaneagle.com.au/collections/off-campus",
-    "https://americaneagle.com.au/collections/american-eagle-new-arrivals-women",
 ]
 
+COLLECTION_HANDLES: list[str] = [
+    "american-eagle-sale",
+    "american-eagle-new-arrivals",
+    "american-eagle-men",
+    "american-eagle-men-jeans",
+    "american-eagle-men-tops",
+    "american-eagle-men-bottoms",
+    "american-eagle-men-bottoms-pants",
+    "american-eagle-men-bottoms-shorts",
+    "american-eagle-men-underwear",
+    "american-eagle-men-activewear",
+    "aerie-new-arrivals",
+    "off-campus",
+]
+
+# Query-to-collection keyword mapping for --query mode
+QUERY_COLLECTION_MAP: dict[str, list[str]] = {
+    "pants": ["american-eagle-men-bottoms-pants", "american-eagle-men-bottoms"],
+    "jeans": ["american-eagle-men-jeans", "american-eagle-men"],
+    "shorts": ["american-eagle-men-bottoms-shorts", "american-eagle-men-bottoms"],
+    "tops": ["american-eagle-men-tops", "american-eagle-men"],
+    "sale": ["american-eagle-sale"],
+    "new": ["american-eagle-new-arrivals"],
+    "underwear": ["american-eagle-men-underwear"],
+    "activewear": ["american-eagle-men-activewear"],
+    "aerie": ["aerie-new-arrivals"],
+}
+
 # Phase 1: Pagination
-PAGINATION_TYPE = "next_button"
-NEXT_BUTTON_SELECTOR = 'a[rel="next"]'
-PAGE_PARAM_NAME = "page"
-MAX_PAGES = None  # no limit
+MAX_PAGES = 50
+PAGE_SIZE = 250
 
-# Phase 1: Item Link Extraction
-ITEM_CONTAINER_SELECTOR = "[data-product-id]"
-ITEM_LINK_SELECTOR = 'a[href*="/products/"]'
-ITEM_URL_PATTERN = re.compile(r"/products/([A-Za-z0-9\-_]+)")
+# Phase 2: Shopify API extraction
+SHOPIFY_PRODUCT_API = "https://americaneagle.com.au/products/{handle}.json"
 
-# Paths
+# Rate limiting
+DELAY_SECONDS = 1.0
+REQUEST_TIMEOUT = 15
+MAX_RETRIES = 3
+
+# HTTP headers
+HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/html, */*",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+}
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_DIR = os.path.join(SCRIPT_DIR, "..", "logs")
-LOG_FILE = os.path.join(LOG_DIR, f"{SITE_SLUG}.log")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
 # ═══════════════════════════════════════════════════════════════════════════════
 
+LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, f"{SITE_SLUG}.log")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -107,585 +136,810 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
     handlers=[
         logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
+        logging.StreamHandler(),
     ],
 )
 logger = logging.getLogger(SITE_SLUG)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DATA STRUCTURES
+# HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-@dataclass
-class Product:
-    """Standard product output structure."""
-    id: int = 0
-    title: str = ""
-    price: str = ""
-    availability: str = ""
-    original_price: str = ""
-    currency: str = ""
-    url: str = ""
-    src_url: str = ""
-    location: str = ""
-    status_code: int = 0
-    scraped_at: str = ""
-    remarks: str = ""
-    # Extended fields
-    brand: str = ""
-    description: str = ""
-    images: list = field(default_factory=list)
-    sku: str = ""
-    category: str = ""
-    tags: str = ""
-    variant_id: str = ""
-    variant_name: str = ""
-    variant_size: str = ""
-    variant_color: str = ""
+
+class _HTMLTextExtractor(HTMLParser):
+    """Strip HTML tags and return plain text."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self._parts.append(data)
+
+    def get_text(self) -> str:
+        return " ".join(self._parts).strip()
+
+
+def strip_html(html: str) -> str:
+    """Remove HTML tags and return plain text."""
+    if not html:
+        return ""
+    extractor = _HTMLTextExtractor()
+    extractor.feed(html)
+    text = extractor.get_text()
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def format_price(raw_price: Any, currency_symbol: str = CURRENCY_SYMBOL) -> str:
+    """Format a price string with currency symbol.
+
+    Args:
+        raw_price: Numeric string like '58.95' or already formatted '$58.95'.
+        currency_symbol: Currency symbol to prepend.
+
+    Returns:
+        Formatted price like '$58.95'.
+    """
+    if not raw_price:
+        return ""
+    raw_price = str(raw_price).strip()
+    if raw_price.startswith(("$", "€", "£")):
+        return raw_price
+    try:
+        price_float = float(raw_price)
+        return f"{currency_symbol}{price_float:,.2f}"
+    except (ValueError, TypeError):
+        return f"{currency_symbol}{raw_price}"
+
+
+def normalize_availability(available: bool) -> str:
+    """Map Shopify availability boolean to standard text."""
+    return "In Stock" if available else "Out of Stock"
+
+
+def extract_style_id(body_html: str) -> str:
+    """Extract style ID from product body_html .api-id section."""
+    if not body_html:
+        return ""
+    match = re.search(r"Style ID:\s*([\w\-]+)", body_html)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def extract_category(tags: list[str]) -> str:
+    """Extract most specific category from Shopify tags with 'cat:' prefix."""
+    cat_tags = [t for t in tags if t.startswith("cat:")]
+    if not cat_tags:
+        return ""
+    return max(cat_tags, key=len)
+
+
+def extract_handle_from_url(url: str) -> str:
+    """Extract product handle from a Shopify product URL."""
+    parsed = urlparse(url)
+    path = parsed.path
+    match = re.match(r".*/products/([A-Za-z0-9][\w\-]*)", path)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def is_soft_404(product_data: Optional[dict]) -> bool:
+    """Detect soft 404 from Shopify API response."""
+    if not product_data:
+        return True
+    product = product_data.get("product", {})
+    title = product.get("title", "")
+    if not title:
+        return True
+    title_lower = title.lower()
+    if any(
+        kw in title_lower
+        for kw in [
+            "not found",
+            "unavailable",
+            "discontinued",
+            "no longer available",
+            "page not found",
+            "404",
+        ]
+    ):
+        return True
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HTTP UTILITIES
+# HTTP REQUEST UTILITY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _http_get(url: str, session: requests.Session) -> requests.Response:
-    """Make a rate-limited HTTP GET request with retries."""
-    time.sleep(DELAY)
-    last_exc = None
+_http_session: Optional[requests.Session] = None
+
+
+def get_http_session() -> requests.Session:
+    """Get or create a shared HTTP session."""
+    global _http_session
+    if _http_session is None:
+        _http_session = requests.Session()
+        _http_session.headers.update(HEADERS)
+    return _http_session
+
+
+def safe_get(url: str, timeout: int = REQUEST_TIMEOUT) -> Optional[requests.Response]:
+    """Make an HTTP GET request with retry logic."""
+    session = get_http_session()
+    last_error: Optional[Exception] = None
+
     for attempt in range(MAX_RETRIES):
         try:
-            resp = session.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            resp = session.get(url, timeout=timeout, allow_redirects=True)
             return resp
-        except requests.RequestException as exc:
-            last_exc = exc
-            wait = DELAY * (2 ** attempt)
-            logger.warning("Retry %d/%d for %s: %s (wait %.1fs)", attempt + 1, MAX_RETRIES, url[:80], exc, wait)
-            time.sleep(wait)
-    logger.error("Failed after %d retries for %s: %s", MAX_RETRIES, url[:80], last_exc)
-    raise last_exc  # type: ignore
+        except requests.RequestException as e:
+            last_error = e
+            wait = DELAY_SECONDS * (attempt + 1)
+            logger.warning(
+                "Request failed (attempt %d/%d) for %s: %s",
+                attempt + 1,
+                MAX_RETRIES,
+                url[:80],
+                e,
+            )
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(wait)
+
+    logger.error("All %d attempts failed for %s: %s", MAX_RETRIES, url[:80], last_error)
+    return None
 
 
-def _normalize_url(href: str) -> str:
-    """Normalize a URL: make absolute, strip trailing slashes, remove fragments."""
-    if not href:
-        return ""
-    if href.startswith("//"):
-        href = "https:" + href
-    elif href.startswith("/"):
-        href = SITE_URL.rstrip("/") + href
-    # Remove fragment
-    href = href.split("#")[0]
-    # Normalize query string order
-    parsed = urlparse(href)
-    if parsed.query:
-        params = parse_qs(parsed.query, keep_blank_values=True)
-        # Keep variant param but sort
-        normalized_query = urlencode(params, doseq=True)
-        href = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{normalized_query}"
+def safe_get_json(url: str, timeout: int = REQUEST_TIMEOUT) -> Optional[dict]:
+    """Make an HTTP GET request and parse JSON response."""
+    resp = safe_get(url, timeout)
+    if resp is None:
+        return None
+    try:
+        resp.raise_for_status()
+        return resp.json()
+    except (ValueError, requests.HTTPError) as e:
+        logger.error("Failed to parse JSON from %s: %s", url[:80], e)
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 1: URL DISCOVERY (Shopify Collection JSON API)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def discover_urls_from_all_collections(
+    max_pages: Optional[int] = None,
+    limit: Optional[int] = None,
+) -> tuple[list[str], str]:
+    """Discover ALL product URLs via Shopify /collections/all/products.json API.
+
+    This is the PRIMARY discovery method. The search page is client-side rendered
+    and does NOT return product links in static HTML.
+
+    Args:
+        max_pages: Maximum pagination pages to follow.
+        limit: Maximum number of product URLs to return.
+
+    Returns:
+        Tuple of (list of product URLs, source URL used).
+    """
+    logger.info(
+        "Phase 1: Discovering products via /collections/all/products.json"
+    )
+
+    urls: list[str] = []
+    seen_handles: set[str] = set()
+    page_num = 1
+    max_pg = max_pages or MAX_PAGES
+
+    while page_num <= max_pg:
+        if limit and len(urls) >= limit:
+            logger.info("Phase 1: Reached limit=%d at page %d", limit, page_num)
+            break
+
+        api_url = ALL_COLLECTIONS_API.replace("{page}", str(page_num))
+        logger.info(
+            "Phase 1: Fetching /collections/all page %d ...", page_num
+        )
+
+        data = safe_get_json(api_url)
+        if not data or not data.get("products"):
+            logger.info(
+                "Phase 1: No products returned on page %d, stopping", page_num
+            )
+            break
+
+        products = data["products"]
+        new_count = 0
+        for product in products:
+            handle = product.get("handle", "")
+            if handle and handle not in seen_handles:
+                seen_handles.add(handle)
+                product_url = f"{SITE_URL}/products/{handle}"
+                urls.append(product_url)
+                new_count += 1
+
+        logger.info(
+            "Phase 1: Page %d → %d products (%d new, %d total)",
+            page_num,
+            len(products),
+            new_count,
+            len(urls),
+        )
+
+        if len(products) < PAGE_SIZE:
+            logger.info(
+                "Phase 1: Received %d products (< %d page size), "
+                "last page reached",
+                len(products),
+                PAGE_SIZE,
+            )
+            break
+
+        page_num += 1
+        time.sleep(DELAY_SECONDS)
+
+    if limit:
+        urls = urls[:limit]
+
+    logger.info("Phase 1: Discovered %d total product URLs", len(urls))
+    return urls, f"{SITE_URL}/collections/all"
+
+
+def discover_urls_from_collection(
+    collection_handle: str,
+    max_pages: Optional[int] = None,
+    limit: Optional[int] = None,
+) -> tuple[list[str], str]:
+    """Discover product URLs from a specific collection via JSON API.
+
+    Args:
+        collection_handle: Shopify collection handle (e.g. 'american-eagle-men').
+        max_pages: Maximum pagination pages.
+        limit: Maximum product URLs.
+
+    Returns:
+        Tuple of (product URLs list, source URL).
+    """
+    logger.info(
+        "Phase 1: Discovering products from collection '%s'", collection_handle
+    )
+
+    urls: list[str] = []
+    seen_handles: set[str] = set()
+    page_num = 1
+    max_pg = max_pages or MAX_PAGES
+
+    while page_num <= max_pg:
+        if limit and len(urls) >= limit:
+            break
+
+        api_url = (
+            f"{SITE_URL}/collections/{collection_handle}"
+            f"/products.json?limit=250&page={page_num}"
+        )
+        logger.info(
+            "Phase 1: Fetching collection '%s' page %d ...",
+            collection_handle,
+            page_num,
+        )
+
+        data = safe_get_json(api_url)
+        if not data or not data.get("products"):
+            break
+
+        products = data["products"]
+        new_count = 0
+        for product in products:
+            handle = product.get("handle", "")
+            if handle and handle not in seen_handles:
+                seen_handles.add(handle)
+                product_url = f"{SITE_URL}/products/{handle}"
+                urls.append(product_url)
+                new_count += 1
+
+        logger.info(
+            "Phase 1: Collection '%s' page %d → %d products (%d new)",
+            collection_handle,
+            page_num,
+            len(products),
+            new_count,
+        )
+
+        if len(products) < PAGE_SIZE:
+            break
+
+        page_num += 1
+        time.sleep(DELAY_SECONDS)
+
+    if limit:
+        urls = urls[:limit]
+
+    logger.info(
+        "Phase 1: Discovered %d products from collection '%s'",
+        len(urls),
+        collection_handle,
+    )
+    return urls, f"{SITE_URL}/collections/{collection_handle}"
+
+
+def discover_urls_from_query(
+    query: str,
+    max_pages: Optional[int] = None,
+    limit: Optional[int] = None,
+) -> tuple[list[str], str]:
+    """Discover product URLs based on a search query.
+
+    Maps the query to relevant collection handles using QUERY_COLLECTION_MAP.
+    Falls back to /collections/all if no mapping found.
+
+    Args:
+        query: Search term.
+        max_pages: Maximum pagination pages.
+        limit: Maximum product URLs.
+
+    Returns:
+        Tuple of (product URLs list, source description).
+    """
+    query_lower = query.lower().strip()
+
+    # Try to find matching collections from the keyword map
+    matched_handles: list[str] = []
+    for keyword, handles in QUERY_COLLECTION_MAP.items():
+        if keyword in query_lower:
+            matched_handles.extend(handles)
+
+    # Deduplicate while preserving order
+    matched_handles = list(dict.fromkeys(matched_handles))
+
+    if matched_handles:
+        logger.info(
+            "Phase 1: Query '%s' matched collections: %s",
+            query,
+            matched_handles,
+        )
+
+        all_urls: list[str] = []
+        all_src_parts: list[str] = []
+
+        for handle in matched_handles:
+            if limit and len(all_urls) >= limit:
+                break
+            remaining = (limit - len(all_urls)) if limit else None
+            urls, src = discover_urls_from_collection(
+                handle, max_pages, remaining
+            )
+            for u in urls:
+                if u not in all_urls:
+                    all_urls.append(u)
+            all_src_parts.append(handle)
+
+        src_url = (
+            f"collections:{','.join(all_src_parts)}"
+            if all_src_parts
+            else f"{SITE_URL}/collections/all"
+        )
+        return all_urls, src_url
+
+    # Fallback: use /collections/all
+    logger.info(
+        "Phase 1: No collection match for query '%s', "
+        "falling back to /collections/all",
+        query,
+    )
+    return discover_urls_from_all_collections(max_pages, limit)
+
+
+def discover_urls_from_category_url(
+    category_url: str,
+    max_pages: Optional[int] = None,
+    limit: Optional[int] = None,
+) -> tuple[list[str], str]:
+    """Discover product URLs from a category/collection URL.
+
+    Args:
+        category_url: Full category/collection URL.
+        max_pages: Maximum pagination pages.
+        limit: Maximum product URLs.
+
+    Returns:
+        Tuple of (product URLs list, source URL).
+    """
+    parsed = urlparse(category_url)
+    path_parts = parsed.path.strip("/").split("/")
+
+    if "collections" in path_parts:
+        idx = path_parts.index("collections")
+        if idx + 1 < len(path_parts):
+            collection_handle = path_parts[idx + 1]
+            return discover_urls_from_collection(
+                collection_handle, max_pages, limit
+            )
+
+    logger.warning("Could not extract collection handle from %s", category_url)
+    return [], category_url
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 2: PRODUCT DATA EXTRACTION (Shopify API)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def extract_product_via_api(
+    url: str, src_url: str
+) -> dict[str, Any]:
+    """Extract product data using Shopify /products/{handle}.json API.
+
+    Args:
+        url: Full product page URL.
+        src_url: Source listing/search URL where the product was discovered.
+
+    Returns:
+        Dictionary with extracted product fields.
+    """
+    handle = extract_handle_from_url(url)
+    if not handle:
+        return _make_error_product(
+            url, src_url, "Could not extract product handle from URL"
+        )
+
+    api_url = SHOPIFY_PRODUCT_API.replace("{handle}", handle)
+    data = safe_get_json(api_url)
+
+    status_code = 200
+    if data is None:
+        return _make_error_product(
+            url, src_url, f"Failed to fetch product JSON from {api_url}"
+        )
+
+    # Check for soft 404
+    if is_soft_404(data):
+        return _make_error_product(
+            url, src_url, "Soft 404: product not found", status_code
+        )
+
+    product = data.get("product", {})
+    title = product.get("title", "").strip()
+
+    if not title:
+        return _make_error_product(
+            url, src_url, "Soft 404: product has no title", status_code
+        )
+
+    # Match variant (via ?variant= param if present, otherwise first variant)
+    variant_id = _extract_variant_id_from_url(url)
+    variants = product.get("variants", [])
+
+    matched_variant = None
+    if variant_id:
+        for v in variants:
+            if str(v.get("id")) == str(variant_id):
+                matched_variant = v
+                break
+    if matched_variant is None and variants:
+        matched_variant = variants[0]
+
+    # Build product record
+    now = datetime.now(timezone.utc).isoformat()
+    record: dict[str, Any] = {
+        "id": 0,
+        "url": url,
+        "src_url": src_url,
+        "status_code": status_code,
+        "scraped_at": now,
+        "remarks": "",
+    }
+
+    # Core fields
+    record["title"] = title
+    record["sku"] = ""
+    record["brand"] = product.get("vendor", "")
+    record["description"] = _extract_description(product.get("body_html", ""))
+    record["variant_name"] = ""
+    record["location"] = ""
+
+    # Variant-specific fields
+    if matched_variant:
+        raw_price = matched_variant.get("price", "")
+        record["price"] = format_price(raw_price)
+
+        raw_compare = matched_variant.get("compare_at_price")
+        record["original_price"] = (
+            format_price(raw_compare) if raw_compare else ""
+        )
+
+        available = matched_variant.get("available", True)
+        record["availability"] = normalize_availability(available)
+
+        record["currency"] = matched_variant.get("price_currency", CURRENCY_CODE)
+        record["sku"] = matched_variant.get("sku", "") or ""
+        record["variant_name"] = matched_variant.get("title", "")
     else:
-        href = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-    return href
+        record["price"] = ""
+        record["original_price"] = ""
+        record["availability"] = "Out of Stock"
+        record["currency"] = CURRENCY_CODE
+
+    # Extra fields
+    record["style_id"] = extract_style_id(product.get("body_html", ""))
+
+    tags = product.get("tags", [])
+    record["category"] = extract_category(tags if isinstance(tags, list) else [])
+
+    # Images - product gallery only (scoped to product.images)
+    images = product.get("images", [])
+    image_urls: list[str] = []
+    for img in images:
+        src = img.get("src", "")
+        if src and src not in image_urls:
+            # Skip non-product images (logo, icons, navigation)
+            skip_patterns = [
+                "/brand.assets/",
+                "/emoji/",
+                "/flags/",
+                "/icon/",
+                "/navigation/",
+            ]
+            if any(p in src for p in skip_patterns):
+                continue
+            image_urls.append(src)
+    record["images"] = ",".join(image_urls[:20]) if image_urls else ""
+
+    return record
 
 
-def _extract_handle_from_url(url: str) -> Optional[str]:
-    """Extract product handle from a /products/{handle} URL."""
+def _extract_variant_id_from_url(url: str) -> Optional[str]:
+    """Extract variant ID from URL query parameter."""
     parsed = urlparse(url)
-    match = ITEM_URL_PATTERN.search(parsed.path)
+    params = parsed.query
+    match = re.search(r"variant=(\d+)", params)
     if match:
         return match.group(1)
     return None
 
 
-def _strip_html(html: str) -> str:
-    """Strip HTML tags and decode entities from a string."""
-    if not html:
+def _extract_description(body_html: str) -> str:
+    """Extract clean description from Shopify body_html."""
+    if not body_html:
         return ""
-    text = re.sub(r"<br\s*/?>", "\n", html)
-    text = re.sub(r"<[^>]+>", "", text)
-    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = text.strip()
 
-    # Remove duplicated trailing text (common in Shopify body_html where
-    # the intro paragraph appears in both the description and detail sections)
-    lines = text.split("\n")
-    # Check if the first non-empty line appears again near the end
-    first_line = ""
-    for line in lines:
-        stripped = line.strip()
-        if stripped:
-            first_line = stripped
-            break
-    if first_line and len(first_line) > 20 and len(lines) > 4:
-        # Check last 3 lines for the first_line content
-        tail = "\n".join(l.strip() for l in lines[-3:]).strip()
-        if tail.startswith(first_line):
-            # Remove the duplicated portion from the end
-            deduped = "\n".join(lines[:-1]).strip()
-            # Remove trailing whitespace/newlines again
-            deduped = re.sub(r"\n{3,}", "\n\n", deduped).strip()
-            if len(deduped) > len(first_line):
-                text = deduped
+    cleaned = re.sub(
+        r"<(script|style)[^>]*>.*?</\1>",
+        "",
+        body_html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
 
+    # Try to get main description from api-description section
+    api_desc_match = re.search(
+        r'class="api-description"[^>]*>(.*?)</div>',
+        cleaned,
+        re.DOTALL,
+    )
+    if api_desc_match:
+        text = strip_html(api_desc_match.group(1))
+        if text:
+            return text
+
+    # Fallback: strip HTML and take first 500 chars
+    text = strip_html(cleaned)
+    if len(text) > 500:
+        text = text[:500].rstrip() + "..."
     return text
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 1: URL DISCOVERY (HTTP Requests + BeautifulSoup)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _extract_item_links_from_html(html: str) -> list[str]:
-    """Extract product URLs from listing page HTML using BeautifulSoup."""
-    urls: list[str] = []
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-
-        # Primary: extract links from within [data-product-id] containers
-        containers = soup.select(ITEM_CONTAINER_SELECTOR)
-        if containers:
-            for container in containers:
-                links = container.select(ITEM_LINK_SELECTOR)
-                for link in links:
-                    href = link.get("href", "")
-                    if href and "/products/" in href:
-                        urls.append(_normalize_url(href))
-        else:
-            # Fallback: extract all product links from the page
-            links = soup.select(ITEM_LINK_SELECTOR)
-            for link in links:
-                href = link.get("href", "")
-                if href and "/products/" in href:
-                    urls.append(_normalize_url(href))
-    except Exception as exc:
-        logger.warning("Error extracting item links from HTML: %s", exc)
-    return urls
-
-
-def _get_next_page_url_from_html(html: str, current_url: str, next_page_num: int) -> Optional[str]:
-    """Determine the next page URL from listing page HTML."""
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-
-        if PAGINATION_TYPE == "next_button":
-            next_btn = soup.select_one(NEXT_BUTTON_SELECTOR)
-            if next_btn:
-                href = next_btn.get("href", "")
-                if href:
-                    return _normalize_url(href)
-                # Check if it's a link with text content but no href (SPA-style) - skip for HTTP
-        elif PAGINATION_TYPE == "page_param":
-            separator = "&" if "?" in current_url else "?"
-            return f"{current_url}{separator}{PAGE_PARAM_NAME}={next_page_num}"
-    except Exception as exc:
-        logger.warning("Error finding next page: %s", exc)
-    return None
-
-
-def _discover_urls_via_search(
-    session: requests.Session,
-    query: str,
-    max_pages: Optional[int] = None,
-    limit: Optional[int] = None,
-) -> tuple[list[str], str]:
-    """Phase 1a: Discover product URLs by searching the site.
-
-    Returns:
-        Tuple of (list of product URLs, the search URL used as src_url).
-    """
-    search_url = SEARCH_URL_PATTERN.replace("{query}", query)
-    logger.info("Phase 1: Searching for '%s' → %s", query, search_url)
-
-    try:
-        resp = _http_get(search_url, session)
-        resp.raise_for_status()
-    except Exception as exc:
-        logger.error("Phase 1: Failed to fetch search page: %s", exc)
-        return [], search_url
-
-    all_urls: list[str] = _extract_item_links_from_html(resp.text)
-    logger.info("Phase 1: Page 1 → %d product links found", len(all_urls))
-
-    current_page = 1
-    current_url = search_url
-
-    while True:
-        if max_pages and current_page >= max_pages:
-            logger.info("Phase 1: Reached max_pages=%d", max_pages)
-            break
-        if limit and len(all_urls) >= limit:
-            logger.info("Phase 1: Reached limit=%d product URLs", limit)
-            break
-
-        next_url = _get_next_page_url_from_html(resp.text, current_url, current_page + 1)
-        if not next_url:
-            logger.info("Phase 1: No more pages (page %d)", current_page)
-            break
-
-        logger.info("Phase 1: Navigating to page %d → %s", current_page + 1, next_url[:100])
-        try:
-            resp = _http_get(next_url, session)
-            resp.raise_for_status()
-        except Exception as exc:
-            logger.warning("Phase 1: Failed to fetch page %d: %s", current_page + 1, exc)
-            break
-
-        current_url = next_url
-        new_urls = _extract_item_links_from_html(resp.text)
-        new_count = len(set(new_urls) - set(all_urls))
-        logger.info(
-            "Phase 1: Page %d → %d items (%d new)",
-            current_page + 1,
-            len(new_urls),
-            new_count,
-        )
-
-        if new_count == 0:
-            logger.info("Phase 1: No new items on page %d, stopping", current_page + 1)
-            break
-
-        all_urls.extend(new_urls)
-        current_page += 1
-
-    # Deduplicate by product handle (strip query params to avoid
-    # duplicates from different tracking/variant query strings)
-    seen_handles: set[str] = set()
-    unique_urls: list[str] = []
-    for u in all_urls:
-        handle = _extract_handle_from_url(u)
-        if handle and handle not in seen_handles:
-            seen_handles.add(handle)
-            unique_urls.append(u)
-    if limit:
-        unique_urls = unique_urls[:limit]
-
-    logger.info("Phase 1: Discovered %d unique product URLs", len(unique_urls))
-    return unique_urls, search_url
-
-
-def _discover_urls_via_category(
-    session: requests.Session,
-    category_url: str,
-    max_pages: Optional[int] = None,
-    limit: Optional[int] = None,
-) -> tuple[list[str], str]:
-    """Phase 1b: Discover product URLs from a category/collection page.
-
-    Returns:
-        Tuple of (list of product URLs, the category URL used as src_url).
-    """
-    logger.info("Phase 1: Browsing category → %s", category_url)
-
-    try:
-        resp = _http_get(category_url, session)
-        resp.raise_for_status()
-    except Exception as exc:
-        logger.error("Phase 1: Failed to fetch category page: %s", exc)
-        return [], category_url
-
-    all_urls: list[str] = _extract_item_links_from_html(resp.text)
-    logger.info("Phase 1: Category page 1 → %d product links", len(all_urls))
-
-    current_page = 1
-    current_url = category_url
-
-    while True:
-        if max_pages and current_page >= max_pages:
-            break
-        if limit and len(all_urls) >= limit:
-            break
-
-        next_url = _get_next_page_url_from_html(resp.text, current_url, current_page + 1)
-        if not next_url:
-            break
-
-        logger.info("Phase 1: Category page %d → %s", current_page + 1, next_url[:100])
-        try:
-            resp = _http_get(next_url, session)
-            resp.raise_for_status()
-        except Exception as exc:
-            logger.warning("Phase 1: Failed to fetch category page %d: %s", current_page + 1, exc)
-            break
-
-        current_url = next_url
-        new_urls = _extract_item_links_from_html(resp.text)
-        new_count = len(set(new_urls) - set(all_urls))
-
-        if new_count == 0:
-            break
-
-        all_urls.extend(new_urls)
-        current_page += 1
-
-    seen_handles: set[str] = set()
-    unique_urls: list[str] = []
-    for u in all_urls:
-        handle = _extract_handle_from_url(u)
-        if handle and handle not in seen_handles:
-            seen_handles.add(handle)
-            unique_urls.append(u)
-    if limit:
-        unique_urls = unique_urls[:limit]
-
-    logger.info("Phase 1: Discovered %d unique product URLs from category", len(unique_urls))
-    return unique_urls, category_url
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 2: PRODUCT EXTRACTION (Shopify JSON API)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _extract_variant_id_from_url(url: str) -> Optional[int]:
-    """Extract variant ID from URL query parameter ?variant=XXXXX."""
-    parsed = urlparse(url)
-    params = parse_qs(parsed.query)
-    variant_ids = params.get("variant", [])
-    if variant_ids:
-        try:
-            return int(variant_ids[0])
-        except (ValueError, IndexError):
-            pass
-    return None
-
-
-def _detect_soft_404(product_data: dict, url: str, handle: str) -> Optional[str]:
-    """Detect soft 404: product not found, redirected, or unavailable.
-
-    Returns:
-        A remark string if soft 404 detected, None otherwise.
-    """
-    title = (product_data.get("title") or "").lower()
-    handle_lower = handle.lower()
-
-    # Check title for not-found indicators
-    bad_patterns = [
-        "page not found",
-        "product not found",
-        "404",
-        "not available",
-        "no longer available",
-        "unavailable",
-        "discontinued",
-        "oops",
-        "error",
-    ]
-    for pattern in bad_patterns:
-        if pattern in title:
-            return f"Soft 404: product not found ('{pattern}' in title)"
-
-    # Check if product title matches handle (very short/empty product data)
-    if not title or len(title) < 2:
-        return "Soft 404: product data empty or missing title"
-
-    return None
-
-
-def _scrape_product_via_api(
-    session: requests.Session,
+def _make_error_product(
     url: str,
     src_url: str,
-) -> Product:
-    """Phase 2: Extract product data using the Shopify JSON API.
-
-    Fetches /products/{handle}.json and maps all fields.
-    """
-    product = Product()
-    product.url = url
-    product.src_url = src_url
-    product.scraped_at = datetime.now(timezone.utc).isoformat()
-    product.currency = CURRENCY_CODE
-
-    # Extract handle from URL
-    handle = _extract_handle_from_url(url)
-    if not handle:
-        product.remarks = "Could not extract product handle from URL"
-        product.status_code = 0
-        logger.warning("Cannot extract handle from %s", url)
-        return product
-
-    # Extract variant ID from URL (if present)
-    url_variant_id = _extract_variant_id_from_url(url)
-
-    # Build Shopify JSON API URL
-    api_url = f"{SITE_URL}/products/{handle}.json"
-
-    try:
-        resp = _http_get(api_url, session)
-        product.status_code = resp.status_code
-        resp.raise_for_status()
-
-        data = resp.json()
-        product_data = data.get("product", {})
-
-        if not product_data:
-            product.remarks = "Soft 404: no product data in JSON response"
-            return product
-
-        # Soft 404 detection
-        soft_404 = _detect_soft_404(product_data, url, handle)
-        if soft_404:
-            product.remarks = soft_404
-            return product
-
-        # ── Title ──────────────────────────────────────────────────
-        product.title = (product_data.get("title") or "").strip()
-
-        # ── Vendor / Brand ─────────────────────────────────────────
-        product.brand = (product_data.get("vendor") or "").strip()
-
-        # ── Description ─────────────────────────────────────────────
-        body_html = product_data.get("body_html") or ""
-        product.description = _strip_html(body_html)
-
-        # ── Tags / Category ─────────────────────────────────────────
-        # Shopify API may return tags as a string or a list depending on the store
-        tags = product_data.get("tags", []) or []
-        if isinstance(tags, str):
-            tags = [t.strip() for t in tags.split(",") if t.strip()]
-        product.tags = ", ".join(tags) if tags else ""
-
-        # Extract category from cat: prefixed tags
-        cat_tags = [t for t in tags if isinstance(t, str) and t.startswith("cat:")]
-        if cat_tags:
-            # Use the most specific (longest) category path
-            product.category = max(cat_tags, key=len).replace("cat:", "")
-
-        # ── Images ──────────────────────────────────────────────────
-        images = product_data.get("images", []) or []
-        product.images = [img.get("src", "") for img in images if img.get("src")]
-
-        # ── Variants ────────────────────────────────────────────────
-        variants = product_data.get("variants", []) or []
-        if variants:
-            # Select the matching variant or the first one
-            matched_variant = variants[0]
-            if url_variant_id is not None:
-                for v in variants:
-                    if v.get("id") == url_variant_id:
-                        matched_variant = v
-                        break
-
-            product.variant_id = str(matched_variant.get("id", ""))
-            product.variant_name = str(matched_variant.get("title") or "").strip()
-            product.variant_size = str(matched_variant.get("option1") or "").strip()
-            product.variant_color = str(matched_variant.get("option2") or "").strip()
-            product.sku = str(matched_variant.get("sku") or "").strip()
-
-            # ── Price (with currency symbol per formatting rules) ────
-            raw_price = matched_variant.get("price") or ""
-            if raw_price:
-                try:
-                    price_float = float(raw_price)
-                    product.price = f"{CURRENCY_SYMBOL}{price_float:,.2f}"
-                except (ValueError, TypeError):
-                    product.price = f"{CURRENCY_SYMBOL}{raw_price}"
-
-            # ── Original Price (compare_at_price) ───────────────────
-            compare_price = matched_variant.get("compare_at_price") or ""
-            if compare_price:
-                try:
-                    compare_float = float(compare_price)
-                    product.original_price = f"{CURRENCY_SYMBOL}{compare_float:,.2f}"
-                except (ValueError, TypeError):
-                    product.original_price = f"{CURRENCY_SYMBOL}{compare_price}"
-
-            # ── Currency from variant data if available ──────────────
-            variant_currency = matched_variant.get("price_currency") or ""
-            if variant_currency:
-                product.currency = variant_currency
-
-            # ── Availability ──────────────────────────────────────────
-            inventory_mgmt = matched_variant.get("inventory_management") or ""
-            available = matched_variant.get("available")
-            if available is False:
-                product.availability = "Out of Stock"
-            elif inventory_mgmt:
-                product.availability = "In Stock"
-            else:
-                product.availability = "In Stock"  # Default for Shopify
-
-        # ── Construct canonical product URL ─────────────────────────
-        product_handle = product_data.get("handle") or handle
-        product.url = f"{SITE_URL}/products/{product_handle}"
-
-    except requests.HTTPError as exc:
-        if exc.response is not None and exc.response.status_code == 404:
-            product.remarks = "Soft 404: product not found (404 from JSON API)"
-            product.status_code = exc.response.status_code
-        else:
-            product.remarks = f"HTTP error: {exc}"
-            product.status_code = getattr(exc.response, "status_code", 0)
-        logger.error("Phase 2: HTTP error for %s: %s", url[:80], exc)
-    except requests.RequestException as exc:
-        product.remarks = f"Request error: {exc}"
-        product.status_code = 0
-        logger.error("Phase 2: Request error for %s: %s", url[:80], exc)
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
-        product.remarks = f"Parse error: {exc}"
-        logger.error("Phase 2: Parse error for %s: %s", url[:80], exc)
-
-    return product
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# OUTPUT HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _product_to_dict(p: Product) -> dict:
-    """Convert Product dataclass to output dictionary."""
-    d = {
-        "id": p.id,
-        "title": p.title,
-        "price": p.price,
-        "availability": p.availability,
-        "original_price": p.original_price,
-        "currency": p.currency,
-        "url": p.url,
-        "src_url": p.src_url,
-        "location": p.location,
-        "status_code": p.status_code,
-        "scraped_at": p.scraped_at,
-        "remarks": p.remarks,
+    error: str,
+    status_code: int = 0,
+) -> dict[str, Any]:
+    """Create an error product record."""
+    return {
+        "id": 0,
+        "url": url,
+        "src_url": src_url,
+        "status_code": status_code,
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+        "remarks": f"Error: {error[:200]}",
+        "title": "",
+        "price": "",
+        "availability": "",
+        "original_price": "",
+        "currency": "",
+        "sku": "",
+        "brand": "",
+        "description": "",
+        "variant_name": "",
+        "style_id": "",
+        "category": "",
+        "images": "",
+        "location": "",
     }
-    # Include extended fields only if they have values
-    if p.brand:
-        d["brand"] = p.brand
-    if p.description:
-        d["description"] = p.description
-    if p.images:
-        d["images"] = p.images
-    if p.sku:
-        d["sku"] = p.sku
-    if p.category:
-        d["category"] = p.category
-    if p.tags:
-        d["tags"] = p.tags
-    if p.variant_id:
-        d["variant_id"] = p.variant_id
-    if p.variant_name:
-        d["variant_name"] = p.variant_name
-    if p.variant_size:
-        d["variant_size"] = p.variant_size
-    if p.variant_color:
-        d["variant_color"] = p.variant_color
-    return d
 
 
-def _write_output(results: list[dict], start_time: float, failed_count: int) -> str:
-    """Write results to timestamped JSON output file."""
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def main() -> None:
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description=f"{SITE_NAME} Navigation Scraper"
+    )
+    parser.add_argument(
+        "--query",
+        type=str,
+        default=None,
+        help="Search query (default: 'pants')",
+    )
+    parser.add_argument(
+        "--category-url",
+        type=str,
+        default=None,
+        help="Category/collection URL to crawl",
+    )
+    parser.add_argument(
+        "--input",
+        type=str,
+        default=None,
+        help="Path to input URLs JSON file",
+    )
+    parser.add_argument(
+        "--urls",
+        nargs="+",
+        default=None,
+        help="Product URLs as CLI arguments",
+    )
+    parser.add_argument(
+        "--sample",
+        action="store_true",
+        help="Scrape only 5 products",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Max products to scrape",
+    )
+    parser.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help="Disable proxy (default for this site)",
+    )
+    args = parser.parse_args()
+
+    limit = 5 if args.sample else args.limit
+
+    logger.info("=" * 80)
+    logger.info("Starting scraper for %s", SITE_NAME)
+    logger.info("Platform: %s | Method: http_requests (Shopify API)", PLATFORM)
+    logger.info("Limit: %s | Sample: %s", limit or "unlimited", args.sample)
+    logger.info("=" * 80)
+
+    start_time = time.time()
+    discovered_urls: list[str] = []
+    src_url = ""
+
+    # ── URL Resolution ──────────────────────────────────────────────────
+
+    if args.urls:
+        # Direct product URLs from CLI
+        discovered_urls = args.urls
+        src_url = "cli_input"
+        logger.info(
+            "Using %d product URLs from CLI arguments", len(discovered_urls)
+        )
+
+    elif args.input:
+        # Product URLs from input file
+        try:
+            with open(args.input, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            discovered_urls = data.get("urls", [])
+            src_url = args.input
+            logger.info(
+                "Loaded %d product URLs from %s",
+                len(discovered_urls),
+                args.input,
+            )
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logger.error("Failed to read input file '%s': %s", args.input, e)
+            sys.exit(1)
+
+    elif args.category_url:
+        # Phase 1: Discover from specific category/collection URL
+        discovered_urls, src_url = discover_urls_from_category_url(
+            args.category_url, MAX_PAGES, limit
+        )
+
+    else:
+        # Default: Phase 1 discovery
+        # Use query if provided, otherwise use DEFAULT_QUERY
+        query = args.query if args.query else DEFAULT_QUERY
+        logger.info(
+            "Phase 1: Default discovery mode with query '%s'", query
+        )
+
+        # Map query to relevant collection(s) via Collection JSON API
+        # Falls back to /collections/all if no mapping found
+        discovered_urls, src_url = discover_urls_from_query(
+            query, MAX_PAGES, limit
+        )
+
+    if not discovered_urls:
+        logger.warning("No product URLs discovered. Exiting.")
+        sys.exit(0)
+
+    # ── Phase 2: Extract Data ───────────────────────────────────────────
+
+    total = len(discovered_urls)
+    logger.info("=" * 80)
+    logger.info("Phase 2: Extracting data from %d products", total)
+    logger.info("=" * 80)
+
+    results: list[dict[str, Any]] = []
+    success_count = 0
+    fail_count = 0
+
+    for i, url in enumerate(discovered_urls, 1):
+        product_url = url.strip()
+        if not product_url:
+            continue
+
+        # Progress logging
+        if i % 25 == 0 or i == 1 or i == total:
+            percent = (i / total) * 100
+            logger.info(
+                "Progress: [%d/%d] (%.1f%%)", i, total, percent
+            )
+        logger.info("Scraping: %s", product_url[:100])
+
+        try:
+            product = extract_product_via_api(product_url, src_url)
+            results.append(product)
+
+            if product.get("title"):
+                success_count += 1
+            else:
+                fail_count += 1
+                logger.warning(
+                    "No title extracted for %s", product_url[:80]
+                )
+        except Exception as exc:
+            fail_count += 1
+            logger.error("Failed to extract %s: %s", product_url[:80], exc)
+            results.append(_make_error_product(product_url, src_url, str(exc)))
+
+        # Rate limiting between requests
+        if i < total:
+            time.sleep(DELAY_SECONDS)
+
+    # Assign sequential IDs
+    for idx, product in enumerate(results, 1):
+        product["id"] = idx
+
+    # ── Write Output ────────────────────────────────────────────────────
+
     output = {
         "site": {
             "name": SITE_NAME,
             "url": SITE_URL,
             "platform": PLATFORM,
-            "scraping_method": SCRAPING_METHOD,
+            "scraping_method": "http_requests_shopify_api",
             "scraped_at": datetime.now(timezone.utc).isoformat(),
         },
-        "products": results,
+        OUTPUT_KEY: results,
         "metadata": {
             "scraping_duration_seconds": round(time.time() - start_time, 2),
-            "failed_products": failed_count,
-            "rate_limit_delay": DELAY,
+            "discovered_urls": len(discovered_urls),
+            "extracted_items": len(results),
+            "failed_products": fail_count,
+            "rate_limit_delay": DELAY_SECONDS,
         },
     }
 
@@ -696,189 +950,15 @@ def _write_output(results: list[dict], start_time: float, failed_count: int) -> 
     with open(output_filename, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False, default=str)
 
-    return output_filename
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def main() -> None:
-    """Main entry point for the two-phase navigation scraper."""
-    parser = argparse.ArgumentParser(
-        description=f"{SITE_NAME} Navigation Scraper (Two-Phase)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  python3 scraper_draft.py                           # default: search 'pants'\n"
-            "  python3 scraper_draft.py --query 'jeans'           # search for jeans\n"
-            "  python3 scraper_draft.py --sample                 # scrape first 5 only\n"
-            "  python3 scraper_draft.py --limit 50               # max 50 products\n"
-            "  python3 scraper_draft.py --urls URL1 URL2         # specific URLs\n"
-            "  python3 scraper_draft.py --input urls.json        # from file\n"
-        ),
-    )
-    parser.add_argument("--query", type=str, help="Search query for Phase 1 discovery")
-    parser.add_argument(
-        "--category-url",
-        type=str,
-        help="Category/collection URL to crawl for Phase 1",
-    )
-    parser.add_argument(
-        "--listing-url",
-        type=str,
-        help="Generic listing page URL to crawl for Phase 1",
-    )
-    parser.add_argument("--input", type=str, help="Path to input product URLs JSON file")
-    parser.add_argument(
-        "--urls",
-        type=str,
-        nargs="+",
-        help="Product URLs to scrape directly (skip Phase 1)",
-    )
-    parser.add_argument(
-        "--sample",
-        action="store_true",
-        help="Scrape only the first 5 products discovered",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Max number of products to scrape",
-    )
-    parser.add_argument(
-        "--no-proxy",
-        action="store_true",
-        default=True,
-        help="Disable proxy (default: no proxy for this site)",
-    )
-    args = parser.parse_args()
-
-    # Determine effective limit
-    limit = 5 if args.sample else args.limit
-
-    logger.info("=" * 80)
-    logger.info("Starting scraper for %s", SITE_NAME)
-    logger.info("Platform: %s | Method: %s", PLATFORM, SCRAPING_METHOD)
-    logger.info("=" * 80)
-
-    session = requests.Session()
-    start_time = time.time()
-    discovered_urls: list[str] = []
-    src_url_base: str = SITE_URL
-
-    # ── Determine product URL source ──────────────────────────────────
-    if args.urls:
-        # Direct URL mode: skip Phase 1
-        logger.info("Mode: Direct URLs (%d provided)", len(args.urls))
-        discovered_urls = args.urls
-        src_url_base = ""  # Each URL is its own source
-    elif args.input:
-        # Input file mode: skip Phase 1
-        logger.info("Mode: Input file → %s", args.input)
-        try:
-            with open(args.input, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            discovered_urls = data.get("urls", [])
-            logger.info("Loaded %d URLs from input file", len(discovered_urls))
-        except Exception as exc:
-            logger.error("Failed to read input file: %s", exc)
-            sys.exit(1)
-    elif args.category_url:
-        # Phase 1: Category discovery
-        urls, src_url_base = _discover_urls_via_category(
-            session, args.category_url, MAX_PAGES, limit
-        )
-        discovered_urls = urls
-    elif args.listing_url:
-        # Phase 1: Generic listing page discovery
-        urls, src_url_base = _discover_urls_via_category(
-            session, args.listing_url, MAX_PAGES, limit
-        )
-        discovered_urls = urls
-    elif args.query:
-        # Phase 1: Search discovery
-        urls, src_url_base = _discover_urls_via_search(
-            session, args.query, MAX_PAGES, limit
-        )
-        discovered_urls = urls
-    else:
-        # Default: Phase 1 search with DEFAULT_QUERY
-        logger.info("Mode: Default search (query='%s')", DEFAULT_QUERY)
-        urls, src_url_base = _discover_urls_via_search(
-            session, DEFAULT_QUERY, MAX_PAGES, limit
-        )
-        discovered_urls = urls
-
-    if not discovered_urls:
-        logger.warning("No product URLs discovered. Exiting.")
-        _write_output([], start_time, 0)
-        sys.exit(0)
-
-    # ── Phase 2: Extract product data ──────────────────────────────────
-    logger.info("=" * 80)
-    logger.info("Phase 2: Extracting data from %d products", len(discovered_urls))
-    logger.info("=" * 80)
-
-    results: list[dict] = []
-    failed_count = 0
-    total = len(discovered_urls)
-
-    for i, url in enumerate(discovered_urls, 1):
-        # Determine src_url: use the listing page if available, else the URL itself
-        if src_url_base:
-            item_src_url = src_url_base
-        else:
-            item_src_url = url
-
-        # Progress reporting
-        if i == 1 or i % 25 == 0 or i == total:
-            percent = (i / total) * 100
-            logger.info(
-                "Progress: [%d/%d] (%.1f%%)", i, total, percent
-            )
-        logger.info("Scraping: %s", url[:120])
-
-        try:
-            product = _scrape_product_via_api(session, url, item_src_url)
-            product.id = i
-            result_dict = _product_to_dict(product)
-            results.append(result_dict)
-
-            if product.remarks and ("error" in product.remarks.lower() or "404" in product.remarks.lower()):
-                failed_count += 1
-
-            status = "OK" if product.title else "SKIP"
-            logger.info(
-                "  → %s | %s | %s",
-                status,
-                product.title[:60] if product.title else "NO TITLE",
-                product.price,
-            )
-        except Exception as exc:
-            logger.error("Failed to scrape %s: %s", url[:80], exc)
-            failed_count += 1
-            error_product = Product(
-                id=i, url=url, src_url=item_src_url,
-                status_code=0,
-                scraped_at=datetime.now(timezone.utc).isoformat(),
-                remarks=f"Error: {str(exc)[:200]}",
-            )
-            results.append(_product_to_dict(error_product))
-
-    # ── Write output ───────────────────────────────────────────────────
-    output_filename = _write_output(results, start_time, failed_count)
-    success_count = len(results) - failed_count
-
+    # ── Summary ─────────────────────────────────────────────────────────
     duration = round(time.time() - start_time, 2)
     logger.info("=" * 80)
     logger.info("EXTRACTION COMPLETE")
     logger.info(
-        "Total: %d, Success: %d, Failed: %d",
+        "Total: %d | Success: %d | Failed: %d",
         len(results),
         success_count,
-        failed_count,
+        fail_count,
     )
     logger.info("Duration: %.1f seconds", duration)
     logger.info("Output: %s", output_filename)

@@ -495,6 +495,18 @@ def _finalize_job(job: ScrapeJob) -> None:
                         logger.info(
                             "Job %d: preserved %s to analysis/", job.id, artifact
                         )
+
+                site_dir = Path(settings.PROJECT_ROOT) / "scrapers" / site_slug
+                site_dir.mkdir(parents=True, exist_ok=True)
+                for f in ws.glob("output_*.json"):
+                    shutil.copy2(str(f), site_dir / f.name)
+                    logger.info(
+                        "Job %d: preserved %s to scrapers/%s/",
+                        job.id,
+                        f.name,
+                        site_slug,
+                    )
+
                 shutil.rmtree(ws, ignore_errors=True)
                 logger.info("Job %d: cleaned workspace/%s/", job.id, site_slug)
         except Exception as exc:

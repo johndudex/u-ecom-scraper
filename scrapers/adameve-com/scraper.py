@@ -2,18 +2,17 @@
 """
 Adam & Eve Navigation Scraper - Two-Phase Architecture
 
-Phase 1: Discover product URLs via search/category pages (HTTP requests + BeautifulSoup)
-Phase 2: Extract product data from each discovered page (HTTP requests)
+Phase 1: Navigate the site to discover product URLs via search with load-more pagination
+Phase 2: Scrape each discovered product page for structured data
 
 Usage:
-    python3 scraper.py                                # default: search "lingerie"
-    python3 scraper.py --query "vibrators"             # search with custom query
-    python3 scraper.py --category-url "https://..."    # crawl a specific category
-    python3 scraper.py --input custom_urls.json        # scrape URLs from file
-    python3 scraper.py --urls "https://..." "..."     # scrape specific URLs
-    python3 scraper.py --sample                        # scrape first 5 items only
-    python3 scraper.py --limit 50                      # max 50 items
-    python3 scraper.py --no-proxy                       # disable proxy (default)
+    python3 scraper.py                                 # search "lingerie" by default
+    python3 scraper.py --query "vibrators"             # custom search query
+    python3 scraper.py --input input_urls.json         # scrape from URL list
+    python3 scraper.py --urls "https://..." "https://..."  # scrape specific URLs
+    python3 scraper.py --sample                         # scrape first 5 items
+    python3 scraper.py --limit 50                       # max 50 items
+    python3 scraper.py --no-proxy                       # no proxy (default)
 """
 
 import argparse
@@ -25,10 +24,9 @@ import sys
 import time
 from datetime import datetime, timezone
 from typing import Optional
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, urljoin
 
-import requests
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -36,56 +34,47 @@ from bs4 import BeautifulSoup
 
 SITE_NAME = "Adam & Eve"
 SITE_URL = "https://www.adameve.com"
-PLATFORM = "custom"
+PLATFORM = "custom_aspnet"
 SITE_SLUG = "adameve-com"
-SCRAPING_METHOD = "http_requests"
-DELAY = 2.0
-MAX_PAGES = 5
+
+# Phase 1: Navigation / Discovery
 DEFAULT_QUERY = "lingerie"
+SEARCH_URL_BASE = "https://www.adameve.com/lingerie-ch-951.aspx?st=lingerie"
+
+# Item link extraction (from navigation_analysis.json)
+ITEM_CONTAINER_SELECTOR = '[data-cy="product-grid-item"]'
+ITEM_LINK_SELECTOR = 'a[href*="/sp-"]'
+ITEM_URL_PATTERN = re.compile(r"/sp-[A-Za-z0-9\-]+-\d+\.aspx")
+
+# Pagination
+PAGINATION_TYPE = "load_more"
+LOAD_MORE_SELECTOR = "#load-more-component, .ae-plp__button a"
+MAX_PAGES = 5
+
+# Phase 2: Extraction
+SCRAPING_METHOD = "playwright"
+DELAY_BETWEEN_REQUESTS = 2.0
+PAGE_LOAD_TIMEOUT = 30000
 OUTPUT_KEY = "products"
 
-# Phase 1: Navigation configuration (from navigation_analysis.json)
-SEARCH_WORKING_URL = "https://www.adameve.com/lingerie-ch-951.aspx?st=lingerie"
-CATEGORY_URLS = [
-    "https://www.adameve.com/adult-sex-toys/womens-sex-toys-ch-955.aspx",
-    "https://www.adameve.com/adult-sex-toys/vibrators-ch-1011.aspx",
-    "https://www.adameve.com/adult-sex-toys/dildo-sex-toys-ch-1012.aspx",
-    "https://www.adameve.com/lingerie-ch-951.aspx",
-    "https://www.adameve.com/adult-sex-toys/anal-sex-toys-ch-1002.aspx",
-    "https://www.adameve.com/adult-sex-toys/nipple-toys-c-1016.aspx",
-    "https://www.adameve.com/adult-sex-toys/kinky-bondage-ch-1007.aspx",
-    "https://www.adameve.com/adult-sex-toys-ch-1503.aspx",
+# Soft 404 detection patterns
+SOFT_404_PATTERNS = [
+    "page not found",
+    "product not found",
+    "no longer available",
+    "discontinued",
+    "unavailable",
+    "item not found",
+    "we're sorry",
+    "oops",
 ]
-
-ITEM_CONTAINER_SELECTOR = '[data-cy="product-grid-item"]'
-ITEM_LINK_SELECTOR = '[data-cy="product-grid-item"] a[href]'
-PAGE_PARAM_NAME = "pnum"
-
-# Product URL filter — matches /sp-{slug}-{id}.aspx
-PRODUCT_URL_REGEX = re.compile(r"/sp-[A-Za-z0-9\-]+-\d+\.aspx")
-
-# serverSideEvents regex for dataLayer extraction
-SERVER_SIDE_EVENTS_REGEX = re.compile(
-    r"var\s+serverSideEvents\s*=\s*(\[[\s\S]*?\]);", re.DOTALL
-)
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-    "Connection": "keep-alive",
-}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-LOG_DIR = os.path.join(SCRIPT_DIR, "..", "logs")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(SCRIPT_DIR, "..", "..", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, f"{SITE_SLUG}.log")
 
@@ -102,33 +91,63 @@ logger = logging.getLogger(SITE_SLUG)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HTTP UTILITY
+# HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def fetch_page(url: str, timeout: int = 15) -> requests.Response:
-    """Fetch a page with rate limiting and error handling.
-
-    Returns the raw requests.Response object.
-    Raises on network failures.
-    """
-    time.sleep(DELAY)
-    try:
-        response = requests.get(
-            url, headers=HEADERS, timeout=timeout, allow_redirects=True
-        )
-        response.raise_for_status()
-        return response
-    except requests.RequestException as exc:
-        logger.error("Failed to fetch %s: %s", url[:100], exc)
-        raise
+def _normalize_url(href: str) -> str:
+    """Normalize a URL to absolute form."""
+    if not href:
+        return ""
+    if href.startswith("//"):
+        return "https:" + href
+    if href.startswith("/"):
+        return SITE_URL.rstrip("/") + href
+    return href
 
 
-def fetch_soup(url: str, timeout: int = 15) -> tuple[BeautifulSoup, requests.Response]:
-    """Fetch a URL and return (BeautifulSoup, Response)."""
-    response = fetch_page(url, timeout)
-    soup = BeautifulSoup(response.text, "html.parser")
-    return soup, response
+def _is_valid_product_url(url: str) -> bool:
+    """Check if URL matches expected product URL pattern."""
+    return bool(ITEM_URL_PATTERN.search(url))
+
+
+def _map_availability(availability_raw: str) -> str:
+    """Map schema.org availability URI to human-readable text."""
+    if not availability_raw:
+        return ""
+    avail_lower = availability_raw.lower()
+    if "instock" in avail_lower or "instock" in availability_raw:
+        return "In Stock"
+    if "outofstock" in avail_lower or "soldout" in avail_lower:
+        return "Out of Stock"
+    if "preorder" in avail_lower:
+        return "Pre-order"
+    if "limitedavailability" in avail_lower:
+        return "Limited Stock"
+    return availability_raw
+
+
+def _check_soft_404(title: str, h1_text: str, final_url: str, original_url: str) -> str:
+    """Detect soft 404 pages. Returns remark string if detected, empty string otherwise."""
+    # Check title / h1 for not-found patterns
+    for text in [title, h1_text]:
+        if text:
+            text_lower = text.lower()
+            for pattern in SOFT_404_PATTERNS:
+                if pattern in text_lower:
+                    return f"Soft 404: '{pattern}' detected in page content"
+
+    # Check if final URL after redirects is significantly different
+    if original_url and final_url:
+        orig_path = urlparse(original_url).path.rstrip("/")
+        final_path = urlparse(final_url).path.rstrip("/")
+        # Remove query strings for comparison
+        if orig_path and final_path and orig_path != final_path:
+            # If redirected to a completely different page (not just added query params)
+            if not final_path.startswith(orig_path):
+                return f"Soft 404: redirected from {orig_path} to {final_path}"
+
+    return ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -136,350 +155,154 @@ def fetch_soup(url: str, timeout: int = 15) -> tuple[BeautifulSoup, requests.Res
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _extract_product_links_from_html(soup: BeautifulSoup) -> list[str]:
-    """Extract product page URLs from a listing page HTML.
-
-    Uses verified selectors from scraper_analysis:
-      - container: [data-cy="product-grid-item"]
-      - link: [data-cy="product-grid-item"] a[href]
-    Filters to keep only URLs matching the product URL pattern.
-    """
-    links: list[str] = []
-
-    # Primary: extract from product grid containers
-    try:
-        containers = soup.select(ITEM_CONTAINER_SELECTOR)
-        for container in containers:
-            for link_el in container.select("a[href]"):
-                href = link_el.get("href", "")
-                if href:
-                    full_url = urljoin(SITE_URL, href)
-                    if PRODUCT_URL_REGEX.search(full_url):
-                        links.append(full_url)
-    except Exception as exc:
-        logger.warning("Error extracting item links from containers: %s", exc)
-
-    # Fallback: direct link selector
-    if not links:
-        try:
-            for link_el in soup.select(ITEM_LINK_SELECTOR):
-                href = link_el.get("href", "")
-                if href:
-                    full_url = urljoin(SITE_URL, href)
-                    if PRODUCT_URL_REGEX.search(full_url):
-                        links.append(full_url)
-        except Exception as exc:
-            logger.warning("Fallback link extraction failed: %s", exc)
-
-    return links
-
-
-def _build_paged_url(base_url: str, page_num: int) -> str:
-    """Build a paginated URL by appending the pnum parameter."""
-    parsed = urlparse(base_url)
-    params = parse_qs(parsed.query)
-    params["pnum"] = [str(page_num)]
-    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{urlencode(params, doseq=True)}"
-
-
-def discover_urls_via_search(
+def _discover_urls_via_search(
+    page,
     query: str,
     max_pages: Optional[int] = None,
     limit: Optional[int] = None,
-) -> list[str]:
-    """Phase 1a: Discover product URLs by searching the site.
+) -> tuple[list[str], str]:
+    """Phase 1: Discover product URLs by searching the site.
 
-    Uses the verified working search URL pattern from navigation_analysis.
+    Returns a tuple of (discovered_urls, search_url_used).
     """
-    if query == "lingerie":
-        search_url = SEARCH_WORKING_URL
-    else:
-        # Construct search URL using the known pattern
-        search_url = f"{SITE_URL}/search?st={query}"
+    # Build search URL by appending ?st={query} to the lingerie category page
+    search_url = f"https://www.adameve.com/lingerie-ch-951.aspx?st={query}"
+    logger.info("Phase 1: Searching for '%s' → %s", query, search_url)
 
-    logger.info("Phase 1: Searching for '%s' -> %s", query, search_url)
-    all_urls: list[str] = []
-
-    # Page 1
     try:
-        soup, _resp = fetch_soup(search_url)
-        page_urls = _extract_product_links_from_html(soup)
-        new_urls = [u for u in page_urls if u not in all_urls]
-        all_urls.extend(new_urls)
-        logger.info(
-            "Phase 1: Page 1 -> %d items (%d new)", len(page_urls), len(new_urls)
-        )
+        page.goto(search_url, timeout=PAGE_LOAD_TIMEOUT)
+        page.wait_for_load_state("networkidle")
+        time.sleep(2)
     except Exception as exc:
-        logger.error("Phase 1: Failed to fetch search page: %s", exc)
-        return all_urls[:limit] if limit else all_urls
+        logger.error("Phase 1: Failed to load search page: %s", exc)
+        return [], search_url
 
-    # Paginate via pnum parameter
-    current_page = 1
-    while True:
-        if max_pages and current_page >= max_pages:
-            logger.info("Phase 1: Reached max_pages=%d", max_pages)
-            break
+    all_urls: list[str] = _extract_item_links(page)
+    logger.info("Phase 1: Initial page → %d product links found", len(all_urls))
+
+    # Handle load-more pagination
+    pages_loaded = 1
+    while pages_loaded < (max_pages or MAX_PAGES):
         if limit and len(all_urls) >= limit:
             logger.info("Phase 1: Reached limit=%d", limit)
             break
 
-        current_page += 1
-        next_url = _build_paged_url(search_url, current_page)
-
-        try:
-            soup, _resp = fetch_soup(next_url)
-            page_urls = _extract_product_links_from_html(soup)
-            new_urls = [u for u in page_urls if u not in all_urls]
-
-            if not new_urls:
-                logger.info(
-                    "Phase 1: No new items on page %d, stopping", current_page
-                )
-                break
-
-            all_urls.extend(new_urls)
-            logger.info(
-                "Phase 1: Page %d -> %d items (%d new)",
-                current_page,
-                len(page_urls),
-                len(new_urls),
-            )
-        except Exception as exc:
-            logger.warning("Phase 1: Failed to fetch page %d: %s", current_page, exc)
+        loaded_more = _click_load_more(page)
+        if not loaded_more:
+            logger.info("Phase 1: No more items to load (page %d)", pages_loaded)
             break
 
-    unique_urls = list(dict.fromkeys(all_urls))
-    if limit:
-        unique_urls = unique_urls[:limit]
-    logger.info("Phase 1: Discovered %d total product URLs via search", len(unique_urls))
-    return unique_urls
-
-
-def discover_urls_via_category(
-    category_url: str,
-    max_pages: Optional[int] = None,
-    limit: Optional[int] = None,
-) -> list[str]:
-    """Phase 1b: Discover product URLs from a category page.
-
-    Uses pnum pagination parameter.
-    """
-    logger.info("Phase 1: Browsing category -> %s", category_url)
-    all_urls: list[str] = []
-
-    try:
-        soup, _resp = fetch_soup(category_url)
-        page_urls = _extract_product_links_from_html(soup)
-        new_urls = [u for u in page_urls if u not in all_urls]
-        all_urls.extend(new_urls)
+        time.sleep(2)
+        new_urls = _extract_item_links(page)
+        new_count = len(set(new_urls) - set(all_urls))
         logger.info(
-            "Phase 1: Page 1 -> %d items (%d new)", len(page_urls), len(new_urls)
+            "Phase 1: After load-more #%d → %d total links (%d new)",
+            pages_loaded,
+            len(new_urls),
+            new_count,
         )
-    except Exception as exc:
-        logger.error("Phase 1: Failed to fetch category page: %s", exc)
-        return all_urls[:limit] if limit else all_urls
 
-    current_page = 1
-    while True:
-        if max_pages and current_page >= max_pages:
-            break
-        if limit and len(all_urls) >= limit:
+        if new_count == 0:
+            logger.info("Phase 1: No new items after load-more, stopping")
             break
 
-        current_page += 1
-        next_url = _build_paged_url(category_url, current_page)
-
-        try:
-            soup, _resp = fetch_soup(next_url)
-            page_urls = _extract_product_links_from_html(soup)
-            new_urls = [u for u in page_urls if u not in all_urls]
-
-            if not new_urls:
-                logger.info(
-                    "Phase 1: No new items on category page %d, stopping", current_page
-                )
-                break
-
-            all_urls.extend(new_urls)
-            logger.info(
-                "Phase 1: Category page %d -> %d items (%d new)",
-                current_page,
-                len(page_urls),
-                len(new_urls),
-            )
-        except Exception:
-            break
+        all_urls = list(dict.fromkeys(all_urls + new_urls))
+        pages_loaded += 1
 
     unique_urls = list(dict.fromkeys(all_urls))
     if limit:
         unique_urls = unique_urls[:limit]
-    logger.info(
-        "Phase 1: Discovered %d product URLs from category", len(unique_urls)
-    )
-    return unique_urls
+
+    logger.info("Phase 1: Discovered %d unique product URLs", len(unique_urls))
+    return unique_urls, search_url
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 2: PRODUCT EXTRACTION
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _get_meta(soup: BeautifulSoup, property_name: str) -> Optional[str]:
-    """Get content attribute of a meta tag by its property name."""
-    meta = soup.find("meta", attrs={"property": property_name})
-    if meta:
-        return (meta.get("content") or "").strip()
-    return None
-
-
-def _extract_server_side_events(html: str) -> Optional[dict]:
-    """Extract and parse the serverSideEvents JS variable from inline <script>.
-
-    The dataLayer contains: ProductName, Price, Brand, Sku, Colors, Sizes,
-    dimension11 (availability), dimension12 (review_count), dimension13 (rating),
-    ecommerce.detail.products[0].category, etc.
-    """
+def _click_load_more(page) -> bool:
+    """Click the load-more button. Returns True if clicked successfully."""
     try:
-        match = SERVER_SIDE_EVENTS_REGEX.search(html)
-        if match:
-            data = json.loads(match.group(1))
-            if data and isinstance(data, list) and len(data) > 0:
-                return data[0]
-    except (json.JSONDecodeError, IndexError) as exc:
-        logger.warning("Failed to parse serverSideEvents: %s", exc)
-    return None
+        btn = page.query_selector(LOAD_MORE_SELECTOR)
+        if not btn:
+            logger.info("Phase 1: Load-more button not found")
+            return False
 
+        # Check if button is visible and enabled
+        is_visible = btn.is_visible()
+        if not is_visible:
+            logger.info("Phase 1: Load-more button not visible")
+            return False
 
-def _detect_soft_404(
-    soup: BeautifulSoup, requested_url: str, final_url: str
-) -> Optional[str]:
-    """Detect soft 404 pages and return a description, or None if valid.
-
-    Checks:
-    1. Final URL after redirects differs from product URL pattern
-    2. Page title / H1 contains not-found indicators
-    3. og:type is not 'product'
-    """
-    # Check redirect to non-product page
-    if final_url != requested_url and not PRODUCT_URL_REGEX.search(final_url):
-        return f"Soft 404: redirected to non-product page {final_url}"
-
-    # Check H1 text
-    h1 = soup.select_one("h1")
-    if h1:
-        h1_text = h1.get_text(strip=True).lower()
-        indicators = [
-            "not found",
-            "unavailable",
-            "discontinued",
-            "no longer available",
-            "page not found",
-            "404",
-            "product not found",
-            "item not found",
-        ]
-        for indicator in indicators:
-            if indicator in h1_text:
-                return f"Soft 404: H1 contains '{indicator}'"
-
-    # Check title tag
-    title_tag = soup.find("title")
-    if title_tag:
-        title_text = title_tag.get_text(strip=True).lower()
-        for indicator in ["not found", "404", "page not found"]:
-            if indicator in title_text:
-                return "Soft 404: page title indicates missing product"
-
-    # Check og:type
-    og_type = _get_meta(soup, "og:type")
-    if og_type and og_type.strip().lower() != "product":
-        return f"Soft 404: og:type is '{og_type}' not 'product'"
-
-    return None
-
-
-def _extract_gallery_images(soup: BeautifulSoup, og_image: Optional[str]) -> list[str]:
-    """Extract product gallery images scoped to product containers.
-
-    Rules:
-    - Scope to product gallery containers only
-    - Skip brand assets, emoji, flags, icons, navigation, logos
-    - Cap at 15 images
-    """
-    images: list[str] = []
-    if og_image:
-        full = urljoin(SITE_URL, og_image) if og_image.startswith("/") else og_image
-        images.append(full)
-
-    skip_patterns = [
-        "/brand.assets/",
-        "/emoji/",
-        "/flags/",
-        "/icon/",
-        "/navigation/",
-        "/logo",
-    ]
-
-    # Try known product gallery selectors
-    gallery_selectors = [
-        '[data-auto-id="product-image"] img',
-        ".product-gallery img",
-        "#pdp-gallery img",
-        '[data-testid*="gallery"] img',
-        ".main-image img",
-        ".pdp-image img",
-        ".product-detail img",
-    ]
-
-    for selector in gallery_selectors:
-        try:
-            img_els = soup.select(selector)
-            for img_el in img_els:
-                src = (
-                    img_el.get("src")
-                    or img_el.get("data-src")
-                    or img_el.get("data-lazy-src")
-                    or ""
-                )
-                if not src:
-                    continue
-                full_src = urljoin(SITE_URL, src) if src.startswith("/") else src
-
-                # Skip non-product images
-                src_lower = src.lower()
-                if any(p in src_lower for p in skip_patterns):
-                    continue
-                # Skip tiny images (likely icons/badges)
-                if "1x1" in src or "blank.gif" in src:
-                    continue
-
-                if full_src not in images:
-                    images.append(full_src)
-        except Exception:
-            continue
-
-        if len(images) > 2:
-            break
-
-    return images[:15]
-
-
-def extract_product_data(url: str, src_url: str) -> dict:
-    """Phase 2: Extract structured product data from a single product page.
-
-    Primary data source: OG meta tags
-    Secondary data source: serverSideEvents dataLayer variable
-    Clean title: h1 element
-    """
-    try:
-        response = fetch_page(url, timeout=15)
+        # Scroll button into view and click
+        btn.scroll_into_view_if_needed()
+        time.sleep(0.5)
+        btn.click()
+        # Wait for new content to load
+        page.wait_for_timeout(3000)
+        return True
     except Exception as exc:
+        logger.warning("Phase 1: Error clicking load-more: %s", exc)
+        return False
+
+
+def _extract_item_links(page) -> list[str]:
+    """Extract product page URLs from a listing page."""
+    links: list[str] = []
+    seen: set[str] = set()
+
+    try:
+        containers = page.query_selector_all(ITEM_CONTAINER_SELECTOR)
+        logger.debug("Phase 1: Found %d product grid containers", len(containers))
+
+        for container in containers:
+            link_elements = container.query_selector_all(ITEM_LINK_SELECTOR)
+            for link_el in link_elements:
+                href = link_el.get_attribute("href") or ""
+                if href:
+                    full_url = _normalize_url(href)
+                    # Strip query params for dedup
+                    clean_url = full_url.split("?")[0]
+                    if clean_url not in seen and _is_valid_product_url(clean_url):
+                        seen.add(clean_url)
+                        links.append(full_url)
+    except Exception as exc:
+        logger.warning("Phase 1: Error extracting item links from containers: %s", exc)
+
+    # Fallback: try without container
+    if not links:
+        try:
+            link_elements = page.query_selector_all(ITEM_LINK_SELECTOR)
+            for link_el in link_elements:
+                href = link_el.get_attribute("href") or ""
+                if href:
+                    full_url = _normalize_url(href)
+                    clean_url = full_url.split("?")[0]
+                    if clean_url not in seen and _is_valid_product_url(clean_url):
+                        seen.add(clean_url)
+                        links.append(full_url)
+        except Exception as exc:
+            logger.warning("Phase 1: Fallback link extraction failed: %s", exc)
+
+    return links
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 2: ITEM EXTRACTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _extract_product_data(page, url: str, src_url: str) -> dict:
+    """Phase 2: Extract structured product data from a product page."""
+    original_url = url
+
+    try:
+        page.goto(url, timeout=PAGE_LOAD_TIMEOUT)
+        page.wait_for_load_state("networkidle")
+        time.sleep(1)
+    except Exception as exc:
+        logger.error("Phase 2: Failed to load %s: %s", url[:80], exc)
         return _error_product(url, src_url, str(exc))
 
-    status_code = response.status_code
-    final_url = response.url
-    html = response.text
-    soup = BeautifulSoup(html, "html.parser")
+    final_url = page.url
+    status_code = 200
 
     product: dict = {
         "id": 0,
@@ -488,205 +311,313 @@ def extract_product_data(url: str, src_url: str) -> dict:
         "availability": "",
         "original_price": "",
         "currency": "",
-        "url": final_url,
+        "url": original_url,
         "src_url": src_url,
         "location": "",
         "status_code": status_code,
         "scraped_at": datetime.now(timezone.utc).isoformat(),
         "remarks": "",
         "brand": "",
+        "description": "",
         "sku": "",
+        "mpn": "",
         "rating": "",
         "review_count": "",
         "category": "",
-        "description": "",
         "images": [],
-        "variants_colors": [],
-        "variants_sizes": [],
+        "variants": [],
     }
 
-    # ── Soft 404 detection ──────────────────────────────────────────────
-    soft_404 = _detect_soft_404(soup, url, final_url)
-    if soft_404:
-        product["remarks"] = soft_404
-        logger.warning("Soft 404 detected: %s -> %s", url[:80], soft_404)
-        return product
+    try:
+        # ── JSON-LD Extraction ──────────────────────────────────────────
+        json_ld_blocks = page.evaluate(
+            "() => { "
+            "  var scripts = document.querySelectorAll('script[type=\"application/ld+json\"]'); "
+            "  var results = []; "
+            "  for (var i = 0; i < scripts.length; i++) { "
+            "    try { results.push(JSON.parse(scripts[i].textContent)); } "
+            "    catch(e) { results.push(null); } "
+            "  } "
+            "  return results; "
+            "}"
+        )
 
-    # ── OG Meta Tags (primary data source) ──────────────────────────────
-    og_title = _get_meta(soup, "og:title")
-    og_url = _get_meta(soup, "og:url")
-    og_desc = _get_meta(soup, "og:description")
-    og_image = _get_meta(soup, "og:image")
-    og_price_amount = _get_meta(soup, "og:price:amount")
-    og_price_currency = _get_meta(soup, "og:price:currency")
-    og_brand = _get_meta(soup, "og:brand")
-    og_availability = _get_meta(soup, "og:availability")
+        product_found = False
+        breadcrumb_parts = []
 
-    # ── serverSideEvents dataLayer (secondary) ──────────────────────────
-    sse = _extract_server_side_events(html)
+        for block in json_ld_blocks:
+            if not block:
+                continue
+            block_type = block.get("@type", "")
 
-    # ── Title: prefer h1 (clean name) over OG title (includes branding) ──
-    h1 = soup.select_one("h1")
-    if h1:
-        product["title"] = h1.get_text(strip=True)
-    elif og_title:
-        product["title"] = og_title
+            # Extract category from BreadcrumbList
+            if isinstance(block_type, str) and block_type == "BreadcrumbList":
+                items = block.get("itemListElement", [])
+                for item in items:
+                    pos = item.get("position", 0)
+                    name = item.get("name", "")
+                    if pos >= 2:  # Skip root (position 1 = "Adam & Eve")
+                        breadcrumb_parts.append(name)
 
-    # ── URL ──────────────────────────────────────────────────────────────
-    if og_url:
-        product["url"] = og_url
+            # Extract product data from Product block
+            if isinstance(block_type, str) and block_type == "Product":
+                product_found = True
+                _extract_from_jsonld(block, product)
 
-    # ── Price ────────────────────────────────────────────────────────────
-    if og_price_amount:
+        if breadcrumb_parts:
+            product["category"] = " > ".join(breadcrumb_parts)
+
+        # ── Soft 404 Detection ──────────────────────────────────────────
+        h1_text = ""
         try:
-            price_val = float(og_price_amount)
-            currency = og_price_currency or "USD"
-            product["currency"] = currency
-            product["price"] = f"${price_val:,.2f}"
-        except ValueError:
-            product["price"] = og_price_amount
-            product["currency"] = og_price_currency or "USD"
-    elif sse and sse.get("Price"):
-        try:
-            price_val = float(str(sse["Price"]))
-            product["price"] = f"${price_val:,.2f}"
-        except ValueError:
-            product["price"] = str(sse["Price"])
-        product["currency"] = "USD"
-
-    # ── Original Price: empty unless a clear "was" price is visible ──────
-    # OG price:amount IS the regular/list price. Look for a visible sale price
-    # in the HTML that doesn't require a promo code.
-    # For simplicity, leave original_price empty (price is the current price).
-    product["original_price"] = ""
-
-    # ── Availability ────────────────────────────────────────────────────
-    if og_availability:
-        avail_lower = og_availability.lower()
-        if avail_lower == "instock" or "in" in avail_lower:
-            product["availability"] = "In Stock"
-        elif "out" in avail_lower or "oos" in avail_lower or "discontinu" in avail_lower:
-            product["availability"] = "Out of Stock"
-        else:
-            product["availability"] = "In Stock"
-    elif sse:
-        dim11 = str(sse.get("dimension11", ""))
-        if "In Stock" in dim11:
-            product["availability"] = "In Stock"
-        elif "Out of Stock" in dim11 or "Out" in dim11:
-            product["availability"] = "Out of Stock"
-        elif dim11:
-            product["availability"] = dim11
-        else:
-            product["availability"] = "In Stock"
-    else:
-        product["availability"] = "In Stock"
-
-    # ── Currency ─────────────────────────────────────────────────────────
-    if not product["currency"]:
-        product["currency"] = og_price_currency or "USD"
-
-    # ── Brand ──────────────────────────────────────────────────────────
-    if og_brand:
-        product["brand"] = og_brand
-    elif sse and sse.get("Brand"):
-        product["brand"] = str(sse["Brand"])
-
-    # ── SKU ─────────────────────────────────────────────────────────────
-    if sse and sse.get("Sku"):
-        product["sku"] = str(sse["Sku"])
-
-    # ── Rating (round to 1 decimal) ────────────────────────────────────
-    if sse and sse.get("dimension13") is not None:
-        try:
-            rating = float(sse["dimension13"])
-            product["rating"] = f"{rating:.1f}"
-        except (ValueError, TypeError):
-            product["rating"] = str(sse["dimension13"])
-
-    # ── Review Count ───────────────────────────────────────────────────
-    if sse and sse.get("dimension12") is not None:
-        try:
-            rc = int(float(str(sse["dimension12"])))
-            product["review_count"] = str(rc)
-        except (ValueError, TypeError):
-            product["review_count"] = str(sse["dimension12"])
-
-    # ── Category ─────────────────────────────────────────────────────────
-    if sse:
-        try:
-            ecommerce = sse.get("ecommerce", {})
-            detail = ecommerce.get("detail", {})
-            prods = detail.get("products", [])
-            if isinstance(prods, list) and prods:
-                cat = prods[0].get("category", "")
-                if cat:
-                    product["category"] = cat
-        except (AttributeError, IndexError, TypeError):
-            pass
-
-    # ── Description ──────────────────────────────────────────────────────
-    if og_desc:
-        product["description"] = og_desc
-    else:
-        # Fallback: look for a description section
-        try:
-            desc_el = soup.select_one("meta[name='description']")
-            if desc_el:
-                product["description"] = desc_el.get("content", "")
+            h1_el = page.query_selector("h1")
+            if h1_el:
+                h1_text = (h1_el.text_content() or "").strip()
         except Exception:
             pass
 
-    # ── Images (scoped to product gallery) ───────────────────────────────
-    product["images"] = _extract_gallery_images(soup, og_image)
+        soft_404 = _check_soft_404(product.get("title", ""), h1_text, final_url, original_url)
+        if soft_404:
+            product["remarks"] = soft_404
+            if not product_found:
+                # No Product JSON-LD found — likely not a product page
+                product["availability"] = "Out of Stock"
+                return product
 
-    # ── Variants: Colors ────────────────────────────────────────────────
-    if sse and sse.get("Colors"):
-        colors = sse["Colors"]
-        if isinstance(colors, list):
-            product["variants_colors"] = colors
-        elif isinstance(colors, str):
-            product["variants_colors"] = [c.strip() for c in colors.split(",") if c.strip()]
+        # ── CSS Fallback Extraction (for fields JSON-LD misses) ────────
+        _extract_from_css(page, product)
 
-    # ── Variants: Sizes (dataLayer often empty, CSS fallback) ───────────
-    sizes: list[str] = []
-    if sse and sse.get("Sizes"):
-        sz = sse["Sizes"]
-        if isinstance(sz, list) and sz:
-            sizes = sz
-        elif isinstance(sz, str) and sz.strip():
-            sizes = [s.strip() for s in sz.split(",") if s.strip()]
+        # ── Format Fields ───────────────────────────────────────────────
+        _format_product_fields(product)
 
-    # CSS fallback for sizes: look for size-related selects/options
-    if not sizes:
-        try:
-            for sel in soup.select("select"):
-                prev_label = sel.find_previous("label")
-                prev_span = sel.find_previous("span")
-                context_text = ""
-                if prev_label:
-                    context_text = prev_label.get_text(strip=True).lower()
-                elif prev_span:
-                    context_text = prev_span.get_text(strip=True).lower()
-                if "size" in context_text:
-                    options = sel.select("option[value]")
-                    sizes = [
-                        opt.get_text(strip=True)
-                        for opt in options
-                        if opt.get("value") and opt.get_text(strip=True)
-                    ]
-                    if sizes:
-                        break
-        except Exception:
-            pass
-
-    product["variants_sizes"] = sizes
+    except Exception as exc:
+        logger.warning("Phase 2: Extraction error for %s: %s", url[:60], exc)
+        product["remarks"] = f"Partial extraction error: {str(exc)[:200]}"
 
     return product
 
 
+def _extract_from_jsonld(block: dict, product: dict) -> None:
+    """Extract fields from a JSON-LD Product block.
+
+    Adam & Eve uses capitalized field names: Name, Mpn, Image, Description, Brand, Offers.
+    """
+    # Title — try Name (capitalized) then name (lowercase)
+    product["title"] = block.get("Name") or block.get("name") or ""
+
+    # SKU / MPN
+    product["sku"] = block.get("Mpn") or block.get("mpn") or ""
+    product["mpn"] = product["sku"]
+
+    # Description
+    product["description"] = block.get("Description") or block.get("description") or ""
+
+    # Brand
+    brand = block.get("Brand") or block.get("brand")
+    if isinstance(brand, dict):
+        product["brand"] = brand.get("Name") or brand.get("name") or ""
+    elif isinstance(brand, str):
+        product["brand"] = brand
+
+    # Images
+    images = block.get("Image") or block.get("image") or []
+    if isinstance(images, str):
+        images = [images]
+    product["images"] = images
+
+    # Offers — handle both capitalized and lowercase field names
+    offers = block.get("Offers") or block.get("offers") or {}
+    if isinstance(offers, list) and offers:
+        offers = offers[0]
+
+    if isinstance(offers, dict):
+        # Price — regular list price from JSON-LD
+        raw_price = offers.get("Price") or offers.get("price") or ""
+        if raw_price:
+            product["original_price"] = str(raw_price)
+
+        # Currency
+        currency = offers.get("PriceCurrency") or offers.get("priceCurrency") or "USD"
+        product["currency"] = currency
+
+        # Availability
+        avail = offers.get("Availability") or offers.get("availability") or ""
+        product["availability"] = _map_availability(avail)
+
+    # Rating
+    aggregate = block.get("AggregateRating") or block.get("aggregateRating")
+    if isinstance(aggregate, dict):
+        rating_val = aggregate.get("RatingValue") or aggregate.get("ratingValue")
+        if rating_val is not None:
+            product["rating"] = str(round(float(rating_val), 1))
+
+        review_count = aggregate.get("ReviewCount") or aggregate.get("reviewCount")
+        if review_count is not None:
+            product["review_count"] = str(int(review_count))
+
+
+def _extract_from_css(page, product: dict) -> None:
+    """Extract fields from the DOM using CSS selectors.
+
+    Used for promo price (not in JSON-LD), images, and variants.
+    """
+    # ── Promo/Sale Price (CSS primary) ──────────────────────────────────
+    if not product.get("price"):
+        try:
+            promo_price = page.evaluate(
+                "() => { "
+                "  var el = document.querySelector('#product-details .jcpoffer-pricerange.v1'); "
+                "  if (el) return el.textContent.trim(); "
+                "  el = document.querySelector('.jcpoffer-pricerange'); "
+                "  if (el) return el.textContent.trim(); "
+                "  return ''; "
+                "}"
+            )
+            if promo_price:
+                product["price"] = promo_price.strip()
+        except Exception:
+            pass
+
+    # ── Title fallback ───────────────────────────────────────────────────
+    if not product.get("title"):
+        try:
+            h1 = page.query_selector("h1.item_title")
+            if h1:
+                product["title"] = (h1.text_content() or "").strip()
+            else:
+                h1 = page.query_selector("h1")
+                if h1:
+                    product["title"] = (h1.text_content() or "").strip()
+        except Exception:
+            pass
+
+    # ── Original Price (CSS fallback) ───────────────────────────────────
+    if not product.get("original_price"):
+        try:
+            was_price = page.evaluate(
+                "() => { "
+                "  var el = document.querySelector('#product-details .ae-price--normal'); "
+                "  if (el) return el.textContent.trim(); "
+                "  el = document.querySelector('.ae-price--was.v1'); "
+                "  if (el) return el.textContent.trim(); "
+                "  return ''; "
+                "}"
+            )
+            if was_price:
+                # Extract numeric value from e.g. "Reg $54.99"
+                match = re.search(r"[\d,]+\.?\d*", was_price)
+                if match:
+                    product["original_price"] = match.group(0)
+        except Exception:
+            pass
+
+    # ── Currency fallback (meta tag) ─────────────────────────────────────
+    if not product.get("currency"):
+        try:
+            currency = page.evaluate(
+                "() => { "
+                "  var el = document.querySelector('meta[property=\"og:price:currency\"]'); "
+                "  return el ? el.getAttribute('content') : ''; "
+                "}"
+            )
+            if currency:
+                product["currency"] = currency
+        except Exception:
+            pass
+
+    # ── Images (product gallery only) ───────────────────────────────────
+    if not product.get("images"):
+        try:
+            gallery_images = page.evaluate(
+                "() => { "
+                "  var imgs = document.querySelectorAll('.ae-pdp-thumb img'); "
+                "  var result = []; "
+                "  for (var i = 0; i < imgs.length; i++) { "
+                "    var src = imgs[i].src || imgs[i].getAttribute('data-src') || ''; "
+                "    if (src && src.indexOf('/cms/image/') !== -1) { "
+                "      result.push(src); "
+                "    } "
+                "  } "
+                "  return result; "
+                "}"
+            )
+            if gallery_images:
+                product["images"] = gallery_images
+        except Exception:
+            pass
+
+        # Fallback to og:image if no gallery images
+        if not product.get("images"):
+            try:
+                og_image = page.evaluate(
+                    "() => { "
+                    "  var el = document.querySelector('meta[property=\"og:image\"]'); "
+                    "  return el ? el.getAttribute('content') : ''; "
+                    "}"
+                )
+                if og_image:
+                    product["images"] = [og_image]
+            except Exception:
+                pass
+
+    # ── Variants (size options) ──────────────────────────────────────────
+    try:
+        variants = page.evaluate(
+            "() => { "
+            "  var els = document.querySelectorAll('.ae-sizes__text.size-swatch'); "
+            "  var result = []; "
+            "  for (var i = 0; i < els.length; i++) { "
+            "    var text = els[i].textContent.trim(); "
+            "    if (text) result.push(text); "
+            "  } "
+            "  return result; "
+            "}"
+        )
+        if variants:
+            product["variants"] = variants
+    except Exception:
+        pass
+
+    # ── Description fallback ───────────────────────────────────────────
+    if not product.get("description"):
+        try:
+            desc_el = page.query_selector(".ae-product-description")
+            if desc_el:
+                product["description"] = (desc_el.text_content() or "").strip()
+        except Exception:
+            pass
+
+
+def _format_product_fields(product: dict) -> None:
+    """Format and validate extracted product fields."""
+    # Ensure price has currency symbol
+    if product.get("price"):
+        price = product["price"]
+        if not re.match(r"^[\$\€\£\¥]", price):
+            currency = product.get("currency", "USD")
+            symbol = {"USD": "$", "EUR": "€", "GBP": "£"}.get(currency, "$")
+            product["price"] = f"{symbol}{price}"
+
+    # Ensure original_price has currency symbol
+    if product.get("original_price"):
+        orig = product["original_price"]
+        if not re.match(r"^[\$\€\£\¥]", orig):
+            currency = product.get("currency", "USD")
+            symbol = {"USD": "$", "EUR": "€", "GBP": "£"}.get(currency, "$")
+            product["original_price"] = f"{symbol}{orig}"
+
+    # If no promo price found, use original_price as price
+    if not product.get("price") and product.get("original_price"):
+        product["price"] = product["original_price"]
+        product["original_price"] = ""
+
+    # Clean up description length
+    if product.get("description") and len(product["description"]) > 2000:
+        product["description"] = product["description"][:2000] + "..."
+
+
 def _error_product(url: str, src_url: str, error: str) -> dict:
-    """Create an error product record with empty defaults."""
+    """Create an error product record."""
     return {
         "id": 0,
         "title": "",
@@ -701,14 +632,14 @@ def _error_product(url: str, src_url: str, error: str) -> dict:
         "scraped_at": datetime.now(timezone.utc).isoformat(),
         "remarks": f"Error: {error[:200]}",
         "brand": "",
+        "description": "",
         "sku": "",
+        "mpn": "",
         "rating": "",
         "review_count": "",
         "category": "",
-        "description": "",
         "images": [],
-        "variants_colors": [],
-        "variants_sizes": [],
+        "variants": [],
     }
 
 
@@ -717,133 +648,147 @@ def _error_product(url: str, src_url: str, error: str) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def main() -> None:
+def main():
     parser = argparse.ArgumentParser(description=f"{SITE_NAME} Navigation Scraper")
-    parser.add_argument(
-        "--query", type=str, help="Search query for Phase 1 navigation"
-    )
-    parser.add_argument(
-        "--category-url", type=str, help="Category URL for Phase 1 discovery"
-    )
-    parser.add_argument(
-        "--input", type=str, dest="input_file", help="Path to input URLs JSON file"
-    )
+    parser.add_argument("--query", type=str, help="Search query for discovery mode")
+    parser.add_argument("--input", type=str, help="Path to input URLs JSON file")
     parser.add_argument("--urls", nargs="+", help="Product URLs as CLI arguments")
-    parser.add_argument(
-        "--sample", action="store_true", help="Scrape first 5 items only"
-    )
+    parser.add_argument("--sample", action="store_true", help="Scrape first 5 items only")
     parser.add_argument("--limit", type=int, default=None, help="Max items to scrape")
-    parser.add_argument(
-        "--no-proxy",
-        action="store_true",
-        default=True,
-        help="Disable proxy (default for this site)",
-    )
-    args = parser.parse_args()
+    parser.add_argument("--no-proxy", action="store_true", default=True, help="No proxy (default)")
+    parser.add_argument("--headless", action="store_true", default=True, help="Headless mode")
+    parser.add_argument("--xvfb", action="store_true", default=True, help=argparse.SUPPRESS)
+    args, _ = parser.parse_known_args()
 
     limit = 5 if args.sample else args.limit
+
     start_time = time.time()
     discovered_urls: list[str] = []
-    src_url_base: str = ""
+    src_url_base = SITE_URL
 
     logger.info("=" * 80)
     logger.info("Starting scraper for %s", SITE_NAME)
-    logger.info("Strategy: %s", SCRAPING_METHOD)
-    logger.info("Delay: %ss", DELAY)
     logger.info("=" * 80)
 
-    # ── Determine URL source ────────────────────────────────────────────
-    if args.urls:
-        # Direct URLs from CLI
-        discovered_urls = list(args.urls)
-        src_url_base = SITE_URL
-        logger.info("Using %d URLs from CLI arguments", len(discovered_urls))
-
-    elif args.input_file:
-        # URLs from input file
-        try:
-            with open(args.input_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            discovered_urls = data.get("urls", [])
-            src_url_base = SITE_URL
-            logger.info("Loaded %d URLs from %s", len(discovered_urls), args.input_file)
-        except Exception as exc:
-            logger.error("Failed to read input file: %s", exc)
-            sys.exit(1)
-
-    elif args.category_url:
-        # Phase 1: Category discovery
-        discovered_urls = discover_urls_via_category(
-            args.category_url, MAX_PAGES, limit
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=args.headless,
+            args=[],
         )
-        src_url_base = args.category_url
+        context = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
 
-    else:
-        # Phase 1: Search discovery (default)
-        query = args.query or DEFAULT_QUERY
-        discovered_urls = discover_urls_via_search(query, MAX_PAGES, limit)
-        src_url_base = SEARCH_WORKING_URL
+        # ── Determine URL source ────────────────────────────────────────
+        if args.input:
+            # Read from input file (--input mode)
+            try:
+                with open(args.input, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    discovered_urls = data.get("urls", [])
+                logger.info("Loaded %d URLs from %s", len(discovered_urls), args.input)
+            except Exception as exc:
+                logger.error("Failed to read input file: %s", exc)
+                browser.close()
+                sys.exit(1)
+            src_url_base = ""
 
-    if not discovered_urls:
-        logger.warning("No product URLs to scrape")
-        sys.exit(0)
+        elif args.urls:
+            # Use URLs from CLI (--urls mode)
+            discovered_urls = list(args.urls)
+            logger.info("Using %d URLs from CLI arguments", len(discovered_urls))
+            src_url_base = ""
 
-    if limit:
-        discovered_urls = discovered_urls[:limit]
+        elif args.query:
+            # Phase 1: Search discovery (--query mode)
+            discovered_urls, src_url_base = _discover_urls_via_search(
+                page, args.query, MAX_PAGES, limit
+            )
 
-    total = len(discovered_urls)
-    logger.info("Total products to scrape: %d", total)
-    logger.info("=" * 80)
+        else:
+            # Default: Phase 1 search discovery with DEFAULT_QUERY
+            logger.info("No --query/--input/--urls provided; using default search: '%s'", DEFAULT_QUERY)
+            discovered_urls, src_url_base = _discover_urls_via_search(
+                page, DEFAULT_QUERY, MAX_PAGES, limit
+            )
 
-    # ── Phase 2: Extract data from each URL ────────────────────────────
-    results: list[dict] = []
-    success_count = 0
-    failed_count = 0
+        # Apply limit
+        if limit and len(discovered_urls) > limit:
+            discovered_urls = discovered_urls[:limit]
 
-    for i, url in enumerate(discovered_urls, 1):
-        # Progress logging every 25 items and at boundaries
-        if i == 1 or i == total or i % 25 == 0:
-            percent = (i / total) * 100
-            logger.info("Progress: [%d/%d] (%.1f%%)", i, total, percent)
+        if not discovered_urls:
+            logger.warning("No product URLs to scrape")
+            browser.close()
+            sys.exit(0)
 
-        logger.info("Scraping: %s", url[:100])
+        logger.info("Total products to scrape: %d", len(discovered_urls))
+        logger.info("=" * 80)
 
-        try:
-            product = extract_product_data(url, src_url_base)
-            results.append(product)
+        # ── Phase 2: Extract data from each URL ────────────────────────
+        results: list[dict] = []
+        total = len(discovered_urls)
+        success = 0
+        failed = 0
 
-            if product.get("title"):
-                success_count += 1
-            elif "Soft 404" in product.get("remarks", ""):
-                logger.warning("Soft 404 skipped: %s", url[:80])
-                failed_count += 1
+        for i, url in enumerate(discovered_urls, 1):
+            # Determine src_url
+            if src_url_base:
+                item_src_url = src_url_base
+            elif args.input:
+                item_src_url = url
             else:
-                failed_count += 1
-        except Exception as exc:
-            logger.error("Failed to extract %s: %s", url[:80], exc)
-            results.append(_error_product(url, src_url_base, str(exc)))
-            failed_count += 1
+                item_src_url = url
 
-    # Assign sequential IDs
-    for idx, item in enumerate(results, 1):
-        item["id"] = idx
+            if i % 25 == 0 or i == 1:
+                percent = (i / total) * 100
+                logger.info(
+                    "Progress: [%d/%d] (%.1f%%) — Success: %d, Failed: %d",
+                    i, total, percent, success, failed,
+                )
+            logger.info("Scraping: %s", url[:120])
+
+            try:
+                product = _extract_product_data(page, url, item_src_url)
+                product["id"] = i
+                results.append(product)
+
+                if product.get("title") and not product.get("remarks", "").startswith("Error"):
+                    success += 1
+                else:
+                    failed += 1
+            except Exception as exc:
+                logger.error("Failed to extract %s: %s", url[:80], exc)
+                error_prod = _error_product(url, item_src_url, str(exc))
+                error_prod["id"] = i
+                results.append(error_prod)
+                failed += 1
+
+            if i < total:
+                time.sleep(DELAY_BETWEEN_REQUESTS)
+
+        browser.close()
 
     # ── Write output ────────────────────────────────────────────────────
+    duration = round(time.time() - start_time, 2)
+
     output = {
         "site": {
             "name": SITE_NAME,
             "url": SITE_URL,
             "platform": PLATFORM,
-            "scraping_method": f"{SCRAPING_METHOD}_navigation",
+            "scraping_method": "playwright_navigation",
             "scraped_at": datetime.now(timezone.utc).isoformat(),
         },
         OUTPUT_KEY: results,
         "metadata": {
-            "scraping_duration_seconds": round(time.time() - start_time, 2),
-            "failed_products": failed_count,
-            "rate_limit_delay": DELAY,
-            "discovered_urls": total,
-            "extracted_items": len(results),
+            "scraping_duration_seconds": duration,
+            "failed_products": failed,
+            "rate_limit_delay": DELAY_BETWEEN_REQUESTS,
         },
     }
 
@@ -856,10 +801,10 @@ def main() -> None:
     logger.info("=" * 80)
     logger.info("EXTRACTION COMPLETE")
     logger.info(
-        "Total: %d, Success: %d, Failed: %d", total, success_count, failed_count
+        "Total: %d, Success: %d, Failed: %d",
+        len(results), success, failed,
     )
-    logger.info("Duration: %.1fs", time.time() - start_time)
-    logger.info("Output: %s", output_filename)
+    logger.info("Duration: %.1fs → %s", duration, output_filename)
     logger.info("=" * 80)
 
 
