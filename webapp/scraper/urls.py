@@ -67,6 +67,16 @@ urlpatterns = [
         name="approval_inline",
     ),
     path("jobs/<int:job_id>/scraper-code/", views.scraper_code, name="scraper_code"),
+    path(
+        "jobs/<int:job_id>/output/<str:filename>/",
+        views.job_output_view,
+        name="job_output_view",
+    ),
+    path(
+        "jobs/<int:job_id>/output/<str:filename>/download/",
+        views.job_output_download,
+        name="job_output_download",
+    ),
     path("jobs/<int:job_id>/tool-calls/", views.tool_calls_api, name="tool_calls_api"),
     path("jobs/<int:job_id>/agent-summary/", views.agent_summary, name="agent_summary"),
     path("agent-playground/", views.agent_playground, name="agent_playground"),

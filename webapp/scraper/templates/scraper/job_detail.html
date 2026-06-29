@@ -36,6 +36,7 @@
             {% if site %}
             <a href="{% url 'site_detail' site_id=site.pk %}" class="px-3 py-1 text-xs font-medium text-ink-secondary border border-line-strong rounded-md hover:bg-raised transition-colors">View Site</a>
             {% endif %}
+            <a href="{% url 'agent_summary' job_id=job.id %}" class="px-3 py-1 text-xs font-medium text-accent border border-accent/30 rounded-md hover:bg-accent/10 transition-colors">Agent Summary</a>
             {% if is_active %}
             <a href="{% url 'job_cancel' job_id=job.id %}" class="px-3 py-1 text-xs font-medium text-danger border border-danger/30 rounded-md hover:bg-danger/10 transition-colors">Cancel</a>
             {% elif is_terminal %}
@@ -274,7 +275,7 @@
         </div>
         {% endif %}
 
-        {% if output_files and site %}
+        {% if output_files %}
         <div class="panel overflow-hidden">
             <div class="panel-header">
                 <h3 class="text-sm-heading text-ink">Output Files</h3>
@@ -282,8 +283,8 @@
             <div>
                 {% for f in output_files %}
                 <div class="px-4 py-2.5 flex items-center justify-between border-b border-line-subtle last:border-0">
-                    <a href="{% url 'site_output_view' site_id=site.pk filename=f %}" class="text-xs text-accent hover:text-accent-hover truncate max-w-[200px] font-mono">{{ f }}</a>
-                    <a href="{% url 'site_output_download' site_id=site.pk filename=f %}" class="text-ink-muted hover:text-ink-secondary" title="Download">
+                    <a href="{% url 'job_output_view' job_id=job.id filename=f %}" class="text-xs text-accent hover:text-accent-hover truncate max-w-[200px] font-mono">{{ f }}</a>
+                    <a href="{% url 'job_output_download' job_id=job.id filename=f %}" class="text-ink-muted hover:text-ink-secondary" title="Download">
                         <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="currentColor" viewBox="0 0 16 16"><path d="M.5 9.9a.5.5 0 0 1 .5.5.5.5 0 0 1 .5-.5.5.5 0 0 1-.5-.5v-8a.5.5 0 0 1 .5-.5h8a.5.5 0 0 1 .5.5v8a.5.5 0 0 1-.5.5.5.5 0 0 1-.5-.5h-8ZM3.5 1A1.5 1.5 0 0 0 2 2.5V4.5h1V1ZM12 1.5V4.5h1V1.5h-2Z"/></svg>
                     </a>
                 </div>

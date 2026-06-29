@@ -352,8 +352,77 @@ def scraper_code(request, job_id):
     return HttpResponseNotFound("Scraper code not found")
 
 
+def _resolve_job_slug(job):
+    """Resolve the scraper folder slug for a job."""
+    if job.site_folder:
+        return job.site_folder
+    if job.site_name:
+        name_slug = job.site_name.lower().replace(" ", "-").replace(".", "-")
+        for char in name_slug:
+            if not char.isalnum() and char != "-":
+                name_slug = name_slug.replace(char, "-")
+        return name_slug
+    return ""
+
+
 @login_required
-def job_restart(request, job_id):
+def job_output_view(request, job_id, filename):
+    job = get_object_or_404(ScrapeJob, pk=job_id)
+    safe_name = os.path.basename(filename)
+    if not safe_name.endswith(".json"):
+        raise Http404("Only JSON files can be viewed")
+    if "/" in safe_name or "\\" in safe_name:
+        raise Http404("Invalid filename")
+    slug = _resolve_job_slug(job)
+    if not slug:
+        raise Http404("No scraper folder for this job")
+    file_path = os.path.join(settings.PROJECT_ROOT, "scrapers", slug, safe_name)
+    if not os.path.isfile(file_path):
+        raise Http404("File not found")
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        pretty = json.dumps(data, indent=2, ensure_ascii=False)
+    except (json.JSONDecodeError, OSError):
+        raise Http404("Could not read file")
+
+    products = data.get("products", [])
+    download_url = reverse(
+        "job_output_download", kwargs={"job_id": job.id, "filename": safe_name}
+    )
+    return render(
+        request,
+        "scraper/output_view.html",
+        {
+            "job": job,
+            "filename": safe_name,
+            "json_content": pretty,
+            "product_count": len(products),
+            "download_url": download_url,
+        },
+    )
+
+
+@login_required
+def job_output_download(request, job_id, filename):
+    job = get_object_or_404(ScrapeJob, pk=job_id)
+    safe_name = os.path.basename(filename)
+    if not safe_name.endswith(".json"):
+        raise Http404("Only JSON files can be downloaded")
+    if "/" in safe_name or "\\" in safe_name:
+        raise Http404("Invalid filename")
+    slug = _resolve_job_slug(job)
+    if not slug:
+        raise Http404("No scraper folder for this job")
+    file_path = os.path.join(settings.PROJECT_ROOT, "scrapers", slug, safe_name)
+    if not os.path.isfile(file_path):
+        raise Http404("File not found")
+    return FileResponse(
+        open(file_path, "rb"),
+        content_type="application/json",
+        as_attachment=True,
+        filename=safe_name,
+    )
     job = get_object_or_404(ScrapeJob, pk=job_id)
     if job.status in [
         ScrapeJob.STATUS_COMPLETED,
