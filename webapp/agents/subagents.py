@@ -1170,7 +1170,10 @@ def _summarize_test_report(state: dict) -> str:
     if not report:
         return ""
     assessment = report.get("overall_assessment", "UNKNOWN")
-    confidence = report.get("confidence_score", 0.0)
+    try:
+        confidence = float(report.get("confidence_score", 0.0))
+    except (ValueError, TypeError):
+        confidence = 0.0
     issues = report.get("issues", [])
     retry_count = state.get("test_retry_count", 0)
     if retry_count == 99:
@@ -1700,6 +1703,18 @@ def build_code_tester_message(state: dict) -> list:
             f"If the scraper does not pass this test, the job will end.\n"
             f"Read the previous test report at: workspace/{slug}/test_report.json\n\n"
         )
+        human_feedback = state.get("human_feedback", "")
+        if human_feedback:
+            retry_context += (
+                f"### User-Flagged Issue (CRITICAL — verify this is fixed)\n"
+                f"The user specifically reported:\n"
+                f"> {human_feedback}\n\n"
+                f"Your validation MUST specifically check this issue. "
+                f"If it is NOT resolved, this is a FAIL regardless of other "
+                f"field quality. Do NOT give the scraper credit for fixing "
+                f"this issue unless the output JSON demonstrably shows the "
+                f"correct value.\n\n"
+            )
     elif retry_count > 0:
         retry_context = (
             f"\n### RETEST MODE (Cycle {retry_count + 1})\n"

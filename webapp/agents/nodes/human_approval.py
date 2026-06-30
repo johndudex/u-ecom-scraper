@@ -5,8 +5,9 @@ The node reads ``interrupt_reason``, ``interrupt_options`` and
 ``interrupt_decisions`` from state and calls ``langgraph.types.interrupt()``.
 After the user responds, stores ``human_response``.
 
-Auto-detects ``testing_exhausted`` when ``test_retry_count >= 3`` and no
-explicit interrupt_reason is set by the upstream routing node.
+Auto-detects ``testing_exhausted`` when ``test_retry_count`` reaches
+``MAX_TEST_RETRIES`` and no explicit interrupt_reason is set by the
+upstream routing node.
 """
 
 import logging
@@ -18,7 +19,7 @@ from ..state import ScrapeState
 
 logger = logging.getLogger(__name__)
 
-MAX_TEST_RETRIES = 3
+MAX_TEST_RETRIES = 2
 
 
 def human_approval(state: ScrapeState) -> dict:
@@ -29,6 +30,16 @@ def human_approval(state: ScrapeState) -> dict:
 
     if not reason:
         test_retries = state.get("test_retry_count", 0)
+        if test_retries == 99:
+            logger.warning(
+                "human_approval: final retry sentinel (99) reached without explicit "
+                "reason — routing to cleanup to prevent infinite loop"
+            )
+            return {
+                "human_response": {"decision": "approve", "label": "Final retry failed"},
+                "human_feedback": "",
+                "interrupt_reason": "final_retry_failed",
+            }
         if test_retries >= MAX_TEST_RETRIES:
             reason = "testing_exhausted"
             assessment = "UNKNOWN"

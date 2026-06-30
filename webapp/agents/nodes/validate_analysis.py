@@ -86,9 +86,12 @@ def validate_analysis(state: ScrapeState) -> Command:
 
     state_update: dict[str, Any] = {"site_analysis": analysis}
 
-    confidence = float(
-        analysis.get("confidence_score", analysis.get("confidence", 0.0))
-    )
+    try:
+        confidence = float(
+            analysis.get("confidence_score", analysis.get("confidence", 0.0))
+        )
+    except (ValueError, TypeError):
+        confidence = 0.0
     mechanisms = analysis.get("scraping_mechanisms", [])
     primary_mechanism = analysis.get("scraping_mechanism", "")
 

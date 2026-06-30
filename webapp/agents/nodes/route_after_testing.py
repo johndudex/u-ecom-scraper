@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 MIN_CONFIDENCE_PASS = 0.85
 MIN_CONFIDENCE_PARTIAL = 0.5
+MAX_TEST_AUTO_RETRIES = 2
 
 DEAD_STATUS_CODES = {301, 302, 303, 307, 308, 404, 410, 451}
 
@@ -56,10 +57,11 @@ def route_after_testing(state: ScrapeState) -> str:
                 "route_after_testing: FINAL attempt produced no test_report → cleanup"
             )
             return "cleanup"
-        if retry_count < 2:
+        if retry_count < MAX_TEST_AUTO_RETRIES:
             logger.warning(
-                "route_after_testing: no test_report, retry %d/3 via scraper_analyzer",
+                "route_after_testing: no test_report, retry %d/%d via scraper_analyzer",
                 retry_count + 1,
+                MAX_TEST_AUTO_RETRIES + 1,
             )
             return "scraper_analyzer"
         logger.error(
@@ -69,7 +71,10 @@ def route_after_testing(state: ScrapeState) -> str:
         return "cleanup"
 
     assessment = report.get("overall_assessment", "FAIL")
-    confidence = float(report.get("confidence_score", 0.0))
+    try:
+        confidence = float(report.get("confidence_score", 0.0))
+    except (ValueError, TypeError):
+        confidence = 0.0
     issues = report.get("issues", [])
     high_severity = any(i.get("severity") == "high" for i in issues)
 
@@ -78,13 +83,6 @@ def route_after_testing(state: ScrapeState) -> str:
         return "field_confirmation"
 
     if is_final_attempt:
-        if confidence >= MIN_CONFIDENCE_PARTIAL and _scraper_produced_valid_output(state):
-            logger.warning(
-                "route_after_testing: FINAL attempt PARTIAL (confidence=%.2f) "
-                "→ field_confirmation",
-                confidence,
-            )
-            return "field_confirmation"
         logger.error(
             "route_after_testing: FINAL attempt FAILED (assessment=%s, confidence=%.2f) "
             "→ cleanup",
@@ -93,28 +91,22 @@ def route_after_testing(state: ScrapeState) -> str:
         )
         return "cleanup"
 
-    if retry_count < 2:
-        if retry_count >= 1 and confidence >= 0.80:
-            logger.warning(
-                "route_after_testing: problem well-diagnosed after %d retries "
-                "(confidence=%.2f) → human_approval for user guidance",
-                retry_count + 1,
-                confidence,
-            )
-            return "human_approval"
+    if retry_count < MAX_TEST_AUTO_RETRIES:
         logger.info(
-            "route_after_testing: %s (confidence=%.2f, high_severity=%s), retry %d/3 via scraper_analyzer",
+            "route_after_testing: %s (confidence=%.2f, high_severity=%s), "
+            "retry %d/%d via scraper_analyzer",
             assessment,
             confidence,
             high_severity,
             retry_count + 1,
+            MAX_TEST_AUTO_RETRIES + 1,
         )
         return "scraper_analyzer"
 
     if confidence >= MIN_CONFIDENCE_PARTIAL and _scraper_produced_valid_output(state):
         logger.warning(
-            "route_after_testing: retries exhausted (count=%d, assessment=%s, confidence=%.2f) "
-            "→ field_confirmation (partial output with valid products)",
+            "route_after_testing: retries exhausted (count=%d, assessment=%s, "
+            "confidence=%.2f) → field_confirmation (partial output with valid products)",
             retry_count,
             assessment,
             confidence,
@@ -122,7 +114,8 @@ def route_after_testing(state: ScrapeState) -> str:
         return "field_confirmation"
 
     logger.warning(
-        "route_after_testing: retries exhausted (count=%d, assessment=%s) → human_approval",
+        "route_after_testing: retries exhausted (count=%d, assessment=%s) "
+        "→ human_approval",
         retry_count,
         assessment,
     )

@@ -1336,7 +1336,10 @@ def _invoke_scraper_analyzer(
         analysis = _load_scraper_analysis(slug)
         update: dict[str, Any] = {"messages": []}
         if analysis:
-            raw_conf = float(analysis.get("confidence_score", 1.0))
+            try:
+                raw_conf = float(analysis.get("confidence_score", 1.0))
+            except (ValueError, TypeError):
+                raw_conf = 1.0
             penalties = 0.0
             nav_findings = state.get("navigation_findings") or {}
             listing = nav_findings.get("listing_page", {})
@@ -1469,9 +1472,8 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         try:
             from scraper.models import Step
 
-            Step.objects.filter(job_id=job_id, phase="testing").update(
-                notes=f"Retry cycle {retry_count}"
-            )
+            note = "FINAL retry" if retry_count == 99 else f"Retry cycle {retry_count}"
+            Step.objects.filter(job_id=job_id, phase="testing").update(notes=note)
         except Exception:
             pass
     set_tool_context(dict(state), agent_name="code_tester")
@@ -1814,32 +1816,18 @@ def route_from_human_approval(state: ScrapeState) -> str:
         logger.info("route_from_human_approval: user cancelled (%s)", reason)
         return "__end__"
 
-    approve_values = {"approve", "yes", "ok", "continue", "continue anyway", "proceed"}
-    if choice.lower() in approve_values:
-        choice = "continue"
-        label = "Continue anyway"
-
-    routing: dict[str, str] = {
-        "re_scrape": "setup_workspace",
-        "retry_failed": "setup_workspace",
-        "choose_mechanism": "code_writer",
-        "low_coverage": "code_writer",
-        "validation_failed": "field_confirmation",
-        "reanalyze_exhausted": "run_execution",
-        "pre_execution": "run_execution",
-        "skill_approval": "skill_learner",
-        "field_confirmation": "run_execution",
-        "testing_exhausted": "field_confirmation",
-        "playwright_unavailable": "navigation_synthesize",
-        "review": "run_execution",
-    }
-
+    # Handle testing_exhausted BEFORE the approve_values override,
+    # because "Provide feedback for final retry" has decision="approve"
+    # and would get its label overwritten to "Continue anyway".
     if reason == "testing_exhausted":
-        if choice in cancel_values:
-            logger.info("route_from_human_approval: testing_exhausted -> cancelled")
-            return "__end__"
         feedback = state.get("human_feedback", "")
-        if label == "Provide feedback for final retry" and feedback:
+        if label == "Provide feedback for final retry":
+            if not feedback:
+                logger.warning(
+                    "route_from_human_approval: testing_exhausted -> final retry "
+                    "requested but no feedback provided, proceeding to field_confirmation"
+                )
+                return "field_confirmation"
             logger.info(
                 "route_from_human_approval: testing_exhausted -> scraper_analyzer "
                 "(FINAL retry with user feedback: %s)",
@@ -1856,6 +1844,25 @@ def route_from_human_approval(state: ScrapeState) -> str:
             "route_from_human_approval: testing_exhausted -> field_confirmation"
         )
         return "field_confirmation"
+
+    approve_values = {"approve", "yes", "ok", "continue", "continue anyway", "proceed"}
+    if choice.lower() in approve_values:
+        choice = "continue"
+        label = "Continue anyway"
+
+    routing: dict[str, str] = {
+        "re_scrape": "setup_workspace",
+        "retry_failed": "setup_workspace",
+        "choose_mechanism": "code_writer",
+        "low_coverage": "code_writer",
+        "validation_failed": "field_confirmation",
+        "reanalyze_exhausted": "run_execution",
+        "pre_execution": "run_execution",
+        "skill_approval": "skill_learner",
+        "field_confirmation": "run_execution",
+        "playwright_unavailable": "navigation_synthesize",
+        "review": "run_execution",
+    }
 
     if reason == "low_confidence":
         if "continue" in (label or "").lower():
@@ -2137,6 +2144,7 @@ def build_scrape_graph(
             "site_analyzer": "site_analyzer",
             "update_tracker_analysis": "update_tracker_analysis",
             "normalize_fields": "normalize_fields",
+            "cleanup": "cleanup",
             "__end__": END,
         },
     )
