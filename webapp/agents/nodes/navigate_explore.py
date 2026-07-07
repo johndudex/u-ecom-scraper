@@ -3715,7 +3715,15 @@ def navigate_explore(state: dict, config=None) -> dict[str, Any]:
     # search box; prioritize that strategy and skip the (futile, slow) keyword
     # URL enumeration for them. Product/article sites are unaffected.
     page_type = (state.get("page_type") or "").lower()
-    ct_type = ((site_analysis.get("content_type") or {}).get("type") or "").lower()
+    # Source content_type from the deterministic state config (derived from
+    # the job's page_type), NOT from the LLM-written site_analysis. The
+    # analyzer prompt's output schema doesn't define content_type, so the LLM
+    # improvises its shape run-to-run (bare string vs {"type": ...} object) —
+    # reading from state eliminates that variance entirely. content_type_config
+    # is populated upstream (check_tracker / setup_workspace) from page_type.
+    _ct_cfg = state.get("content_type_config") or {}
+    _ct = _ct_cfg.get("content_type") if isinstance(_ct_cfg, dict) else ""
+    ct_type = _ct.lower() if isinstance(_ct, str) else ""
     is_job_site = page_type.startswith("job") or ct_type == "job_posting"
     if is_job_site:
         logger.info("navigate_explore: job site detected — classic search first")

@@ -158,6 +158,8 @@ Save findings as JSON to the path provided by the orchestrator:
 }
 ```
 
+**Do NOT add a `content_type` or `output_key` field to this JSON.** The content type is already known to the orchestrator (derived from the job's page type) and is tracked separately — re-emitting it here only creates a shape mismatch (string vs object) that crashes downstream nodes. Stick to exactly the keys shown above.
+
 ## Confidence Score
 
 - **High (0.9-1.0):** Platform detected, mechanism verified via probe, connectivity confirmed
