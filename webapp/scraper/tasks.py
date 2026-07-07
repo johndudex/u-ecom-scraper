@@ -254,35 +254,29 @@ def resume_scrape_task(job_id: int, human_response: Any) -> None:
         logger.warning(
             "resume INVOKE job=%s recursion_limit=%s", job.id, config.get("recursion_limit")
         )
-        # LangGraph v1: if the checkpoint has multiple pending interrupts (from
-        # different tasks/nodes), Command(resume=X) errors because it doesn't
-        # know WHICH interrupt to resume. Fix: resume them one at a time in a
-        # loop — each invoke call clears one interrupt. If a NEW interrupt
-        # appears after resuming (GraphInterrupt), stop and let the approval
-        # flow handle it.
-        while True:
-            snapshot = graph.get_state(config)
-            pending = sum(
-                1 for t in getattr(snapshot, "tasks", [])
-                if getattr(t, "interrupts", None)
+        # LangGraph v1: if the checkpoint has multiple pending interrupts (stale
+        # from a prior node + a new one), Command(resume=X) errors because it
+        # doesn't know WHICH interrupt to resume. Fix: read the checkpoint, get
+        # ALL interrupt IDs, and resume ALL of them with the same value as a
+        # dict {interrupt_id: value}.
+        snapshot = graph.get_state(config)
+        interrupt_ids = []
+        for task in getattr(snapshot, "tasks", []):
+            for intr in (getattr(task, "interrupts", None) or []):
+                iid = getattr(intr, "interrupt_id", None) or getattr(intr, "id", None)
+                if iid:
+                    interrupt_ids.append(iid)
+
+        if len(interrupt_ids) > 1:
+            logger.info(
+                "Job %d: %d pending interrupts (ids=%s) — resuming all at once",
+                job.id, len(interrupt_ids), interrupt_ids,
             )
-            if pending == 0:
-                break
-            if pending > 1:
-                logger.info(
-                    "Job %d: %d pending interrupts — resuming one at a time",
-                    job.id, pending,
-                )
-            try:
-                graph.invoke(Command(resume=human_response), config)
-                break  # resumed successfully, no more interrupts
-            except Exception as inner_exc:
-                from langgraph.errors import GraphInterrupt as _GI
-                if isinstance(inner_exc, _GI) and pending > 1:
-                    # Still have more pending interrupts — loop to resume the next
-                    logger.info("Job %d: resumed one interrupt, %d remaining", job.id, pending - 1)
-                    continue
-                raise  # re-raise for the outer handler
+            resume_value = {iid: human_response for iid in interrupt_ids}
+        else:
+            resume_value = human_response
+
+        graph.invoke(Command(resume=resume_value), config)
     except Exception as exc:
         from langgraph.errors import GraphInterrupt, GraphRecursionError
 
