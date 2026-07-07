@@ -51,8 +51,46 @@ def _get_browser_service_url() -> str:
     return os.environ.get("BROWSER_SERVICE_URL", "http://browser_service:8001")
 
 
-def _needs_browser(state: ScrapeState) -> bool:
-    return state.get("scraping_method", "") in BROWSER_METHODS
+# Ground-truth markers: if the generated scraper imports a browser library it
+# MUST run in browser_service (the celery container has no playwright/Chrome).
+# The analyzer's `scraping_method` is often null for hybrid scrapers — e.g. a
+# two-phase job-board scraper whose strategy is http_requests but whose phase 1
+# imports playwright to drive a search form. Trusting the null field routes such
+# scrapers in-process and they crash instantly on `import playwright`.
+_BROWSER_IMPORT_MARKERS = (
+    "import playwright",
+    "from playwright",
+    "import seleniumbase",
+    "from seleniumbase",
+    "undetected_chromedriver",
+    "from selenium",
+    "import selenium",
+    "webdriver",
+)
+
+
+def _scraper_source_needs_browser(scraper_path: str) -> bool:
+    """Inspect the generated scraper's imports — ground truth for browser need.
+
+    Reads only the top of the file (imports + SCRAPING_METHOD live there).
+    Generic: works for any scraper regardless of how the analyzer labeled it.
+    """
+    if not scraper_path or not os.path.isfile(scraper_path):
+        return False
+    try:
+        with open(scraper_path, "r", errors="ignore") as fh:
+            head = fh.read(8192)
+    except OSError:
+        return False
+    return any(marker in head for marker in _BROWSER_IMPORT_MARKERS)
+
+
+def _needs_browser(state: ScrapeState, scraper_path: str = "") -> bool:
+    if state.get("scraping_method", "") in BROWSER_METHODS:
+        return True
+    # Fallback: the analyzer field is unreliable (null for hybrids). The
+    # scraper's own imports are the source of truth.
+    return _scraper_source_needs_browser(scraper_path)
 
 
 def _needs_cloak(state: ScrapeState) -> bool:
@@ -119,7 +157,7 @@ def run_execution(state: ScrapeState) -> dict:
             "run_execution: navigation job, passing --query '%s'", search_criteria
         )
 
-    if _needs_browser(state):
+    if _needs_browser(state, scraper_path):
         logger.info("run_execution: browser-based scraper, dispatching to browser_service")
         result = _run_via_browser_service(scraper_path, args, site_folder, state)
 
