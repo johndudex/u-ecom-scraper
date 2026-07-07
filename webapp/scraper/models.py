@@ -243,6 +243,11 @@ class Approval(models.Model):
     approval_type = models.CharField(max_length=30, choices=TYPE_CHOICES)
     question = models.TextField(blank=True, default="")
     response_data = models.JSONField(null=True, blank=True, default=dict)
+    # The LangGraph interrupt_id this approval corresponds to. Needed to
+    # resume ONLY this specific interrupt (not stale ones from earlier nodes
+    # that accumulate in the checkpoint). Set when _check_and_create_approval
+    # creates the approval from the snapshot.
+    interrupt_id = models.CharField(max_length=200, blank=True, default="")
     status = models.CharField(
         max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING
     )

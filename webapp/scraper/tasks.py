@@ -23,7 +23,7 @@ from celery import shared_task
 from django.conf import settings
 from django.utils import timezone
 
-from .models import ScrapeJob, Step
+from .models import Approval, ScrapeJob, Step
 from .services import LangGraphService
 
 logger = logging.getLogger(__name__)
@@ -254,25 +254,46 @@ def resume_scrape_task(job_id: int, human_response: Any) -> None:
         logger.warning(
             "resume INVOKE job=%s recursion_limit=%s", job.id, config.get("recursion_limit")
         )
-        # LangGraph v1: if the checkpoint has multiple pending interrupts (stale
-        # from a prior node + a new one), Command(resume=X) errors because it
-        # doesn't know WHICH interrupt to resume. Fix: read the checkpoint, get
-        # ALL interrupt IDs, and resume ALL of them with the same value as a
-        # dict {interrupt_id: value}.
+        # LangGraph v1: interrupts accumulate in the checkpoint across the
+        # pipeline. When the user approves a specific gate, we must resume ONLY
+        # that gate's interrupt — not all pending ones (stale interrupts from
+        # earlier nodes would get the wrong response). The Approval carries the
+        # interrupt_id; we resume as {interrupt_id: response} for a targeted
+        # resume. If interrupt_id is missing (old approval), fall back to
+        # resuming all pending with the same value (the dict approach).
         snapshot = graph.get_state(config)
-        interrupt_ids = []
+        all_interrupt_ids = []
         for task in getattr(snapshot, "tasks", []):
             for intr in (getattr(task, "interrupts", None) or []):
                 iid = getattr(intr, "interrupt_id", None) or getattr(intr, "id", None)
                 if iid:
-                    interrupt_ids.append(iid)
+                    all_interrupt_ids.append(str(iid))
 
-        if len(interrupt_ids) > 1:
+        # Try to find the specific interrupt_id from the approved Approval.
+        target_iid = ""
+        try:
+            approved = Approval.objects.filter(
+                job_id=job_id, status=Approval.STATUS_APPROVED
+            ).exclude(interrupt_id="").order_by("-resolved_at").first()
+            if approved:
+                target_iid = approved.interrupt_id
+        except Exception:
+            pass
+
+        if target_iid and target_iid in all_interrupt_ids:
+            # Targeted resume: only the approved interrupt.
             logger.info(
-                "Job %d: %d pending interrupts (ids=%s) — resuming all at once",
-                job.id, len(interrupt_ids), interrupt_ids,
+                "Job %d: targeted resume interrupt_id=%s (%d total pending)",
+                job.id, target_iid, len(all_interrupt_ids),
             )
-            resume_value = {iid: human_response for iid in interrupt_ids}
+            resume_value = {target_iid: human_response}
+        elif len(all_interrupt_ids) > 1:
+            # Fallback: resume all pending with the same value.
+            logger.info(
+                "Job %d: no target interrupt_id — resuming all %d pending",
+                job.id, len(all_interrupt_ids),
+            )
+            resume_value = {iid: human_response for iid in all_interrupt_ids}
         else:
             resume_value = human_response
 

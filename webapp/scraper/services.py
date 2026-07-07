@@ -271,6 +271,7 @@ class LangGraphService:
 
         for task in getattr(snapshot, "tasks", []):
             interrupts = getattr(task, "interrupts", [])
+            task_id = getattr(task, "id", "") or ""
             for interrupt_value in interrupts:
                 if not isinstance(interrupt_value, dict):
                     if hasattr(interrupt_value, "value"):
@@ -281,9 +282,19 @@ class LangGraphService:
                 if not isinstance(interrupt_value, dict):
                     interrupt_value = {"value": str(interrupt_value)}
 
+                # Capture the interrupt_id so we can resume ONLY this one
+                # (not stale interrupts from earlier nodes).
+                intr_id = getattr(interrupt_value, "interrupt_id", "") or ""
+                if not intr_id:
+                    intr_id = task_id
+
                 approval = LangGraphService.interrupt_to_approval(
                     interrupt_value, job
                 )
+                # Store the interrupt_id on the approval for targeted resume.
+                if intr_id:
+                    approval.interrupt_id = str(intr_id)
+                    approval.save(update_fields=["interrupt_id"])
                 found_interrupt = True
 
                 # System log so the UI shows what was asked.
