@@ -88,6 +88,26 @@ def run_scraper_script(
         output_file = _find_output_file(os.path.dirname(scraper_path))
         product_count = _count_products(output_file) if output_file else 0
 
+        # Fix file ownership: browser_service runs as root, but celery/django
+        # run as uid 1000 (scraper). On real Linux (not WSL2), root-owned files
+        # in the shared volume can't be moved/copied by the scraper user during
+        # cleanup. Chown output + any new files in the scraper dir to 1000:1000.
+        try:
+            import pwd
+            _scraper_dir = os.path.dirname(scraper_path) or PROJECT_ROOT
+            os.chown(_scraper_dir, 1000, 1000)
+            for _name in os.listdir(_scraper_dir):
+                _fpath = os.path.join(_scraper_dir, _name)
+                os.chown(_fpath, 1000, 1000)
+                if os.path.isdir(_fpath):
+                    for _sub in os.listdir(_fpath):
+                        try:
+                            os.chown(os.path.join(_fpath, _sub), 1000, 1000)
+                        except OSError:
+                            pass
+        except (PermissionError, OSError):
+            pass  # not running as root or already correct
+
         return {
             "returncode": result.returncode,
             "stdout": result.stdout or "",
