@@ -271,8 +271,16 @@ class LangGraphService:
 
         for task in getattr(snapshot, "tasks", []):
             interrupts = getattr(task, "interrupts", [])
-            task_id = getattr(task, "id", "") or ""
             for interrupt_value in interrupts:
+                # Capture the interrupt's id from the Interrupt OBJECT before
+                # we reduce it to its .value dict below. LangGraph's Interrupt
+                # dataclass exposes `.id` (there is NO `interrupt_id` attr),
+                # and Command(resume={id: value}) keys on this same `.id`.
+                # tasks.py reads intr.id the same way — so they MUST match or
+                # the targeted resume never fires (silent fallback to "resume
+                # all"). Do NOT use task.id here: that's a different UUID.
+                intr_id = getattr(interrupt_value, "id", "") or ""
+
                 if not isinstance(interrupt_value, dict):
                     if hasattr(interrupt_value, "value"):
                         interrupt_value = interrupt_value.value
@@ -281,12 +289,6 @@ class LangGraphService:
 
                 if not isinstance(interrupt_value, dict):
                     interrupt_value = {"value": str(interrupt_value)}
-
-                # Capture the interrupt_id so we can resume ONLY this one
-                # (not stale interrupts from earlier nodes).
-                intr_id = getattr(interrupt_value, "interrupt_id", "") or ""
-                if not intr_id:
-                    intr_id = task_id
 
                 approval = LangGraphService.interrupt_to_approval(
                     interrupt_value, job

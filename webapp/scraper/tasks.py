@@ -269,14 +269,22 @@ def resume_scrape_task(job_id: int, human_response: Any) -> None:
                 if iid:
                     all_interrupt_ids.append(str(iid))
 
-        # Try to find the specific interrupt_id from the approved Approval.
+        # Find the interrupt_id of the gate the user actually approved. Pick
+        # the most-recently-resolved approval whose interrupt_id is STILL
+        # pending — this skips approvals whose interrupt was already consumed
+        # by an earlier resume (stale) and handles a rapid double-approve
+        # (two approvals before either resume fires): each resume targets the
+        # one still left pending.
         target_iid = ""
         try:
-            approved = Approval.objects.filter(
+            pending_set = set(all_interrupt_ids)
+            approved_qs = Approval.objects.filter(
                 job_id=job_id, status=Approval.STATUS_APPROVED
-            ).exclude(interrupt_id="").order_by("-resolved_at").first()
-            if approved:
-                target_iid = approved.interrupt_id
+            ).exclude(interrupt_id="").order_by("-resolved_at")
+            for a in approved_qs:
+                if a.interrupt_id in pending_set:
+                    target_iid = a.interrupt_id
+                    break
         except Exception:
             pass
 
