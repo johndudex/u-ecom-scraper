@@ -63,6 +63,7 @@ from .nodes import (
     validate_analysis,
     validate_coverage,
 )
+from .nodes.run_execution import _find_newest_output
 from .state import ScrapeState
 from .subagents import (
     build_cleanup_message,
@@ -2037,11 +2038,13 @@ def _invoke_store_job_listings(
     if exec_status != "SUCCESS":
         return {"messages": []}
     if not output_file:
-        # Try to find the latest output file
+        # Try to find the latest output file (newest mtime across workspace
+        # and scrapers — see _find_newest_output for why mtime, not name-sorted).
         try:
             root = _get_project_root()
             site_folder = os.path.join(root, "scrapers", slug)
-            output_file = os.path.join(site_folder, _find_output_file(site_folder))
+            workspace_folder = os.path.join(root, "workspace", slug)
+            output_file = _find_newest_output(workspace_folder, site_folder)
         except Exception:
             output_file = ""
     if not output_file or not os.path.isfile(output_file):

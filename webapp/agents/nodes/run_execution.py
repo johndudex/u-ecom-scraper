@@ -323,9 +323,7 @@ def _run_in_process(
                 "error_message": f"Scraper exited with code {result.returncode}. {stderr}",
             }
 
-        output_file = _find_output_file(site_folder)
-        if not output_file and workspace_folder:
-            output_file = _find_output_file(workspace_folder)
+        output_file = _find_newest_output(workspace_folder, site_folder)
         product_count = _count_products(output_file) if output_file else 0
 
         return {
@@ -439,17 +437,39 @@ def _run_via_browser_service(
                 pass
 
 
-def _find_output_file(site_folder: str) -> str:
-    if not os.path.isdir(site_folder):
-        return ""
-    candidates = sorted(
-        [
-            os.path.join(site_folder, f)
-            for f in os.listdir(site_folder)
-            if f.startswith("output_") and f.endswith(".json")
-        ]
-    )
-    return candidates[-1] if candidates else ""
+def _find_newest_output(*directories: str) -> str:
+    """Return the newest-mtime ``output_*.json`` across the given directories.
+
+    The scraper writes its output next to itself (``SCRIPT_DIR`` = dirname of
+    the scraper file), which during a run is ``workspace/{slug}/``. Selecting by
+    name OR scanning ``scrapers/{slug}/`` first returns a *stale* output from a
+    prior job on a re-scrape (that dir already holds old outputs), so the
+    current run's freshly-written file is never picked — and the wrong file
+    propagates to ScrapeJob.output_file / product_count / store_job_listings
+    (e.g. 1 job recorded instead of 69). Picking the newest mtime across all
+    relevant dirs reliably identifies the file THIS run just wrote, regardless
+    of which dir it landed in.
+    """
+    best_mtime = -1.0
+    best_path = ""
+    for directory in directories:
+        if not directory or not os.path.isdir(directory):
+            continue
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for name in names:
+            if not (name.startswith("output_") and name.endswith(".json")):
+                continue
+            path = os.path.join(directory, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if mtime > best_mtime:
+                best_mtime, best_path = mtime, path
+    return best_path
 
 
 def _count_products(output_path: str) -> int:
