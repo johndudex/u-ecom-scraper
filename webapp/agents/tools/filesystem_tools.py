@@ -92,7 +92,7 @@ def get_filesystem_tools(
 
         Returns:
             The file content as text, or an error message if the file
-            cannot be read.
+            cannot be read. Files larger than 50K chars are truncated.
         """
         try:
             safe = _enforce_root(path, root)
@@ -100,7 +100,7 @@ def get_filesystem_tools(
             return str(e)
         try:
             with open(safe, "r", encoding="utf-8") as f:
-                return f.read()
+                content = f.read()
         except FileNotFoundError:
             return f"File not found: {path}"
         except IsADirectoryError:
@@ -109,6 +109,16 @@ def get_filesystem_tools(
             return f"Cannot read binary file as text: {path}"
         except Exception as e:
             return f"Error reading '{path}': {e}"
+
+        MAX_READ_CHARS = 50_000
+        if len(content) > MAX_READ_CHARS:
+            return (
+                content[:MAX_READ_CHARS]
+                + f"\n\n... [TRUNCATED: file is {len(content):,} chars, "
+                f"showing first {MAX_READ_CHARS:,}. "
+                f"Use search_content for targeted queries on large files.]"
+            )
+        return content
 
     @tool
     def write_file(path: str, content: str) -> str:

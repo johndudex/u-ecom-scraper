@@ -83,12 +83,15 @@ Save cleanup report to: `workspace/{site_slug}/cleanup_report.json`
 
 ## Tool Call Budget: 10 maximum
 
-- 1-2 calls: read_file (verify workspace files exist)
-- 1-3 calls: write_file (copy files to site folder)
-- 1 call: write_file (cleanup report)
+- 1-2 calls: `search_files` (check what files exist in the workspace)
+- 1-3 calls: `run_bash` (copy files to scrapers/ folder using `cp`)
+- 1 call: `write_file` (cleanup report)
 
 ## What NOT to Do
 
+- Do NOT use `read_file` on output_*.json files — they can be very large (1MB+) and will
+  exceed the LLM's prompt limit. Use `search_files` to check they exist, then `run_bash` (`cp`)
+  to copy them. You don't need to READ file contents to copy them.
 - Do NOT modify the scraper code
 - Do NOT run the scraper
 - Do NOT delete workspace analysis files

@@ -6,7 +6,7 @@ events via ``LangGraphService.stream_graph``, and finalises the job.
 A secondary task ``resume_scrape_task`` re-invokes the graph with a
 ``Command(resume=...)`` after a human approval is resolved.
 
-Browser-based scraper execution is handled by browser-service via HTTP,
+Browser-based scraper execution is handled by browser_service via HTTP,
 not by a separate Celery queue.
 """
 
@@ -251,15 +251,27 @@ def resume_scrape_task(job_id: int, human_response: Any) -> None:
         job.status = ScrapeJob.STATUS_RUNNING
         job.save(update_fields=["status"])
         _publish_job_status(job.id, ScrapeJob.STATUS_RUNNING)
+        logger.warning(
+            "resume INVOKE job=%s recursion_limit=%s", job.id, config.get("recursion_limit")
+        )
         graph.invoke(Command(resume=human_response), config)
     except Exception as exc:
-        from langgraph.errors import GraphInterrupt
+        from langgraph.errors import GraphInterrupt, GraphRecursionError
 
         if isinstance(exc, GraphInterrupt):
             logger.info("Job %d: interrupted again after resume", job.id)
             LangGraphService._check_and_create_approval(graph, config, job)
             job.status = ScrapeJob.STATUS_WAITING_APPROVAL
             job.save(update_fields=["status"])
+            _publish_job_status(job.id, ScrapeJob.STATUS_WAITING_APPROVAL)
+            return
+
+        if isinstance(exc, GraphRecursionError):
+            logger.warning(
+                "Job %d: GraphRecursionError after resume -> pausing for approval",
+                job.id,
+            )
+            LangGraphService.create_recursion_approval(job, str(exc))
             _publish_job_status(job.id, ScrapeJob.STATUS_WAITING_APPROVAL)
             return
 
@@ -461,11 +473,17 @@ def _finalize_job(job: ScrapeJob) -> None:
                     job.platform = site_block["platform"]
                 if site_block.get("scraping_method") and not job.scraping_method:
                     job.scraping_method = site_block["scraping_method"]
-                products = out_data.get("products", [])
-                if products:
+                # count items across content types (products/jobs/articles/...)
+                items = []
+                for _ck in ("products", "jobs", "articles", "results", "items", "threads", "pages"):
+                    _v = out_data.get(_ck)
+                    if isinstance(_v, list) and _v:
+                        items = _v
+                        break
+                if items:
                     successful = [
                         prod
-                        for prod in products
+                        for prod in items
                         if prod.get("title") and prod.get("status_code", 0) > 0
                     ]
                     job.product_count = len(successful)
@@ -524,6 +542,44 @@ def _finalize_job(job: ScrapeJob) -> None:
                 logger.info("Job %d: cleaned workspace/%s/", job.id, site_slug)
         except Exception as exc:
             logger.warning("Job %d: workspace cleanup failed: %s", job.id, exc)
+
+    # ── Guard production input_urls.json against silent shrinkage ───────
+    # A job's workspace input_urls.json can be a subset (e.g. a sample/manual
+    # run), and the cleanup agent may copy it over the production file —
+    # silently shrinking the canonical URL list.  If the Site model carries
+    # MORE URLs than the production file, re-derive the file from the Site
+    # (source of truth).  Never wipes a larger file; no-op for navigation
+    # jobs whose Site has no input_urls.  Generic. [data integrity]
+    if site_slug:
+        try:
+            from scraper.models import Site as _Site
+
+            _site = _Site.objects.filter(slug=site_slug).first()
+            if _site and _site.input_urls:
+                _site_dir = Path(settings.PROJECT_ROOT) / "scrapers" / site_slug
+                _iu_path = _site_dir / "input_urls.json"
+                _existing = []
+                if _iu_path.is_file():
+                    try:
+                        _existing = (
+                            json.loads(_iu_path.read_text(encoding="utf-8")).get("urls", [])
+                            or []
+                        )
+                    except Exception:
+                        _existing = []
+                if len(_site.input_urls) > len(_existing):
+                    _site_dir.mkdir(parents=True, exist_ok=True)
+                    with open(_iu_path, "w", encoding="utf-8") as fh:
+                        json.dump(
+                            {"urls": _site.input_urls}, fh, indent=2, ensure_ascii=False
+                        )
+                    logger.info(
+                        "Job %d: re-synced input_urls.json from Site "
+                        "(%d → %d URLs, was shrunk)",
+                        job.id, len(_existing), len(_site.input_urls),
+                    )
+        except Exception as exc:
+            logger.warning("Job %d: input_urls re-sync guard failed: %s", job.id, exc)
 
     # ── Determine final status ──────────────────────────────────────────
     if job.status in (
@@ -648,7 +704,7 @@ def _graph_is_interrupted(graph: Any, config: dict[str, Any]) -> bool:
 # Stuck-job watchdog
 # ═══════════════════════════════════════════════════════════════════════════
 
-STUCK_JOB_ACTIVITY_TIMEOUT_MINUTES = 15
+STUCK_JOB_ACTIVITY_TIMEOUT_MINUTES = 30
 
 
 @shared_task

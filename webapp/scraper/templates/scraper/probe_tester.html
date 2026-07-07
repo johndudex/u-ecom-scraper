@@ -38,6 +38,11 @@
                         <span class="text-xs font-medium text-ink-secondary group-hover:text-ink transition-colors font-mono">uc_chrome_none</span>
                     </label>
 
+                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-md bg-void border border-[#8b5cf6]/40 px-3 py-2 hover:bg-raised/50 transition-colors" title="CloakBrowser stealth Chromium (C++ fingerprint patches) — defeats Akamai where UC fails">
+                        <input type="checkbox" name="methods" value="cloak_none" checked>
+                        <span class="text-xs font-medium text-[#8b5cf6] group-hover:text-ink transition-colors font-mono">cloak_none</span>
+                    </label>
+
                     <label class="flex items-center gap-2.5 cursor-pointer group rounded-md bg-void border border-line-subtle px-3 py-2 hover:bg-raised/50 transition-colors">
                         <input type="checkbox" name="methods" value="direct_http_datacenter">
                         <span class="text-xs font-medium text-ink-secondary group-hover:text-ink transition-colors font-mono">direct_http_datacenter</span>
@@ -53,6 +58,11 @@
                         <span class="text-xs font-medium text-ink-secondary group-hover:text-ink transition-colors font-mono">uc_chrome_datacenter</span>
                     </label>
 
+                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-md bg-void border border-line-subtle px-3 py-2 hover:bg-raised/50 transition-colors" title="CloakBrowser stealth + datacenter proxy">
+                        <input type="checkbox" name="methods" value="cloak_datacenter">
+                        <span class="text-xs font-medium text-[#8b5cf6] group-hover:text-ink transition-colors font-mono">cloak_datacenter</span>
+                    </label>
+
                     <label class="flex items-center gap-2.5 cursor-pointer group rounded-md bg-void border border-line-subtle px-3 py-2 hover:bg-raised/50 transition-colors">
                         <input type="checkbox" name="methods" value="direct_http_residential">
                         <span class="text-xs font-medium text-ink-secondary group-hover:text-ink transition-colors font-mono">direct_http_residential</span>
@@ -61,6 +71,11 @@
                     <label class="flex items-center gap-2.5 cursor-pointer group rounded-md bg-void border border-line-subtle px-3 py-2 hover:bg-raised/50 transition-colors">
                         <input type="checkbox" name="methods" value="playwright_residential">
                         <span class="text-xs font-medium text-ink-secondary group-hover:text-ink transition-colors font-mono">playwright_residential</span>
+                    </label>
+
+                    <label class="flex items-center gap-2.5 cursor-pointer group rounded-md bg-void border border-line-subtle px-3 py-2 hover:bg-raised/50 transition-colors" title="CloakBrowser stealth + residential proxy">
+                        <input type="checkbox" name="methods" value="cloak_residential">
+                        <span class="text-xs font-medium text-[#8b5cf6] group-hover:text-ink transition-colors font-mono">cloak_residential</span>
                     </label>
 
                     <label class="flex items-center gap-2.5 cursor-pointer group rounded-md bg-void border border-line-subtle px-3 py-2 hover:bg-raised/50 transition-colors">
@@ -132,13 +147,16 @@
         'playwright_none',
         'playwright_datacenter',
         'playwright_residential',
+        'cloak_none',
+        'cloak_datacenter',
+        'cloak_residential',
         'uc_chrome_none',
         'uc_chrome_datacenter',
         'uc_chrome_residential',
     ];
 
     function methodDisplayName(m) {
-        return m.replace('playwright_', 'playwright ').replace('uc_chrome_', 'uc_chrome ');
+        return m.replace('playwright_', 'playwright ').replace('uc_chrome_', 'uc_chrome ').replace('cloak_', 'cloak ');
     }
 
     const COUNTRY_REMAP = {"uk": "gb"};

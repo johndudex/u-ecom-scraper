@@ -30,12 +30,15 @@ PROXY_TIERS = ["none", "datacenter", "residential"]
 ESCALATION_STEPS = [
     ("direct_http", "none"),
     ("playwright_none", "none"),
+    ("cloak_none", "none"),
     ("uc_chrome_none", "none"),
     ("direct_http_datacenter", "datacenter"),
     ("playwright_datacenter", "datacenter"),
+    ("cloak_datacenter", "datacenter"),
     ("uc_chrome_datacenter", "datacenter"),
     ("direct_http_residential", "residential"),
     ("playwright_residential", "residential"),
+    ("cloak_residential", "residential"),
     ("uc_chrome_residential", "residential"),
 ]
 
@@ -46,6 +49,9 @@ def _dispatch_step(method_name: str, url: str, timeout: int, country: Optional[s
     if method_name.startswith("direct_http_"):
         tier = method_name.replace("direct_http_", "")
         return _try_direct_http(url, timeout=timeout, proxy_tier=tier, country=country)
+    if method_name.startswith("cloak_"):
+        tier = method_name.replace("cloak_", "")
+        return _try_cloak(url, tier, timeout=min(timeout, 40), country=country)
     if method_name.startswith("playwright_"):
         tier = method_name.replace("playwright_", "")
         pw_timeout = 35 if tier != "none" else 25
@@ -99,7 +105,12 @@ def run_probe(url: str, render_js: bool = True, timeout: int = 120, start_method
             )
 
         if result and result.get("needs_akamai_bypass"):
-            _log_step(f"{step_name}: Akamai detected, stopping escalation")
+            _log_step(f"{step_name}: Akamai detected — trying CloakBrowser stealth bypass")
+            cloak_res = _try_cloak(url, "none", timeout=min(timeout, 40), country=country)
+            if cloak_res and cloak_res.get("success"):
+                _log_step("cloak_none: SUCCEEDED (Akamai bypassed)")
+                return cloak_res
+            _log_step(f"{step_name}: cloak did not bypass Akamai; stopping escalation")
             return result
 
         if result and result.get("success"):
@@ -523,6 +534,89 @@ def _try_playwright(url: str, proxy_tier: str, timeout: int = 25, country: Optio
         if pw:
             try:
                 pw.stop()
+            except Exception:
+                pass
+
+
+def _try_cloak(url: str, proxy_tier: str, timeout: int = 40, country: Optional[str] = None) -> Optional[dict]:
+    """Probe with CloakBrowser — a stealth Chromium with C++-level fingerprint
+    patches that defeats Akamai/anti-bot where vanilla Playwright and UC mode fail.
+    Mirror of ``_try_playwright`` but drives cloak's stealth binary directly."""
+    browser = None
+    try:
+        from cloakbrowser import launch as cloak_launch
+
+        config = get_proxy_config()
+        launch_kwargs: dict[str, Any] = {"headless": True}
+        proxy = config.build_proxy_url(proxy_tier, country=country) if proxy_tier != "none" else None
+        if proxy:
+            launch_kwargs["proxy"] = proxy
+
+        browser = cloak_launch(**launch_kwargs)
+        page = browser.new_page()
+        page.set_default_timeout(timeout * 1000)
+
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+        page.wait_for_timeout(2000)
+
+        html = page.content()
+        _capture_html_for_render(html)
+        title = page.title() or ""
+        blocked = is_blocked(html[:5000])
+        jsonld = extract_jsonld(html)
+        meta = extract_meta_tags(html)
+        status_code = resp.status if resp else 0
+        body_text = ""
+        try:
+            body_text = page.evaluate("() => document.body?.innerText?.substring(0, 1500) || ''")[:1500]
+        except Exception:
+            pass
+
+        has_content = len(html) > 2000 and not blocked
+        if has_content:
+            from src.page_analysis import run_selector_tests
+
+            return {
+                "success": True,
+                "method": f"cloak_{proxy_tier}",
+                "proxy_tier": proxy_tier,
+                "status_code": status_code,
+                "title": title[:200],
+                "body_length": len(html),
+                "body_text": body_text,
+                "needs_browser": True,
+                "blocked": False,
+                "needs_stealth": True,
+                "jsonld": jsonld,
+                "meta": meta,
+                "selector_results": run_selector_tests(page),
+                "error": "",
+            }
+        return {
+            "success": False,
+            "method": f"cloak_{proxy_tier}",
+            "proxy_tier": proxy_tier,
+            "status_code": status_code,
+            "title": title[:200],
+            "body_length": len(html),
+            "body_text": body_text,
+            "needs_browser": True,
+            "blocked": True,
+            "needs_stealth": True,
+            "needs_akamai_bypass": _detect_akamai(html, status_code),
+            "jsonld": jsonld,
+            "meta": meta,
+            "selector_results": "Skipped — page blocked or empty",
+            "error": "Page blocked or empty content",
+        }
+
+    except Exception as exc:
+        logger.info("Cloak (%s) failed: %s", proxy_tier, exc)
+        return None
+    finally:
+        if browser:
+            try:
+                browser.close()
             except Exception:
                 pass
 

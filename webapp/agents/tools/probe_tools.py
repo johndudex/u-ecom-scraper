@@ -1,7 +1,7 @@
-"""Page probe tool — delegates to browser-service.
+"""Page probe tool — delegates to browser_service.
 
 Provides ``probe_page`` — a single tool that sends an HTTP POST to the
-browser-service ``/probe`` endpoint.  The service handles the full
+browser_service ``/probe`` endpoint.  The service handles the full
 escalation chain (HTTP -> Playwright -> UC Chrome) internally, so this
 module is now a thin HTTP client with result formatting.
 
@@ -24,7 +24,7 @@ from .guards import apply_guard, require_non_akamai_tool
 logger = logging.getLogger(__name__)
 
 BROWSER_SERVICE_URL = os.environ.get(
-    "BROWSER_SERVICE_URL", "http://browser-service:8001"
+    "BROWSER_SERVICE_URL", "http://browser_service:8001"
 )
 PROBE_TIMEOUT = int(os.environ.get("PROBE_TIMEOUT", "180"))
 CACHE_EXPIRY_HOURS = 4
@@ -563,7 +563,7 @@ def get_probe_tools() -> list:
     def probe_page(url: str, render_js: bool = True) -> str:
         """Test page accessibility with automatic proxy escalation.
 
-        Delegates to browser-service which runs the tier-first escalation chain:
+        Delegates to browser_service which runs the tier-first escalation chain:
         1. Direct HTTP (no proxy)
         2. Playwright (no proxy)
         3. UC Chrome (no proxy)
@@ -699,18 +699,18 @@ def get_probe_tools() -> list:
             return _format_probe_result(data)
 
         except httpx.ConnectError:
-            logger.error("probe_page: browser-service unreachable at %s", service_url)
+            logger.error("probe_page: browser_service unreachable at %s", service_url)
             return (
                 f"PROBE RESULT for {url}\n"
                 f"Method: service_unavailable\n"
                 f"Proxy tier: none\n"
                 f"HTTP status: 0\n"
                 f"Error: Browser service ({service_url}) is unreachable. "
-                f"Ensure browser-service container is running.\n"
+                f"Ensure browser_service container is running.\n"
                 f"\nAll methods failed — cannot test selectors."
             )
         except httpx.TimeoutException:
-            logger.error("probe_page: browser-service timed out for %s", url[:100])
+            logger.error("probe_page: browser_service timed out for %s", url[:100])
             return (
                 f"PROBE RESULT for {url}\n"
                 f"Method: timeout\n"
@@ -738,7 +738,7 @@ def get_probe_html_tool() -> list:
     def probe_html(url: str) -> str:
         """Fetch a page's full HTML using the correct access method.
 
-        Delegates to browser-service /render endpoint which uses the same
+        Delegates to browser_service /render endpoint which uses the same
         escalation chain as probe_page but returns the raw HTML content
         instead of metadata. Use this when you need the full page DOM to
         extract links, forms, or other structural elements.
@@ -814,7 +814,7 @@ def get_probe_html_tool() -> list:
             return f"RENDER FAILED for {url}\nMethod: {data.get('method', 'unknown')}\nError: {error}"
 
         except httpx.ConnectError:
-            logger.error("probe_html: browser-service unreachable at %s", service_url)
+            logger.error("probe_html: browser_service unreachable at %s", service_url)
             return f"RENDER FAILED for {url}\nError: Browser service unreachable at {service_url}"
         except httpx.TimeoutException:
             logger.error("probe_html: timed out for %s", url[:100])

@@ -245,6 +245,16 @@
         </div>
         {% endif %}
 
+        {% if has_dagster_code %}
+        <div class="panel overflow-hidden">
+            <div class="panel-header">
+                <h3 class="text-sm-heading text-ink">Dagster Code</h3>
+                <a href="{% url 'dagster_code' job_id=job.id %}" class="text-xs text-accent hover:text-accent-hover border border-accent/30 px-2 py-1 rounded-md hover:border-accent/50 transition-colors">Download</a>
+            </div>
+            <p class="text-xs text-ink-secondary p-4">BaseTlsScraper format — ready for the client's Dagster pipeline.</p>
+        </div>
+        {% endif %}
+
         {% if sample_output %}
         <div class="panel overflow-hidden">
             <div class="panel-header">

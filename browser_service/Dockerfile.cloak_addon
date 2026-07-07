@@ -1,0 +1,10 @@
+# Addon layer: extend the existing browser_service image (which already has
+# Playwright + Chromium + SeleniumBase + deps) with CloakBrowser + the stealth
+# .pth patcher. A full rebuild is slow on a constrained network because
+# `playwright install --with-deps` re-downloads ~740MB of apt deps; this layer
+# reuses those cached layers and only adds cloak. Proper (build-time, persistent
+# image) — NOT a runtime container install.
+FROM u-ecom-scraper-browser_service:latest
+RUN pip install --no-cache-dir cloakbrowser && python -m cloakbrowser install
+COPY browser_service/cloak_stealth_patch.py /usr/local/lib/python3.12/site-packages/cloak_stealth_patch.py
+RUN printf 'import cloak_stealth_patch\n' > /usr/local/lib/python3.12/site-packages/cloak_stealth.pth

@@ -326,7 +326,7 @@ u-ecom-scraper/
 - Always use `ruff` for linting and formatting
 - Handle exceptions with appropriate logging
 - Rate limiting is critical - always respect the site's bandwidth
-- **Debug Auto-Login**: `DEBUG_AUTO_LOGIN=True` in docker-compose.yml automatically authenticates as the first superuser. This allows curl/CDP access to authenticated pages (including Django admin) without manual login cookies. To take screenshots via CDP, use `http://host.docker.internal:8000/` (not localhost) from the browser-service container.
+- **Debug Auto-Login**: `DEBUG_AUTO_LOGIN=True` in docker-compose.yml automatically authenticates as the first superuser. This allows curl/CDP access to authenticated pages (including Django admin) without manual login cookies. To take screenshots via CDP, use `http://host.docker.internal:8000/` (not localhost) from the browser_service container.
 - **Admin Theme**: Django admin theme is controlled by `admin/base_site.html`. It kills `theme.js`, `dark_mode.css`, `responsive.css`, and `dashboard.css` at the template block level. The float-based layout from `base.css` is neutralized via CSS reset. Custom `admin/index.html` prevents `dashboard.css` loading. Nav sidebar width set to 232px to match main app.
 - **Lint/Typecheck**: `ruff check scrapers/` and `ruff format scrapers/`
 - **Tests**: `docker compose exec django sh -c "cd /app/webapp && PYTHONPATH=/app/webapp:/app python -m pytest /app/tests/ -v"`

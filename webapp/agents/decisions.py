@@ -39,18 +39,24 @@ def build_decisions(
     reject_with_feedback: bool = True,
     respond_label: str | None = None,
 ) -> list[dict[str, Any]]:
-    decisions: list[dict[str, Any]] = [{"type": DECISION_APPROVE, "label": approve_label}]
+    decisions: list[dict[str, Any]] = [
+        {"type": DECISION_APPROVE, "label": approve_label}
+    ]
     if reject_label:
-        decisions.append({
-            "type": DECISION_REJECT,
-            "label": reject_label,
-            "allow_feedback": reject_with_feedback,
-        })
+        decisions.append(
+            {
+                "type": DECISION_REJECT,
+                "label": reject_label,
+                "allow_feedback": reject_with_feedback,
+            }
+        )
     if respond_label:
-        decisions.append({
-            "type": DECISION_RESPOND,
-            "label": respond_label,
-        })
+        decisions.append(
+            {
+                "type": DECISION_RESPOND,
+                "label": respond_label,
+            }
+        )
     return decisions
 
 
@@ -58,10 +64,19 @@ def options_to_decisions(options: list[str]) -> list[dict[str, Any]]:
     choices: list[dict[str, Any]] = []
     for opt in options:
         if opt in CANCEL_LABELS:
-            choices.append({"type": DECISION_REJECT, "label": opt, "allow_feedback": False})
+            choices.append(
+                {"type": DECISION_REJECT, "label": opt, "allow_feedback": False}
+            )
         else:
             choices.append({"type": DECISION_APPROVE, "label": opt})
     return choices
+
+
+def is_cancel(decision: dict[str, Any]) -> bool:
+    d = decision.get("decision")
+    if d is None:
+        return True
+    return d in CANCEL_LABELS or d == DECISION_REJECT
 
 
 def _parse_decision(response: Any) -> dict[str, Any]:
@@ -72,13 +87,8 @@ def _parse_decision(response: Any) -> dict[str, Any]:
         return {"decision": choice}
     if isinstance(response, str):
         return {"decision": response}
+    logger.warning(
+        "_parse_decision: unexpected response type %s, defaulting to Cancel",
+        type(response).__name__,
+    )
     return {"decision": "Cancel"}
-
-
-def is_cancel(decision: dict[str, Any]) -> bool:
-    d = decision.get("decision", "")
-    return d in CANCEL_LABELS or d == DECISION_REJECT
-
-
-def is_approve(decision: dict[str, Any]) -> bool:
-    return decision.get("decision") == DECISION_APPROVE or decision.get("decision") not in CANCEL_LABELS

@@ -14,12 +14,11 @@ import logging
 
 from langgraph.types import interrupt
 
+from ..constants import FINAL_RETRY_FAILED, FINAL_RETRY_SENTINEL, MAX_TEST_RETRIES
 from ..decisions import _parse_decision, options_to_decisions
 from ..state import ScrapeState
 
 logger = logging.getLogger(__name__)
-
-MAX_TEST_RETRIES = 2
 
 
 def human_approval(state: ScrapeState) -> dict:
@@ -30,15 +29,18 @@ def human_approval(state: ScrapeState) -> dict:
 
     if not reason:
         test_retries = state.get("test_retry_count", 0)
-        if test_retries == 99:
+        if test_retries == FINAL_RETRY_SENTINEL:
             logger.warning(
-                "human_approval: final retry sentinel (99) reached without explicit "
+                f"human_approval: final retry sentinel ({FINAL_RETRY_SENTINEL}) reached without explicit "
                 "reason — routing to cleanup to prevent infinite loop"
             )
             return {
-                "human_response": {"decision": "approve", "label": "Final retry failed"},
+                "human_response": {
+                    "decision": "approve",
+                    "label": "Final retry failed",
+                },
                 "human_feedback": "",
-                "interrupt_reason": "final_retry_failed",
+                "interrupt_reason": FINAL_RETRY_FAILED,
             }
         if test_retries >= MAX_TEST_RETRIES:
             reason = "testing_exhausted"

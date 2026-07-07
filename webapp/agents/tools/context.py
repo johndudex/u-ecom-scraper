@@ -49,6 +49,14 @@ def set_tool_context(state: dict, agent_name: str = "") -> None:
             if isinstance(probe.get("anti_bot"), dict)
             else False
         )
+        # Robust fallback: if the ONLY working access method is a stealth
+        # browser (uc_chrome_* or cloak_*), vanilla browser/HTTP were blocked
+        # → anti-bot is present even if the probe didn't raise an explicit flag.
+        # This must mirror the same fallback in build_scraper_analyzer_message.
+        if not _ctx["anti_bot"]:
+            _m = str(_ctx["probe_method"])
+            if _m.startswith("uc_chrome") or _m.startswith("cloak"):
+                _ctx["anti_bot"] = True
     else:
         _ctx["probe_method"] = ""
         _ctx["anti_bot"] = False

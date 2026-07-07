@@ -40,7 +40,7 @@ _BLOCKED_BY_UC_CHROME = (
     "Playwright MCP browser tools are blocked — use probe_page for "
     "page access. Do NOT use playwright_browser_navigate, snapshot, "
     "click, or evaluate. Use probe_page (which routes through "
-    "browser-service UC Chrome) for any page inspection needed."
+    "browser_service UC Chrome) for any page inspection needed."
 )
 
 _BLOCKED_OFF_TARGET = (
@@ -66,6 +66,28 @@ def _is_same_domain(url: str, domain: str) -> bool:
         return urlparse(url).hostname == domain
     except Exception:
         return False
+
+
+def _coerce_url_str(value: Any) -> str:
+    """Coerce a tool ``url`` argument into a string.
+
+    LLMs occasionally pass ``url`` as a dict (e.g. ``{"url": "...", "title": ...}``)
+    rather than a plain string.  Under langgraph v1 a tool that raises (here:
+    ``urlparse``/``.rstrip`` on a dict) is re-raised by the ToolNode instead of
+    being swallowed into a retry message, which crashes the agent.  Normalizing
+    to a string up-front keeps the guards robust.  Generic — not site-specific.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("url", "href", "link", "address", "value"):
+            inner = value.get(key)
+            if isinstance(inner, str) and inner:
+                return inner
+        return str(value)
+    if value is None:
+        return ""
+    return str(value)
 
 
 def _make_guard(check_fn: Callable[..., str | None]) -> Callable:
@@ -123,9 +145,9 @@ def _check_akamai(func: Callable, args: tuple, kwargs: dict) -> str | None:
 
 
 def _check_target_url(func: Callable, args: tuple, kwargs: dict) -> str | None:
-    url = kwargs.get("url", "")
+    url = _coerce_url_str(kwargs.get("url", ""))
     if not url and args:
-        url = str(args[0]) if args[0] else ""
+        url = _coerce_url_str(args[0])
     if not url:
         return None
 
@@ -161,7 +183,7 @@ def _check_target_url(func: Callable, args: tuple, kwargs: dict) -> str | None:
 
 
 def _check_blocked_domain(func: Callable, args: tuple, kwargs: dict) -> str | None:
-    url = kwargs.get("url", "")
+    url = _coerce_url_str(kwargs.get("url", ""))
     if not url:
         return None
     if not is_anti_bot_detected():
@@ -177,9 +199,9 @@ def _check_blocked_domain(func: Callable, args: tuple, kwargs: dict) -> str | No
 
 
 def _check_same_domain(func: Callable, args: tuple, kwargs: dict) -> str | None:
-    url = kwargs.get("url", "")
+    url = _coerce_url_str(kwargs.get("url", ""))
     if not url and args:
-        url = str(args[0]) if args[0] else ""
+        url = _coerce_url_str(args[0])
     if not url:
         return None
     try:
@@ -228,7 +250,71 @@ def _urls_match(url_a: str, url_b: str) -> bool:
 
         return a.hostname == b.hostname and path_a == path_b
     except Exception:
-        return url_a.rstrip("/") == url_b.rstrip("/")
+        try:
+            return str(url_a).rstrip("/") == str(url_b).rstrip("/")
+        except Exception:
+            return False
+
+
+def _catch_tool_errors_sync(func: Callable) -> Callable:
+    """Wrap a tool func so exceptions return an error message instead of raising.
+
+    v1's ToolNode RE-RAISES tool errors (v0.6 swallowed them into a retry
+    message); this restores the forgiving v0.6 behavior so an agent whose tool
+    errors gets a ``[tool error: ...]`` message + can recover, instead of the
+    whole agent crashing. Generic — applies to every tool. [v1 tool-error handling]
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            logger.warning(
+                "tool %s raised %s: %s — returning error message",
+                getattr(func, "__name__", "tool"),
+                type(e).__name__,
+                str(e)[:200],
+            )
+            return f"[tool error: {type(e).__name__}: {str(e)[:500]}]"
+
+    return wrapper
+
+
+def _catch_tool_errors_async(coro: Callable) -> Callable:
+    @functools.wraps(coro)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await coro(*args, **kwargs)
+        except Exception as e:
+            logger.warning(
+                "tool %s raised %s: %s — returning error message",
+                getattr(coro, "__name__", "tool"),
+                type(e).__name__,
+                str(e)[:200],
+            )
+            return f"[tool error: {type(e).__name__}: {str(e)[:500]}]"
+
+    return wrapper
+
+
+def apply_tool_error_catcher(tool_obj: Any) -> Any:
+    """Wrap a tool's func/coroutine to catch exceptions → error message.
+
+    Apply AFTER guards so it's the outer wrapper (catches both tool-func errors
+    and guard errors). Idempotent (skips if already applied). Works with
+    ``@tool`` functions and ``StructuredTool`` instances.
+    """
+    if hasattr(tool_obj, "func") and tool_obj.func is not None:
+        if not getattr(tool_obj, "_error_catcher_applied", False):
+            tool_obj.func = _catch_tool_errors_sync(tool_obj.func)
+            if hasattr(tool_obj, "coroutine") and tool_obj.coroutine is not None:
+                tool_obj.coroutine = _catch_tool_errors_async(tool_obj.coroutine)
+            try:
+                tool_obj._error_catcher_applied = True
+            except Exception:
+                pass
+    return tool_obj
 
 
 def apply_guard(tool_obj: Any, guard: Callable) -> Any:

@@ -50,12 +50,82 @@ Write `navigation_analysis.json` to `workspace/{site_slug}/navigation_analysis.j
     "url_pattern": "/product/{slug}",
     "url_examples": ["https://site.com/product/shoe-1", "https://site.com/product/shoe-2"]
   },
+  "filters": {
+    "has_filters": true,
+    "method": "url | form | mixed",
+    "date_filter": {
+      "param_name": "date_posted",
+      "url_pattern": "/jobs?date_posted={days}",
+      "selector": "select[name='date_posted']",
+      "values": ["1", "7", "30", "all"]
+    },
+    "location_filter": {
+      "param_name": "location",
+      "url_pattern": "/jobs?location={state}",
+      "selector": "input[name='location']"
+    },
+    "category_filter": {
+      "param_name": "category",
+      "url_pattern": "/jobs?category={category}",
+      "selector": "select[name='specialty']"
+    }
+  },
   "list_page_detection": {
     "is_list_page": true,
     "indicators": ["multiple product links", "grid layout"]
   }
 }
 ```
+
+If no filters are detected, write `"filters": {"has_filters": false}`.
+
+## Finding the Job Listing Page (job boards — IMPORTANT)
+
+**Job-board homepages usually have NO direct links to job listings** — their nav is
+all marketing/resource pages (About, Resources, Why-us, etc.). Do NOT fall back to
+`/products`, `/about`, `/resources`, or similar — those have zero jobs.
+
+To find the actual job results, do BOTH:
+1. **Try common job-search entry points**: `/jobs`, `/job-search`, `/search/jobs`,
+   `/search`, `/careers`. Load each until one returns job cards/links.
+2. **Submit the keyword search form** (usually a `Keywords`/`keyword`/`search` input
+   on the homepage with a submit button). Fill it with the search term (or a broad
+   term like the profession) + submit → land on the job-results page.
+
+Once on a job-results page, extract the **job detail links** (URLs containing
+`/job-`, `/jobs/`, `/position`, a numeric job id, etc.). Also note **specialty/
+category listing pages** (e.g. `/emergency-medicine-jobs/`, `/nursing-jobs/`) —
+many boards expose jobs via per-specialty listing pages that paginate fully; if you
+find these, prefer them as the discovery source (they often have more complete
+pagination than search).
+
+**Do not report `/products` or a marketing page as the listing page.** If you cannot
+find a job-results page, report `listing_page.url: null` and list what you tried.
+
+## Filter Detection (for job portals and search sites)
+
+Many sites — especially **job portals** — let users filter results by **date posted** (e.g. last 7 days), **location** (e.g. a state or city), and **category/job type**. Detect these so the generated scraper can pre-filter its results. There are two mechanisms:
+
+### URL-based filters
+The filter appears as a query parameter on the listing/results URL. Common params:
+- **Date**: `date_posted`, `fromage`, `days`, `posted`, `postedWithin`, `dateRange`
+- **Location**: `location`, `l`, `where`, `city`, `state`, `radius`
+- **Category/role**: `category`, `specialty`, `discipline`, `job_type`, `profession`, `department`
+
+Example: `https://site.com/jobs?keyword=rn&location=Alabama&fromage=7`
+
+### Form-based filters
+The filter is a `<select>` dropdown, `<input>`, or checkbox group on the page that must be interacted with (filled/selected) before results update. Record the CSS selector and available option values.
+
+### How to report filters
+For each of the three filter types (date, location, category), report:
+- `param_name` (if URL-based) — the query parameter that controls it
+- `url_pattern` — the listing path with the param and a `{days}`/`{state}`/`{category}` placeholder
+- `selector` (if form-based) — the CSS selector of the `<select>`/`<input>`
+- `values` — known option values (e.g. `["1","7","30","all"]` for a date dropdown)
+
+Only include a filter type you actually observed on the page. Set `method` to `url`, `form`, or `mixed` based on what you found. If the site has no filterable controls, set `has_filters: false`.
+
 
 ## Input Modes
 
@@ -97,6 +167,7 @@ Do NOT call `probe_page` — the site_analyzer already determined what works.
    - Try search (if navigation mode)
    - Find item link patterns
    - Test pagination
+   - **Detect filters** (date/location/category) — especially for job portals
 4. Write `navigation_analysis.json` (1 call)
 
 ## BUDGET: 40 tool calls maximum (navigation), 20 tool calls maximum (list_page).

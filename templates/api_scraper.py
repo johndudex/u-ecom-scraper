@@ -51,7 +51,7 @@ if API_KEY:
     API_HEADERS["Authorization"] = f"Bearer {API_KEY}"
 
 PAGINATION_TYPE = "offset"
-PAGE_SIZE = 50
+PAGE_SIZE = {PAGE_SIZE}  # use the API's MAX page size (e.g. 100-500) for full extraction; no item cap
 DELAY_BETWEEN_REQUESTS = {DELAY_BETWEEN_REQUESTS}
 MAX_RETRIES = 3
 
@@ -149,6 +149,31 @@ def transform_api_product(api_product: dict, index: int, src_url: str) -> dict:
     }
 
 
+def transform_api_jobs(raw_jobs: list[dict], src_url: str = "") -> list[dict]:
+    """JOB boards: map raw API items to standard job fields using the GENERIC
+    resolver in ``src.job_fields``.  Do NOT hardcode site-specific field names —
+    ``map_jobs`` infers each field's source path (title, company, location,
+    description, salary, job_type, posted_date, apply_url, requirements) by
+    coverage over the batch, so the SAME code works across job platforms.
+    Use this in place of ``transform_api_product`` when scraping job postings.
+    """
+    from src.job_fields import map_jobs
+
+    if not raw_jobs:
+        return []
+    jobs = map_jobs(sample_items=raw_jobs, raw_items=raw_jobs)
+    now = datetime.now(timezone.utc).isoformat()
+    for idx, j in enumerate(jobs, start=1):
+        j.setdefault("id", idx)
+        if src_url:
+            j.setdefault("src_url", src_url)
+        j.setdefault("status_code", 200)
+        j.setdefault("scraped_at", now)
+        j.setdefault("remarks", "")
+    return jobs
+
+
+
 def fetch_all_products_via_api() -> tuple[list[str], list[dict]]:
     all_products = []
     offset = 0
@@ -180,7 +205,14 @@ def fetch_all_products_via_api() -> tuple[list[str], list[dict]]:
 
         logger.info(f"Page {page}: {len(products)} products (total: {len(all_products)})")
 
+        # Stop when a page is short (exhausted) OR we've hit the API's reported total.
         if len(products) < PAGE_SIZE:
+            break
+        total = (
+            data.get("totalCount") or data.get("total_count") or data.get("count")
+            or data.get("total") or data.get("totalResults") or data.get("totalJobs")
+        )
+        if isinstance(total, int) and total > 0 and len(all_products) >= total:
             break
 
         if PAGINATION_TYPE == "cursor":
@@ -189,9 +221,7 @@ def fetch_all_products_via_api() -> tuple[list[str], list[dict]]:
                 break
         elif PAGINATION_TYPE == "offset":
             offset += PAGE_SIZE
-        else:
-            page += 1
-
+        # page-based: single increment below (do NOT increment twice)
         page += 1
 
     urls = [p.get("url", "") or p.get("handle", "") for p in all_products]

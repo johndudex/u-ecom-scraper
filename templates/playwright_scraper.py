@@ -85,7 +85,14 @@ def clean_html(html_str: str) -> str:
 
 
 def get_browser(pw, headless=True, proxy=None):
-    """Connect to browser — remote CDP if available, local launch otherwise."""
+    """Connect to browser — remote CDP if available, local launch otherwise.
+
+    NOTE: stealth is handled transparently by the browser_service
+    cloak_stealth_patch (.pth) — when STEALTH_BROWSER=cloak is set for anti-bot
+    sites, the launch() below drives CloakBrowser's stealth Chromium binary. Do
+    NOT call cloakbrowser.launch() here (it would start a second Playwright and
+    conflict with the caller's sync_playwright context).
+    """
     cdp_endpoint = os.environ.get("BROWSER_CDP_ENDPOINT", "")
     if cdp_endpoint:
         logger.info(f"Connecting to remote browser via CDP: {cdp_endpoint}")

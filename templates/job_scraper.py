@@ -21,10 +21,10 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html import unescape
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -46,6 +46,31 @@ JOB_LISTING_URL = "{LISTING_URL}"
 SRC_URL = "{LISTING_URL}"
 DELAY_BETWEEN_REQUESTS = {DELAY_BETWEEN_REQUESTS}
 MAX_RETRIES = 3
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FILTER CONFIGURATION - populated from navigation_analysis.filters
+# These control date-range and location filtering for job portals.
+# Leave param/selector blank when the site does not expose that filter; the
+# scraper then falls back to client-side filtering of extracted data.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Filter mechanism: "url" (params in URL), "form" (form elements), "mixed", or "none"
+FILTER_METHOD = "{FILTER_METHOD}"
+
+# Date filter — default to last 7 days
+DATE_FILTER_DAYS = 7
+DATE_FILTER_PARAM = "{DATE_FILTER_PARAM}"        # URL param, e.g. "date_posted", "fromage"
+DATE_FILTER_SELECTOR = "{DATE_FILTER_SELECTOR}"  # CSS selector for a form <select>/<input>
+
+# Location filter — default to Alabama
+LOCATION_FILTER_VALUE = "{LOCATION_FILTER_VALUE}"  # e.g. "Alabama", "AL"
+LOCATION_FILTER_PARAM = "{LOCATION_FILTER_PARAM}"
+LOCATION_FILTER_SELECTOR = "{LOCATION_FILTER_SELECTOR}"
+
+# Category filter — empty means ALL categories/specialties
+CATEGORY_FILTER_VALUE = ""
+CATEGORY_FILTER_PARAM = "{CATEGORY_FILTER_PARAM}"
+CATEGORY_FILTER_SELECTOR = "{CATEGORY_FILTER_SELECTOR}"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -98,6 +123,162 @@ def make_absolute_url(url: str, base: str = SITE_URL) -> str:
     if url.startswith("//"):
         return f"https:{url}"
     return urljoin(base, url)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FILTER HELPERS - date range + location filtering for job portals
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# US state name → 2-letter code (for flexible location matching)
+_US_STATES = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA", "west virginia": "WV",
+    "wisconsin": "WI", "wyoming": "WY", "district of columbia": "DC",
+}
+
+
+def build_filtered_url(base_url: str, days: int = None,
+                       location: str = None, category: str = None) -> str:
+    """Append filter parameters to a listing URL (URL-based filtering).
+
+    Only applies params that are configured (non-empty) in the FILTER config.
+    Preserves any existing query params on base_url.
+    """
+    parsed = urlparse(base_url)
+    param_dict = dict(parse_qsl(parsed.query, keep_blank_values=True))
+
+    if days is None:
+        days = DATE_FILTER_DAYS
+    if location is None:
+        location = LOCATION_FILTER_VALUE
+    if category is None:
+        category = CATEGORY_FILTER_VALUE
+
+    if days and DATE_FILTER_PARAM:
+        param_dict[DATE_FILTER_PARAM] = str(days)
+    if location and LOCATION_FILTER_PARAM:
+        param_dict[LOCATION_FILTER_PARAM] = location
+    if category and CATEGORY_FILTER_PARAM:
+        param_dict[CATEGORY_FILTER_PARAM] = category
+
+    new_query = urlencode(param_dict)
+    url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    if new_query:
+        url += f"?{new_query}"
+    return url
+
+
+def matches_location(location_str: str, target: str = None) -> bool:
+    """Return True if a job's location matches the target.
+
+    Flexible matching: accepts full state names ("Alabama"), 2-letter codes
+    ("AL"), and partial city/state strings ("Birmingham, AL").  When target is
+    empty/None, returns True (no location filter applied).
+    """
+    if target is None:
+        target = LOCATION_FILTER_VALUE
+    if not target:
+        return True
+    if not location_str:
+        return False
+
+    loc = location_str.lower()
+    tgt = target.lower().strip()
+
+    # Resolve target to a 2-letter state code: "alabama"→"AL", "al"→"AL"
+    code = _US_STATES.get(tgt)
+    is_code_input = len(tgt) == 2
+    if not code and is_code_input:
+        code = tgt.upper()
+
+    # Boundary-aware match (case-insensitive) — handles "Birmingham, AL"
+    if code:
+        if re.search(
+            r"(^|[\s,])" + re.escape(code) + r"([\s,]|$)", loc, re.IGNORECASE
+        ):
+            return True
+        # If the target was itself a 2-letter code, only the boundary match
+        # counts — a loose substring check would false-positive on words like
+        # "Dallas" (contains "al").
+        if is_code_input:
+            return False
+
+    # Loose substring match only for longer targets (state names, cities)
+    if len(tgt) > 2 and tgt in loc:
+        return True
+    return False
+
+
+def parse_posted_date(date_str: str) -> Optional[datetime]:
+    """Parse a job posting date from many formats. Returns datetime or None.
+
+    Handles ISO strings, common US formats, and relative phrases
+    ("2 days ago", "today", "yesterday", "just posted").
+    """
+    if not date_str:
+        return None
+    s = str(date_str).strip()
+    if not s:
+        return None
+
+    explicit_formats = [
+        "%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+        "%m/%d/%Y", "%m/%d/%y", "%B %d, %Y", "%b %d, %Y",
+        "%d %B %Y", "%d %b %Y",
+    ]
+    for fmt in explicit_formats:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+
+    low = s.lower()
+    now = datetime.now()
+    if "today" in low or "just posted" in low or low == "just":
+        return now
+    if "yesterday" in low:
+        return now - timedelta(days=1)
+
+    m = re.search(r"(\d+)\s*(day|hour|week|month)s?\s*ago", low)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        if unit == "hour":
+            return now - timedelta(hours=n)
+        if unit == "day":
+            return now - timedelta(days=n)
+        if unit == "week":
+            return now - timedelta(weeks=n)
+        if unit == "month":
+            return now - timedelta(days=n * 30)
+    return None
+
+
+def is_within_days(posted_date_str: str, max_days: int = None) -> bool:
+    """Return True if a job's posted date is within max_days of now.
+
+    If the date cannot be parsed, returns True (keep) so we don't silently drop
+    jobs due to an unparseable date. Set max_days<=0 to disable the filter.
+    """
+    if max_days is None:
+        max_days = DATE_FILTER_DAYS
+    if not max_days or max_days <= 0:
+        return True
+    posted = parse_posted_date(posted_date_str)
+    if posted is None:
+        return True
+    age_days = (datetime.now() - posted).days
+    return age_days <= max_days
 
 
 def fetch_page(url: str) -> Optional[tuple[BeautifulSoup, int]]:
@@ -256,6 +437,18 @@ def extract_job_from_page(soup: BeautifulSoup, url: str, status_code: int, src_u
         href = apply_el.get("href", "")
         job["apply_url"] = make_absolute_url(href)
 
+    # Posted date (for date-range filtering)
+    posted_raw = ""
+    if jsonld:
+        posted_raw = jsonld.get("datePosted", "") or jsonld.get("datePosted", "")
+    if not posted_raw:
+        pd_el = soup.select_one("{POSTED_DATE_SELECTOR}")
+        if pd_el:
+            posted_raw = pd_el.get_text(strip=True)
+    job["posted_date"] = posted_raw
+    parsed_dt = parse_posted_date(posted_raw)
+    job["posted_date_parsed"] = parsed_dt.date().isoformat() if parsed_dt else ""
+
     return job
 
 
@@ -263,13 +456,28 @@ def extract_job_from_page(soup: BeautifulSoup, url: str, status_code: int, src_u
 # DISCOVERY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def discover_job_urls() -> list[str]:
+def discover_job_urls(days: int = None, location: str = None,
+                      category: str = None) -> list[str]:
+    """Discover job URLs from the listing page, applying URL-based filters.
+
+    When FILTER_METHOD is url/mixed and filter params are configured, the date
+    and location params are appended to the listing URL so the site returns a
+    pre-filtered result set. Pagination is followed until a page returns no
+    new job links.
+    """
     all_urls = []
     seen = set()
     page = 1
 
+    # Apply URL-based filters to the base listing URL
+    base = JOB_LISTING_URL
+    if FILTER_METHOD in ("url", "mixed"):
+        base = build_filtered_url(JOB_LISTING_URL, days=days, location=location, category=category)
+        logger.info(f"Applied URL filters: {base}")
+
     while True:
-        paginated_url = f"{JOB_LISTING_URL}?page={page}"
+        sep = "&" if "?" in base else "?"
+        paginated_url = f"{base}{sep}page={page}"
         logger.info(f"Fetching listing page {page}: {paginated_url}")
 
         result = fetch_page(paginated_url)
@@ -278,16 +486,18 @@ def discover_job_urls() -> list[str]:
 
         soup, _ = result
         links = soup.select("{JOB_LINK_SELECTOR}")
+        added_this_page = 0
         for link in links:
             href = link.get("href", "")
             absolute_url = make_absolute_url(href)
             if absolute_url and absolute_url not in seen:
                 seen.add(absolute_url)
                 all_urls.append(absolute_url)
+                added_this_page += 1
 
-        logger.info(f"Page {page}: {len(links)} jobs found (total: {len(all_urls)})")
+        logger.info(f"Page {page}: {added_this_page} new jobs (total: {len(all_urls)})")
 
-        if len(links) == 0:
+        if added_this_page == 0:
             break
 
         page += 1
@@ -321,7 +531,15 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Max jobs to scrape")
     parser.add_argument("--input", type=str, default=None, help="Path to input URLs JSON file")
     parser.add_argument("--urls", nargs="+", default=None, help="Job URLs as arguments")
-    args = parser.parse_args()
+    parser.add_argument("--days", type=int, default=DATE_FILTER_DAYS,
+                        help="Max job age in days (default: last 7 days)")
+    parser.add_argument("--location", type=str, default=LOCATION_FILTER_VALUE,
+                        help="Location filter, e.g. 'Alabama' or 'AL'")
+    # browser_service auto-appends --xvfb for browser-based scrapers; declare it
+    # (ignored here) and use parse_known_args so any other injected runner flags
+    # don't crash argparse on startup.
+    parser.add_argument("--xvfb", action="store_true", help=argparse.SUPPRESS)
+    args, _unknown = parser.parse_known_args()
 
     start_time = time.time()
 
@@ -329,6 +547,7 @@ def main():
     logger.info(f"Starting job scraper for {SITE_NAME}")
     logger.info(f"Site: {SITE_URL}")
     logger.info(f"Listing URL: {JOB_LISTING_URL}")
+    logger.info(f"Filter: last {args.days} days, location={args.location or '(all)'}")
     logger.info(f"Output: {OUTPUT_FILE}")
     logger.info("=" * 80)
 
@@ -342,7 +561,7 @@ def main():
         job_urls = load_urls_from_file(INPUT_FILE)
     else:
         logger.info("No input_urls.json found. Discovering jobs from listing page...")
-        job_urls = discover_job_urls()
+        job_urls = discover_job_urls(days=args.days, location=args.location)
         save_urls_to_file(INPUT_FILE, job_urls)
 
     if args.sample:
@@ -354,6 +573,7 @@ def main():
 
     results = []
     failed = 0
+    skipped_filter = 0
 
     for i, url in enumerate(job_urls):
         result = fetch_page(url)
@@ -361,6 +581,17 @@ def main():
             soup, status_code = result
             job = extract_job_from_page(soup, url, status_code, SRC_URL)
             job["id"] = i + 1
+
+            # Client-side filtering (safety net — works regardless of filter mechanism)
+            if not matches_location(job.get("location", ""), args.location):
+                logger.info(f"Skipping (location '{job.get('location', '')}' != {args.location}): {url}")
+                skipped_filter += 1
+                continue
+            if not is_within_days(job.get("posted_date", ""), args.days):
+                logger.info(f"Skipping (older than {args.days}d, posted={job.get('posted_date', '')}): {url}")
+                skipped_filter += 1
+                continue
+
             results.append(job)
         else:
             logger.error(f"Failed to fetch: {url}")
@@ -382,6 +613,11 @@ def main():
         "metadata": {
             "scraping_duration_seconds": round(time.time() - start_time, 2),
             "failed_items": failed,
+            "skipped_by_filter": skipped_filter,
+            "filters_applied": {
+                "max_days": args.days,
+                "location": args.location,
+            },
             "rate_limit_delay": DELAY_BETWEEN_REQUESTS,
         },
     }

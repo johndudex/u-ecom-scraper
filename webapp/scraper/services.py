@@ -55,6 +55,15 @@ INTERRUPT_TO_APPROVAL_TYPE: dict[str, str] = {
     "pre_execution": "execution",
     "reanalyze_exhausted": "validation",
     "skill_approval": "skill_update",
+    "budget_exhausted_site": "validation",
+    "budget_exhausted_product": "validation",
+    "budget_exhausted_navigation": "validation",
+    "missing_artifact_site": "validation",
+    "missing_artifact_product": "validation",
+    "missing_artifact_navigation": "validation",
+    "playwright_unavailable": "mechanism",
+    "testing_exhausted": "validation",
+    "review": "execution",
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -193,7 +202,7 @@ class LangGraphService:
         """Return the LangGraph ``config`` dict for a given ScrapeJob pk."""
         return {
             "configurable": {"thread_id": LangGraphService.get_thread_id(job_id)},
-            "recursion_limit": 50,
+            "recursion_limit": 500,
         }
 
     # ── Execution ──────────────────────────────────────────────────
@@ -213,16 +222,24 @@ class LangGraphService:
         """
         try:
             handler = _ScrapeCallbackHandler(job)
+            logger.warning(
+                "stream_graph INVOKE job=%s recursion_limit=%s thread=%s",
+                job.id,
+                config.get("recursion_limit"),
+                (config.get("configurable") or {}).get("thread_id"),
+            )
             graph.invoke(
                 initial_state,
                 config,
                 callbacks=[handler],
             )
         except Exception as exc:
-            from langgraph.errors import GraphInterrupt
+            from langgraph.errors import GraphInterrupt, GraphRecursionError
 
             if isinstance(exc, GraphInterrupt):
                 logger.info("Job %d: GraphInterrupt caught", job.id)
+            elif isinstance(exc, GraphRecursionError):
+                LangGraphService.create_recursion_approval(job, str(exc))
             else:
                 logger.error("Job %d: graph execution failed: %s", job.id, exc)
                 raise
@@ -230,7 +247,6 @@ class LangGraphService:
         LangGraphService._check_and_create_approval(graph, config, job)
 
     # ── Interrupt handling [D2] ─────────────────────────────────────────
-
     @staticmethod
     def _check_and_create_approval(
         graph: CompiledStateGraph,
@@ -306,6 +322,8 @@ class LangGraphService:
 
         reason = interrupt_data.get("reason", "")
         approval_type = INTERRUPT_TO_APPROVAL_TYPE.get(reason, Approval.TYPE_EXECUTION)
+        if reason and reason not in INTERRUPT_TO_APPROVAL_TYPE:
+            logger.info("Unmapped interrupt reason '%s' — defaulting to %s", reason, approval_type)
 
         question = str(
             interrupt_data.get("question", interrupt_data.get("message", ""))
@@ -326,6 +344,51 @@ class LangGraphService:
             reason,
         )
         return approval
+
+    @staticmethod
+    def create_recursion_approval(job: Any, message: str) -> None:
+        """Pause a job when an agent exceeds its recursion budget.
+
+        Instead of hard-failing the job on ``GraphRecursionError``, create a
+        validation Approval so a human can retry (often succeeds with LLM
+        variance) or cancel.  Generic — applies to any agent/node.  [recursion]
+        """
+        from scraper.models import Approval, ScrapeJob, SessionLog
+
+        msg = (message or "")[:500]
+        approval = Approval.objects.create(
+            job=job,
+            approval_type=Approval.TYPE_VALIDATION,
+            question=(
+                "An agent exceeded its step budget and was paused to avoid a "
+                f"hard failure.\n\n{msg}\n\nYou can Resume to retry, or Cancel."
+            ),
+            response_data={"reason": "testing_exhausted", "recursion_error": msg},
+            status=Approval.STATUS_PENDING,
+        )
+        job.status = ScrapeJob.STATUS_WAITING_APPROVAL
+        job.save(update_fields=["status"])
+        seq = SessionLog.objects.filter(job=job).count()
+        SessionLog.objects.create(
+            job=job,
+            role=SessionLog.ROLE_SYSTEM,
+            agent="human_approval",
+            content=f"⏸️ Paused (recursion budget exceeded): {msg[:300]}",
+            seq=seq,
+        )
+        LangGraphService._publish_redis(
+            job.id,
+            {
+                "type": "approval",
+                "approval_id": approval.id,
+                "approval_type": approval.approval_type,
+                "question": approval.question,
+            },
+        )
+        logger.warning(
+            "Job %d: GraphRecursionError -> approval %d (paused, not failed)",
+            job.id, approval.id,
+        )
 
     # ── Redis pub/sub for SSE [D4] ──────────────────────────────────────
 

@@ -36,7 +36,7 @@ Navigation phases (in brackets) run only for `input_mode=navigation|list_page`.
 8. **code_generation** — LLM agent writes the Python scraper using analysis artifacts and verified selectors.
 9. **testing** — LLM agent runs the scraper on samples, validates field CORRECTNESS. Up to 3 retry cycles (code-writer ↔ code-tester).
 10. **field_confirmation** — Runs scraper on sample products, presents extracted data to user for approval. On rejection, loops back to product_analyzer (max 2 cycles).
-11. **execution** — Runs the scraper on all URLs from `input_urls.json`. HTTP scrapers run in celery-worker, browser scrapers dispatch to browser-service.
+11. **execution** — Runs the scraper on all URLs from `input_urls.json`. HTTP scrapers run in celery-worker, browser scrapers dispatch to browser_service.
 12. **cleanup** — LLM agent copies scraper to `scrapers/{site_slug}/`, preserves analysis artifacts. Site model updated automatically.
 13. **skill_learning** — LLM agent examines the scrape for reusable patterns, proposes updates to `.opencode/skills/`. Reads `nav_learning_report.json` to avoid duplicating nav-skill-review's work.
 

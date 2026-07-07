@@ -23,6 +23,27 @@ class Command(BaseCommand):
             default="url_list",
             choices=["url_list", "navigation", "list_page", "search_term"],
         )
+        parser.add_argument(
+            "--page-type",
+            type=str,
+            default="product",
+            dest="page_type",
+            choices=[
+                "product",
+                "product_list",
+                "product_navigation",
+                "article",
+                "article_list",
+                "article_navigation",
+                "job_posting",
+                "job_navigation",
+                "forum_thread",
+                "serp",
+                "page_content",
+            ],
+            help="Page type (drives content type, site_type, and routing). "
+            "Use job_navigation for job portals discovered by browsing.",
+        )
         parser.add_argument("--search", type=str, default="", dest="search_criteria")
         parser.add_argument("--product-url", type=str, default="")
         parser.add_argument("--currency", type=str, default="")
@@ -36,6 +57,7 @@ class Command(BaseCommand):
         url = options["url"]
         job = ScrapeJob.objects.create(
             url=url,
+            page_type=options["page_type"],
             product_url=options["product_url"],
             currency=options["currency"],
             input_mode=options["mode"],
@@ -45,7 +67,8 @@ class Command(BaseCommand):
         )
         self.stdout.write(
             self.style.SUCCESS(
-                f"Created job #{job.id} ({job.input_mode}, '{job.search_criteria}')"
+                f"Created job #{job.id} (page_type={job.page_type}, "
+                f"mode={job.input_mode}, '{job.search_criteria}')"
             )
         )
 

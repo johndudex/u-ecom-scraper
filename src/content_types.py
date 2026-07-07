@@ -122,6 +122,8 @@ JOB_FIELDS = (
     FieldDef("job_type", "Job Type", "text", jsonld_key="employmentType",
              notes="full-time, part-time, contract, etc."),
     FieldDef("apply_url", "Apply URL", "url", jsonld_key="url"),
+    FieldDef("posted_date", "Posted Date", "datetime", jsonld_key="datePosted",
+             notes="Date when job was posted, for filtering by age"),
 )
 
 FORUM_FIELDS = (
@@ -191,12 +193,13 @@ CONTENT_TYPES: dict[str, ContentTypeConfig] = {
         template_family="job",
         jsonld_types=("JobPosting",),
         core_field_names=("title", "company", "location", "description", "url"),
-        optional_field_names=("salary", "requirements", "job_type", "apply_url"),
+        optional_field_names=("salary", "requirements", "job_type", "apply_url", "posted_date"),
         direct_field_names=tuple(f.name for f in DIRECT_FIELDS),
         all_fields=JOB_FIELDS + DIRECT_FIELDS,
         extraction_hints=(
             "Look for job title, company name, location, salary range, "
-            "requirements list, apply button/link."
+            "requirements list, apply button/link. Posted date is important "
+            "for filtering jobs by age (e.g., last 7 days)."
         ),
         input_modes=("url_list", "navigation"),
     ),
@@ -286,6 +289,26 @@ INPUT_MODE_CHOICES = [
 def get_content_type(page_type: str) -> Optional[ContentTypeConfig]:
     content_type_name, _ = PAGE_TYPE_MAP.get(page_type, (page_type, "url_list"))
     return CONTENT_TYPES.get(content_type_name)
+
+
+# Fields present on every item regardless of content type — not useful as a
+# "is this a real item" signal, so excluded from output-filter fields.
+_ALWAYS_PRESENT_FIELDS = {"title", "url", "src_url", "scraped_at", "status_code", "remarks", "id"}
+
+
+def output_filter_fields(content_type: str) -> list[str]:
+    """Fields whose presence indicates a real item of this content type — used by
+    output filters to drop nav/category pages and extraction failures (e.g. a
+    product detail page has a price; a job has a company/location; a category page
+    has neither). Derived from the content type's core fields minus the
+    always-present ones, so it stays in sync with the registry and is generic
+    (no per-content-type hardcoding at call sites). Returns [] for unknown types
+    (callers then keep every item with a title).
+    """
+    cfg = CONTENT_TYPES.get(content_type)
+    if not cfg:
+        return []
+    return [f for f in cfg.core_field_names if f not in _ALWAYS_PRESENT_FIELDS]
 
 
 def get_content_type_for_site_type(site_type: str) -> Optional[ContentTypeConfig]:

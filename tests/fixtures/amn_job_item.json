@@ -1,0 +1,73 @@
+{
+  "jobID": "3515728",
+  "sourceSystem": "AMIE",
+  "sourceJobID": "1276603",
+  "status": "Active",
+  "sourceOrganizationID": "505910",
+  "jobTitle": "Physical Therapist - Outpatient",
+  "jobType": "Travel",
+  "descriptionLong": "Located in the vibrant town of Oxford, AL, the ATI Clinic offers an exciting work environment surrounded by numerous attractions like adventure golf, bowling, or visiting stunning natural parks. The clinic itself maximizes a supportive and collaborative atmosphere, recognized for delivering award-winning outcomes five years running. At the ATI Clinic, you’ll be part of a professional team leading in musculoskeletal care, advancing your career trajectory and specialization within an award-winning framework. Work typically includes direct patient interactions, collaboration with a supportive team, and maintaining the high standards that have led to national recognition. Join us and contribute to providing exceptional care in a thriving, friendly community.",
+  "jobBenefits": "Allied travel assignments are typically for 13 weeks and offer generous packages that include:  <ul>   <li>    Competitive pay rates</li>   <li>    Medical, Dental, Vision</li>   <li>    401(k) and Flex Spending</li>   <li>    Life Insurance</li>   <li>    Accident and Short-term Disability Coverage</li>   <li>    Free Continuing Education</li>   <li>    Competitive Housing Deal</li>   <li>    Refer a friend and earn extra cash!</li>  </ul>",
+  "requiredQualifications": "Physical Therapist, Outpatient\r\nExperience: 1 year\r\n\r\nLicense and OP experience are required.",
+  "preferredQualifications": "Travel experience is preferred",
+  "startDate": "2026-07-20T00:00:00+00:00",
+  "datePosted": "2026-06-18T14:21:56+00:00",
+  "searchDocumentModified": "2026-06-18T22:28:10.304+00:00",
+  "shift": "8 D",
+  "duration": "26",
+  "durationInt": 26,
+  "location": {
+    "type": "Point",
+    "coordinates": [
+      -85.83702,
+      33.60906
+    ]
+  },
+  "city": {
+    "cityID": 156309,
+    "name": "Oxford"
+  },
+  "state": {
+    "stateID": 128,
+    "name": "Alabama",
+    "abbrev": "AL"
+  },
+  "disciplineSpecialty": {
+    "disciplineSpecialtyID": 836,
+    "disciplineName": "Physical Therapist",
+    "specialtyName": "Outpatient",
+    "sourceDisciplineID": "14",
+    "sourceSpecialtyID": "65"
+  },
+  "divisionCompany": {
+    "divisionCompanyID": 7,
+    "companyName": "Med Travelers",
+    "divisionName": "Allied",
+    "aboutCompany": "At AMN Healthcare, we strive to be recognized as the most trusted, innovative, and influential force in helping healthcare organizations provide quality patient care that continually evolves to make healthcare more human, more effective, and more achievable."
+  },
+  "payRate": {
+    "minPayRate": 2227,
+    "maxPayRate": 2295,
+    "payRateType": "Weekly",
+    "payRateTypeAbbrev": "wk"
+  },
+  "organization": {
+    "sourceSystem": "AMIE",
+    "sourceOrganizationID": "505910",
+    "name": "",
+    "address1": "50 Commons Way Ste D",
+    "address2": "",
+    "zip": "36203"
+  },
+  "tags": [
+    "Exclusive",
+    "Compact State"
+  ],
+  "communities": [
+    "Allied"
+  ],
+  "facilityType": "Clinic",
+  "positionsAvailable": 1,
+  "hoursPerWeek": 40,
+  "caid": 45145
+}

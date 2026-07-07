@@ -58,6 +58,16 @@ class ScrapeState(TypedDict, total=False):
     product_analysis_retries: int
     test_retry_count: int
     reanalyze_count: int
+    # How many times product_analyzer has re-mapped failed fields in this run
+    # (capped by MAX_REMAPS). Set when route_after_testing sends a mapping
+    # failure back to product_analyzer.
+    remap_count: int
+    # Append-only log of scraping strategies that failed testing + why, so the
+    # strategy cascade never re-picks a strategy that already failed. Each entry
+    # is {"strategy": <name>, "reason": <why it failed>}. route_after_testing
+    # appends on an access/strategy-class failure; scraper_analyzer reads it to
+    # pick the next strategy.
+    strategies_tried: Annotated[list, operator.add]
     budget_retry_count: int
     budget_retry_summary: str
 
@@ -99,9 +109,18 @@ class ScrapeState(TypedDict, total=False):
     next_node_after_testing: Annotated[str, _last_write_wins]
     next_node_after_cleanup: Annotated[str, _last_write_wins]
 
+    # ── Dagster conversion (post-completion, non-blocking) ──────────────
+    # Path to the generated {slug}_dagster.py file (set by dagster_converter
+    # agent; read by the UI to show the download button). None if not generated.
+    dagster_path: Annotated[Optional[str], _last_write_wins]
+
     # ── Navigation ──────────────────────────────────────────────────────
     navigation_findings: Annotated[Optional[dict[str, Any]], _last_write_wins]
     playwright_unavailable: bool
+    # set when navigate_explore hands off to the LLM navigation_agent (form-driven
+    # site the deterministic explorer couldn't drive); read by navigation_synthesize
+    # to skip re-synthesizing the agent's already-written navigation_analysis.json.
+    handoff_reason: Annotated[str, _last_write_wins]
 
     # ── Error ───────────────────────────────────────────────────────────
     error_message: Annotated[str, _last_write_wins]

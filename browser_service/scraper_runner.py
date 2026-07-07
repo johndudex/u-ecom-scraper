@@ -41,18 +41,36 @@ def run_scraper_script(
     cmd = ["python3", scraper_path]
     if args:
         cmd.extend(args)
+    # Inject --xvfb ONLY if the scraper declares it (SeleniumBase/UC scrapers do).
+    # Playwright/job scrapers get the virtual display via the DISPLAY env (set
+    # below) and their argparse rejects an unknown --xvfb → exit code 2.
     if "--xvfb" not in cmd:
-        cmd.append("--xvfb")
+        try:
+            with open(scraper_path, "r", errors="ignore") as _f:
+                _src = _f.read()
+            if "--xvfb" in _src:
+                cmd.append("--xvfb")
+        except OSError:
+            cmd.append("--xvfb")  # default to old behavior if unreadable
 
     env = {
         **os.environ,
         "DISPLAY": DISPLAY,
         "PROJECT_ROOT": PROJECT_ROOT,
-        "BROWSER_CDP_ENDPOINT": f"http://127.0.0.1:9223",
         "PYTHONUNBUFFERED": "1",
     }
     if env_overrides:
         env.update(env_overrides)
+    # Under CloakBrowser stealth, scrapers must launch their own stealth
+    # Chromium (the launch() patcher routes it through cloak). Do NOT point them
+    # at the shared CDP scraper chrome (9223) — connecting there would bypass
+    # cloak and hit the same anti-bot block as plain Chrome.
+    _stealth = (env.get("STEALTH_BROWSER", "") or "").strip().lower()
+    if _stealth != "cloak":
+        env["BROWSER_CDP_ENDPOINT"] = "http://127.0.0.1:9223"
+    else:
+        # explicitly clear any inherited endpoint so scrapers launch, not connect
+        env.pop("BROWSER_CDP_ENDPOINT", None)
 
     start = time.time()
     try:

@@ -10,13 +10,13 @@ from typing import Any
 
 from langgraph.types import Command
 
+from ..constants import MAX_VALIDATE_RETRIES
 from ..decisions import options_to_decisions
 from ..state import ScrapeState
 
 logger = logging.getLogger(__name__)
 
 MIN_CONFIDENCE = 0.7
-MAX_VALIDATE_RETRIES = 2
 
 
 def _get_project_root() -> str:

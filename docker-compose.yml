@@ -48,8 +48,8 @@ services:
       ZAI_MAIN_MODEL: ${ZAI_MAIN_MODEL:-glm-5-turbo}
       ZAI_SMALL_MODEL: ${ZAI_SMALL_MODEL:-glm-5-turbo}
       DJANGO_SUPERUSER_PASSWORD: ${DJANGO_SUPERUSER_PASSWORD:-admin}
-      PLAYWRIGHT_MCP_URL: http://browser-service:8111/sse
-      BROWSER_SERVICE_URL: http://browser-service:8001
+      PLAYWRIGHT_MCP_URL: http://browser_service:8111/sse
+      BROWSER_SERVICE_URL: http://browser_service:8001
       DEBUG: "True"
       DJANGO_SETTINGS_MODULE: config.settings
       SECRET_KEY: dev-secret-key-change-in-production
@@ -61,7 +61,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      browser-service:
+      browser_service:
         condition: service_healthy
     mem_limit: 512m
 
@@ -83,8 +83,8 @@ services:
       ZAI_BASE_URL: ${ZAI_BASE_URL:-https://api.z.ai/api/coding/paas/v4/}
       ZAI_MAIN_MODEL: ${ZAI_MAIN_MODEL:-glm-5-turbo}
       ZAI_SMALL_MODEL: ${ZAI_SMALL_MODEL:-glm-5-turbo}
-      PLAYWRIGHT_MCP_URL: http://browser-service:8111/sse
-      BROWSER_SERVICE_URL: http://browser-service:8001
+      PLAYWRIGHT_MCP_URL: http://browser_service:8111/sse
+      BROWSER_SERVICE_URL: http://browser_service:8001
       DJANGO_SETTINGS_MODULE: config.settings
       SECRET_KEY: dev-secret-key-change-in-production
       PYTHONPATH: /app
@@ -93,7 +93,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      browser-service:
+      browser_service:
         condition: service_healthy
     deploy:
       replicas: 1
@@ -145,15 +145,15 @@ services:
         condition: service_healthy
     mem_limit: 128m
 
-  browser-service:
+  browser_service:
     profiles: ["full"]
     build:
       context: .
-      dockerfile: browser-service/Dockerfile
+      dockerfile: browser_service/Dockerfile
     init: true
     shm_size: "256m"
     volumes:
-      - ./browser-service:/app/browser-service
+      - ./browser_service:/app/browser_service
       - ./scrapers:/app/scrapers
       - ./src:/app/src:ro
       - ./config:/app/config:ro

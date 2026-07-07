@@ -46,6 +46,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 from langchain_core.runnables import RunnableConfig
 
+from .constants import FINAL_RETRY_SENTINEL
 from .decisions import options_to_decisions
 from .nodes import (
     check_tracker,
@@ -71,7 +72,7 @@ from .subagents import (
     build_product_analyzer_message,
     build_scraper_analyzer_message,
     build_site_analyzer_message,
-    build_skill_learner_message,
+    build_dagster_converter_message,
     create_cleanup_agent,
     create_code_tester,
     create_code_writer,
@@ -80,14 +81,27 @@ from .subagents import (
     create_scraper_analyzer,
     create_site_analyzer,
     create_skill_learner,
+    build_skill_learner_message,
+    create_dagster_converter,
 )
 from .tools.context import set_tool_context, clear_tool_context
 
 logger = logging.getLogger(__name__)
 
-AGENT_RECURSION_LIMIT = 100
+# Default per-agent recursion limit (langgraph counts each model+tool step).
+# Raised from 100 -> 150: complex sites (e.g. AMN job-field mapping) legitimately
+# exceed 100 steps.  Map entries above override per agent.  If an agent STILL
+# exceeds its limit, GraphRecursionError is caught in services.py/tasks.py and
+# converted to a human_approval (graceful pause) rather than failing the job.
+AGENT_RECURSION_LIMIT = 150
 API_MAX_RETRIES = 3
 API_RETRY_DELAYS = [5, 15, 30]
+
+# Debug toggle: when False, the post-generation scraper patches AND the
+# analysis-level strategy overrides are SKIPPED, so `run_node --no-patches`
+# shows the raw LLM output. Lets us prove a source-level fix makes a patch
+# redundant before deleting the patch. Production default is True.
+_PATCHES_ENABLED = True
 
 
 def _with_api_retry(func):
@@ -144,7 +158,78 @@ def _fix_json_artifact(slug: str, filename: str) -> None:
             logger.warning("_fix_json_artifact: could not fix %s: %s", path, exc)
 
 
-def _patch_scraper_xvfb(slug: str) -> None:
+
+
+
+
+
+def _enforce_anti_bot_strategy(analysis: dict, slug: str, filename: str) -> dict:
+    """For anti-bot sites, force the strategy fields to ``playwright`` (cloak).
+
+    Bot protection (Akamai/Cloudflare/PerimeterX) guards **API endpoints too**,
+    not just HTML pages — a discovered ``internal_api``/``http_requests`` strategy
+    403/400s exactly like direct HTTP does (verified: calvklein's b2c-api returns
+    400). So the only reliable strategy for an anti-bot site is playwright (cloak
+    is runtime-injected via STEALTH_BROWSER=cloak). code_writer is often tempted
+    by a discovered API endpoint despite prompt guidance, so this rewrites the
+    analysis fields deterministically before code_writer reads them.
+
+    KEPT after verify-then-delete: `run_node code_writer` showed code_writer picks
+    ``internal_api`` for anti-bot sites even with the strengthened prompt, producing
+    a non-working scraper. Generic — driven by the anti_bot signal, no site names.
+    """
+    if not isinstance(analysis, dict) or not slug:
+        return analysis
+    conn = analysis.get("connectivity") or {}
+    anti_bot = analysis.get("anti_bot") or {}
+    method = (conn.get("method_that_worked") if isinstance(conn, dict) else "") or ""
+    detected = bool(
+        (isinstance(anti_bot, dict) and anti_bot.get("detected"))
+        or str(method).startswith(("uc_chrome", "cloak"))
+    )
+    if not detected:
+        return analysis
+    # Strategies that won't work behind bot protection → playwright.
+    _bad = ("seleniumbase", "undetected", "stealth_browser", "uc_chrome",
+            "internal_api", "http_requests", "requests", "api")
+    _keys = ("scraping_mechanism", "scraping_method", "strategy",
+             "recommended_strategy", "mechanism")
+    changed = False
+
+    def _rewrite(d: dict) -> None:
+        nonlocal changed
+        for k, v in list(d.items()):
+            if isinstance(v, str) and any(t in v.lower() for t in _bad):
+                d[k] = "playwright"
+                changed = True
+
+    _rewrite(analysis)
+    mr = analysis.get("mechanism_reassessment")
+    if isinstance(mr, dict):
+        _rewrite(mr)
+    if not changed:
+        return analysis
+    try:
+        path = os.path.join(_get_project_root(), "workspace", slug, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(analysis, f, indent=2, ensure_ascii=False)
+        logger.info("_enforce_anti_bot_strategy: anti-bot → playwright in %s/%s", slug, filename)
+    except Exception as exc:
+        logger.warning("_enforce_anti_bot_strategy: %s", exc)
+    return analysis
+
+
+def _patch_scraper_output_filter(slug: str, content_type: str = "") -> None:
+    """Insert a content-type-aware output filter in scraper_draft.py.
+
+    Discovery can capture non-item pages (nav/category roots, soft-404s). This
+    filter drops them before the output is written: keep items that have a
+    ``title`` AND at least one of the content type's core fields. For ``product``
+    that's price/availability (unchanged from the old price filter); for
+    ``job_posting`` it's company/location; for ``article`` author/publish_date;
+    unknown types keep every item with a title. GENERIC — field set comes from
+    ``src.content_types.output_filter_fields``, no per-type hardcoding here.
+    """
     if not slug:
         return
     try:
@@ -157,13 +242,61 @@ def _patch_scraper_xvfb(slug: str) -> None:
     try:
         with open(scraper_path, "r", encoding="utf-8") as f:
             code = f.read()
-        patched = code.replace("SB(uc=True, xvfb=True,", "SB(uc=True, xvfb=args.xvfb,")
-        if patched != code:
+        if "_OUTPUT_FILTER_APPLIED" in code or "_OUTPUT_PRICE_FILTER_APPLIED" in code:
+            return
+        from src.content_types import output_filter_fields
+
+        fields = [f for f in output_filter_fields(content_type) if isinstance(f, str)]
+        # build: keep items with a title AND any of the content type's filter fields.
+        if fields:
+            checks = " or ".join(f"p.get({f!r})" for f in fields)
+            cond = f"p.get('title') and ({checks})"
+            label = f"title+{','.join(fields)}"
+        else:
+            cond = "p.get('title')"
+            label = "title"
+        filter_code = (
+            "# _OUTPUT_FILTER_APPLIED — drop non-item pages (content-type aware)\n"
+            f"_FILTER_FIELDS = {fields!r}\n"
+            "try:\n"
+            "    _before = len(output.get(OUTPUT_KEY, []))\n"
+            f"    output[OUTPUT_KEY] = [p for p in output.get(OUTPUT_KEY, []) if {cond}]\n"
+            "    _after = len(output[OUTPUT_KEY])\n"
+            "    if _before != _after:\n"
+            f"        logger.info('output filter: %d → %d items (removed %d without {label})',\n"
+            "                     _before, _after, _before - _after)\n"
+            "except Exception:\n"
+            "    pass\n"
+            "\n"
+        )
+        # Insert before `json.dump(output` (fallback: json.dump( / output_filename)
+        marker = "json.dump(output"
+        idx = code.find(marker)
+        if idx < 0:
+            marker = "json.dump("
+            idx = code.find(marker)
+        if idx < 0:
+            marker = "output_filename"
+            idx = code.find(marker)
+        if idx > 0:
+            line_start = code.rfind("\n", 0, idx) + 1
+            indent = code[line_start:idx]
+            indented_filter = "\n".join(
+                indent + line if line else line for line in filter_code.split("\n")
+            )
+            code = code[:line_start] + indented_filter + "\n" + code[line_start:]
             with open(scraper_path, "w", encoding="utf-8") as f:
-                f.write(patched)
-            logger.info("_patch_scraper_xvfb: patched hardcoded xvfb=True → args.xvfb")
+                f.write(code)
+            logger.info(
+                "_patch_scraper_output_filter: inserted filter (%s) for content_type=%s",
+                label, content_type or "(unknown)",
+            )
+        else:
+            logger.warning("_patch_scraper_output_filter: could not find output write location")
     except Exception as exc:
-        logger.warning("_patch_scraper_xvfb: %s", exc)
+        logger.warning("_patch_scraper_output_filter: %s", exc)
+
+
 
 
 def _load_test_report(slug: str) -> dict | None:
@@ -246,15 +379,15 @@ def _load_scraper_analysis(slug: str) -> dict | None:
 
 
 AGENT_RECURSION_MAP: dict[str, int] = {
-    "site_analyzer": 150,
-    "product_analyzer": 100,
-    "navigation_agent": 120,
-    "nav_skill_review": 30,
-    "scraper_analyzer": 80,
-    "code_writer": 60,
-    "code_tester": 60,
-    "cleanup": 40,
-    "skill_learner": 40,
+    "site_analyzer": 250,
+    "product_analyzer": 200,
+    "navigation_agent": 200,
+    "nav_skill_review": 60,
+    "scraper_analyzer": 160,
+    "code_writer": 120,
+    "code_tester": 120,
+    "cleanup": 80,
+    "skill_learner": 80,
 }
 
 
@@ -859,6 +992,20 @@ def _invoke_product_analyzer(
 ) -> dict[str, Any] | Command:
     job_id = state.get("job_id", 0)
     slug = state.get("site_slug", "")
+    # Re-map mode: route_after_testing sent us here because code_tester flagged a
+    # MAPPING failure (test_report.remediation.target == "mapping"). After the
+    # agent re-maps the failed fields, route straight to code_writer (skipping
+    # normalize/validate) so the scraper regenerates against the corrected mapping.
+    _pa_test_report = state.get("test_report") or {}
+    _pa_remediation = (
+        _pa_test_report.get("remediation") if isinstance(_pa_test_report, dict) else None
+    )
+    is_remap = isinstance(_pa_remediation, dict) and _pa_remediation.get("target") == "mapping"
+    if is_remap:
+        logger.info(
+            "_invoke_product_analyzer: RE-MAP mode (job %s) — fields %s",
+            job_id, _pa_remediation.get("fields"),
+        )
     is_budget_retry = state.get("interrupt_reason") == "budget_exhausted_product"
     is_missing_artifact = state.get("interrupt_reason") == "missing_artifact_product"
     budget_retries = (
@@ -920,10 +1067,22 @@ def _invoke_product_analyzer(
             analysis = _read_json_artifact(
                 _get_project_root(), slug, "product_analysis.json"
             )
+            # Anti-bot ⇒ playwright (cloak). KEPT: code_writer otherwise picks the
+            # discovered API (which Akamai also guards → 400). Gated by _PATCHES_ENABLED.
+            if _PATCHES_ENABLED:
+                analysis = _enforce_anti_bot_strategy(analysis, slug, "product_analysis.json")
             update: dict[str, Any] = {
                 "messages": [],
                 "product_analysis": analysis,
             }
+            if is_remap:
+                remap_count = int(state.get("remap_count", 0) or 0) + 1
+                logger.info(
+                    "_invoke_product_analyzer: re-mapped failed fields → code_writer "
+                    "(remap %d, job %s)", remap_count, job_id,
+                )
+                update["remap_count"] = remap_count
+                return Command(goto="code_writer", update=update)
             return update
 
         tool_call_count = sum(
@@ -969,6 +1128,16 @@ def _invoke_product_analyzer(
                 analysis = _read_json_artifact(
                     _get_project_root(), slug, "product_analysis.json"
                 )
+                if is_remap:
+                    remap_count = int(state.get("remap_count", 0) or 0) + 1
+                    logger.info(
+                        "_invoke_product_analyzer: re-mapped (retry path) → code_writer "
+                        "(remap %d, job %s)", remap_count, job_id,
+                    )
+                    return Command(
+                        goto="code_writer",
+                        update={"messages": [], "product_analysis": analysis, "remap_count": remap_count},
+                    )
                 return {
                     "messages": [],
                     "product_analysis": analysis,
@@ -1219,7 +1388,6 @@ def _invoke_navigation_explore(
 ) -> dict[str, Any] | Command:
     """Graph wrapper for the deterministic navigation exploration node."""
     from .nodes.navigate_explore import navigate_explore as _explore
-    from .decisions import options_to_decisions
 
     job_id = state.get("job_id", 0)
     _notify_phase(job_id, "navigation_explore", "running")
@@ -1243,7 +1411,7 @@ def _invoke_navigation_explore(
                         "The explore fell back to HTTP but may have missed JS-rendered content.\n\n"
                         "Options:\n"
                         "- **Use probe_html**: Proceed with single-page fetch (no clicking/scrolling)\n"
-                        "- **Retry Playwright**: Retry — check that the browser-service container is running\n"
+                        "- **Retry Playwright**: Retry — check that the browser_service container is running\n"
                         "- **Cancel**: Abort this job"
                     ),
                     "interrupt_options": options,
@@ -1251,6 +1419,70 @@ def _invoke_navigation_explore(
                 },
                 goto="human_approval",
             )
+
+        # Handoff to the LLM navigation_agent when the deterministic explorer
+        # detected a search form (classic_search) but couldn't get many real item
+        # links from it — e.g. a JS/validation-gated POST form (locumtenens
+        # QuickSearch: required-specialty + decorative-vs-real submit button). The
+        # agent drives the form with browser tools + the navigation-patterns skill.
+        # Threshold is generous (< 30) because listing_page.product_links can be
+        # inflated by category/nav noise; classic_search detection (a multi-select
+        # form was found) is the real signal of a form-driven job board.
+        if isinstance(result, dict):
+            # navigate_explore has inconsistent return shapes — some paths return
+            # {"navigation_findings": findings, ...}, others return the bare
+            # findings dict. Handle both.
+            _f = result.get("navigation_findings") or result
+            _lp = _f.get("listing_page") or {}
+            _pl = len(_lp.get("product_links") or [])
+            _hn = _f.get("homepage_nav") or {}
+            _form = (
+                _f.get("classic_search")
+                or _hn.get("classic_search")
+                or _lp.get("classic_search")
+            )
+            # Anti-bot guard: don't hand off to navigation_agent for anti-bot sites —
+            # its MCP browser isn't cloak-enabled, so Akamai would block it. Anti-bot
+            # sites (e.g. calvklein) find few links at analysis time (truncated
+            # /render) but the RUNTIME scraper (cloak) gets the products, so a low
+            # analysis-time count is expected + not a failure there.
+            _probe = state.get("probe_result") or {}
+            _ab = _probe.get("anti_bot") if isinstance(_probe, dict) else None
+            _conn = _probe.get("connectivity") if isinstance(_probe, dict) else None
+            _meth = (
+                (_probe.get("method") if isinstance(_probe, dict) else "")
+                or (_conn.get("method_that_worked") if isinstance(_conn, dict) else "")
+                or ""
+            )
+            _anti_bot = bool(
+                state.get("anti_bot_detected")
+                or (isinstance(_ab, dict) and _ab.get("detected"))
+                or str(_meth).startswith(("uc_chrome", "cloak"))
+            )
+            # Hand off when navigate_explore clearly failed to discover the catalog:
+            # either a form was detected but yielded few links (form not driven well),
+            # OR very few links were found at all (explore missed the listing surface).
+            # The agent then decides HOW to recover — it may drive a form, re-capture
+            # a backend API (via playwright_browser_network_requests), or find SEO
+            # listing pages. It reads navigation_findings.json first, so a backend API
+            # navigate_explore already captured is visible to it. (anti_bot guard is a
+            # hard limit: the agent's MCP browser isn't cloak-enabled.)
+            if not _anti_bot and ((_form and _pl < 30) or (_pl < 5)):
+                logger.info(
+                    "_invoke_navigation_explore: only %d product link(s) found "
+                    "(form_detected=%s, anti_bot=%s) — handing off to navigation_agent (job %s)",
+                    _pl,
+                    bool(_form),
+                    _anti_bot,
+                    job_id,
+                )
+                return Command(
+                    update={
+                        "navigation_findings": _f,
+                        "handoff_reason": "form_driving_needed",
+                    },
+                    goto="navigation_agent",
+                )
 
         return result
     except Exception as exc:
@@ -1266,11 +1498,78 @@ def _invoke_navigation_synthesize(
     from .nodes.navigate_synthesize import navigate_synthesize as _synthesize
 
     job_id = state.get("job_id", 0)
+
+    # If the LLM navigation_agent already wrote navigation_analysis.json (it runs
+    # on the form-driven handoff path), skip re-synthesizing from raw findings —
+    # the agent's structured output IS the analysis. Synthesize would otherwise
+    # overwrite the agent's work with a re-reading of the (sparse) raw findings.
+    try:
+        slug = state.get("site_slug", "")
+        na_path = os.path.join(_get_project_root(), "workspace", slug, "navigation_analysis.json")
+        if state.get("handoff_reason") and os.path.isfile(na_path):
+            analysis = _read_json_artifact(_get_project_root(), slug, "navigation_analysis.json")
+            if analysis:
+                logger.info(
+                    "_invoke_navigation_synthesize: navigation_analysis.json already "
+                    "written by navigation_agent (handoff) — skipping synthesis (job %s)",
+                    job_id,
+                )
+                _notify_phase(job_id, "navigation_synthesize", "done")
+                return {"messages": [], "navigation_analysis": analysis}
+    except Exception as exc:
+        logger.warning("_invoke_navigation_synthesize: skip-check failed: %s", exc)
+
     _notify_phase(job_id, "navigation_synthesize", "running")
     set_tool_context(dict(state), agent_name="navigation_synthesize")
     try:
         result = _synthesize(dict(state), config)
         _notify_phase(job_id, "navigation_synthesize", "done")
+
+        # SOURCE FIX: navigation_synthesize (LLM) sometimes drops the product
+        # URLs discovered by navigation_explore. The product links are in
+        # navigation_findings.json > listing_page.product_links — merge them into
+        # navigation_analysis.json > item_links.urls if missing. This ensures
+        # code_writer has the correct URLs to build the scraper around, instead
+        # of generating broken discovery logic. [fix data flow at the source]
+        try:
+            slug = state.get("site_slug", "")
+            root = _get_project_root()
+            nf_path = os.path.join(root, "workspace", slug, "navigation_findings.json")
+            na_path = os.path.join(root, "workspace", slug, "navigation_analysis.json")
+            if os.path.isfile(nf_path) and os.path.isfile(na_path):
+                import json as _json
+                nf = _json.load(open(nf_path))
+                na = _json.load(open(na_path))
+                # product URLs are nested in listing_page.product_links (list of dicts with 'href')
+                lp = nf.get("listing_page") or {}
+                _raw_links = lp.get("product_links") or []
+                product_urls = []
+                for _rl in _raw_links:
+                    if isinstance(_rl, str):
+                        product_urls.append(_rl)
+                    elif isinstance(_rl, dict) and _rl.get("href"):
+                        product_urls.append(_rl["href"])
+                if product_urls:
+                    il = na.get("item_links")
+                    if not isinstance(il, dict):
+                        il = {}
+                    existing = il.get("urls") or []
+                    # Filter to strings only (some items may be dicts)
+                    existing_str = [u for u in existing if isinstance(u, str)]
+                    product_str = [u for u in product_urls if isinstance(u, str)]
+                    if len(existing_str) < len(product_str):
+                        il["urls"] = list(dict.fromkeys(existing_str + product_str))
+                        na["item_links"] = il
+                        with open(na_path, "w") as f:
+                            _json.dump(na, f, indent=2, ensure_ascii=False)
+                        logger.info(
+                            "navigation_synthesize: merged %d product URLs from "
+                            "findings into analysis.item_links.urls (had %d)",
+                            len(product_urls), len(existing),
+                        )
+        except Exception as exc_merge:
+            logger.warning("navigation_synthesize: URL merge failed: %s", exc_merge)
+
         return result
     except Exception as exc:
         logger.exception(
@@ -1322,7 +1621,33 @@ def _invoke_scraper_analyzer(
     try:
         slug = state.get("site_slug", "")
         logger.info("_invoke_scraper_analyzer: starting (job %s)", job_id)
-        messages = build_scraper_analyzer_message(state)
+        # ── Strategy cascade ── if re-running because the prior strategy failed
+        # testing, record it so the LLM picks a DIFFERENT strategy this time.
+        tried = list(state.get("strategies_tried") or [])
+        _prior_strategy = (state.get("scraper_analysis") or {}).get("strategy", "")
+        _prior_report = state.get("test_report") or {}
+        _new_tried: list = []
+        if _prior_strategy and isinstance(_prior_report, dict) and _prior_report.get("overall_assessment") not in (None, "PASS"):
+            try:
+                from .nodes.route_after_testing import classify_test_failure
+                _action, _reason = classify_test_failure(_prior_report, _prior_strategy)
+                if _action == "strategy" and not any(
+                    (t.get("strategy") if isinstance(t, dict) else t) == _prior_strategy
+                    for t in tried
+                ):
+                    _new_tried = [{"strategy": _prior_strategy, "reason": _reason}]
+                    logger.info(
+                        "_invoke_scraper_analyzer: strategy '%s' failed (%s) — recording; "
+                        "will pick a different strategy (job %s)",
+                        _prior_strategy, _reason, job_id,
+                    )
+            except Exception as _e:
+                logger.warning("_invoke_scraper_analyzer: failure classify failed: %s", _e)
+        # Give the message builder the full tried-list (incl. the just-failed one).
+        _state_for_msg = dict(state)
+        if _new_tried:
+            _state_for_msg["strategies_tried"] = tried + _new_tried
+        messages = build_scraper_analyzer_message(_state_for_msg)
         _log_agent_context(state, "scraper-analyzer", messages)
         agent = create_scraper_analyzer(site_slug=slug)
         hb = _start_heartbeat(job_id, "scraper-analyzer")
@@ -1334,6 +1659,9 @@ def _invoke_scraper_analyzer(
         _notify_phase(job_id, "scraper_analyzer", "done")
 
         analysis = _load_scraper_analysis(slug)
+        # Anti-bot ⇒ playwright (cloak). KEPT (see _enforce_anti_bot_strategy note).
+        if _PATCHES_ENABLED:
+            analysis = _enforce_anti_bot_strategy(analysis, slug, "scraper_analysis.json")
         update: dict[str, Any] = {"messages": []}
         if analysis:
             try:
@@ -1407,6 +1735,8 @@ def _invoke_scraper_analyzer(
                 "_invoke_scraper_analyzer: no scraper_analysis found at workspace/%s/",
                 slug,
             )
+        if _new_tried:
+            update["strategies_tried"] = _new_tried  # append (Annotated[list, operator.add])
         return update
     except Exception:
         _notify_phase(job_id, "scraper_analyzer", "failed")
@@ -1425,12 +1755,16 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         update = {}
         if state.get("test_report"):
             current_count = state.get("test_retry_count", 0)
-            if current_count != 99:
+            if current_count != FINAL_RETRY_SENTINEL:
                 update["test_retry_count"] = current_count + 1
                 logger.info(
                     "_invoke_code_writer: retry cycle %d (job %s)",
                     update["test_retry_count"],
                     job_id,
+                )
+                assert update["test_retry_count"] <= FINAL_RETRY_SENTINEL - 1, (
+                    f"test_retry_count {update['test_retry_count']} exceeds "
+                    f"MAX_TEST_RETRIES ({FINAL_RETRY_SENTINEL - 1})"
                 )
             else:
                 logger.info(
@@ -1448,8 +1782,21 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "code-writer", config)
         _notify_phase(job_id, "code_writer", "done")
-        slug = state.get("site_slug", "")
-        _patch_scraper_xvfb(slug)
+        if _PATCHES_ENABLED:
+            # Strategy-drift patches REMOVED (verify-then-delete via run_node --no-patches):
+            # _patch_scraper_waits, _patch_scraper_to_playwright — code_writer now emits
+            # sleep(8)+domcontentloaded and pure Playwright unaided (Phase 2 prompts).
+            # _patch_scraper_xvfb / _discovery / _multisource / _write_discovered_urls_to_input
+            # — see deletion notes in the commit/plan.
+            _ct = (state.get("content_type_config") or {}).get("content_type") or ""
+            if not _ct:
+                try:
+                    from src.content_types import get_content_type
+                    _cfg = get_content_type(state.get("page_type", "product"))
+                    _ct = _cfg.name if _cfg else ""
+                except Exception:
+                    _ct = ""
+            _patch_scraper_output_filter(slug, _ct)
         update["messages"] = []
         scraper_analysis = state.get("scraper_analysis") or {}
         strategy = scraper_analysis.get("strategy", "")
@@ -1463,7 +1810,7 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         clear_tool_context()
 
 
-@_with_api_retry
+
 def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
     job_id = state.get("job_id", 0)
     retry_count = state.get("test_retry_count", 0)
@@ -1472,10 +1819,14 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         try:
             from scraper.models import Step
 
-            note = "FINAL retry" if retry_count == 99 else f"Retry cycle {retry_count}"
+            note = "FINAL retry" if retry_count == FINAL_RETRY_SENTINEL else f"Retry cycle {retry_count}"
             Step.objects.filter(job_id=job_id, phase="testing").update(notes=note)
         except Exception:
             pass
+    # _check_strategy_mismatch REMOVED (Fix B): with Phase 2 prompts, code_writer
+    # emits the correct Playwright strategy unaided — verified via run_node
+    # code_writer --no-patches (0 seleniumbase). The deterministic pre-test guard
+    # no longer fires; strategy drift is handled by the normal test→retry loop.
     set_tool_context(dict(state), agent_name="code_tester")
     try:
         logger.info("_invoke_code_tester: starting (job %s)", job_id)
@@ -1593,6 +1944,226 @@ def _invoke_skill_learner(state: ScrapeState, config: RunnableConfig) -> dict[st
         raise
     finally:
         clear_tool_context()
+
+
+def _invoke_dagster_converter(
+    state: ScrapeState, config: RunnableConfig
+) -> dict[str, Any]:
+    """Post-completion agent: convert the existing scraper into the client's
+    BaseTlsScraper format. Non-blocking — failure is logged but doesn't affect
+    the job status."""
+    job_id = state.get("job_id", 0)
+    slug = state.get("site_slug", "")
+
+    # Only run if the scraper exists + job succeeded
+    try:
+        root = _get_project_root()
+        scraper_exists = os.path.isfile(
+            os.path.join(root, "scrapers", slug, "scraper.py")
+        ) or os.path.isfile(
+            os.path.join(root, "workspace", slug, "scraper_draft.py")
+        )
+        if not scraper_exists:
+            logger.info("_invoke_dagster_converter: no scraper found for %s — skipping", slug)
+            return {"messages": []}
+    except Exception:
+        return {"messages": []}
+
+    set_tool_context(dict(state), agent_name="dagster_converter")
+    try:
+        logger.info("_invoke_dagster_converter: starting (job %s, slug %s)", job_id, slug)
+        messages = build_dagster_converter_message(state)
+        _log_agent_context(state, "dagster-converter", messages)
+        agent = create_dagster_converter(site_slug=slug)
+        result = agent.invoke(
+            {"messages": messages}, config=_agent_config(config, "dagster_converter")
+        )
+        _persist_agent_logs(state, result, "dagster-converter", config)
+
+        # Check if the dagster file was written
+        ws_dagster = os.path.join(root, "workspace", slug, f"{slug}_dagster.py")
+        scrapers_dagster = os.path.join(root, "scrapers", slug, f"{slug}_dagster.py")
+        if os.path.isfile(ws_dagster):
+            # Syntax check
+            try:
+                import ast
+                with open(ws_dagster, "r") as f:
+                    ast.parse(f.read())
+                # Copy to scrapers/ (persistent — survives workspace cleans)
+                os.makedirs(os.path.dirname(scrapers_dagster), exist_ok=True)
+                import shutil
+                shutil.copy2(ws_dagster, scrapers_dagster)
+                logger.info(
+                    "_invoke_dagster_converter: generated %s_dagster.py (syntax OK, copied to scrapers/)",
+                    slug,
+                )
+                return {"messages": [], "dagster_path": scrapers_dagster}
+            except SyntaxError as exc:
+                logger.warning(
+                    "_invoke_dagster_converter: %s_dagster.py has syntax error: %s",
+                    slug, exc,
+                )
+        else:
+            logger.warning(
+                "_invoke_dagster_converter: agent did not write %s_dagster.py",
+                slug,
+            )
+        return {"messages": []}
+    except Exception as exc:
+        logger.warning("_invoke_dagster_converter: failed (non-blocking): %s", exc)
+        return {"messages": []}
+    finally:
+        clear_tool_context()
+
+
+def _invoke_store_job_listings(
+    state: ScrapeState, config: RunnableConfig
+) -> dict[str, Any]:
+    """Post-completion: ingest job listings from the output JSON into the DB.
+
+    Deterministic (not an LLM agent). Reads the output file, parses the jobs array,
+    and inserts/updates JobListing rows. Only runs for job content types.
+    Non-blocking — failure is logged but doesn't affect the job.
+    """
+    page_type = state.get("page_type", "")
+    exec_status = state.get("execution_status", "")
+    output_file = state.get("output_file", "")
+    slug = state.get("site_slug", "")
+    job_id = state.get("job_id", 0)
+
+    # Guard: only for job content types + successful execution + output exists
+    if "job" not in page_type.lower():
+        return {"messages": []}
+    if exec_status != "SUCCESS":
+        return {"messages": []}
+    if not output_file:
+        # Try to find the latest output file
+        try:
+            root = _get_project_root()
+            site_folder = os.path.join(root, "scrapers", slug)
+            output_file = os.path.join(site_folder, _find_output_file(site_folder))
+        except Exception:
+            output_file = ""
+    if not output_file or not os.path.isfile(output_file):
+        logger.info("_invoke_store_job_listings: no output file for %s — skipping", slug)
+        return {"messages": []}
+
+    try:
+        import json as _json
+        from datetime import datetime as _dt
+
+        with open(output_file, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+
+        # Get the output key (usually "jobs")
+        ct_config = state.get("content_type_config") or {}
+        output_key = ct_config.get("output_key", "jobs")
+        items = data.get(output_key) or data.get("jobs") or data.get("products") or []
+        if not items:
+            logger.info("_invoke_store_job_listings: no items in %s — skipping", output_file)
+            return {"messages": []}
+
+        # Known fields → model columns; everything else → extra_data
+        _KNOWN_FIELDS = {
+            "title", "company", "location", "description", "salary",
+            "job_type", "employment_type", "posted_date", "valid_through",
+            "url", "job_id", "src_url", "remarks",
+        }
+
+        # Resolve the Site FK
+        from scraper.models import JobListing, Site as SiteModel
+        site_obj = None
+        if slug:
+            site_obj = SiteModel.objects.filter(slug=slug).first()
+
+        site_name = state.get("site_name", "") or (site_obj.name if site_obj else "") or slug
+        scrape_job_ref = None
+        if job_id:
+            from scraper.models import ScrapeJob
+            scrape_job_ref = ScrapeJob.objects.filter(id=job_id).first()
+
+        created_count = 0
+        updated_count = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            # Parse posted_date
+            posted_raw = item.get("posted_date") or item.get("date_posted") or ""
+            posted_date = None
+            if posted_raw:
+                for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%m/%d/%Y", "%d/%m/%Y"):
+                    try:
+                        posted_date = _dt.strptime(str(posted_raw)[:19], fmt).date()
+                        break
+                    except ValueError:
+                        continue
+
+            valid_raw = item.get("valid_through") or ""
+            valid_through = None
+            if valid_raw:
+                for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):
+                    try:
+                        valid_through = _dt.strptime(str(valid_raw)[:19], fmt).date()
+                        break
+                    except ValueError:
+                        continue
+
+            url = item.get("url", "")
+            job_src_id = item.get("job_id") or item.get("job_number") or ""
+
+            # Extra data: any field not in the known set
+            extra = {k: v for k, v in item.items() if k not in _KNOWN_FIELDS}
+
+            # Dedup key: (site_slug, url) — or (site_slug, job_source_id) if no url
+            defaults = {
+                "title": (item.get("title") or "")[:500],
+                "company": (item.get("company") or "")[:300],
+                "location": (item.get("location") or "")[:300],
+                "description": item.get("description") or "",
+                "salary": (item.get("salary") or "")[:300],
+                "job_type": (item.get("job_type") or "")[:100],
+                "employment_type": (item.get("employment_type") or item.get("employment_type") or "")[:100],
+                "posted_date": posted_date,
+                "valid_through": valid_through,
+                "site_name": site_name,
+                "site": site_obj,
+                "scrape_job": scrape_job_ref,
+                "extra_data": extra,
+            }
+
+            # Dedup: prefer url, fall back to job_source_id
+            if url:
+                defaults["url"] = url[:1000]
+                defaults["job_source_id"] = str(job_src_id)[:200]
+                obj, created = JobListing.objects.update_or_create(
+                    site_slug=slug, url=url[:1000], defaults=defaults
+                )
+            elif job_src_id:
+                defaults["job_source_id"] = str(job_src_id)[:200]
+                obj, created = JobListing.objects.update_or_create(
+                    site_slug=slug, job_source_id=str(job_src_id)[:200], defaults=defaults
+                )
+            else:
+                # No dedup key — just create
+                obj = JobListing.objects.create(
+                    site_slug=slug, url="", job_source_id="", **defaults
+                )
+                created = True
+
+            if created:
+                created_count += 1
+            else:
+                updated_count += 1
+
+        logger.info(
+            "_invoke_store_job_listings: %d created, %d updated from %s (job %s)",
+            created_count, updated_count, output_file, job_id,
+        )
+        return {"messages": [], "listings_stored": created_count + updated_count}
+    except Exception as exc:
+        logger.warning("_invoke_store_job_listings: failed (non-blocking): %s", exc)
+        return {"messages": []}
 
 
 def _log_agent_context(state: ScrapeState, agent_name: str, messages: list) -> None:
@@ -1795,15 +2366,6 @@ def route_from_human_approval(state: ScrapeState) -> str:
     reason = state.get("interrupt_reason", "")
     response = state.get("human_response")
 
-    MAX_TOTAL_RESUMES = 5
-    total_resumes = state.get("test_retry_count", 0)
-    if total_resumes >= MAX_TOTAL_RESUMES and total_resumes != 99:
-        logger.warning(
-            "route_from_human_approval: hard cap reached (%d resumes) → cleanup",
-            total_resumes,
-        )
-        return "cleanup"
-
     if isinstance(response, dict):
         choice = response.get("decision", response.get("choice", ""))
         label = response.get("label", choice)
@@ -1835,7 +2397,7 @@ def route_from_human_approval(state: ScrapeState) -> str:
             )
             return Command(
                 update={
-                    "test_retry_count": 99,
+                    "test_retry_count": FINAL_RETRY_SENTINEL,
                     "human_feedback": feedback,
                 },
                 goto="scraper_analyzer",
@@ -2026,6 +2588,7 @@ def build_scrape_graph(
     # ── Add LLM agent wrapper nodes ────────────────────────────────────
     workflow.add_node("site_analyzer", _invoke_site_analyzer)
     workflow.add_node("navigation_explore", _invoke_navigation_explore)
+    workflow.add_node("navigation_agent", _invoke_navigation_agent)
     workflow.add_node("navigation_synthesize", _invoke_navigation_synthesize)
     workflow.add_node("nav_skill_review", _invoke_nav_skill_review)
     workflow.add_node("product_analyzer", _invoke_product_analyzer)
@@ -2034,6 +2597,8 @@ def build_scrape_graph(
     workflow.add_node("code_tester", _invoke_code_tester)
     workflow.add_node("cleanup", _invoke_cleanup)
     workflow.add_node("skill_learner", _invoke_skill_learner)
+    workflow.add_node("dagster_converter", _invoke_dagster_converter)
+    workflow.add_node("store_job_listings", _invoke_store_job_listings)
 
     # ── Wire edges ──────────────────────────────────────────────────────
 
@@ -2062,7 +2627,10 @@ def build_scrape_graph(
         },
     )
 
-    # navigation_explore → conditional (human_approval if Playwright down, else navigation_synthesize)
+    # navigation_explore → conditional (human_approval if Playwright down, else navigation_synthesize).
+    # navigate_explore may also return Command(goto="navigation_agent") when it detects a form-driven
+    # site it can't drive deterministically (low product links + form detected) — the LLM navigation_agent
+    # then drives the form with browser tools + skills, and flows into navigation_synthesize.
     workflow.add_conditional_edges(
         "navigation_explore",
         _route_after_navigation_explore,
@@ -2071,6 +2639,7 @@ def build_scrape_graph(
             "human_approval": "human_approval",
         },
     )
+    workflow.add_edge("navigation_agent", "navigation_synthesize")
     workflow.add_edge("navigation_synthesize", "product_analyzer")
 
     # update_tracker_analysis → validate_analysis
@@ -2101,6 +2670,8 @@ def build_scrape_graph(
         {
             "field_confirmation": "field_confirmation",
             "scraper_analyzer": "scraper_analyzer",
+            "product_analyzer": "product_analyzer",
+            "code_writer": "code_writer",
             "human_approval": "human_approval",
             "cleanup": "cleanup",
         },
@@ -2123,8 +2694,10 @@ def build_scrape_graph(
     # nav_skill_review → skill_learner (or END if skill_learner skipped)
     workflow.add_edge("nav_skill_review", "skill_learner")
 
-    # skill_learner is the last node — always goes to END
-    workflow.add_edge("skill_learner", END)
+    # skill_learner → dagster_converter → store_job_listings → END
+    workflow.add_edge("skill_learner", "dagster_converter")
+    workflow.add_edge("dagster_converter", "store_job_listings")
+    workflow.add_edge("store_job_listings", END)
 
     # human_approval → conditional resume routing
     workflow.add_conditional_edges(

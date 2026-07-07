@@ -1,0 +1,113 @@
+{% extends "scraper/base.html" %}
+{% load static %}
+
+{% block page_title %}Jobs Dashboard{% endblock %}
+
+{% block content %}
+<div class="space-y-4">
+    {# Header #}
+    <div class="flex items-center justify-between flex-wrap gap-3">
+        <div>
+            <h1 class="text-lg-heading text-ink">Jobs Dashboard</h1>
+            <p class="text-sm text-ink-secondary mt-0.5">{{ total }} listings posted in the last {{ days }} day{{ days|pluralize }}</p>
+        </div>
+        <div class="flex items-center gap-2 text-xs">
+            <span class="text-ink-secondary">Range:</span>
+            {% for d in day_choices %}
+                <a href="?days={{ d }}{% if company_filter %}&company={{ company_filter }}{% endif %}{% if location_filter %}&location={{ location_filter }}{% endif %}{% if site_filter %}&site={{ site_filter }}{% endif %}"
+                   class="px-2 py-1 rounded-md border {% if days == d %}border-accent text-accent bg-accent/5{% else %}border-line text-ink-secondary hover:border-line-hover hover:text-ink{% endif %} transition-colors">
+                    {{ d }}d
+                </a>
+            {% endfor %}
+        </div>
+    </div>
+
+    {# Summary cards #}
+    <div class="grid grid-cols-3 gap-3">
+        <div class="panel p-4">
+            <div class="text-2xl font-bold text-ink">{{ total }}</div>
+            <div class="text-xs text-ink-secondary mt-1">Total Listings</div>
+        </div>
+        <div class="panel p-4">
+            <div class="text-2xl font-bold text-ink">{{ unique_companies }}</div>
+            <div class="text-xs text-ink-secondary mt-1">Companies</div>
+        </div>
+        <div class="panel p-4">
+            <div class="text-2xl font-bold text-ink">{{ unique_sites }}</div>
+            <div class="text-xs text-ink-secondary mt-1">Sites</div>
+        </div>
+    </div>
+
+    {# Filter bar #}
+    <form method="get" class="panel p-3 flex items-center gap-3 flex-wrap">
+        <input type="hidden" name="days" value="{{ days }}">
+        <input type="text" name="company" value="{{ company_filter }}" placeholder="Company..."
+               class="bg-void border border-line text-ink text-xs px-3 py-1.5 rounded-md w-40 focus:border-accent focus:outline-none">
+        <input type="text" name="location" value="{{ location_filter }}" placeholder="Location..."
+               class="bg-void border border-line text-ink text-xs px-3 py-1.5 rounded-md w-40 focus:border-accent focus:outline-none">
+        <select name="site" class="bg-void border border-line text-ink text-xs px-3 py-1.5 rounded-md focus:border-accent focus:outline-none">
+            <option value="">All sites</option>
+            {% for s in site_choices %}
+                <option value="{{ s }}" {% if site_filter == s %}selected{% endif %}>{{ s }}</option>
+            {% endfor %}
+        </select>
+        <button type="submit" class="text-xs text-accent border border-accent/30 px-3 py-1.5 rounded-md hover:border-accent/50 hover:bg-accent/5 transition-colors">Filter</button>
+        {% if company_filter or location_filter or site_filter %}
+            <a href="?days={{ days }}" class="text-xs text-ink-secondary hover:text-ink ml-auto">Clear filters</a>
+        {% endif %}
+    </form>
+
+    {# Listings table #}
+    <div class="panel overflow-hidden">
+        <div class="overflow-x-auto">
+            <table class="w-full text-left">
+                <thead>
+                    <tr class="border-b border-line-subtle text-[10px] text-ink-secondary uppercase tracking-wider">
+                        <th class="py-2.5 px-3 font-medium">Title</th>
+                        <th class="py-2.5 px-3 font-medium">Company</th>
+                        <th class="py-2.5 px-3 font-medium">Location</th>
+                        <th class="py-2.5 px-3 font-medium">Posted</th>
+                        <th class="py-2.5 px-3 font-medium">Site</th>
+                        <th class="py-2.5 px-3 font-medium">Type</th>
+                        <th class="py-2.5 px-3 font-medium text-right">Link</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for listing in listings %}
+                    <tr class="border-b border-line-subtle/50 hover:bg-panel-hover transition-colors text-xs">
+                        <td class="py-2 px-3 text-ink">{{ listing.title|truncatechars:50 }}</td>
+                        <td class="py-2 px-3 text-ink-secondary">{{ listing.company|truncatechars:25 }}</td>
+                        <td class="py-2 px-3 text-ink-secondary">{{ listing.location|truncatechars:25 }}</td>
+                        <td class="py-2 px-3 text-ink-secondary whitespace-nowrap">
+                            {% if listing.posted_date %}{{ listing.posted_date|date:"M j" }}{% else %}—{% endif %}
+                        </td>
+                        <td class="py-2 px-3 text-ink-secondary">{{ listing.site_name|truncatechars:15 }}</td>
+                        <td class="py-2 px-3">
+                            {% if listing.job_type %}
+                                <span class="inline-block px-1.5 py-0.5 text-[10px] rounded bg-accent/10 text-accent border border-accent/20">{{ listing.job_type }}</span>
+                            {% endif %}
+                        </td>
+                        <td class="py-2 px-3 text-right">
+                            {% if listing.url %}
+                                <a href="{{ listing.url }}" target="_blank" rel="noopener" class="text-accent hover:text-accent-hover text-[10px]">View ↗</a>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% empty %}
+                    <tr>
+                        <td colspan="7" class="py-8 text-center text-ink-secondary text-xs">
+                            No job listings found for the selected filters.
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% if total > 500 %}
+        <div class="px-3 py-2 text-[10px] text-ink-secondary border-t border-line-subtle text-center">
+            Showing first 500 of {{ total }} listings — add filters to narrow results.
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

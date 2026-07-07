@@ -58,11 +58,11 @@ When detected, the probe returns `needs_akamai_bypass: true` and the system auto
 
 ```
 probe_page(url)
-  └─> browser-service /probe
+  └─> browser_service /probe
        ├─ Direct HTTP → checks for Akamai signals
        ├─ If Akamai detected: returns needs_akamai_bypass=true
        └─ probe_tools.py detects flag
-            └─> browser-service /probe-akamai
+            └─> browser_service /probe-akamai
                  ├─ Layer 1: TLS pre-warm (curl_cffi)
                  ├─ Layer 2: Playwright stealth
                  └─ Layer 3: UC Chrome fallback

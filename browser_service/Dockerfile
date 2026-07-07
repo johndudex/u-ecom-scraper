@@ -4,6 +4,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget gnupg2 curl ca-certificates \
     xvfb xauth python3-tk libtk8.6 \
     fonts-liberation fonts-noto-cjk fonts-wqy-zenhei \
+    fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
+    fonts-ipafont-gothic fonts-tlwg-loma-otf \
     libnss3 libatk1.0-0 libatk-bridge2.0-0 \
     libcups2 libdrm2 libgbm1 libasound2 \
     libpango-1.0-0 libpangocairo-1.0-0 \
@@ -28,27 +30,33 @@ RUN mkdir -p /var/run/dbus /tmp/.X11-unix && \
 
 WORKDIR /app
 
-COPY browser-service/requirements.txt /tmp/browser-requirements.txt
+COPY browser_service/requirements.txt /tmp/browser-requirements.txt
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/browser-requirements.txt -r /tmp/requirements.txt && \
     mkdir -p /usr/local/lib/python3.12/site-packages/seleniumbase/drivers && \
     chmod -R 777 /usr/local/lib/python3.12/site-packages/seleniumbase/drivers && \
     seleniumbase install chromedriver && \
     playwright install chromium --with-deps && \
-    npm install -g @playwright/mcp@latest
+    npm install -g @playwright/mcp@latest && \
+    python -m cloakbrowser install || echo "cloak binary download deferred to first launch"
 
-COPY scripts/pre_download_uc_driver.py /tmp/pre_download_uc_driver.py
-RUN mkdir -p /app/logs /app/data /app/workspace && \
-    Xvfb :99 -screen 0 1920x1080x24 & sleep 1 && \
-    DISPLAY=:99 python3 /tmp/pre_download_uc_driver.py && \
-    kill %1 2>/dev/null ; true
+# pre_download_uc_driver.py was removed (UC-driver pre-download is obsolete after
+# the cloakbrowser stealth migration). Keep the dirs the rest of the image expects.
+RUN mkdir -p /app/logs /app/data /app/workspace
 
-COPY browser-service/ /app/browser-service/
+COPY browser_service/ /app/browser_service/
 COPY src/ /app/src/
 COPY config/ /app/config/
 COPY scripts/ /app/scripts/
 COPY data/ /app/data/
 COPY templates/ /app/templates/
+
+# CloakBrowser stealth safety net: a .pth that, when STEALTH_BROWSER=cloak is set,
+# wraps playwright.BrowserType.launch to drive cloak's stealth Chromium binary.
+# Lives in site-packages so it loads at every python startup (incl. generated
+# scrapers), independent of code generation.
+COPY browser_service/cloak_stealth_patch.py /usr/local/lib/python3.12/site-packages/cloak_stealth_patch.py
+RUN printf 'import cloak_stealth_patch\n' > /usr/local/lib/python3.12/site-packages/cloak_stealth.pth
 
 RUN mkdir -p /app/scrapers /app/logs /app/workspace /app/data/akamai-cookies
 
@@ -59,5 +67,5 @@ CMD ["sh", "-c", "\
     rm -rf /tmp/chrome-profiles/mcp/SingletonLock /tmp/chrome-profiles/mcp/SingletonSocket /tmp/chrome-profiles/mcp/SingletonCookie && \
     rm -rf /tmp/chrome-profiles/scraper/SingletonLock /tmp/chrome-profiles/scraper/SingletonSocket /tmp/chrome-profiles/scraper/SingletonCookie && \
     LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
-    PYTHONPATH=/app exec uvicorn browser-service.server:app --host 0.0.0.0 --port 8001 --workers 1 --log-level info \
+    PYTHONPATH=/app exec uvicorn browser_service.server:app --host 0.0.0.0 --port 8001 --workers 1 --log-level info \
 "]

@@ -75,6 +75,14 @@ how to discover product URLs generically. Use this when synthesizing
 **Sites**: Sites with no visible category nav, search-first UX
 **Extraction**: Find search input, construct search URL
 
+**⚠ Capped search results:** Many sites cap search-result pagination well below the
+true total (e.g. a search shows "88 items" but only serves 2 pages / ~46 products,
+then returns empty). If the page shows a total count greater than what pagination
+serves, **do not rely on search for full discovery** — instead use the site's
+**category/listing pages** (e.g. `/mens-...`, `/womens-...`), which usually paginate
+to the full set. Always compare discovered count vs. the displayed total and switch
+to category discovery if search is incomplete. This is generic — not site-specific.
+
 ## Search URL Patterns
 
 ### Query-Parameter Search (most common)
@@ -305,6 +313,52 @@ bookoutlet.com (Next.js), any React/Vue SPA
   or Algolia API calls.
 - **Rate Limiting**: Always use 2+ second delays between page loads.
 
+## Learned: POST-to-Session-ID Search Results (ASP.NET MVC Job Boards)
+**Source:** https://www.locumtenens.com (2026-07-01)
+**Applicability:** ASP.NET MVC job boards and similar server-rendered platforms where search uses POST forms that return session-based result URLs
+
+Some ASP.NET MVC sites (especially job boards) use POST-based search forms that
+generate a server-side search session. The form POST returns a redirect or page
+with a session ID parameter (e.g., `?sId=70123291`). All subsequent pagination
+references that session ID to maintain search state.
+
+**Key characteristics:**
+- Homepage may have a simple keyword search (`input[name="Keywords"]`, GET method)
+- A dedicated "QuickSearch" or "AdvancedSearch" page uses POST method with multiple
+  `<select>` dropdowns (Disciplines, Specialties, Locations, etc.)
+- Results page URL contains a server-generated session ID: `/Resources/JobSearch/SearchResults?sId={id}`
+- Pagination uses a page param combined with the session: `?sId={id}&pgNum=2`
+- Advanced filters (date range via `JobAge`, etc.) available via a separate form on the results page
+
+**Strategy for scraping:**
+```javascript
+// 1. Submit the POST form (QuickSearch or AdvancedSearch) to get results with sId
+// 2. Extract sId from the resulting URL
+const sId = new URL(pageUrl).searchParams.get('sId');
+// 3. Paginate by incrementing pgNum while keeping sId
+const nextPageUrl = `/Resources/JobSearch/SearchResults?sId=${sId}&pgNum=${pageNum}`;
+```
+
+**Extraction mechanics (verified 2026-07-06):**
+- Results are **server-rendered HTML** on the SearchResults page — no AJAX wait needed.
+- Item links are SSR anchors matching `a[href*="/job-"]`, shaped `/{specialty}-jobs/{role}/{state}/job-{id}`.
+- **Required-field gotcha:** these forms often gate submit on client-side validation (e.g. a
+  `FormValidation.full.min.js` rule that requires a "Specialty" `<select>`). Fill EVERY select + click
+  the form's OWN `<input type=submit>` inside `<form>` (not decorative submit-styled buttons outside
+  the form). Drive the form per-specialty to enumerate the catalog.
+- **Output filter:** job items have company/location, NOT a price — a price-only output filter would
+  delete them. Filter on title + a content-type core field (see code-writer.md).
+
+**Detection signals:**
+- `<form method="post">` with `<select>` dropdowns for category/specialty filters
+- Results URL contains an opaque `sId` or `sid` parameter (server-generated, not user-supplied)
+- Pagination links contain the same `sId` value across pages
+- Item URLs follow SEO-friendly patterns like `/{specialty}-jobs/{role}/{state}/job-{id}`
+
+**Note:** The existing ASP.NET entry in the Platform Quick Reference covers
+`/search.aspx?search=q` GET-based search. This POST-to-session pattern is a
+distinct variant common on ASP.NET MVC job boards.
+
 ## Search Platform SSR/CSR Verification
 
 **CRITICAL**: When a search platform is detected (HawkSearch, SearchSpring,
@@ -336,7 +390,7 @@ scraping strategy. The rendering mode varies by site, not by platform.
 Choosing Playwright when HTTP would work adds:
 - Slower execution (browser startup, page rendering)
 - Fragility (browser crashes, timeouts)
-- Resource cost (browser-service container)
+- Resource cost (browser_service container)
 - Deployment complexity
 
 **Example**: adameve.com uses HawkSearch but renders product cards server-side.
@@ -401,3 +455,63 @@ if (loadMoreBtn && loadMoreBtn.closest(
     loadMoreBtn = null;  // It's a facet expander, not pagination
 }
 ```
+
+## Learned: searchTerm Search Parameter (Headless SFCC / Next.js)
+**Source:** https://www.calvinklein.co.uk/ (2026-07-04)
+**Applicability:** Headless SFCC sites with Next.js storefronts (PVH Corp brands, and potentially other decoupled SFCC implementations)
+
+Some sites use `searchTerm` (camelCase) instead of the standard `q` parameter for search:
+- URL: `/search?searchTerm={query}` (e.g., `/search?searchTerm=watches`)
+- Search input ID: `#searchTerm`
+- These are typically headless SFCC + Next.js sites where the frontend decouples from standard SFCC URL conventions
+
+**Detection:** Look for `#searchTerm` input ID or `searchTerm` in URL query params after search submission.
+
+**Add to the Search URL Patterns table:**
+
+| Pattern | Example | Sites |
+|---------|---------|-------|
+| `/search?searchTerm={query}` | `/search?searchTerm=watches` | Headless SFCC/Next.js (PVH Corp) |
+
+**Note:** This is distinct from the standard SFCC `/search?q={query}` and the ASP.NET `/search?search={query}` patterns already documented.
+
+## Learned: GET-Based Multi-Select Filter Forms (Job Boards)
+**Source:** https://www.vistastaff.com (2026-07-06)
+**Applicability:** Healthcare staffing, recruitment, and other job board sites that use GET-based filter forms with multiple `<select>` dropdowns instead of text search
+
+Many job board sites use **GET-form filter interfaces** rather than traditional text search. A `<form method="get" action="/job-board/">` contains multiple `<select>` dropdowns (e.g., `profession`, `specialty`, `state`) that construct filter URLs via query parameters. This is distinct from both the POST-to-session pattern (locumtenens.com) and text-based `?q=` search patterns.
+
+**Key characteristics:**
+- `<form method="get">` with `<select name="profession">`, `<select name="specialty">`, `<select name="state">` dropdowns
+- Options use **numeric IDs** as values (e.g., `<option value="361">Physician</option>`)
+- Filter URL: `/job-board/?profession=361&specialty=all&type=&state=all`
+- All combinations are directly URL-constructable — no session ID needed
+- Individual item URLs follow descriptive SEO slugs: `/job-board/{role}-{specialty}-in-{state}-{numericId}/`
+- Pagination uses a simple **next button** (no page-number params)
+- **Fully SSR** — direct HTTP requests work, no browser rendering needed
+
+**Strategy for scraping:**
+```javascript
+// Enumerate filters by iterating select options
+// Build URLs directly via query parameters (no form submission needed)
+const baseUrl = '/job-board/';
+// Example: all physician jobs
+const url = `${baseUrl}?profession=361&specialty=all&state=all`;
+// Example: physician cardiology in Arizona
+const url = `${baseUrl}?profession=361&specialty=22&state=AZ`;
+// Paginate via the next button link on results page
+```
+
+**Detection signals:**
+- `<form method="get">` with multiple `<select name="...">` dropdowns (NOT a text search `<input>`)
+- Select option values are numeric IDs, not text slugs
+- URL constructed by appending `?param=value&param=value` from select values
+- No `sId` or session parameter in results URL (distinguishes from POST-to-session pattern)
+
+**Catalog enumeration strategy:** Drive per-profession + per-specialty combinations to cover the full job catalog. For large specialty lists (100+), start with `specialty=all` per profession, then drill into specific specialties if needed.
+
+**Note:** This is distinct from the POST-to-session pattern (locumtenens.com, ASP.NET MVC) because:
+1. Uses GET method (URLs are stable and shareable)
+2. No server-side session — filter params are self-contained
+3. Direct HTTP construction without form submission
+4. Common on WordPress-based job boards with custom post types

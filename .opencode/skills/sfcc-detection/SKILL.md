@@ -704,9 +704,49 @@ When JSON-LD is missing, use HTML selectors:
 | content | `.article-content`, `.content-body`, `.rte-content` |
 | images | `.article-content img[src]` |
 
+## Learned: Headless SFCC with Next.js Frontend (PVH Corp)
+**Source:** https://www.calvinklein.co.uk/ (2026-07-04)
+**Applicability:** SFCC sites migrated to decoupled Next.js/React storefronts (especially PVH Corp brands: Calvin Klein, Tommy Hilfiger)
+
+Some SFCC sites have migrated to headless commerce with a Next.js frontend while keeping SFCC as the backend. These sites have significantly different URL patterns from standard SFCC:
+
+### URL Pattern Differences
+
+| Aspect | Standard SFCC | Headless Next.js SFCC |
+|--------|--------------|----------------------|
+| Product URL | `/{locale}/{slug}-{sku}.html` | `/{slug}-{sku}` (no locale, no `.html`) |
+| Category URL | `/{locale}/category/` | `/{slug}` (e.g., `/women`, `/ladies-underwear`) |
+| Search URL | `/{locale}/search?q={query}` | `/search?searchTerm={query}` |
+| Locale | In URL path (`/uk/`, `/au_en/`) | Domain-based (`.co.uk`, `.com`) |
+
+### Detection Signals
+
+- **Static assets** from CDN like `static-fe-live-prod.dtc-ecom.{region}.{brand}.com`
+- **Next.js chunks** in `<script src>` tags with `/_next/static/chunks/` paths
+- **CSR/SPA rendering** — no product links in raw HTML, requires browser
+- **No `.html` in product URLs** — breaks standard SFCC `is_product_url()` detection
+- **Akamai bot protection** common on these sites (requires stealth browser)
+- **`data-testid` attributes** used for product grid items (e.g., `[data-testid*="GridItem"]`)
+
+### Impact on Scraping
+
+1. **`is_product_url()` will fail** — the function checks for `.html` suffix which is absent. Update regex to also match paths ending with SKU-like numeric suffixes (e.g., `-\w{8,12}$`).
+2. **Locale detection** must use domain TLD (`.co.uk` → GBP, `.com` → USD) instead of URL path.
+3. **HTTP scraping won't work** — headless frontends are CSR; must use Playwright/stealth browser.
+4. **JSON-LD may still be present** in SSR shell or injected by JS — check after page load.
+
+### Known Sites Using This Pattern
+
+| Brand | Domain | Notes |
+|-------|--------|-------|
+| Calvin Klein UK | calvinklein.co.uk | PVH Corp, Akamai protected |
+| Calvin Klein US | calvinklein.com | Same architecture |
+| Tommy Hilfiger | tommy.com | PVH Corp, likely same pattern |
+
 ## Known SFCC Sites
 
 | Site | Locale Format | Notes |
 |------|-------------|-------|
 | apac.christianlouboutin.com | APAC (5-letter) | Informed this skill |
+| calvinklein.co.uk | Headless Next.js | No locale prefix, no .html, Akamai |
 | (add more sites as they are scraped) | | |

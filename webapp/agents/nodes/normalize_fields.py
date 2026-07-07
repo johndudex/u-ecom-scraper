@@ -263,6 +263,45 @@ def _merge_fields(existing: dict, mapped: dict, direct: dict) -> dict:
     return merged
 
 
+def _deterministic_job_mapping(analysis: dict, content_type_config: dict) -> dict:
+    """Map job fields with the generic resolver (src.job_fields) — deterministic,
+    no LLM.  Builds a sample list from the raw data sections in product_analysis
+    (JSON-LD / API / Algolia), infers the best source path per field by coverage,
+    and returns the same ``{field: {method, selector, examples}}`` shape the LLM
+    mapper produces so downstream nodes are unchanged.
+    """
+    try:
+        from src.job_fields import infer_field_map, apply_field_map
+    except Exception as exc:
+        logger.warning("normalize_fields: src.job_fields unavailable: %s", exc)
+        return {}
+
+    samples: list[dict] = []
+    jd = (analysis.get("jsonld_extraction") or {}).get("product_data") or {}
+    if isinstance(jd, dict) and jd:
+        samples.append(jd)
+    api = analysis.get("api_fields") or {}
+    if isinstance(api, dict) and api:
+        samples.append(api)
+    alg = (analysis.get("algolia_fields") or {}).get("primary") or {}
+    if isinstance(alg, dict) and alg:
+        samples.append(alg)
+    if not samples:
+        return {}
+
+    fmap = infer_field_map(samples, content_type_config)
+    example = apply_field_map(samples[0], fmap, content_type_config) if samples else {}
+    out: dict[str, dict] = {}
+    for field, path in fmap.items():
+        if path:
+            out[field] = {
+                "method": "resolver",
+                "selector": path,
+                "examples": str(example.get(field, ""))[:80],
+            }
+    return out
+
+
 def normalize_fields(state: ScrapeState) -> dict[str, Any]:
     slug = state["site_slug"]
     analysis = _load_analysis(slug)
@@ -283,6 +322,27 @@ def normalize_fields(state: ScrapeState) -> dict[str, Any]:
     existing_fields = analysis.get("fields", {})
     if not isinstance(existing_fields, dict):
         existing_fields = {}
+
+    # Job content type: use the deterministic field resolver instead of the LLM.
+    ct_name = (content_type_config or {}).get("content_type") or ""
+    page_type = (state.get("page_type") or "").lower()
+    if ct_name == "job_posting" or page_type.startswith("job"):
+        job_mapped = _deterministic_job_mapping(analysis, content_type_config)
+        if job_mapped:
+            merged = _merge_fields(existing_fields, job_mapped, DIRECT_FIELDS)
+            analysis["fields"] = merged
+            _save_analysis(slug, analysis)
+            logger.info(
+                "normalize_fields: job fields mapped via resolver (LLM skipped): %s",
+                ", ".join(sorted(job_mapped.keys())),
+            )
+            return {
+                "product_analysis": analysis,
+                "content_analysis": analysis,
+                "fields_extracted": list(merged.keys()),
+                "current_phase": "normalize_fields",
+                "phases_completed": state.get("phases_completed", []) + ["normalize_fields"],
+            }
 
     if _core_fields_present(existing_fields, core):
         logger.info("normalize_fields: core fields already present, adding direct fields only")

@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 AGENT_TOOL_MAP: dict[str, list[str]] = {
     "site_analyzer": ["playwright", "web", "write_file", "read_file", "probe"],
     "product_analyzer": ["playwright", "web", "write_file", "read_file", "probe", "probe_html"],
-    "navigation_agent": ["playwright", "web", "write_file", "read_file"],
+    "navigation_agent": ["playwright", "web", "write_file", "read_file", "load_skill", "list_skills"],
     "navigation_explore": ["playwright", "web", "write_file", "read_file"],
     "navigation_synthesize": ["read_file", "write_file", "load_skill", "web"],
     "nav_skill_review": [
@@ -61,6 +61,12 @@ AGENT_TOOL_MAP: dict[str, list[str]] = {
         "search_files",
         "load_skill",
         "list_skills",
+    ],
+    "dagster_converter": [
+        "read_file",
+        "write_file",
+        "search_content",
+        "search_files",
     ],
 }
 

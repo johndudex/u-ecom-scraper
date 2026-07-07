@@ -24,6 +24,7 @@ import re
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
 
+from .constants import DEAD_STATUS_CODES, FINAL_RETRY_SENTINEL
 from .llm import get_main_llm
 from .prompts import load_agent_prompt
 
@@ -42,6 +43,7 @@ AGENT_TEMPERATURES: dict[str, float] = {
     "code-tester": 0.1,
     "cleanup": 0.1,
     "skill-learner": 0.3,
+    "dagster-converter": 0.1,
 }
 
 # ── Internal name mapping: agent node name → prompt file stem ─────────────
@@ -58,6 +60,7 @@ AGENT_PROMPT_MAP: dict[str, str] = {
     "code_tester": "code-tester",
     "cleanup": "cleanup",
     "skill_learner": "skill-learner",
+    "dagster_converter": "dagster-converter",
 }
 
 
@@ -73,6 +76,7 @@ AGENT_MAX_ITERATIONS: dict[str, int] = {
     "code_tester": 20,
     "cleanup": 15,
     "skill_learner": 15,
+    "dagster_converter": 15,
 }
 
 BROWSER_UNAVAILABLE_WARNING = (
@@ -213,7 +217,8 @@ def create_code_writer(site_slug: str = "") -> object:
 
 
 def create_code_tester(site_slug: str = "") -> object:
-    return _build_agent("code_tester", site_slug=site_slug)
+    # First agent migrated to create_agent (v1). Short agent, no truncation needed.
+    return _build_agent("code_tester", site_slug=site_slug, use_create_agent=True)
 
 
 def create_cleanup_agent(site_slug: str = "") -> object:
@@ -222,6 +227,10 @@ def create_cleanup_agent(site_slug: str = "") -> object:
 
 def create_skill_learner(site_slug: str = "") -> object:
     return _build_agent("skill_learner", site_slug=site_slug)
+
+
+def create_dagster_converter(site_slug: str = "") -> object:
+    return _build_agent("dagster_converter", site_slug=site_slug)
 
 
 # ── Shared builder ────────────────────────────────────────────────────────
@@ -310,7 +319,7 @@ def _truncate_messages(input_dict: dict) -> dict:
     return {"messages": kept}
 
 
-def _build_agent(agent_name: str, site_slug: str = "") -> object:
+def _build_agent(agent_name: str, site_slug: str = "", use_create_agent: bool = False) -> object:
     prompt_stem = AGENT_PROMPT_MAP[agent_name]
     temperature = AGENT_TEMPERATURES[prompt_stem]
 
@@ -347,9 +356,20 @@ def _build_agent(agent_name: str, site_slug: str = "") -> object:
         len(tools),
     )
 
-    agent = create_react_agent(
-        llm, tools=tools, prompt=system_prompt, pre_model_hook=_truncate_messages
-    )
+    if use_create_agent:
+        # v1 path: langchain.agents.create_agent (create_react_agent is deprecated).
+        # code_tester is a short agent (≤10 tool calls) on a large-context model, so
+        # it doesn't need the pre_model_hook truncation. Other agents stay on
+        # create_react_agent until their truncation is moved to SummarizationMiddleware
+        # (see docs/langgraph-v1-enhancements.md). Gated + revertible per agent.
+        from langchain.agents import create_agent
+
+        agent = create_agent(model=llm, tools=tools, system_prompt=system_prompt)
+        logger.info("Created agent '%s' via create_agent (v1 path)", agent_name)
+    else:
+        agent = create_react_agent(
+            llm, tools=tools, prompt=system_prompt, pre_model_hook=_truncate_messages
+        )
     return agent
 
 
@@ -498,6 +518,14 @@ def _get_tools_sync(agent_name: str, workspace_scope: str = "") -> list:
     )
 
     tools = _apply_guards(tools, agent_name)
+
+    # Generic tool-error handling: v1's ToolNode re-raises tool errors (v0.6
+    # swallowed them into retry messages). Wrap every tool to catch exceptions
+    # → return an error message, so an agent recovers instead of crashing.
+    # Applied AFTER guards so it's the outer wrapper (catches guard errors too).
+    from .tools.guards import apply_tool_error_catcher
+
+    tools = [apply_tool_error_catcher(t) for t in tools]
 
     return tools
 
@@ -795,6 +823,49 @@ def build_product_analyzer_message(state: dict) -> list:
             "5. write_file to save field mapping (1 call)\n\n"
         )
 
+    # Re-map mode: code_tester flagged a MAPPING failure → focus on the failed
+    # fields instead of redoing the whole analysis. The pipeline routes here from
+    # route_after_testing when test_report.remediiation.target == "mapping".
+    remap_context = ""
+    test_report = state.get("test_report") or {}
+    remediation = test_report.get("remediation") if isinstance(test_report, dict) else None
+    failed_fields: list[str] = []
+    if isinstance(remediation, dict) and remediation.get("target") == "mapping":
+        failed_fields = [f for f in (remediation.get("fields") or []) if isinstance(f, str)]
+        fields_str = ", ".join(failed_fields) or "(unspecified)"
+        remap_context = (
+            f"\n### CRITICAL — RE-MAP FAILED FIELDS (mapping-failure recovery)\n"
+            f"code_tester ran the generated scraper and these required fields FAILED because their "
+            f"MAPPING in product_analysis.json is missing/wrong/unverified:\n"
+            f"  **{fields_str}**\n"
+            f"Steps:\n"
+            f"1. Read `workspace/{slug}/test_report.json` (why each field failed).\n"
+            f"2. Read `workspace/{slug}/product_analysis.json` (the current mapping).\n"
+            f"3. Re-probe the product page and re-map ONLY the failed fields with corrected "
+            f"selectors/methods — try JSON-LD, the backend API (see hint below), or the rendered "
+            f"DOM. Keep the `expectations` blocks; set `tested: true` with a real example.\n"
+            f"4. Write product_analysis.json back (full file).\n"
+            f"Do NOT redo fields that already work. Spend your budget on the failed fields.\n\n"
+        )
+
+    # Backend product/listing API hint — captured by navigate_explore. Generic:
+    # let the agent decide if the API covers the fields it needs.
+    api_hint = ""
+    nav_analysis = state.get("navigation_analysis") or {}
+    api_endpoint = nav_analysis.get("api_endpoint") if isinstance(nav_analysis, dict) else None
+    api_endpoint = api_endpoint if isinstance(api_endpoint, dict) else {}
+    if api_endpoint.get("url"):
+        api_hint = (
+            f"\n### Backend API Hint (may contain the fields you need)\n"
+            f"navigate_explore captured this backend API on the site:\n"
+            f"- URL: `{api_endpoint.get('url')}`\n"
+            f"- method: {api_endpoint.get('method', 'GET')}, pagination: "
+            f"{api_endpoint.get('pagination_param', '?')}\n"
+            f"Test whether this API returns the data for the fields you're mapping (title, price, "
+            f"availability, etc.). If it does, prefer mapping from the API (structured JSON) over "
+            f"DOM selectors — it's more reliable. If it doesn't cover a field, use selectors.\n\n"
+        )
+
     content = (
         f"## OBJECTIVE\n"
         f"Building a scraper for {url}. The scraper reads URLs "
@@ -808,6 +879,8 @@ def build_product_analyzer_message(state: dict) -> list:
         f"**Site slug:** {slug}\n"
         f"**Site analysis:** workspace/{slug}/site_analysis.json\n"
         f"**Save artifact to:** workspace/{slug}/product_analysis.json\n"
+        f"{remap_context}"
+        f"{api_hint}"
         f"{cached_probe}"
         f"{access_strategy}"
         f"{workflow}"
@@ -893,6 +966,49 @@ def build_navigation_agent_message(state: dict) -> list:
             f"- Item link patterns from search/category results\n\n"
         )
 
+    # Skills reuse: always tell the agent to load navigation-patterns first — it
+    # carries reusable patterns + `## Learned:` sections captured from prior sites
+    # by nav_skill_review (e.g. ASP.NET POST-to-session-id job boards). This closes
+    # the learn→reuse loop.
+    skills_section = (
+        "\n### Reuse captured patterns (Skills)\n"
+        "BEFORE exploring from scratch, call `load_skill(\"navigation-patterns\")`. "
+        "Its `## Learned:` sections record reusable patterns from prior sites "
+        "(e.g. ASP.NET MVC job boards that POST to a `/SearchResults?sId=...` page). "
+        "If a Learned pattern matches this site, apply it directly. Also `list_skills` "
+        "and load any platform-specific skill that fits.\n\n"
+    )
+
+    # Handoff context: when the deterministic navigate_explore couldn't drive a
+    # form, it stashes its partial findings + a handoff_reason. Tell the agent what
+    # was already tried so it doesn't repeat the dead-end.
+    handoff_section = ""
+    if state.get("handoff_reason") or state.get("navigation_findings"):
+        handoff_section = (
+            "\n### Handed off from the deterministic explorer\n"
+            f"The fast deterministic explorer ran first and got stuck. READ "
+            f"`workspace/{slug}/navigation_findings.json` to see what it already tried "
+            f"(homepage nav, the search form it found, category links, backend endpoints) "
+            f"and continue from there — don't repeat its work.\n"
+            f"**Handoff reason:** {state.get('handoff_reason', 'form_driving_needed')}\n\n"
+            "### Form-driving mechanics discovery (SCOPE-LIMITED)\n"
+            "You are discovering HOW the form works so code_writer can iterate it at scale "
+            "— you are NOT doing bulk extraction.\n"
+            "- The deterministic explorer usually fails because: (a) it clicked a decorative "
+            "submit button OUTSIDE the form instead of the form's real `<input type=submit>` "
+            "INSIDE it, or (b) the form has a required field (often Specialty) enforced by "
+            "client-side validation whose rule lives in a JS bundle, not the HTML.\n"
+            "- Drive ONE successful form submission: fill EVERY `<select>`/input (use "
+            "`playwright_browser_evaluate` to set values + dispatch change events so the "
+            "validation library sees them), click the form's OWN submit input (inside "
+            "`<form>`), and if submit is blocked, read the validation message and satisfy it.\n"
+            "- CAPTURE the result: the results page URL (often a redirect to "
+            "`/SearchResults?sId=...`) AND any AJAX endpoint that carries the items "
+            "(`playwright_browser_network_requests`). The downstream scraper will replay this.\n"
+            "- STOP once you have a working results URL / AJAX endpoint + a sample item link. "
+            "Do NOT iterate all dropdown combinations — that is code_writer's job.\n\n"
+        )
+
     content = (
         f"## OBJECTIVE\n"
         f"Analyze the navigation patterns of {url} to enable a self-navigating scraper.\n\n"
@@ -905,15 +1021,23 @@ def build_navigation_agent_message(state: dict) -> list:
         f"**Save artifact to:** workspace/{slug}/navigation_analysis.json\n"
         f"{connectivity_section}"
         f"{mode_section}"
+        f"{skills_section}"
+        f"{handoff_section}"
         f"### Workflow\n"
-        f"1. Read site_analysis.json (1 call)\n"
-        f"2. Navigate to the site homepage or listing page (1 call)\n"
-        f"3. Explore navigation patterns: search, categories, pagination, item links (5-15 calls)\n"
-        f"4. Write navigation_analysis.json (1 call)\n\n"
+        f"1. `load_skill(\"navigation-patterns\")` — apply any matching Learned pattern (1 call)\n"
+        f"2. Read site_analysis.json (1 call); if handed off, also read navigation_findings.json\n"
+        f"3. Navigate to the site homepage or listing page (1 call)\n"
+        f"4. Explore navigation patterns: search, categories, pagination, item links (5-15 calls)\n"
+        f"5. Write navigation_analysis.json (1 call)\n\n"
         f"### BUDGET: {'40' if input_mode == 'navigation' else '20'} tool calls maximum.\n\n"
         f"### WRITE EARLY — CRITICAL\n"
         f"Write navigation_analysis.json as soon as you have the key patterns "
         f"(search + item_links minimum). Overwrite later if you find more.\n\n"
+        f"### STRICT JSON — CRITICAL\n"
+        f"The file MUST be strict, parseable JSON. No `...`/ellipsis placeholders, "
+        f"no `// comments`, no trailing commas, no unquoted keys. If a list is long, "
+        f"write the first 10 REAL entries and stop — never write `...` as a stand-in. "
+        f"Validate it parses before finishing.\n\n"
         f"### What NOT to Do\n"
         f"- Do NOT collect individual content URLs — analyze patterns only\n"
         f"- Do NOT scrape content from individual pages\n"
@@ -1107,12 +1231,72 @@ def build_scraper_analyzer_message(state: dict) -> list:
             f"Adjust strategy and proxy tier based on failures. Escalate ONE proxy tier.\n"
         )
 
+    # Strategy cascade: strategies that already failed testing + why. The LLM must
+    # pick a DIFFERENT strategy this time (the prior one provably can't reach the
+    # content for this site). Generic — driven by the failure log, not site names.
+    _tried = state.get("strategies_tried") or []
+    cascade_section = ""
+    if _tried:
+        _lines = []
+        for t in _tried:
+            if isinstance(t, dict):
+                _lines.append(f"  - `{t.get('strategy', '?')}`: {t.get('reason', 'failed')}")
+            else:
+                _lines.append(f"  - `{t}`: failed")
+        cascade_section = (
+            "\n### Strategies already tried + failed (DO NOT re-pick)\n"
+            + "\n".join(_lines)
+            + "\nPick a DIFFERENT strategy from the remaining options (http_requests, "
+            "playwright, internal_api, shopify_api), guided by the analysis signals "
+            "(anti_bot / js_rendering_needed / method_that_worked / api_endpoint / SSR). "
+            "If the failed strategy was Playwright (timed out), prefer http_requests for "
+            "SSR sites with a discoverable listing-page taxonomy. If http/api was blocked "
+            "or empty, prefer Playwright. Do NOT regenerate the same failed strategy.\n"
+        )
+
     navigation_context = state.get("navigation_analysis")
     nav_line = ""
     nav_read = ""
     if navigation_context:
         nav_line = "This job uses a two-phase navigation scraper. Read navigation_analysis.json for discovery patterns.\n"
         nav_read = "3. Read navigation_analysis.json (1 call)\n"
+
+    # Anti-bot detection drives the cloak stealth path. CloakBrowser
+    # (STEALTH_BROWSER=cloak, auto-applied at runtime by the run_scraper tool)
+    # defeats Akamai at the C++ fingerprint level — stronger than SeleniumBase
+    # UC's config-level stealth. So when anti-bot is present, the probe's
+    # "Playwright blocked" finding (which tested VANILLA Playwright) is
+    # superseded: prefer playwright+cloak over UC.
+    _site_analysis = state.get("site_analysis") or {}
+    _ab = _site_analysis.get("anti_bot") or {}
+    _anti_bot = isinstance(_ab, dict) and bool(_ab.get("detected"))
+    # Robust fallback: if the ONLY working access method is a stealth browser
+    # (uc_chrome_* or cloak_*), vanilla browser/HTTP were blocked → anti-bot is
+    # present even if the probe didn't raise an explicit flag. CloakBrowser
+    # defeats this where UC is fragile.
+    _conn = _site_analysis.get("connectivity") or {}
+    _method = (_conn.get("method_that_worked") or "") if isinstance(_conn, dict) else ""
+    if not _anti_bot and (_method.startswith("uc_chrome") or _method.startswith("cloak")):
+        _anti_bot = True
+    # When anti-bot is detected, route uc_chrome_* → playwright (cloak) instead of
+    # seleniumbase_uc. CloakBrowser (STEALTH_BROWSER=cloak, applied to the Playwright
+    # launch at runtime) defeats Akamai at the C++ fingerprint level — stronger than
+    # SeleniumBase UC's config-level stealth, which Akamai can still detect.
+    if _anti_bot:
+        _uc_strategy_mapping = (
+            f"   - `uc_chrome_none` → **`playwright`** (cloak), proxy `none`\n"
+            f"   - `uc_chrome_datacenter` → **`playwright`** (cloak), proxy `datacenter`\n"
+            f"   - `uc_chrome_residential` → **`playwright`** (cloak), proxy `residential`\n"
+            f"     (ANTI-BOT/AKAMAI: CloakBrowser stealth is applied to Playwright via "
+            f"STEALTH_BROWSER=cloak at runtime — stronger than UC. The probe's "
+            f"'Playwright blocked' note referred to VANILLA Playwright and is superseded.)\n"
+        )
+    else:
+        _uc_strategy_mapping = (
+            f"   - `uc_chrome_none` → `seleniumbase_uc`, proxy `none`\n"
+            f"   - `uc_chrome_datacenter` → `seleniumbase_uc`, proxy `datacenter`\n"
+            f"   - `uc_chrome_residential` → `seleniumbase_uc`, proxy `residential`\n"
+        )
 
     content = (
         f"## OBJECTIVE\n"
@@ -1122,7 +1306,7 @@ def build_scraper_analyzer_message(state: dict) -> list:
         f"**Site analysis:** workspace/{slug}/site_analysis.json\n"
         f"**Product analysis:** workspace/{slug}/product_analysis.json\n"
         f"**Save to:** workspace/{slug}/scraper_analysis.json\n\n"
-        f"{nav_line}{retry_section}"
+        f"{nav_line}{retry_section}{cascade_section}"
         f"### Workflow\n"
         f"1. Read site_analysis.json (1 call)\n"
         f"2. Read product_analysis.json (1 call)\n"
@@ -1130,9 +1314,7 @@ def build_scraper_analyzer_message(state: dict) -> list:
         f"3. Determine strategy from `connectivity.method_that_worked`:\n"
         f"   - `direct_http` → `http_requests`, proxy `none`\n"
         f"   - `browser_none` → `playwright`, proxy `none`\n"
-        f"   - `uc_chrome_none` → `seleniumbase_uc`, proxy `none`\n"
-        f"   - `uc_chrome_datacenter` → `seleniumbase_uc`, proxy `datacenter`\n"
-        f"   - `uc_chrome_residential` → `seleniumbase_uc`, proxy `residential`\n"
+        f"{_uc_strategy_mapping}"
         f"   - SPA detected → MUST use browser strategy, NOT http_requests\n"
         f"4. write_file to save scraper_analysis.json (1 call)\n\n"
         f"### BUDGET: 8 tool calls maximum.\n\n"
@@ -1176,7 +1358,7 @@ def _summarize_test_report(state: dict) -> str:
         confidence = 0.0
     issues = report.get("issues", [])
     retry_count = state.get("test_retry_count", 0)
-    if retry_count == 99:
+    if retry_count == FINAL_RETRY_SENTINEL:
         retry_label = "FINAL ATTEMPT"
     else:
         retry_label = f"Retry Cycle {retry_count + 1}"
@@ -1204,9 +1386,25 @@ def _summarize_test_report(state: dict) -> str:
             for i in medium[:3]:
                 field = i.get("field", i.get("description", "?"))
                 lines.append(f"  - `{field}`: {i.get('description', '')}")
-    if retry_count > 0 and retry_count != 99:
+    # Fix A: surface the RAW error so code_writer makes a targeted fix instead of
+    # regenerating from scratch (which reintroduces variance).
+    strategy_error = report.get("strategy_error") if isinstance(report, dict) else None
+    crash_error = report.get("crash_error") if isinstance(report, dict) else None
+    if strategy_error:
+        lines.append(
+            f"\n**⚠️ STRATEGY MISMATCH — rewrite using the correct strategy:**\n"
+            f"{strategy_error}\n"
+            f"Rewrite using the correct strategy; do NOT keep the wrong approach."
+        )
+    elif crash_error:
+        lines.append(
+            "\n**⚠️ THE SCRAPER CRASHED — make a MINIMAL, targeted fix for THIS error "
+            "(do NOT rewrite from scratch — that reintroduces variance):**\n"
+            f"```\n{str(crash_error)[:1500]}\n```"
+        )
+    if retry_count > 0 and retry_count != FINAL_RETRY_SENTINEL:
         lines.append(f"\n*{retry_count} previous attempt(s) failed.*")
-    elif retry_count == 99:
+    elif retry_count == FINAL_RETRY_SENTINEL:
         lines.append("\n*This is the FINAL retry attempt based on user feedback. "
                       "If this does not pass, the job will end.*")
     return "\n".join(lines)
@@ -1225,6 +1423,22 @@ def build_code_writer_message(state: dict) -> list:
     mechanism = scraper_analysis.get("strategy") or site_analysis.get(
         "scraping_mechanism", ""
     )
+    # When anti-bot is detected, stealth is applied at runtime via CloakBrowser
+    # (a Playwright backend, injected when STEALTH_BROWSER=cloak).  Normalize a
+    # UC-style mechanism to "playwright" so code_writer gets ONE consistent
+    # instruction set (the cloak note: use p.chromium.launch()) instead of
+    # CONFLICTING guidance (seleniumbase_section saying "MUST use SeleniumBase"
+    # vs cloak note saying "do NOT use UC/Selenium").  Non-anti-bot sites that
+    # genuinely need SeleniumBase are unaffected.  Generic. [code_writer clarity]
+    try:
+        from agents.tools.context import is_anti_bot_detected
+
+        if is_anti_bot_detected() and mechanism in (
+            "seleniumbase_uc", "undetected_chromedriver", "stealth_browser", "uc_chrome",
+        ):
+            mechanism = "playwright"
+    except Exception:
+        pass
     algolia = site_analysis.get("algolia", {})
     site_input_urls = state.get("input_urls") or []
 
@@ -1284,7 +1498,20 @@ def build_code_writer_message(state: dict) -> list:
         )
 
     template_hint = ""
-    if mechanism:
+    input_mode = (state.get("input_mode") or "").lower()
+    template_file = ""
+    # Navigation-style jobs (discovery required) use the two-phase navigation
+    # template — but ONLY for BROWSER access strategies. API/HTTP strategies
+    # (e.g. AMN's backend-API discovery, method=http_requests) keep their own
+    # single-phase template. Stealth for browser jobs is applied at runtime via
+    # STEALTH_BROWSER (cloak), NOT by switching to the UC template.
+    _browser_strategies = (
+        "playwright", "stealth_browser", "undetected_chromedriver",
+        "seleniumbase_uc", "browser", "uc_chrome", "",
+    )
+    if input_mode in ("navigation", "list_page", "search_term") and mechanism in _browser_strategies:
+        template_file = "navigation_scraper.py"
+    elif mechanism:
         template_file = f"{mechanism}_scraper.py"
         if mechanism in (
             "stealth_browser",
@@ -1292,10 +1519,43 @@ def build_code_writer_message(state: dict) -> list:
             "seleniumbase_uc",
         ):
             template_file = "undetected_chromedriver_scraper.py"
+    if template_file:
+        _cloak_note = ""
+        try:
+            from agents.tools.context import is_anti_bot_detected
+
+            if is_anti_bot_detected():
+                _cloak_note = (
+                    "\n**STEALTH:** This site uses anti-bot/Akamai protection. Stealth "
+                    "is handled AUTOMATICALLY at runtime — browser_service's cloak_stealth "
+                    "patch wraps Playwright's launch() to drive CloakBrowser's stealth "
+                    "Chromium (C++ fingerprint patches + build_args + ignore_default_args) "
+                    "when STEALTH_BROWSER=cloak is set. **Just use a normal "
+                    "`p.chromium.launch()`** inside `with sync_playwright() as p:` — do NOT "
+                    "call `cloakbrowser.launch()` directly (it starts a second Playwright and "
+                    "crashes), do NOT swap to UC/Selenium, do NOT add anti-bot workarounds. "
+                    "Use the `playwright` strategy.\n"
+                    "**ANTI-BOT PLAYBOOK (both phases via the cloak browser):**\n"
+                    "- **Discovery (Phase 1):** render the search/category URL "
+                    "(`navigation_analysis.search.working_url`) via `page.goto(url, "
+                    "wait_until='domcontentloaded')` + a short wait; then extract product "
+                    "links from the RENDERED DOM with `page.eval_on_selector_all('a[href]', "
+                    "'els => els.map(e => e.href)')`. Keep every SAME-DOMAIN link, then DROP "
+                    "obvious non-product links (nav/category/account/help). Verify "
+                    "`len(product_urls) > 0` before Phase 2. Do NOT use a backend HTTP API "
+                    "for discovery on an anti-bot site (likely protected: HTTP 400/403).\n"
+                    "- **Extraction (Phase 2):** for each product URL, render via cloak + "
+                    "read JSON-LD (`<script type=\"application/ld+json\">` → Product schema: "
+                    "Offers.price / priceCurrency / availability). Cloak renders JSON-LD "
+                    "reliably.\n"
+                )
+        except Exception:
+            pass
         template_hint = (
             f"\n### Template\nRead the template at: templates/{template_file} "
             f"and use it as your base. The scraper will run on a dedicated worker "
-            f"container that has Chrome, SeleniumBase, and Playwright installed."
+            f"container that has Chrome, SeleniumBase, Playwright, and CloakBrowser "
+            f"installed.{_cloak_note}"
         )
 
     scraper_analysis_section = ""
@@ -1442,7 +1702,36 @@ def build_code_writer_message(state: dict) -> list:
 
     navigation_section = ""
     navigation_analysis = state.get("navigation_analysis") or {}
+    # SOURCE FIX: navigation_synthesize (LLM) sometimes drops the product URLs
+    # that navigation_explore discovered. Merge them from navigation_findings.json
+    # HERE — at the point code_writer consumes the analysis. This ensures
+    # code_writer has the actual product URLs to build the scraper around.
     if navigation_analysis:
+        try:
+            import json as _json_nf, os as _os_nf
+            _slug = state.get("site_slug", "")
+            _nf_path = _os_nf.join(settings.PROJECT_ROOT, "workspace", _slug, "navigation_findings.json")
+            if _os_nf.isfile(_nf_path):
+                _nf = _json_nf.load(open(_nf_path))
+                _lp = _nf.get("listing_page") or {}
+                _purls_raw = _lp.get("product_links") or []
+                _purls = []
+                for u in _purls_raw:
+                    if isinstance(u, str):
+                        _purls.append(u)
+                    elif isinstance(u, dict) and u.get("href"):
+                        _purls.append(u["href"])
+                if _purls:
+                    _il = navigation_analysis.get("item_links")
+                    if not isinstance(_il, dict):
+                        _il = {}
+                    _existing = [u for u in (_il.get("urls") or []) if isinstance(u, str)]
+                    if len(_existing) < len(_purls):
+                        _il["urls"] = list(dict.fromkeys(_existing + _purls))
+                        navigation_analysis["item_links"] = _il
+                        logger.info("build_code_writer_message: merged %d product URLs from findings → nav_analysis", len(_purls))
+        except Exception:
+            pass
         input_mode = state.get("input_mode", "url_list")
         discovery = navigation_analysis.get("discovery_method", "unknown")
         search_info = navigation_analysis.get("search", {})
@@ -1498,6 +1787,19 @@ def build_code_writer_message(state: dict) -> list:
                 nav_lines.append(
                     f"  - Page indicator: \"{pagination_info['page_indicator_text']}\""
                 )
+
+        # Strong directive: paginate the FULL catalog (don't stop at page 1).
+        nav_lines.append(
+            "\n**DISCOVERY — paginate EVERY page (CRITICAL for full extraction):** "
+            "Search/category pages usually show only 24-48 products each. You MUST "
+            "follow pagination to the LAST page to discover the full catalog (often "
+            "65-200+ products across multiple pages). Set `MAX_PAGES` high (e.g. 20) "
+            "or null (unlimited), and keep paginating (next button / `?page=N` / "
+            "scroll) until a page returns NO new product URLs. Stopping at page 1 "
+            "misses most products — that is a discovery failure. The template's "
+            "`_get_next_page_url` already has runtime fallbacks for unknown pagination "
+            "(next-button selectors + `?page=N`); preserve that loop.\n"
+        )
 
         if item_links_info.get("container_selector"):
             nav_lines.append(
@@ -1569,20 +1871,252 @@ def build_code_writer_message(state: dict) -> list:
 
         navigation_section = "\n".join(nav_lines)
 
-    if navigation_section:
-        if mechanism in (
-            "stealth_browser",
-            "undetected_chromedriver",
-            "seleniumbase_uc",
-        ):
-            template_hint = (
-                "\n### Template\nRead the template at: templates/undetected_chromedriver_scraper.py "
-                f"and use it as your base (SeleniumBase UC Mode). Adapt it for TWO-PHASE "
-                f"architecture: Phase 1 discovers product URLs via site navigation patterns from "
-                f"navigation_analysis.json, Phase 2 scrapes each discovered product page.\n"
+        # If navigate_explore captured a backend JSON search API (React/Vue SPA,
+        # e.g. AMN Healthcare's /JobSearch), PREFER a clean HTTP api_scraper over
+        # driving the browser.  The API returns fully-populated items, so the
+        # browser two-phase discovery below is superseded.
+        api_endpoint = navigation_analysis.get("api_endpoint") or {}
+        api_section = ""
+        if api_endpoint.get("url"):
+            api_base = api_endpoint.get("base") or str(api_endpoint.get("url", "")).split("?")[0]
+            api_params = api_endpoint.get("query_params") or []
+            page_param = api_endpoint.get("pagination_param") or (
+                "PageNumber" if "PageNumber" in api_params
+                else ("page" if "page" in api_params else "page")
             )
-        else:
-            template_hint = _template_family and nav_template_hint or ""
+            page_size_param = api_endpoint.get("page_size_param") or "PageSize"
+            api_section = (
+                "\n### CRITICAL — Backend JSON search API discovered (PREFERRED — do NOT drive a browser)\n"
+                "The site renders listings client-side by calling a JSON search API, which "
+                "navigate_explore captured from the browser's network calls. **Use this API "
+                "directly with HTTP `requests` — do NOT use Playwright/Selenium, do NOT parse "
+                "the DOM, and do NOT follow the two-phase browser discovery above.**\n"
+                f"- **Endpoint:** `{api_endpoint.get('method', 'GET')} {api_base}`\n"
+                f"- **Discovered query params:** {api_params}\n"
+                "- The complete working URL (with every param + value) is in "
+                "`navigation_analysis.api_endpoint.url` — READ it. But you do NOT need every "
+                "captured param: many are **facet selectors** (e.g. repeated `FilterTypes=`) that "
+                "only control which filter facets are RETURNED in the response, NOT which items "
+                "match. **Use a MINIMAL URL** — just the search/location param + "
+                f"`{page_param}` + `{page_size_param}` (+ orderby if present). Omit facet "
+                "params entirely. A truncated/guessed facet value (e.g. `PayRateTyp` instead of "
+                "`PayRateType`) causes HTTP 400, so dropping facets is the safe choice.\n"
+                f"- **Pagination:** increment `{page_param}` starting at 1; use a large "
+                f"`{page_size_param}` (e.g. 100) to minimize calls. Stop when "
+                "`len(items) >= response total` — the total is in a key like `jobCount`, "
+                "`totalCount`, `count`, or `total` (inspect the first response).\n"
+                "- **Headers:** set a real browser `User-Agent`, `Accept: application/json`, "
+                "and `Origin` + `Referer` matching the site.\n"
+                "- **No proxy needed — this is a public API.** Send DIRECT requests "
+                "(`proxies=None`); a datacenter/residential proxy is unnecessary and may be "
+                "rejected. If a proxy helper is in the template, force the no-proxy/direct path.\n"
+                "- **No auth/cookies/subscription key required.** If a request fails, re-check "
+                "the param NAMES — do not add login or key logic.\n"
+            )
+            # Anti-bot caveat: the captured API may itself be protected (e.g. calvklein's
+            # PVH API returns 400 directly). When anti-bot is detected, tell code_writer to
+            # VERIFY the API + fall back to browser+cloak+JSON-LD if it fails. Generic.
+            try:
+                from agents.tools.context import is_anti_bot_detected
+
+                if is_anti_bot_detected():
+                    api_section += (
+                        "\n**⚠️ ANTI-BOT SITE — VERIFY THE API, ELSE FALL BACK TO BROWSER.** "
+                        "This site uses anti-bot protection, so the captured API may itself be "
+                        "protected (returns 400/403/empty when called directly, without the "
+                        "browser-warmed headers/cookies). **On the FIRST run, make a single test "
+                        "request and check you actually get items back.** If the API returns 0 "
+                        "items or an error, do NOT keep retrying it — SWITCH to rendering each "
+                        "page with the cloak browser (`p.chromium.launch()`; stealth is applied "
+                        "automatically via STEALTH_BROWSER=cloak) and extract fields from JSON-LD "
+                        "(`<script type=\"application/ld+json\">` — Product schema → Offers.price / "
+                        "priceCurrency / availability), which the cloak browser renders reliably. "
+                        "The browser path is the reliable fallback for anti-bot sites.\n"
+                    )
+            except Exception:
+                pass
+            if (state.get("page_type") or "").lower().startswith("job"):
+                api_section += (
+                    "\n**This API returns FULLY-populated items — Phase 2 (per-detail scrape) "
+                    "is NOT needed.** Map fields with the GENERIC resolver; do NOT hardcode any "
+                    "site-specific field names (no `divisionCompany.companyName`, no `or`-chains):\n"
+                    "- **Use `src/job_fields.py`.** `from src.job_fields import map_jobs` then "
+                    "`jobs = map_jobs(sample_items=first_page, raw_items=all_items)`. It "
+                    "auto-detects the source path for each standard job field (title, company, "
+                    "location, description, salary, job_type, posted_date, apply_url, "
+                    "requirements) by coverage over the sample — it handles nested objects, "
+                    "composite location (city.name + state.abbrev -> 'City, ST'), salary ranges, "
+                    "list-valued employmentType, and normalizes posted_date to ISO-8601. The "
+                    "resolver picks whatever source is actually populated for THIS site, so the "
+                    "same code works across job platforms without per-site edits.\n"
+                    "- **Verify each field.** code_tester reports per-field coverage in "
+                    "`results.field_coverage`. If a field shows `MISSING`/0% the resolver found "
+                    "no populated candidate — if a real source exists that the alias table "
+                    "misses, ADD it to `JOB_ALIASES` in `src/job_fields.py` (do not patch the "
+                    "generated scraper). Never ship a core field at 0%.\n"
+                    "- **Construct `url` when the API has none.** Many job APIs expose a job "
+                    "ID but no direct URL (the posting is a SPA route). If `map_jobs` leaves "
+                    "`url` empty, build it per item from the job ID using the job-link pattern "
+                    "navigate_explore discovered (see `navigation_findings.json` product_links / "
+                    "`navigation_analysis.item_links.url_pattern`, e.g. "
+                    "`https://site/job-details/{jobID}/{slug}/`). Set this constructed URL on "
+                    "each mapped job so the `url` core field is populated.\n"
+                    f"- **Date filter (last 7 days):** there is usually NO server-side "
+                    "posted-date param. Fetch ALL pages, then KEEP ONLY items whose `posted_date` "
+                    "(normalized to ISO-8601 `YYYY-MM-DD` by the resolver) is within "
+                    "`datetime.now(timezone.utc) - 7 days`.\n"
+                    "- Add a `--query` arg defaulting to the target location (e.g. 'Alabama') "
+                    "and feed it into the API's location query param. The captured URL may have "
+                    "been taken from a category/browse page and OMIT the location param — the "
+                    "site's location search box is in "
+                    "`navigation_analysis.filters.location_filter` / findings `filter_ui.location_selectors`. "
+                    "Add the location param and VERIFY it works: the response total should DROP "
+                    "to only jobs in that location. Common param names to try (in order): "
+                    "`LocationSearch`, `location`, `state`, `State`, `city`, `q`. Pair with a "
+                    "radius/distance param if one appears in the captured URL (e.g. "
+                    "`LocationDistance`).\n"
+                )
+            api_section += (
+                "\n**Output:** write the filtered list to `output_{datetime}.json`.\n"
+            )
+            # The API loop replaces the browser navigation template.
+            nav_template_hint = (
+                "\n### Template\nRead templates/api_scraper.py as your base (HTTP + JSON). "
+                "The entire scraper is ONE paginated API loop — no Playwright/browser.\n"
+            )
+            # Prepend so the API guidance is read first and supersedes the
+            # generic two-phase browser text that follows.
+            navigation_section = api_section + navigation_section
+
+        # Filter requirements (date/location/category — job portals & search sites)
+        filters_info = navigation_analysis.get("filters", {}) or {}
+        # fmethod is set inside the has_filters block below, but referenced by
+        # the form/classic-search check further down — initialise it so a
+        # navigation job with NO detected filters doesn't NameError there.
+        fmethod = filters_info.get("method") if filters_info.get("has_filters") else None
+        if filters_info.get("has_filters"):
+            fmethod = filters_info.get("method", "url")
+            filter_lines = [
+                "\n### Filter Requirements (apply during Phase 1 discovery)\n",
+                f"This site supports result filtering via: **{fmethod}**\n",
+            ]
+            for label, key in [
+                ("Date", "date_filter"),
+                ("Location", "location_filter"),
+                ("Category", "category_filter"),
+            ]:
+                fcfg = filters_info.get(key) or {}
+                if not fcfg:
+                    continue
+                _strategy = fcfg.get("strategy", "")
+                _sval = fcfg.get("strategy_value")
+                _dval = fcfg.get("detected_value", "")
+                _values = fcfg.get("values") or []
+                detail = []
+                if fcfg.get("param_name"):
+                    detail.append(f"URL param `{fcfg['param_name']}`")
+                if fcfg.get("url_pattern"):
+                    detail.append(f"pattern `{fcfg['url_pattern']}`")
+                if fcfg.get("selector"):
+                    detail.append(f"form element `{fcfg['selector']}`")
+                if fcfg.get("form_action") or fcfg.get("submit_button"):
+                    detail.append(
+                        f"submit form `{fcfg.get('form_id') or fcfg.get('form_action')}`"
+                        f" (button `{fcfg.get('submit_button')}`)"
+                    )
+                # Strategy-driven filter guidance (replaces hardcoded "Alabama" etc.).
+                # pin → use the specific value from the query; iterate → loop options + dedup.
+                if _strategy == "pin" and _sval:
+                    filter_lines.append(
+                        f"- **{label}**: PIN to `{_sval}` ({fcfg.get('reason','')}). "
+                        f"{', '.join(detail)}.\n"
+                    )
+                elif _strategy == "iterate" or (not _strategy and _dval in ("all", "any", "", None) and _values):
+                    _opts = [
+                        (v.get("v", "") if isinstance(v, dict) else v)
+                        for v in _values
+                    ]
+                    _opts = [o for o in _opts if o and o not in ("all", "any")]
+                    filter_lines.append(
+                        f"- **{label}**: ITERATE over {len(_opts)} options "
+                        f"({_opts[:12]}{'...' if len(_opts) > 12 else ''}). For each, "
+                        f"build the URL via the pattern above, collect item links, and "
+                        f"**dedup by job/item ID** across iterations. (detected_value="
+                        f"'{_dval}'; query didn't specify this dimension → enumerate "
+                        f"for full catalog.)\n"
+                    )
+                elif _strategy == "ignore":
+                    continue  # don't mention irrelevant filters
+                else:
+                    # Fallback (older analysis without strategy): use detected_value,
+                    # NOT a hardcoded default. Surface options for code_writer to decide.
+                    filter_lines.append(
+                        f"- **{label}**: use detected_value `{_dval}`. {', '.join(detail)}. "
+                        f"Options: {_values[:8]}{'...' if len(_values) > 8 else ''}\n"
+                    )
+            filter_lines.append(
+                "\nApply pin filters to their values; iterate iterate-filters "
+                "(loop options, dedup by ID). For URL-based filters, append params; "
+                "for form-based, interact with the form. Sample job URLs "
+                "(item_links.url_examples) are for field/selector mapping ONLY — "
+                "do NOT infer filter values from their content.\n"
+            )
+            navigation_section += "\n".join(filter_lines)
+
+        # Form-based / "classic" search discovery CANNOT be done via raw HTTP
+        # (anti-forgery tokens + server-side session → HTTP 500). Force a
+        # browser-driven Phase 1 and tell the code-writer exactly how.
+        classic = (navigation_analysis.get("homepage_nav", {}) or {}).get("classic_search")
+        if fmethod == "form" or classic:
+            navigation_section += (
+                "\n**CRITICAL — browser-driven Phase 1 (form/classic search):** "
+                "This site's search is a POST form protected by anti-forgery tokens "
+                "and a server-side session, so raw `requests.post(...)` returns HTTP "
+                "500 and discovers nothing. Phase 1 MUST use **Playwright in a real "
+                f"browser**. Read `workspace/{slug}/navigation_findings.json` "
+                "(`homepage_nav.classic_search`) for the search-page URL and its "
+                "`<select>` fields, then: open the search page, fill the dropdowns "
+                "(Location → Alabama/AL; leave category at 'Any'), **click the submit "
+                "button** to obtain the session results URL, then apply the result "
+                "filters (set the date `<select>` to the 'Last 7 Days' option and "
+                "click the result-form submit button), and paginate. NOTE: this "
+                "site's form REQUIRES a **Specialty** selection to submit — a "
+                "Discipline or Location alone will NOT submit (validation blocks "
+                "it). So for **ALL categories** you MUST iterate the **Specialties** "
+                "`<select>` (NOT Disciplines), submitting once per specialty and "
+                "deduping the discovered links. Phase 2 (field extraction from the "
+                "detail pages) may use HTTP since pages are server-rendered.\n"
+                "**Form-interaction tips (important — sites vary):**\n"
+                "- Submit buttons may be `input[type='submit']` OR `button[type='submit']` "
+                "(LocumTenens' search form uses `input[type='submit']`; its results filter "
+                "form uses `button[type='submit']`). Click with a fallback chain, e.g. try "
+                "`input[type='submit']`, then `button[type='submit']`, then "
+                "`form button`, then `form.requestSubmit()` — never assume `button` only.\n"
+                "- `<select>` changes on jQuery sites need `page.select_option(sel, value)` "
+                "(Playwright) which fires the right events; if a `<select>` is a "
+                "bootstrap-multiselect, also dispatch a jQuery `change` after setting.\n"
+            )
+
+    if navigation_section:
+        # Navigation jobs always use the two-phase navigation_scraper template
+        # (Playwright). Do NOT fall back to the SeleniumBase UC template — it
+        # bypasses the cloak safety net (STEALTH_BROWSER=cloak) that lets
+        # Playwright defeat Akamai on anti-bot sites.
+        template_hint = _template_family and nav_template_hint or ""
+        _sa = state.get("site_analysis") or {}
+        _ab = _sa.get("anti_bot")
+        _conn = _sa.get("connectivity")
+        _method = _conn.get("method_that_worked", "") if isinstance(_conn, dict) else ""
+        _nav_anti_bot = (isinstance(_ab, dict) and bool(_ab.get("detected"))) or _method.startswith("uc_chrome")
+        if _nav_anti_bot:
+            template_hint += (
+                "\n**STEALTH:** Anti-bot/Akamai detected. Stealth is AUTOMATIC at "
+                "runtime — browser_service wraps Playwright launch() to drive "
+                "CloakBrowser's stealth Chromium when STEALTH_BROWSER=cloak is set. "
+                "**Use a normal `p.chromium.launch()`** — do NOT use UC/Selenium, do "
+                "NOT call cloakbrowser.launch() directly (it conflicts with "
+                "sync_playwright). Use the `playwright` strategy.\n"
+            )
 
     content = (
         f"## OBJECTIVE\n"
@@ -1601,6 +2135,21 @@ def build_code_writer_message(state: dict) -> list:
         f"**Save input URLs to:** workspace/{slug}/input_urls.json"
         f"{provided_urls_section}"
         f"{retry_section}{human_feedback_section}{algolia_section}{navigation_section}{template_hint}{scraper_analysis_section}\n\n"
+        f"### Full Extraction (MANDATORY — no item caps)\n"
+        f"The scraper MUST extract EVERY item the source exposes — never cap the count.\n"
+        f"- Do NOT set an arbitrary `MAX_PAGES` / `MAX_ITEMS` limit. Paginate until exhaustion "
+        f"(a page returns fewer items than the page size) OR until the API's reported total "
+        f"(`totalCount`/`count`/`total`) is reached.\n"
+        f"- Set the page size to the source's MAX (often 100-500; e.g. Aya=500, AMN=100). "
+        f"Larger pages = fewer requests = faster full extraction.\n"
+        f"- **Concurrency:** if Phase 2 (per-detail-page extraction) is HTTP-based "
+        f"(`requests`/`httpx`, not browser), extract items concurrently with a "
+        f"`ThreadPoolExecutor(max_workers=8)` and a thread-local `requests.Session` "
+        f"(the Session is NOT thread-safe to share). This turns thousands of sequential "
+        f"2s fetches into minutes (e.g. 1300 jobs in ~7min vs ~54min). Preserve order by "
+        f"indexing results to the discovery position.\n"
+        f"- The default (no-args) run must do the FULL extraction. `--sample`/`--limit` are "
+        f"only for quick tests; never make them the default behavior.\n\n"
         f"### Architecture\n"
     )
     if navigation_section:
@@ -1696,7 +2245,7 @@ def build_code_tester_message(state: dict) -> list:
 
     retry_context = ""
     retry_count = state.get("test_retry_count", 0)
-    if retry_count == 99:
+    if retry_count == FINAL_RETRY_SENTINEL:
         retry_context = (
             f"\n### FINAL RETEST MODE (User-Initiated Final Retry)\n"
             f"This is the FINAL test attempt based on user feedback. "
@@ -1740,13 +2289,59 @@ def build_code_tester_message(state: dict) -> list:
                 f"- Validate that discovered URLs are PRODUCT pages, not category pages\n"
             )
         nav_validation += (
-            f"- `--sample --query \"{search_criteria}\"` — use these exact args so Phase 1 discovery runs\n"
+            f"- `--sample --query \"{search_criteria}\"` — use these exact args so Phase 1 discovery runs.\n"
             f"- Do NOT run with only `--sample` — the scraper will fall back to input_urls.json "
             f"instead of discovering products via search\n"
             f"- A FAIL is expected if Phase 1 discovers category/landing page URLs instead of product URLs\n"
             f"- This is a navigation scraper — input_urls.json is NOT used. "
             f"Products come from the scraper's own discovery.\n"
         )
+
+    # Job-portal filter validation: verify date/location filtering was applied
+    page_type = state.get("page_type", "")
+    if page_type in ("job_navigation", "job_posting") or state.get("site_type") == "jobs":
+        nav_analysis = state.get("navigation_analysis") or {}
+        filters_info = nav_analysis.get("filters", {}) or {}
+        if filters_info.get("has_filters"):
+            nav_validation += (
+                "\n### Job Filter Validation (REQUIRED)\n"
+                "This job portal supports filtering. Verify the scraper applied it:\n"
+                "- Every output item's `location` must match Alabama (or be empty if "
+                "unparseable — never an out-of-state location)\n"
+                "- Every output item's `posted_date` must be within the last 7 days "
+                "(parse the date; reject items older than 7 days)\n"
+                "- If items violate the date/location filter, this is a HIGH severity "
+                "issue (filters not applied)\n"
+                "- Confirm the `posted_date` field is populated for most items\n"
+            )
+
+    # Strategy constraint (Fix C): code_tester must not recommend switching strategies.
+    strategy = (state.get("scraper_analysis") or {}).get("strategy", "") or (
+        state.get("site_analysis") or {}
+    ).get("scraping_mechanism", "")
+    strategy_constraint = ""
+    if strategy:
+        strategy_constraint = (
+            f"\n### Strategy Constraint (CRITICAL for remediation)\n"
+            f"The scraping strategy was chosen upstream by scraper_analyzer as **{strategy}**. "
+            f"Default: work WITHIN this strategy — if the scraper used the wrong selectors or "
+            f"missed a field, say so with `target: \"mapping\"` or `target: \"scraper\"`.\n\n"
+            f"EXCEPTION — access/strategy failure: if the scraper extracted ~0 items BECAUSE "
+            f"the strategy itself can't reach the content (e.g. `http_requests`/`api` returned "
+            f"empty/403/blocked, or `playwright` TIMED OUT trying to drive a heavy form), set "
+            f"`target: \"strategy\"` and name the cause in `reason` (timeout / blocked / api-400 "
+            f"/ http-empty). The pipeline will switch to a different strategy. Use `strategy` "
+            f"ONLY for these access-class failures — never for a field-mapping or selector bug.\n"
+        )
+    # Crash capture (Fix A): record the raw traceback so code_writer can make a targeted fix.
+    crash_capture = (
+        "\n### If the Scraper CRASHED\n"
+        "If `run_scraper` shows the scraper exited non-zero, raised an exception, or hit a "
+        "syntax/argparse/import error (it never produced valid output), set "
+        "`overall_assessment: \"CRASH\"` and put the EXACT stderr/traceback verbatim in a "
+        "top-level `crash_error` field. A crash is a code bug — the pipeline routes it to a "
+        "targeted bug fix, not a full rewrite, so the verbatim error is essential.\n"
+    )
 
     content = (
         f"## OBJECTIVE\n"
@@ -1757,21 +2352,33 @@ def build_code_tester_message(state: dict) -> list:
         f"**Product analysis:** workspace/{slug}/product_analysis.json\n"
         f"**Save test report to:** workspace/{slug}/test_report.json\n\n"
         f"{nav_validation}"
-        f"### Workflow (5 steps)\n"
-        f"1. Read `workspace/{slug}/scraper_draft.py` (1 call)\n"
-        f"2. Read `workspace/{slug}/product_analysis.json` (1 call)\n"
-        f"3. Run scraper: `run_scraper(path=\"workspace/{slug}/scraper_draft.py\", "
-        f'args={["--sample", "--query", search_criteria] if input_mode in ("navigation", "list_page", "search_term") and search_criteria else ["--sample"]})` (1-2 calls)\n'
-        f"4. Read the output JSON (1 call)\n"
-        f"5. Write test_report.json (1 call)\n\n"
+        f"### Workflow (4 steps)\n"
+        f"1. Run scraper: `run_scraper(path=\"workspace/{slug}/scraper_draft.py\", "
+        f"args=" + str(["--sample", "--input", "input_urls.json"]) + ")` (1-2 calls)\n"
+        f"**For navigation jobs**: use `--input input_urls.json` (NOT `--query`). "
+        f"The input_urls.json contains product URLs already discovered by navigation_explore. "
+        f"Using `--input` tests the ACTUAL products (with prices), not re-discovered URLs.\n"
+        f"2. Read `workspace/{slug}/product_analysis.json` for field expectations (1 call)\n"
+        f"3. Read the output JSON file that run_scraper produced (1 call)\n"
+        f"4. Write test_report.json (1 call)\n\n"
+        f"**IMPORTANT: Do NOT read scraper_draft.py.** Assess the scraper ONLY by its output. "
+        f"The code contains post-generation patches (robust overrides, output filters) that are correct by design. "
+        f"Judge solely by whether the output JSON has correctly-populated product fields.\n\n"
         f"### Validation Method\n"
         f"Compare scraper output against `product_analysis.json > fields > {{field}} > expectations`. "
         f"Each field has a validation contract (type, required, min_length, should_not_match, "
         f"sample_values, known_bad_values, format_hint). Do NOT re-fetch live pages.\n\n"
+        f"### IMPORTANT: Non-Product URLs Are Expected\n"
+        f"The scraper uses BROAD link discovery (captures all same-domain links). Some discovered "
+        f"URLs will be category/nav/non-product pages — the scraper's output filter removes items "
+        f"without a price. **This is correct behavior, not a failure.** Judge the scraper ONLY by "
+        f"the PRICED products in the output. If the priced products have correctly populated "
+        f"title/price/availability, it's a PASS — do NOT flag missing items from non-product URLs "
+        f"as high severity. A sample of 5 URLs that yields 3-5 priced products with good fields is a PASS.\n\n"
         f"### BUDGET: 10 tool calls maximum.\n\n"
         f"### How Scraper Execution Works\n"
         f"The `run_scraper` tool automatically detects browser-based scrapers (Playwright, "
-        f"SeleniumBase, etc.) and dispatches them to a remote `browser-service` container "
+        f"SeleniumBase, etc.) and dispatches them to a remote `browser_service` container "
         f"that has Chrome + Xvfb + all browser libraries pre-installed. "
         f"HTTP-based scrapers run locally. You NEVER need to install packages.\n\n"
         f"### What NOT to Do\n"
@@ -1781,10 +2388,35 @@ def build_code_tester_message(state: dict) -> list:
         f"- Do NOT install packages, run bash commands, or load skills\n"
         f"- Do NOT read input_urls.json — that file is not your concern\n\n"
         f"### Dead URLs\n"
-        f"Products with status_code in [301, 302, 303, 307, 308, 404, 410, 451] are dead URLs "
+        f"Products with status_code in {sorted(DEAD_STATUS_CODES)} are dead URLs "
         f"— exclude from quality assessment. If ALL are dead, set PASS with confidence 1.0.\n\n"
         f"### Optional Fields\n"
         f"Fields `original_price` and `location` are optional — missing = severity low, never high.\n\n"
+        f"### Remediation Recommendation (REQUIRED in test_report)\n"
+        f"After assessing the scraper, add a top-level `remediation` object telling the pipeline "
+        f"WHERE the fix should happen:\n"
+        f"```json\n"
+        f"\"remediation\": {{\n"
+        f"  \"target\": \"mapping\" | \"scraper\" | \"strategy\",\n"
+        f"  \"fields\": [\"price\"],\n"
+        f"  \"reason\": \"...\"\n"
+        f"}}\n"
+        f"```\n"
+        f"Decision rule — for each FAILED **required** field, compare the scraper output against "
+        f"`product_analysis.json`'s mapping for that field:\n"
+        f"- If the field's mapping is **missing / `tested: false` / selector looks wrong or "
+        f"unverified** → the root cause is the MAPPING → set `target: \"mapping\"` and list those "
+        f"fields. The pipeline re-runs product_analyzer to fix the mapping (not just regenerate the "
+        f"scraper with the same bad input).\n"
+        f"- If the mapping looks correct (right selector/method, `tested: true`) but the scraper "
+        f"didn't implement it → `target: \"scraper\"`.\n"
+        f"- If the scraper extracted ~0 items because the STRATEGY can't access the content "
+        f"(http/api empty or 403/blocked; playwright timed out) → `target: \"strategy\"` with the "
+        f"cause in `reason` (timeout / blocked / api-400 / http-empty). The pipeline switches "
+        f"strategy. Do NOT use `strategy` for selector or field-mapping bugs.\n"
+        f"- If everything passes → `target: \"scraper\"` (no real remediation needed).\n"
+        f"When unsure, default to `\"scraper\"`. Only list fields that are required AND failed.\n\n"
+        f"{strategy_constraint}{crash_capture}"
         f"**CRITICAL: You MUST call write_file to save your test report to "
         f"workspace/{slug}/test_report.json as your LAST action.**"
     )
@@ -1808,11 +2440,18 @@ def build_cleanup_message(state: dict) -> list:
         f"**Target folder:** scrapers/{slug}/\n"
         f"**Save cleanup report to:** workspace/{slug}/cleanup_report.json\n\n"
         f"### Workflow\n"
-        f"1. Copy scraper_draft.py to scrapers/{slug}/scraper.py\n"
-        f"2. Copy input_urls.json to scrapers/{slug}/input_urls.json\n"
-        f"3. write_file to save cleanup report (1 call)\n\n"
+        f"1. Use `run_bash` to copy files (NOT read_file — you don't need to read their contents):\n"
+        f"   - `cp workspace/{slug}/scraper_draft.py scrapers/{slug}/scraper.py`\n"
+        f"   - `cp workspace/{slug}/input_urls.json scrapers/{slug}/input_urls.json` (if it exists)\n"
+        f"   - `cp workspace/{slug}/output_*.json scrapers/{slug}/` (if any exist)\n"
+        f"   - `cp -r workspace/{slug}/analysis scrapers/{slug}/analysis` (if it exists)\n"
+        f"2. Use `search_files` to list what's in the workspace (NOT read_file).\n"
+        f"3. write_file to save cleanup report (1 call).\n\n"
         f"### BUDGET: 10 tool calls maximum.\n\n"
         f"### What NOT to Do\n"
+        f"- Do NOT use read_file on output_*.json files — they can be very large and will\n"
+        f"  exceed the LLM's prompt limit. Use `search_files` to check they exist, then\n"
+        f"  `run_bash` (`cp`) to copy them.\n"
         f"- Do NOT modify the scraper code\n"
         f"- Do NOT delete workspace analysis files (site_analysis.json, product_analysis.json, test_report.json)\n"
         f"- Do NOT run the scraper\n\n"
@@ -1873,6 +2512,54 @@ def build_skill_learner_message(state: dict) -> list:
     return [HumanMessage(content=content)]
 
 
+def build_dagster_converter_message(state: dict) -> list:
+    """Build the message for the dagster_converter agent."""
+    slug = state.get("site_slug", "unknown")
+    url = state.get("url", "")
+    site_name = state.get("site_name", slug)
+
+    # Find the existing scraper path (production first, workspace fallback)
+    scraper_path = f"scrapers/{slug}/scraper.py"
+    workspace_scraper = f"workspace/{slug}/scraper_draft.py"
+
+    content = (
+        f"## OBJECTIVE\n"
+        f"Convert the existing scraper for {url} into the client's `BaseTlsScraper` format.\n\n"
+        f"## Files to Read\n"
+        f"1. **Existing scraper**: `{scraper_path}` (or `{workspace_scraper}` if the production "
+        f"version doesn't exist yet). Read the FULL scraper — understand Phase 1 (discovery) + "
+        f"Phase 2 (extraction).\n"
+        f"2. **Client template**: `templates/dagster_template.py` — the `BaseTlsScraper` class. "
+        f"Understand `self._fetch()`, `scrape_one(url)`, `discover_urls()`.\n"
+        f"3. **Field mappings**: `workspace/{slug}/product_analysis.json` — which selectors/methods "
+        f"extract each field.\n"
+        f"4. **Navigation**: `workspace/{slug}/navigation_analysis.json` — filter dimensions, URL "
+        f"patterns, option lists (for `discover_urls`).\n"
+        f"5. **Site info**: `workspace/{slug}/site_analysis.json` — platform, scraping method.\n\n"
+        f"## What to Generate\n"
+        f"Write `workspace/{slug}/{slug}_dagster.py` — a `BaseTlsScraper` subclass with:\n"
+        f"- `discover_urls(self) -> list[str]`: Phase 1 — iterate filter combinations from "
+        f"navigation_analysis, build listing URLs, fetch each, extract + dedup item URLs.\n"
+        f"- `scrape_one(self, url: str) -> dict`: Phase 2 — fetch one item page + parse fields "
+        f"(using the SAME selectors/logic as the original scraper).\n"
+        f"- Helper methods as needed (copied/adapted from the original).\n"
+        f"- All required imports (tls_client, requests, BeautifulSoup, re, json, etc.).\n\n"
+        f"## Strategy Adaptation\n"
+        f"- `http_requests`: use `self._fetch()` for both phases + BeautifulSoup/regex parse.\n"
+        f"- `playwright`: use browser_service `/render` endpoint or Playwright internally "
+        f"(keep the `BaseTlsScraper` interface; change the implementation).\n"
+        f"- `internal_api`: convert API calls to `self._fetch()` or `requests.get()`.\n\n"
+        f"## Rules\n"
+        f"- PRESERVE the parsing logic faithfully (same selectors, same field names).\n"
+        f"- Keep the class extending `BaseTlsScraper` + `scrape_one(self, url) -> dict`.\n"
+        f"- Include `discover_urls()` for navigation jobs; return `[]` for url_list jobs.\n"
+        f"- Dedup by job/item ID in `discover_urls()`.\n"
+        f"- Syntax-check before writing (valid Python).\n"
+        f"- Write to `workspace/{slug}/{slug}_dagster.py`.\n"
+    )
+    return [HumanMessage(content=content)]
+
+
 __all__ = [
     "create_site_analyzer",
     "create_product_analyzer",
@@ -1881,6 +2568,7 @@ __all__ = [
     "create_code_tester",
     "create_cleanup_agent",
     "create_skill_learner",
+    "create_dagster_converter",
     "create_nav_skill_review",
     "build_site_analyzer_message",
     "build_product_analyzer_message",
@@ -1890,4 +2578,5 @@ __all__ = [
     "build_cleanup_message",
     "build_skill_learner_message",
     "build_nav_skill_review_message",
+    "build_dagster_converter_message",
 ]

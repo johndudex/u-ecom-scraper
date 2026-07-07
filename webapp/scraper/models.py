@@ -228,11 +228,13 @@ class Approval(models.Model):
     STATUS_PENDING = "pending"
     STATUS_APPROVED = "approved"
     STATUS_REJECTED = "rejected"
+    STATUS_SUPERSEDED = "superseded"
 
     STATUS_CHOICES = [
         (STATUS_PENDING, "Pending"),
         (STATUS_APPROVED, "Approved"),
         (STATUS_REJECTED, "Rejected"),
+        (STATUS_SUPERSEDED, "Superseded (job ended)"),
     ]
 
     job = models.ForeignKey(
@@ -447,3 +449,100 @@ class AgentPlayground(models.Model):
 
     def __str__(self):
         return f"#{self.id} {self.agent_name} ({self.status})"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Close pending approvals when a job reaches a terminal state.
+#
+# A job that ends (completed/failed/cancelled/blocked) can no longer act on its
+# open approvals — leaving them "pending" pollutes the approval queue with ghost
+# entries.  This generic post_save hook closes them so the queue only shows
+# approvals that are genuinely actionable (i.e. on waiting_approval jobs).
+# Idempotent: only ever touches status=pending rows.  [goal: human-interaction]
+# ─────────────────────────────────────────────────────────────────────────────
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+_TERMINAL_JOB_STATUSES = frozenset({
+    ScrapeJob.STATUS_COMPLETED,
+    ScrapeJob.STATUS_FAILED,
+    ScrapeJob.STATUS_CANCELLED,
+    ScrapeJob.STATUS_CAPTCHA_BLOCKED,
+    ScrapeJob.STATUS_AKAMAI_BLOCKED,
+})
+
+
+@receiver(post_save, sender=ScrapeJob)
+def _close_open_approvals_on_terminal_job(sender, instance: "ScrapeJob", **kwargs):
+    """Supersede any still-pending approvals the moment a job ends."""
+    if instance.status not in _TERMINAL_JOB_STATUSES:
+        return
+    open_approvals = instance.approvals.filter(status=Approval.STATUS_PENDING)
+    if not open_approvals.exists():
+        return
+    from django.utils import timezone
+    import logging as _logging
+
+    count = open_approvals.count()
+    open_approvals.update(
+        status=Approval.STATUS_SUPERSEDED,
+        resolved_at=timezone.now(),
+    )
+    _logging.getLogger("scraper.models").info(
+        "Job %s: superseded %d open approval(s) (job ended: %s)",
+        instance.id, count, instance.status,
+    )
+
+
+class JobListing(models.Model):
+    """A single scraped job listing, stored for the jobs dashboard.
+
+    Populated by the `store_job_listings` graph node (post-completion, non-breaking)
+    from the output JSON of job_navigation / job_posting scrapes. Enables the
+    dashboard to show "all jobs posted in the last N days" across all sites without
+    re-reading JSON files.
+    """
+
+    # Identity + source
+    scrape_job = models.ForeignKey(
+        ScrapeJob, on_delete=models.CASCADE, related_name="listings", null=True, blank=True
+    )
+    site = models.ForeignKey(
+        Site, null=True, blank=True, on_delete=models.SET_NULL, related_name="listings"
+    )
+    site_name = models.CharField(max_length=200, blank=True, default="")
+    site_slug = models.CharField(max_length=200, blank=True, default="")
+    url = models.URLField(max_length=1000, blank=True, default="")
+    job_source_id = models.CharField(max_length=200, blank=True, default="")
+
+    # Core fields (from content_types JOB_FIELDS)
+    title = models.CharField(max_length=500, blank=True, default="")
+    company = models.CharField(max_length=300, blank=True, default="")
+    location = models.CharField(max_length=300, blank=True, default="")
+    description = models.TextField(blank=True, default="")
+    salary = models.CharField(max_length=300, blank=True, default="")
+    job_type = models.CharField(max_length=100, blank=True, default="")
+    employment_type = models.CharField(max_length=100, blank=True, default="")
+
+    # Date filtering (the key field for the dashboard)
+    posted_date = models.DateField(null=True, blank=True, db_index=True)
+    valid_through = models.DateField(null=True, blank=True)
+
+    # Extra fields (flexible — store any site-specific fields not covered above)
+    extra_data = models.JSONField(default=dict, blank=True)
+
+    # Metadata
+    scraped_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-posted_date", "-scraped_at"]
+        indexes = [
+            models.Index(fields=["posted_date"]),
+            models.Index(fields=["company"]),
+            models.Index(fields=["location"]),
+            models.Index(fields=["site_slug"]),
+        ]
+
+    def __str__(self):
+        return f"{self.title} @ {self.company} ({self.posted_date})"
+

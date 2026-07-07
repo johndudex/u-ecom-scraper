@@ -2,7 +2,7 @@
 
 Provides ``run_bash`` for local commands and ``run_scraper`` for executing
 generated scrapers.  Browser-based scrapers are dispatched to
-browser-service via HTTP.  HTTP-based scrapers run locally as subprocesses.
+browser_service via HTTP.  HTTP-based scrapers run locally as subprocesses.
 """
 
 import logging
@@ -20,7 +20,7 @@ MAX_OUTPUT_CHARS = 10000
 DEFAULT_TIMEOUT = 120
 
 BROWSER_SERVICE_URL = os.environ.get(
-    "BROWSER_SERVICE_URL", "http://browser-service:8001"
+    "BROWSER_SERVICE_URL", "http://browser_service:8001"
 )
 SCRAPER_HTTP_TIMEOUT = int(os.environ.get("SCRAPER_HTTP_TIMEOUT", "7200"))
 
@@ -128,7 +128,7 @@ def get_shell_tools(
         if "pip install" in command or "pip3 install" in command:
             return ("Error: pip install is not allowed. All required packages are "
                     "pre-installed in the execution environment. Browser-based scrapers "
-                    "run on browser-service which has Chrome, SeleniumBase, and Playwright. "
+                    "run on browser_service which has Chrome, SeleniumBase, and Playwright. "
                     "Use run_scraper instead of run_bash for scraper execution.")
         try:
             result = subprocess.run(
@@ -168,7 +168,7 @@ def get_shell_tools(
 
         Automatically detects whether the scraper needs a browser (Playwright,
         SeleniumBase, etc.).  Browser-based scrapers are dispatched to
-        browser-service which has Chrome + Xvfb.  HTTP-based scrapers run
+        browser_service which has Chrome + Xvfb.  HTTP-based scrapers run
         locally.
 
         Args:
@@ -207,34 +207,47 @@ def get_shell_tools(
             cmd_args = shlex.split(cli_args) if cli_args else []
 
         if needs_browser:
-            logger.info("run_scraper: browser-based, dispatching to browser-service: %s", scraper_path)
+            logger.info("run_scraper: browser-based, dispatching to browser_service: %s", scraper_path)
             try:
                 service_url = _get_browser_service_url()
+                # Anti-bot/Akamai sites: route the scraper's Playwright launch
+                # through CloakBrowser (stealth Chromium) instead of plain Chrome.
+                # The scraper reads STEALTH_BROWSER and swaps in cloak's launch().
+                env_overrides = None
+                try:
+                    from agents.tools.context import is_anti_bot_detected
+
+                    if is_anti_bot_detected():
+                        env_overrides = {"STEALTH_BROWSER": "cloak"}
+                        logger.info("run_scraper: anti-bot detected → STEALTH_BROWSER=cloak")
+                except Exception:
+                    pass
                 resp = httpx.post(
                     f"{service_url}/scrape",
                     json={
                         "scraper_path": full_path,
                         "args": cmd_args,
                         "timeout": timeout,
+                        "env_overrides": env_overrides,
                     },
                     timeout=timeout + 60,
                 )
                 if resp.status_code == 404:
-                    return f"Scraper not found at {full_path} on browser-service"
+                    return f"Scraper not found at {full_path} on browser_service"
                 resp.raise_for_status()
                 result = resp.json()
                 output = _format_result(result)
-                output += f"\n[ran on browser-service, duration: {result.get('duration', '?')}s]"
+                output += f"\n[ran on browser_service, duration: {result.get('duration', '?')}s]"
                 if result.get("output_file"):
                     output += f"\n[output_file: {result['output_file']}]"
                 return output
             except httpx.ConnectError:
-                return f"Error: browser-service ({_get_browser_service_url()}) is unreachable"
+                return f"Error: browser_service ({_get_browser_service_url()}) is unreachable"
             except httpx.TimeoutException:
-                return f"Scraper timed out after {timeout + 60}s on browser-service"
+                return f"Scraper timed out after {timeout + 60}s on browser_service"
             except Exception as exc:
-                logger.error("run_scraper: browser-service dispatch failed: %s", exc)
-                return f"Error dispatching to browser-service: {exc}"
+                logger.error("run_scraper: browser_service dispatch failed: %s", exc)
+                return f"Error dispatching to browser_service: {exc}"
         else:
             logger.info("run_scraper: http-based, running locally: %s", scraper_path)
             try:

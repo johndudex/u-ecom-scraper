@@ -100,7 +100,7 @@ ZAI_API_KEY = config("ZAI_API_KEY", default="")
 ZAI_BASE_URL = config("ZAI_BASE_URL", default="https://api.z.ai/api/coding/paas/v4/")
 ZAI_MAIN_MODEL = config("ZAI_MAIN_MODEL", default="glm-5-turbo")
 ZAI_SMALL_MODEL = config("ZAI_SMALL_MODEL", default="glm-5-turbo")
-PLAYWRIGHT_MCP_URL = config("PLAYWRIGHT_MCP_URL", default="http://browser-service:8111/sse")
+PLAYWRIGHT_MCP_URL = config("PLAYWRIGHT_MCP_URL", default="http://browser_service:8111/sse")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 SCRAPERS_DIR = PROJECT_ROOT / "scrapers"

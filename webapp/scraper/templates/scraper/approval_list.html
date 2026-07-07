@@ -22,7 +22,7 @@
         <div class="p-5">
             <div class="flex items-start justify-between gap-3 mb-3">
                 <div class="flex items-center gap-2.5 flex-wrap">
-                    <span class="status-badge {% if approval.approval_type == 'field_confirmation' %}status-in_progress{% elif approval.approval_type == 'pre_execution' %}status-completed{% elif approval.approval_type == 'human_approval' %}status-waiting_approval{% else %}status-pending{% endif %}">{{ approval.get_approval_type_display }}</span>
+                    <span class="status-badge {% if approval.approval_type == 'field_confirm' %}status-in_progress{% elif approval.approval_type == 'execution' %}status-completed{% elif approval.approval_type == 'validation' %}status-in_progress{% elif approval.approval_type == 'confidence' %}status-waiting_approval{% elif approval.approval_type == 'mechanism' %}status-in_progress{% else %}status-pending{% endif %}">{{ approval.get_approval_type_display }}</span>
                     <span class="text-xs text-ink-muted font-mono">Job #{{ approval.job.id }} &middot; {{ approval.job.url|truncatechars:40 }}</span>
                 </div>
                 <a href="{% url 'approval_detail' approval.id %}" class="flex items-center gap-1 text-xs text-ink-secondary hover:text-accent border border-line-subtle px-2.5 py-1.5 rounded-md hover:bg-raised hover:border-accent/30 transition-all flex-shrink-0">

@@ -375,7 +375,7 @@ def _run_sample_via_queue(scraper_path: str, args: list[str]) -> str:
         from django.conf import settings
 
         browser_service_url = getattr(
-            settings, "BROWSER_SERVICE_URL", "http://browser-service:8001"
+            settings, "BROWSER_SERVICE_URL", "http://browser_service:8001"
         )
         resp = httpx.post(
             f"{browser_service_url}/scrape",

@@ -1,881 +1,1163 @@
 #!/usr/bin/env python3
-"""DollarTree.com product scraper using HTTP requests.
+"""
+Dollar Tree Navigation Scraper - Two-Phase Architecture
 
-Extracts product data from DollarTree product pages via server-rendered
-JSON-LD structured data and meta tags. No JavaScript rendering needed.
+Phase 1: Discover product URLs from sitemap XML (primary) or listing page navigation
+Phase 2: Scrape each product page using Playwright (Knockout.js SPA requires JS rendering)
 
-Strategy: http_requests (direct HTTP, no proxy)
-Platform: Oracle Commerce Cloud (OCC)
-Extraction: Hybrid — JSON-LD primary, meta tags for price, CSS fallbacks
+Oracle Commerce Cloud site using Knockout.js — server-side HTML is an empty shell.
+All product data is rendered client-side. Playwright is required for Phase 2 extraction.
 
-JSON-LD structure on DollarTree product pages:
-  - Block 0: { "@type": "Product", ... } — has offers, sku, category, etc.
-  - Block 1: { "aggregateRating": { "@type": "AggregateRating", ... } }
-  - Block 2: { "review": { "@type": "Review", ... } }
+CRITICAL: JSON-LD offers.price is the CASE/BULK price (e.g., $18 for 12 units).
+Per-unit price MUST come from CSS .list-sale-price or meta[property='product:price:amount'].
 
-IMPORTANT: JSON-LD offers.price is BULK/CASE pricing (e.g., $15 for 12 units).
-The actual per-item price comes from meta[property='product:price:amount'].
+Usage:
+    python3 scraper.py                                # Default: sitemap discovery
+    python3 scraper.py --query "furniture"             # Listing page discovery
+    python3 scraper.py --listing-url URL               # Browse a specific listing page
+    python3 scraper.py --sitemap                       # Explicit sitemap discovery
+    python3 scraper.py --input urls.json                # Read URLs from JSON file
+    python3 scraper.py --urls URL1 URL2 URL3           # Pass URLs directly via CLI
+    python3 scraper.py --sample                        # Scrape first 5 products only
+    python3 scraper.py --limit 50                      # Max 50 products
+    python3 scraper.py --no-proxy                      # Explicitly disable proxy (default)
 """
 
 import argparse
 import json
 import logging
 import os
-import random
 import re
 import sys
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
-from urllib.parse import urlparse
+from typing import Optional
+from urllib.parse import urljoin, urlparse
+from xml.etree import ElementTree
 
-import requests
-from bs4 import BeautifulSoup
+import requests as http_requests
+from playwright.sync_api import sync_playwright, Page
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
-SITE_NAME = "DollarTree"
+SITE_NAME = "Dollar Tree"
 SITE_URL = "https://www.dollartree.com"
-PLATFORM = "custom"  # Oracle Commerce Cloud (OCC)
-SCRAPING_METHOD = "http_requests"
-DELAY = 2.0  # Rate limiting delay in seconds (Akamai CDN present)
-
+PLATFORM = "oracle_commerce_cloud"
+SITE_SLUG = "dollartree-com"
+CURRENCY = "USD"
+DEFAULT_QUERY = "furniture"
+OUTPUT_KEY = "products"
+SCRAPING_METHOD = "playwright"
+DELAY_BETWEEN_REQUESTS = 2.0
+PAGE_LOAD_TIMEOUT = 45000
+MAX_SCROLL_ATTEMPTS = 15
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE = os.path.join(SCRIPT_DIR, "logs", "dollartree-com.log")
-INPUT_URLS_FILE = os.path.join(SCRIPT_DIR, "input_urls.json")
+LOG_DIR = os.path.join(SCRIPT_DIR, "..", "logs")
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) "
-    "Gecko/20100101 Firefox/127.0.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/18.2 Safari/605.1.15",
+# Phase 1: Sitemap Configuration (PRIMARY discovery method)
+SITEMAP_URLS = [
+    "https://www.dollartree.com/productSitemap.xml",
+    "https://www.dollartree.com/productSitemap-2.xml",
 ]
 
-# Image URL patterns to skip (navigation, icons, brands, etc.)
-IMAGE_SKIP_PATTERNS = [
-    "/brand.assets/", "/emoji/", "/flags/", "/icon/", "/navigation/",
-    "/logo/", "/badge/",
-]
+# Phase 1: Listing/Search Configuration (secondary — /products only shows categories)
+LISTING_URL = "https://www.dollartree.com/products"
+SEARCH_URL_TEMPLATE = "https://www.dollartree.com/products"
 
-# Soft 404 detection markers
-SOFT_404_MARKERS = [
-    "not found", "page not found", "product not found",
-    "unavailable", "discontinued", "no longer available",
-    "item not found", "we couldn't find",
-]
+# Product URL pattern: /{slug}/{numeric-id} — MUST end with digits as LAST path segment
+# CRITICAL FIX: Added $ anchor so re.fullmatch() rejects category URLs like
+# /picture-frames/3x2-picture-frames (where \d+ would match the leading '3')
+PRODUCT_URL_REGEX = re.compile(
+    r"https?://(?:www\.)?dollartree\.com/[A-Za-z0-9][A-Za-z0-9\-]*/\d+$"
+)
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
+# Phase 2: Wait selectors (Knockout.js rendering)
+WAIT_SELECTOR = "h1.product-name"
+PRICE_SELECTOR = ".list-sale-price"
+AVAILABILITY_SELECTOR = ".stock-availability"
 
-os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, f"{SITE_SLUG}.log")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    format="%(asctime)s %(levelname)-5s [%(name)s] %(message)s",
+    datefmt="%H:%M:%S",
     handlers=[
         logging.FileHandler(LOG_FILE, encoding="utf-8"),
         logging.StreamHandler(),
     ],
 )
-logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
+logger = logging.getLogger(SITE_SLUG)
 
 
-@dataclass
-class Product:
-    """Standard product data structure."""
-
-    id: int = 0
-    title: str = ""
-    price: str = ""
-    availability: str = ""
-    original_price: str = ""
-    currency: str = ""
-    url: str = ""
-    src_url: str = ""
-    location: str = ""
-    status_code: int = 0
-    scraped_at: str = ""
-    remarks: str = ""
-    # Extended fields (not in base schema but extractable)
-    sku: str = ""
-    brand: str = ""
-    category: str = ""
-    description: str = ""
-    image: str = ""
-    rating: str = ""
-    review_count: str = ""
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 1: URL DISCOVERY
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
-@dataclass
-class JSONLDData:
-    """Parsed JSON-LD blocks from a product page."""
+def discover_urls_from_sitemap(limit: Optional[int] = None) -> list[str]:
+    """Discover product URLs from the product sitemap XML files.
 
-    product: Optional[dict[str, Any]] = None
-    aggregate_rating: Optional[dict[str, Any]] = None
-    review: Optional[dict[str, Any]] = None
-
-
-# ---------------------------------------------------------------------------
-# HTTP session
-# ---------------------------------------------------------------------------
-
-
-def create_session() -> requests.Session:
-    """Create a requests session with appropriate headers."""
-    session = requests.Session()
-    session.headers.update({
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        "User-Agent": random.choice(USER_AGENTS),
-    })
-    return session
-
-
-# ---------------------------------------------------------------------------
-# JSON-LD extraction
-# ---------------------------------------------------------------------------
-
-
-def parse_all_jsonld(soup: BeautifulSoup) -> JSONLDData:
-    """Parse all JSON-LD blocks from the page.
-
-    DollarTree product pages have 3 JSON-LD blocks:
-      - Block 0: { "@type": "Product", "name": ..., "offers": {...}, ... }
-      - Block 1: { "aggregateRating": { "@type": "AggregateRating", ... } }
-        NOTE: NO top-level @type — use wrapper key 'aggregateRating'
-      - Block 2: { "review": { "@type": "Review", ... } }
-        NOTE: NO top-level @type — use wrapper key 'review'
+    Dollar Tree (OCC) exposes product sitemaps at /productSitemap.xml and
+    /productSitemap-2.xml. These are static XML files accessible via HTTP.
+    This is the PRIMARY discovery method because the /products listing page
+    only contains category links, not product links.
     """
-    data = JSONLDData()
-    scripts = soup.find_all("script", type="application/ld+json")
+    logger.info("Phase 1: Discovering product URLs from sitemaps...")
+    all_urls: list[str] = []
 
-    for idx, script in enumerate(scripts):
-        if not script.string:
-            continue
+    for sitemap_url in SITEMAP_URLS:
         try:
-            parsed = json.loads(script.string)
-        except (json.JSONDecodeError, TypeError):
-            continue
-
-        if not isinstance(parsed, dict):
-            continue
-
-        atype = parsed.get("@type", "")
-
-        # Block 0: Product (has @type)
-        if atype == "Product" and data.product is None:
-            data.product = parsed
-            logger.debug("JSON-LD block %d: Product found", idx)
-            continue
-
-        # Block 1: AggregateRating (NO @type, has 'aggregateRating' key)
-        if data.aggregate_rating is None and "aggregateRating" in parsed:
-            agg = parsed["aggregateRating"]
-            if isinstance(agg, dict):
-                data.aggregate_rating = agg
-                logger.debug(
-                    "JSON-LD block %d: AggregateRating found via wrapper key", idx
-                )
-            continue
-
-        # Block 2: Review (NO @type, has 'review' key)
-        if data.review is None and "review" in parsed:
-            rev = parsed["review"]
-            if isinstance(rev, dict):
-                data.review = rev
-                logger.debug(
-                    "JSON-LD block %d: Review found via wrapper key", idx
-                )
-            continue
-
-        # Also handle case where @type IS set on blocks 1/2
-        if atype == "AggregateRating" and data.aggregate_rating is None:
-            data.aggregate_rating = parsed
-        elif atype == "Review" and data.review is None:
-            data.review = parsed
-
-    return data
-
-
-def get_offers(product_block: dict[str, Any]) -> dict[str, Any]:
-    """Extract the offers dict from a JSON-LD Product block.
-
-    Handles cases where offers is a dict, a list of dicts, or nested.
-    """
-    offers_raw = product_block.get("offers")
-    if offers_raw is None:
-        return {}
-
-    if isinstance(offers_raw, dict):
-        return offers_raw
-
-    if isinstance(offers_raw, list):
-        # Return the first dict in the list
-        for item in offers_raw:
-            if isinstance(item, dict):
-                return item
-        return {}
-
-    return {}
-
-
-# ---------------------------------------------------------------------------
-# Soft 404 detection
-# ---------------------------------------------------------------------------
-
-
-def detect_soft_404(
-    soup: BeautifulSoup,
-    status_code: int,
-    requested_url: str,
-    final_url: str,
-    jsonld: JSONLDData,
-) -> tuple[bool, str]:
-    """Detect soft 404 pages where the product no longer exists.
-
-    Returns (is_soft_404, reason_string).
-    """
-    # Real HTTP 404
-    if status_code == 404:
-        return True, "Soft 404: HTTP 404 returned"
-
-    # Check if final URL differs significantly from requested URL (redirect)
-    if final_url and requested_url:
-        req_path = urlparse(requested_url).path.rstrip("/")
-        fin_path = urlparse(final_url).path.rstrip("/")
-        if fin_path != req_path and fin_path != "":
-            return True, f"Soft 404: redirected to {final_url}"
-
-    # No JSON-LD Product block means likely not a product page
-    if jsonld.product is None:
-        # Check page title and H1 for 404 markers
-        title_text = ""
-        h1_el = soup.find("h1")
-        if h1_el:
-            title_text = h1_el.get_text(strip=True).lower()
-
-        for marker in SOFT_404_MARKERS:
-            if marker in title_text:
-                return True, f"Soft 404: H1 contains '{marker}'"
-
-        # Also check <title> tag
-        page_title = soup.find("title")
-        if page_title:
-            pt_text = page_title.get_text(strip=True).lower()
-            for marker in SOFT_404_MARKERS:
-                if marker in pt_text:
-                    return True, f"Soft 404: page title contains '{marker}'"
-
-        return True, "Soft 404: no JSON-LD Product found on page"
-
-    # Check JSON-LD product name for 404 markers
-    product_name = jsonld.product.get("name", "")
-    if product_name:
-        name_lower = str(product_name).lower()
-        for marker in SOFT_404_MARKERS:
-            if marker in name_lower:
-                return True, f"Soft 404: product name contains '{marker}'"
-
-    return False, ""
-
-
-# ---------------------------------------------------------------------------
-# Field extraction helpers
-# ---------------------------------------------------------------------------
-
-
-def extract_price_from_meta(soup: BeautifulSoup, raw_html: str) -> tuple[str, str]:
-    """Extract price and currency from meta tags.
-
-    Returns (price_string, currency_string).
-    The meta product:price:amount has the per-item price (e.g., '1.25'),
-    NOT the JSON-LD bulk price ($15).
-
-    Uses multiple strategies:
-      1. BeautifulSoup with property attribute
-      2. BeautifulSoup with name attribute
-      3. Regex on raw HTML (ultimate fallback)
-    """
-    price = ""
-    currency = ""
-
-    # Strategy 1: property attribute (standard)
-    meta_price = soup.find(
-        "meta",
-        attrs={"property": "product:price:amount"},
-    )
-    if not meta_price:
-        # Strategy 2: name attribute (some sites use name= instead of property=)
-        meta_price = soup.find(
-            "meta",
-            attrs={"name": "product:price:amount"},
-        )
-    if not meta_price:
-        # Strategy 3: regex on raw HTML
-        m = re.search(
-            r'<meta[^>]+(?:property|name)\s*=\s*["\']product:price:amount["\'][^>]+content\s*=\s*["\']([\d.]+)["\']',
-            raw_html,
-            re.IGNORECASE,
-        )
-        if not m:
-            # Try reversed attribute order
-            m = re.search(
-                r'<meta[^>]+content\s*=\s*["\']([\d.]+)["\'][^>]+(?:property|name)\s*=\s*["\']product:price:amount["\']',
-                raw_html,
-                re.IGNORECASE,
+            logger.info("  Fetching sitemap: %s", sitemap_url)
+            resp = http_requests.get(
+                sitemap_url,
+                timeout=15,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; Bot/1.0)"},
             )
-        if m:
-            price = m.group(1).strip()
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "")
+            if "xml" not in content_type and not resp.text.strip().startswith("<"):
+                logger.warning(
+                    "  Sitemap %s returned non-XML content, skipping", sitemap_url
+                )
+                continue
 
-    if meta_price and meta_price.get("content"):
-        raw = meta_price["content"].strip()
-        try:
-            val = float(raw)
-            if 0 < val < 15:  # Sanity check — bulk price would be ~15
-                price = f"${val:.2f}"
-        except (ValueError, TypeError):
-            price = f"${raw}"
+            root = ElementTree.fromstring(resp.text)
+            ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
-    # Currency meta tag
-    meta_currency = soup.find(
-        "meta",
-        attrs={"property": "product:price:currency"},
-    )
-    if not meta_currency:
-        meta_currency = soup.find(
-            "meta",
-            attrs={"name": "product:price:currency"},
-        )
-    if not meta_currency:
-        m = re.search(
-            r'<meta[^>]+(?:property|name)\s*=\s*["\']product:price:currency["\'][^>]+content\s*=\s*["\']([A-Z]{3})["\']',
-            raw_html,
-            re.IGNORECASE,
-        )
-        if not m:
-            m = re.search(
-                r'<meta[^>]+content\s*=\s*["\']([A-Z]{3})["\'][^>]+(?:property|name)\s*=\s*["\']product:price:currency["\']',
-                raw_html,
-                re.IGNORECASE,
+            # Sitemap index: recurse into child sitemaps
+            sitemap_entries = root.findall(".//sm:sitemap/sm:loc", ns)
+            if sitemap_entries:
+                logger.info(
+                    "  Sitemap index with %d child sitemaps", len(sitemap_entries)
+                )
+                for entry in sitemap_entries:
+                    child_url = entry.text.strip()
+                    if child_url:
+                        child_urls = _fetch_sitemap_urls(child_url)
+                        all_urls.extend(child_urls)
+                continue
+
+            # Regular sitemap: extract URLs directly
+            urls = _parse_sitemap_product_urls(root, ns)
+            logger.info(
+                "  Sitemap %s: %d product URLs found", sitemap_url, len(urls)
             )
-        if m:
-            currency = m.group(1).strip()
+            all_urls.extend(urls)
 
-    if meta_currency and meta_currency.get("content"):
-        currency = meta_currency["content"].strip()
+        except http_requests.RequestException as e:
+            logger.warning("  Failed to fetch sitemap %s: %s", sitemap_url, e)
+        except ElementTree.ParseError as e:
+            logger.warning("  Failed to parse sitemap %s: %s", sitemap_url, e)
 
-    return price, currency
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique_urls: list[str] = []
+    for url in all_urls:
+        if url not in seen:
+            seen.add(url)
+            unique_urls.append(url)
+
+    if limit:
+        unique_urls = unique_urls[:limit]
+
+    logger.info("Phase 1 (sitemap): Discovered %d unique product URLs", len(unique_urls))
+    return unique_urls
 
 
-def extract_price_from_css(soup: BeautifulSoup) -> str:
-    """Extract price from CSS fallback selector .list-sale-price."""
-    el = soup.select_one(".list-sale-price")
-    if el:
-        text = el.get_text(strip=True)
-        # The text is like '$1.25 each' or similar
-        match = re.search(r"\$?\d+\.?\d*", text)
-        if match:
-            return match.group().replace("$", "")
-    return ""
-
-
-def format_price(raw_value: str) -> str:
-    """Ensure price string has a currency symbol.
-
-    Args:
-        raw_value: A price string, e.g. '1.25' or '$1.25'.
-
-    Returns:
-        Formatted price with $ prefix, e.g. '$1.25'.
-    """
-    if not raw_value:
-        return ""
-    raw_value = raw_value.strip()
-    if raw_value.startswith("$"):
-        return raw_value
+def _fetch_sitemap_urls(sitemap_url: str) -> list[str]:
+    """Fetch and parse a child sitemap URL."""
     try:
-        val = float(raw_value)
-        return f"${val:.2f}"
-    except (ValueError, TypeError):
-        return f"${raw_value}"
+        resp = http_requests.get(
+            sitemap_url,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; Bot/1.0)"},
+        )
+        resp.raise_for_status()
+        root = ElementTree.fromstring(resp.text)
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+        return _parse_sitemap_product_urls(root, ns)
+    except Exception as e:
+        logger.warning("  Failed to fetch child sitemap %s: %s", sitemap_url, e)
+        return []
 
 
-def normalize_availability(raw: str) -> str:
-    """Normalize schema.org availability to standard strings."""
-    if not raw:
-        return ""
-    # Handle full URLs like 'http://schema.org/InStock'
-    segment = raw.split("/")[-1] if "/" in raw else raw
-    mapping = {
-        "InStock": "In Stock",
-        "InStoreOnly": "In Stock",
-        "LimitedAvailability": "In Stock",
-        "OnlineOnly": "In Stock",
-        "OutOfStock": "Out of Stock",
-        "Discontinued": "Out of Stock",
-        "PreOrder": "In Stock",
-    }
-    return mapping.get(segment, segment.replace("Stock", " Stock"))
+def _parse_sitemap_product_urls(
+    root: ElementTree.Element, ns: dict
+) -> list[str]:
+    """Extract product URLs from a sitemap XML, filtering by the product URL pattern.
 
-
-def extract_image_url(
-    soup: BeautifulSoup,
-    jsonld: JSONLDData,
-) -> str:
-    """Extract product image URL, scoped to product gallery."""
-    # Primary: JSON-LD Product image
-    if jsonld.product:
-        img = jsonld.product.get("image")
-        if isinstance(img, str) and img.startswith("http"):
-            return img
-        if isinstance(img, list) and img:
-            for item in img:
-                if isinstance(item, str) and item.startswith("http"):
-                    return item
-
-    # Fallback: meta og:image
-    meta_img = soup.find("meta", attrs={"property": "og:image"})
-    if meta_img and meta_img.get("content"):
-        return meta_img["content"].strip()
-
-    # Fallback: CSS selector scoped to product details
-    container = soup.select_one(".oc3-product-details")
-    if container:
-        imgs = container.select("img.img-responsive")
-        for img_el in imgs:
-            src = img_el.get("src") or img_el.get("data-src", "")
-            if src and _is_valid_product_image(src):
-                if not src.startswith("http"):
-                    src = f"https://www.dollartree.com{src}"
-                return src
-
-    return ""
-
-
-def _is_valid_product_image(url: str) -> bool:
-    """Check if an image URL looks like a product image."""
-    url_lower = url.lower()
-    for pattern in IMAGE_SKIP_PATTERNS:
-        if pattern in url_lower:
-            return False
-    # Should have some product indicator
-    return "/products/" in url_lower or "/product" in url_lower or "ccstore" in url_lower
-
-
-def extract_category(product_block: dict[str, Any]) -> str:
-    """Extract category from JSON-LD Product block (may be an array)."""
-    cat = product_block.get("category")
-    if not cat:
-        return ""
-    if isinstance(cat, list):
-        return " > ".join(str(c) for c in cat if c)
-    return str(cat)
-
-
-def extract_brand(product_block: dict[str, Any]) -> str:
-    """Extract brand from JSON-LD Product block."""
-    brand = product_block.get("brand")
-    if isinstance(brand, dict):
-        name = brand.get("name")
-        return str(name) if name and str(name).lower() not in ("null", "none") else ""
-    if isinstance(brand, str) and brand.lower() not in ("null", "none", ""):
-        return brand
-    return ""
-
-
-def extract_rating(jsonld: JSONLDData) -> str:
-    """Extract rating from JSON-LD AggregateRating block."""
-    if not jsonld.aggregate_rating:
-        return ""
-    val = jsonld.aggregate_rating.get("ratingValue")
-    if val is not None:
-        return str(val)
-    return ""
-
-
-def extract_review_count(jsonld: JSONLDData) -> str:
-    """Extract review count from JSON-LD AggregateRating block."""
-    if not jsonld.aggregate_rating:
-        return ""
-    count = jsonld.aggregate_rating.get("reviewCount")
-    if count is not None:
-        return str(count)
-    return ""
-
-
-def extract_rating_css_fallback(soup: BeautifulSoup) -> tuple[str, str]:
-    """Extract rating and review count from BazaarVoice CSS fallback.
-
-    aria-label example: 'average rating value is 5.0 of 5.'
+    CRITICAL FIX: Uses re.fullmatch() instead of re.match() to ensure the
+    numeric product ID is the LAST path segment. re.match() only checks the
+    beginning and would accept category URLs like /picture-frames/3x2-picture-frames.
     """
-    rating = ""
-    review_count = ""
-    el = soup.select_one(".bv_main_rating_button[aria-label*='rating']")
-    if el:
-        aria = el.get("aria-label", "")
-        # Extract rating value: "average rating value is 5.0 of 5."
-        m = re.search(r"is\s+([\d.]+)\s+of", aria)
-        if m:
-            rating = m.group(1)
-
-    return rating, review_count
+    urls: list[str] = []
+    for loc in root.findall(".//sm:url/sm:loc", ns):
+        url = loc.text.strip() if loc.text else ""
+        if url and PRODUCT_URL_REGEX.fullmatch(url):
+            urls.append(url)
+    return urls
 
 
-# ---------------------------------------------------------------------------
-# Main product extraction
-# ---------------------------------------------------------------------------
-
-
-def extract_product(
+def discover_urls_from_listing(
+    page: Page,
     url: str,
-    session: requests.Session,
-    product_id: int,
-) -> Product:
-    """Extract product data from a single DollarTree product page.
+    limit: Optional[int] = None,
+) -> list[str]:
+    """Phase 1b: Discover product URLs by navigating a listing/search page.
 
-    Args:
-        url: The product page URL.
-        session: A requests.Session instance.
-        product_id: Sequential ID for this product.
+    Dollar Tree is a Knockout.js SPA — product cards render after JS execution.
+    The /products page shows CATEGORIES, not products. This function navigates
+    into category subpages to find actual product links.
 
-    Returns:
-        A Product dataclass with extracted data.
+    Strategy:
+    1. Load the listing page, wait for Knockout.js rendering
+    2. Extract all links, filter for category URLs (non-product pattern)
+    3. Navigate into each category page to find product links
+    4. Scroll within each category to trigger lazy loading
     """
-    product = Product(
-        id=product_id,
-        url=url,
-        src_url=url,
-        scraped_at=datetime.now(timezone.utc).isoformat(),
-    )
-
+    logger.info("Phase 1: Navigating listing page → %s", url)
     try:
-        time.sleep(DELAY)
-        response = session.get(url, timeout=20)
-        product.status_code = response.status_code
+        page.goto(url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
+        page.wait_for_timeout(5000)
+    except Exception as exc:
+        logger.error("  Failed to load listing page: %s", exc)
+        return []
 
-        if response.status_code != 200:
-            product.remarks = f"HTTP {response.status_code}"
-            logger.warning("HTTP %d for %s", response.status_code, url)
-            return product
+    # First try to extract product links directly from the listing page
+    all_urls: list[str] = []
+    seen: set[str] = set()
 
-        # Check if redirected to a different URL
-        final_url = response.url
-        response.encoding = response.apparent_encoding or "utf-8"
-        html = response.text
-        raw_html = html  # Keep for regex fallbacks
+    initial_links = _extract_product_links_from_page(page)
+    for u in initial_links:
+        if u not in seen:
+            seen.add(u)
+            all_urls.append(u)
 
-        soup = BeautifulSoup(html, "html.parser")
-        jsonld = parse_all_jsonld(soup)
+    logger.info("  Direct product links from listing: %d", len(all_urls))
 
-        # Debug logging for JSON-LD parsing
-        if jsonld.product:
-            logger.debug(
-                "JSON-LD Product keys: %s",
-                list(jsonld.product.keys()),
-            )
-            offers = jsonld.product.get("offers")
-            logger.debug("JSON-LD offers raw type: %s, value: %s", type(offers), str(offers)[:200] if offers else "None")
-        else:
-            logger.warning("No JSON-LD Product block found for %s", url)
-
-        # Soft 404 detection
-        is_404, reason = detect_soft_404(
-            soup, response.status_code, url, final_url, jsonld
+    if all_urls:
+        # Found some product links directly, good!
+        _scroll_and_collect(page, all_urls, seen, limit)
+        unique_urls = list(dict.fromkeys(all_urls))
+        if limit:
+            unique_urls = unique_urls[:limit]
+        logger.info(
+            "Phase 1 (listing): Discovered %d unique product URLs from %s",
+            len(unique_urls),
+            url,
         )
-        if is_404:
-            product.remarks = reason
-            logger.info("Soft 404 detected for %s: %s", url, reason)
-            return product
+        return unique_urls
 
-        # --- Extract fields ---
-        warnings: list[str] = []
+    # No product links found — navigate into category pages to find products
+    logger.info("  No direct product links. Navigating into category pages...")
 
-        # Title — from JSON-LD Product.name
-        if jsonld.product:
-            product.title = str(jsonld.product.get("name", "") or "")
-        if not product.title:
-            h1 = soup.find("h1")
-            if h1:
-                product.title = h1.get_text(strip=True)
-        if not product.title:
-            warnings.append("title missing")
+    category_urls = _extract_category_links_from_page(page)
+    logger.info("  Found %d category links to explore", len(category_urls))
 
-        # SKU — from JSON-LD Product.sku (direct child)
-        if jsonld.product:
-            sku_val = jsonld.product.get("sku")
-            if sku_val is not None:
-                product.sku = str(sku_val)
-        # Fallback: extract numeric ID from URL path
-        if not product.sku:
-            path_parts = urlparse(url).path.rstrip("/").split("/")
-            if len(path_parts) >= 2:
-                product.sku = path_parts[-1]
+    cat_limit = 10  # Explore up to 10 categories to find products
+    for cat_url in category_urls[:cat_limit]:
+        if limit and len(all_urls) >= limit:
+            break
 
-        # Description — from JSON-LD Product.description
-        if jsonld.product:
-            product.description = str(jsonld.product.get("description", "") or "")
+        logger.info("  Exploring category: %s", cat_url)
+        try:
+            page.goto(
+                cat_url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded"
+            )
+            page.wait_for_timeout(4000)
+        except Exception as exc:
+            logger.warning("  Failed to load category page %s: %s", cat_url, exc)
+            continue
 
-        # Price — PRIMARY from meta tag (per-item price, e.g., 1.25)
-        meta_price, meta_currency = extract_price_from_meta(soup, raw_html)
-        product.price = format_price(meta_price)
-        product.currency = meta_currency
+        # Scroll and collect product links within this category
+        _scroll_and_collect(page, all_urls, seen, limit)
 
-        # Price fallback: CSS
-        if not product.price:
-            css_price = extract_price_from_css(soup)
-            product.price = format_price(css_price)
-            if css_price:
-                warnings.append("price from CSS fallback")
+    unique_urls = list(dict.fromkeys(all_urls))
+    if limit:
+        unique_urls = unique_urls[:limit]
 
-        # Currency fallback: JSON-LD offers.priceCurrency
-        if not product.currency and jsonld.product:
-            offers = get_offers(jsonld.product)
-            ld_currency = offers.get("priceCurrency")
-            if ld_currency:
-                product.currency = str(ld_currency)
+    logger.info(
+        "Phase 1 (listing): Discovered %d unique product URLs from %s",
+        len(unique_urls),
+        url,
+    )
+    return unique_urls
 
-        # Availability — from JSON-LD offers.availability
-        if jsonld.product:
-            offers = get_offers(jsonld.product)
-            raw_avail = offers.get("availability")
-            if raw_avail:
-                product.availability = normalize_availability(str(raw_avail))
-            else:
-                # Debug: log available offers keys
-                logger.debug(
-                    "Availability missing. Offers keys: %s",
-                    list(offers.keys()) if offers else "empty",
-                )
 
-        # If availability still empty, default to In Stock
-        if not product.availability:
-            product.availability = "In Stock"
-            warnings.append("availability defaulted to In Stock")
-
-        # Brand
-        if jsonld.product:
-            product.brand = extract_brand(jsonld.product)
-
-        # Category
-        if jsonld.product:
-            product.category = extract_category(jsonld.product)
-
-        # Image
-        product.image = extract_image_url(soup, jsonld)
-
-        # Rating — from JSON-LD AggregateRating (block with 'aggregateRating' key)
-        product.rating = extract_rating(jsonld)
-        if not product.rating:
-            # CSS fallback from BazaarVoice
-            css_rating, _ = extract_rating_css_fallback(soup)
-            product.rating = css_rating
-            if css_rating:
-                warnings.append("rating from CSS fallback")
-
-        # Review count — from JSON-LD AggregateRating
-        product.review_count = extract_review_count(jsonld)
-
-        # Original price (typically empty for DollarTree)
-        product.original_price = ""
-
-        # Currency default fallback
-        if not product.currency:
-            product.currency = "USD"
-            warnings.append("currency defaulted to USD")
-
-        # Warnings
-        if warnings:
-            existing = product.remarks
-            product.remarks = f"{existing}; {'; '.join(warnings)}" if existing else "; ".join(warnings)
+def _scroll_and_collect(
+    page: Page,
+    all_urls: list[str],
+    seen: set[str],
+    limit: Optional[int] = None,
+) -> None:
+    """Scroll a page and collect product links, appending to all_urls in-place."""
+    for attempt in range(MAX_SCROLL_ATTEMPTS):
+        current_urls = _extract_product_links_from_page(page)
+        new_count = 0
+        for u in current_urls:
+            if u not in seen:
+                seen.add(u)
+                all_urls.append(u)
+                new_count += 1
 
         logger.info(
-            "Extracted: [%d] %s — %s (avail: %s, currency: %s)",
-            product_id,
-            product.title[:60],
-            product.price,
-            product.availability,
-            product.currency,
+            "    Scroll %d/%d: %d links (%d new, %d total)",
+            attempt + 1,
+            MAX_SCROLL_ATTEMPTS,
+            len(current_urls),
+            new_count,
+            len(all_urls),
         )
 
-    except requests.Timeout:
-        product.remarks = "Request timeout"
-        logger.error("Timeout fetching %s", url)
-    except requests.ConnectionError:
-        product.remarks = "Connection error"
-        logger.error("Connection error fetching %s", url)
-    except Exception as e:
-        product.remarks = f"Extraction error: {e}"
-        logger.error("Error extracting %s: %s", url, e, exc_info=True)
+        if limit and len(all_urls) >= limit:
+            break
+
+        # Try "Load More" button
+        load_more_clicked = _try_click_load_more(page)
+        if load_more_clicked:
+            page.wait_for_timeout(3000)
+            continue
+
+        # Scroll down
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(2000)
+
+        # Check for pagination
+        next_page = _try_get_next_page_link(page)
+        if next_page:
+            logger.info("    Following pagination → %s", next_page)
+            try:
+                page.goto(
+                    next_page, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded"
+                )
+                page.wait_for_timeout(4000)
+                continue
+            except Exception as exc:
+                logger.warning("    Failed to follow pagination: %s", exc)
+                break
+
+        # No new links after sufficient attempts
+        if new_count == 0 and attempt >= 2:
+            logger.info("    No new links after scroll, stopping")
+            break
+
+
+def _extract_product_links_from_page(page: Page) -> list[str]:
+    """Extract all product page URLs from the current page DOM.
+
+    CRITICAL FIX: Uses re.fullmatch() instead of re.match(). re.match() only
+    checks the beginning of the string, so it would accept category URLs like
+    /picture-frames/3x2-picture-frames (where \\d+ matches the leading '3').
+    fullmatch() requires the ENTIRE string to match the pattern.
+    """
+    links: list[str] = []
+    try:
+        hrefs = page.evaluate(
+            """() => {
+                const links = document.querySelectorAll('a[href]');
+                return Array.from(links).map(a => a.getAttribute('href'));
+            }"""
+        )
+        for href in hrefs or []:
+            if not href:
+                continue
+            # Resolve relative URLs
+            full_url = urljoin(SITE_URL, href) if href.startswith("/") else href
+            # CRITICAL: Use fullmatch() to reject category URLs
+            if PRODUCT_URL_REGEX.fullmatch(full_url):
+                links.append(full_url)
+    except Exception as exc:
+        logger.warning("  Error extracting product links: %s", exc)
+    return links
+
+
+def _extract_category_links_from_page(page: Page) -> list[str]:
+    """Extract category listing page URLs from a page.
+
+    Category URLs are on dollartree.com but don't match the product URL pattern
+    (they don't end with /{numeric-id}). We collect URLs that look like category
+    pages: have multiple path segments but don't end with a pure numeric ID.
+    """
+    links: list[str] = []
+    seen: set[str] = set()
+    try:
+        hrefs = page.evaluate(
+            """() => {
+                const links = document.querySelectorAll('a[href]');
+                return Array.from(links).map(a => a.getAttribute('href'));
+            }"""
+        )
+        for href in hrefs or []:
+            if not href:
+                continue
+            full_url = urljoin(SITE_URL, href) if href.startswith("/") else href
+            # Skip if it's a product URL (we only want categories)
+            if PRODUCT_URL_REGEX.fullmatch(full_url):
+                continue
+            # Must be on dollartree.com domain
+            if "dollartree.com" not in full_url:
+                continue
+            # Must have a path with multiple segments (at least 2 after domain)
+            path = urlparse(full_url).path.strip("/")
+            if not path:
+                continue
+            segments = [s for s in path.split("/") if s]
+            if len(segments) < 2:
+                continue
+            # Skip common non-category paths
+            skip_prefixes = ("/products", "/search", "/cart", "/checkout", "/account")
+            if any(path.startswith(p) for p in skip_prefixes):
+                continue
+            # Last segment should NOT be purely numeric (that's a product)
+            if segments[-1].isdigit():
+                continue
+            # Looks like a category
+            if full_url not in seen:
+                seen.add(full_url)
+                links.append(full_url)
+    except Exception as exc:
+        logger.warning("  Error extracting category links: %s", exc)
+    return links
+
+
+def _try_click_load_more(page: Page) -> bool:
+    """Try to find and click a 'Load More' / 'Show More' / 'View All' button."""
+    selectors = [
+        'button:has-text("Load More")',
+        'button:has-text("Show More")',
+        'a:has-text("Load More")',
+        'a:has-text("Show More")',
+        'a:has-text("View All")',
+        '[class*="load-more"]',
+        '[class*="show-more"]',
+        '[data-action="load-more"]',
+        '[data-action="show-more"]',
+    ]
+    for sel in selectors:
+        try:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                btn.click()
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _try_get_next_page_link(page: Page) -> Optional[str]:
+    """Try to find a 'Next Page' pagination link."""
+    selectors = [
+        'a:has-text("Next")',
+        'a:has-text(">")',
+        'a[rel="next"]',
+        '[class*="pagination"] a:has-text(">")',
+        '[class*="pager"] a:has-text("Next")',
+        'a[href*="page="]:has-text("Next")',
+    ]
+    for sel in selectors:
+        try:
+            link = page.query_selector(sel)
+            if link and link.is_visible():
+                href = link.get_attribute("href") or ""
+                if href:
+                    return (
+                        urljoin(SITE_URL, href) if href.startswith("/") else href
+                    )
+        except Exception:
+            continue
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 2: PRODUCT EXTRACTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def extract_product_data(page: Page, url: str, src_url: str) -> dict:
+    """Phase 2: Extract structured product data from a single product page.
+
+    Uses hybrid extraction:
+    - JSON-LD for: title, description, image, brand, sku, category, rating,
+                  review_count, currency
+    - CSS for: price (per-unit, NOT case price), availability
+    - Meta tags for: price fallback, currency fallback
+
+    IMPORTANT: JSON-LD offers.price is the CASE/BULK price (e.g., $18 for 12×$1.50).
+    Per-unit price is extracted from .list-sale-price CSS or
+    meta[property='product:price:amount'].
+
+    Wait strategy: Multi-step approach for Knockout.js SPA rendering:
+    1. page.goto() with domcontentloaded
+    2. waitForSelector('h1.product-name', {timeout: 15000})
+    3. waitForSelector('.list-sale-price', {timeout: 10000})
+    4. If step 2 fails, wait for JSON-LD as fallback
+    5. If extraction yields empty title, wait 3s and retry once
+    """
+    try:
+        page.goto(url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
+        # Multi-step wait for Knockout.js rendering
+        try:
+            page.wait_for_selector(WAIT_SELECTOR, timeout=15000)
+            # Also wait for price element
+            try:
+                page.wait_for_selector(PRICE_SELECTOR, timeout=10000)
+            except Exception:
+                pass
+        except Exception:
+            # Fallback: wait for JSON-LD scripts to be injected by Knockout
+            try:
+                page.wait_for_selector(
+                    'script[type="application/ld+json"]', timeout=10000
+                )
+            except Exception:
+                # Last resort: just wait
+                page.wait_for_timeout(5000)
+    except Exception as exc:
+        logger.error("  Failed to load product page %s: %s", url[:80], exc)
+        return _make_error_item(url, src_url, f"Page load failed: {exc}")
+
+    product: dict = _extract_fields_from_page(page, url, src_url)
+
+    # Retry logic: if title is empty, wait and retry once
+    if not product.get("title"):
+        logger.warning(
+            "  Title empty on first extraction attempt, waiting and retrying..."
+        )
+        page.wait_for_timeout(3000)
+        product = _extract_fields_from_page(page, url, src_url)
 
     return product
 
 
-# ---------------------------------------------------------------------------
-# CLI arguments
-# ---------------------------------------------------------------------------
+def _extract_fields_from_page(page: Page, url: str, src_url: str) -> dict:
+    """Extract all product fields from the current page state.
+
+    Separated from navigate logic to support retry extraction.
+    """
+    product: dict = {
+        "id": 0,
+        "title": "",
+        "price": "",
+        "availability": "",
+        "original_price": "",
+        "currency": "",
+        "url": url,
+        "src_url": src_url,
+        "location": "",
+        "status_code": 200,
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+        "remarks": "",
+    }
+
+    # ── Soft 404 Detection ────────────────────────────────────────────
+    try:
+        final_url = page.url
+        if final_url and final_url.rstrip("/") != url.rstrip("/"):
+            path = urlparse(final_url).path
+            if path in ("/", "/products", "/search") or not PRODUCT_URL_REGEX.fullmatch(
+                final_url
+            ):
+                product["remarks"] = f"Soft 404: redirected to {final_url}"
+                product["status_code"] = 301
+                return product
+    except Exception:
+        pass
+
+    # Check page title/H1 for soft 404 indicators
+    try:
+        page_text = page.evaluate(
+            """() => {
+                const h1 = document.querySelector('h1');
+                const title = document.title || '';
+                const body = (document.body?.innerText || '').substring(0, 500);
+                return JSON.stringify({
+                    h1: h1?.textContent || '',
+                    title: title,
+                    body: body
+                });
+            }"""
+        )
+        if page_text:
+            page_info = json.loads(page_text)
+            text_to_check = (
+                (page_info.get("h1") or "")
+                + " "
+                + (page_info.get("title") or "")
+                + " "
+                + (page_info.get("body") or "")
+            ).lower()
+            soft_404_phrases = [
+                "page not found",
+                "product not found",
+                "no longer available",
+                "discontinued",
+                "item not found",
+                "page could not be found",
+                "oops",
+            ]
+            for phrase in soft_404_phrases:
+                h1_lower = (page_info.get("h1") or "").lower()
+                title_lower = (page_info.get("title") or "").lower()
+                if phrase in h1_lower or phrase in title_lower:
+                    product["remarks"] = (
+                        f"Soft 404: '{phrase}' found in page heading/title"
+                    )
+                    return product
+                if phrase == "page not found" and phrase in text_to_check:
+                    product["remarks"] = f"Soft 404: '{phrase}' detected on page"
+                    return product
+    except Exception:
+        pass
+
+    # ── Extract JSON-LD Data ──────────────────────────────────────────
+    json_ld_data: Optional[dict] = None
+    aggregate_rating: Optional[dict] = None
+
+    try:
+        ld_blocks = page.evaluate(
+            """() => {
+                const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                return Array.from(scripts).map(s => {
+                    try { return JSON.parse(s.textContent); }
+                    catch(e) { return null; }
+                }).filter(Boolean);
+            }"""
+        )
+
+        for block in (ld_blocks or []):
+            block_type = block.get("@type", "")
+            if isinstance(block_type, str) and block_type == "Product":
+                json_ld_data = block
+            elif isinstance(block_type, str) and block_type == "AggregateRating":
+                aggregate_rating = block
+
+            if isinstance(block_type, list):
+                if "Product" in block_type:
+                    json_ld_data = block
+                if "AggregateRating" in block_type:
+                    aggregate_rating = block
+
+    except Exception as exc:
+        logger.warning("  JSON-LD extraction failed: %s", exc)
+
+    if not json_ld_data:
+        product["remarks"] = (
+            "No JSON-LD Product block found — may not be a valid product page"
+        )
+
+    # ── Title ──────────────────────────────────────────────────────────
+    try:
+        if json_ld_data:
+            product["title"] = json_ld_data.get("name", "")
+        if not product["title"]:
+            product["title"] = page.evaluate(
+                """() => {
+                    const h1 = document.querySelector('h1.product-name');
+                    return h1 ? h1.textContent.trim() : '';
+                }"""
+            ) or ""
+        if not product["title"]:
+            product["title"] = page.evaluate(
+                """() => {
+                    const h1 = document.querySelector('h1');
+                    return h1 ? h1.textContent.trim() : '';
+                }"""
+            ) or ""
+    except Exception as exc:
+        logger.warning("  Title extraction failed: %s", exc)
+
+    # ── Price (CRITICAL: use CSS, NOT JSON-LD) ─────────────────────────
+    # JSON-LD offers.price is the CASE/BULK price (12 units × unit price).
+    # Per-unit price MUST come from .list-sale-price or meta tag.
+    try:
+        price = page.evaluate(
+            """() => {
+                // Primary: .list-sale-price CSS element
+                const p = document.querySelector('.list-sale-price');
+                if (p) {
+                    const dollar = p.querySelector('.list-price-text-dollar');
+                    const cent = p.querySelector('.list-price-text-cent');
+                    const dollarText = dollar ? dollar.textContent.trim().replace('.', '') : '';
+                    const centText = cent ? cent.textContent.trim() : '00';
+                    if (dollarText) return '$' + dollarText + '.' + centText;
+                }
+                // Fallback: meta tag
+                const meta = document.querySelector('meta[property="product:price:amount"]');
+                if (meta && meta.content) return '$' + meta.content;
+                // Last resort: try any visible price element
+                const priceEl = document.querySelector('[data-auto-id="product-price"]');
+                if (priceEl) return priceEl.textContent.trim();
+                return '';
+            }"""
+        ) or ""
+        product["price"] = price
+    except Exception as exc:
+        logger.warning("  Price extraction failed: %s", exc)
+
+    # ── Availability ──────────────────────────────────────────────────
+    try:
+        avail = page.evaluate(
+            """() => {
+                const el = document.querySelector('.stock-availability');
+                if (!el) return '';
+                const text = el.textContent.trim().toLowerCase();
+                const classes = el.className || '';
+                if (classes.includes('out-of-stock') || text.includes('unavail')) {
+                    return 'Out of Stock';
+                }
+                if (text.includes('available') || text.includes('in stock')) {
+                    return 'In Stock';
+                }
+                return text;
+            }"""
+        ) or ""
+        if avail:
+            if "out of stock" in avail.lower() or "unavail" in avail.lower():
+                product["availability"] = "Out of Stock"
+            else:
+                product["availability"] = "In Stock"
+        elif json_ld_data:
+            offers = json_ld_data.get("offers", {})
+            if isinstance(offers, dict):
+                avail_url = offers.get("availability", "")
+                if "OutOfStock" in avail_url or "SoldOut" in avail_url:
+                    product["availability"] = "Out of Stock"
+                elif "InStock" in avail_url or "LimitedAvailability" in avail_url:
+                    product["availability"] = "In Stock"
+    except Exception as exc:
+        logger.warning("  Availability extraction failed: %s", exc)
+
+    # ── Currency ──────────────────────────────────────────────────────
+    try:
+        currency = page.evaluate(
+            """() => {
+                const meta = document.querySelector('meta[property="product:price:currency"]');
+                if (meta && meta.content) return meta.content;
+                return '';
+            }"""
+        ) or ""
+        if not currency and json_ld_data:
+            offers = json_ld_data.get("offers", {})
+            if isinstance(offers, dict):
+                currency = offers.get("priceCurrency", "")
+        product["currency"] = currency or CURRENCY
+    except Exception:
+        product["currency"] = CURRENCY
+
+    # ── Brand ──────────────────────────────────────────────────────────
+    brand: str = ""
+    try:
+        if json_ld_data:
+            brand_obj = json_ld_data.get("brand")
+            if isinstance(brand_obj, dict):
+                brand = brand_obj.get("name", "")
+        if not brand:
+            brand = page.evaluate(
+                """() => {
+                    const els = document.querySelectorAll('.text-bold-content');
+                    for (const el of els) {
+                        if (el.textContent.includes('Brand:')) {
+                            const next = el.nextElementSibling;
+                            if (next) return next.textContent.trim();
+                            return el.textContent.replace('Brand:', '').trim();
+                        }
+                    }
+                    return '';
+                }"""
+            ) or ""
+    except Exception:
+        pass
+
+    # ── SKU ────────────────────────────────────────────────────────────
+    sku: str = ""
+    try:
+        sku = page.evaluate(
+            """() => {
+                const el = document.querySelector('.occ-sku');
+                if (el) return el.textContent.replace('SKU:', '').trim();
+                return '';
+            }"""
+        ) or ""
+        if not sku and json_ld_data:
+            sku = str(json_ld_data.get("sku", ""))
+    except Exception:
+        pass
+
+    # ── Category ─────────────────────────────────────────────────────
+    category: str = ""
+    try:
+        if json_ld_data:
+            category = json_ld_data.get("product_category", "")
+            if not category:
+                cats = json_ld_data.get("category", [])
+                if isinstance(cats, list) and cats:
+                    category = list(dict.fromkeys(cats))[-1] if cats else ""
+                elif isinstance(cats, str):
+                    category = cats
+    except Exception:
+        pass
+
+    # ── Description ───────────────────────────────────────────────────
+    description: str = ""
+    try:
+        description = page.evaluate(
+            """() => {
+                const ps = document.querySelectorAll('main p');
+                for (const p of ps) {
+                    const parent = p.parentElement;
+                    if (parent && parent.className && parent.className.includes('text-regular-content')) {
+                        const text = p.textContent.trim();
+                        if (text.length > 30) return text;
+                    }
+                }
+                return '';
+            }"""
+        ) or ""
+        if not description and json_ld_data:
+            description = json_ld_data.get("description", "")
+    except Exception:
+        if json_ld_data:
+            description = json_ld_data.get("description", "")
+
+    # ── Image ──────────────────────────────────────────────────────────
+    image: str = ""
+    try:
+        if json_ld_data:
+            img = json_ld_data.get("image", "")
+            if isinstance(img, list) and img:
+                image = img[0]
+            elif isinstance(img, str):
+                image = img
+        if not image:
+            image = page.evaluate(
+                """() => {
+                    const img = document.querySelector('img[src*="height=475"]');
+                    return img ? img.src : '';
+                }"""
+            ) or ""
+    except Exception:
+        pass
+
+    # Filter out non-product images
+    if image:
+        skip_patterns = [
+            "/brand.assets/", "/emoji/", "/flags/", "/icon/", "/navigation/"
+        ]
+        if any(pat in image for pat in skip_patterns):
+            image = ""
+
+    # ── Rating & Review Count ──────────────────────────────────────────
+    rating: str = ""
+    review_count: str = ""
+    try:
+        if aggregate_rating:
+            rating = str(aggregate_rating.get("ratingValue", ""))
+            review_count = str(aggregate_rating.get("reviewCount", ""))
+        elif json_ld_data and json_ld_data.get("aggregateRating"):
+            ag = json_ld_data["aggregateRating"]
+            if isinstance(ag, dict):
+                rating = str(ag.get("ratingValue", ""))
+                review_count = str(ag.get("reviewCount", ""))
+    except Exception:
+        pass
+
+    # ── Assemble extra fields into remarks ─────────────────────────────
+    extra_parts: list[str] = []
+    if brand:
+        extra_parts.append(f"Brand: {brand}")
+    if sku:
+        extra_parts.append(f"SKU: {sku}")
+    if category:
+        extra_parts.append(f"Category: {category}")
+    if rating:
+        extra_parts.append(f"Rating: {rating}/5")
+    if review_count:
+        extra_parts.append(f"Reviews: {review_count}")
+    if description:
+        desc_preview = description[:150] + ("..." if len(description) > 150 else "")
+        extra_parts.append(f"Desc: {desc_preview}")
+    if image:
+        extra_parts.append(f"Image: {image}")
+
+    if extra_parts:
+        if product["remarks"]:
+            product["remarks"] += " | " + " | ".join(extra_parts)
+        else:
+            product["remarks"] = " | ".join(extra_parts)
+
+    return product
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse command line arguments."""
+def _make_error_item(url: str, src_url: str, error: str) -> dict:
+    """Create an error product item."""
+    return {
+        "id": 0,
+        "title": "",
+        "price": "",
+        "availability": "",
+        "original_price": "",
+        "currency": "",
+        "url": url,
+        "src_url": src_url,
+        "location": "",
+        "status_code": 0,
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+        "remarks": f"Error: {error[:200]}",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def main():
     parser = argparse.ArgumentParser(
-        description=f"{SITE_NAME} product scraper (HTTP requests)"
+        description=f"{SITE_NAME} Navigation Scraper (Two-Phase)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--input",
-        type=str,
-        default=INPUT_URLS_FILE,
+        "--query", type=str, default=None,
+        help="Search query for listing page discovery",
+    )
+    parser.add_argument(
+        "--listing-url", type=str, default=None,
+        help="Specific listing/category URL to browse for product links",
+    )
+    parser.add_argument(
+        "--sitemap", action="store_true", default=False,
+        help="Use sitemap XML for Phase 1 discovery",
+    )
+    parser.add_argument(
+        "--input", type=str, default=None,
         help="Path to input URLs JSON file",
     )
     parser.add_argument(
-        "--urls",
-        nargs="+",
-        default=None,
+        "--urls", type=str, nargs="+", default=None,
         help="Product URLs as CLI arguments",
     )
     parser.add_argument(
-        "--sample",
-        action="store_true",
-        default=False,
-        help="Scrape only 5 products",
+        "--sample", action="store_true",
+        help="Scrape first 5 products only",
     )
     parser.add_argument(
-        "--limit",
-        type=int,
-        default=0,
-        help="Max products to scrape (0 = no limit)",
+        "--limit", type=int, default=None,
+        help="Max products to scrape",
     )
     parser.add_argument(
-        "--no-proxy",
-        action="store_true",
-        default=True,
-        help="Do not use proxy (default for this site)",
+        "--no-proxy", action="store_true", default=True,
+        help="Disable proxy (default: no proxy)",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--headless", action="store_true", default=True,
+        help="Run browser in headless mode",
+    )
+    parser.add_argument("--xvfb", action="store_true", default=False, help=argparse.SUPPRESS)
+    args = parser.parse_args()
 
+    limit = 5 if args.sample else args.limit
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
-def main() -> None:
-    """Main entry point."""
-    args = parse_args()
     start_time = time.time()
+    discovered_urls: list[str] = []
+    src_url_base: str = SITE_URL
 
-    # Determine input URLs
-    urls: list[str] = []
-    if args.urls:
-        urls = list(args.urls)
-        logger.info("Using %d URLs from CLI arguments", len(urls))
-    else:
+    logger.info("=" * 80)
+    logger.info("Starting %s Navigation Scraper", SITE_NAME)
+    logger.info("Platform: %s | Method: %s", PLATFORM, SCRAPING_METHOD)
+    logger.info(
+        "Rate limit delay: %.1fs | Limit: %s",
+        DELAY_BETWEEN_REQUESTS,
+        limit or "none",
+    )
+    logger.info("=" * 80)
+
+    # ── Determine URL source ──────────────────────────────────────────
+    if args.input:
         input_path = args.input
         if not os.path.isabs(input_path):
             input_path = os.path.join(SCRIPT_DIR, input_path)
+        logger.info("Reading URLs from file: %s", input_path)
         try:
             with open(input_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                urls = data.get("urls", [])
-            logger.info(
-                "Loaded %d URLs from %s", len(urls), input_path
-            )
-        except FileNotFoundError:
-            logger.error("Input file not found: %s", input_path)
-            sys.exit(1)
-        except json.JSONDecodeError as e:
-            logger.error("Invalid JSON in input file: %s", e)
+            discovered_urls = data.get("urls", [])
+            src_url_base = "input_file"
+            logger.info("Loaded %d URLs from file", len(discovered_urls))
+        except Exception as exc:
+            logger.error("Failed to read input file: %s", exc)
             sys.exit(1)
 
-    if not urls:
-        logger.error("No URLs to scrape. Exiting.")
-        sys.exit(1)
+    elif args.urls:
+        discovered_urls = list(args.urls)
+        src_url_base = "cli_args"
+        logger.info("Loaded %d URLs from CLI arguments", len(discovered_urls))
 
-    # Apply limits
-    if args.sample:
-        urls = urls[:5]
-        logger.info("Sample mode: scraping first 5 products")
-    elif args.limit > 0:
-        urls = urls[: args.limit]
-        logger.info("Limit mode: scraping up to %d products", args.limit)
-
-    # --- Start scraping ---
-    logger.info("=" * 80)
-    logger.info("Starting scraper for %s", SITE_NAME)
-    logger.info("Total products: %d", len(urls))
-    logger.info("Scraping method: %s", SCRAPING_METHOD)
-    logger.info("Rate limit delay: %.1fs", DELAY)
-    logger.info("=" * 80)
-
-    session = create_session()
-    results: list[dict[str, Any]] = []
-    failed_count = 0
-
-    for idx, url in enumerate(urls, start=1):
-        # Rotate user agent periodically
-        if idx % 5 == 0:
-            session.headers["User-Agent"] = random.choice(USER_AGENTS)
-
-        product = extract_product(url, session, idx)
-        results.append(product.__dict__)
-
-        if not product.title and not product.price:
-            failed_count += 1
-
-        # Progress reporting
-        if idx % 25 == 0 or idx == len(urls):
-            pct = (idx / len(urls)) * 100
-            logger.info(
-                "Progress: [%d/%d] (%.1f%%)", idx, len(urls), pct
+    elif args.listing_url:
+        # User explicitly wants listing page discovery
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=args.headless, args=[])
+            context = browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                ),
             )
+            page = context.new_page()
+            discovered_urls = discover_urls_from_listing(page, args.listing_url, limit)
+            src_url_base = args.listing_url
+            browser.close()
 
-    # --- Write output ---
-    duration = round(time.time() - start_time, 2)
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
-    output_file = os.path.join(SCRIPT_DIR, f"output_{timestamp}.json")
+    elif args.query or args.sitemap:
+        # Explicit sitemap or query mode
+        if args.sitemap:
+            discovered_urls = discover_urls_from_sitemap(limit)
+            src_url_base = "sitemap"
+        else:
+            # Query mode: try listing page first, fall back to sitemap
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=args.headless, args=[])
+                context = browser.new_context(
+                    viewport={"width": 1920, "height": 1080},
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+                    ),
+                )
+                page = context.new_page()
+                discovered_urls = discover_urls_from_listing(page, LISTING_URL, limit)
+                src_url_base = LISTING_URL
+                browser.close()
 
+            # If listing page found no products, fall back to sitemap
+            if not discovered_urls:
+                logger.info(
+                    "Listing page found no product URLs, falling back to sitemap..."
+                )
+                discovered_urls = discover_urls_from_sitemap(limit)
+                src_url_base = "sitemap_fallback"
+
+    else:
+        # DEFAULT: Phase 1 sitemap discovery (most reliable for this SPA)
+        # The /products listing page only shows category links, not products.
+        # Sitemap XML directly contains all product URLs.
+        logger.info(
+            "Default mode: Phase 1 sitemap discovery (query: '%s')", DEFAULT_QUERY
+        )
+        discovered_urls = discover_urls_from_sitemap(limit)
+        src_url_base = "sitemap"
+
+    if not discovered_urls:
+        logger.warning("No product URLs discovered. Exiting.")
+        sys.exit(0)
+
+    if limit:
+        discovered_urls = discovered_urls[:limit]
+
+    logger.info("=" * 80)
+    logger.info("Phase 2: Extracting data from %d products", len(discovered_urls))
+    logger.info("Source: %s", src_url_base)
+    logger.info("=" * 80)
+
+    # ── Phase 2: Scrape each product ──────────────────────────────────
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=args.headless, args=[])
+        context = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
+
+        results: list[dict] = []
+        success_count = 0
+        failed_count = 0
+        total = len(discovered_urls)
+
+        for i, url in enumerate(discovered_urls, 1):
+            if i % 25 == 0 or i == 1:
+                percent = (i / total) * 100
+                logger.info(
+                    "Progress: [%d/%d] (%.1f%%) — Success: %d, Failed: %d",
+                    i,
+                    total,
+                    percent,
+                    success_count,
+                    failed_count,
+                )
+
+            logger.info("  [%d/%d] Scraping: %s", i, total, url[:100])
+
+            try:
+                product = extract_product_data(page, url, src_url_base)
+                product["id"] = i
+                results.append(product)
+
+                if product.get("title"):
+                    success_count += 1
+                elif product.get("remarks") and "Error" in product.get("remarks", ""):
+                    failed_count += 1
+                else:
+                    failed_count += 1
+
+            except Exception as exc:
+                logger.error("  Failed to extract %s: %s", url[:80], exc)
+                error_item = _make_error_item(url, src_url_base, str(exc))
+                error_item["id"] = i
+                results.append(error_item)
+                failed_count += 1
+
+            # Rate limiting
+            if i < total:
+                time.sleep(DELAY_BETWEEN_REQUESTS)
+
+        browser.close()
+
+    # ── Write Output ──────────────────────────────────────────────────
     output = {
         "site": {
             "name": SITE_NAME,
             "url": SITE_URL,
             "platform": PLATFORM,
-            "scraping_method": SCRAPING_METHOD,
+            "scraping_method": "playwright_navigation",
             "scraped_at": datetime.now(timezone.utc).isoformat(),
         },
-        "products": results,
+        OUTPUT_KEY: results,
         "metadata": {
-            "scraping_duration_seconds": duration,
+            "scraping_duration_seconds": round(time.time() - start_time, 2),
+            "discovered_urls": len(discovered_urls),
+            "extracted_items": len(results),
             "failed_products": failed_count,
-            "rate_limit_delay": DELAY,
+            "rate_limit_delay": DELAY_BETWEEN_REQUESTS,
         },
     }
 
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+    output_filename = os.path.join(SCRIPT_DIR, f"output_{timestamp}.json")
 
-    # --- Summary ---
-    success = len(results) - failed_count
+    with open(output_filename, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False, default=str)
+
     logger.info("=" * 80)
     logger.info("EXTRACTION COMPLETE")
-    logger.info("Total: %d, Success: %d, Failed: %d", len(results), success, failed_count)
-    logger.info("Duration: %.2f seconds", duration)
-    logger.info("Output: %s", output_file)
+    logger.info(
+        "Total: %d | Success: %d | Failed: %d",
+        len(results),
+        success_count,
+        failed_count,
+    )
+    logger.info("Duration: %.1fs", time.time() - start_time)
+    logger.info("Output: %s", output_filename)
     logger.info("=" * 80)
 
 

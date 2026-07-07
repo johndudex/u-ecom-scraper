@@ -53,7 +53,7 @@ If `probe_page` returns a "BLOCKED" message saying UC Chrome is required, use `p
 probe_html(url="PRODUCT_URL")
 ```
 
-`probe_html` fetches the full page HTML via browser-service using the correct access method. Extract JSON-LD from `<script type="application/ld+json">` tags and selectors from the HTML. You will NOT get pre-tested selector results — you must identify selectors manually from the HTML.
+`probe_html` fetches the full page HTML via browser_service using the correct access method. Extract JSON-LD from `<script type="application/ld+json">` tags and selectors from the HTML. You will NOT get pre-tested selector results — you must identify selectors manually from the HTML.
 
 ### Browser Unavailable Fallback
 
@@ -138,8 +138,13 @@ After your deep analysis, reassess the scraping mechanism:
 
 - If JSON-LD has complete product data → recommend `http_requests`
 - If page is server-rendered with static HTML → recommend `http_requests`
-- If page requires JS rendering AND has anti-bot → recommend `seleniumbase_uc`
-- If page requires JS rendering but NO anti-bot → recommend `playwright`
+- If page requires JS rendering (with OR without anti-bot) → recommend `playwright`.
+  CloakBrowser stealth (a C++-patched Chromium that defeats Akamai/Cloudflare
+  fingerprinting) is applied **automatically at runtime** when anti_bot is detected
+  (browser_service sets `STEALTH_BROWSER=cloak` for the scraper subprocess). You do
+  NOT need SeleniumBase/UC — and must NOT recommend it: a plain Playwright
+  `p.chromium.launch()` drives CloakBrowser transparently, whereas SeleniumBase UC
+  mode is more fragile and is not wired into the runtime stealth path.
 
 Document your reassessment in `mechanism_reassessment`. This overrides the site-analyzer's recommendation if different.
 
@@ -160,7 +165,7 @@ Save to: `workspace/{site_slug}/product_analysis.json`
     "method_that_worked": "direct_http|browser_none|uc_chrome_none|...",
     "proxy_tier": "none",
     "js_rendering_needed": true,
-    "notes": "UC Chrome bypassed Akamai. Use seleniumbase_uc strategy."
+    "notes": "Anti-bot detected (Akamai). Use the playwright strategy — CloakBrowser stealth is auto-applied at runtime."
   },
   "extraction_methods": {
     "primary": "structured_data",

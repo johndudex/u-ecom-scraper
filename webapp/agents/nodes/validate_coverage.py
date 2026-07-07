@@ -7,13 +7,13 @@ from typing import Any
 
 from langgraph.types import Command
 
+from ..constants import MAX_VALIDATE_RETRIES
 from ..decisions import options_to_decisions
 from ..state import ScrapeState
 
 logger = logging.getLogger(__name__)
 
 MIN_COVERAGE = 0.80
-MAX_VALIDATE_RETRIES = 2
 
 CORE_FIELDS = {
     "title",
@@ -90,7 +90,25 @@ def validate_coverage(state: ScrapeState) -> Command:
         return Command(goto="code_tester")
 
     content_type_config = state.get("content_type_config", {})
+    # Resolve core fields from the job's page type so job/article/forum jobs are
+    # evaluated against their OWN core fields, not the legacy product set.
+    # Product-family page types keep DEFAULT_CORE_FIELDS exactly (no behavior
+    # change for the dominant product use case).
+    page_type = state.get("page_type", "product") or "product"
     core = DEFAULT_CORE_FIELDS
+    if not page_type.startswith("product"):
+        try:
+            from src.content_types import get_content_type
+
+            ct = get_content_type(page_type)
+            if ct and getattr(ct, "core_fields", None):
+                core = set(ct.core_fields)
+        except Exception as exc:  # defensive — fall back to product fields
+            logger.warning(
+                "validate_coverage: could not resolve core fields for %s: %s",
+                page_type,
+                exc,
+            )
     if content_type_config and "core_field_names" in content_type_config:
         core = set(content_type_config["core_field_names"])
 
@@ -123,7 +141,10 @@ def validate_coverage(state: ScrapeState) -> Command:
             goto="human_approval",
         )
 
-    state_update: dict[str, Any] = {"product_analysis": analysis, "content_analysis": analysis}
+    state_update: dict[str, Any] = {
+        "product_analysis": analysis,
+        "content_analysis": analysis,
+    }
 
     extracted_fields = _extract_covered_fields(analysis)
 
@@ -140,6 +161,25 @@ def validate_coverage(state: ScrapeState) -> Command:
 
     missing = core - covered
     state_update["fields_extracted"] = list(extracted_fields)
+
+    # For SPA-over-API jobs, field mapping is done generically by src.job_fields
+    # at SCRAPE time (the generated api_scraper calls ``map_jobs`` against the
+    # real API items), not from this product_analysis (a single detail page).
+    # So a low product_analysis coverage here is a false negative — don't pause;
+    # let code_writer map fields via the resolver. product/article paths (no
+    # api_endpoint) keep the coverage gate unchanged.
+    nav_analysis = state.get("navigation_analysis") or {}
+    api_ep = nav_analysis.get("api_endpoint")
+    api_url = (api_ep or {}).get("url") if isinstance(api_ep, dict) else None
+    if api_url:
+        logger.info(
+            "validate_coverage: backend JSON API discovered (%s); fields will be mapped "
+            "generically by src.job_fields at scrape time — skipping product_analysis "
+            "coverage gate (%.0f%%)",
+            str(api_url)[:80],
+            coverage_ratio * 100,
+        )
+        return Command(update=state_update, goto="scraper_analyzer")
 
     if coverage_ratio < MIN_COVERAGE:
         logger.info("validate_coverage: low coverage, missing fields: %s", missing)

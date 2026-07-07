@@ -139,18 +139,64 @@ Based on `site_analysis.scraping_mechanism` AND `site_analysis.anti_bot`, select
 | `internal_api` | `templates/api_scraper.py` |
 | `http_requests` | `templates/requests_scraper.py` |
 | `playwright` | `templates/playwright_scraper.py` |
-| `stealth_browser` | `templates/undetected_chromedriver_scraper.py` |
+| `stealth_browser` | `templates/playwright_scraper.py` (cloak stealth is runtime-injected, NOT a separate template) |
 
-**IMPORTANT — Akamai with high severity:**
-If `site_analysis.anti_bot.type == "akamai"` AND `site_analysis.anti_bot.severity == "high"` (or `uc_recommended == true`), use the **undetected-chromedriver template** (`templates/undetected_chromedriver_scraper.py`) instead of the Playwright template. Akamai consistently blocks Playwright's Chromium fingerprint.
+**IMPORTANT — Anti-bot / Akamai sites:**
+For ANY anti-bot site (Akamai, Cloudflare, PerimeterX — `anti_bot.detected == true`), use the
+**Playwright template** with a plain `p.chromium.launch()`. Do NOT use SeleniumBase, undetected
+chromedriver, or `SB(uc=True)`. CloakBrowser (a stealth Chromium that defeats fingerprinting) is
+applied **automatically at runtime** by the browser_service when `STEALTH_BROWSER=cloak` is set for
+the scraper subprocess — your generated scraper does nothing special, it just launches Chromium
+normally and stealth is injected transparently. Keep the Playwright API throughout (`page.goto`,
+`page.evaluate`, `page.query_selector`, `page.eval_on_selector_all`).
 
-Key differences when using undetected-chromedriver:
-- Uses `undetected_chromedriver` and `selenium` instead of `playwright`
-- `driver.execute_script()` instead of `page.evaluate()`
-- **CRITICAL:** Use `var`-based JavaScript, NOT arrow function IIFEs. Selenium's `execute_script` cannot return values from `(() => { return x; })()` patterns.
-- Accept cookies via `driver.execute_script()` with JS click (more reliable than Selenium's `find_element`)
-- Check for block pages via `driver.execute_script("return document.body ? document.body.innerText.toUpperCase() : '';")`
-- Warm-up: visit homepage, wait 20 seconds, accept cookies before scraping
+**Anti-bot ⇒ Playwright, even if a backend API was discovered.** Bot protection (Akamai/Cloudflare)
+guards the **API endpoints too**, not just the HTML pages — a `requests`/`httpx` call to a discovered
+`/api/...` or `b2c-api` endpoint will typically return 403/400/blocked, exactly like the direct HTTP
+does. So for an anti-bot site you MUST pick `playwright` (the navigation_scraper template) regardless
+of any API endpoint you see in navigation_findings/site_analysis. Only deviate to `internal_api` for
+an anti-bot site if the analysis contains POSITIVE evidence — a `probe_page`/`web_fetch` result showing
+the API returning product JSON with a plain request — and even then prefer playwright unless that
+evidence is unambiguous. When in doubt: playwright.
+
+**Template fidelity (navigation / two-phase jobs):**
+When generating a navigation scraper, base it on `templates/navigation_scraper.py` and **keep its
+structure intact** — do NOT rewrite discovery, waits, or pagination from scratch:
+- Waits (HARD RULE): every page load MUST use `page.wait_for_load_state("domcontentloaded")`
+  followed by `time.sleep(8)`. Never emit `"networkidle"` (SPAs never reach it → 30s timeout) and
+  never shorten the sleep below 8 (SPAs need the render time). Do not substitute sleep(2/3/4/5).
+- Item-link extraction: keep the template's `_extract_item_links` — it tries generic product-card
+  selectors FIRST (`[data-testid*='product']`, `[data-testid*='GridItem']`, `[data-pid]`,
+  `[class*='product-tile']`, `[class*='product-card']`, …) then a same-domain fallback, all filtered
+  through the template's generic `_is_product_url` (structural path check — no hardcoded tokens).
+  These generic selectors are what find the real product grid (e.g. `[data-testid*='GridItem']`
+  matches SFCC grids). Filling in a single narrow site-specific selector is fine, and you MAY
+  override `_is_product_url` with a tighter per-site version (regex + slug list) when
+  product_analysis gives enough signal — but do NOT replace the multi-selector strategy with a
+  densest-`<a>`-cluster heuristic; that captures nav/category links and breaks discovery.
+- Pagination: keep the template's `_get_next_page_url` (next-button selectors + `?page=N` fallback).
+  Fill `PAGINATION_TYPE` if you detected it; otherwise the runtime fallback handles it.
+
+**Content-type-aware output filter (MANDATORY).** Every scraper MUST drop non-item pages before
+writing output: keep items that have a `title` AND at least one of the content type's core fields
+(other than title/url). For `product` that's price/availability; for `job_posting` company/location;
+for `article` author/publish_date; default to title-only. Discovery can capture nav/category roots
+and soft-404s — this filter is what keeps them out of the output. NEVER key the filter on price alone
+(jobs/articles have no price → a price-only filter deletes every real item).
+
+**Filter iteration (pin vs iterate).** `navigation_analysis.filters` tags each filter dimension with a
+`strategy`:
+- **`pin`**: the user's query names this dimension (e.g., "jobs in Alabama" → location pin to AL). Use
+  the `strategy_value` as a fixed filter — do NOT iterate it.
+- **`iterate`**: the query didn't name this dimension → it's broad (`detected_value="all"`). Generate a
+  **loop** over the dimension's option values (from the `values` list): for each value, build the
+  discovery URL via the captured `url_pattern`, collect item links, and **dedup by job/item ID** across
+  iterations. This enumerates the full catalog when `all` returns a capped/paginated subset.
+- **No strategy field** (older analysis): default to `detected_value` (typically `all`). If `all` + an
+  option list is present, iterate to be safe (dedup handles overlap).
+
+Sample job URLs (`item_links.url_examples`) are for **field/selector mapping ONLY** — never infer filter
+values from their content. A sample job being in Alabama does not mean the scrape targets Alabama.
 
 Read the template file and use it as the base for your scraper.
 

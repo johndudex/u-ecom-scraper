@@ -1,0 +1,20 @@
+{
+  "@context": "http://schema.org",
+  "@type": "JobPosting",
+  "title": "Account Executive, AI Sales (Grower)",
+  "datePosted": "2026-06-26T17:05:44-04:00",
+  "description": "&lt;h2&gt;Who we are&lt;/h2&gt;\n&lt;h3&gt;About Stripe&lt;/h3&gt;\n&lt;p&gt;Stripe is a financial infrastructure platform for businesses. Millions of companies - from the world’s largest enterprises to",
+  "employmentType": "FULL_TIME",
+  "hiringOrganization": {
+    "@type": "Organization",
+    "name": "Stripe"
+  },
+  "jobLocation": {
+    "@type": "Place",
+    "address": {
+      "@type": "PostalAddress",
+      "addressLocality": "San Francisco, CA",
+      "addressRegion": ""
+    }
+  }
+}

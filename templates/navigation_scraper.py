@@ -60,6 +60,7 @@ ITEM_URL_PATTERN = "{ITEM_URL_PATTERN}"  # e.g. r"/product/([^/]+)"
 SCRAPING_METHOD = "{SCRAPING_METHOD}"  # "playwright", "http_requests", etc.
 PROXY_TIER = "{PROXY_TIER}"  # "none", "datacenter", "residential"
 DELAY_BETWEEN_REQUESTS = {DELAY_BETWEEN_REQUESTS}
+ROTATE_EVERY = 25  # relaunch the browser every N items to avoid stealth-Chromium crashes under sustained load
 PAGE_LOAD_TIMEOUT = 30000
 SRC_URL = SITE_URL
 
@@ -68,6 +69,20 @@ OUTPUT_KEY = "{OUTPUT_KEY}"  # "products", "articles", "jobs", etc.
 CONTENT_TYPE = "{CONTENT_TYPE}"
 
 CURRENCY = "{CURRENCY}" or "USD"
+
+# Output filter: drop items that failed extraction (no title) or that lack any of
+# the content type's core identifying fields. The broad discovery fallback can
+# capture a few non-product pages (nav/category roots); this keeps the output
+# clean. Derived from CONTENT_TYPE — generic, no site-specific field names.
+_CONTENT_FILTER_FIELDS = {
+    "product": ["price", "availability"],
+    "article": ["author", "publish_date"],
+    "job_posting": ["company", "location"],
+    "forum_thread": ["author"],
+    "serp": ["url", "snippet"],
+    "page_content": [],
+}
+CORE_FILTER_FIELDS = _CONTENT_FILTER_FIELDS.get(CONTENT_TYPE, [])
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
@@ -97,8 +112,8 @@ def _discover_urls_via_search(
     logger.info("Phase 1: Searching for '%s' → %s", query, search_url)
 
     page.goto(search_url, timeout=PAGE_LOAD_TIMEOUT)
-    page.wait_for_load_state("networkidle")
-    time.sleep(2)
+    page.wait_for_load_state("domcontentloaded")
+    time.sleep(8)
 
     all_urls: list[str] = _extract_item_links(page)
 
@@ -118,8 +133,8 @@ def _discover_urls_via_search(
 
         logger.info("Phase 1: Navigating to page %d", current_page + 1)
         page.goto(next_url, timeout=PAGE_LOAD_TIMEOUT)
-        page.wait_for_load_state("networkidle")
-        time.sleep(2)
+        page.wait_for_load_state("domcontentloaded")
+        time.sleep(8)
 
         new_urls = _extract_item_links(page)
         new_count = len(set(new_urls) - set(all_urls))
@@ -148,8 +163,8 @@ def _discover_urls_via_category(
     """Phase 1b: Discover item URLs from a category page."""
     logger.info("Phase 1: Browsing category → %s", category_url)
     page.goto(category_url, timeout=PAGE_LOAD_TIMEOUT)
-    page.wait_for_load_state("networkidle")
-    time.sleep(2)
+    page.wait_for_load_state("domcontentloaded")
+    time.sleep(8)
 
     all_urls: list[str] = _extract_item_links(page)
 
@@ -166,8 +181,8 @@ def _discover_urls_via_category(
 
         logger.info("Phase 1: Category page %d", current_page + 1)
         page.goto(next_url, timeout=PAGE_LOAD_TIMEOUT)
-        page.wait_for_load_state("networkidle")
-        time.sleep(2)
+        page.wait_for_load_state("domcontentloaded")
+        time.sleep(8)
 
         new_urls = _extract_item_links(page)
         if not new_urls or not (set(new_urls) - set(all_urls)):
@@ -211,7 +226,59 @@ def _extract_item_links(page) -> list[str]:
         except Exception as exc:
             logger.warning("Phase 1: Fallback link extraction failed: %s", exc)
 
+    # Robust final fallback: if selector-based extraction found too few links,
+    # capture ALL same-domain anchor hrefs and keep only those that look like
+    # item-detail pages (via the generic _is_product_url structural check — no
+    # hardcoded token list). The primary card selectors above do the real work;
+    # this only fires when they miss, and the soft-404 check + output filter
+    # catch any non-item page that still slips through.
+    if len(links) < 20:
+        try:
+            all_hrefs = page.eval_on_selector_all(
+                "a[href]", "els => els.map(e => e.href)"
+            )
+            existing = set(links)
+            for h in all_hrefs:
+                if h in existing:
+                    continue
+                if not _is_product_url(h):
+                    continue
+                links.append(h)
+                existing.add(h)
+            logger.info(
+                "Phase 1: robust fallback captured %d same-domain links", len(links)
+            )
+        except Exception as exc:
+            logger.warning("Phase 1: robust link fallback failed: %s", exc)
+
     return links
+
+
+def _is_product_url(href: str) -> bool:
+    """Generic item-detail URL detector — no site-specific tokens.
+
+    True for same-domain URLs whose path looks like a detail page (deep/long slug,
+    usually carrying a numeric product code); False for shallow nav/category roots
+    (``/women``, ``/sale``, ``/account``, locale roots like ``/en-us``). Structural
+    floor only — code_writer may override it with a tighter per-site version (regex
+    + slug list from product_analysis) when there's enough signal.
+    """
+    from urllib.parse import urlparse
+
+    if not href:
+        return False
+    site_host = (urlparse(SITE_URL).hostname or "").lower()
+    if site_host and site_host not in href.lower():
+        return False
+    path = urlparse(href).path.strip("/")
+    if not path or len(path) < 6:
+        return False
+    segs = path.split("/")
+    last = segs[-1]
+    # shallow single-segment root with no digit → nav/category (e.g. /women, /sale)
+    if len(segs) == 1 and len(last) < 12 and not any(c.isdigit() for c in last):
+        return False
+    return True
 
 
 def _get_next_page_url(page, next_page_num: int) -> Optional[str]:
@@ -228,8 +295,8 @@ def _get_next_page_url(page, next_page_num: int) -> Optional[str]:
                 # SPA-style: no href, click the element and return the new URL
                 try:
                     btn.click()
-                    page.wait_for_load_state("networkidle")
-                    time.sleep(2)
+                    page.wait_for_load_state("domcontentloaded")
+                    time.sleep(8)
                     new_url = page.url
                     if new_url:
                         return new_url
@@ -242,7 +309,35 @@ def _get_next_page_url(page, next_page_num: int) -> Optional[str]:
         current_url = page.url
         separator = "&" if "?" in current_url else "?"
         return f"{current_url}{separator}{PAGE_PARAM_NAME}={next_page_num}"
-    return None
+    else:
+        # Unknown pagination type — try common patterns at runtime so we still
+        # collect the FULL catalog (not just page 1). The discovery loop stops
+        # when a page yields no NEW urls, so this is safe (bounded by MAX_PAGES
+        # + deduped). Generic: catches sites where navigation didn't detect
+        # the pagination mechanism (e.g. calvklein search). [#3 discovery completeness]
+        for sel in (
+            'a[rel="next"]', 'a.next', 'li.next a', '[aria-label*="next" i]',
+            'a:has-text("Next")', 'button:has-text("Next")', 'a:has-text(">")',
+        ):
+            try:
+                btn = page.query_selector(sel)
+                if btn:
+                    href = btn.get_attribute("href") or ""
+                    if href:
+                        if href.startswith("http"):
+                            return href
+                        return SITE_URL.rstrip("/") + (href if href.startswith("/") else "/" + href)
+                    btn.click()
+                    page.wait_for_load_state("domcontentloaded")
+                    time.sleep(8)
+                    if page.url:
+                        return page.url
+            except Exception:
+                pass
+        # Param-based fallback: try ?page=N (most common). Loop stops if no new items.
+        current_url = page.url
+        sep = "&" if "?" in current_url else "?"
+        return f"{current_url}{sep}page={next_page_num}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -257,7 +352,7 @@ def _extract_item_data(page, url: str, src_url: str) -> dict:
     """
     try:
         page.goto(url, timeout=PAGE_LOAD_TIMEOUT)
-        page.wait_for_load_state("networkidle")
+        page.wait_for_load_state("domcontentloaded")
         time.sleep(1)
     except Exception as exc:
         logger.error("Phase 2: Failed to load %s: %s", url[:80], exc)
@@ -356,6 +451,23 @@ def _error_item(url: str, src_url: str, error: str) -> dict:
     }
 
 
+def _browser_alive(page) -> bool:
+    """Trivial probe — returns False if the page/context/browser has died.
+
+    Stealth Chromium (CloakBrowser) can crash under sustained load (observed:
+    dies after ~40-50 page loads on heavy anti-bot SPAs), surfacing as
+    "Target page, context or browser has been closed" on the next goto. Because
+    ``_extract_item_data`` catches goto errors internally, the outer loop would
+    otherwise keep appending error-items for every remaining URL. This probe lets
+    the loop detect the death and relaunch the browser. Generic.
+    """
+    try:
+        page.evaluate("1")
+        return True
+    except Exception:
+        return False
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -382,18 +494,24 @@ def main():
     discovered_urls: list[str] = []
 
     with sync_playwright() as p:
-        browser_args = []
-        if proxy_url:
-            browser_args.append(f"--proxy-server={proxy_url}")
-        browser = p.chromium.launch(
-            headless=args.headless,
-            args=browser_args,
-        )
-        context = browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        )
-        page = context.new_page()
+        # NOTE: stealth is handled transparently by the browser_service
+        # cloak_stealth_patch (.pth) — when STEALTH_BROWSER=cloak is set for
+        # anti-bot sites, this launch() drives CloakBrowser's stealth Chromium
+        # binary (with build_args + ignore_default_args). Keep this a plain
+        # launch(); do NOT call cloakbrowser.launch() here (it starts a second
+        # Playwright and conflicts with this sync_playwright() context).
+        def _launch_browser():
+            browser_args = []
+            if proxy_url:
+                browser_args.append(f"--proxy-server={proxy_url}")
+            b = p.chromium.launch(headless=args.headless, args=browser_args)
+            ctx = b.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
+            return b, ctx, ctx.new_page()
+
+        browser, context, page = _launch_browser()
 
         # ── Phase 1: Discover URLs ───────────────────────────────────────
         if args.query:
@@ -410,6 +528,33 @@ def main():
             browser.close()
             sys.exit(1)
 
+        # ── Phase 1b: Also discover from CATEGORY_URLS ──────────────────
+        # A single search often returns fewer products than the site has
+        # (e.g. calvklein search = 48 watches, but category pages have 65+).
+        # CATEGORY_URLS is filled by code_writer from navigation_analysis.
+        # Only visit categories related to the search term (if any). Generic.
+        if not args.sample and CATEGORY_URLS:
+            _existing = set(discovered_urls)
+            _search_q = (args.query or "").lower()
+            for _cat_url in CATEGORY_URLS:
+                if not isinstance(_cat_url, str) or _cat_url in _existing:
+                    continue
+                if _search_q and _search_q not in _cat_url.lower():
+                    continue
+                try:
+                    logger.info("Phase 1b: Visiting category %s", _cat_url[:60])
+                    _cat_urls = _discover_urls_via_category(page, _cat_url, MAX_PAGES, limit)
+                    _new = [u for u in _cat_urls if u not in _existing]
+                    if _new:
+                        discovered_urls.extend(_new)
+                        _existing.update(_new)
+                        logger.info("Phase 1b: %s -> %d new URLs (total %d)", _cat_url[:40], len(_new), len(discovered_urls))
+                except Exception as _cat_exc:
+                    logger.warning("Phase 1b: category %s failed: %s", _cat_url[:40], _cat_exc)
+            discovered_urls = list(dict.fromkeys(discovered_urls))
+            if limit:
+                discovered_urls = discovered_urls[:limit]
+
         if not discovered_urls:
             logger.warning("No item URLs discovered")
             browser.close()
@@ -424,6 +569,20 @@ def main():
             logger.info("Progress: [%d/%d] (%.1f%%", i, total, (i / total) * 100)
             logger.info("Scraping: %s", url[:100])
 
+            # Detect a dead browser (stealth Chromium can crash under sustained
+            # load) and relaunch before attempting the item, so one mid-run crash
+            # doesn't fail every remaining URL. Proactively rotate the context
+            # every ROTATE_EVERY items to release memory buildup.
+            if (not _browser_alive(page)) or (i > 1 and (i - 1) % ROTATE_EVERY == 0):
+                if i > 1:
+                    logger.warning("Phase 2: relaunching browser at item %d (alive=%s)", i, _browser_alive(page))
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    browser, context, page = _launch_browser()
+                    time.sleep(3)
+
             try:
                 item = _extract_item_data(page, url, src_url_base)
                 items.append(item)
@@ -437,6 +596,13 @@ def main():
         browser.close()
 
     # ── Write output ────────────────────────────────────────────────────
+    # Output filter: drop extraction failures + items lacking any core field.
+    _extra = [f for f in CORE_FILTER_FIELDS if f and f != "title"]
+    _before = len(items)
+    items = [it for it in items if it.get("title") and (not _extra or any(it.get(f) for f in _extra))]
+    if len(items) != _before:
+        logger.info("output filter: %d → %d items (dropped %d without core fields)", _before, len(items), _before - len(items))
+
     output = {
         "site": {
             "name": SITE_NAME,

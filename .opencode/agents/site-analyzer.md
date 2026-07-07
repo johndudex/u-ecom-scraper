@@ -109,8 +109,11 @@ Based on probe result:
 | Direct HTTP returned full data | `http_requests` |
 | Direct HTTP returned JSON-LD but no price | `http_requests` with CSS fallback |
 | Browser needed, no anti-bot (`browser_*`) | `playwright` |
-| Anti-bot detected, UC Chrome worked (`uc_chrome_*`) | `seleniumbase_uc` |
+| Anti-bot detected, **CloakBrowser worked** (`cloak_*`) | `playwright` (cloak auto-applied) — **preferred** for anti-bot |
+| Anti-bot detected, only UC Chrome worked (`uc_chrome_*`) | `playwright` (cloak auto-applied) — UC is fragile; cloak is stronger |
 | Shopify detected | `shopify_api` |
+
+**About CloakBrowser (stealth):** The probe escalates through stealth methods including CloakBrowser (a stealth Chromium with C++-level fingerprint patches). When the probe reports `cloak_*` or `uc_chrome_*` as the working method, the site has anti-bot protection and the scraper should use `playwright` — CloakBrowser is applied **automatically at runtime** via `STEALTH_BROWSER=cloak` (no code change needed in the scraper). Do NOT recommend `seleniumbase_uc` for anti-bot sites; cloak defeats Akamai where UC fails.
 
 ## Your Output
 

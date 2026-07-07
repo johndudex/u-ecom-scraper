@@ -366,6 +366,7 @@ _LISTING_PAGE_EXTRACTION_JS = r"""
     grid_containers: [],
     page_count: null,
     total_products: null,
+    api_endpoints: [],
   };
 
   // --- Detect item/product links ---
@@ -811,6 +812,130 @@ _LISTING_PAGE_EXTRACTION_JS = r"""
       result.item_count_text = text;
     }
   });
+
+  // --- Detect filter parameters (URL-based + form-based) ---
+  // Job portals and search sites use filters for date (posted age),
+  // location, and category/job-type. Capture both URL params (URL filtering)
+  // and form elements (form-based filtering) so the generated scraper can
+  // apply the right mechanism per site.
+  const detectedFilters = {
+    url_date_params: [],
+    url_location_params: [],
+    url_category_params: [],
+    url_other_params: []
+  };
+  try {
+    const urlParams = new URLSearchParams(window.location.search);
+    for (const [key, value] of urlParams.entries()) {
+      const k = key.toLowerCase();
+      if (['date_posted','posted','posteddate','days','fromage','daterange','date','pd','postedwithin','age'].includes(k)) {
+        detectedFilters.url_date_params.push({param: key, value: value});
+      } else if (['location','l','loc','city','state','st','radius','lat','lng','geo','where','region'].includes(k)) {
+        detectedFilters.url_location_params.push({param: key, value: value});
+      } else if (['category','cat','job_type','jt','specialty','discipline','profession','department','profession_id'].includes(k)) {
+        detectedFilters.url_category_params.push({param: key, value: value});
+      } else {
+        detectedFilters.url_other_params.push({param: key, value: value});
+      }
+    }
+  } catch(e) {}
+  result.detected_filters = detectedFilters;
+
+  // Detect filter UI elements (dropdowns / inputs for date, location, category)
+  const filterUI = {
+    date_selectors: [],
+    location_selectors: [],
+    category_selectors: []
+  };
+  function buildElSelector(el) {
+    if (el.id) return '#' + CSS.escape(el.id);
+    if (el.name) return el.tagName.toLowerCase() + '[name="' + el.name + '"]';
+    if (el.className && typeof el.className === 'string') {
+      const firstClass = el.className.trim().split(/\s+/)[0];
+      if (firstClass) return el.tagName.toLowerCase() + '.' + firstClass;
+    }
+    return null;
+  }
+  function describeEl(el) {
+    const entry = {};
+    const sel = buildElSelector(el);
+    if (!sel) return null;
+    entry.selector = sel;
+    if (el.name) entry.name = el.name;
+    if (el.id) entry.id = el.id;
+    if (el.tagName === 'SELECT') {
+      entry.options = Array.from(el.options).slice(0, 20).map(function(o) { return o.value || o.text; });
+    } else if (el.placeholder) {
+      entry.placeholder = el.placeholder;
+    }
+    return entry;
+  }
+  const filterEls = document.querySelectorAll(
+    'select, input[type="text"], input[type="search"], input[type="date"], input:not([type])'
+  );
+  filterEls.forEach(function(el) {
+    const name = (el.name || el.id || '').toLowerCase();
+    const placeholder = (el.placeholder || '').toLowerCase();
+    const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+    const combined = name + ' ' + placeholder + ' ' + ariaLabel;
+    if (!combined || combined.trim() === '') return;
+    if (/\b(date|posted|days|fromage|recent|age)\b/.test(combined)) {
+      const e = describeEl(el);
+      if (e) filterUI.date_selectors.push(e);
+    } else if (/\b(location|state|city|zip|postal|radius|where|region|geo)\b/.test(combined)) {
+      const e = describeEl(el);
+      if (e) filterUI.location_selectors.push(e);
+    } else if (/\b(category|specialty|discipline|profession|job.?type|department|profession)\b/.test(combined)) {
+      const e = describeEl(el);
+      if (e) filterUI.category_selectors.push(e);
+    }
+  });
+  result.filter_ui = filterUI;
+
+  // --- Detect backend JSON API endpoints (React/Vue SPAs over XHR) ---
+  // Many modern boards (e.g. AMN Healthcare) render listings client-side by
+  // fetching JSON from a backend search API.  Capture those XHR/fetch resource
+  // URLs so the code-writer can emit a clean HTTP api_scraper instead of a
+  // fragile browser driver.  Reads the browser's Performance Resource Timing
+  // entries (no response bodies, but the URL + query is enough to reproduce).
+  try {
+    const apiRE = /(job|search|listing|feed|result|position|vacanc|posting)/i;
+    const seen = new Set();
+    const candidates = [];
+    const entries = (performance && performance.getEntriesByType)
+      ? performance.getEntriesByType('resource') : [];
+    for (const e of entries) {
+      const url = e.name || '';
+      if (!url || seen.has(url)) continue;
+      // initiator fetch/xhr, or any URL that looks like a JSON search API
+      const isXhr = (e.initiatorType === 'xmlhttprequest' || e.initiatorType === 'fetch');
+      const looksApi = apiRE.test(url) || /\/api\/|\/v1\/|search/i.test(url);
+      if (!(isXhr || looksApi)) continue;
+      seen.add(url);
+      // Do NOT truncate — a query-heavy search URL (e.g. AMN's /JobSearch with
+      // ~16 repeated FilterTypes) can exceed 400 chars; slicing there corrupts
+      // the LAST param value (PayRateType -> PayRateTyp), which the API then
+      // rejects with HTTP 400.  Keep the full URL.
+      candidates.push({ url: url, method: 'GET', initiator: e.initiatorType || '' });
+    }
+    // Heuristic ranking: prefer URLs that mention job/search and have query params
+    // (those are the real listing/search calls, not telemetry).
+    candidates.sort((a, b) => {
+      const score = (c) => {
+        let s = 0;
+        if (/job/i.test(c.url)) s += 3;
+        if (/search/i.test(c.url)) s += 2;
+        if (c.url.includes('?')) s += 2;
+        if (c.url.includes('PageNumber') || c.url.includes('page=')) s += 2;
+        if (/\/api\/|\/v1\//i.test(c.url)) s += 1;
+        return s;
+      };
+      return score(b) - score(a);
+    });
+    result.api_endpoints = candidates.slice(0, 8);
+  } catch (apiErr) {
+    result.api_endpoints = [];
+  }
 
   return JSON.stringify(result);
 }
@@ -1278,6 +1403,25 @@ _PRODUCT_PRESENCE_SELECTORS = [
     '[data-testid*="PriceText"]',
 ]
 
+# Regexes (applied to absolute hrefs) that identify a JOB-DETAIL link on job
+# boards.  Unconditional/safe: e-commerce sites have none of these, so adding
+# them to content detection cannot cause false positives on product sites — it
+# only lets _wait_for_content recognize job boards (e.g. AMN's
+# /job-details/{id}/{slug}/) as "content present" instead of timing out and
+# discarding the real job links as stale DOM.
+_JOB_LINK_HREF_PATTERNS = [
+    r"/job-details/",
+    r"/job-details\.",
+    r"/jobs/job[-/]?",
+    r"/job-posting",
+    r"/jobposting",
+    r"/careers/job/",
+    r"/jobs/view/",
+    r"/position/[a-z0-9-]*\d{4,}",
+    # /job(s)/<slug-with-id>/  (id >= 4 digits anywhere in a jobs path segment)
+    r"/jobs?/[a-z0-9_-]*\d{4,}[a-z0-9_-]*/?",
+]
+
 
 def _wait_for_content(
     evaluate,
@@ -1306,6 +1450,19 @@ def _wait_for_content(
             for (const sel of sels) {{
                 if (document.querySelectorAll(sel).length >= 3) {{
                     return JSON.stringify({{present: true, selector: sel}});
+                }}
+            }}
+            // Job-board fallback: >= 3 links whose href looks like a job detail
+            // (e.g. AMN /job-details/3515728/...).  Lets us recognize React/SPA
+            // job boards as "content present" so their links aren't discarded.
+            const jobPats = {json.dumps(_JOB_LINK_HREF_PATTERNS)}.map(p => new RegExp(p));
+            let jobCount = 0;
+            for (const a of document.querySelectorAll('a[href]')) {{
+                if (jobPats.some(re => re.test(a.href))) {{
+                    jobCount++;
+                    if (jobCount >= 3) {{
+                        return JSON.stringify({{present: true, selector: "job-link-pattern"}});
+                    }}
                 }}
             }}
             return JSON.stringify({{present: false}});
@@ -1419,6 +1576,24 @@ def _visit_and_extract(
 
     findings["listing_page"].update(listing_data)
     product_count = len(listing_data.get("product_links", []))
+
+    # Accumulate backend JSON API endpoints across ALL page visits.  SPAs
+    # (React/Vue job boards, e.g. AMN) fetch listings via XHR; capturing the
+    # endpoint on one page must survive a later, non-SPA page overwriting
+    # listing_page.  Store deduped-by-URL in a persistent top-level list so the
+    # code-writer can emit a clean api_scraper.
+    page_apis = listing_data.get("api_endpoints") or []
+    if page_apis:
+        all_apis = findings.setdefault("api_endpoints", [])
+        seen = {a.get("url") for a in all_apis}
+        for api in page_apis:
+            if api.get("url") and api.get("url") not in seen:
+                all_apis.append(api)
+                seen.add(api.get("url"))
+        logger.info(
+            "navigate_explore: captured %d backend API endpoint(s) on %s (accumulated %d)",
+            len(page_apis), page_url[:80], len(all_apis),
+        )
 
     if product_count > 0:
         actual_url_raw = _invoke_tool(
@@ -1584,6 +1759,457 @@ def _has_real_product_links(findings: dict) -> bool:
     return True
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Classic dropdown-form search (job boards, classifieds, real-estate listings)
+# ────────────────────────────────────────────────────────────────────────────
+# Many sites — especially JOB PORTALS — expose a dedicated "classic search"
+# page with multiple <select> dropdowns (discipline/specialty, location,
+# category) behind a POST form, instead of a keyword search box.  Keyword-GET
+# search (STEP 3a-3c) cannot handle these: the criteria live in a server-side
+# session, not the URL.  This strategy activates ONLY when keyword search
+# produced no item links: it locates the search page, fills the dropdowns,
+# submits, and — critically — detects the result-page filters (e.g. a "Date
+# Posted" / "Last 7 Days" select) that job scraping needs.
+
+_CLASSIC_SEARCH_LINK_RE = re.compile(
+    r"(jobsearch|quicksearch|quick-?search|find-?a-?job|job-?search|"
+    r"browse-?jobs?|search-?jobs?|/search/|/jobs?/search|postings?|vacanc"
+    r"|search-?results?)",
+    re.I,
+)
+
+
+def _find_classic_search_candidates(homepage_data: dict, base_url: str) -> list[str]:
+    """Return ranked candidate URLs for a classic search page (Find a Job, etc.)."""
+    raw_links: list = []
+    for key in ("category_links", "nav_links", "all_links", "links"):
+        raw_links.extend(homepage_data.get(key, []) or [])
+    seen: set[str] = set()
+    scored: list[tuple[int, str]] = []
+    for link in raw_links:
+        href = (link.get("href") if isinstance(link, dict) else link) or ""
+        text = (link.get("text") if isinstance(link, dict) else "") or ""
+        href = (href or "").strip()
+        if not href or href.startswith("#") or href.lower().startswith("javascript"):
+            continue
+        absu = urljoin(base_url, href)
+        if not absu.startswith("http") or absu in seen:
+            continue
+        seen.add(absu)
+        hay = (absu + " " + text).lower()
+        score = 0
+        if any(k in hay for k in ("jobsearch", "quicksearch", "quick-search", "/search")):
+            score += 6
+        if _CLASSIC_SEARCH_LINK_RE.search(hay):
+            score += 3
+        if score:
+            scored.append((score, absu))
+    scored.sort(key=lambda x: -x[0])
+    return [u for _, u in scored[:5]]
+
+
+# Detect a "classic search" form: a <form> with >= 2 populated <select>s.
+_CLASSIC_FORM_DETECT_JS = r"""
+() => {
+  const forms = Array.from(document.querySelectorAll('form'));
+  let best = null;
+  for (const f of forms) {
+    const selects = Array.from(f.querySelectorAll('select'))
+      .filter(s => s.options && s.options.length > 2);
+    if (selects.length < 2) continue;
+    const infos = selects.map(s => {
+      const name = s.name || s.id || '';
+      const selector = s.name ? `select[name="${s.name}"]` : (s.id ? `select#${s.id}` : '');
+      const options = Array.from(s.options).map(o => ({
+        v: o.value || '', t: (o.textContent || '').trim()
+      })).filter(o => o.t || o.v);
+      return {name, selector, optionCount: s.options.length, options: options.slice(0, 80)};
+    });
+    const score = selects.length;
+    if (!best || score > best.score) {
+      best = {
+        score,
+        action: (f.getAttribute('action') || f.action || ''),
+        method: (f.getAttribute('method') || 'get').toLowerCase(),
+        selects: infos,
+      };
+    }
+  }
+  return JSON.stringify(best || {score: 0, selects: []});
+}
+"""
+
+
+def _build_classic_fill_js(criteria: str) -> str:
+    """JS that classifies each select, picks a sensible option, and submits.
+
+    * category/specialty selects -> option whose label/value matches the search
+      criteria (fallback: first non-blank, non-'Any' option).
+    * location/date selects on the SEARCH form -> 'Any'/blank when available
+      (broad results for discovery; the real targeting happens via the detected
+      result-page filters).
+    """
+    crit_lit = json.dumps((criteria or "").lower())
+    return (
+        r"""
+    () => {
+      const crit = """
+        + crit_lit
+        + r""";
+      const STATE_RE = /\b(alabama|alaska|arizona|california|texas|florida|new york|georgia|michigan|ohio|illinois|washington)\b/i;
+      function classify(opts) {
+        const vals = opts.map(o => (o.v || '').toLowerCase());
+        const txt = opts.map(o => (o.t || '')).join(' ');
+        const twoLetter = vals.filter(v => v.length === 2 && /^[a-z]{2}$/.test(v)).length;
+        if (STATE_RE.test(txt) || twoLetter >= 8) return 'location';
+        if (/\b(last|past|days?|weeks?|months?|any|posted)\b/i.test(txt)) return 'date';
+        return 'category';
+      }
+      function pick(opts, kind) {
+        const real = opts.filter(o => (o.t || o.v) && !/^\s*(any|all|please|select|choose)/i.test(o.t));
+        if (kind === 'category') {
+          let m = opts.find(o => o.t && crit && o.t.toLowerCase().includes(crit));
+          if (!m) m = opts.find(o => o.v && crit && o.v.toLowerCase().includes(crit));
+          if (m) return m.v;
+          return (real[0] || opts[1] || opts[0] || {}).v || '';
+        }
+        let any = opts.find(o => /^\s*(any|all)\s*$/i.test(o.t) || o.v === '');
+        if (any) return any.v;
+        return (real[0] || opts[1] || opts[0] || {}).v || '';
+      }
+      let form = null;
+      document.querySelectorAll('form').forEach(f => {
+        const n = f.querySelectorAll('select').length;
+        if (n >= 2 && (!form || n > form.querySelectorAll('select').length)) form = f;
+      });
+      if (!form) return JSON.stringify({submitted: false, reason: 'no multi-select form'});
+      const fills = [];
+      Array.from(form.querySelectorAll('select')).forEach(s => {
+        if (!s.options || s.options.length < 2) return;
+        const opts = Array.from(s.options).map(o => ({v: o.value || '', t: (o.textContent || '').trim()}));
+        const kind = classify(opts);
+        if (kind === 'date') return;
+        const val = pick(opts, kind);
+        try {
+          s.value = val;
+          s.dispatchEvent(new Event('input', {bubbles: true}));
+          s.dispatchEvent(new Event('change', {bubbles: true}));
+          fills.push({name: s.name || s.id, kind, value: val});
+        } catch (e) {}
+      });
+      let submitted = false;
+      // Prefer clicking the submit button: ASP.NET/jQuery formValidation
+      // (e.g. formValidation.js) attaches to the button click and gates the
+      // submit on validation, so requestSubmit()/submit() get blocked.
+      let btn = form.querySelector(
+        'input[type="submit"], button[type="submit"], button:not([type])'
+      );
+      if (!btn) {
+        btn = Array.from(form.querySelectorAll('button, input[type="button"], a.btn, a.button'))
+          .find(b => /\b(search|go|find|submit|view|results?)\b/i.test((b.textContent || '') + ' ' + (b.value || '')));
+      }
+      let via = 'none';
+      try {
+        if (btn) { btn.click(); via = 'button'; }
+        else if (typeof form.requestSubmit === 'function') { form.requestSubmit(); via = 'requestSubmit'; }
+        else { form.submit(); via = 'submit'; }
+        submitted = true;
+      } catch (e) {}
+      return JSON.stringify({submitted, via, fills, action: form.getAttribute('action') || ''});
+    }
+    """
+    )
+
+
+# Detect date/location/category filter <select>s on a RESULTS page.
+# For each, also capture the enclosing filter form's action + submit button so
+# the generated scraper knows HOW to apply the filter (some sites auto-submit
+# on change; others, e.g. LocumTenens, need an explicit "Search" button click).
+_RESULT_FILTER_DETECT_JS = r"""
+() => {
+  const out = {date: [], location: [], category: []};
+  function formInfo(s) {
+    const f = s.closest('form');
+    if (!f) return {};
+    const btn = f.querySelector('button[type="submit"], input[type="submit"]');
+    let btnSel = '';
+    if (btn) {
+      if (btn.id) btnSel = `#${btn.id}`;
+      else if (btn.name) btnSel = `${btn.tagName.toLowerCase()}[${btn.type}][name="${btn.name}"]`;
+      else btnSel = `${btn.tagName.toLowerCase()}[type="${btn.type}"]`;
+    }
+    return {form_id: f.id || '', form_action: (f.getAttribute('action') || f.action || ''),
+            submit_button: btnSel, submit_text: btn ? (btn.textContent || btn.value || '').trim().slice(0, 24) : ''};
+  }
+  document.querySelectorAll('select').forEach(s => {
+    const name = (s.name || s.id || '').toLowerCase();
+    const opts = Array.from(s.options).map(o => ({
+      v: (o.value || ''), t: (o.textContent || '').trim()
+    }));
+    const selector = s.name ? `select[name="${s.name}"]` : (s.id ? `select#${s.id}` : '');
+    const isDate = /(jobage|age|date|posted|recent|fromage)/.test(name)
+      || opts.some(o => /(last|past)\s*\d+\s*day|\d+\s*day|days?/.test((o.t || '').toLowerCase()));
+    const isLoc = /(loc|state|region|city|geo|where|facility)/.test(name)
+      || opts.filter(o => /^[a-z]{2}$/.test((o.v || '').toLowerCase())).length >= 6;
+    const isCat = /(spec|categ|discip|profess|depart|jobtype|role|title)/.test(name);
+    const entry = Object.assign(
+      {selector, name: s.name || s.id || '', options: opts.slice(0, 50)},
+      formInfo(s)
+    );
+    if (isDate && !isLoc) out.date.push(entry);
+    else if (isLoc) out.location.push(entry);
+    else if (isCat) out.category.push(entry);
+  });
+  return JSON.stringify(out);
+}
+"""
+
+
+# Best-effort: apply a "last 7 days"-style date filter on the results page and
+# re-submit, so we can prove (via before/after counts) that filtering works.
+# Bootstrap-multiselect widgets ignore a bare native select.value change, so we
+# try the jQuery multiselect API, then the checkbox click, then the native
+# change event (which the site's onchange handler turns into a form submit).
+_DATE_APPLY_JS = r"""
+() => {
+  const selects = Array.from(document.querySelectorAll('select'));
+  let dateSel = null, target = null;
+  for (const s of selects) {
+    const name = (s.name || s.id || '').toLowerCase();
+    const opts = Array.from(s.options);
+    const isDate = /(jobage|age|date|posted|recent|fromage)/.test(name)
+      || opts.some(o => /(last|past)\s*\d+\s*day/.test((o.textContent || '').toLowerCase()));
+    if (!isDate) continue;
+    target = opts.find(o => /last\s*7\s*day/i.test(o.textContent || ''))
+      || opts.find(o => o.value === '7')
+      || opts.find(o => /7/.test(o.value));
+    if (target) { dateSel = s; break; }
+  }
+  if (!dateSel || !target) return JSON.stringify({applied: false});
+  const name = dateSel.name || dateSel.id;
+  const jq = window.jQuery || window.$;
+  const methods = [];
+  // Method 1: bootstrap-multiselect jQuery API
+  try {
+    if (jq && jq.fn && jq.fn.multiselect) { jq(dateSel).multiselect('select', target.value); methods.push('jq.multiselect'); }
+  } catch (e) {}
+  // Method 2: click the matching checkbox inside the multiselect dropdown
+  try {
+    const wrap = dateSel.closest('.multiselect-native-select') || dateSel.parentElement;
+    const scope = wrap ? wrap : document;
+    const cb = Array.from(scope.querySelectorAll('input[type=checkbox]'))
+      .find(c => c.value === target.value);
+    if (cb) { cb.click(); methods.push('checkbox.click'); }
+  } catch (e) {}
+  // Method 3: native select + change (site onchange -> form submit)
+  try { dateSel.value = target.value; } catch (e) {}
+  dateSel.dispatchEvent(new Event('input', {bubbles: true}));
+  dateSel.dispatchEvent(new Event('change', {bubbles: true}));
+  methods.push('native.change');
+  // Fallback: explicit submit of the enclosing filter form
+  const form = dateSel.closest('form');
+  let submitted = false;
+  if (form) {
+    try {
+      const btn = form.querySelector('input[type=submit], button[type=submit]');
+      if (btn) { btn.click(); submitted = true; }
+      else if (form.requestSubmit) { form.requestSubmit(); submitted = true; }
+      else { form.submit(); submitted = true; }
+    } catch (e) {}
+  }
+  return JSON.stringify({
+    applied: true, name, value: target.value,
+    label: (target.textContent || '').trim(), methods, submitted,
+  });
+}
+"""
+
+
+def _try_classic_dropdown_search(
+    navigate,
+    evaluate,
+    homepage_data: dict,
+    search_criteria: str,
+    findings: dict,
+    base_url: str,
+) -> bool:
+    """Classic dropdown-form search for sites without keyword-GET search.
+
+    Returns True if real item links were found.  The caller only invokes this
+    when keyword search (STEP 3a-3c) yielded nothing, so product sites (whose
+    keyword search works) never enter this path.
+    """
+    import time
+
+    candidates = _find_classic_search_candidates(homepage_data, base_url)
+    # Also probe the homepage itself (some sites put the dropdown form there).
+    probe_urls = candidates + ([base_url] if base_url not in candidates else [])
+
+    search_form_found = None
+    search_page_url = None
+    for purl in probe_urls[:5]:
+        logger.info("navigate_explore: classic-search — probing %s", purl)
+        _invoke_tool(navigate, url=purl)
+        time.sleep(2)
+        detect_raw = _invoke_tool(evaluate, function=_CLASSIC_FORM_DETECT_JS)
+        detect = _parse_eval_json(detect_raw) or {}
+        n_sel = len(detect.get("selects") or [])
+        if detect.get("score", 0) >= 2 and n_sel >= 2:
+            search_form_found = detect
+            search_page_url = purl
+            logger.info(
+                "navigate_explore: classic-search form detected on %s (%d selects, action=%s)",
+                purl, n_sel, detect.get("action"),
+            )
+            break
+
+    if not search_form_found:
+        logger.info(
+            "navigate_explore: classic-search — no multi-select form on any candidate page"
+        )
+        return False
+
+    findings["search_attempted"] = True
+    findings["homepage_nav"]["classic_search"] = {
+        "url": search_page_url,
+        "action": search_form_found.get("action"),
+        "method": search_form_found.get("method"),
+        "selects": search_form_found.get("selects"),
+    }
+
+    # Fill selects + submit.  ASP.NET/jQuery formValidation wires up async, so
+    # the first button click can race and not navigate — retry the submit while
+    # the URL hasn't changed away from the search form page.
+    fill_js = _build_classic_fill_js(search_criteria)
+    fill_raw = _invoke_tool(evaluate, function=fill_js)
+    fill_result = _parse_eval_json(fill_raw) or {}
+    logger.info(
+        "navigate_explore: classic-search fill+submit -> %s", str(fill_result)[:200]
+    )
+
+    submit_js = r"""
+    () => {
+      let form = null;
+      document.querySelectorAll('form').forEach(f => {
+        const n = f.querySelectorAll('select').length;
+        if (n >= 2 && (!form || n > form.querySelectorAll('select').length)) form = f;
+      });
+      if (!form) return JSON.stringify({ok: false, reason: 'no form'});
+      let btn = form.querySelector('input[type="submit"], button[type="submit"], button:not([type])');
+      if (!btn) btn = Array.from(form.querySelectorAll('button, input[type="button"]'))
+        .find(b => /\b(search|go|find|submit|view|results?)\b/i.test((b.textContent || '') + ' ' + (b.value || '')));
+      let via = 'none';
+      try {
+        if (btn) { btn.click(); via = 'button'; }
+        else if (typeof form.requestSubmit === 'function') { form.requestSubmit(); via = 'requestSubmit'; }
+        else { form.submit(); via = 'submit'; }
+      } catch (e) { return JSON.stringify({ok: false, reason: String(e).slice(0, 120)}); }
+      return JSON.stringify({ok: true, via});
+    }
+    """
+
+    def _current_url() -> str:
+        raw = _invoke_tool(evaluate, function="() => window.location.href")
+        mm = re.search(r'"(https?://[^"]+)"', raw or "")
+        return mm.group(1) if mm else ""
+
+    time.sleep(3)
+    for _attempt in range(4):
+        cur = _current_url()
+        if cur.rstrip("/").lower() != search_page_url.rstrip("/").lower():
+            break  # navigated to results
+        _invoke_tool(evaluate, function=submit_js)
+        time.sleep(4)
+
+    content_status = _wait_for_content(evaluate, timeout=25)
+    if not content_status.get("loaded"):
+        time.sleep(8)
+
+    # Capture results URL (often session-based, e.g. ?sId=...)
+    results_url = _current_url() or search_page_url
+
+    listing_raw = _invoke_tool(evaluate, function=_LISTING_PAGE_EXTRACTION_JS)
+    listing_data = _parse_eval_json(listing_raw) or {}
+    # Only discard extracted links if we never left the search form page. The
+    # content-wait heuristic times out on SSR results pages (ASP.NET MVC) even
+    # when the job links are fully present — and we read filters fine, so the
+    # page IS loaded. Trust the links whenever the URL actually changed.
+    navigated = (
+        results_url.rstrip("/").lower() != search_page_url.rstrip("/").lower()
+    )
+    if not content_status.get("loaded") and not navigated:
+        listing_data["product_links"] = []
+        listing_data["total_products"] = None
+
+    findings["listing_page"] = findings.get("listing_page", {}) or {}
+    findings["listing_page"].update(listing_data)
+    findings["listing_page"]["url"] = results_url
+    findings["listing_page"]["discovery"] = "classic_form_search"
+    findings["listing_page"]["classic_search_url"] = search_page_url
+
+    prod_count = len(findings["listing_page"].get("product_links", []))
+    logger.info(
+        "navigate_explore: classic-search extracted %d item links from %s",
+        prod_count, results_url,
+    )
+
+    # Detect result-page filters (date / location / category selects).
+    filt_raw = _invoke_tool(evaluate, function=_RESULT_FILTER_DETECT_JS)
+    filt = _parse_eval_json(filt_raw) or {}
+    filter_ui = {
+        "date_selectors": filt.get("date", []) or [],
+        "location_selectors": filt.get("location", []) or [],
+        "category_selectors": filt.get("category", []) or [],
+    }
+    findings["listing_page"]["filter_ui"] = filter_ui
+    if filter_ui["date_selectors"] or filter_ui["location_selectors"] or filter_ui["category_selectors"]:
+        logger.info(
+            "navigate_explore: classic-search detected result filters — date=%d loc=%d cat=%d",
+            len(filter_ui["date_selectors"]),
+            len(filter_ui["location_selectors"]),
+            len(filter_ui["category_selectors"]),
+        )
+
+    found = prod_count > 0
+
+    # Best-effort proof: apply "last 7 days" and record before/after counts.
+    if found and filter_ui["date_selectors"]:
+        before = prod_count
+        apply_raw = _invoke_tool(evaluate, function=_DATE_APPLY_JS)
+        apply_res = _parse_eval_json(apply_raw) or {}
+        if apply_res.get("applied"):
+            logger.info(
+                "navigate_explore: applied date filter %s=%s (%s) via %s — waiting for refresh",
+                apply_res.get("name"), apply_res.get("value"),
+                apply_res.get("label"), apply_res.get("methods"),
+            )
+            time.sleep(3)
+            try:
+                _wait_for_content(evaluate, timeout=20)
+            except Exception:
+                pass
+            re_raw = _invoke_tool(evaluate, function=_LISTING_PAGE_EXTRACTION_JS)
+            re_data = _parse_eval_json(re_raw) or {}
+            after = len(re_data.get("product_links", []))
+            findings["listing_page"]["date_filter_proof"] = {
+                "applied": apply_res.get("applied"),
+                "filter": apply_res.get("name"),
+                "value": apply_res.get("value"),
+                "label": apply_res.get("label"),
+                "methods": apply_res.get("methods"),
+                "count_before": before,
+                "count_after": after,
+            }
+            logger.info(
+                "navigate_explore: date filter changed item count %d -> %d",
+                before, after,
+            )
+            if re_data.get("product_links"):
+                findings["listing_page"]["product_links"] = re_data["product_links"]
+
+    return found
+
+
 def _try_interactive_pagination(evaluate, findings: dict) -> None:
     """Try clicking Load More / Next Page / infinite scroll to get more products."""
     import time
@@ -1747,6 +2373,7 @@ def _do_explore_via_browser(
     search_criteria: str,
     site_analysis: dict,
     search_url: str = "",
+    is_job_site: bool = False,
 ) -> dict[str, Any]:
     """Run the exploration procedure using Playwright MCP tools.
 
@@ -1866,9 +2493,38 @@ def _do_explore_via_browser(
 
     found_products = False
 
+    # ── STEP 3 (job sites): Classic dropdown-form search FIRST ────────────
+    # Job portals use a multi-<select> POST form (no keyword box), so the
+    # keyword strategies below are futile and slow. Run classic search first;
+    # only fall through to keyword search if it finds nothing.
+    if is_job_site and search_criteria:
+        logger.info("navigate_explore: STEP 3 (job) — classic dropdown-form search")
+        try:
+            if _try_classic_dropdown_search(
+                navigate,
+                evaluate,
+                findings.get("homepage_nav", {}),
+                search_criteria,
+                findings,
+                base_url,
+            ):
+                found_products = True
+        except Exception as exc:
+            logger.warning(
+                "navigate_explore: classic-search (job-first) failed: %s",
+                str(exc)[:200],
+            )
+            findings["errors"].append(f"classic_search error: {str(exc)[:160]}")
+
     # 3a: PRIMARY — Interactive form-based search (type into search box + Enter)
     form_search_count = 0
-    if search_criteria and search_form and search_form.get("search_input_selector"):
+    if (
+        not found_products
+        and not is_job_site
+        and search_criteria
+        and search_form
+        and search_form.get("search_input_selector")
+    ):
         logger.info(
             "navigate_explore: STEP 3a — interactive form search for '%s'",
             search_criteria,
@@ -1885,7 +2541,7 @@ def _do_explore_via_browser(
     # 3b: SECONDARY — URL-based search
     # Also try when form search worked to compare — form search may use a
     # different/lower-result endpoint (e.g. search.aspx vs /search?searchTerm=)
-    if search_criteria and (not found_products or form_search_count < 30):
+    if not is_job_site and search_criteria and (not found_products or form_search_count < 30):
         findings["search_attempted"] = True
         search_urls = _build_search_urls(
             search_form, search_criteria, effective_base_url, homepage_data
@@ -1921,7 +2577,7 @@ def _do_explore_via_browser(
     # Also attempt when URL search found very few products (<10) — the trigger-based
     # form search often yields many more results (e.g. CK UK: URL=5, form=48+93)
     current_count = len(findings.get("listing_page", {}).get("product_links", []))
-    if search_criteria and (not found_products or current_count < 10):
+    if not is_job_site and search_criteria and (not found_products or current_count < 10):
         # Navigate back to homepage for search trigger/form access
         logger.info("navigate_explore: STEP 3c — navigating to homepage for search access")
         homepage_url = effective_base_url if effective_base_url else base_url
@@ -1971,6 +2627,29 @@ def _do_explore_via_browser(
             )
             if _has_real_product_links(findings):
                 found_products = True
+
+    # ── STEP 3d: Classic dropdown-form search (job boards / classifieds) ──
+    # Activates ONLY when keyword search (3a-3c) found nothing (and not already
+    # tried as the job-first strategy above). Locates a dedicated search page
+    # with multiple <select> dropdowns, fills + submits the POST form, and
+    # detects result-page filters (e.g. "Last 7 Days").
+    if search_criteria and not found_products and not is_job_site:
+        logger.info("navigate_explore: STEP 3d — classic dropdown-form search")
+        try:
+            if _try_classic_dropdown_search(
+                navigate,
+                evaluate,
+                findings.get("homepage_nav", {}),
+                search_criteria,
+                findings,
+                base_url,
+            ):
+                found_products = True
+        except Exception as exc:
+            logger.warning(
+                "navigate_explore: classic-search failed: %s", str(exc)[:200]
+            )
+            findings["errors"].append(f"classic_search error: {str(exc)[:160]}")
 
     # ── STEP 4: Interactive pagination ──────────────────────────────────
     if found_products:
@@ -2086,6 +2765,72 @@ def _detect_and_save_url_patterns(
     url_patterns = _detect_url_patterns(all_links, base_url)
     if url_patterns:
         findings["url_patterns"] = url_patterns
+
+
+# ── Filter parameter classification (URL-based filtering for job portals) ──
+
+_FILTER_DATE_KEYS = {
+    "date_posted", "posted", "posteddate", "days", "fromage",
+    "daterange", "date", "pd", "postedwithin", "age",
+}
+_FILTER_LOCATION_KEYS = {
+    "location", "l", "loc", "city", "state", "st", "radius",
+    "lat", "lng", "geo", "where", "region",
+}
+_FILTER_CATEGORY_KEYS = {
+    "category", "cat", "job_type", "jt", "specialty", "discipline",
+    "profession", "department", "profession_id",
+}
+
+
+def _classify_filter_param(key_lower: str) -> str:
+    if key_lower in _FILTER_DATE_KEYS:
+        return "url_date_params"
+    if key_lower in _FILTER_LOCATION_KEYS:
+        return "url_location_params"
+    if key_lower in _FILTER_CATEGORY_KEYS:
+        return "url_category_params"
+    return "url_other_params"
+
+
+def _enrich_filters_from_listing_url(findings: dict) -> None:
+    """Populate ``listing_page.detected_filters`` from the listing URL's query.
+
+    Covers the HTTP/BeautifulSoup fallback path where the browser JS filter
+    detector does not run.  If the browser path already populated
+    ``detected_filters`` with params, this is a no-op (preserves richer data).
+    """
+    listing = findings.get("listing_page", {}) or {}
+    listing_url = listing.get("url", "")
+    existing = listing.get("detected_filters") or {}
+    # Skip if browser path already captured URL params
+    if any(
+        existing.get(bucket)
+        for bucket in ("url_date_params", "url_location_params", "url_category_params")
+    ):
+        return
+    if not listing_url:
+        return
+    detected: dict[str, list] = {
+        "url_date_params": [],
+        "url_location_params": [],
+        "url_category_params": [],
+        "url_other_params": [],
+    }
+    try:
+        query = urlparse(listing_url).query
+        if not query:
+            return
+        from urllib.parse import parse_qsl
+
+        for key, value in parse_qsl(query, keep_blank_values=True):
+            bucket = _classify_filter_param(key.lower())
+            detected[bucket].append({"param": key, "value": value})
+        # Merge into existing detected_filters (browser may have set empty buckets)
+        merged = {**detected, **{k: v for k, v in existing.items() if v}}
+        listing["detected_filters"] = merged
+    except Exception as exc:
+        logger.debug("navigate_explore: filter URL enrichment failed: %s", exc)
 
 
 def _extract_json_ld(soup, base_url: str) -> dict[str, Any]:
@@ -2459,7 +3204,7 @@ def _extract_pagination_bs(soup, base_url: str, listing_page: dict) -> None:
 
 
 def _fetch_via_probe_html(url: str) -> str:
-    """Fetch page HTML via browser-service /render endpoint.
+    """Fetch page HTML via browser_service /render endpoint.
 
     Uses the correct access method (UC Chrome for Akamai sites, Playwright
     for JS-heavy sites, direct HTTP for simple sites).  This bypasses
@@ -2467,7 +3212,7 @@ def _fetch_via_probe_html(url: str) -> str:
     """
     import httpx
 
-    service_url = os.environ.get("BROWSER_SERVICE_URL", "http://browser-service:8001")
+    service_url = os.environ.get("BROWSER_SERVICE_URL", "http://browser_service:8001")
     from src.geo import detect_country as _detect_country
 
     country = _detect_country(url)
@@ -2966,6 +3711,15 @@ def navigate_explore(state: dict, config=None) -> dict[str, Any]:
     root = getattr(settings, "PROJECT_ROOT", os.getcwd())
     site_analysis = _read_site_analysis(root, slug)
 
+    # Job portals use a "classic" dropdown-form search instead of a keyword
+    # search box; prioritize that strategy and skip the (futile, slow) keyword
+    # URL enumeration for them. Product/article sites are unaffected.
+    page_type = (state.get("page_type") or "").lower()
+    ct_type = ((site_analysis.get("content_type") or {}).get("type") or "").lower()
+    is_job_site = page_type.startswith("job") or ct_type == "job_posting"
+    if is_job_site:
+        logger.info("navigate_explore: job site detected — classic search first")
+
     # ── Route based on probe determination ──────────────────────────────
     playwright_unavailable = False
 
@@ -3012,6 +3766,7 @@ def navigate_explore(state: dict, config=None) -> dict[str, Any]:
                     search_criteria,
                     site_analysis,
                     search_url=search_url,
+                    is_job_site=is_job_site,
                 )
             finally:
                 from agents.tools.context import clear_tool_context
@@ -3046,6 +3801,7 @@ def navigate_explore(state: dict, config=None) -> dict[str, Any]:
                             search_criteria,
                             site_analysis,
                             search_url=search_url,
+                            is_job_site=is_job_site,
                         )
                     finally:
                         from agents.tools.context import clear_tool_context
@@ -3171,6 +3927,9 @@ def navigate_explore(state: dict, config=None) -> dict[str, Any]:
     # Write findings to workspace
     findings_path = os.path.join(root, "workspace", slug, "navigation_findings.json")
     os.makedirs(os.path.dirname(findings_path), exist_ok=True)
+
+    # Enrich filter detection from the listing URL (covers HTTP fallback path)
+    _enrich_filters_from_listing_url(findings)
 
     findings["metadata"] = {
         "site_url": url,

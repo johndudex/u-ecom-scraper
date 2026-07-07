@@ -137,7 +137,7 @@ All configuration is via environment variables. Copy `.env.example` to `.env` an
 
 ### Proxy Configuration
 
-Proxy credentials are passed as environment variables (picked up by `browser-service`). Alternatively, create `config/proxy.json` for local development (this file is gitignored):
+Proxy credentials are passed as environment variables (picked up by `browser_service`). Alternatively, create `config/proxy.json` for local development (this file is gitignored):
 
 ```json
 {
@@ -177,7 +177,7 @@ u-ecom-scraper/
 │   │   ├── services.py           # LangGraphService
 │   │   └── views.py              # Django views + SSE streaming + health API
 │   └── config/                   # Django settings, Celery config, URLs
-├── browser-service/              # Browser automation (FastAPI + Chrome)
+├── browser_service/             # Browser automation (FastAPI + Chrome)
 │   ├── Dockerfile                # Chrome + Xvfb + SeleniumBase + Playwright
 │   ├── server.py                 # /probe, /scrape, /health endpoints
 │   ├── browser_pool.py           # Chrome lifecycle management
@@ -243,7 +243,7 @@ docker compose --profile full up --build -d
 docker compose logs -f celery-worker
 
 # View browser service logs
-docker compose logs -f browser-service
+docker compose logs -f browser_service
 
 # Restart a single service
 docker compose restart celery-worker
@@ -301,7 +301,7 @@ Output files are versioned with timestamps so you can track price changes across
 
 ## Architecture
 
-See [docs/architecture.md](docs/architecture.md) for the full architecture diagram including graph flow, inter-container communication, tool matrix, and design decisions.
+See [OVERVIEW.md](OVERVIEW.md) for the full system overview including data flow, pipeline phases, agent roles, and design decisions.
 
 ## Skills System
 

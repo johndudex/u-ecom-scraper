@@ -330,9 +330,9 @@ async def _start_cdp_proxy(public_port: int, internal_port: int, label: str):
             header_data = await client_reader.read(65536)
             if header_data:
                 patched = header_data.replace(
-                    b"Host: browser-service:", b"Host: localhost:"
+                    b"Host: browser_service:", b"Host: localhost:"
                 ).replace(
-                    b"Host: u-ecom-scraper-browser-service-1:", b"Host: localhost:"
+                    b"Host: u-ecom-scraper-browser_service-1:", b"Host: localhost:"
                 )
                 if b"Host:" not in header_data and b"GET " in header_data:
                     first_line = header_data.split(b"\r\n")[0]
@@ -358,7 +358,7 @@ async def _start_cdp_proxy(public_port: int, internal_port: int, label: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting browser-service...")
+    logger.info("Starting browser_service...")
     startup_result = browser_pool.startup()
     if startup_result.get("errors"):
         logger.warning("Browser pool started with errors: %s", startup_result["errors"])
@@ -398,7 +398,7 @@ async def lifespan(app: FastAPI):
                 mcp_process.kill()
     for s in proxy_servers:
         s.close()
-    logger.info("Shutting down browser-service...")
+    logger.info("Shutting down browser_service...")
     browser_pool.shutdown()
 
 
@@ -408,6 +408,46 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+
+def _cloak_info() -> dict:
+    """CloakBrowser binary status (cheap — no browser launch).
+
+    Used by ``/health`` to surface whether the stealth Chromium is installed,
+    and by ``/restart-cloak`` after a re-download.
+    """
+    try:
+        from cloakbrowser import binary_info
+
+        info = binary_info() or {}
+        return {
+            "available": bool(info.get("installed")),
+            "version": info.get("version"),
+            "platform": info.get("platform"),
+            "binary_path": info.get("path") or info.get("binary_path"),
+        }
+    except Exception as exc:
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _cloak_launch_ok() -> bool:
+    """Deep check: actually launch cloak + load a page. ~3-5s. For restart verification."""
+    browser = None
+    try:
+        from cloakbrowser import launch
+
+        browser = launch(headless=True)
+        page = browser.new_page()
+        page.goto("https://example.com", timeout=20000)
+        return bool(page.title())
+    except Exception:
+        return False
+    finally:
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
 
 @app.get("/health")
@@ -434,10 +474,34 @@ async def health():
             "mcp_process_alive": mcp_process_alive,
             "proxy_datacenter": "available" if dc_available else "not configured",
             "proxy_residential": "available" if res_available else "not configured",
+            "cloak": _cloak_info(),
             "uptime_seconds": time.monotonic(),
         },
         status_code=200 if status == "ok" else 503,
     )
+
+
+@app.post("/restart-cloak")
+async def restart_cloak(verify: bool = True):
+    """Re-download the CloakBrowser stealth binary (e.g. if missing/corrupt),
+    then optionally verify it launches. Returns the new binary info."""
+    def _redo():
+        from cloakbrowser import clear_cache, ensure_binary
+
+        try:
+            clear_cache()
+        except Exception:
+            pass
+        return ensure_binary()
+
+    binary_path = await asyncio.get_event_loop().run_in_executor(None, _redo)
+    launch_ok = await asyncio.get_event_loop().run_in_executor(None, _cloak_launch_ok) if verify else None
+    return {
+        "reinstalled": bool(binary_path),
+        "binary_path": binary_path,
+        "launch_ok": launch_ok,
+        "info": _cloak_info(),
+    }
 
 
 class RestartCdpRequest(BaseModel):
@@ -503,7 +567,7 @@ async def probe(request: ProbeRequest):
 
 @app.post("/probe-single")
 async def probe_single(request: SingleProbeRequest):
-    from .probe import _try_direct_http, _try_playwright, _try_uc_chrome
+    from .probe import _try_direct_http, _try_playwright, _try_uc_chrome, _try_cloak
     from src.geo import detect_country as _detect_country
 
     method = request.method
@@ -526,6 +590,15 @@ async def probe_single(request: SingleProbeRequest):
         ),
         "playwright_residential": lambda: _try_playwright(
             request.url, "residential", min(request.timeout, 35), country=country
+        ),
+        "cloak_none": lambda: _try_cloak(
+            request.url, "none", min(request.timeout, 45)
+        ),
+        "cloak_datacenter": lambda: _try_cloak(
+            request.url, "datacenter", min(request.timeout, 45), country=country
+        ),
+        "cloak_residential": lambda: _try_cloak(
+            request.url, "residential", min(request.timeout, 45), country=country
         ),
         "uc_chrome_none": lambda: _try_uc_chrome(
             request.url, "none", min(request.timeout, 40)

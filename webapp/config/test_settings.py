@@ -13,3 +13,6 @@ CELERY_TASK_ALWAYS_EAGER = True
 
 SECRET_KEY = "test-secret-key-not-for-production"
 DEBUG = True
+# Tests hit @login_required views; the DebugAutoLoginMiddleware auto-logs in the
+# first superuser when this is set (conftest.py creates one). Avoids per-test login.
+DEBUG_AUTO_LOGIN = True

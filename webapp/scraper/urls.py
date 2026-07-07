@@ -77,6 +77,7 @@ urlpatterns = [
         name="approval_inline",
     ),
     path("jobs/<int:job_id>/scraper-code/", views.scraper_code, name="scraper_code"),
+    path("jobs/<int:job_id>/dagster-code/", views.dagster_code, name="dagster_code"),
     path(
         "jobs/<int:job_id>/output/<str:filename>/",
         views.job_output_view,
@@ -102,4 +103,5 @@ urlpatterns = [
     ),
     path("health/", views.health_dashboard, name="health"),
     path("api/health/", views.health_api, name="health_api"),
+    path("jobs-dashboard/", views.jobs_dashboard, name="jobs_dashboard"),
 ]

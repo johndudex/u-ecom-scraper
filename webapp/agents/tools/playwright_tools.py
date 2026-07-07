@@ -4,8 +4,8 @@ Connects to the Playwright MCP server (running in Docker) via SSE transport
 using the ``mcp`` library directly, then converts MCP tools to LangChain
 BaseTool instances.
 
-The MCP server connects to browser-service's no-proxy Chrome instance via CDP
-(`http://browser-service:9222`).
+The MCP server connects to browser_service's no-proxy Chrome instance via CDP
+(`http://browser_service:9222`).
 
 Each tool call opens a fresh SSE connection so that closed sessions never
 cause errors.  Tools are cached for the process lifetime.

@@ -3,6 +3,7 @@ import logging
 import os
 import subprocess
 import time
+from datetime import timedelta
 from datetime import datetime, timedelta, timezone as dt_timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -23,7 +24,7 @@ from django.shortcuts import get_object_or_404, redirect, render, reverse
 from django.utils import timezone
 
 from .forms import SiteForm
-from .models import Approval, ProbeCache, ScrapeJob, SessionLog, Site
+from .models import Approval, JobListing, ProbeCache, ScrapeJob, SessionLog, Site
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +214,7 @@ def job_detail(request, job_id):
 
     scraper_code_display = ""
     has_scraper_code = False
+    has_dagster_code = False
     sample_output = ""
     scraper_slug = ""
 
@@ -236,6 +238,16 @@ def job_detail(request, job_id):
                     scraper_code_display = f.read()
                 has_scraper_code = True
                 scraper_slug = slug
+                # Check for dagster file (scrapers/ or workspace/)
+                dagster_path = os.path.join(
+                    settings.PROJECT_ROOT, "scrapers", slug, f"{slug}_dagster.py"
+                )
+                if not os.path.exists(dagster_path):
+                    dagster_path = os.path.join(
+                        settings.PROJECT_ROOT, "workspace", slug, f"{slug}_dagster.py"
+                    )
+                if os.path.exists(dagster_path):
+                    has_dagster_code = True
                 break
             except Exception:
                 pass
@@ -292,6 +304,7 @@ def job_detail(request, job_id):
             "is_active": is_active,
             "agent_stack": agent_stack,
             "has_scraper_code": has_scraper_code,
+            "has_dagster_code": has_dagster_code,
             "scraper_code_display": scraper_code_display,
             "output_files": output_files,
             "site": db_site,
@@ -350,6 +363,30 @@ def scraper_code(request, job_id):
             )
             return response
     return HttpResponseNotFound("Scraper code not found")
+
+
+@login_required
+def dagster_code(request, job_id):
+    """Download the Dagster-format scraper ({slug}_dagster.py)."""
+    job = get_object_or_404(ScrapeJob, pk=job_id)
+    slug = _resolve_job_slug(job)
+    if not slug:
+        return HttpResponseNotFound("Could not resolve site slug")
+    dagster_path = os.path.join(
+        settings.PROJECT_ROOT, "scrapers", slug, f"{slug}_dagster.py"
+    )
+    if not os.path.exists(dagster_path):
+        # fallback: workspace
+        dagster_path = os.path.join(
+            settings.PROJECT_ROOT, "workspace", slug, f"{slug}_dagster.py"
+        )
+    if not os.path.exists(dagster_path):
+        return HttpResponseNotFound("Dagster code not generated yet")
+    with open(dagster_path, "r") as f:
+        content = f.read()
+    response = HttpResponse(content, content_type="text/x-python")
+    response["Content-Disposition"] = f'attachment; filename="{slug}_dagster.py"'
+    return response
 
 
 def _resolve_job_slug(job):
@@ -756,8 +793,19 @@ def job_resume(request, job_id):
     job = get_object_or_404(ScrapeJob, pk=job_id)
 
     if request.method == "POST":
-        data = json.loads(request.body)
-        response = data.get("response", {})
+        try:
+            data = json.loads(request.body)
+        except (json.JSONDecodeError, ValueError):
+            return JsonResponse(
+                {"status": "error", "message": "Invalid JSON in request body"},
+                status=400,
+            )
+        response = data.get("response")
+        if not isinstance(response, dict) or "decision" not in response:
+            return JsonResponse(
+                {"status": "error", "message": "Response must be a dict with a 'decision' key"},
+                status=400,
+            )
         try:
             from .tasks import resume_scrape_task
 
@@ -887,7 +935,7 @@ def probe_cache(request):
 
 
 BROWSER_SERVICE_URL = os.environ.get(
-    "BROWSER_SERVICE_URL", "http://browser-service:8001"
+    "BROWSER_SERVICE_URL", "http://browser_service:8001"
 )
 
 
@@ -1150,16 +1198,20 @@ def site_rerun(request, site_id):
         import httpx
 
         service_url = getattr(
-            settings, "BROWSER_SERVICE_URL", "http://browser-service:8001"
+            settings, "BROWSER_SERVICE_URL", "http://browser_service:8001"
         )
+        # Anti-bot/Akamai sites: route the scraper through CloakBrowser stealth.
+        scrape_json = {
+            "scraper_path": scraper_path,
+            "args": [],
+            "timeout": 3600,
+        }
+        if getattr(site, "needs_akamai_bypass", False):
+            scrape_json["env_overrides"] = {"STEALTH_BROWSER": "cloak"}
         try:
             resp = httpx.post(
                 f"{service_url}/scrape",
-                json={
-                    "scraper_path": scraper_path,
-                    "args": [],
-                    "timeout": 3600,
-                },
+                json=scrape_json,
                 timeout=3660,
             )
             resp.raise_for_status()
@@ -1167,7 +1219,7 @@ def site_rerun(request, site_id):
             output_file = result.get("output_file", "")
             product_count = result.get("product_count", 0)
         except Exception as e:
-            logger.error("site_rerun: browser-service failed: %s", e)
+            logger.error("site_rerun: browser_service failed: %s", e)
             output_file = ""
             product_count = 0
     else:
@@ -1588,7 +1640,7 @@ def _check_celery_beat():
 def _check_browser_service():
     t0 = time.monotonic()
     try:
-        service_url = getattr(settings, "BROWSER_SERVICE_URL", "http://browser-service:8001")
+        service_url = getattr(settings, "BROWSER_SERVICE_URL", "http://browser_service:8001")
         resp = httpx.get(f"{service_url}/health", timeout=5)
         ms = int((time.monotonic() - t0) * 1000)
         if resp.status_code in (200, 503):
@@ -1656,3 +1708,55 @@ def health_api(request):
 @login_required
 def health_dashboard(request):
     return render(request, "scraper/health.html")
+
+
+@login_required
+def jobs_dashboard(request):
+    """Dashboard: all scraped job listings posted in the last N days."""
+    try:
+        days = int(request.GET.get("days", 7))
+    except (ValueError, TypeError):
+        days = 7
+    days = max(1, min(days, 365))
+
+    cutoff = timezone.now().date() - timedelta(days=days)
+    listings = JobListing.objects.filter(posted_date__gte=cutoff).select_related(
+        "scrape_job", "site"
+    )
+
+    # Optional filters
+    company = request.GET.get("company", "").strip()
+    if company:
+        listings = listings.filter(company__icontains=company)
+    location = request.GET.get("location", "").strip()
+    if location:
+        listings = listings.filter(location__icontains=location)
+    site = request.GET.get("site", "").strip()
+    if site:
+        listings = listings.filter(site_slug=site)
+
+    total = listings.count()
+    unique_companies = listings.values_list("company", flat=True).exclude(company="").distinct().count()
+    unique_sites = listings.values_list("site_slug", flat=True).exclude(site_slug="").distinct().count()
+
+    # Site choices for the filter dropdown
+    site_choices = (
+        JobListing.objects.exclude(site_slug="")
+        .values_list("site_slug", flat=True)
+        .distinct()
+        .order_by("site_slug")
+    )
+
+    context = {
+        "listings": listings[:500],
+        "days": days,
+        "day_choices": [1, 7, 14, 30],
+        "total": total,
+        "unique_companies": unique_companies,
+        "unique_sites": unique_sites,
+        "site_choices": site_choices,
+        "company_filter": company,
+        "location_filter": location,
+        "site_filter": site,
+    }
+    return render(request, "scraper/jobs_dashboard.html", context)
