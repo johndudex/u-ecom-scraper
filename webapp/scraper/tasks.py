@@ -265,7 +265,9 @@ def resume_scrape_task(job_id: int, human_response: Any) -> None:
         all_interrupt_ids = []
         for task in getattr(snapshot, "tasks", []):
             for intr in (getattr(task, "interrupts", None) or []):
-                iid = getattr(intr, "interrupt_id", None) or getattr(intr, "id", None)
+                # LangGraph's Interrupt exposes `.id` (the resume key).
+                # `interrupt_id` is a deprecated alias removed in V2 — avoid it.
+                iid = getattr(intr, "id", None)
                 if iid:
                     all_interrupt_ids.append(str(iid))
 
