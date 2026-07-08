@@ -25,7 +25,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
 
 from .constants import DEAD_STATUS_CODES, FINAL_RETRY_SENTINEL
-from .llm import get_main_llm
+from .llm import get_main_llm, get_llm
 from .prompts import load_agent_prompt
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,17 @@ AGENT_TEMPERATURES: dict[str, float] = {
     "cleanup": 0.1,
     "skill-learner": 0.3,
     "dagster-converter": 0.1,
+}
+
+# Per-agent model overrides (keyed by prompt_stem, like AGENT_TEMPERATURES).
+# Value is the NAME of a settings attr holding the model; resolved lazily in
+# _build_agent (settings isn't imported at module level). Agents not listed use
+# the main model (get_main_llm / ZAI_MAIN_MODEL). code_writer is pure codegen —
+# analysis/nav/field-mapping is done upstream and handed to it as structured
+# summaries — so it runs on the faster flash model.
+# Set CODE_WRITER_MODEL=glm-5-turbo (or =ZAI_MAIN_MODEL) to revert.
+AGENT_MODEL_SETTINGS: dict[str, str] = {
+    "code-writer": "CODE_WRITER_MODEL",
 }
 
 # ── Internal name mapping: agent node name → prompt file stem ─────────────
@@ -405,11 +416,21 @@ def _build_agent(agent_name: str, site_slug: str = "", use_create_agent: bool = 
             system_prompt += BROWSER_UNAVAILABLE_WARNING
 
     tools = _strip_v_prefix_from_tools(tools)
-    llm = get_main_llm(temperature)
+    from django.conf import settings as _settings
+
+    _model_setting = AGENT_MODEL_SETTINGS.get(prompt_stem)
+    _model_override = (
+        getattr(_settings, _model_setting, None) if _model_setting else None
+    )
+    if _model_override:
+        llm = get_llm(model=_model_override, temperature=temperature)
+    else:
+        llm = get_main_llm(temperature)
 
     logger.info(
-        "Creating agent '%s' (temp=%.1f, prompt_stem=%s, tools=%d)",
+        "Creating agent '%s' (model=%s, temp=%.1f, prompt_stem=%s, tools=%d)",
         agent_name,
+        _model_override or getattr(_settings, "ZAI_MAIN_MODEL", "glm-5-turbo"),
         temperature,
         prompt_stem,
         len(tools),
