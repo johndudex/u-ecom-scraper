@@ -51,46 +51,23 @@ def _get_browser_service_url() -> str:
     return os.environ.get("BROWSER_SERVICE_URL", "http://browser_service:8001")
 
 
-# Ground-truth markers: if the generated scraper imports a browser library it
-# MUST run in browser_service (the celery container has no playwright/Chrome).
-# The analyzer's `scraping_method` is often null for hybrid scrapers — e.g. a
-# two-phase job-board scraper whose strategy is http_requests but whose phase 1
-# imports playwright to drive a search form. Trusting the null field routes such
-# scrapers in-process and they crash instantly on `import playwright`.
-_BROWSER_IMPORT_MARKERS = (
-    "import playwright",
-    "from playwright",
-    "import seleniumbase",
-    "from seleniumbase",
-    "undetected_chromedriver",
-    "from selenium",
-    "import selenium",
-    "webdriver",
-)
-
-
-def _scraper_source_needs_browser(scraper_path: str) -> bool:
-    """Inspect the generated scraper's imports — ground truth for browser need.
-
-    Reads only the top of the file (imports + SCRAPING_METHOD live there).
-    Generic: works for any scraper regardless of how the analyzer labeled it.
-    """
-    if not scraper_path or not os.path.isfile(scraper_path):
-        return False
-    try:
-        with open(scraper_path, "r", errors="ignore") as fh:
-            head = fh.read(8192)
-    except OSError:
-        return False
-    return any(marker in head for marker in _BROWSER_IMPORT_MARKERS)
-
-
 def _needs_browser(state: ScrapeState, scraper_path: str = "") -> bool:
+    """True if this scraper must run in browser_service (Chrome/Playwright).
+
+    Uses the SAME detector as code_tester's ``run_scraper`` tool
+    (``agents.tools.shell_tools._scraper_needs_browser``) so execution and
+    testing can never disagree on what counts as a browser scraper — that
+    disagreement is what previously routed a playwright scraper to celery
+    (which has no Playwright) and crashed it instantly. The analyzer's
+    ``scraping_method`` is checked first as a cheap fast-path; the shared
+    whole-file scan (catches lazy / inner-function imports) is ground truth.
+    """
     if state.get("scraping_method", "") in BROWSER_METHODS:
         return True
-    # Fallback: the analyzer field is unreliable (null for hybrids). The
-    # scraper's own imports are the source of truth.
-    return _scraper_source_needs_browser(scraper_path)
+    # Lazy import avoids a module-load cycle between nodes and tools.
+    from agents.tools.shell_tools import _scraper_needs_browser
+
+    return _scraper_needs_browser(scraper_path)
 
 
 def _needs_cloak(state: ScrapeState) -> bool:
