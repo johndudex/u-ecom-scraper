@@ -46,7 +46,11 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 from langchain_core.runnables import RunnableConfig
 
-from .constants import FINAL_RETRY_SENTINEL, MAX_CODE_REVIEW_RETRIES
+from .constants import (
+    FINAL_RETRY_SENTINEL,
+    MAX_CRITICAL_REVIEW_RETRIES,
+    MAX_MEDIUM_REVIEW_RETRIES,
+)
 from .decisions import options_to_decisions
 from .nodes import (
     check_tracker,
@@ -1881,10 +1885,11 @@ def _invoke_code_review(state: ScrapeState, config: RunnableConfig) -> dict[str,
     """Read-only review of scraper_draft.py between code_writer and code_tester.
 
     Runs the code_reviewer agent (same context as code_writer + the written
-    scraper). On 'issues', hands the feedback back to code_writer via
-    state.review_feedback (capped at MAX_CODE_REVIEW_RETRIES). Catches logic /
-    intent errors the syntax guard can't see before the expensive code_tester
-    run. [code_reviewer safety net]
+    scraper). On issues, hands the feedback back to code_writer via
+    state.review_feedback with severity-aware caps (critical: tester-invisible →
+    up to MAX_CRITICAL_REVIEW_RETRIES; medium: tester-visible →
+    MAX_MEDIUM_REVIEW_RETRIES then defers to code_tester). Catches logic/intent
+    errors the syntax guard can't see before the expensive code_tester run.
     """
     import json as _json
 
@@ -1928,31 +1933,48 @@ def _invoke_code_review(state: ScrapeState, config: RunnableConfig) -> dict[str,
             verdict = "pass"
 
         update["code_review_verdict"] = verdict
-        if verdict == "issues" and issues_text:
-            cnt = (state.get("review_retry_count", 0) or 0) + 1
-            update["review_retry_count"] = cnt
-            update["review_feedback"] = issues_text
-            logger.info(
-                "_invoke_code_review: ISSUES (attempt %d/%d) — routing back to code_writer",
-                cnt, MAX_CODE_REVIEW_RETRIES,
-            )
+        # Determine the max severity from the issues (robust — accept legacy
+        # "high" as critical, "low" as medium). Falls back to the reviewer's
+        # verdict field if issues lack severities.
+        _sevs = [(i.get("severity") or "").lower() for i in issues if isinstance(i, dict)] if isinstance(issues, list) else []
+        if any(s in ("critical", "high") for s in _sevs) or verdict == "critical":
+            max_sev = "critical"
+        elif any(s in ("medium", "low") for s in _sevs) or verdict == "medium":
+            max_sev = "medium"
         else:
-            logger.info("_invoke_code_review: %s (proceeding to code_tester)", verdict.upper())
-        return update
+            max_sev = "pass"
+
+        # Severity-aware routing (decided HERE, atomically via Command — the old
+        # conditional edge read a stale count and looped past the cap). Critical
+        # (tester-invisible) gets up to MAX_CRITICAL attempts; medium
+        # (tester-visible) gets MAX_MEDIUM, then defers to code_tester.
+        route_to = "code_tester"
+        if max_sev == "critical" and issues_text:
+            cnt = (state.get("critical_retries", 0) or 0) + 1
+            update["critical_retries"] = cnt
+            if cnt <= MAX_CRITICAL_REVIEW_RETRIES:
+                update["review_feedback"] = issues_text
+                route_to = "code_writer"
+                logger.info("_invoke_code_review: CRITICAL (attempt %d/%d) -> code_writer", cnt, MAX_CRITICAL_REVIEW_RETRIES)
+            else:
+                logger.info("_invoke_code_review: critical cap reached (%d/%d) -> code_tester", cnt, MAX_CRITICAL_REVIEW_RETRIES)
+        elif max_sev == "medium" and issues_text:
+            cnt = (state.get("medium_retries", 0) or 0) + 1
+            update["medium_retries"] = cnt
+            if cnt <= MAX_MEDIUM_REVIEW_RETRIES:
+                update["review_feedback"] = issues_text
+                route_to = "code_writer"
+                logger.info("_invoke_code_review: MEDIUM (attempt %d/%d) -> code_writer", cnt, MAX_MEDIUM_REVIEW_RETRIES)
+            else:
+                logger.info("_invoke_code_review: medium cap reached (%d/%d) -> code_tester (tester will catch)", cnt, MAX_MEDIUM_REVIEW_RETRIES)
+        else:
+            logger.info("_invoke_code_review: PASS -> code_tester")
+        return Command(goto=route_to, update=update)
     except Exception:
         _notify_phase(job_id, "code_review", "failed")
         raise
     finally:
         clear_tool_context()
-
-
-def _route_after_code_review(state: ScrapeState) -> str:
-    """Pass → code_tester; issues (under cap) → back to code_writer."""
-    verdict = (state.get("code_review_verdict") or "pass").lower()
-    cnt = state.get("review_retry_count", 0) or 0
-    if verdict == "issues" and cnt <= MAX_CODE_REVIEW_RETRIES:
-        return "code_writer"
-    return "code_tester"
 
 
 def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
@@ -2553,6 +2575,17 @@ def route_from_human_approval(state: ScrapeState) -> str:
         )
         return "field_confirmation"
 
+    # low_coverage (validate_coverage gate): honor "Retry content analysis" BEFORE
+    # the approve_values override clobbers its label to "Continue anyway" (the
+    # retry option is decision-type approve, so without this it silently proceeds).
+    # Retry -> product_analyzer (re-map fields); anything else -> proceed.
+    if reason == "low_coverage":
+        if "retry" in (label or "").lower() or "retry" in (choice or "").lower():
+            logger.info("route_from_human_approval: low_coverage -> retry product_analyzer")
+            return "product_analyzer"
+        logger.info("route_from_human_approval: low_coverage -> proceed to scraper_analyzer")
+        return "scraper_analyzer"
+
     approve_values = {"approve", "yes", "ok", "continue", "continue anyway", "proceed"}
     if choice.lower() in approve_values:
         choice = "continue"
@@ -2717,35 +2750,38 @@ def build_scrape_graph(
 
     workflow = StateGraph(ScrapeState)
 
-    # ── Add deterministic nodes ──────────────────────────────────────────
+    # ── Add nodes (in execution order so the Mermaid diagram reads top-to-bottom) ─
+    # Setup
     workflow.add_node("parse_command", parse_command)
     workflow.add_node("check_tracker", check_tracker)
     workflow.add_node("setup_workspace", setup_workspace)
     workflow.add_node("check_accessibility", check_accessibility)
-    workflow.add_node("update_tracker_analysis", update_tracker_analysis)
-    workflow.add_node("validate_analysis", validate_analysis)
-    workflow.add_node("normalize_fields", normalize_fields)
-    workflow.add_node("validate_coverage", validate_coverage)
-    workflow.add_node("field_confirmation", field_confirmation)
-    workflow.add_node("pre_execution_approval", pre_execution_approval)
-    workflow.add_node("run_execution", run_execution)
-    workflow.add_node("human_approval", human_approval)
-
-    # ── Add LLM agent wrapper nodes ────────────────────────────────────
+    # Analysis
     workflow.add_node("site_analyzer", _invoke_site_analyzer)
     workflow.add_node("navigation_explore", _invoke_navigation_explore)
     workflow.add_node("navigation_agent", _invoke_navigation_agent)
     workflow.add_node("navigation_synthesize", _invoke_navigation_synthesize)
-    workflow.add_node("nav_skill_review", _invoke_nav_skill_review)
     workflow.add_node("product_analyzer", _invoke_product_analyzer)
+    workflow.add_node("update_tracker_analysis", update_tracker_analysis)
+    workflow.add_node("validate_analysis", validate_analysis)
+    workflow.add_node("normalize_fields", normalize_fields)
+    workflow.add_node("validate_coverage", validate_coverage)
+    # Generation & testing
     workflow.add_node("scraper_analyzer", _invoke_scraper_analyzer)
     workflow.add_node("code_writer", _invoke_code_writer)
-    workflow.add_node("code_tester", _invoke_code_tester)
     workflow.add_node("code_review", _invoke_code_review)
+    workflow.add_node("code_tester", _invoke_code_tester)
+    workflow.add_node("field_confirmation", field_confirmation)
+    workflow.add_node("pre_execution_approval", pre_execution_approval)
+    # Execution & post-completion
+    workflow.add_node("run_execution", run_execution)
     workflow.add_node("cleanup", _invoke_cleanup)
+    workflow.add_node("nav_skill_review", _invoke_nav_skill_review)
     workflow.add_node("skill_learner", _invoke_skill_learner)
     workflow.add_node("dagster_converter", _invoke_dagster_converter)
     workflow.add_node("store_job_listings", _invoke_store_job_listings)
+    # Generic human-in-the-loop handler (reached from many gates)
+    workflow.add_node("human_approval", human_approval)
 
     # ── Wire edges ──────────────────────────────────────────────────────
 
@@ -2807,13 +2843,9 @@ def build_scrape_graph(
     # scraper_analyzer → code_writer
     workflow.add_edge("scraper_analyzer", "code_writer")
 
-    # code_writer → code_review (read-only safety net) → code_tester (pass) | code_writer (issues, capped)
+    # code_writer → code_review. The node returns Command(goto=code_tester|code_writer)
+    # atomically (cap enforced in-node), so no conditional edge is needed here.
     workflow.add_edge("code_writer", "code_review")
-    workflow.add_conditional_edges(
-        "code_review",
-        _route_after_code_review,
-        {"code_tester": "code_tester", "code_writer": "code_writer"},
-    )
 
     # code_tester → route_after_testing (conditional)
     workflow.add_conditional_edges(

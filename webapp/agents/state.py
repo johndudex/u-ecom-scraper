@@ -57,10 +57,12 @@ class ScrapeState(TypedDict, total=False):
     content_analysis_retries: int
     product_analysis_retries: int
     test_retry_count: int
-    # code_reviewer feedback loop: issues from the reviewer handed back to
-    # code_writer to fix (cap MAX_CODE_REVIEW_RETRIES). Empty on first pass.
+    # code_reviewer feedback loop: issues handed back to code_writer to fix.
+    # Severity-aware caps: critical issues (tester-invisible) get more attempts
+    # than medium (tester-visible). review_feedback carries the issues text.
     review_feedback: Annotated[str, _last_write_wins]
-    review_retry_count: int
+    critical_retries: int
+    medium_retries: int
     code_review_verdict: str
     reanalyze_count: int
     # How many times product_analyzer has re-mapped failed fields in this run

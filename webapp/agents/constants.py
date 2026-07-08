@@ -10,9 +10,11 @@ to avoid circular import risks.
 # state.strategies_tried so a failed strategy is never re-picked.
 MAX_TEST_RETRIES: int = 6
 
-# Max times code_reviewer hands issues back to code_writer before letting the
-# scraper proceed to code_tester (avoid review/code_writer loops).
-MAX_CODE_REVIEW_RETRIES: int = 2
+# Severity-aware caps for the code_reviewer feedback loop:
+# - critical issues (tester-invisible) get up to 3 fix attempts
+# - medium issues (tester-visible, code_tester will catch) get 1 attempt
+MAX_CRITICAL_REVIEW_RETRIES: int = 3
+MAX_MEDIUM_REVIEW_RETRIES: int = 1
 
 MAX_VALIDATE_RETRIES: int = 2
 
