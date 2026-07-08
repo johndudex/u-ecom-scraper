@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -13,6 +14,40 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = os.environ.get("PROJECT_ROOT", "/app")
 DISPLAY = os.environ.get("DISPLAY", ":98")
 BROWSER_SERVICE_URL = os.environ.get("BROWSER_SERVICE_URL", "http://127.0.0.1:8001")
+
+# ── Chrome crash detection ──────────────────────────────────────────────
+# When a scraper dies because Chrome became unresponsive/closed (common on
+# long browser sessions — e.g. iterating 200+ specialties), the service can
+# restart Chrome + retry. Code bugs (Python Traceback) are NOT retried
+# (left to code_tester). [browser resilience: B-service]
+
+_CHROME_CRASH_MARKERS = (
+    "Target page, has been closed",
+    "Target closed",
+    "Browser has been closed",
+    "Browser closed",
+    "connect ECONNREFUSED",
+    "playwright._impl._api_types.Error: Target",
+    "net::ERR_CONNECTION_",
+    "Page.goto: Target closed",
+    "Execution context was destroyed",
+    "Navigation failed because",
+    "CDP",
+)
+
+_PYTHON_TRACEBACK_RE = re.compile(r"Traceback \(most recent call last\)")
+
+
+def _is_chrome_death(stderr: str) -> bool:
+    """True if stderr indicates a Chrome/CDP crash (retryable), not a code bug."""
+    if not stderr:
+        return False
+    return any(marker in stderr for marker in _CHROME_CRASH_MARKERS)
+
+
+def _has_traceback(stderr: str) -> bool:
+    """True if stderr contains a Python Traceback (code bug — don't retry)."""
+    return bool(_PYTHON_TRACEBACK_RE.search(stderr or ""))
 
 
 def _restart_scraper_chrome() -> None:
@@ -32,18 +67,62 @@ def _restart_scraper_chrome() -> None:
         logger.warning("Could not restart scraper Chrome: %s", exc)
 
 
+def _post_run(result: Any, scraper_path: str, elapsed: float) -> dict[str, Any]:
+    """Find output file, chown, build result dict. Shared by success + failure paths."""
+    scraper_dir = os.path.dirname(scraper_path) or PROJECT_ROOT
+    output_file = _find_output_file(scraper_dir)
+    product_count = _count_products(output_file) if output_file else 0
+
+    if output_file:
+        logger.info(
+            "Post-run: output=%s, items=%d (partial=%s)",
+            os.path.basename(output_file), product_count,
+            result.returncode != 0,
+        )
+
+    # Fix file ownership: browser_service runs as root, but celery/django
+    # run as uid 1000 (scraper). Chown output + any new files to 1000:1000.
+    try:
+        import pwd
+        os.chown(scraper_dir, 1000, 1000)
+        for _name in os.listdir(scraper_dir):
+            _fpath = os.path.join(scraper_dir, _name)
+            os.chown(_fpath, 1000, 1000)
+            if os.path.isdir(_fpath):
+                for _sub in os.listdir(_fpath):
+                    try:
+                        os.chown(os.path.join(_fpath, _sub), 1000, 1000)
+                    except OSError:
+                        pass
+    except (PermissionError, OSError):
+        pass
+
+    return {
+        "returncode": result.returncode,
+        "stdout": (result.stdout or "")[:50000],  # cap to avoid bloating the response
+        "stderr": (result.stderr or "")[:50000],
+        "output_file": output_file,
+        "product_count": product_count,
+        "duration": elapsed,
+    }
+
+
 def run_scraper_script(
     scraper_path: str,
     args: Optional[list[str]] = None,
     timeout: int = 3600,
     env_overrides: Optional[dict[str, str]] = None,
+    max_retries: int = 3,
 ) -> dict[str, Any]:
+    """Run a scraper script with Chrome-crash retry support.
+
+    On Chrome/CDP death (not a code bug), restarts Chrome + retries with
+    exponential backoff (10s → 20s → 40s). The scraper's own checkpoint/resume
+    (B-core, if the template implements it) ensures retries don't redo work.
+    """
     cmd = ["python3", scraper_path]
     if args:
         cmd.extend(args)
-    # Inject --xvfb ONLY if the scraper declares it (SeleniumBase/UC scrapers do).
-    # Playwright/job scrapers get the virtual display via the DISPLAY env (set
-    # below) and their argparse rejects an unknown --xvfb → exit code 2.
     if "--xvfb" not in cmd:
         try:
             with open(scraper_path, "r", errors="ignore") as _f:
@@ -51,7 +130,7 @@ def run_scraper_script(
             if "--xvfb" in _src:
                 cmd.append("--xvfb")
         except OSError:
-            cmd.append("--xvfb")  # default to old behavior if unreadable
+            cmd.append("--xvfb")
 
     env = {
         **os.environ,
@@ -61,83 +140,122 @@ def run_scraper_script(
     }
     if env_overrides:
         env.update(env_overrides)
-    # Under CloakBrowser stealth, scrapers must launch their own stealth
-    # Chromium (the launch() patcher routes it through cloak). Do NOT point them
-    # at the shared CDP scraper chrome (9223) — connecting there would bypass
-    # cloak and hit the same anti-bot block as plain Chrome.
     _stealth = (env.get("STEALTH_BROWSER", "") or "").strip().lower()
     if _stealth != "cloak":
         env["BROWSER_CDP_ENDPOINT"] = "http://127.0.0.1:9223"
     else:
-        # explicitly clear any inherited endpoint so scrapers launch, not connect
         env.pop("BROWSER_CDP_ENDPOINT", None)
 
     start = time.time()
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=os.path.dirname(scraper_path) or PROJECT_ROOT,
-            env=env,
-        )
-        elapsed = round(time.time() - start, 2)
-        logger.info("Scraper exited code %d in %ds", result.returncode, elapsed)
+    backoff = 10  # seconds, doubles each retry (capped at 60)
+    last_result_dict: dict[str, Any] = {}
 
-        output_file = _find_output_file(os.path.dirname(scraper_path))
-        product_count = _count_products(output_file) if output_file else 0
-
-        # Fix file ownership: browser_service runs as root, but celery/django
-        # run as uid 1000 (scraper). On real Linux (not WSL2), root-owned files
-        # in the shared volume can't be moved/copied by the scraper user during
-        # cleanup. Chown output + any new files in the scraper dir to 1000:1000.
+    for attempt in range(1, max_retries + 1):
+        attempt_start = time.time()
+        logger.info("Scraper run attempt %d/%d: %s %s", attempt, max_retries,
+                     os.path.basename(scraper_path), " ".join(args or []))
         try:
-            import pwd
-            _scraper_dir = os.path.dirname(scraper_path) or PROJECT_ROOT
-            os.chown(_scraper_dir, 1000, 1000)
-            for _name in os.listdir(_scraper_dir):
-                _fpath = os.path.join(_scraper_dir, _name)
-                os.chown(_fpath, 1000, 1000)
-                if os.path.isdir(_fpath):
-                    for _sub in os.listdir(_fpath):
-                        try:
-                            os.chown(os.path.join(_fpath, _sub), 1000, 1000)
-                        except OSError:
-                            pass
-        except (PermissionError, OSError):
-            pass  # not running as root or already correct
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=os.path.dirname(scraper_path) or PROJECT_ROOT,
+                env=env,
+            )
+            elapsed = round(time.time() - attempt_start, 2)
+            logger.info(
+                "Scraper exited code %d in %ds (attempt %d/%d)",
+                result.returncode, elapsed, attempt, max_retries,
+            )
 
-        return {
-            "returncode": result.returncode,
-            "stdout": result.stdout or "",
-            "stderr": result.stderr or "",
-            "output_file": output_file,
-            "product_count": product_count,
-            "duration": elapsed,
-        }
+            # Success.
+            if result.returncode == 0:
+                return _post_run(result, scraper_path, round(time.time() - start, 2))
 
-    except subprocess.TimeoutExpired:
-        logger.error("Scraper timed out after %ds", timeout)
-        return {
-            "returncode": -1,
-            "stdout": "",
-            "stderr": f"Timed out after {timeout}s",
-            "output_file": "",
-            "product_count": 0,
-            "duration": timeout,
-        }
+            # Non-zero exit — classify: Chrome crash (retryable) vs code bug.
+            stderr = result.stderr or ""
+            chrome_crash = _is_chrome_death(stderr) and not _has_traceback(stderr)
 
-    except Exception as exc:
-        logger.exception("Scraper execution failed")
-        return {
-            "returncode": -1,
-            "stdout": "",
-            "stderr": str(exc),
-            "output_file": "",
-            "product_count": 0,
-            "duration": round(time.time() - start, 2),
-        }
+            if chrome_crash:
+                logger.warning(
+                    "Scraper: Chrome crash detected (attempt %d/%d). stderr: %s",
+                    attempt, max_retries, stderr[:500],
+                )
+                if attempt < max_retries:
+                    logger.info(
+                        "Scraper: restarting Chrome + retrying in %ds (attempt %d/%d)...",
+                        backoff, attempt + 1, max_retries,
+                    )
+                    _restart_scraper_chrome()
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
+                    last_result_dict = _post_run(result, scraper_path, elapsed)
+                    continue
+                else:
+                    logger.warning(
+                        "Scraper: Chrome crashes exhausted after %d attempts — returning partial result",
+                        max_retries,
+                    )
+            else:
+                # Code bug (Traceback) — don't retry, return immediately.
+                logger.info(
+                    "Scraper: code error (not Chrome crash) — not retrying. stderr: %s",
+                    stderr[:500],
+                )
+
+            return _post_run(result, scraper_path, round(time.time() - start, 2))
+
+        except subprocess.TimeoutExpired:
+            logger.error(
+                "Scraper timed out after %ds (attempt %d/%d)",
+                timeout, attempt, max_retries,
+            )
+            if attempt < max_retries:
+                logger.info(
+                    "Scraper: restarting Chrome + retrying after timeout in %ds...",
+                    backoff,
+                )
+                _restart_scraper_chrome()
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 60)
+                continue
+            return {
+                "returncode": -1,
+                "stdout": "",
+                "stderr": f"Timed out after {timeout}s (exhausted {max_retries} retries)",
+                "output_file": "",
+                "product_count": 0,
+                "duration": timeout,
+            }
+
+        except Exception as exc:
+            logger.exception("Scraper execution failed (attempt %d/%d)", attempt, max_retries)
+            return {
+                "returncode": -1,
+                "stdout": "",
+                "stderr": str(exc),
+                "output_file": "",
+                "product_count": 0,
+                "duration": round(time.time() - start, 2),
+            }
+
+    # Exhausted retries with partial output from last attempt.
+    if last_result_dict:
+        last_result_dict["duration"] = round(time.time() - start, 2)
+        logger.info(
+            "Scraper: returning partial result from last attempt (%d items)",
+            last_result_dict.get("product_count", 0),
+        )
+        return last_result_dict
+    return {
+        "returncode": -1,
+        "stdout": "",
+        "stderr": f"Exhausted all {max_retries} retries",
+        "output_file": "",
+        "product_count": 0,
+        "duration": round(time.time() - start, 2),
+    }
 
 
 def _find_output_file(site_folder: str) -> str:
