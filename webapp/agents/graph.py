@@ -1747,6 +1747,63 @@ def _invoke_scraper_analyzer(
 
 
 @_with_api_retry
+def _fix_scraper_syntax(
+    agent, state: ScrapeState, config: RunnableConfig, job_id: int, slug: str,
+    max_tries: int = 3,
+) -> None:
+    """Re-invoke code_writer to fix syntax errors in scraper_draft.py.
+
+    code_writer has no shell tool to self-validate parseability, so the node
+    does it: ast.parse the scraper, and on SyntaxError feed the exact error
+    (line + message) back to code_writer for an immediate fix. This keeps
+    syntax errors out of code_tester's path — code_tester should test
+    FUNCTIONALITY, not parseability. Best-effort: if still unparseable after
+    max_tries, return and let code_tester catch it (the prior behavior).
+    """
+    import ast
+    from langchain_core.messages import HumanMessage
+
+    scraper_path = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
+    for attempt in range(max_tries):
+        if not os.path.isfile(scraper_path):
+            return
+        try:
+            with open(scraper_path, "r", errors="ignore") as fh:
+                ast.parse(fh.read())
+            if attempt > 0:
+                logger.info(
+                    "_invoke_code_writer: syntax fixed after %d attempt(s) (job %s)",
+                    attempt, job_id,
+                )
+            return  # parses clean
+        except SyntaxError as exc:
+            logger.warning(
+                "_invoke_code_writer: syntax error (attempt %d/%d) in scraper_draft.py line %s: %s",
+                attempt + 1, max_tries, exc.lineno, exc.msg,
+            )
+            line_ctx = f"  { (exc.text or '').strip() }" if exc.text else ""
+            fix_msg = [HumanMessage(content=(
+                f"Your `workspace/{slug}/scraper_draft.py` has a Python syntax error and will not run:\n"
+                f"  **Line {exc.lineno}: {exc.msg}**\n{line_ctx}\n\n"
+                f"Read `workspace/{slug}/scraper_draft.py`, locate the error near line {exc.lineno}, "
+                f"and use `edit_file` to fix ONLY the parse error — do NOT rewrite the whole scraper. "
+                f"Common causes: unclosed bracket/parenthesis/quote, bad indentation, a broken "
+                f"f-string, or a stray character. Fix it now."
+            ))]
+            hb = _start_heartbeat(job_id, "code-writer")
+            try:
+                result = agent.invoke(
+                    {"messages": fix_msg}, config=_agent_config(config, "code_writer")
+                )
+                _persist_agent_logs(state, result, "code-writer", config)
+            finally:
+                _stop_heartbeat(hb)
+    logger.error(
+        "_invoke_code_writer: syntax errors persist after %d attempts (job %s) — letting code_tester catch it",
+        max_tries, job_id,
+    )
+
+
 def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
     job_id = state.get("job_id", 0)
     _notify_phase(job_id, "code_writer", "running")
@@ -1798,6 +1855,12 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 except Exception:
                     _ct = ""
             _patch_scraper_output_filter(slug, _ct)
+
+        # Syntax guard: code_writer has no shell tool to self-validate, so the
+        # node parses the scraper and feeds any SyntaxError back for an
+        # immediate fix (keeps syntax errors out of code_tester's path).
+        _fix_scraper_syntax(agent, state, config, job_id, slug)
+
         update["messages"] = []
         scraper_analysis = state.get("scraper_analysis") or {}
         strategy = scraper_analysis.get("strategy", "")

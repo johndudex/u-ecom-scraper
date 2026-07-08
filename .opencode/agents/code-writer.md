@@ -436,6 +436,7 @@ Before returning, verify:
 - [ ] Structured data extraction included (if available)
 - [ ] File paths are correct (output, log, etc.)
 - [ ] Code runs: `python3 workspace/{site_slug}/scraper_draft.py`
+- [ ] **Code must PARSE.** The orchestrator syntax-checks `scraper_draft.py` the moment you finish; if it has a `SyntaxError` (unclosed bracket/quote, bad indent, broken f-string, stray character) it is handed straight back to you to fix — you never get to functional testing with broken syntax. Write carefully and re-read what you wrote before finishing.
 
 ## Important Notes
 
