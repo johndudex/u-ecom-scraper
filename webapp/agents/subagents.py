@@ -2009,31 +2009,6 @@ def build_code_writer_message(state: dict) -> list:
         api_endpoint = navigation_analysis.get("api_endpoint") or {}
         api_section = ""
 
-        # SSR form-search discovery (e.g. locumtenens QuickSearch POST): no JSON
-        # API, but nav captured the form + discovery steps. Route to HTTP
-        # two-phase (requests.Session + POST + BeautifulSoup), NOT Playwright —
-        # the site is server-rendered so HTTP gets the full HTML directly, and a
-        # long browser iteration is slow/crashy. Generic: any SSR site whose
-        # discovery nav proved reachable via a form POST / http steps.
-        _nav_strat = navigation_analysis.get("scraper_strategy") or {}
-        _phase1 = _nav_strat.get("phase1_discovery") if isinstance(_nav_strat, dict) else {}
-        _phase1_mech = (_phase1.get("mechanism") if isinstance(_phase1, dict) else "") or ""
-        _rendering = (navigation_analysis.get("rendering_verified") or "").lower()
-        _search_form = (navigation_analysis.get("search") or {}).get("search_form") or {}
-        _search_method = ((_search_form.get("method") or "") if isinstance(_search_form, dict) else "").lower()
-        _token_field = ""
-        if isinstance(_search_form, dict):
-            _token_field = (
-                _search_form.get("anti_forgery_token")
-                or _search_form.get("token_field")
-                or _search_form.get("csrf_token")
-                or ""
-            )
-        _is_ssr_form_search = (
-            _rendering in ("ssr", "static", "server", "server_rendered")
-            and ("post" in _search_method or _phase1_mech == "http_requests")
-        )
-
         if api_endpoint.get("url"):
             api_base = api_endpoint.get("base") or str(api_endpoint.get("url", "")).split("?")[0]
             api_params = api_endpoint.get("query_params") or []
@@ -2144,41 +2119,6 @@ def build_code_writer_message(state: dict) -> list:
             # Prepend so the API guidance is read first and supersedes the
             # generic two-phase browser text that follows.
             navigation_section = api_section + navigation_section
-        elif _is_ssr_form_search:
-            # SSR form-search discovery (locumtenens-style): HTTP two-phase,
-            # NOT Playwright. See _is_ssr_form_search above for the rationale.
-            _token_hint = f"the form's anti-forgery token (`{_token_field}`)" if _token_field else "any anti-forgery / CSRF token the form requires"
-            http_search_section = (
-                "\n### SSR form-search discovery — use HTTP, NOT Playwright (CRITICAL)\n"
-                "This site is **server-rendered (SSR)** with **no JSON search API**, but "
-                "navigate_explore captured the form-search discovery mechanics. "
-                "**Implement discovery with HTTP `requests.Session` — do NOT use "
-                "Playwright/Selenium.** The page is server-rendered, so HTTP returns the "
-                "full HTML directly; driving a real browser is slow and crashes on long "
-                "specialty/category iterations.\n"
-                "- Use `requests.Session()` so cookies/session persist across the "
-                "GET (page/token) → POST (search) → GET (paginated results) sequence.\n"
-                "- Follow `navigation_analysis.scraper_strategy.phase1_discovery.steps` "
-                f"EXACTLY — e.g. GET the search page to extract {_token_hint}, then POST "
-                "the search form once per discovery dimension (specialty / category / "
-                "location), paginate the result pages, and collect item URLs.\n"
-                "- Parse HTML responses with **BeautifulSoup** (the response is HTML, not "
-                "JSON), using the `item_links` container/link selectors from navigation_analysis.\n"
-                "- **Iterate EVERY discovery dimension** (all specialties/categories) and "
-                "**paginate EVERY result page** — this site has far more items than one "
-                "search returns. Stopping after a single search or page 1 misses most of "
-                "the data. That is a discovery failure.\n"
-                "- Set a real browser `User-Agent`; no proxy needed for SSR (direct requests).\n"
-            )
-            nav_template_hint = (
-                "\n### Template\nRead templates/http_requests_scraper.py as your extraction "
-                "base, AND add a **Phase-1 HTTP discovery loop** (`requests.Session` + POST "
-                "+ BeautifulSoup) following `scraper_strategy.phase1_discovery.steps`. This is "
-                "a TWO-PHASE HTTP scraper (HTTP discovery + HTTP extraction) — NOT Playwright, "
-                "NOT single-phase. Read navigation_analysis.json's `scraper_strategy` and "
-                "`search` sections for the exact form fields, token, and result URL pattern.\n"
-            )
-            navigation_section = http_search_section + navigation_section
 
         # Filter requirements (date/location/category — job portals & search sites)
         filters_info = navigation_analysis.get("filters", {}) or {}
