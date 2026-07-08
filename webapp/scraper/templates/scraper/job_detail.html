@@ -177,6 +177,7 @@
                 </div>
                 <div class="flex items-center gap-1.5">
                     <button id="refresh-logs-btn" class="text-xs text-ink-secondary hover:text-ink border border-line-strong px-2 py-1 rounded-md hover:bg-raised transition-colors cursor-pointer">Refresh</button>
+                    <button class="text-xs text-ink-secondary hover:text-ink border border-line-strong px-2 py-1 rounded-md hover:bg-raised transition-colors cursor-pointer" onclick="var b=this;var cols=document.querySelectorAll('#log-container .log-agent-body:not(.open)');var exp=cols.length>0;document.querySelectorAll('#log-container .log-agent-body').forEach(function(el){var h=el.previousElementSibling;if(exp){el.classList.add('open');if(h){h.classList.add('open');h.classList.remove('collapsed');}}else{el.classList.remove('open');if(h){h.classList.remove('open');h.classList.add('collapsed');}}});b.textContent=exp?'Collapse All':'Expand All';">Expand All</button>
                     <button class="text-ink-secondary hover:text-ink border border-line-strong px-2 py-1 rounded-md hover:bg-raised transition-colors cursor-pointer" onclick="document.getElementById('log-container').scrollTo({top:document.getElementById('log-container').scrollHeight,behavior:'smooth'})">
                         <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M19.347 14.07a.75.75 0 01.093 1.056l-4.25 5a.75.75 0 11-1.149-.972l3.75-4.406-3.75-4.406a.75.75 0 01.976-1.133l4.25 5a.75.75 0 01.05.912zM4.75 14.07a.75.75 0 01.05.912l-4.25 5a.75.75 0 01-1.149-.972L3.15 14.6.4 10.195a.75.75 0 01.976-1.133l4.25 5a.75.75 0 01-.05.912z" clip-rule="evenodd"/></svg>
                     </button>
@@ -432,7 +433,7 @@
         header.scrollIntoView({behavior:'smooth',block:'start'});
     }
 
-    function addLogs(logs) {
+    function addLogs(logs, autoExpand) {
         var waiting = logContainer.querySelector('[style*="22D3EE"]');
         if (waiting && waiting.parentElement) waiting.parentElement.remove();
         var grouped = {};
@@ -443,16 +444,17 @@
                 var header = logContainer.querySelector('.log-agent-header[data-agent="'+agent+'"]');
                 if (!header) {
                     var hd = document.createElement('div');
-                    hd.className = 'log-agent-header open active';
+                    hd.className = 'log-agent-header ' + (autoExpand ? 'open active' : 'collapsed');
                     hd.setAttribute('data-agent', agent);
                     hd.innerHTML = '<svg class="arrow w-3 h-3 text-ink-muted" viewBox="0 0 24 24" fill="currentColor"><path d="M8.47 4.22a.75.75 0 011.06 0l8.25 8.25a.75.75 0 010 1.06l-8.25 8.25a.75.75 0 01-1.06-1.06L15.94 12 8.47 4.53a.75.75 0 010-1.06z"/></svg><span class="log-badge">'+agent+'</span><span class="ml-auto text-ink-muted text-[10px] font-mono">'+grouped[agent].length+'</span>';
                     var body = document.createElement('div');
-                    body.className = 'log-agent-body open';
+                    body.className = 'log-agent-body' + (autoExpand ? ' open' : '');
                     hd.addEventListener('click', function() { body.classList.toggle('open'); hd.classList.toggle('open'); hd.classList.toggle('collapsed'); hd.classList.toggle('active'); });
                     logContainer.appendChild(hd);
                     logContainer.appendChild(body);
                 }
                 var agentBody = logContainer.querySelector('[data-agent="'+agent+'"] ~ .log-agent-body');
+                if (autoExpand && agentBody) { agentBody.classList.add('open'); var _h = agentBody.previousElementSibling; if (_h) { _h.classList.add('open'); _h.classList.remove('collapsed'); } }
                 var div = document.createElement('div');
                 div.className = 'log-entry log-' + log.role + ' anim-slide-in';
                 div.setAttribute('data-seq', log.seq);
@@ -533,11 +535,11 @@
 
     var es = new EventSource('/jobs/' + jobId + '/events/');
     es.addEventListener('status', function(e) { updateStatus(JSON.parse(e.data).status); });
-    es.addEventListener('logs', function(e) { var d=JSON.parse(e.data); addLogs(d.logs); fetchToolCalls(); setupStepClicks(); });
+    es.addEventListener('logs', function(e) { var d=JSON.parse(e.data); addLogs(d.logs, true); fetchToolCalls(); setupStepClicks(); });
     es.addEventListener('done', function(e) { updateStatus(JSON.parse(e.data).status); liveEl.classList.add('hidden'); liveEl2.classList.add('hidden'); es.close(); });
     es.addEventListener('message', function(e) {
         var data=JSON.parse(e.data); if(!data||!data.type) return;
-        if(data.type==='logs'){addLogs(data.logs||[]);fetchToolCalls();setupStepClicks();}
+        if(data.type==='logs'){addLogs(data.logs||[], true);fetchToolCalls();setupStepClicks();}
         else if(data.type==='step'){addStep(data.phase,data.status);}
         else if(data.type==='status'){updateStatus(data.status);}
         else if(data.type==='syslog'){addSyslog(data);}
