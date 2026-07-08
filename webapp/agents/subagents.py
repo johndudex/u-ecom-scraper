@@ -111,6 +111,65 @@ def _build_content_type_context(state: dict) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+def _summarize_product_analysis(pa: dict) -> str:
+    """Complete-but-lean per-field extraction summary of product_analysis.
+
+    Replaces having code_writer ``read_file`` the full product_analysis.json
+    (often 20K+). Retains EVERY field's extraction method, selector, JSON-LD /
+    CSS fallback, and JS snippet — the things code_writer needs to write
+    extraction code. Drops ``examples``/``expectations``/``tested`` (those are
+    validation concerns for code_tester, not extraction). Typically ~2-4K vs
+    20K+, with zero loss of extraction information.
+    """
+    fields = (pa or {}).get("fields") or {}
+    if not isinstance(fields, dict) or not fields:
+        return ""
+    lines = ["\n### Field Extraction Map (COMPLETE — from product_analysis)\n"]
+    for name, info in fields.items():
+        if not isinstance(info, dict):
+            lines.append(f"- **{name}**: {info}")
+            continue
+        method = info.get("method", "?")
+        sel = info.get("selector") or info.get("path") or ""
+        fb = (
+            info.get("jsonld_fallback")
+            or info.get("css_fallback")
+            or info.get("fallback")
+            or ""
+        )
+        js = info.get("js_extraction") or ""
+        parts = [f"- **{name}** [{method}]"]
+        if sel:
+            parts.append(f"sel=`{sel}`")
+        if fb:
+            parts.append(f"fallback=`{fb}`")
+        if js:
+            parts.append(f"js=`{js}`")
+        lines.append(" ".join(parts))
+    return "\n".join(lines) + "\n"
+
+
+def _summarize_navigation_extras(na: dict) -> str:
+    """Navigation mechanics the structured nav_section doesn't already inject:
+    filters (e.g. a POST-form discovery strategy), search/category notes. Keeps
+    code_writer from needing to read_file navigation_analysis.json.
+    """
+    na = na or {}
+    lines = []
+    fl = na.get("filters") or {}
+    if isinstance(fl, dict) and (fl.get("has_filters") or fl.get("description")):
+        lines.append(
+            f"**Filters:** method={fl.get('method', '?')} — {fl.get('description', '')}"
+        )
+    s = na.get("search") or {}
+    if isinstance(s, dict) and s.get("description"):
+        lines.append(f"**Search notes:** {s['description']}")
+    cats = na.get("categories") or {}
+    if isinstance(cats, dict) and cats.get("description"):
+        lines.append(f"**Categories:** {cats['description']}")
+    return ("\n" + "\n".join(lines) + "\n") if lines else ""
+
+
 def _get_skill_descriptions() -> str:
     """Scan the .opencode/skills/ tree and return a bullet list of skill names
     and their descriptions (first line of the SKILL.md after the frontmatter).
@@ -1697,7 +1756,6 @@ def build_code_writer_message(state: dict) -> list:
             f"**Strategy justification:** {scraper_analysis.get('strategy_justification', '')}\n"
             f"{proxy_instructions}{approach_section}{verified_section}{extras_section}"
             f"{seleniumbase_section}"
-            f"\n**Read the full scraper analysis:** workspace/{slug}/scraper_analysis.json\n"
         )
 
     navigation_section = ""
@@ -1809,10 +1867,10 @@ def build_code_writer_message(state: dict) -> list:
         if item_links_info.get("url_pattern"):
             nav_lines.append(f"  - URL pattern: `{item_links_info['url_pattern']}`")
 
-        nav_lines.append(
-            "\n**Read the full navigation analysis:** "
-            f"workspace/{slug}/navigation_analysis.json\n"
-        )
+        # Discovery mechanics the structured nav_lines above don't cover
+        # (filters/POST-form strategy, search/category notes). Injected so
+        # code_writer doesn't need to read_file navigation_analysis.json.
+        nav_lines.append(_summarize_navigation_extras(navigation_analysis))
         nav_lines.append(
             "\n### Two-Phase Architecture (REQUIRED for this scraper)\n"
             "This scraper must implement TWO phases:\n\n"
@@ -2236,6 +2294,22 @@ def build_code_writer_message(state: dict) -> list:
         f"{' AND call write_file to save input URLs to workspace/' + slug + '/input_urls.json' if not site_input_urls and not navigation_section else ''}. "
         f"Do NOT just print code.**"
     )
+
+    # Inject COMPLETE summaries of the analysis JSONs so code_writer does NOT
+    # read_file them. The full files (product_analysis 20K+, navigation_analysis
+    # 8K, scraper_analysis 4K) bloat the conversation past the context budget and
+    # thrash truncation — these summaries carry every extraction method/selector
+    # and discovery mechanic losslessly at ~10x smaller. [code_writer bloat]
+    pa_summary = _summarize_product_analysis(state.get("product_analysis") or {})
+    if pa_summary:
+        pa_summary += (
+            "\n### DO NOT read_file the analysis JSONs\n"
+            "The field-extraction map and navigation mechanics above are COMPLETE. "
+            "Do NOT call read_file on product_analysis.json, navigation_analysis.json, "
+            "or scraper_analysis.json — re-reading them bloats context and slows you "
+            "down. The template (templates/*.py) is the only file you need to read.\n"
+        )
+        content = content + pa_summary
     return [HumanMessage(content=content)]
 
 
