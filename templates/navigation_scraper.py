@@ -60,7 +60,39 @@ ITEM_URL_PATTERN = "{ITEM_URL_PATTERN}"  # e.g. r"/product/([^/]+)"
 SCRAPING_METHOD = "{SCRAPING_METHOD}"  # "playwright", "http_requests", etc.
 PROXY_TIER = "{PROXY_TIER}"  # "none", "datacenter", "residential"
 DELAY_BETWEEN_REQUESTS = {DELAY_BETWEEN_REQUESTS}
-ROTATE_EVERY = 25  # relaunch the browser every N items to avoid stealth-Chromium crashes under sustained load
+ROTATE_EVERY = 25  # relaunch the browser every N items/categories to avoid stealth-Chromium crashes under sustained load
+
+# ── Checkpoint (B-core: resume after Chrome crash + service retry) ───────
+# During Phase-1 discovery, discovered URLs are saved to a checkpoint file.
+# If the scraper crashes (Chrome death → scraper_runner restarts Chrome +
+# retries), the retry reads this file and skips re-discovery → resumes
+# directly to Phase 2 (extraction). Generic: any navigation scraper.
+_CHECKPOINT_PATH = os.path.join(os.getcwd(), "discovered_urls_checkpoint.json")
+
+
+def _write_checkpoint(urls: list[str]) -> None:
+    """Save discovered URLs so a crash-retry can resume from here."""
+    try:
+        with open(_CHECKPOINT_PATH, "w") as f:
+            json.dump({"urls": list(urls), "count": len(urls), "ts": time.time()}, f)
+        logger.debug("Checkpoint: saved %d URLs to %s", len(urls), _CHECKPOINT_PATH)
+    except Exception as exc:
+        logger.warning("Checkpoint: write failed: %s", exc)
+
+
+def _load_checkpoint() -> list[str]:
+    """Load discovered URLs from a previous run's checkpoint (if any)."""
+    try:
+        if os.path.isfile(_CHECKPOINT_PATH):
+            with open(_CHECKPOINT_PATH, "r") as f:
+                data = json.load(f)
+            urls = data.get("urls", [])
+            if urls:
+                logger.info("Checkpoint: RESUMING with %d URLs from %s", len(urls), _CHECKPOINT_PATH)
+                return urls
+    except Exception as exc:
+        logger.warning("Checkpoint: load failed: %s", exc)
+    return []
 PAGE_LOAD_TIMEOUT = 30000
 SRC_URL = SITE_URL
 
@@ -493,17 +525,19 @@ def main():
     start_time = time.time()
     discovered_urls: list[str] = []
 
+    # B-core: check for checkpoint from a previous (crashed) run.
+    # If found, skip Phase 1 entirely and resume at Phase 2 (extraction).
+    _checkpoint_urls = _load_checkpoint()
+    if _checkpoint_urls:
+        discovered_urls = _checkpoint_urls
+        logger.info("Phase 1: SKIPPED (resumed from checkpoint with %d URLs)", len(discovered_urls))
+
     with sync_playwright() as p:
-        # NOTE: stealth is handled transparently by the browser_service
-        # cloak_stealth_patch (.pth) — when STEALTH_BROWSER=cloak is set for
-        # anti-bot sites, this launch() drives CloakBrowser's stealth Chromium
-        # binary (with build_args + ignore_default_args). Keep this a plain
-        # launch(); do NOT call cloakbrowser.launch() here (it starts a second
-        # Playwright and conflicts with this sync_playwright() context).
         def _launch_browser():
             browser_args = []
             if proxy_url:
                 browser_args.append(f"--proxy-server={proxy_url}")
+            logger.debug("Phase 1: launching browser (proxy=%s, headless=%s)", bool(proxy_url), args.headless)
             b = p.chromium.launch(headless=args.headless, args=browser_args)
             ctx = b.new_context(
                 viewport={"width": 1920, "height": 1080},
@@ -514,46 +548,70 @@ def main():
         browser, context, page = _launch_browser()
 
         # ── Phase 1: Discover URLs ───────────────────────────────────────
-        if args.query:
-            discovered_urls = _discover_urls_via_search(page, args.query, MAX_PAGES, limit)
-            src_url_base = SEARCH_URL_PATTERN.replace("{query}", args.query)
-        elif args.category_url:
-            discovered_urls = _discover_urls_via_category(page, args.category_url, MAX_PAGES, limit)
-            src_url_base = args.category_url
-        elif args.listing_url:
-            discovered_urls = _discover_urls_via_category(page, args.listing_url, MAX_PAGES, limit)
-            src_url_base = args.listing_url
+        if not discovered_urls:
+            if args.query:
+                logger.info("Phase 1: discovering via search '%s'", args.query[:50])
+                discovered_urls = _discover_urls_via_search(page, args.query, MAX_PAGES, limit)
+                src_url_base = SEARCH_URL_PATTERN.replace("{query}", args.query)
+            elif args.category_url:
+                logger.info("Phase 1: discovering via category %s", args.category_url[:50])
+                discovered_urls = _discover_urls_via_category(page, args.category_url, MAX_PAGES, limit)
+                src_url_base = args.category_url
+            elif args.listing_url:
+                logger.info("Phase 1: discovering via listing %s", args.listing_url[:50])
+                discovered_urls = _discover_urls_via_category(page, args.listing_url, MAX_PAGES, limit)
+                src_url_base = args.listing_url
+            else:
+                logger.error("No --query, --category-url, or --listing-url provided")
+                browser.close()
+                sys.exit(1)
+            logger.info("Phase 1: discovered %d URLs (pre-category)", len(discovered_urls))
+            # B-core: checkpoint after initial discovery.
+            _write_checkpoint(discovered_urls)
         else:
-            logger.error("No --query, --category-url, or --listing-url provided")
-            browser.close()
-            sys.exit(1)
+            src_url_base = args.query or args.category_url or args.listing_url or "(checkpoint)"
 
         # ── Phase 1b: Also discover from CATEGORY_URLS ──────────────────
-        # A single search often returns fewer products than the site has
-        # (e.g. calvklein search = 48 watches, but category pages have 65+).
-        # CATEGORY_URLS is filled by code_writer from navigation_analysis.
-        # Only visit categories related to the search term (if any). Generic.
-        if not args.sample and CATEGORY_URLS:
+        if not args.sample and CATEGORY_URLS and not _checkpoint_urls:
             _existing = set(discovered_urls)
             _search_q = (args.query or "").lower()
+            _cat_idx = 0
             for _cat_url in CATEGORY_URLS:
                 if not isinstance(_cat_url, str) or _cat_url in _existing:
                     continue
                 if _search_q and _search_q not in _cat_url.lower():
                     continue
+                _cat_idx += 1
                 try:
-                    logger.info("Phase 1b: Visiting category %s", _cat_url[:60])
+                    logger.info("Phase 1b [%d]: visiting category %s", _cat_idx, _cat_url[:60])
                     _cat_urls = _discover_urls_via_category(page, _cat_url, MAX_PAGES, limit)
                     _new = [u for u in _cat_urls if u not in _existing]
                     if _new:
                         discovered_urls.extend(_new)
                         _existing.update(_new)
-                        logger.info("Phase 1b: %s -> %d new URLs (total %d)", _cat_url[:40], len(_new), len(discovered_urls))
+                        logger.info("Phase 1b [%d]: %s -> %d new URLs (total %d)", _cat_idx, _cat_url[:40], len(_new), len(discovered_urls))
+                    # B-core: checkpoint after each category (incremental progress).
+                    _write_checkpoint(discovered_urls)
                 except Exception as _cat_exc:
-                    logger.warning("Phase 1b: category %s failed: %s", _cat_url[:40], _cat_exc)
+                    logger.warning("Phase 1b [%d]: category %s failed: %s", _cat_idx, _cat_url[:40], _cat_exc)
+
+                # B-prevent: rotate browser every ROTATE_EVERY categories to
+                # prevent Chrome death on long discovery (e.g. 200+ specialties).
+                if _cat_idx > 0 and _cat_idx % ROTATE_EVERY == 0:
+                    logger.info("Phase 1b [%d]: rotating browser (alive=%s)", _cat_idx, _browser_alive(page))
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    browser, context, page = _launch_browser()
+                    time.sleep(3)
+
             discovered_urls = list(dict.fromkeys(discovered_urls))
             if limit:
                 discovered_urls = discovered_urls[:limit]
+            # B-core: final checkpoint after all categories.
+            _write_checkpoint(discovered_urls)
+            logger.info("Phase 1 complete: %d total URLs discovered", len(discovered_urls))
 
         if not discovered_urls:
             logger.warning("No item URLs discovered")
