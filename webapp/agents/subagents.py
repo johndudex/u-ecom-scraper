@@ -123,19 +123,35 @@ def _build_content_type_context(state: dict) -> str:
 
 
 def _summarize_product_analysis(pa: dict) -> str:
-    """Complete-but-lean per-field extraction summary of product_analysis.
+    """Complete-but-lean summary of product_analysis for code_writer.
 
-    Replaces having code_writer ``read_file`` the full product_analysis.json
-    (often 20K+). Retains EVERY field's extraction method, selector, JSON-LD /
-    CSS fallback, and JS snippet — the things code_writer needs to write
-    extraction code. Drops ``examples``/``expectations``/``tested`` (those are
-    validation concerns for code_tester, not extraction). Typically ~2-4K vs
-    20K+, with zero loss of extraction information.
+    Replaces ``read_file`` of the full product_analysis.json (20K+). Includes
+    EVERYTHING code_writer needs to write the scraper:
+
+    - the per-field extraction map (method + selector + JSON-LD/CSS fallback +
+      JS snippet) — compacted; ``examples``/``expectations``/``tested`` are
+      dropped (validation is code_tester's concern, not extraction).
+    - ``page_structure``, ``extraction_methods``, ``jsonld_extraction``,
+      ``mechanism_reassessment``, ``site_analysis_review``, ``variants`` —
+      included verbatim (each is small; these carry the page layout, the
+      primary extraction approach, JSON-LD details + field guidance like
+      "title truncated -> use CSS h1", and mechanism justification).
+    - ``content_type`` / ``output_key`` scalars.
+
+    Only genuinely redundant/non-codegen keys are dropped: ``connectivity``
+    (site_analysis / scraper_analysis_section already cover it),
+    ``confidence_score``, ``site_slug``, ``analyzed_products`` (a count).
+    ~6-7K vs 24K, with zero loss of codegen-relevant information.
     """
-    fields = (pa or {}).get("fields") or {}
+    import json as _json
+
+    pa = pa or {}
+    fields = pa.get("fields") or {}
     if not isinstance(fields, dict) or not fields:
         return ""
-    lines = ["\n### Field Extraction Map (COMPLETE — from product_analysis)\n"]
+    lines = ["\n### Product Analysis (COMPLETE summary — do NOT read the file)\n"]
+    # Per-field extraction map (compact).
+    lines.append("**Field Extraction Map:**")
     for name, info in fields.items():
         if not isinstance(info, dict):
             lines.append(f"- **{name}**: {info}")
@@ -149,14 +165,31 @@ def _summarize_product_analysis(pa: dict) -> str:
             or ""
         )
         js = info.get("js_extraction") or ""
-        parts = [f"- **{name}** [{method}]"]
+        line = f"- **{name}** [{method}]"
         if sel:
-            parts.append(f"sel=`{sel}`")
+            line += f" sel=`{sel}`"
         if fb:
-            parts.append(f"fallback=`{fb}`")
+            line += f" fallback=`{fb}`"
         if js:
-            parts.append(f"js=`{js}`")
-        lines.append(" ".join(parts))
+            line += f" js=`{js}`"
+        lines.append(line)
+    # The other extraction-relevant sections — verbatim (small + complete).
+    for key, label in (
+        ("page_structure", "Page Structure"),
+        ("extraction_methods", "Extraction Methods"),
+        ("jsonld_extraction", "JSON-LD Extraction"),
+        ("mechanism_reassessment", "Mechanism Reassessment"),
+        ("site_analysis_review", "Site Analysis Review"),
+        ("variants", "Variants"),
+    ):
+        val = pa.get(key)
+        if val:
+            lines.append(f"**{label}:** {_json.dumps(val, ensure_ascii=False)}")
+    # Tiny scalars code_writer references.
+    if pa.get("content_type"):
+        lines.append(f"**content_type:** {pa['content_type']}")
+    if pa.get("output_key"):
+        lines.append(f"**output_key:** {pa['output_key']}")
     return "\n".join(lines) + "\n"
 
 

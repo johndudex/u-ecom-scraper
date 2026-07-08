@@ -100,11 +100,12 @@ ZAI_API_KEY = config("ZAI_API_KEY", default="")
 ZAI_BASE_URL = config("ZAI_BASE_URL", default="https://api.z.ai/api/coding/paas/v4/")
 ZAI_MAIN_MODEL = config("ZAI_MAIN_MODEL", default="glm-5-turbo")
 ZAI_SMALL_MODEL = config("ZAI_SMALL_MODEL", default="glm-5-turbo")
-# Per-agent model override for code_writer. code_writer is pure codegen — the
-# analysis, navigation, and field-extraction work is done upstream by the
-# reasoning agents and handed to it as structured summaries — so it runs on
-# the faster flash model. Override via env; set to ZAI_MAIN_MODEL to revert.
-CODE_WRITER_MODEL = config("CODE_WRITER_MODEL", default="glm-4.7-flash")
+# Per-agent model override for code_writer. Defaults to the main model
+# (glm-5-turbo) — the reasoning agents work well on it and code_writer benefits
+# from the stronger model now that it gets complete-but-lean summaries instead
+# of reading the full analysis JSONs. Set CODE_WRITER_MODEL=glm-4.7-flash to
+# A/B test the faster flash model on codegen.
+CODE_WRITER_MODEL = config("CODE_WRITER_MODEL", default="glm-5-turbo")
 PLAYWRIGHT_MCP_URL = config("PLAYWRIGHT_MCP_URL", default="http://browser_service:8111/sse")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
