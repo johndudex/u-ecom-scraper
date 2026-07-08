@@ -10,6 +10,10 @@ to avoid circular import risks.
 # state.strategies_tried so a failed strategy is never re-picked.
 MAX_TEST_RETRIES: int = 6
 
+# Max times code_reviewer hands issues back to code_writer before letting the
+# scraper proceed to code_tester (avoid review/code_writer loops).
+MAX_CODE_REVIEW_RETRIES: int = 2
+
 MAX_VALIDATE_RETRIES: int = 2
 
 # How many times a failed field mapping can be re-done by product_analyzer

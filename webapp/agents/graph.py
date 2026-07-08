@@ -46,7 +46,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 from langchain_core.runnables import RunnableConfig
 
-from .constants import FINAL_RETRY_SENTINEL
+from .constants import FINAL_RETRY_SENTINEL, MAX_CODE_REVIEW_RETRIES
 from .decisions import options_to_decisions
 from .nodes import (
     check_tracker,
@@ -67,6 +67,7 @@ from .nodes.run_execution import _find_newest_output
 from .state import ScrapeState
 from .subagents import (
     build_cleanup_message,
+    build_code_reviewer_message,
     build_code_tester_message,
     build_code_writer_message,
     build_navigation_agent_message,
@@ -75,6 +76,7 @@ from .subagents import (
     build_site_analyzer_message,
     build_dagster_converter_message,
     create_cleanup_agent,
+    create_code_reviewer,
     create_code_tester,
     create_code_writer,
     create_navigation_agent,
@@ -1875,6 +1877,84 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
 
 
 
+def _invoke_code_review(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
+    """Read-only review of scraper_draft.py between code_writer and code_tester.
+
+    Runs the code_reviewer agent (same context as code_writer + the written
+    scraper). On 'issues', hands the feedback back to code_writer via
+    state.review_feedback (capped at MAX_CODE_REVIEW_RETRIES). Catches logic /
+    intent errors the syntax guard can't see before the expensive code_tester
+    run. [code_reviewer safety net]
+    """
+    import json as _json
+
+    job_id = state.get("job_id", 0)
+    _notify_phase(job_id, "code_review", "running")
+    set_tool_context(dict(state), agent_name="code_review")
+    try:
+        logger.info("_invoke_code_review: starting (job %s)", job_id)
+        slug = state.get("site_slug", "")
+        messages = build_code_reviewer_message(state)
+        _log_agent_context(state, "code-reviewer", messages)
+        agent = create_code_reviewer(site_slug=slug)
+        hb = _start_heartbeat(job_id, "code-reviewer")
+        result = agent.invoke(
+            {"messages": messages}, config=_agent_config(config, "code_review")
+        )
+        _stop_heartbeat(hb)
+        _persist_agent_logs(state, result, "code-reviewer", config)
+        _notify_phase(job_id, "code_review", "done")
+
+        update: dict[str, Any] = {"messages": []}
+        review_path = os.path.join(_get_project_root(), "workspace", slug, "code_review.json")
+        verdict = "pass"
+        issues_text = ""
+        try:
+            with open(review_path, "r") as fh:
+                rev = _json.load(fh)
+            verdict = (rev.get("verdict") or "pass").lower()
+            issues = rev.get("issues") or []
+            if isinstance(issues, list) and issues:
+                issues_text = "\n".join(
+                    f"- [{i.get('severity', '?')}] {i.get('area', '')}: {i.get('problem', '')}"
+                    f"  -> FIX: {i.get('fix', '')}"
+                    for i in issues if isinstance(i, dict)
+                )
+        except Exception as exc:
+            logger.warning(
+                "_invoke_code_review: could not read code_review.json (%s) — assuming pass",
+                exc,
+            )
+            verdict = "pass"
+
+        update["code_review_verdict"] = verdict
+        if verdict == "issues" and issues_text:
+            cnt = (state.get("review_retry_count", 0) or 0) + 1
+            update["review_retry_count"] = cnt
+            update["review_feedback"] = issues_text
+            logger.info(
+                "_invoke_code_review: ISSUES (attempt %d/%d) — routing back to code_writer",
+                cnt, MAX_CODE_REVIEW_RETRIES,
+            )
+        else:
+            logger.info("_invoke_code_review: %s (proceeding to code_tester)", verdict.upper())
+        return update
+    except Exception:
+        _notify_phase(job_id, "code_review", "failed")
+        raise
+    finally:
+        clear_tool_context()
+
+
+def _route_after_code_review(state: ScrapeState) -> str:
+    """Pass → code_tester; issues (under cap) → back to code_writer."""
+    verdict = (state.get("code_review_verdict") or "pass").lower()
+    cnt = state.get("review_retry_count", 0) or 0
+    if verdict == "issues" and cnt <= MAX_CODE_REVIEW_RETRIES:
+        return "code_writer"
+    return "code_tester"
+
+
 def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
     job_id = state.get("job_id", 0)
     retry_count = state.get("test_retry_count", 0)
@@ -2661,6 +2741,7 @@ def build_scrape_graph(
     workflow.add_node("scraper_analyzer", _invoke_scraper_analyzer)
     workflow.add_node("code_writer", _invoke_code_writer)
     workflow.add_node("code_tester", _invoke_code_tester)
+    workflow.add_node("code_review", _invoke_code_review)
     workflow.add_node("cleanup", _invoke_cleanup)
     workflow.add_node("skill_learner", _invoke_skill_learner)
     workflow.add_node("dagster_converter", _invoke_dagster_converter)
@@ -2726,8 +2807,13 @@ def build_scrape_graph(
     # scraper_analyzer → code_writer
     workflow.add_edge("scraper_analyzer", "code_writer")
 
-    # code_writer → code_tester
-    workflow.add_edge("code_writer", "code_tester")
+    # code_writer → code_review (read-only safety net) → code_tester (pass) | code_writer (issues, capped)
+    workflow.add_edge("code_writer", "code_review")
+    workflow.add_conditional_edges(
+        "code_review",
+        _route_after_code_review,
+        {"code_tester": "code_tester", "code_writer": "code_writer"},
+    )
 
     # code_tester → route_after_testing (conditional)
     workflow.add_conditional_edges(

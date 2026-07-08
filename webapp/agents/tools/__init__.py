@@ -53,6 +53,11 @@ AGENT_TOOL_MAP: dict[str, list[str]] = {
         "write_file",
         "run_scraper",
     ],
+    "code_review": [
+        "read_file",
+        "search_content",
+        "write_file",
+    ],
     "cleanup": ["read_file", "write_file", "run_bash", "search_files"],
     "skill_learner": [
         "read_file",

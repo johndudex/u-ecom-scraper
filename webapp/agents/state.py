@@ -57,6 +57,11 @@ class ScrapeState(TypedDict, total=False):
     content_analysis_retries: int
     product_analysis_retries: int
     test_retry_count: int
+    # code_reviewer feedback loop: issues from the reviewer handed back to
+    # code_writer to fix (cap MAX_CODE_REVIEW_RETRIES). Empty on first pass.
+    review_feedback: Annotated[str, _last_write_wins]
+    review_retry_count: int
+    code_review_verdict: str
     reanalyze_count: int
     # How many times product_analyzer has re-mapped failed fields in this run
     # (capped by MAX_REMAPS). Set when route_after_testing sends a mapping

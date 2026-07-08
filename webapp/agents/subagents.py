@@ -41,6 +41,7 @@ AGENT_TEMPERATURES: dict[str, float] = {
     "scraper-analyzer": 0.2,
     "code-writer": 0.4,
     "code-tester": 0.1,
+    "code-reviewer": 0.1,
     "cleanup": 0.1,
     "skill-learner": 0.3,
     "dagster-converter": 0.1,
@@ -69,6 +70,7 @@ AGENT_PROMPT_MAP: dict[str, str] = {
     "scraper_analyzer": "scraper-analyzer",
     "code_writer": "code-writer",
     "code_tester": "code-tester",
+    "code_review": "code-reviewer",
     "cleanup": "cleanup",
     "skill_learner": "skill-learner",
     "dagster_converter": "dagster-converter",
@@ -322,6 +324,11 @@ def create_code_writer(site_slug: str = "") -> object:
 def create_code_tester(site_slug: str = "") -> object:
     # First agent migrated to create_agent (v1). Short agent, no truncation needed.
     return _build_agent("code_tester", site_slug=site_slug, use_create_agent=True)
+
+
+def create_code_reviewer(site_slug: str = "") -> object:
+    # Read-only reviewer (read_file, search_content only) — advises, doesn't edit.
+    return _build_agent("code_review", site_slug=site_slug, use_create_agent=True)
 
 
 def create_cleanup_agent(site_slug: str = "") -> object:
@@ -1595,6 +1602,18 @@ def build_code_writer_message(state: dict) -> list:
             f"the root cause that automated testing missed.\n"
         )
 
+    # code_reviewer feedback: the read-only reviewer found these issues in the
+    # previous draft. Fix them (and don't reintroduce them). [code_reviewer loop]
+    review_feedback_section = ""
+    review_feedback = state.get("review_feedback", "")
+    if review_feedback:
+        review_feedback_section = (
+            f"\n\n### Code Review Feedback (MUST FIX — from code_reviewer)\n"
+            f"The code reviewer read your previous scraper_draft.py and found these issues. "
+            f"Fix each one:\n{review_feedback}\n\n"
+            f"Address every issue; do not reintroduce them.\n"
+        )
+
     algolia_section = ""
     if algolia and algolia.get("detected"):
         algolia_section = (
@@ -2307,7 +2326,7 @@ def build_code_writer_message(state: dict) -> list:
         f"**Save scraper to:** workspace/{slug}/scraper_draft.py\n"
         f"**Save input URLs to:** workspace/{slug}/input_urls.json"
         f"{provided_urls_section}"
-        f"{retry_section}{human_feedback_section}{algolia_section}{navigation_section}{template_hint}{scraper_analysis_section}\n\n"
+        f"{retry_section}{human_feedback_section}{review_feedback_section}{algolia_section}{navigation_section}{template_hint}{scraper_analysis_section}\n\n"
         f"### Full Extraction (MANDATORY — no item caps)\n"
         f"The scraper MUST extract EVERY item the source exposes — never cap the count.\n"
         f"- Do NOT set an arbitrary `MAX_PAGES` / `MAX_ITEMS` limit. Paginate until exhaustion "
@@ -2425,6 +2444,74 @@ def build_code_writer_message(state: dict) -> list:
             "down. The template (templates/*.py) is the only file you need to read.\n"
         )
         content = content + pa_summary
+    return [HumanMessage(content=content)]
+
+
+def build_code_reviewer_message(state: dict) -> list:
+    """Build the review task for the code-reviewer agent.
+
+    Same analysis context as code_writer (so it can judge intent vs implementation),
+    plus the prior-cycle failure note if a previous review/test failed. Read-only:
+    the agent reads scraper_draft.py + writes code_review.json.
+    """
+    import json as _json
+    from langchain_core.messages import HumanMessage
+
+    slug = state.get("site_slug", "unknown")
+    scraper_analysis = state.get("scraper_analysis") or {}
+    site_analysis = state.get("site_analysis") or {}
+    navigation_analysis = state.get("navigation_analysis") or {}
+    product_analysis = state.get("product_analysis") or {}
+    strategy = scraper_analysis.get("strategy") or site_analysis.get("scraping_mechanism", "")
+    rendering = (
+        (navigation_analysis.get("rendering_verified") or "").lower()
+        if isinstance(navigation_analysis, dict) else ""
+    )
+
+    discovery_section = ""
+    if isinstance(navigation_analysis, dict) and navigation_analysis:
+        na = navigation_analysis
+        il = na.get("item_links") or {}
+        strat = na.get("scraper_strategy") or {}
+        ph1 = strat.get("phase1_discovery") if isinstance(strat, dict) else {}
+        discovery_section = (
+            f"**Discovery intent** — rendering={rendering}, strategy={strategy}, "
+            f"discovery_method={na.get('discovery_method')}. "
+        )
+        if isinstance(ph1, dict) and ph1.get("steps"):
+            discovery_section += "phase1_discovery.steps: " + _json.dumps(ph1.get("steps"))[:400] + ". "
+        if isinstance(il, dict) and il.get("url_pattern"):
+            discovery_section += f"item url_pattern=`{il.get('url_pattern')}`."
+        discovery_section += (
+            "\nFor navigation jobs the scraper MUST iterate EVERY discovery dimension "
+            "(all specialties/categories/locations) AND paginate EVERY result page — verify this."
+        )
+
+    field_section = _summarize_product_analysis(product_analysis)
+
+    prior_note = ""
+    rf = state.get("review_feedback") or ""
+    if rf:
+        prior_note = (
+            "\n### Prior review feedback (code-writer was asked to fix these — VERIFY fixed)\n"
+            f"{rf}\n"
+        )
+
+    content = (
+        f"## Review Task\n"
+        f"Read `workspace/{slug}/scraper_draft.py` and verify it implements the intent below. "
+        f"You are READ-ONLY — do NOT edit the scraper; write your verdict to "
+        f"`workspace/{slug}/code_review.json` as your LAST action "
+        f"({{verdict: 'pass'|'issues', summary, issues:[{{severity, area, problem, fix}}]}}).\n\n"
+        f"**Mechanism expected:** {strategy or 'http_requests'} (rendering={rendering or 'unknown'}). "
+        f"SSR + form-search → HTTP (requests.Session + POST + BeautifulSoup) — flag Playwright for SSR. "
+        f"JSON api_endpoint → HTTP GET. Rendered-DOM/anti-bot → Playwright/cloak.\n\n"
+        f"{discovery_section}\n\n"
+        f"{field_section}\n"
+        f"{prior_note}\n"
+        f"Apply your checklist. `verdict: 'pass'` ONLY if the scraper fully implements the intent "
+        f"(full discovery loop + all fields + right mechanism). Otherwise return concrete, actionable issues."
+    )
     return [HumanMessage(content=content)]
 
 

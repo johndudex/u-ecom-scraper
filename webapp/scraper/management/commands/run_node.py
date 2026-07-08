@@ -41,6 +41,7 @@ NODES = [
     "product_analyzer",
     "scraper_analyzer",
     "code_writer",
+    "code_review",
     "code_tester",
     "cleanup",
     "skill_learner",
