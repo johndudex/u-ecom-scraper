@@ -1561,18 +1561,22 @@ def _visit_and_extract(
     if not listing_data:
         findings["errors"].append(f"Failed to parse listing extraction for {page_url}")
 
-    # If content wait timed out, extracted products are unreliable — likely
-    # stale DOM from a previous page. Discard them to prevent poisoning
-    # downstream steps (e.g. skipping step 3c due to phantom product count).
+    # Content wait timed out — the links MAY be valid (SSR sites render links
+    # in the initial HTML; the content wait just timed out waiting for JS
+    # widgets/ads to settle) or stale (SPA didn't finish rendering). Previously
+    # ALL links were discarded, which threw away valid SSR links (e.g.
+    # locumtenens — 12 real job URLs discarded as "stale" → 0 product_links →
+    # thin nav_analysis → broken scraper). Keep the links + flag them as
+    # uncertain. Downstream (_is_product_url filter, nav_synthesize dedup,
+    # code_tester) validates them.
     if not content_loaded:
         stale_count = len(listing_data.get("product_links", []))
         if stale_count > 0:
             logger.warning(
-                "navigate_explore: content wait timed out, discarding %d stale product links from %s",
+                "navigate_explore: content wait timed out — KEEPING %d product links from %s (may be valid SSR content; flagged as uncertain)",
                 stale_count, page_url[:100],
             )
-            listing_data["product_links"] = []
-            listing_data["total_products"] = None
+            listing_data["content_wait_timed_out"] = True
 
     findings["listing_page"].update(listing_data)
     product_count = len(listing_data.get("product_links", []))
@@ -1676,16 +1680,16 @@ def _try_form_search(
     )
     listing_data = _parse_eval_json(listing_data_raw)
 
-    # If content wait timed out, discard stale products
+    # Content wait timed out — KEEP links (see comment above for rationale).
+    # Previously discarded, which threw away valid SSR links.
     if not content_loaded:
         stale_count = len(listing_data.get("product_links", []))
         if stale_count > 0:
             logger.warning(
-                "navigate_explore: form search content wait timed out, discarding %d stale product links",
+                "navigate_explore: form search content wait timed out — KEEPING %d product links (may be valid SSR content; flagged as uncertain)",
                 stale_count,
             )
-            listing_data["product_links"] = []
-            listing_data["total_products"] = None
+            listing_data["content_wait_timed_out"] = True
 
     findings["listing_page"].update(listing_data)
 
