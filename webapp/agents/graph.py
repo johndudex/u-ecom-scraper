@@ -1838,16 +1838,21 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         slug = state.get("site_slug", "")
         # Write sample URLs from nav_analysis to input_urls.json so the
         # scraper can use them in --sample mode (skip slow discovery).
+        # Read from the FILE (not state) — the LLM-written file has the
+        # discovered URLs; the state copy sometimes loses item_links.urls.
         try:
             import json as _json
-            na = state.get("navigation_analysis") or {}
-            il = na.get("item_links") or {}
-            sample_urls = il.get("urls") or il.get("url_examples") or []
-            if sample_urls:
-                iu_path = os.path.join(_get_project_root(), "workspace", slug, "input_urls.json")
-                with open(iu_path, "w") as _f:
-                    _json.dump({"urls": sample_urls}, _f, indent=2)
-                logger.info("_invoke_code_writer: wrote %d sample URLs to input_urls.json", len(sample_urls))
+            na_path = os.path.join(_get_project_root(), "workspace", slug, "navigation_analysis.json")
+            if os.path.isfile(na_path):
+                with open(na_path, "r") as _nf:
+                    na = _json.load(_nf)
+                il = na.get("item_links") or {}
+                sample_urls = il.get("urls") or il.get("url_examples") or []
+                if sample_urls:
+                    iu_path = os.path.join(_get_project_root(), "workspace", slug, "input_urls.json")
+                    with open(iu_path, "w") as _f:
+                        _json.dump({"urls": sample_urls}, _f, indent=2)
+                    logger.info("_invoke_code_writer: wrote %d sample URLs to input_urls.json", len(sample_urls))
         except Exception as _exc:
             logger.warning("_invoke_code_writer: failed to write input_urls.json: %s", _exc)
 
