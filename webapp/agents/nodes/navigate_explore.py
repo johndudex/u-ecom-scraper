@@ -1896,9 +1896,22 @@ def _build_classic_fill_js(criteria: str) -> str:
         const val = pick(opts, kind);
         try {
           s.value = val;
+          // If value didn't take (empty value attributes — ASP.NET pattern:
+          // <option value="">Text</option>), select the first real option by
+          // index so the form submits with a non-empty selection.
+          if (!s.value && s.options.length > 1) {
+            for (let idx = 1; idx < s.options.length; idx++) {
+              const txt = (s.options[idx].textContent || '').trim();
+              if (txt && !/^\s*(any|all|please|select|choose)/i.test(txt)) {
+                s.selectedIndex = idx;
+                break;
+              }
+            }
+          }
           s.dispatchEvent(new Event('input', {bubbles: true}));
           s.dispatchEvent(new Event('change', {bubbles: true}));
-          fills.push({name: s.name || s.id, kind, value: val});
+          const selOpt = s.options[s.selectedIndex] || {};
+          fills.push({name: s.name || s.id, kind, value: selOpt.value || (selOpt.textContent || '').trim() || val});
         } catch (e) {}
       });
       let submitted = false;
