@@ -22,8 +22,8 @@ from agents.tools.web_tools import get_web_tools as _get_web_tools
 logger = logging.getLogger(__name__)
 
 AGENT_TOOL_MAP: dict[str, list[str]] = {
-    "site_analyzer": ["playwright", "web", "write_file", "read_file", "probe"],
-    "product_analyzer": ["playwright", "web", "write_file", "read_file", "probe", "probe_html"],
+    "site_analyzer": ["playwright", "web", "write_file", "read_file", "probe", "load_skill", "list_skills"],
+    "product_analyzer": ["playwright", "web", "write_file", "read_file", "probe", "probe_html", "load_skill", "list_skills"],
     "navigation_agent": ["playwright", "web", "write_file", "read_file", "load_skill", "list_skills"],
     "navigation_explore": ["playwright", "web", "write_file", "read_file"],
     "navigation_synthesize": ["read_file", "write_file", "load_skill", "web"],
@@ -57,6 +57,8 @@ AGENT_TOOL_MAP: dict[str, list[str]] = {
         "read_file",
         "search_content",
         "write_file",
+        "load_skill",
+        "list_skills",
     ],
     "cleanup": ["read_file", "write_file", "run_bash", "search_files"],
     "skill_learner": [

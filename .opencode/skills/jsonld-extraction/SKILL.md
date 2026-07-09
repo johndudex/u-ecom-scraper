@@ -126,6 +126,26 @@ for block in json_ld_blocks:
             product_block = block
 ```
 
+## Learned: og:url may return the site root, not the page URL
+**Source:** locumtenens.com (2026-07-09)
+**Applicability:** any scraper using `og:url` / Open Graph as the canonical URL source.
+
+On some sites the `og:url` meta tag is misconfigured (or intentionally set) to the site
+homepage (e.g. `https://www.locumtenens.com`) instead of the actual page URL. Using it
+blindly makes every extracted item share the same (wrong) URL.
+
+**Guard:** before trusting `og:url`, compare it to the site root and to `page.url` /
+`<link rel="canonical">`. If `og:url` equals the site root (or differs from the request URL
+by only the host), discard it and fall back to `page.url` / canonical / the discovered href.
+
+```python
+og = soup.select_one('meta[property="og:url"]')["content"] if soup.select_one('meta[property="og:url"]') else ""
+site_root = urlparse(url).scheme + "://" + urlparse(url).netloc
+item_url = page_url_or_canonical  # the request URL / <link rel=canonical>
+if og and og.rstrip("/") != site_root.rstrip("/"):
+    item_url = og  # og:url looks legit (points at a real page, not the root)
+```
+
 ## Offers Structure
 
 The `offers` field can be a single object or an array:

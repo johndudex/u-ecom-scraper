@@ -253,6 +253,42 @@ Look for:
 6. **Don't click too fast** - Trigger anti-bot if clicking rapidly
 7. **Save snapshots to files** - For offline analysis later
 
+## Learned: Browser Rotation for Long-Running Phase 1 Discovery
+**Source:** https://www.locumtenens.com (2026-07-09)
+**Applicability:** Two-phase scrapers where Phase 1 uses Playwright to navigate hundreds of pages (e.g., iterating all categories/specialties on a job board or catalog site)
+
+When Phase 1 discovery requires navigating hundreds of pages, Chromium browsers can leak
+memory and eventually crash or become unresponsive (blank pages, timeout errors, segfaults).
+**Rotate the browser** — relaunch it every N pages to prevent memory-related failures.
+
+**Implementation pattern:**
+```python
+ROTATE_EVERY = 25  # relaunch browser every N pages
+
+def _browser_alive(page) -> bool:
+    """Probe whether the browser page is still responsive."""
+    try:
+        page.evaluate("1")
+        return True
+    except Exception:
+        return False
+
+# In the discovery loop, after every ROTATE_EVERY pages:
+if not _browser_alive(page) or (pages_since_restart >= ROTATE_EVERY):
+    context.close()
+    browser.close()
+    browser = p.chromium.launch(headless=True)
+    context = browser.new_context(...)
+    page = context.new_page()
+    pages_since_restart = 0
+```
+
+**Key tips:**
+- The `page.evaluate("1")` probe is the fastest way to detect a dead page (no DOM queries needed).
+- 25 pages is a conservative threshold; increase to 50-100 for lighter pages, decrease to 10-15 for heavy pages with lots of images/scripts.
+- Always close both `context` and `browser` before relaunching to fully free memory.
+- Combine with checkpoint/resume (write discovered URLs to file periodically) so a crash doesn't lose progress.
+
 ## Common Issues
 
 1. **Page too large for snapshot**: Use `depth` parameter to limit tree depth

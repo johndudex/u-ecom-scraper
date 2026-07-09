@@ -221,6 +221,52 @@ When choosing `discovery_method` for `navigation_analysis.json`:
 | birdsnest.com.au | Shopify+Fredhopper (CSR) | Search (`/search?q=`) | 30 | Fredhopper numbered pagination detection |
 | aretrotale.com | Centra+Next.js+SearchSpring (CSR) | Category fallback | 30 | Cookie consent, CSS garbage in text, locale prefix |
 
+## Learned: Soft-404 Detection for Expired/Filled Job Postings
+**Source:** https://www.locumtenens.com (2026-07-09)
+**Applicability:** Any job board scraper where job postings can expire or get filled while URLs remain valid (HTTP 200)
+
+Job board sites commonly have postings that expire or get filled, but the URL still returns
+HTTP 200 with a "sorry, this job is no longer available" page. Scrapers that don't detect
+this will extract near-empty items with misleading titles.
+
+**Detection approach:**
+```python
+# Check h1 text and page title against expiration phrases
+h1_text = soup.find("h1").get_text(strip=True).lower() if soup.find("h1") else ""
+page_title = soup.title.get_text(strip=True).lower() if soup.title else ""
+combined = f"{page_title} {h1_text}"
+
+soft404_phrases = [
+    "not found", "page not found", "no longer available",
+    "has been filled", "position has been filled",
+    "job no longer available", "this job is no longer",
+    "unavailable", "discontinued",
+]
+for phrase in soft404_phrases:
+    if phrase in combined:
+        item["remarks"] = f"Soft 404: {phrase}"
+        return item  # skip extraction
+```
+
+**Redirect detection:**
+Also check if the final URL (after redirects) no longer matches the job URL pattern:
+```python
+final_url = resp.url or url
+if final_url.rstrip("/") != url.rstrip("/"):
+    final_path = urlparse(final_url).path
+    if not re.search(r"job-\d+|/job/", final_path):
+        # Redirected to homepage, search page, or non-job page
+        if len(final_path) < 10 or "/search" in final_path.lower():
+            item["remarks"] = f"Soft 404: redirected to {final_url[:100]}"
+            return item
+```
+
+**Key tips:**
+- Use specific phrases only — avoid overly broad words like "error" that appear in normal content.
+- Always check both `<h1>` and `<title>` since expired-page markup varies across sites.
+- For job boards with `og:url` issues (returns site root), prefer the redirect detection method.
+- Mark the item with a `remarks` field rather than deleting it — preserves audit trail.
+
 ## Cookie Consent / GDPR Dialogs
 
 Many sites (especially EU) show a cookie consent dialog that blocks the page
