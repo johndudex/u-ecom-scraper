@@ -55,6 +55,18 @@ with open("input_urls.json", "r") as f:
 
 # Or accept --urls flag
 # python3 scraper.py --urls "https://shop.com/p1" "https://shop.com/p2"
+
+# CRITICAL for two-phase scrapers: In --sample mode, SKIP Phase 1 (discovery)
+# and use the URLs already in input_urls.json directly for Phase 2 extraction.
+# Discovery (iterating specialties/categories/form-search) is SLOW and will
+# timeout the sample test (120s limit). The orchestrator writes discovered
+# sample URLs to input_urls.json before you run — use them.
+if args.sample and urls:
+    logger.info("Sample mode: skipping discovery, using %d URLs from input_urls.json", len(urls))
+    discovered_urls = urls
+else:
+    discovered_urls = discover_urls()  # full discovery (all specialties/categories)
+```
 ```
 
 The `input_urls.json` format:
