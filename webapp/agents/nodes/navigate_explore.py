@@ -1932,7 +1932,14 @@ def _build_classic_fill_js(criteria: str) -> str:
         else { form.submit(); via = 'submit'; }
         submitted = true;
       } catch (e) {}
-      return JSON.stringify({submitted, via, fills, action: form.getAttribute('action') || ''});
+      const selectDebug = Array.from(form.querySelectorAll('select')).map(s => ({
+        name: s.name || s.id || '',
+        optionsCount: s.options.length,
+        firstOpt: s.options[0] ? (s.options[0].textContent || '').trim().slice(0, 30) : '',
+        secondOpt: s.options[1] ? (s.options[1].textContent || '').trim().slice(0, 30) : '',
+        secondVal: s.options[1] ? s.options[1].value : '',
+      }));
+      return JSON.stringify({submitted, via, fills, action: form.getAttribute('action') || '', selectDebug});
     }
     """
     )
@@ -2101,8 +2108,11 @@ def _try_classic_dropdown_search(
     fill_raw = _invoke_tool(evaluate, function=fill_js)
     fill_result = _parse_eval_json(fill_raw) or {}
     logger.info(
-        "navigate_explore: classic-search fill+submit -> %s", str(fill_result)[:200]
+        "navigate_explore: classic-search fill+submit -> %s", str(fill_result)[:500]
     )
+    _sd = fill_result.get("selectDebug") if isinstance(fill_result, dict) else None
+    if _sd:
+        logger.info("navigate_explore: classic-search selectDebug -> %s", json.dumps(_sd)[:500])
 
     submit_js = r"""
     () => {
