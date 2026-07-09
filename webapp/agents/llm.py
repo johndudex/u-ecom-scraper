@@ -26,11 +26,14 @@ def get_llm(model: Optional[str] = None, temperature: float = 0.3) -> ChatOpenAI
         # Retry transient api.z.ai connection drops (large code_writer calls
         # fail mid-transfer with openai.APIConnectionError). Default is 2; bump
         # so a momentary network blip doesn't kill the agent. [generic]
-        # NOTE: no request_timeout — an earlier 300s value cut off code_writer's
-        # legitimate ~5-8 min codegen calls (retries fired every 300s = the
-        # timeout, not connection drops). Job 321 completed codegen with no
-        # timeout; max_retries + tool-call logging handle the real failure modes.
         max_retries=getattr(settings, "LLM_MAX_RETRIES", 5),
+        # Bound each call so a *stuck* call (api.z.ai accepts it but never
+        # responds) fails fast and max_retries can retry it — without this a
+        # silent hang parks the agent forever (the heartbeat masks it from the
+        # watchdog). 600s is generous: legitimate codegen is ~5-8 min, so this
+        # only fires on true hangs. (An earlier 300s cut off real codegen; no
+        # timeout at all let hangs persist — 600s is the balance.)
+        timeout=getattr(settings, "LLM_REQUEST_TIMEOUT", 600),
     )
 
 
