@@ -1938,6 +1938,7 @@ def _invoke_code_review(state: ScrapeState, config: RunnableConfig) -> dict[str,
         review_path = os.path.join(_get_project_root(), "workspace", slug, "code_review.json")
         verdict = "pass"
         issues_text = ""
+        issues = []
         try:
             with open(review_path, "r") as fh:
                 rev = _json.load(fh)
