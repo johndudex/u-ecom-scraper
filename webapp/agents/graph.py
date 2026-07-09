@@ -1574,6 +1574,13 @@ def _invoke_navigation_synthesize(
                             "findings into analysis.item_links.urls (had %d)",
                             len(product_urls), len(existing),
                         )
+                        # ALSO update the state return value (result) so downstream
+                        # nodes (code_writer, etc.) see the URLs without needing to
+                        # re-read the file. This is the root-cause fix for the
+                        # state-loses-URLs bug that required the input_urls.json
+                        # workaround in _invoke_code_writer.
+                        if isinstance(result, dict):
+                            result["navigation_analysis"] = na
         except Exception as exc_merge:
             logger.warning("navigation_synthesize: URL merge failed: %s", exc_merge)
 
@@ -1838,21 +1845,18 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         slug = state.get("site_slug", "")
         # Write sample URLs from nav_analysis to input_urls.json so the
         # scraper can use them in --sample mode (skip slow discovery).
-        # Read from the FILE (not state) — the LLM-written file has the
-        # discovered URLs; the state copy sometimes loses item_links.urls.
+        # Reads from STATE (navigation_synthesize merges URLs into state
+        # via the result update — see _invoke_navigation_synthesize).
         try:
             import json as _json
-            na_path = os.path.join(_get_project_root(), "workspace", slug, "navigation_analysis.json")
-            if os.path.isfile(na_path):
-                with open(na_path, "r") as _nf:
-                    na = _json.load(_nf)
-                il = na.get("item_links") or {}
-                sample_urls = il.get("urls") or il.get("url_examples") or []
-                if sample_urls:
-                    iu_path = os.path.join(_get_project_root(), "workspace", slug, "input_urls.json")
-                    with open(iu_path, "w") as _f:
-                        _json.dump({"urls": sample_urls}, _f, indent=2)
-                    logger.info("_invoke_code_writer: wrote %d sample URLs to input_urls.json", len(sample_urls))
+            na = state.get("navigation_analysis") or {}
+            il = na.get("item_links") or {}
+            sample_urls = il.get("urls") or il.get("url_examples") or []
+            if sample_urls:
+                iu_path = os.path.join(_get_project_root(), "workspace", slug, "input_urls.json")
+                with open(iu_path, "w") as _f:
+                    _json.dump({"urls": sample_urls}, _f, indent=2)
+                logger.info("_invoke_code_writer: wrote %d sample URLs to input_urls.json", len(sample_urls))
         except Exception as _exc:
             logger.warning("_invoke_code_writer: failed to write input_urls.json: %s", _exc)
 
