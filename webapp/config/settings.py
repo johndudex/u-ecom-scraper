@@ -106,6 +106,11 @@ ZAI_SMALL_MODEL = config("ZAI_SMALL_MODEL", default="glm-5-turbo")
 # of reading the full analysis JSONs. Set CODE_WRITER_MODEL=glm-4.7-flash to
 # A/B test the faster flash model on codegen.
 CODE_WRITER_MODEL = config("CODE_WRITER_MODEL", default="glm-5-turbo")
+# Stream code_writer's LLM output token-by-token (sync agent.stream). Gives
+# real-time visibility (no "looks idle"), a healthier streaming connection
+# (fewer mid-codegen drops), and an idle-timeout (no-token-for-N-sec) hang
+# signal. Set USE_STREAMING_CODEWRITER=False to revert to blocking invoke().
+USE_STREAMING_CODEWRITER = config("USE_STREAMING_CODEWRITER", default=True, cast=bool)
 PLAYWRIGHT_MCP_URL = config("PLAYWRIGHT_MCP_URL", default="http://browser_service:8111/sse")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent

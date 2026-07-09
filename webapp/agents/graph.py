@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import re
 import time
 import functools
@@ -1879,6 +1880,163 @@ def _fix_scraper_syntax(
     )
 
 
+# ── code_writer streaming ───────────────────────────────────────────────
+# Streaming code_writer's LLM output token-by-token (sync agent.stream) so the
+# large ~7,400-token codegen (a) is visible in real time (no "looks idle"),
+# (b) holds a healthier streaming connection (fewer mid-codegen drops), and
+# (c) gives a precise "no token for N sec" idle signal for stuck-call
+# detection. See plan: so-initially-when-i-quiet-owl.md.
+
+_STREAM_SENTINEL = object()
+# Exception class names that indicate a transient network/timeout failure worth
+# retrying the whole stream for (matched by name so we don't import every
+# vendor SDK — httpx/openai/requests all surface distinct classes).
+_STREAM_RETRYABLE_NAMES = {
+    "APIConnectionError",
+    "APITimeoutError",
+    "ReadTimeout",
+    "ReadTimeoutError",
+    "ConnectTimeout",
+    "ConnectError",
+    "ConnectionResetError",
+    "ConnectionError",
+    "RemoteProtocolError",
+    "ChunkedEncodingError",
+    "TransportError",
+    "StreamError",
+}
+
+
+def _is_stream_retryable(exc: Exception) -> bool:
+    """True if a stream exception looks transient (drop/timeout) → retry."""
+    if type(exc).__name__ in _STREAM_RETRYABLE_NAMES:
+        return True
+    return isinstance(exc, (ConnectionError, TimeoutError, OSError))
+
+
+def _publish_code_writer_token(job_id: int, text: str) -> None:
+    """Best-effort publish a codegen token delta to the job SSE channel."""
+    if not text:
+        return
+    try:
+        from .scraper.services import LangGraphService
+
+        LangGraphService._publish_redis(
+            job_id, {"type": "agent_token", "agent": "code-writer", "text": text[:200]}
+        )
+    except Exception:
+        pass
+
+
+def _parse_stream_chunk(chunk: Any) -> tuple[str | None, Any]:
+    """Normalize a langgraph multi-mode stream chunk to (mode, data).
+
+    Multi-mode (stream_mode=[...]) yields ``(namespace, mode, data)`` in v1;
+    single-mode may yield a bare dict. Be defensive — the happy-path run_node
+    test confirms the real shape.
+    """
+    if isinstance(chunk, (tuple, list)):
+        if len(chunk) >= 3:
+            return str(chunk[1]), chunk[2]
+        if len(chunk) == 2:
+            return str(chunk[0]), chunk[1]
+        return None, None
+    if isinstance(chunk, dict):
+        return "values", chunk
+    return None, None
+
+
+def _stream_code_writer_to_completion(
+    agent: Any,
+    messages: Any,
+    config: RunnableConfig,
+    job_id: int,
+    *,
+    max_attempts: int = 3,
+    idle_timeout: float = 120.0,
+) -> dict[str, Any]:
+    """Run the code_writer react agent as a **sync stream**, returning a result
+    dict shaped like ``agent.invoke()``'s (``{"messages": [...]}``) so
+    ``_persist_agent_logs`` works unchanged.
+
+    Runs the blocking generator on a daemon thread and consumes chunks from a
+    queue with an ``idle_timeout`` — "no chunk for idle_timeout sec" ⇒ the call
+    is stuck ⇒ retry. Producer exceptions (mid-stream drops) are forwarded via
+    ``exc_box`` and retried if transient. ``GraphRecursionError`` etc. are NOT
+    retried — they propagate to the existing approval/failure path.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        q: queue.Queue = queue.Queue()
+        exc_box: list[Exception] = []
+        last_values: dict[str, Any] | None = None
+
+        def _producer() -> None:  # runs on a daemon thread; NO Django ORM here
+            try:
+                for chunk in agent.stream(
+                    {"messages": messages},
+                    config=config,
+                    stream_mode=["messages", "values"],
+                ):
+                    q.put(chunk)
+            except Exception as e:  # noqa: BLE001 — forward anything to main thread
+                exc_box.append(e)
+            finally:
+                q.put(_STREAM_SENTINEL)
+
+        producer = threading.Thread(target=_producer, daemon=True)
+        producer.start()
+
+        try:
+            while True:
+                try:
+                    item = q.get(timeout=idle_timeout)
+                except queue.Empty:
+                    # No chunk for idle_timeout sec ⇒ stuck call. Retry.
+                    raise TimeoutError(
+                        f"code_writer stream idle > {idle_timeout:.0f}s (attempt {attempt}/{max_attempts})"
+                    )
+                if item is _STREAM_SENTINEL:
+                    break
+                mode, data = _parse_stream_chunk(item)
+                if mode == "values" and isinstance(data, dict):
+                    last_values = data  # accumulate; last one == final state
+                elif mode == "messages":
+                    # data is (message_chunk, metadata); stream its text for visibility
+                    try:
+                        msg_chunk = data[0] if isinstance(data, (tuple, list)) else data
+                        _publish_code_writer_token(job_id, getattr(msg_chunk, "content", "") or "")
+                    except Exception:
+                        pass
+
+            # Producer finished — surface any exception it captured (mid-stream drop).
+            if exc_box:
+                raise exc_box[0]
+
+            if last_values is not None and last_values.get("messages") is not None:
+                return last_values  # drop-in replacement for invoke()'s result
+            # Defensive fallback if no values chunk arrived.
+            return {"messages": list(messages)}
+
+        except Exception as exc:
+            last_exc = exc
+            if _is_stream_retryable(exc) and attempt < max_attempts:
+                logger.warning(
+                    "code_writer stream attempt %d/%d failed (%s: %s); retrying",
+                    attempt,
+                    max_attempts,
+                    type(exc).__name__,
+                    str(exc)[:160],
+                )
+                continue
+            raise  # non-retryable (e.g. GraphRecursionError) or out of attempts → propagate
+
+    # Should be unreachable (loop raises on last attempt), but keep mypy happy.
+    if last_exc is not None:
+        raise last_exc
+    return {"messages": list(messages)}
+
+
 def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
     job_id = state.get("job_id", 0)
     _notify_phase(job_id, "code_writer", "running")
@@ -1926,9 +2084,16 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         _log_agent_context(state, "code-writer", messages)
         agent = create_code_writer(site_slug=slug)
         hb = _start_heartbeat(job_id, "code-writer")
-        result = agent.invoke(
-            {"messages": messages}, config=_agent_config(config, "code_writer")
-        )
+        _cw_cfg = _agent_config(config, "code_writer")
+        from django.conf import settings as _settings
+
+        if getattr(_settings, "USE_STREAMING_CODEWRITER", True):
+            # Stream code_writer token-by-token: real-time visibility + an
+            # idle-timeout hang signal + a healthier streaming connection.
+            result = _stream_code_writer_to_completion(agent, messages, _cw_cfg, job_id)
+            logger.info("_invoke_code_writer: streamed code_writer (token-level)")
+        else:
+            result = agent.invoke({"messages": messages}, config=_cw_cfg)
         _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "code-writer", config)
         _notify_phase(job_id, "code_writer", "done")
