@@ -847,13 +847,19 @@ def build_product_analyzer_message(state: dict) -> list:
     url = state.get("url", "")
     product_url = state.get("product_url") or state.get("sample_url") or ""
 
+    # When no specific item URL was provided, gather the URLs navigation discovered
+    # and let the product_analyzer LLM pick a real item/detail page from them
+    # (content-type-generic — works for products / jobs / articles / …). We do NOT
+    # deterministically pick one here: the LLM is better at recognizing a real item
+    # page vs an about-us / category / listing page across arbitrary sites, and a
+    # Python heuristic (the old ">=2 path segments" rule) let content pages through.
+    pick_candidates: list[str] = []
     if not product_url:
         nav_findings = state.get("navigation_findings") or {}
         nav_analysis = state.get("navigation_analysis") or {}
         listing = nav_findings.get("listing_page", {})
         product_links = listing.get("product_links", [])
-
-        candidates = []
+        candidates: list[str] = []
         if product_links:
             candidates = [
                 p.get("href", "") if isinstance(p, dict) else str(p)
@@ -864,21 +870,8 @@ def build_product_analyzer_message(state: dict) -> list:
             for u in item_links.get("url_examples", []):
                 if u and u not in candidates:
                     candidates.append(u)
-
-        for candidate in candidates:
-            from urllib.parse import urlparse
-
-            parsed = urlparse(candidate)
-            path = parsed.path.strip("/")
-            path_parts = [p for p in path.split("/") if p]
-            if path_parts and not candidate.endswith("/"):
-                if len(path_parts) >= 2 or re.search(r"[A-Z]\d{5,}", path):
-                    product_url = candidate
-                    break
-
-        if not product_url and candidates:
-            product_url = candidates[0]
-    if not product_url:
+        pick_candidates = [c for c in candidates if c]
+    if not product_url and not pick_candidates:
         product_url = "auto-discover"
 
     content_type_context = _build_content_type_context(state)
@@ -986,6 +979,30 @@ def build_product_analyzer_message(state: dict) -> list:
             f"DOM selectors — it's more reliable. If it doesn't cover a field, use selectors.\n\n"
         )
 
+    # Content-type-generic page instruction. If a specific URL was provided, analyze
+    # it directly; otherwise hand the discovered candidates to the LLM and let it pick
+    # a real item/detail page — no deterministic heuristic (the old ">=2 path segments"
+    # rule let about-us pages through). Works across content types (products/jobs/…).
+    content_type_name = (
+        (state.get("content_type_config") or {}).get("content_type")
+        or state.get("page_type")
+        or "item"
+    )
+    if pick_candidates:
+        cand_list = "\n".join(f"- {c}" for c in pick_candidates[:12])
+        page_instruction = (
+            f"**No specific {content_type_name} URL was provided.** The navigation step "
+            f"discovered these candidate URLs:\n{cand_list}\n\n"
+            f"Pick the one that is a **real {content_type_name} detail/item page** — a "
+            f"*single* {content_type_name} (one job posting / one product / one article — "
+            f"match this site's content type), **not** a listing, category, or about-us / "
+            f"contact / blog / search page. `probe_page` it, then map every extractable "
+            f"field from it. If none look like item pages, probe 2-3 of them to find a "
+            f"real one.\n"
+        )
+    else:
+        page_instruction = f"**Page URL (analyze this page):** {product_url}\n"
+
     content = (
         f"## OBJECTIVE\n"
         f"Building a scraper for {url}. The scraper reads URLs "
@@ -994,7 +1011,7 @@ def build_product_analyzer_message(state: dict) -> list:
         f"## Your Task: Content Field Mapping\n\n"
         f"Critically review the site analysis, then analyze the **page** "
         f"below to map every extractable field with exact selectors.\n\n"
-        f"**Page URL (analyze this page):** {product_url}\n"
+        f"{page_instruction}"
         f"**Site URL:** {url}\n"
         f"**Site slug:** {slug}\n"
         f"**Site analysis:** workspace/{slug}/site_analysis.json\n"
