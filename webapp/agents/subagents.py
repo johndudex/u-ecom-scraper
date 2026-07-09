@@ -857,19 +857,23 @@ def build_product_analyzer_message(state: dict) -> list:
     if not product_url:
         nav_findings = state.get("navigation_findings") or {}
         nav_analysis = state.get("navigation_analysis") or {}
-        listing = nav_findings.get("listing_page", {})
-        product_links = listing.get("product_links", [])
         candidates: list[str] = []
-        if product_links:
-            candidates = [
-                p.get("href", "") if isinstance(p, dict) else str(p)
-                for p in product_links
-            ]
+        # Prefer the CURATED item URLs from navigation_synthesize (deduped/filtered
+        # real item pages). listing_page.product_links is the RAW extract and can
+        # include content pages (about-us/resources) that navigate_explore's JS
+        # looksLikeProduct filter leaks through — using it first shadowed the real
+        # item URLs (locumtenens job 219 got about-us candidates, not job URLs).
+        item_links = nav_analysis.get("item_links", {})
+        for u in item_links.get("url_examples") or []:
+            if u and u not in candidates:
+                candidates.append(u)
+        # Supplement with raw listing_page links only if synthesize produced none.
         if not candidates:
-            item_links = nav_analysis.get("item_links", {})
-            for u in item_links.get("url_examples", []):
-                if u and u not in candidates:
-                    candidates.append(u)
+            listing = nav_findings.get("listing_page", {})
+            for pl in listing.get("product_links") or []:
+                href = pl.get("href", "") if isinstance(pl, dict) else str(pl)
+                if href and href not in candidates:
+                    candidates.append(href)
         pick_candidates = [c for c in candidates if c]
     if not product_url and not pick_candidates:
         product_url = "auto-discover"
