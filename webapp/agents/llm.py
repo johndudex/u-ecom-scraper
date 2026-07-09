@@ -23,6 +23,14 @@ def get_llm(model: Optional[str] = None, temperature: float = 0.3) -> ChatOpenAI
         openai_api_key=settings.ZAI_API_KEY,
         model=model or getattr(settings, "ZAI_MAIN_MODEL", "glm-5-turbo"),
         temperature=temperature,
+        # Retry transient api.z.ai connection drops (large code_writer calls
+        # fail mid-transfer with openai.APIConnectionError). Default is 2; bump
+        # so a momentary network blip doesn't kill the agent. [generic]
+        # NOTE: no request_timeout — an earlier 300s value cut off code_writer's
+        # legitimate ~5-8 min codegen calls (retries fired every 300s = the
+        # timeout, not connection drops). Job 321 completed codegen with no
+        # timeout; max_retries + tool-call logging handle the real failure modes.
+        max_retries=getattr(settings, "LLM_MAX_RETRIES", 5),
     )
 
 

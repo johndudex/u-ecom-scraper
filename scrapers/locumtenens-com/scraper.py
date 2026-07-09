@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
-LocumTenens.com Job Scraper — Two-Phase Navigation Architecture
+LocumTenens.com Job Scraper — Two-Phase Architecture
 
-Phase 1 (Playwright): Navigate the QuickSearch form, iterate ALL specialties with
-  Location=Alabama, submit each, apply JobAge=7 (last 7 days), paginate results,
-  and collect unique job URLs.
-Phase 2 (HTTP requests): Fetch each discovered job-detail page, extract structured
-  data from JSON-LD + CSS selectors, and write output JSON.
+Phase 1: Discover job URLs by iterating the Specialties <select> on the
+         QuickSearch POST form using Playwright, then paginating results.
+Phase 2: Extract structured data from each job detail page concurrently
+         using requests + BeautifulSoup (pages are server-rendered).
+
+The QuickSearch form requires a Specialty selection and uses anti-forgery
+tokens + server-side sessions, so raw requests.post() returns HTTP 500.
+Phase 1 MUST use a real browser (Playwright).
 
 Usage:
-    python3 scraper_draft.py                          # full extraction (default)
-    python3 scraper_draft.py --sample                 # first 5 items only
-    python3 scraper_draft.py --limit 20               # max 20 items
-    python3 scraper_draft.py --no-proxy                # no proxy (default for this site)
-    python3 scraper_draft.py --input urls.json         # scrape pre-provided URLs
-    python3 scraper_draft.py --urls URL1 URL2 ...      # scrape specific URLs
+    python3 scraper_draft.py                          # full discovery + extraction
+    python3 scraper_draft.py --sample                  # 5 jobs from input_urls.json
+    python3 scraper_draft.py --limit 50                # cap at 50 jobs
+    python3 scraper_draft.py --urls URL1 URL2 ...     # specific URLs
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -23,10 +26,10 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
-from html.parser import HTMLParser
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -40,89 +43,56 @@ from playwright.sync_api import sync_playwright
 
 SITE_NAME = "LocumTenens.com"
 SITE_URL = "https://www.locumtenens.com"
-PLATFORM = "custom ASP.NET MVC"
+PLATFORM = "custom"
 SITE_SLUG = "locumtenens-com"
-CONTENT_TYPE = "job_posting"
+SCRAPING_METHOD = "playwright_navigation"
+PROXY_TIER = "none"
 OUTPUT_KEY = "jobs"
+CONTENT_TYPE = "job_posting"
 CURRENCY = "USD"
 
-# Phase 1: Form interaction
-QUICKSEARCH_URL = f"{SITE_URL}/Resources/JobSearch/QuickSearch"
-DISCIPLINES_SELECTOR = 'select[name="Disciplines"]'
-SPECIALTIES_SELECTOR = 'select[name="Specialties"]'
-LOCATIONS_SELECTOR = 'select[name="Locations"]'
-SUBMIT_SELECTOR = 'input[type="submit"]'
-RESULTS_PAGE_PARAM = "pgNum"
-RESULTS_PER_PAGE = 25
-MAX_PAGES = 50
+# Phase 1 — QuickSearch form (browser-based)
+QUICK_SEARCH_URL = f"{SITE_URL}/Resources/JobSearch/QuickSearch"
+ITEM_CONTAINER_SELECTOR = "li.job-results-item"
+ITEM_LINK_SELECTOR = "a.job-link"
+JOB_URL_REGEX = re.compile(r"/job-\d+")
+JOB_ID_REGEX = re.compile(r"job-(\d+)")
+PAGINATION_PARAM = "page"
+MAX_PAGES = None  # unlimited — paginate until exhaustion
+ROTATE_EVERY = 25  # relaunch browser every N pages to prevent crashes
 
-# Phase 1: Item extraction from results
-ITEM_CONTAINER_SELECTOR = ".job-results-list"
-ITEM_LINK_SELECTOR = 'a[href*="/job-"]'
-TOTAL_COUNT_SELECTOR = "span.cds-text-midnight.cds-text-fw-bold"
-TOTAL_COUNT_PATTERN = r"\d+\s*-\s*\d+\s+of\s+(\d+)"
-
-# Phase 1: Filter form on results page
-FILTER_JOB_AGE_SELECTOR = 'select[name="JobAge"]'
-FILTER_SUBMIT_SELECTOR = 'button[type="submit"]'
-
-# Phase 2: HTTP extraction
-SCRAPING_METHOD = "http_requests"
-PROXY_TIER = "none"
+# Phase 2 — extraction (HTTP)
+PHASE2_MAX_WORKERS = 8
+REQUEST_TIMEOUT = 15
 DELAY_BETWEEN_REQUESTS = 1.0
-PAGE_LOAD_TIMEOUT = 30000
-
-# Content filter for job_posting output
-CORE_FILTER_FIELDS = ["company", "location"]
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE = os.path.join(SCRIPT_DIR, f"logs/{SITE_SLUG}.log")
-
-# Default search query (used as label in output metadata)
-DEFAULT_QUERY = "all jobs posted in the last 7 days in Alabama"
-
-# Job URL pattern: /{specialty}-jobs/{role}/{state}/job-{id}
-JOB_URL_REGEX = re.compile(
-    r"https?://(?:www\.)?locumtenens\.com/[a-z0-9-]+-jobs/[a-z0-9-]+/[a-z0-9-]+/job-\d+",
-    re.IGNORECASE,
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HTML STRIPPER
-# ═══════════════════════════════════════════════════════════════════════════════
+# Crash-recovery checkpoint
+_CHECKPOINT_PATH = os.path.join(SCRIPT_DIR, "discovered_urls_checkpoint.json")
 
-
-class _HTMLStripper(HTMLParser):
-    """Minimal HTML-to-text stripper."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._parts: list[str] = []
-
-    def handle_data(self, data: str) -> None:
-        self._parts.append(data)
-
-    def get_text(self) -> str:
-        return "".join(self._parts).strip()
-
-
-def strip_html(html: str) -> str:
-    s = _HTMLStripper()
-    s.feed(html)
-    return s.get_text()
-
+# Thread-local storage for per-thread requests.Session in Phase 2
+_thread_local = threading.local()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
 # ═══════════════════════════════════════════════════════════════════════════════
 
-os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, f"{SITE_SLUG}.log")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-5s [%(name)s] %(message)s",
     datefmt="%H:%M:%S",
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.FileHandler(LOG_FILE),
         logging.StreamHandler(),
     ],
 )
@@ -130,675 +100,717 @@ logger = logging.getLogger(SITE_SLUG)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 1: URL DISCOVERY (Playwright — browser-driven form interaction)
+# HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _is_job_url(href: str) -> bool:
-    """Check if a URL looks like a job detail page."""
-    if not href:
-        return False
-    # Normalize relative paths
-    if href.startswith("/"):
-        href = SITE_URL.rstrip("/") + href
-    return bool(JOB_URL_REGEX.match(href))
-
-
-def _extract_job_links_from_page(page) -> list[str]:
-    """Extract job links from a search results page."""
-    links: list[str] = []
-    seen: set[str] = set()
-
-    # Primary: use the known container + link selector
-    try:
-        containers = page.query_selector_all(ITEM_CONTAINER_SELECTOR)
-        for container in containers:
-            link_els = container.query_selector_all(ITEM_LINK_SELECTOR)
-            for el in link_els:
-                href = el.get_attribute("href") or ""
-                if href:
-                    if href.startswith("/"):
-                        href = SITE_URL.rstrip("/") + href
-                    if _is_job_url(href) and href not in seen:
-                        links.append(href)
-                        seen.add(href)
-    except Exception as exc:
-        logger.warning("Phase 1: container extraction failed: %s", exc)
-
-    # Fallback: scan all anchors on the page
-    if not links:
-        try:
-            all_hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
-            for h in all_hrefs:
-                if _is_job_url(h) and h not in seen:
-                    links.append(h)
-                    seen.add(h)
-        except Exception as exc:
-            logger.warning("Phase 1: fallback link extraction failed: %s", exc)
-
-    return links
-
-
-def _submit_search_form(page, location: str = "AL", specialty_value: Optional[str] = None) -> Optional[str]:
-    """Fill and submit the QuickSearch form. Returns the resulting URL or None."""
-    try:
-        page.goto(QUICKSEARCH_URL, timeout=PAGE_LOAD_TIMEOUT)
-        page.wait_for_load_state("domcontentloaded")
-        time.sleep(3)
-
-        # Wait for selects to be ready
-        page.wait_for_selector(DISCIPLINES_SELECTOR, timeout=10000)
-
-        # Reset Discipline to "Any" (value="0")
-        page.select_option(DISCIPLINES_SELECTOR, "0")
-        time.sleep(0.5)
-
-        # Set Location to Alabama
-        page.select_option(LOCATIONS_SELECTOR, location)
-        time.sleep(0.5)
-
-        # Set Specialty if provided
-        if specialty_value:
-            page.select_option(SPECIALTIES_SELECTOR, specialty_value)
-            time.sleep(0.5)
-
-        # Click submit button (try input[type='submit'] first, then fallback chain)
-        submitted = False
-        for sel in [
-            'input[type="submit"]',
-            'button[type="submit"]',
-            "form button",
-        ]:
-            try:
-                btn = page.query_selector(sel)
-                if btn:
-                    btn.click()
-                    submitted = True
-                    break
-            except Exception:
-                continue
-
-        if not submitted:
-            # Last resort: form.requestSubmit()
-            try:
-                page.evaluate("document.querySelector('form')?.requestSubmit()")
-                submitted = True
-            except Exception:
-                pass
-
-        if not submitted:
-            logger.warning("Phase 1: Could not submit search form")
-            return None
-
-        page.wait_for_load_state("domcontentloaded")
-        time.sleep(5)
-
-        # The form POST redirects to /Resources/JobSearch/SearchResults?sId=XXXX
-        result_url = page.url
-        logger.info("Phase 1: Search submitted → %s", result_url)
-
-        # Verify we landed on a results page
-        if "SearchResults" in result_url or "sId=" in result_url:
-            return result_url
-
-        return None
-
-    except Exception as exc:
-        logger.error("Phase 1: Form submission error: %s", exc)
-        return None
-
-
-def _apply_date_filter(page, job_age: str = "7") -> bool:
-    """Apply the JobAge filter on the results page and re-submit."""
-    try:
-        # Wait for the filter form to be present
-        page.wait_for_selector(FILTER_JOB_AGE_SELECTOR, timeout=10000)
-        time.sleep(1)
-
-        page.select_option(FILTER_JOB_AGE_SELECTOR, job_age)
-        time.sleep(0.5)
-
-        # Submit the filter form
-        submitted = False
-        for sel in [
-            'button[type="submit"]',
-            'input[type="submit"]',
-            "form button",
-        ]:
-            try:
-                btn = page.query_selector(sel)
-                if btn:
-                    btn.click()
-                    submitted = True
-                    break
-            except Exception:
-                continue
-
-        if not submitted:
-            logger.warning("Phase 1: Could not submit date filter")
-            return False
-
-        page.wait_for_load_state("domcontentloaded")
-        time.sleep(5)
-        logger.info("Phase 1: Date filter applied (JobAge=%s) → %s", job_age, page.url)
-        return True
-
-    except Exception as exc:
-        logger.warning("Phase 1: Date filter error: %s", exc)
-        return False
-
-
-def _paginate_results(page, base_results_url: str, limit: Optional[int]) -> list[str]:
-    """Paginate through search results collecting all job URLs."""
-    all_urls: list[str] = []
-    seen: set[str] = set()
-    current_page = 1
-
-    # Extract links from the current page (already loaded)
-    new_links = _extract_job_links_from_page(page)
-    for link in new_links:
-        if link not in seen:
-            all_urls.append(link)
-            seen.add(link)
-
-    logger.info("Phase 1: Page 1 → %d items (total: %d)", len(new_links), len(all_urls))
-
-    while current_page < MAX_PAGES:
-        if limit and len(all_urls) >= limit:
-            logger.info("Phase 1: Reached limit=%d", limit)
-            break
-
-        # Build next page URL
-        current_page += 1
-        separator = "&" if "?" in base_results_url else "?"
-        next_url = f"{base_results_url}{separator}{RESULTS_PAGE_PARAM}={current_page}"
-
-        try:
-            page.goto(next_url, timeout=PAGE_LOAD_TIMEOUT)
-            page.wait_for_load_state("domcontentloaded")
-            time.sleep(3)
-        except Exception as exc:
-            logger.warning("Phase 1: Failed to load page %d: %s", current_page, exc)
-            break
-
-        new_links = _extract_job_links_from_page(page)
-        new_count = 0
-        for link in new_links:
-            if link not in seen:
-                all_urls.append(link)
-                seen.add(link)
-                new_count += 1
-
-        logger.info(
-            "Phase 1: Page %d → %d items (%d new, total: %d)",
-            current_page,
-            len(new_links),
-            new_count,
-            len(all_urls),
-        )
-
-        # No new items → last page
-        if new_count == 0:
-            logger.info("Phase 1: No new items on page %d, stopping pagination", current_page)
-            break
-
-    return all_urls
-
-
-def _discover_all_job_urls(page, limit: Optional[int] = None) -> list[str]:
-    """Discover all job URLs by iterating specialties with Location=Alabama, JobAge=7 days.
-
-    The search form REQUIRES a Specialty selection to submit. To cover ALL categories,
-    we iterate every option in the Specialties <select> dropdown, submit once per
-    specialty, apply the 7-day date filter, paginate, and deduplicate URLs.
-    """
-    all_urls: list[str] = []
-    seen: set[str] = set()
-
-    try:
-        page.goto(QUICKSEARCH_URL, timeout=PAGE_LOAD_TIMEOUT)
-        page.wait_for_load_state("domcontentloaded")
-        time.sleep(3)
-        page.wait_for_selector(SPECIALTIES_SELECTOR, timeout=10000)
-
-        # Get all specialty options
-        specialty_options = page.eval_on_selector(
-            SPECIALTIES_SELECTOR,
-            """sel => {
-                const opts = [];
-                for (const o of sel.options) {
-                    if (o.value) opts.push({value: o.value, text: o.text});
-                }
-                return opts;
-            }""",
-        )
-        logger.info("Phase 1: Found %d specialty options to iterate", len(specialty_options))
-    except Exception as exc:
-        logger.error("Phase 1: Failed to load QuickSearch page: %s", exc)
-        return all_urls
-
-    for idx, opt in enumerate(specialty_options):
-        if limit and len(all_urls) >= limit:
-            break
-
-        spec_value = opt["value"]
-        spec_text = opt["text"]
-        logger.info(
-            "Phase 1: [%d/%d] Submitting search: Specialty='%s'",
-            idx + 1,
-            len(specialty_options),
-            spec_text,
-        )
-
-        results_url = _submit_search_form(page, location="AL", specialty_value=spec_value)
-        if not results_url:
-            logger.info("  → No results URL (specialty may have no jobs)")
-            continue
-
-        # Check if results page actually has results
-        page_links = _extract_job_links_from_page(page)
-        if not page_links:
-            logger.info("  → No job links on results page, skipping specialty")
-            continue
-
-        # Apply 7-day date filter
-        _apply_date_filter(page, job_age="7")
-
-        # Paginate and collect URLs
-        # Use the page.url after filter as base (filter re-submits and may change sId)
-        filtered_url = page.url
-        spec_urls = _paginate_results(page, filtered_url, limit)
-
-        new_count = 0
-        for url in spec_urls:
-            if url not in seen:
-                all_urls.append(url)
-                seen.add(url)
-                new_count += 1
-
-        logger.info("  → Specialty '%s': %d URLs (%d new, cumulative: %d)", spec_text, len(spec_urls), new_count, len(all_urls))
-
-    logger.info("Phase 1: Discovery complete — %d unique job URLs", len(all_urls))
-    return all_urls
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PHASE 2: HTTP-BASED EXTRACTION (requests + BeautifulSoup + JSON-LD)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-def _make_session() -> requests.Session:
-    """Create a new HTTP session with appropriate headers."""
+def _create_session() -> requests.Session:
+    """Create a fresh requests.Session with browser-like headers."""
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": DEFAULT_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
-        "Connection": "keep-alive",
+        "Accept-Encoding": "gzip, deflate, br",
     })
     return s
 
 
-def _extract_jsonld(soup: BeautifulSoup) -> Optional[dict]:
-    """Extract JobPosting JSON-LD block from the page."""
+def _get_thread_session() -> requests.Session:
+    """Return the thread-local Session (each worker thread gets its own)."""
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = _create_session()
+    return _thread_local.session
+
+
+# ── Checkpoint (resume after crash) ────────────────────────────────────────
+
+
+def _write_checkpoint(urls: list[str], src_urls: list[str]) -> None:
+    """Persist discovered URLs so a crashed run can resume."""
     try:
-        for script in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(script.string)
-                if isinstance(data, dict) and data.get("@type") == "JobPosting":
-                    return data
-                if isinstance(data, list):
-                    for item in data:
-                        if isinstance(item, dict) and item.get("@type") == "JobPosting":
-                            return item
-            except (json.JSONDecodeError, TypeError):
-                continue
+        with open(_CHECKPOINT_PATH, "w") as f:
+            json.dump({
+                "urls": urls,
+                "src_urls": src_urls,
+                "count": len(urls),
+                "ts": time.time(),
+            }, f)
     except Exception as exc:
-        logger.warning("JSON-LD parse error: %s", exc)
-    return None
+        logger.warning("Checkpoint write failed: %s", exc)
 
 
-def _extract_job_data(session: requests.Session, url: str, src_url: str, index: int) -> dict:
-    """Extract structured job data from a single job detail page via HTTP."""
+def _load_checkpoint() -> tuple[list[str], list[str]]:
+    """Load URLs from a previous run's checkpoint (if any)."""
     try:
-        resp = session.get(url, timeout=15)
-        status_code = resp.status_code
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        logger.error("Phase 2: HTTP error for %s: %s", url[:80], exc)
-        return _error_item(url, src_url, status_code=getattr(exc.response, "status_code", 0), error=str(exc), index=index)
+        if os.path.isfile(_CHECKPOINT_PATH):
+            with open(_CHECKPOINT_PATH) as f:
+                data = json.load(f)
+            urls = data.get("urls", [])
+            if urls:
+                logger.info(
+                    "Checkpoint: RESUMING with %d URLs", len(urls)
+                )
+                return urls, data.get("src_urls", urls[:])
+    except Exception as exc:
+        logger.warning("Checkpoint load failed: %s", exc)
+    return [], []
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    jsonld = _extract_jsonld(soup)
+
+def _clear_checkpoint() -> None:
+    """Remove checkpoint after successful completion."""
+    try:
+        if os.path.isfile(_CHECKPOINT_PATH):
+            os.remove(_CHECKPOINT_PATH)
+    except OSError:
+        pass
+
+
+def _extract_job_id(url: str) -> str:
+    """Pull the numeric job id from a URL for deduplication."""
+    m = JOB_ID_REGEX.search(url)
+    return m.group(1) if m else url
+
+
+def _browser_alive(page) -> bool:
+    """Probe whether the browser page is still responsive."""
+    try:
+        page.evaluate("1")
+        return True
+    except Exception:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 1 — URL DISCOVERY (Playwright)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _extract_job_links_from_page(page) -> list[str]:
+    """Extract job links from the current results page using Playwright."""
+    links: list[str] = []
+    try:
+        containers = page.query_selector_all(ITEM_CONTAINER_SELECTOR)
+        for container in containers:
+            link_el = container.query_selector(ITEM_LINK_SELECTOR)
+            if link_el:
+                href = link_el.get_attribute("href") or ""
+                if href:
+                    if href.startswith("/"):
+                        href = SITE_URL.rstrip("/") + href
+                    links.append(href)
+    except Exception as exc:
+        logger.warning("Phase 1: Error extracting item links: %s", exc)
+
+    # Fallback: bare link selector
+    if not links:
+        try:
+            link_els = page.query_selector_all(ITEM_LINK_SELECTOR)
+            for link_el in link_els:
+                href = link_el.get_attribute("href") or ""
+                if href:
+                    if href.startswith("/"):
+                        href = SITE_URL.rstrip("/") + href
+                    links.append(href)
+        except Exception as exc:
+            logger.warning("Phase 1: Fallback link extraction failed: %s", exc)
+
+    return links
+
+
+def _get_next_page_url(page, next_page_num: int) -> Optional[str]:
+    """Determine the URL for the next page of results.
+
+    Uses the template's runtime fallback chain: next-button selectors
+    first, then ?page=N param fallback.
+    """
+    # Try common next-button selectors
+    for sel in (
+        'a[rel="next"]',
+        'a.next',
+        'li.next a',
+        '[aria-label*="next" i]',
+        'a:has-text("Next")',
+        'button:has-text("Next")',
+        'a:has-text(">")',
+        '.pagination a.active + a',
+    ):
+        try:
+            btn = page.query_selector(sel)
+            if btn:
+                href = btn.get_attribute("href") or ""
+                if href:
+                    if href.startswith("http"):
+                        return href
+                    return SITE_URL.rstrip("/") + (
+                        href if href.startswith("/") else "/" + href
+                    )
+                # SPA-style: click and return new URL
+                try:
+                    btn.click()
+                    page.wait_for_load_state("domcontentloaded")
+                    time.sleep(8)
+                    if page.url:
+                        return page.url
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Param-based fallback: ?page=N
+    current_url = page.url
+    sep = "&" if "?" in current_url else "?"
+    return f"{current_url}{sep}{PAGINATION_PARAM}={next_page_num}"
+
+
+def _paginate_results_page(page, base_url: str, max_pages: Optional[int] = None) -> list[str]:
+    """Follow pagination on a results page and return all deduplicated job links.
+
+    Starts with the current page (base_url) and follows next pages.
+    """
+    all_links: list[str] = []
+    seen: set[str] = set()
+
+    # First page: already loaded in the browser
+    current_links = _extract_job_links_from_page(page)
+    for lnk in current_links:
+        jid = _extract_job_id(lnk)
+        if jid not in seen:
+            seen.add(jid)
+            all_links.append(lnk)
+
+    for page_num in range(2, (max_pages or 10_000) + 1):
+        next_url = _get_next_page_url(page, page_num)
+        if not next_url:
+            break
+
+        try:
+            page.goto(next_url, timeout=30000)
+            page.wait_for_load_state("domcontentloaded")
+            time.sleep(5)
+        except Exception as exc:
+            logger.warning(
+                "Phase 1: Pagination page %d failed: %s", page_num, exc
+            )
+            break
+
+        new_links = _extract_job_links_from_page(page)
+        new_count = 0
+        for lnk in new_links:
+            jid = _extract_job_id(lnk)
+            if jid not in seen:
+                seen.add(jid)
+                all_links.append(lnk)
+                new_count += 1
+
+        logger.debug(
+            "Phase 1:   page %d → %d raw, %d new (running %d)",
+            page_num, len(new_links), new_count, len(all_links),
+        )
+
+        if new_count == 0:
+            logger.info("Phase 1: No new items on page %d, stopping", page_num)
+            break
+
+    return all_links
+
+
+def discover_urls_via_playwright(
+    page,
+    max_specialties: Optional[int] = None,
+    limit: Optional[int] = None,
+    max_pages: Optional[int] = None,
+) -> tuple[list[str], list[str]]:
+    """Iterate all specialties in the QuickSearch form using Playwright,
+    submit each, paginate results, and collect every unique job URL.
+
+    Returns (urls, src_urls) — parallel lists.
+    """
+    logger.info("Phase 1: Loading QuickSearch page …")
+    try:
+        page.goto(QUICK_SEARCH_URL, timeout=30000)
+        page.wait_for_load_state("domcontentloaded")
+        time.sleep(8)
+    except Exception as exc:
+        logger.error("Phase 1: Failed to load QuickSearch: %s", exc)
+        return [], []
+
+    # Parse specialty options from the <select>
+    specialty_options: list[dict[str, str]] = []
+    try:
+        options = page.eval_on_selector_all(
+            "select[name='Specialties'] option",
+            "els => els.map(e => ({ value: e.value, text: e.textContent.trim() }))",
+        )
+        for opt in options:
+            val = opt.get("value", "").strip()
+            text = opt.get("text", "").strip()
+            if val:  # skip empty placeholder
+                specialty_options.append({"value": val, "text": text})
+    except Exception as exc:
+        logger.error("Phase 1: Failed to parse specialty options: %s", exc)
+        return [], []
+
+    if not specialty_options:
+        logger.error("Phase 1: No specialty options found — aborting")
+        return [], []
+
+    if max_specialties:
+        specialty_options = specialty_options[:max_specialties]
+
+    total_specs = len(specialty_options)
+    all_urls: list[str] = []
+    all_src_urls: list[str] = []
+    seen_ids: set[str] = set()
+    checkpoint_interval = 10
+
+    for idx, spec in enumerate(specialty_options, 1):
+        logger.info(
+            "Phase 1: [%d/%d] Specialty: %s (val=%s)",
+            idx, total_specs, spec["text"], spec["value"],
+        )
+
+        # Navigate to the QuickSearch form fresh for each specialty
+        try:
+            page.goto(QUICK_SEARCH_URL, timeout=30000)
+            page.wait_for_load_state("domcontentloaded")
+            time.sleep(5)
+        except Exception as exc:
+            logger.warning(
+                "Phase 1: Failed to reload QuickSearch for %s: %s",
+                spec["text"], exc,
+            )
+            time.sleep(DELAY_BETWEEN_REQUESTS)
+            continue
+
+        # Select the specialty
+        try:
+            page.select_option("select[name='Specialties']", spec["value"])
+            time.sleep(1)
+
+            # Locations: leave at default (Any / first option)
+            # Disciplines: leave at default
+
+            # Submit the form — try input[type='submit'] first, then
+            # button[type='submit'], then form.requestSubmit()
+            submitted = False
+            for submit_sel in [
+                "form input[type='submit']",
+                "form button[type='submit']",
+                "form input[value='Search']",
+                "form button:has-text('Search')",
+            ]:
+                try:
+                    btn = page.query_selector(submit_sel)
+                    if btn:
+                        btn.click()
+                        submitted = True
+                        break
+                except Exception:
+                    pass
+
+            if not submitted:
+                try:
+                    page.evaluate("document.querySelector('form').requestSubmit()")
+                    submitted = True
+                except Exception:
+                    pass
+
+            if not submitted:
+                logger.warning(
+                    "Phase 1: Could not submit form for %s", spec["text"]
+                )
+                continue
+
+            # Wait for navigation to results page
+            page.wait_for_load_state("domcontentloaded")
+            time.sleep(8)
+
+            current_url = page.url
+            logger.info(
+                "Phase 1: Landed on %s", current_url[:100],
+            )
+
+            # Check if we're on a results page
+            if "SearchResults" not in current_url and "sId=" not in current_url:
+                logger.warning(
+                    "Phase 1: Unexpected URL after submit: %s", current_url,
+                )
+                time.sleep(DELAY_BETWEEN_REQUESTS)
+                continue
+
+        except Exception as exc:
+            logger.warning(
+                "Phase 1: Form interaction failed for %s: %s",
+                spec["text"], exc,
+            )
+            time.sleep(DELAY_BETWEEN_REQUESTS)
+            continue
+
+        # Paginate results from this specialty
+        links = _paginate_results_page(page, current_url, max_pages)
+
+        new_count = 0
+        for lnk in links:
+            jid = _extract_job_id(lnk)
+            if jid not in seen_ids:
+                seen_ids.add(jid)
+                all_urls.append(lnk)
+                all_src_urls.append(current_url)
+                new_count += 1
+
+        logger.info(
+            "Phase 1: [%d/%d] %s → %d jobs (%d new, cumulative %d)",
+            idx, total_specs, spec["text"], len(links), new_count, len(all_urls),
+        )
+
+        if limit and len(all_urls) >= limit:
+            logger.info(
+                "Phase 1: Reached limit=%d — stopping discovery", limit
+            )
+            all_urls = all_urls[:limit]
+            all_src_urls = all_src_urls[:limit]
+            break
+
+        # Incremental checkpoint
+        if idx % checkpoint_interval == 0:
+            _write_checkpoint(all_urls, all_src_urls)
+
+        time.sleep(DELAY_BETWEEN_REQUESTS)
+
+    logger.info(
+        "Phase 1 complete — %d unique job URLs discovered across %d specialties",
+        len(all_urls), total_specs,
+    )
+    return all_urls, all_src_urls
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PHASE 2 — ITEM EXTRACTION (requests + BeautifulSoup)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _extract_job_data(url: str, src_url: str) -> dict:
+    """Fetch a single job detail page and extract all fields.
+
+    Uses a robust multi-strategy approach for title extraction since the
+    exact job posting page DOM may differ from the content-page analysis.
+    """
+    session = _get_thread_session()
 
     item: dict = {
-        "id": 0,
-        "title": "",
-        "price": "",
-        "availability": "",
-        "original_price": "",
-        "currency": CURRENCY,
         "url": url,
         "src_url": src_url,
-        "location": "",
-        "status_code": status_code,
+        "status_code": 0,
         "scraped_at": datetime.now(timezone.utc).isoformat(),
         "remarks": "",
+        "title": "",
+        "description": "",
+        "body_content": "",
+        "category": "",
+        "hero_image": "",
+        "paragraphs": [],
+        "headings": [],
+        "lists": [],
     }
 
-    # ── Soft 404 detection ─────────────────────────────────────────────
-    title_tag = soup.find("title")
-    title_text = (title_tag.get_text(strip=True) if title_tag else "").lower()
-    h1_tag = soup.find("h1")
-    h1_text = (h1_tag.get_text(strip=True) if h1_tag else "").lower()
-    soft404_phrases = ["not found", "unavailable", "discontinued", "no longer available", "page not found", "404"]
-    if any(phrase in title_text or phrase in h1_text for phrase in soft404_phrases):
-        item["remarks"] = "Soft 404: job not found"
-        logger.warning("Phase 2: Soft 404 detected for %s", url[:80])
+    try:
+        resp = session.get(url, timeout=REQUEST_TIMEOUT)
+        item["status_code"] = resp.status_code
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        item["remarks"] = f"Error fetching page: {exc}"
+        logger.warning("Phase 2: Fetch failed for %s: %s", url[:80], exc)
         return item
 
-    # Check for redirect
-    final_url = resp.url.rstrip("/")
-    if final_url != url.rstrip("/") and not _is_job_url(final_url):
-        item["remarks"] = "Soft 404: redirected to non-job page"
-        return item
-
-    # Check JSON-LD presence for job pages
-    if not jsonld:
-        # Still attempt CSS extraction — some pages may lack JSON-LD
-        logger.debug("Phase 2: No JSON-LD for %s, using CSS only", url[:60])
-
-    # ── Title: h1 (primary — full descriptive title) ────────────────────
     try:
-        h1_el = soup.select_one("h1.job-details-header")
-        if h1_el:
-            item["title"] = h1_el.get_text(strip=True)
-        elif h1_tag:
-            item["title"] = h1_text.strip() or ""
-        elif jsonld:
-            # Fallback to JSON-LD title (note: abbreviated like "DNP")
-            item["title"] = jsonld.get("title", "")
-    except Exception:
-        pass
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-    # ── Job ID ──────────────────────────────────────────────────────────
-    try:
-        if jsonld:
-            ident = jsonld.get("identifier", {})
-            if isinstance(ident, dict):
-                item["job_id"] = ident.get("value", "")
-            elif isinstance(ident, str):
-                item["job_id"] = ident
-    except Exception:
-        pass
-    if not item.get("job_id"):
-        try:
-            el = soup.select_one(".job-details-top-text.text-end")
-            if el:
-                text = el.get_text(strip=True)
-                item["job_id"] = text.replace("Job ID:", "").strip()
-        except Exception:
-            pass
+        # ── Debug: log the page title for diagnostics ─────────────
+        page_title = soup.title.get_text(strip=True) if soup.title else "(no title tag)"
+        logger.debug("Phase 2: page <title> = '%s' for %s", page_title, url[:80])
 
-    # ── Specialty ───────────────────────────────────────────────────────
-    try:
-        el = soup.select_one(".row > .col-6:first-child .job-details-top-text")
-        if el:
-            text = el.get_text(strip=True)
-            if "Job ID:" not in text:
-                item["specialty"] = text
-    except Exception:
-        pass
+        # ── Soft-404 detection ────────────────────────────────────
+        # Only use strong, specific indicators — avoid overly broad words
+        # like "error" which appear in normal page titles.
+        h1_el = soup.find("h1")
+        h1_text = h1_el.get_text(strip=True) if h1_el else ""
+        soft404_phrases = [
+            "not found",
+            "page not found",
+            "no longer available",
+            "has been filled",
+            "position has been filled",
+            "job no longer available",
+            "this job is no longer",
+            "unavailable",
+            "discontinued",
+        ]
+        combined_text = f"{page_title} {h1_text}".lower()
+        for phrase in soft404_phrases:
+            if phrase in combined_text:
+                item["remarks"] = f"Soft 404: {phrase}"
+                logger.info("Phase 2: Soft 404 detected ('%s') on %s", phrase, url[:80])
+                return item
 
-    # ── Location ────────────────────────────────────────────────────────
-    try:
-        if jsonld:
-            loc = jsonld.get("jobLocation", {})
-            if isinstance(loc, dict):
-                addr = loc.get("address", {})
-                if isinstance(addr, dict):
-                    item["location"] = addr.get("addressRegion", "") or addr.get("addressLocality", "")
-    except Exception:
-        pass
-    if not item.get("location"):
-        try:
-            els = soup.select(".job-post-locations")
-            if els:
-                item["location"] = els[0].get_text(strip=True)
-        except Exception:
-            pass
+        # Check for redirect to a completely different domain or non-job page
+        final_url = resp.url or url
+        if final_url.rstrip("/") != url.rstrip("/"):
+            final_path = urlparse(final_url).path
+            if not JOB_URL_REGEX.search(final_path):
+                # Only flag as soft-404 if redirected to a completely different
+                # section of the site (e.g., homepage, search page)
+                if len(final_path) < 10 or "/search" in final_path.lower():
+                    item["remarks"] = f"Soft 404: redirected to {final_url[:100]}"
+                    logger.info("Phase 2: Redirect to non-job page: %s", final_url[:100])
+                    return item
+        item["url"] = final_url
 
-    # ── Date posted ─────────────────────────────────────────────────────
-    try:
-        if jsonld:
-            item["date_posted"] = jsonld.get("datePosted", "")
-    except Exception:
-        pass
+        # ── Title — multi-strategy extraction ─────────────────────
+        # Strategy 1: Specific job page selectors (may exist on some pages)
+        title_text = ""
+        title_el = (
+            soup.select_one("h1.interior-page-title")
+            or soup.select_one("h1.job-title")
+            or soup.select_one("h1.page-title")
+            or soup.select_one("h1.heading")
+            or soup.select_one("h1")
+        )
+        if title_el:
+            title_text = title_el.get_text(strip=True)
 
-    # ── Employment type ────────────────────────────────────────────────
-    try:
-        if jsonld:
-            item["employment_type"] = jsonld.get("employmentType", "")
-    except Exception:
-        pass
+        # Strategy 2: If h1 is empty/too short, try og:title meta tag
+        if not title_text or len(title_text) < 3:
+            og_title = soup.select_one("meta[property='og:title']")
+            if og_title and og_title.get("content"):
+                title_text = og_title["content"].strip()
+                # Strip common suffixes like " | LocumTenens.com"
+                title_text = re.split(r"\s*[\|\-–—]\s*LocumTenens", title_text, 1)[0].strip()
 
-    # ── Description ────────────────────────────────────────────────────
-    try:
-        if jsonld:
-            desc_html = jsonld.get("description", "")
-            if desc_html:
-                item["description"] = strip_html(desc_html)
-    except Exception:
-        pass
-    if not item.get("description"):
-        try:
-            el = soup.select_one(".job-details-body")
-            if el:
-                item["description"] = el.get_text(separator=" ", strip=True)
-        except Exception:
-            pass
+        # Strategy 3: Use the HTML <title> tag as last resort
+        if not title_text or len(title_text) < 3:
+            raw_title = page_title
+            # Clean up the page title: remove site name suffix
+            title_text = re.split(
+                r"\s*[\|\-–—]\s*", raw_title, 1
+            )[0].strip()
+            # Also try splitting on " - LocumTenens" specifically
+            if not title_text or len(title_text) < 3:
+                title_text = re.split(
+                    r"\s*[\|\-–—]\s*LocumTenens", raw_title, 1
+                )[0].strip()
 
-    # ── Dates needed ────────────────────────────────────────────────────
-    try:
-        el = soup.select_one(".job-details-glance-list li:first-child")
-        if el:
-            text = el.get_text(strip=True)
-            item["dates_needed"] = text.replace("Dates needed:", "").strip()
-    except Exception:
-        pass
+        # Strategy 4: Try any prominent heading or the first large text
+        if not title_text or len(title_text) < 3:
+            for selector in [".title", ".job-heading", ".page-heading", "[class*='title']"]:
+                el = soup.select_one(selector)
+                if el:
+                    txt = el.get_text(strip=True)
+                    if txt and len(txt) >= 3 and len(txt) < 200:
+                        title_text = txt
+                        break
 
-    # ── Shift type ─────────────────────────────────────────────────────
-    try:
-        els = soup.select(".job-details-glance-list li")
-        if len(els) > 1:
-            text = els[1].get_text(strip=True)
-            item["shift_type"] = text.replace("Shift type:", "").strip()
-    except Exception:
-        pass
+        item["title"] = title_text
 
-    # ── Assignment type ────────────────────────────────────────────────
-    try:
-        els = soup.select(".job-details-glance-list li")
-        if len(els) > 2:
-            text = els[2].get_text(strip=True)
-            item["assignment_type"] = text.replace("Assignment type:", "").strip()
-    except Exception:
-        pass
+        if not item["title"]:
+            logger.warning(
+                "Phase 2: No title found for %s — page_title='%s', h1='%s'",
+                url[:80], page_title, h1_text,
+            )
 
-    # ── Recruiter name ──────────────────────────────────────────────────
-    try:
-        el = soup.select_one(".job-details-body .flex-grow-1 h5")
-        if el:
-            text = el.get_text(strip=True)
-            if text.lower() not in ("additional job details", ""):
-                item["recruiter_name"] = text
-    except Exception:
-        pass
+        # ── URL (og:url) — use canonical if available ──────────
+        url_meta = soup.select_one("meta[property='og:url']")
+        canonical = soup.select_one("link[rel='canonical']")
+        if url_meta and url_meta.get("content"):
+            item["url"] = url_meta["content"]
+        elif canonical and canonical.get("href"):
+            item["url"] = canonical["href"]
 
-    # ── Verified badge ─────────────────────────────────────────────────
-    try:
-        el = soup.select_one(".job-is-tier-1 .cds-badge")
-        if el:
-            item["verified"] = el.get_text(strip=True)
-    except Exception:
-        pass
+        # ── Description (meta description / og:description) ──────
+        desc_el = (
+            soup.select_one("meta[name='description']")
+            or soup.select_one("meta[property='og:description']")
+        )
+        item["description"] = (
+            desc_el.get("content", "").strip() if desc_el else ""
+        )
 
-    # ── Job category ────────────────────────────────────────────────────
-    try:
-        # Primary: CSS selector for 4th .job-post-locations element
-        el = soup.select_one(".job-post-locations:nth-child(4)")
-        if el:
-            item["job_category"] = el.get_text(strip=True)
-        else:
-            # Fallback: grab 4th element from the full list
-            els = soup.select(".job-post-locations")
-            if len(els) >= 4:
-                item["job_category"] = els[3].get_text(strip=True)
-    except Exception:
-        pass
-    # Fallback: parse role from URL path (e.g. /family-practice-jobs/dnp/virginia/job-1339893)
-    if not item.get("job_category"):
-        try:
-            parsed = urlparse(url)
-            path_segs = [s for s in parsed.path.strip("/").split("/") if s]
-            # URL pattern: /{specialty}-jobs/{role}/{state}/job-{id}
-            if len(path_segs) >= 4 and path_segs[-1].startswith("job-"):
-                role_seg = path_segs[2] if len(path_segs) >= 3 else ""
-                if role_seg:
-                    item["job_category"] = role_seg.upper()
-        except Exception:
-            pass
+        # ── Category ──────────────────────────────────────────────
+        cat_el = (
+            soup.select_one("h6.cds-overline")
+            or soup.select_one(".job-category")
+            or soup.select_one(".category-label")
+            or soup.select_one("[itemtype='http://schema.org/BreadcrumbList'] li:last-child a")
+            or soup.select_one(".breadcrumb li:last-child a")
+        )
+        item["category"] = cat_el.get_text(strip=True) if cat_el else ""
 
-    # ── Hiring organization ───────────────────────────────────────────
-    try:
-        if jsonld:
-            org = jsonld.get("hiringOrganization", {})
-            if isinstance(org, dict):
-                item["company"] = org.get("name", "")
-                item["hiring_organization"] = item["company"]
-    except Exception:
-        pass
+        # ── Body content ──────────────────────────────────────────
+        body_el = (
+            soup.select_one(".interior-page-content .umb-grid")
+            or soup.select_one(".interior-page-content")
+            or soup.select_one("main")
+            or soup.select_one(".job-details")
+            or soup.select_one(".job-description")
+            or soup.select_one("[role='main']")
+            or soup.select_one(".content")
+        )
+        if body_el:
+            item["body_content"] = body_el.get_text(
+                separator=" ", strip=True
+            )
 
-    # ── Industry ───────────────────────────────────────────────────────
-    try:
-        if jsonld:
-            item["industry"] = jsonld.get("industry", "")
-    except Exception:
-        pass
+        # ── Hero image ───────────────────────────────────────────
+        hero_img = ""
+        hero_section = soup.select_one("section.interior-page-header-img")
+        if hero_section:
+            style = hero_section.get("style", "")
+            m = re.search(r"url\(['\"]?(.*?)['\"]?\)", style)
+            if m:
+                hero_img = m.group(1)
+        if not hero_img:
+            og_img = soup.select_one("meta[property='og:image']")
+            hero_img = og_img.get("content", "") if og_img else ""
+        item["hero_image"] = hero_img
 
-    # ── Valid through ───────────────────────────────────────────────────
-    try:
-        if jsonld:
-            item["valid_through"] = jsonld.get("validThrough", "")
-    except Exception:
-        pass
+        # ── Paragraphs (text > 20 chars) ────────────────────────
+        paragraphs = []
+        p_selectors = [
+            ".interior-page-content p",
+            "main p",
+            ".job-details p",
+            ".job-description p",
+            "[role='main'] p",
+            "article p",
+        ]
+        for sel in p_selectors:
+            for p in soup.select(sel):
+                txt = p.get_text(strip=True)
+                if len(txt) > 20 and txt not in paragraphs:
+                    paragraphs.append(txt)
+            if paragraphs:
+                break
+        if not paragraphs:
+            for p in soup.find_all("p"):
+                txt = p.get_text(strip=True)
+                if len(txt) > 20 and txt not in paragraphs:
+                    paragraphs.append(txt)
+        item["paragraphs"] = paragraphs
 
-    # ── Phase 2 safety-net filter: check location is Alabama ─────────────
-    # The discovery phase already filters by Alabama, but re-check on detail page
-    location_lower = (item.get("location") or "").lower()
-    if location_lower and location_lower not in ("al", "alabama"):
-        item["remarks"] = f"Location mismatch: '{item.get('location')}' is not Alabama"
+        # ── Headings ──────────────────────────────────────────────
+        headings = []
+        h_selectors = [
+            ".interior-page-content",
+            "main",
+            ".job-details",
+            ".job-description",
+            "[role='main']",
+            "article",
+        ]
+        for scope in h_selectors:
+            scoped = soup.select_one(scope)
+            if scoped:
+                for h in scoped.find_all(["h2", "h3", "h4"]):
+                    level = int(h.name[1])
+                    txt = h.get_text(strip=True)
+                    if txt:
+                        headings.append({"level": level, "text": txt})
+                if headings:
+                    break
+        if not headings:
+            for h in soup.find_all(["h2", "h3", "h4"]):
+                level = int(h.name[1])
+                txt = h.get_text(strip=True)
+                if txt:
+                    headings.append({"level": level, "text": txt})
+        item["headings"] = headings
 
-    # ── Phase 2 safety-net filter: check date is within 7 days ──────────
-    date_posted = item.get("date_posted", "")
-    if date_posted:
-        try:
-            posted = datetime.fromisoformat(date_posted)
-            cutoff = datetime.now(timezone.utc) - timedelta(days=7)
-            if posted.tzinfo is None:
-                posted = posted.replace(tzinfo=timezone.utc)
-            if posted < cutoff:
-                item["remarks"] = (item.get("remarks") or "") + f" Posted {date_posted} (>7 days old)"
-        except (ValueError, TypeError):
-            pass
+        # ── Lists ─────────────────────────────────────────────────
+        lists = []
+        for scope_sel in [
+            ".interior-page-content",
+            "main",
+            ".job-details",
+            ".job-description",
+            "[role='main']",
+        ]:
+            scoped = soup.select_one(scope_sel)
+            if scoped:
+                for lst in scoped.find_all(["ul", "ol"]):
+                    list_type = lst.name.lower()
+                    list_items = [
+                        li.get_text(strip=True)
+                        for li in lst.find_all("li")
+                        if li.get_text(strip=True)
+                    ]
+                    if list_items:
+                        lists.append({"type": list_type, "items": list_items})
+                if lists:
+                    break
+        item["lists"] = lists
+
+    except Exception as exc:
+        item["remarks"] = f"Extraction error: {exc}"
+        logger.warning("Phase 2: Extraction error for %s: %s", url[:80], exc)
 
     return item
 
 
-def _error_item(url: str, src_url: str, status_code: int = 0, error: str = "", index: int = 0) -> dict:
-    return {
-        "id": index,
-        "title": "",
-        "price": "",
-        "availability": "",
-        "original_price": "",
-        "currency": CURRENCY,
-        "url": url,
-        "src_url": src_url,
-        "location": "",
-        "status_code": status_code,
-        "scraped_at": datetime.now(timezone.utc).isoformat(),
-        "remarks": f"Error: {error[:200]}",
-    }
+def extract_all_concurrent(
+    urls: list[str],
+    src_urls: list[str],
+    max_workers: int = PHASE2_MAX_WORKERS,
+) -> list[dict]:
+    """Extract data from all discovered URLs using a thread pool."""
+    logger.info(
+        "Phase 2: Extracting %d jobs with %d workers",
+        len(urls), max_workers,
+    )
 
+    results: list[Optional[dict]] = [None] * len(urls)
+    success_count = 0
+    fail_count = 0
 
-def _extract_items_concurrent(urls: list[str], src_url: str, limit: Optional[int] = None) -> list[dict]:
-    """Extract job data concurrently using ThreadPoolExecutor."""
-    # Index URLs to preserve discovery order
-    indexed_urls = list(enumerate(urls[:limit] if limit else urls))
-    results_map: dict[int, dict] = {}
-    failed = 0
+    def _worker(index: int, url: str, src: str) -> tuple[int, dict]:
+        return index, _extract_job_data(url, src)
 
-    def _worker(idx: int, url: str) -> tuple[int, dict]:
-        session = _make_session()
-        try:
-            time.sleep(DELAY_BETWEEN_REQUESTS * 0.3)  # slight per-thread jitter
-            item = _extract_job_data(session, url, src_url, idx)
-            return idx, item
-        except Exception as exc:
-            logger.error("Worker error for %s: %s", url[:80], exc)
-            return idx, _error_item(url, src_url, error=str(exc), index=idx)
-        finally:
-            session.close()
-
-    total = len(indexed_urls)
-    logger.info("Phase 2: Extracting %d jobs with ThreadPoolExecutor(max_workers=8)", total)
-
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
-            executor.submit(_worker, idx, url): idx
-            for idx, url in indexed_urls
+            pool.submit(_worker, i, url, src): i
+            for i, (url, src) in enumerate(zip(urls, src_urls))
         }
-        for i, future in enumerate(as_completed(futures), 1):
-            idx, item = future.result()
-            results_map[idx] = item
-            if not item.get("title"):
-                failed += 1
-            if i % 25 == 0 or i == total:
-                pct = (i / total) * 100
-                logger.info("Phase 2: Progress [%d/%d] (%.1f%%)", i, total, pct)
+        completed = 0
+        for future in as_completed(futures):
+            completed += 1
+            idx = futures[future]
+            try:
+                _, item = future.result()
+                results[idx] = item
+                if item.get("title"):
+                    success_count += 1
+                else:
+                    fail_count += 1
+            except Exception as exc:
+                results[idx] = {
+                    "url": urls[idx],
+                    "src_url": src_urls[idx],
+                    "status_code": 0,
+                    "scraped_at": datetime.now(timezone.utc).isoformat(),
+                    "remarks": f"Worker error: {exc}",
+                }
+                fail_count += 1
 
-    # Reassemble in discovery order
-    ordered = [results_map[idx] for idx in sorted(results_map.keys())]
+            if completed % 25 == 0 or completed == len(urls):
+                pct = (completed / len(urls)) * 100
+                logger.info(
+                    "Progress: [%d/%d] (%.1f%%)", completed, len(urls), pct
+                )
 
-    # Assign sequential IDs
-    for seq, item in enumerate(ordered, 1):
-        item["id"] = seq
-
-    logger.info("Phase 2: Extraction complete — %d success, %d failed", len(ordered) - failed, failed)
-    return ordered
-
-
-def _extract_items_sequential(urls: list[str], src_url: str, limit: Optional[int] = None) -> list[dict]:
-    """Extract job data sequentially (for --sample or small sets)."""
-    session = _make_session()
-    items: list[dict] = []
-    total = len(urls[:limit] if limit else urls)
-    failed = 0
-
-    for i, url in enumerate(urls[:limit] if limit else urls, 1):
-        logger.info("Phase 2: Progress [%d/%d] (%.1f%%) — %s", i, total, (i / total) * 100, url[:100])
-        item = _extract_job_data(session, url, src_url, i)
-        item["id"] = i
-        items.append(item)
-        if not item.get("title"):
-            failed += 1
-        if i < total:
-            time.sleep(DELAY_BETWEEN_REQUESTS)
-
-    session.close()
-    logger.info("Phase 2: Sequential extraction — %d success, %d failed", len(items) - failed, failed)
-    return items
+    logger.info(
+        "Phase 2 complete — success: %d, failed: %d",
+        success_count, fail_count,
+    )
+    return [r for r in results if r is not None]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -806,14 +818,34 @@ def _extract_items_sequential(urls: list[str], src_url: str, limit: Optional[int
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def main():
-    parser = argparse.ArgumentParser(description=f"{SITE_NAME} Job Scraper (Navigation)")
-    parser.add_argument("--input", type=str, help="Path to input URLs JSON file")
-    parser.add_argument("--urls", nargs="+", help="Job URLs as CLI arguments")
-    parser.add_argument("--sample", action="store_true", help="Scrape first 5 items only")
-    parser.add_argument("--limit", type=int, default=None, help="Max items to scrape")
-    parser.add_argument("--no-proxy", action="store_true", default=True, help="Disable proxy (default)")
-    parser.add_argument("--headless", action="store_true", default=True, help="Headless browser mode")
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=f"{SITE_NAME} Job Scraper"
+    )
+    parser.add_argument(
+        "--input", type=str, help="Path to input URLs JSON file"
+    )
+    parser.add_argument(
+        "--urls", nargs="+", help="Job URLs passed on the CLI"
+    )
+    parser.add_argument(
+        "--sample", action="store_true", help="Scrape first 5 items only"
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None, help="Max items to scrape"
+    )
+    parser.add_argument(
+        "--no-proxy", action="store_true", default=True,
+        help="Disable proxy (default: no proxy)",
+    )
+    parser.add_argument(
+        "--query", type=str, default=None,
+        help="Search query (default: iterate all specialties)",
+    )
+    parser.add_argument(
+        "--headless", action="store_true", default=True,
+        help="Headless mode (default: True)",
+    )
     args = parser.parse_args()
 
     limit = 5 if args.sample else args.limit
@@ -821,96 +853,117 @@ def main():
 
     logger.info("=" * 80)
     logger.info("Starting scraper for %s", SITE_NAME)
-    logger.info("Content type: %s | Output key: %s", CONTENT_TYPE, OUTPUT_KEY)
+    logger.info("Scraping method: %s", SCRAPING_METHOD)
     logger.info("=" * 80)
 
     discovered_urls: list[str] = []
-    src_url: str = SITE_URL
+    src_urls: list[str] = []
 
-    # ── Mode: --input or --urls provided → skip Phase 1 ─────────────────
-    if args.input or args.urls:
-        if args.input:
-            try:
-                with open(args.input, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    discovered_urls = data.get("urls", [])
-            except Exception as exc:
-                logger.error("Failed to read %s: %s", args.input, exc)
-                sys.exit(1)
-        elif args.urls:
-            discovered_urls = list(args.urls)
+    # ── --urls mode: extract specific URLs directly ──────────────
+    if args.urls:
+        discovered_urls = list(args.urls)
+        src_urls = list(args.urls)
+        logger.info("Using %d URLs from --urls flag", len(discovered_urls))
 
-        logger.info("Loaded %d URLs from input (--input/--urls)", len(discovered_urls))
-        for url in discovered_urls:
-            src_url = url
-            break
-    else:
-        # ── Default: Phase 1 discovery via search form ────────────────
-        logger.info("Phase 1: Discovering job URLs via search form (Alabama, last 7 days, all specialties)")
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=args.headless)
-            context = browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
+    # ── --input mode ──────────────────────────────────────────────
+    elif args.input:
+        try:
+            with open(args.input) as f:
+                data = json.load(f)
+            discovered_urls = data.get("urls", [])
+            src_urls = list(discovered_urls)
+            logger.info(
+                "Using %d URLs from --input %s",
+                len(discovered_urls), args.input,
             )
-            page = context.new_page()
+        except Exception as exc:
+            logger.error("Failed to read --input file: %s", exc)
+            sys.exit(1)
 
-            discovered_urls = _discover_all_job_urls(page, limit=limit)
-            src_url = f"{SITE_URL}/Resources/JobSearch/SearchResults (Alabama, 7 days)"
+    # ── --sample mode: skip Phase 1, use input_urls.json ─────────
+    elif args.sample:
+        input_path = os.path.join(SCRIPT_DIR, "input_urls.json")
+        if not os.path.isfile(input_path):
+            logger.error(
+                "--sample requires input_urls.json but it does not exist at %s",
+                input_path,
+            )
+            sys.exit(1)
+        try:
+            with open(input_path) as f:
+                data = json.load(f)
+            discovered_urls = data.get("urls", [])
+            src_urls = list(discovered_urls)
+            logger.info(
+                "Sample mode: using %d URLs from input_urls.json",
+                len(discovered_urls),
+            )
+        except Exception as exc:
+            logger.error("Failed to read input_urls.json: %s", exc)
+            sys.exit(1)
 
-            browser.close()
+    # ── Default: Phase 1 discovery via Playwright ─────────────────
+    else:
+        ck_urls, ck_src = _load_checkpoint()
+        if ck_urls:
+            discovered_urls = ck_urls
+            src_urls = ck_src
+            logger.info(
+                "Phase 1: SKIPPED — resumed from checkpoint with %d URLs",
+                len(ck_urls),
+            )
+        else:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=args.headless)
+                context = browser.new_context(
+                    viewport={"width": 1920, "height": 1080},
+                    user_agent=DEFAULT_USER_AGENT,
+                )
+                page = context.new_page()
 
-        if not discovered_urls:
-            logger.warning("No job URLs discovered — exiting")
-            sys.exit(0)
+                discovered_urls, src_urls = discover_urls_via_playwright(
+                    page,
+                    max_specialties=None,
+                    limit=limit,
+                    max_pages=MAX_PAGES,
+                )
+                _write_checkpoint(discovered_urls, src_urls)
 
-        logger.info("Total products discovered: %d", len(discovered_urls))
+                browser.close()
 
-    # ── Phase 2: Extract data ───────────────────────────────────────────
+    # ── Guard: nothing discovered ──────────────────────────────────
     if not discovered_urls:
-        logger.warning("No URLs to extract — exiting")
+        logger.warning("No job URLs discovered — exiting")
         sys.exit(0)
 
-    logger.info("=" * 80)
-    logger.info("Phase 2: Extracting data from %d jobs", len(discovered_urls[:limit] if limit else discovered_urls))
-    logger.info("=" * 80)
+    # Apply limit (applies after discovery)
+    if limit:
+        discovered_urls = discovered_urls[:limit]
+        src_urls = src_urls[:limit]
 
-    # Use concurrent extraction for larger sets, sequential for small/sample
-    effective_urls = discovered_urls[:limit] if limit else discovered_urls
-    if len(effective_urls) > 10:
-        items = _extract_items_concurrent(discovered_urls, src_url, limit=limit)
-    else:
-        items = _extract_items_sequential(discovered_urls, src_url, limit=limit)
+    total_products = len(discovered_urls)
+    logger.info("Total products: %d", total_products)
 
-    # ── Output filter ───────────────────────────────────────────────────
-    _before = len(items)
-    items = [
-        it for it in items
-        if it.get("title") and (
-            not CORE_FILTER_FIELDS or any(it.get(f) for f in CORE_FILTER_FIELDS)
-        )
-    ]
-    if len(items) != _before:
+    # ── Phase 2: Extract data concurrently ────────────────────────
+    items = extract_all_concurrent(discovered_urls, src_urls)
+
+    # ── Output filter: keep only items with a title ────────────────
+    before = len(items)
+    items = [it for it in items if it.get("title")]
+    dropped = before - len(items)
+    if dropped:
         logger.info(
-            "Output filter: %d → %d items (dropped %d without core fields)",
-            _before, len(items), _before - len(items),
+            "Output filter: %d → %d items (dropped %d without title)",
+            before, len(items), dropped,
         )
 
-    # ── Write output ────────────────────────────────────────────────────
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
-    output_filename = os.path.join(SCRIPT_DIR, f"output_{timestamp}.json")
-
+    # ── Write output file ──────────────────────────────────────────
     output = {
         "site": {
             "name": SITE_NAME,
             "url": SITE_URL,
             "platform": PLATFORM,
-            "scraping_method": f"playwright_navigation + {SCRAPING_METHOD}",
+            "scraping_method": SCRAPING_METHOD,
             "scraped_at": datetime.now(timezone.utc).isoformat(),
         },
         OUTPUT_KEY: items,
@@ -918,10 +971,12 @@ def main():
             "scraping_duration_seconds": round(time.time() - start_time, 1),
             "discovered_urls": len(discovered_urls),
             "extracted_items": len(items),
-            "failed_products": sum(1 for it in items if not it.get("title")),
             "rate_limit_delay": DELAY_BETWEEN_REQUESTS,
         },
     }
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+    output_filename = os.path.join(SCRIPT_DIR, f"output_{timestamp}.json")
 
     with open(output_filename, "w", encoding="utf-8") as f:
         # _OUTPUT_FILTER_APPLIED — drop non-item pages (content-type aware)
@@ -939,14 +994,18 @@ def main():
 
         json.dump(output, f, indent=2, ensure_ascii=False, default=str)
 
-    success = sum(1 for it in items if it.get("title"))
-    failed = sum(1 for it in items if not it.get("title"))
+    # Cleanup checkpoint on successful completion
+    _clear_checkpoint()
 
+    success = len([i for i in items if i.get("title")])
     logger.info("=" * 80)
     logger.info("EXTRACTION COMPLETE")
-    logger.info("Total discovered: %d | Extracted: %d | Success: %d | Failed: %d",
-                len(discovered_urls), len(items), success, failed)
-    logger.info("Duration: %.1fs → %s", time.time() - start_time, output_filename)
+    logger.info(
+        "Total: %d, Success: %d, Failed: %d",
+        total_products, success, dropped,
+    )
+    logger.info("Output: %s", output_filename)
+    logger.info("Duration: %.1fs", time.time() - start_time)
     logger.info("=" * 80)
 
 

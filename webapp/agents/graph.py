@@ -41,6 +41,7 @@ from typing import Any, Optional
 from django.utils import timezone
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.callbacks import BaseCallbackHandler, BaseCallbackManager
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
@@ -398,16 +399,77 @@ AGENT_RECURSION_MAP: dict[str, int] = {
 }
 
 
+class _ToolCallLogger(BaseCallbackHandler):
+    """Write a SessionLog per tool call, in real time.
+
+    Why this exists: agent tool calls are batch-persisted only AFTER
+    ``agent.invoke()`` returns (``_persist_agent_logs``). During a long run
+    (code_writer ~15 min) the only SessionLog entries are content-free heartbeats
+    — the job *looks* idle/hung while actively working, which caused a healthy
+    run to be misdiagnosed as a hang and cancelled. This callback writes a
+    SessionLog on every ``on_tool_start`` so monitoring sees real progress
+    (which tool, which args) as it happens, and can distinguish slow-but-working
+    from a genuinely stuck LLM call. Generic — attached centrally in
+    ``_agent_config`` so every agent benefits.
+    """
+
+    def __init__(self, job_id: int, agent_name: str) -> None:
+        self.job_id = job_id
+        self.agent_name = agent_name
+
+    def on_tool_start(self, serialized, input_str, **kwargs) -> None:  # type: ignore[override]
+        try:
+            name = ""
+            if isinstance(serialized, dict):
+                name = serialized.get("name") or ""
+            from scraper.models import SessionLog
+
+            seq = SessionLog.objects.filter(job_id=self.job_id).count()
+            SessionLog.objects.create(
+                job_id=self.job_id,
+                role=SessionLog.ROLE_ASSISTANT,
+                agent=self.agent_name,
+                content=f"[TOOL] {name}: {(input_str or '')[:140]}",
+                seq=seq,
+            )
+        except Exception:
+            # A logging callback must NEVER crash the agent it observes.
+            pass
+
+
 def _agent_config(config: RunnableConfig, agent_name: str = "") -> RunnableConfig:
     """Create a config copy with a higher recursion limit for react agents.
 
     React agents make many tool-call rounds (each round = 1 recursion step).
     The default limit of 25 is too low for browsing-heavy agents like
     site_analyzer.  Per-agent limits are set in AGENT_RECURSION_MAP.
+
+    Also attaches ``_ToolCallLogger`` (real-time tool-call SessionLog entries)
+    when ``job_id`` is present in the config metadata, so long agent runs don't
+    look idle. [progress-visibility fix]
     """
     limit = AGENT_RECURSION_MAP.get(agent_name, AGENT_RECURSION_LIMIT)
     agent_cfg = {**config}
     agent_cfg["recursion_limit"] = limit
+    # Real-time tool-call logging: job_id is placed in config metadata by
+    # LangGraphService.get_config, so it propagates to every node. Attaching
+    # here (not per-invoke-site) covers all agents in one place.
+    job_id = (config.get("metadata") or {}).get("job_id") if isinstance(config, dict) else None
+    if job_id:
+        cb = _ToolCallLogger(int(job_id), agent_name)
+        existing = agent_cfg.get("callbacks")
+        # config["callbacks"] can be: None, a list of handlers, OR a
+        # BaseCallbackManager (langgraph passes one; it's NOT iterable — calling
+        # list() on it raises TypeError). Normalise to a flat handler list so
+        # langgraph's run-tracking handlers are preserved alongside ours.
+        if existing is None:
+            agent_cfg["callbacks"] = [cb]
+        elif isinstance(existing, list):
+            agent_cfg["callbacks"] = [*existing, cb]
+        elif isinstance(existing, BaseCallbackManager):
+            agent_cfg["callbacks"] = [*existing.handlers, cb]
+        else:
+            agent_cfg["callbacks"] = [existing, cb]
     return agent_cfg
 
 

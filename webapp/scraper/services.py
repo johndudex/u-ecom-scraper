@@ -203,6 +203,10 @@ class LangGraphService:
         return {
             "configurable": {"thread_id": LangGraphService.get_thread_id(job_id)},
             "recursion_limit": 500,
+            # job_id in metadata propagates to every node's config, so
+            # _agent_config can attach _ToolCallLogger for real-time tool-call
+            # logging (long agents otherwise look idle). [progress-visibility]
+            "metadata": {"job_id": job_id},
         }
 
     # ── Execution ──────────────────────────────────────────────────

@@ -275,11 +275,26 @@ def _find_output_file(site_folder: str) -> str:
 
 
 def _count_products(output_path: str) -> int:
+    """Count extracted items in an output file.
+
+    The output list key varies by content type — ``products`` for shopping,
+    ``jobs`` for job_posting, ``articles``, ``threads``, etc. (see
+    ``src/content_types.py`` output_key). Hardcoding ``"products"`` silently
+    reports 0 for every non-product job, so the pipeline marks a successful
+    600-job extraction as failed. Instead, count the primary item list: the
+    largest top-level list in the output JSON (the standard schema has exactly
+    one — site/metadata are dicts). Generic across all content types.
+    """
     if not output_path or not os.path.isfile(output_path):
         return 0
     try:
         with open(output_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        return len(data.get("products", []))
+        if isinstance(data, dict):
+            return max(
+                (len(v) for v in data.values() if isinstance(v, list)),
+                default=0,
+            )
+        return 0
     except Exception:
         return 0

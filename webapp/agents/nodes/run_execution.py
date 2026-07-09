@@ -51,6 +51,78 @@ def _get_browser_service_url() -> str:
     return os.environ.get("BROWSER_SERVICE_URL", "http://browser_service:8001")
 
 
+def _accepted_cli_flags(scraper_path: str) -> set[str] | None:
+    """Return the long-flag names the scraper's argparse accepts.
+
+    Done by static AST analysis of ``add_argument("--flag", ...)`` calls — no
+    execution, so it works even if the scraper's deps (playwright, etc.) aren't
+    importable in this container. Returns None if undeterminable (caller then
+    passes args unchanged rather than risk breaking an opaque scraper).
+
+    Why this exists: the generated scraper's argparse is LLM-written and may
+    drop flags run_execution passes (e.g. ``--query`` for nav jobs,
+    ``--category-url`` for list pages). An unsupported flag makes argparse
+    exit(2) before any scraping happens — the scraper never even starts. This
+    probe lets run_execution pass only flags the scraper actually accepts.
+    [generic CLI-contract guard, no site-specific assumptions]
+    """
+    try:
+        import ast
+
+        with open(scraper_path, "r", errors="ignore") as fh:
+            tree = ast.parse(fh.read())
+        flags: set[str] = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "attr", "") == "add_argument"
+            ):
+                for arg in node.args:
+                    if (
+                        isinstance(arg, ast.Constant)
+                        and isinstance(arg.value, str)
+                        and arg.value.startswith("--")
+                    ):
+                        flags.add(arg.value[2:])
+        return flags or None
+    except Exception as exc:
+        logger.warning("run_execution: could not parse scraper CLI flags: %s", exc)
+        return None
+
+
+def _filter_supported_args(
+    args: list[str], accepted: set[str] | None
+) -> list[str]:
+    """Keep only ``--flag`` tokens (and their values) the scraper accepts.
+
+    If ``accepted`` is None (introspection failed), return args unchanged.
+    Handles ``--flag value``, ``--flag v1 v2`` (nargs="+"), and bare
+    ``--store_true`` flags by consuming consecutive non-flag tokens as values.
+    """
+    if accepted is None:
+        return args
+    filtered: list[str] = []
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok.startswith("--") and tok[2:] in accepted:
+            filtered.append(tok)
+            i += 1
+            # consume all consecutive values (handles nargs="+" + single value)
+            while i < len(args) and not args[i].startswith("--"):
+                filtered.append(args[i])
+                i += 1
+        elif tok.startswith("--"):
+            # unsupported flag — skip it and its values
+            i += 1
+            while i < len(args) and not args[i].startswith("--"):
+                i += 1
+        else:
+            # orphan value with no kept flag — drop
+            i += 1
+    return filtered
+
+
 def _needs_browser(state: ScrapeState, scraper_path: str = "") -> bool:
     """True if this scraper must run in browser_service (Chrome/Playwright).
 
@@ -134,6 +206,21 @@ def run_execution(state: ScrapeState) -> dict:
             "run_execution: navigation job, passing --query '%s'", search_criteria
         )
 
+    # CLI-contract guard: drop any flag the generated scraper doesn't define,
+    # so an LLM-authored argparse can't exit(2) and silently zero the output.
+    if args:
+        accepted = _accepted_cli_flags(scraper_path)
+        filtered = _filter_supported_args(args, accepted)
+        if filtered != args:
+            logger.warning(
+                "run_execution: scraper doesn't accept some flags — "
+                "passed %s, accepted %s, filtering to %s",
+                args,
+                sorted(accepted) if accepted else "unknown",
+                filtered,
+            )
+        args = filtered
+
     if _needs_browser(state, scraper_path):
         logger.info("run_execution: browser-based scraper, dispatching to browser_service")
         result = _run_via_browser_service(scraper_path, args, site_folder, state)
@@ -214,12 +301,21 @@ def _run_category_sources(state, scraper_path, base_args, site_folder, primary_r
         all_products = list(primary_products)
         service_url = _os.environ.get("BROWSER_SERVICE_URL", "http://browser_service:8001")
         stealth_env = _stealth_env(state)
+        accepted_flags = _accepted_cli_flags(scraper_path)
+        # If the scraper doesn't accept --category-url, multisource can't target
+        # a category page — every run would just repeat full discovery (the
+        # --query guard already stripped the flag). Skip entirely to avoid
+        # several multi-minute duplicate discovery runs. [generic]
+        if not accepted_flags or "category-url" not in accepted_flags:
+            logger.info(
+                "multisource: scraper doesn't support --category-url, skipping "
+                "category runs (would duplicate primary discovery)"
+            )
+            return primary_result
 
         for cat_url in relevant[:5]:  # max 5 category pages
             logger.info("multisource: running scraper on category %s", cat_url[:60])
             try:
-                cat_args = ["--category-url", cat_url] + [a for a in base_args if a != "--query" and not base_args[base_args.index(a)-1] == "--query" if a != search_term]
-                # simpler: just --category-url
                 cat_args = ["--category-url", cat_url]
                 resp = httpx.post(
                     f"{service_url}/scrape",
