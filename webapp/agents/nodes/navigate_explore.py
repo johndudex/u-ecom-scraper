@@ -683,26 +683,6 @@ _LISTING_PAGE_EXTRACTION_JS = r"""
     }
   }
 
-  // Detect Fredhopper / Shopify liquid pagination config
-  try {
-    if (window.liquidCustom && window.liquidCustom.pagination) {
-      const pConfig = window.liquidCustom.pagination;
-      if (!result.pagination) {
-        result.pagination = {
-          type: pConfig.infiniteScrollMode === "button" ? "load_more" : "infinite_scroll",
-          items_per_page: pConfig.itemsPerPage || null,
-        };
-      }
-      result.framework_config = {fredhopper: true, shopify: true};
-    }
-  } catch(e) {}
-
-  // Detect Fredhopper platform
-  if (window.fredhopper) {
-    result.framework_config = result.framework_config || {};
-    result.framework_config.fredhopper = true;
-  }
-
   // Detect "next page" / "previous page" text links (CK UK, some SFCC sites)
   // These are plain <a> or <span> elements with text like "next page", "previous page"
   // Often accompanied by a page indicator like "01/02" or "1 of 2"
@@ -791,6 +771,38 @@ _LISTING_PAGE_EXTRACTION_JS = r"""
       if (m) {
         // Prefer the "of N" number (total), otherwise the first number
         result.total_products = parseInt(m[m.length - 1], 10);
+        break;
+      }
+    }
+  }
+
+  // --- Range-with-total pattern (e.g. locumtenens "1 - 100 of 3771") -----
+  // The signal is the TEXT pattern (\d+ - \d+ of \d+), NOT a class glob —
+  // sites use unpredictable classes for the count element (locumtenens uses
+  // `.cds-text-midnight.cds-text-fw-bold`, which the allowlist above misses).
+  // Walk visible leaf text elements and capture the RAW count string into
+  // item_count_text so navigate_synthesize's parse_count_string() can derive
+  // total_items and the orchestrator can stamp source="site_reported".
+  // Currency/decimal strings are rejected downstream by the parser.
+  if (!result.item_count_text) {
+    const rangeRe = /(\d+)\s*[-–]\s*(\d+)\s+of\s+(\d{1,3}(?:,\d{3})+|\d+)/i;
+    const leaves = document.querySelectorAll(
+      'div, span, p, h1, h2, h3, h4, h5, label, li, small, em, strong'
+    );
+    for (let i = 0; i < leaves.length && i < 4000; i++) {
+      const el = leaves[i];
+      // Skip containers whose descendants also match — we want the deepest
+      // element holding the count text (avoids duplicating parent totals).
+      if (el.querySelector('div, span, p, li, h1, h2, h3, h4, label')) continue;
+      const txt = (el.innerText || el.textContent || '').trim();
+      if (!txt || txt.length > 80) continue;
+      const m = txt.match(rangeRe);
+      if (m) {
+        result.item_count_text = txt;
+        if (!result.total_products) {
+          const total = parseInt(m[3].replace(/,/g, ''), 10);
+          if (total) result.total_products = total;
+        }
         break;
       }
     }
@@ -935,6 +947,200 @@ _LISTING_PAGE_EXTRACTION_JS = r"""
     result.api_endpoints = candidates.slice(0, 8);
   } catch (apiErr) {
     result.api_endpoints = [];
+  }
+
+  // --- Detect EMBEDDED item-JSON (generic data-model signal) ----------------
+  // Many modern sites embed the full item dataset as a JSON array inside a
+  // <script> tag in the listing/category HTML (e.g. window.jobsData=[...],
+  // Next.js #__NEXT_DATA__, Nuxt #__NUXT__, JSON-LD ItemList). This is a THIRD
+  // data model — distinct from "detail pages" — where the listing page itself
+  // contains every record. Detecting the largest homogeneous array of
+  // record-like objects lets navigation pick the data-richest listing and lets
+  // code_writer extract from the listing JSON instead of scraping detail pages.
+  // CONTENT-AGNOSTIC: keys on "array of record objects", so it works for
+  // products, jobs, articles, events — anything. No site-specific names.
+  try {
+    // defaults so a partial failure still leaves a sane signal
+    result.embedded_json = {detected: false, sources: [], best: null};
+    result.data_richness = (result.product_links || []).length;
+    result.data_source = (result.product_links || []).length >= 3 ? 'detail_links' : 'none';
+
+    // A "record array" = >=3 objects, each with >=3 primitive fields, sharing
+    // >=2 keys (homogeneous). Returns {count, keys} or null.
+    function isRecordArray(arr) {
+      if (!Array.isArray(arr) || arr.length < 3) return null;
+      const objs = arr.filter(x => x && typeof x === 'object' && !Array.isArray(x));
+      if (objs.length < 3) return null;
+      const primKeySets = [];
+      for (const o of objs) {
+        const ks = Object.keys(o).filter(k => {
+          const v = o[k];
+          return v === null || typeof v !== 'object';
+        });
+        if (ks.length < 3) return null;
+        primKeySets.push(ks);
+      }
+      const counts = {};
+      primKeySets.forEach(ks => ks.forEach(k => counts[k] = (counts[k] || 0) + 1));
+      const shared = Object.keys(counts).filter(k => counts[k] >= objs.length * 0.6);
+      if (shared.length < 2) return null;
+      const topKeys = Object.keys(counts).sort((a, b) => counts[b] - counts[a]).slice(0, 20);
+      return {count: arr.length, keys: topKeys};
+    }
+    function sanitizeRecord(o) {
+      if (!o || typeof o !== 'object') return o;
+      const out = {};
+      let n = 0;
+      for (const k of Object.keys(o)) {
+        if (n >= 25) break;
+        let v = o[k];
+        if (Array.isArray(v)) v = '[...]';
+        else if (v && typeof v === 'object') v = '{...}';
+        else if (typeof v === 'string' && v.length > 140) v = v.slice(0, 140) + '…';
+        out[k] = v;
+        n++;
+      }
+      return out;
+    }
+    // Deep-walk a parsed JSON value for its largest record array; remember the path.
+    // Classify a record array by its locator/path's last segment so structural
+    // taxonomy arrays (categories/specialties/professions/filters) don't outrank
+    // the real item array (jobs/products). Mirrors _classify_array_name in Python.
+    const ITEM_NOUNS = ['job','product','item','result','listing','post','article','record','vacanc','opening','feed','inventory','catalog','stock','sku','card','entry','course','event','property','vehicle','recipe','deal','order'];
+    const TAX_NOUNS = ['categor','special','profession','disciplin','expertis','department','facet','filter','refin','taxonom','tag','skill','qualif','certif','breadcrumb','menu','subtyp','locale','geograph','region','countr','zone','borough','spec'];
+    function classifyArray(path) {
+      if (!path) return 'neutral';
+      let seg = path.replace(/\[[^\]]*\]/g, '').split('.').pop().replace(/^#/, '').toLowerCase();
+      if (TAX_NOUNS.some(t => seg.indexOf(t) !== -1)) return 'taxonomy';
+      if (ITEM_NOUNS.some(t => seg.indexOf(t) !== -1)) return 'item';
+      return 'neutral';
+    }
+    function walk(val, path, depth, best) {
+      if (depth > 6 || val == null) return;
+      if (Array.isArray(val)) {
+        const info = isRecordArray(val);
+        if (info) {
+          const cls = classifyArray(path);
+          const score = cls === 'taxonomy' ? -1 : (cls === 'item' ? info.count * 3 : info.count);
+          if (score > best.score) {
+            best.score = score;
+            best.count = info.count;
+            best.keys = info.keys;
+            best.path = path;
+            best.record = sanitizeRecord(val.find(x => x && typeof x === 'object' && !Array.isArray(x)));
+          }
+        }
+        for (let i = 0; i < Math.min(val.length, 15); i++) walk(val[i], path + '[' + i + ']', depth + 1, best);
+      } else if (typeof val === 'object') {
+        for (const k of Object.keys(val)) walk(val[k], path ? path + '.' + k : k, depth + 1, best);
+      }
+    }
+    // Balanced-bracket slice: text[openIdx]==='[' -> substring incl. matching ']'.
+    function balancedArray(text, openIdx) {
+      let depth = 0, inStr = false, q = '';
+      for (let i = openIdx; i < text.length; i++) {
+        const c = text[i];
+        if (inStr) {
+          if (c === '\\') { i++; continue; }
+          if (c === q) inStr = false;
+          continue;
+        }
+        if (c === '"' || c === "'") { inStr = true; q = c; continue; }
+        if (c === '[') depth++;
+        else if (c === ']') { depth--; if (depth === 0) return text.slice(openIdx, i + 1); }
+      }
+      return null;
+    }
+    const sources = [];
+    function addSource(kind, locator, best, preview) {
+      if (!best || best.count < 3) return;
+      sources.push({
+        kind: kind,
+        locator: locator,
+        record_count: best.count,
+        array_path: best.path || '',
+        sample_keys: best.keys || [],
+        sample_record: best.record || null,
+        script_preview: (preview || '').slice(0, 300),
+      });
+    }
+    function freshBest() { return {count: 0, score: -1, keys: [], path: '', record: null}; }
+
+    // 1) JSON-LD blocks (ItemList / arrays of typed records)
+    document.querySelectorAll('script[type="application/ld+json"]').forEach((s, idx) => {
+      const raw = (s.textContent || '').trim();
+      if (!raw) return;
+      let data;
+      try { data = JSON.parse(raw); } catch (e) { return; }
+      const items = Array.isArray(data) ? data : [data];
+      const best = freshBest();
+      items.forEach(it => walk(it, 'jsonld.' + ((it && typeof it === 'object' && it['@type']) || 'block'), 0, best));
+      if (best.count >= 3) {
+        const typed = items.find(x => x && typeof x === 'object' && x['@type']);
+        const t = (typed && typed['@type']) || ('block' + idx);
+        addSource('jsonld', 'jsonld:' + t, best, raw);
+      }
+    });
+
+    // 2) Next.js / Nuxt hydration data
+    [['#__NEXT_DATA__', 'next_data'], ['#__NUXT__', 'nuxt_data']].forEach(pair => {
+      const sel = pair[0], kind = pair[1];
+      const el = document.querySelector(sel);
+      if (!el) return;
+      try {
+        const data = JSON.parse(el.textContent || '');
+        const best = freshBest();
+        walk(data, sel, 0, best);
+        if (best.count >= 3) addSource(kind, sel, best, (el.textContent || '').slice(0, 300));
+      } catch (e) {}
+    });
+
+    // 3) Inline <script> JSON blobs: whole-JSON scripts + named assignments.
+    // Bounded (<=30 scripts, <=1MB each, <=20 assignments each) so a giant
+    // webpack bundle never stalls extraction.
+    const scripts = Array.from(document.querySelectorAll('script:not([src])')).slice(0, 30);
+    scripts.forEach(s => {
+      let txt = (s.textContent || '').trim();
+      if (!txt || txt.length < 30) return;
+      if (txt.length > 1000000) txt = txt.slice(0, 1000000);
+      // whole-script JSON?
+      if (txt[0] === '[' || txt[0] === '{') {
+        try {
+          const best = freshBest();
+          walk(JSON.parse(txt), 'script', 0, best);
+          if (best.count >= 3) { addSource('inline_script', 'script-json', best, txt.slice(0, 300)); return; }
+        } catch (e) {}
+      }
+      // named assignments: NAME = [ { ... } ]  (window.foo.bar, var x, obj key)
+      const re = /(?:^|[;\n\s{}(,])((?:[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*){0,4}))\s*[:=]\s*\[\s*\{/g;
+      let m, attempts = 0;
+      while ((m = re.exec(txt)) !== null && attempts < 20) {
+        attempts++;
+        const name = m[1];
+        const openIdx = m.index + m[0].lastIndexOf('[');
+        const sub = balancedArray(txt, openIdx);
+        if (!sub || sub.length > 8000000) continue;
+        try {
+          const best = freshBest();
+          walk(JSON.parse(sub), name, 0, best);
+          if (best.count >= 3) { addSource('inline_script', name, best, txt.slice(openIdx, openIdx + 300)); return; }
+        } catch (e) {}
+      }
+    });
+
+    // Aggregate: richest source wins.
+    sources.sort((a, b) => b.record_count - a.record_count);
+    const bestSrc = sources[0] || null;
+    const embCount = bestSrc ? bestSrc.record_count : 0;
+    const linkCount = (result.product_links || []).length;
+    result.embedded_json = {detected: !!bestSrc, sources: sources.slice(0, 5), best: bestSrc};
+    result.data_richness = Math.max(embCount, linkCount);
+    if (embCount >= 3) result.data_source = 'embedded_json';
+    else if (linkCount >= 3) result.data_source = 'detail_links';
+    else result.data_source = 'none';
+  } catch (embErr) {
+    // Never let detection break the rest of the extraction result.
+    result.embedded_json = result.embedded_json || {detected: false, sources: [], best: null};
   }
 
   return JSON.stringify(result);
@@ -1242,36 +1448,6 @@ def _pick_category_to_visit(
     return category_links[0].get("href")
 
 
-def _construct_category_urls_from_buttons(
-    nav_buttons: list[dict],
-    base_url: str,
-) -> list[dict]:
-    """Construct category URLs from button-based nav labels.
-
-    For SPA sites where nav items are <button> (no href), we infer URLs from
-    common patterns: /{slug}, /category/{slug}, /collections/{slug}.
-    """
-    parsed = urlparse(base_url)
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    result: list[dict] = []
-
-    for btn in nav_buttons:
-        label = btn.get("text") or btn.get("ariaLabel") or ""
-        if not label or len(label) > 50:
-            continue
-        # Slugify the label
-        slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
-        if not slug:
-            continue
-        # Generate candidate URLs
-        for pattern in [f"/{slug}", f"/category/{slug}", f"/collections/{slug}"]:
-            result.append(
-                {"href": f"{origin}{pattern}", "text": label, "inferred": True}
-            )
-
-    return result
-
-
 def _build_search_urls(
     search_form: dict | None,
     search_criteria: str,
@@ -1325,22 +1501,9 @@ def _build_search_urls(
                 new_query = up.urlencode(params, doseq=True)
                 candidates.append(up.urlunparse(hint_parsed._replace(query=new_query)))
 
-        criteria_slug = re.sub(r"[^a-z0-9]+", "-", term.lower()).strip("-")
         common_patterns = [
-            f"{origin}{base_path}/search?q={criteria_encoded}",
-            f"{origin}{base_path}/search?search={criteria_encoded}",
-            f"{origin}{base_path}/search?searchterm={criteria_encoded}",
-            f"{origin}{base_path}/search?searchTerm={criteria_encoded}",
             f"{origin}/search?q={criteria_encoded}",
-            f"{origin}/search?search={criteria_encoded}",
-            f"{origin}/search?searchterm={criteria_encoded}",
-            f"{origin}/search?searchTerm={criteria_encoded}",
             f"{origin}{base_path}/search.aspx?search={criteria_encoded}",
-            f"{origin}{base_path}/search.asp?search={criteria_encoded}",
-            f"{origin}{base_path}/search/?q={criteria_encoded}",
-            f"{origin}{base_path}/search/{criteria_encoded}",
-            f"{origin}{base_path}/search/{criteria_slug}",
-            f"{origin}/search/{criteria_encoded}",
         ]
         candidates.extend(common_patterns)
         all_candidates.extend(candidates)
@@ -1421,6 +1584,363 @@ _JOB_LINK_HREF_PATTERNS = [
     # /job(s)/<slug-with-id>/  (id >= 4 digits anywhere in a jobs path segment)
     r"/jobs?/[a-z0-9_-]*\d{4,}[a-z0-9_-]*/?",
 ]
+
+
+# ── Embedded-JSON detection in raw HTML (Python twin of the in-DOM detector) ─
+# Used by _verify_rendering to decide whether the listing's embedded item data is
+# reachable via a plain HTTP fetch (SSR) or only after JS rendering (CSR). This
+# is the right signal for "data in a <script> JSON blob" sites — raw-vs-rendered
+# *link* counts misread them (a page can have ~10 cards but a 500-record blob).
+
+def _is_record_list(arr) -> int | None:
+    """Return the count if ``arr`` is a homogeneous array of record-like dicts.
+
+    A record array: >=3 dicts, each with >=3 primitive (non-container) fields,
+    sharing >=2 keys across >=60% of records. Content-agnostic. Mirrors the
+    in-browser ``isRecordArray`` in ``_LISTING_PAGE_EXTRACTION_JS``.
+    """
+    if not isinstance(arr, list) or len(arr) < 3:
+        return None
+    objs = [x for x in arr if isinstance(x, dict)]
+    if len(objs) < 3:
+        return None
+    counts: dict[str, int] = {}
+    for o in objs:
+        ks = [k for k, v in o.items() if not isinstance(v, (dict, list))]
+        if len(ks) < 3:
+            return None
+        for k in set(ks):
+            counts[k] = counts.get(k, 0) + 1
+    shared = [1 for k, c in counts.items() if c >= len(objs) * 0.6]
+    if len(shared) < 2:
+        return None
+    return len(arr)
+
+
+# ── Array-name classification (item vs taxonomy) ────────────────────────────
+# A listing page often embeds BOTH the item dataset (e.g. jobsData) AND larger
+# structural/taxonomy arrays (specialties, professions, categories, filters).
+# The "largest record array" is frequently the taxonomy, NOT the items — picking
+# it would make code_writer extract specialties instead of jobs (ayahealthcare
+# case: expertises=110 vs jobsData=10). Classify by the array's locator name:
+# exclude taxonomy/facet arrays, prefer item arrays. Generic site-structure
+# vocabulary — NOT site-specific. Mirrored in the JS detector.
+_ITEM_NOUNS = (
+    "job", "product", "item", "result", "listing", "post", "article", "record",
+    "vacanc", "opening", "feed", "inventory", "catalog", "stock", "sku", "card",
+    "entry", "course", "event", "property", "vehicle", "recipe", "deal", "order",
+)
+_TAXONOMY_NOUNS = (
+    "categor", "special", "profession", "disciplin", "expertis", "department",
+    "facet", "filter", "refin", "taxonom", "tag", "skill", "qualif", "certif",
+    "breadcrumb", "menu", "subtyp", "locale", "geograph", "region", "countr",
+    "zone", "borough", "spec",  # speciality/spec
+)
+
+
+def _classify_array_name(path: str) -> str:
+    """Classify a record array by its locator/path's last segment.
+
+    Returns ``'taxonomy'`` (structural: categories/specialties/professions/
+    filters — NOT the items), ``'item'`` (jobs/products/listings), or
+    ``'neutral'``. Generic site-structure vocabulary; no site-specific names.
+    """
+    if not path:
+        return "neutral"
+    seg = re.sub(r"\[[^\]]*\]", "", str(path)).split(".")[-1].lower().lstrip("#")
+    if any(t in seg for t in _TAXONOMY_NOUNS):
+        return "taxonomy"
+    if any(t in seg for t in _ITEM_NOUNS):
+        return "item"
+    return "neutral"
+
+
+def _record_top_keys(arr) -> list:
+    """Top field names by frequency across the record dicts in ``arr``."""
+    counts: dict[str, int] = {}
+    for x in arr:
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if not isinstance(v, (dict, list)):
+                    counts[k] = counts.get(k, 0) + 1
+    return sorted(counts, key=lambda k: -counts[k])[:20]
+
+
+def _sanitize_record(arr) -> dict | None:
+    """A truncated, JSON-safe copy of the first record dict in ``arr``."""
+    for x in arr:
+        if isinstance(x, dict):
+            out: dict = {}
+            for i, (k, v) in enumerate(x.items()):
+                if i >= 25:
+                    break
+                if isinstance(v, list):
+                    v = "[...]"
+                elif isinstance(v, dict):
+                    v = "{...}"
+                elif isinstance(v, str) and len(v) > 140:
+                    v = v[:140] + "…"
+                out[k] = v
+            return out
+    return None
+
+
+def _find_best_record_array(obj, best: dict, path: str = "", depth: int = 0) -> None:
+    """Deep-walk a parsed JSON value; set ``best`` to the best ITEM record array.
+
+    Scoring excludes taxonomy/facet arrays (so a 110-element `expertises`
+    taxonomy never beats a 10-element `jobsData`) and boosts item-named arrays.
+    ``best`` keys: count, score, path, keys, record.
+    """
+    if depth > 6 or obj is None:
+        return
+    if isinstance(obj, list):
+        n = _is_record_list(obj)
+        if n:
+            cls = _classify_array_name(path)
+            score = -1 if cls == "taxonomy" else (n * 3 if cls == "item" else n)
+            if score > best.get("score", -1):
+                best.update({
+                    "count": n, "score": score, "path": path,
+                    "keys": _record_top_keys(obj), "record": _sanitize_record(obj),
+                })
+        for i, x in enumerate(obj[:20]):
+            _find_best_record_array(x, best, f"{path}[{i}]", depth + 1)
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            _find_best_record_array(v, best, f"{path}.{k}" if path else str(k), depth + 1)
+
+
+def _balanced_substr(text: str, open_idx: int, open_ch: str = "[", close_ch: str = "]") -> str | None:
+    """Return text[open_idx..matching close] (inclusive), honoring string literals."""
+    if open_idx < 0 or open_idx >= len(text) or text[open_idx] != open_ch:
+        return None
+    depth = 0
+    in_str = False
+    quote = ""
+    i = open_idx
+    while i < len(text):
+        c = text[i]
+        if in_str:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                in_str = False
+            i += 1
+            continue
+        if c in ('"', "'"):
+            in_str = True
+            quote = c
+        elif c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return text[open_idx : i + 1]
+        i += 1
+    return None
+
+
+def _raw_html_has_embedded_json(html: str, locator_hints: list[str] | None = None) -> bool:
+    """True if ``html`` embeds a homogeneous record-array in a <script> tag.
+
+    Mirrors the in-DOM detector so the SSR-vs-CSR call is consistent. Scans
+    JSON-LD, ``#__NEXT_DATA__``/``#__NUXT__``, and inline scripts (named
+    assignments + whole-JSON). When ``locator_hints`` are given (tokens from the
+    rendered-DOM detector, e.g. a variable name), scripts are filtered to those
+    mentioning a hint for speed + precision, falling back to a full scan.
+    Bounded; never raises.
+    """
+    if not html:
+        return False
+    try:
+        from bs4 import BeautifulSoup
+    except Exception:
+        return False
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return False
+    best: dict = {"count": 0, "score": -1}
+
+    def _scan_json_text(txt: str) -> None:
+        if not txt or len(txt) < 30:
+            return
+        if len(txt) > 1_000_000:
+            txt = txt[:1_000_000]
+        stripped = txt.strip()
+        if stripped[:1] in "[{":
+            try:
+                _find_best_record_array(json.loads(stripped), best, path="script")
+                if best["count"] >= 3:
+                    return
+            except (json.JSONDecodeError, ValueError):
+                pass
+        for m in re.finditer(
+            r"(?:^|[;\n\s{}(,])([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*){0,4})\s*[:=]\s*\[\s*\{",
+            txt,
+        ):
+            name = m.group(1)
+            open_idx = txt.find("[", m.start(1))
+            sub = _balanced_substr(txt, open_idx)
+            if not sub or len(sub) > 8_000_000:
+                continue
+            try:
+                _find_best_record_array(json.loads(sub), best, path=name)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if best["count"] >= 3:
+                return
+
+    hints = [h for h in (locator_hints or []) if h]
+
+    # JSON-LD (typed records are items by nature; classify by @type)
+    for s in soup.find_all("script", attrs={"type": "application/ld+json"}):
+        try:
+            data = json.loads(s.string or "")
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+        items = data if isinstance(data, list) else [data]
+        for it in items:
+            t = (it.get("@type") if isinstance(it, dict) else "") or "Block"
+            _find_best_record_array(it, best, path=f"jsonld.{t}")
+
+    # Next.js / Nuxt hydration (nested arrays inherit their key as the name)
+    for sid in ("__NEXT_DATA__", "__NUXT__"):
+        el = soup.find(id=sid)
+        if el and el.string:
+            try:
+                _find_best_record_array(json.loads(el.string), best, path=sid)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
+
+    # Inline scripts (bounded; hint-filtered when hints available)
+    for idx, s in enumerate(soup.find_all("script", src=False)):
+        if idx > 40:
+            break
+        txt = s.string or s.get_text() or ""
+        if not txt:
+            continue
+        if hints and not any(h in txt for h in hints):
+            continue
+        _scan_json_text(txt)
+        if best["count"] >= 3:
+            return True
+
+    # If hints filtered everything out, retry the inline scripts without the filter.
+    if hints and best["count"] < 3:
+        for idx, s in enumerate(soup.find_all("script", src=False)):
+            if idx > 40:
+                break
+            _scan_json_text(s.string or s.get_text() or "")
+            if best["count"] >= 3:
+                return True
+
+    return best["count"] >= 3
+
+
+def _embedded_json_locator_hints(listing: dict) -> list[str]:
+    """Tokens from the rendered-DOM detector to guide the raw-HTML scan."""
+    emb = listing.get("embedded_json") or {}
+    if not isinstance(emb, dict):
+        return []
+    hints: list[str] = []
+    for src in (emb.get("sources") or [])[:5]:
+        if not isinstance(src, dict):
+            continue
+        loc = src.get("locator") or ""
+        if loc:
+            hints.append(loc)
+            # also the last segment (variable name) for inline assignments
+            if "." in loc:
+                hints.append(loc.split(".")[-1])
+    return hints
+
+
+def _verify_rendering(findings: dict) -> None:
+    """Determine whether the listing page's item links require JS rendering.
+
+    Compares the rendered item-link count (from the Playwright extraction, in
+    ``findings["listing_page"]["product_links"]``) against a raw-HTTP fetch of the
+    same listing URL. If the raw HTML has 0 item links but the rendered DOM had
+    some, the listings are JS-rendered (CSR) → ``_derive_strategy`` picks a browser
+    strategy upfront instead of http_requests (the ayahealthcare failure: homepage
+    reachable via direct_http but listings JS-rendered). Realizes the documented
+    ``rendering_verified`` contract (SKILL.md). Bounded: one fetch, short timeout,
+    errors → "unknown" (never blocks).
+    """
+    listing = findings.get("listing_page") or {}
+    listing_url = (listing.get("url") or "").strip()
+    rendered_count = len(listing.get("product_links") or [])
+    listing["rendered_item_link_count"] = rendered_count
+    # Embedded-JSON signal: a listing can have ~0 visible links yet carry the
+    # whole dataset in a <script> blob. Don't bail on the raw-HTML check just
+    # because there were no rendered links — the data may still be SSR-reachable.
+    emb = listing.get("embedded_json") or {}
+    emb_best = (emb.get("best") or {}) if isinstance(emb, dict) else {}
+    emb_count = int(emb_best.get("record_count") or 0) if isinstance(emb_best, dict) else 0
+    if not listing_url or (rendered_count == 0 and emb_count == 0):
+        listing["rendering_verified"] = "unknown"
+        listing["raw_html_product_link_count"] = 0
+        return
+    try:
+        import httpx
+        from bs4 import BeautifulSoup
+
+        resp = httpx.get(
+            listing_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=15.0,
+            follow_redirects=True,
+        )
+        if resp.status_code >= 400:
+            listing["rendering_verified"] = "unknown"
+            listing["raw_html_product_link_count"] = 0
+            return
+        soup = BeautifulSoup(resp.text, "html.parser")
+        raw_count = 0
+        for sel in _PRODUCT_PRESENCE_SELECTORS:
+            raw_count += len(soup.select(sel))
+        job_pats = [re.compile(p) for p in _JOB_LINK_HREF_PATTERNS]
+        for a in soup.find_all("a", href=True):
+            if any(p.search(a["href"]) for p in job_pats):
+                raw_count += 1
+        listing["raw_html_product_link_count"] = raw_count
+        if raw_count == 0 and rendered_count > 0:
+            listing["rendering_verified"] = "csr"
+        elif raw_count > 0:
+            listing["rendering_verified"] = "ssr"
+        else:
+            listing["rendering_verified"] = "unknown"
+        # Embedded-JSON override: for "data in a <script> blob" sites the link
+        # count is the wrong signal. If the rendered DOM detected a record array,
+        # check whether that array is ALSO in the raw HTML — if so the data is
+        # SSR-reachable (http_requests works); if it's only in the rendered DOM
+        # the page is CSR (needs a browser). This drives _derive_strategy's
+        # existing ssr/cs/http_navigation cascade with no special-case branch.
+        if emb_count >= 3:
+            hints = _embedded_json_locator_hints(listing)
+            if _raw_html_has_embedded_json(resp.text, hints):
+                listing["rendering_verified"] = "ssr"
+                listing["embedded_json_reachable_via"] = "raw_html"
+            else:
+                listing["rendering_verified"] = "csr"
+                listing["embedded_json_reachable_via"] = "rendered_dom"
+        logger.info(
+            "navigate_explore: rendering_verified=%s (raw=%d rendered=%d emb=%d) for %s",
+            listing["rendering_verified"], raw_count, rendered_count, emb_count, listing_url[:80],
+        )
+    except Exception as exc:
+        logger.warning("navigate_explore: raw-HTML rendering check failed: %s", exc)
+        listing["rendering_verified"] = "unknown"
+        listing["raw_html_product_link_count"] = 0
 
 
 def _wait_for_content(
@@ -1612,6 +2132,7 @@ def _visit_and_extract(
         product_count,
         page_url,
     )
+    _snapshot_listing(findings)
     return page_url
 
 
@@ -1736,6 +2257,8 @@ def _try_form_search(
                     actual_url,
                 )
 
+    _snapshot_listing(findings)
+
 
 _PROMO_URL_KEYWORDS = [
     "special-collection", "pride-collection", "bestsellers", "sale-",
@@ -1761,6 +2284,94 @@ def _has_real_product_links(findings: dict) -> bool:
         product_only = [p for p in real if (p.get("href", "") or "").lower() not in cat_hrefs]
         return len(product_only) >= 3
     return True
+
+
+# ── Listing-page data signal: rank candidates by content richness ──────────
+# Embedded-JSON listing sites (e.g. ayahealthcare's category pages embedding a
+# jobsData blob) carry the whole dataset on ONE page. The "best" listing is the
+# data-richest one, NOT the first page with a few nav links. Each visited
+# candidate is snapshotted; after exploration the richest snapshot is promoted
+# into ``findings["listing_page"]``. Generic + conservative: only rescues a
+# thin/failed listing, or promotes an embedded-JSON page over a detail-link one.
+
+def _data_score(listing: dict) -> int:
+    """Richness score for a listing_page dict.
+
+    Embedded-JSON record count is the strongest signal (the page literally
+    contains every item); otherwise fall back to the extracted product-link
+    count.
+    """
+    if not isinstance(listing, dict):
+        return 0
+    emb = listing.get("embedded_json") or {}
+    best = (emb.get("best") or {}) if isinstance(emb, dict) else {}
+    rec = best.get("record_count") or 0
+    if listing.get("data_source") == "embedded_json" and rec:
+        return int(rec)
+    return len(listing.get("product_links") or [])
+
+
+def _snapshot_listing(findings: dict) -> None:
+    """Record the current listing_page under its URL for later promotion."""
+    listing = findings.get("listing_page") or {}
+    if not isinstance(listing, dict) or not listing:
+        return
+    url = (listing.get("url") or "").strip()
+    if not url:
+        return
+    emb = listing.get("embedded_json") or {}
+    best = (emb.get("best") or {}) if isinstance(emb, dict) else {}
+    snaps = findings.setdefault("_listing_snapshots", {})
+    snaps[url] = {
+        "score": _data_score(listing),
+        "data_source": listing.get("data_source"),
+        "product_link_count": len(listing.get("product_links") or []),
+        "embedded_record_count": best.get("record_count", 0) if isinstance(best, dict) else 0,
+        "listing": dict(listing),
+    }
+
+
+def _promote_data_richest_listing(findings: dict) -> None:
+    """Promote the data-richest visited listing into ``findings["listing_page"]``.
+
+    Conservative — never overrides an already-good detail-link listing unless a
+    strictly-richer *embedded-JSON* page was seen (embedded data is a stronger
+    "this page has the whole dataset" signal than a handful of detail links).
+    This is what corrects "navigation explored a marketing page and concluded
+    no items": the data-rich category page wins.
+    """
+    snaps = findings.get("_listing_snapshots") or {}
+    if not snaps:
+        return
+    current = findings.get("listing_page") or {}
+    cur_score = _data_score(current)
+    cur_ds = current.get("data_source")
+    best_url = None
+    best_score = cur_score
+    best_ds = cur_ds
+    for url, info in snaps.items():
+        s = info.get("score", 0) or 0
+        if s > best_score:
+            best_score = s
+            best_url = url
+            best_ds = info.get("data_source")
+    if best_url is None or best_score < 3:
+        return
+    # Promote only when:
+    #  (a) the current listing is thin/failed (no real data), OR
+    #  (b) an embedded-JSON page beats the current listing's score.
+    current_is_thin = cur_score < 3 or cur_ds in (None, "none")
+    embedded_beats = best_ds == "embedded_json" and best_score > cur_score
+    if not (current_is_thin or embedded_beats):
+        return
+    promoted = dict((snaps[best_url].get("listing")) or {})
+    promoted["promoted_from"] = best_url
+    findings["listing_page"] = promoted
+    logger.info(
+        "navigate_explore: promoted data-richest listing %s (score=%d, %s) "
+        "over current (score=%d, %s)",
+        best_url[:80], best_score, best_ds, cur_score, cur_ds,
+    )
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1989,66 +2600,6 @@ _RESULT_FILTER_DETECT_JS = r"""
 """
 
 
-# Best-effort: apply a "last 7 days"-style date filter on the results page and
-# re-submit, so we can prove (via before/after counts) that filtering works.
-# Bootstrap-multiselect widgets ignore a bare native select.value change, so we
-# try the jQuery multiselect API, then the checkbox click, then the native
-# change event (which the site's onchange handler turns into a form submit).
-_DATE_APPLY_JS = r"""
-() => {
-  const selects = Array.from(document.querySelectorAll('select'));
-  let dateSel = null, target = null;
-  for (const s of selects) {
-    const name = (s.name || s.id || '').toLowerCase();
-    const opts = Array.from(s.options);
-    const isDate = /(jobage|age|date|posted|recent|fromage)/.test(name)
-      || opts.some(o => /(last|past)\s*\d+\s*day/.test((o.textContent || '').toLowerCase()));
-    if (!isDate) continue;
-    target = opts.find(o => /last\s*7\s*day/i.test(o.textContent || ''))
-      || opts.find(o => o.value === '7')
-      || opts.find(o => /7/.test(o.value));
-    if (target) { dateSel = s; break; }
-  }
-  if (!dateSel || !target) return JSON.stringify({applied: false});
-  const name = dateSel.name || dateSel.id;
-  const jq = window.jQuery || window.$;
-  const methods = [];
-  // Method 1: bootstrap-multiselect jQuery API
-  try {
-    if (jq && jq.fn && jq.fn.multiselect) { jq(dateSel).multiselect('select', target.value); methods.push('jq.multiselect'); }
-  } catch (e) {}
-  // Method 2: click the matching checkbox inside the multiselect dropdown
-  try {
-    const wrap = dateSel.closest('.multiselect-native-select') || dateSel.parentElement;
-    const scope = wrap ? wrap : document;
-    const cb = Array.from(scope.querySelectorAll('input[type=checkbox]'))
-      .find(c => c.value === target.value);
-    if (cb) { cb.click(); methods.push('checkbox.click'); }
-  } catch (e) {}
-  // Method 3: native select + change (site onchange -> form submit)
-  try { dateSel.value = target.value; } catch (e) {}
-  dateSel.dispatchEvent(new Event('input', {bubbles: true}));
-  dateSel.dispatchEvent(new Event('change', {bubbles: true}));
-  methods.push('native.change');
-  // Fallback: explicit submit of the enclosing filter form
-  const form = dateSel.closest('form');
-  let submitted = false;
-  if (form) {
-    try {
-      const btn = form.querySelector('input[type=submit], button[type=submit]');
-      if (btn) { btn.click(); submitted = true; }
-      else if (form.requestSubmit) { form.requestSubmit(); submitted = true; }
-      else { form.submit(); submitted = true; }
-    } catch (e) {}
-  }
-  return JSON.stringify({
-    applied: true, name, value: target.value,
-    label: (target.textContent || '').trim(), methods, submitted,
-  });
-}
-"""
-
-
 def _try_classic_dropdown_search(
     navigate,
     evaluate,
@@ -2197,201 +2748,10 @@ def _try_classic_dropdown_search(
             len(filter_ui["category_selectors"]),
         )
 
+    _snapshot_listing(findings)
+
     found = prod_count > 0
-
-    # Best-effort proof: apply "last 7 days" and record before/after counts.
-    if found and filter_ui["date_selectors"]:
-        before = prod_count
-        apply_raw = _invoke_tool(evaluate, function=_DATE_APPLY_JS)
-        apply_res = _parse_eval_json(apply_raw) or {}
-        if apply_res.get("applied"):
-            logger.info(
-                "navigate_explore: applied date filter %s=%s (%s) via %s — waiting for refresh",
-                apply_res.get("name"), apply_res.get("value"),
-                apply_res.get("label"), apply_res.get("methods"),
-            )
-            time.sleep(3)
-            try:
-                _wait_for_content(evaluate, timeout=20)
-            except Exception:
-                pass
-            re_raw = _invoke_tool(evaluate, function=_LISTING_PAGE_EXTRACTION_JS)
-            re_data = _parse_eval_json(re_raw) or {}
-            after = len(re_data.get("product_links", []))
-            findings["listing_page"]["date_filter_proof"] = {
-                "applied": apply_res.get("applied"),
-                "filter": apply_res.get("name"),
-                "value": apply_res.get("value"),
-                "label": apply_res.get("label"),
-                "methods": apply_res.get("methods"),
-                "count_before": before,
-                "count_after": after,
-            }
-            logger.info(
-                "navigate_explore: date filter changed item count %d -> %d",
-                before, after,
-            )
-            if re_data.get("product_links"):
-                findings["listing_page"]["product_links"] = re_data["product_links"]
-
     return found
-
-
-def _try_interactive_pagination(evaluate, findings: dict) -> None:
-    """Try clicking Load More / Next Page / infinite scroll to get more products."""
-    import time
-
-    listing = findings.get("listing_page", {})
-    product_links = listing.get("product_links", [])
-    if not product_links:
-        return
-
-    pagination_info = listing.get("pagination") or {}
-    total_count = (
-        listing.get("total_products", 0)
-        or pagination_info.get("total_product_count", 0)
-        or pagination_info.get("max_pages", 0)
-    )
-    current_count = len(product_links)
-
-    logger.info(
-        "navigate_explore: pagination — have %d products, total=%s",
-        current_count,
-        total_count or "unknown",
-    )
-
-    dismiss_js = r"""() => {
-        const consentTexts = [
-            'allow all', 'accept all', 'accept', 'i agree', 'agree',
-            'got it', 'ok', 'continue', 'yes', 'sure',
-            'allow', 'consent', 'approve',
-        ];
-        const btns = document.querySelectorAll('button, a[role="button"], a[class*="consent" i], button[class*="consent" i]');
-        for (const b of btns) {
-            const t = (b.textContent || '').trim().toLowerCase();
-            if (consentTexts.some(ct => t === ct || t.startsWith(ct))) {
-                if (b.offsetParent !== null) {
-                    b.click();
-                    return 'dismissed: ' + t;
-                }
-            }
-        }
-        return 'no_consent';
-    }"""
-
-    max_rounds = 5
-    scroll_attempts = 0
-    for round_num in range(max_rounds * 2):
-        time.sleep(2)
-
-        # Dismiss cookie consent that may appear after navigation
-        _invoke_tool(evaluate, function=dismiss_js)
-
-        pagination_js = r"""() => {
-            // 1. Load More button
-            const loadMore = document.querySelector(
-                'button[class*="load-more" i], a[class*="load-more" i], '
-                + 'button[data-action="load-more"], .load-more-btn, '
-                + 'button[class*="show-more" i], button[class*="view-more" i]'
-            );
-            if (loadMore && loadMore.offsetParent !== null) {
-                loadMore.click();
-                return JSON.stringify({action: 'clicked_load_more'});
-            }
-
-            // 2. Next page link (standard)
-            const next = document.querySelector(
-                'a[rel="next"], .pagination .next, button.next, '
-                + 'a[aria-label="Next" i], a[aria-label="next" i], '
-                + 'li.next a, .pager .next a'
-            );
-            if (next) {
-                next.click();
-                return JSON.stringify({action: 'clicked_next_page'});
-            }
-
-            // 3. "next page" text link (CK UK style and similar SFCC sites)
-            const allClickable = document.querySelectorAll(
-                'a, button, [role="button"], [tabindex="0"]'
-            );
-            for (const el of allClickable) {
-                const t = (el.textContent || '').trim().toLowerCase();
-                if (t === 'next page' || t === 'next >' || t === 'next ›') {
-                    el.click();
-                    return JSON.stringify({action: 'clicked_next_page_text'});
-                }
-            }
-
-            // 4. Infinite scroll — scroll to bottom
-            window.scrollTo(0, document.body.scrollHeight);
-            return JSON.stringify({action: 'scrolled_to_bottom'});
-        }"""
-        action_raw = _invoke_tool(evaluate, function=pagination_js)
-        action = _parse_eval_json(action_raw)
-
-        if not action:
-            break
-
-        action_type = action.get("action", "")
-        logger.info(
-            "navigate_explore: pagination round %d — %s",
-            round_num + 1,
-            action_type,
-        )
-
-        if action_type == "scrolled_to_bottom":
-            time.sleep(4)
-            scroll_attempts += 1
-            if scroll_attempts >= 3:
-                logger.info("navigate_explore: infinite scroll — 3 scrolls with no new products, stopping")
-                break
-        else:
-            time.sleep(3)
-            scroll_attempts = 0
-
-        content_status = _wait_for_content(evaluate, timeout=10)
-        if not content_status.get("loaded"):
-            time.sleep(2)
-
-        new_data_raw = _invoke_tool(
-            evaluate,
-            function=_LISTING_PAGE_EXTRACTION_JS,
-        )
-        new_data = _parse_eval_json(new_data_raw)
-        if not new_data:
-            break
-
-        new_links = new_data.get("product_links", [])
-        existing_hrefs = {p.get("href", "") for p in product_links}
-        added = [p for p in new_links if p.get("href", "") not in existing_hrefs]
-
-        if added:
-            scroll_attempts = 0
-            product_links.extend(added)
-            listing["product_links"] = product_links
-            if new_data.get("pagination"):
-                listing["pagination"] = new_data["pagination"]
-
-            logger.info(
-                "navigate_explore: pagination round %d — added %d products (total %d)",
-                round_num + 1,
-                len(added),
-                len(product_links),
-            )
-        elif action_type != "scrolled_to_bottom":
-            logger.info(
-                "navigate_explore: pagination round %d — no new products, stopping",
-                round_num + 1,
-            )
-            break
-
-        if total_count and len(product_links) >= total_count:
-            logger.info(
-                "navigate_explore: pagination — reached total count (%d >= %d)",
-                len(product_links),
-                total_count,
-            )
-            break
 
 
 def _do_explore_via_browser(
@@ -2401,6 +2761,7 @@ def _do_explore_via_browser(
     site_analysis: dict,
     search_url: str = "",
     is_job_site: bool = False,
+    content_type: str = "",
 ) -> dict[str, Any]:
     """Run the exploration procedure using Playwright MCP tools.
 
@@ -2438,7 +2799,6 @@ def _do_explore_via_browser(
                 "navigate_explore: search_url yielded %d products",
                 len(findings["listing_page"]["product_links"]),
             )
-            _try_interactive_pagination(evaluate, findings)
             _detect_and_save_url_patterns(findings, None, base_url)
             return findings
         logger.info(
@@ -2504,8 +2864,45 @@ def _do_explore_via_browser(
         logger.info("navigate_explore: detected locale prefix %s", locale_prefix)
         findings["locale_prefix"] = locale_prefix
 
-    # ── STEP 3: Search (form-based PRIMARY, URL-based SECONDARY) ────────
+    # ── STEP 2c: LLM pre-visit URL judgment (which candidates are real listings) ──
+    # Deterministic heuristics (_cat_priority, keyword match) pick marketing pages
+    # (e.g. aya's /travel-nursing/). An LLM judges candidate URLs correct vs wrong
+    # from URL + anchor text + the ask (content type + query) — one cheap call, no
+    # page fetched. STEP 5 then visits the judged-correct URLs first. Safe fallback
+    # to the deterministic ordering if the LLM is unavailable/empty. [llm url selector]
     category_links = homepage_data.get("category_links", [])
+    judged_correct_urls: list[str] = []
+    try:
+        from .url_judge import judge_candidate_urls, ranked_correct
+
+        _cand_seen: set[str] = set()
+        _judge_candidates: list[dict] = []
+        for link in (
+            list(homepage_data.get("category_links", []))
+            + list(homepage_data.get("footer_links", []))
+        ):
+            href = (link.get("href") or "").strip() if isinstance(link, dict) else ""
+            if not href or href in _cand_seen:
+                continue
+            if _is_non_category_link(href, link.get("text", "") if isinstance(link, dict) else ""):
+                continue
+            _cand_seen.add(href)
+            _judge_candidates.append({"href": href, "text": (link.get("text", "") if isinstance(link, dict) else "")})
+        if _judge_candidates:
+            _judgment = judge_candidate_urls(
+                _judge_candidates, content_type, search_criteria, base_url
+            )
+            findings["homepage_nav"]["llm_url_selection"] = _judgment
+            judged_correct_urls = ranked_correct(_judgment, limit=8)
+            logger.info(
+                "navigate_explore: LLM URL selector — %d candidates, %d judged correct",
+                len(_judge_candidates), len(judged_correct_urls),
+            )
+    except Exception as _judge_exc:
+        logger.warning("navigate_explore: LLM URL selector failed: %s", _judge_exc)
+        findings.setdefault("errors", []).append(f"url_judge error: {str(_judge_exc)[:120]}")
+
+    # ── STEP 3: Search (form-based PRIMARY, URL-based SECONDARY) ────────
     search_form = homepage_data.get("search_form")
     # Build effective base URL with locale prefix (avoid double-prefix)
     if locale_prefix:
@@ -2678,10 +3075,6 @@ def _do_explore_via_browser(
             )
             findings["errors"].append(f"classic_search error: {str(exc)[:160]}")
 
-    # ── STEP 4: Interactive pagination ──────────────────────────────────
-    if found_products:
-        _try_interactive_pagination(evaluate, findings)
-
     # ── STEP 5: Fallback — category exploration ──────────────────────────
     if not found_products:
         filtered_cats = [
@@ -2709,36 +3102,28 @@ def _do_explore_via_browser(
                 return 2
             return 3
 
-        filtered_cats.sort(key=_cat_priority)
+        # PRIMARY: visit URLs the LLM judged correct (best-first). FALLBACK: the
+        # deterministic _cat_priority ordering when the LLM gave nothing.
+        if judged_correct_urls:
+            ordered_urls = list(judged_correct_urls)
+            logger.info(
+                "navigate_explore: STEP 5 using LLM-judged correct URLs (%d)", len(ordered_urls)
+            )
+        else:
+            filtered_cats.sort(key=_cat_priority)
+            ordered_urls = [c.get("href", "") for c in filtered_cats[:5] if c.get("href")]
 
-        for cat in filtered_cats[:4]:
-            cat_url = cat.get("href", "")
+        for cat_url in ordered_urls[:5]:
             if not cat_url:
                 continue
             logger.info("navigate_explore: trying category %s", cat_url)
             findings["listing_page"] = {}
             _visit_and_extract(navigate, evaluate, cat_url, cat_url, findings)
-            if _has_real_product_links(findings):
+            lp = findings.get("listing_page") or {}
+            # Stop on real data: embedded item JSON OR a page with real product links.
+            if lp.get("data_source") == "embedded_json" or _has_real_product_links(findings):
                 found_products = True
                 break
-
-    if not found_products and not category_links:
-        nav_buttons = homepage_data.get("nav_buttons", [])
-        if nav_buttons:
-            logger.info(
-                "navigate_explore: trying %d inferred category URLs from button nav",
-                len(nav_buttons),
-            )
-            inferred_cats = _construct_category_urls_from_buttons(nav_buttons, base_url)
-            for cat in inferred_cats[:6]:
-                findings["listing_page"] = {}
-                _visit_and_extract(
-                    navigate, evaluate, cat["href"], cat["href"], findings
-                )
-                if _has_real_product_links(findings):
-                    found_products = True
-                    findings["homepage_nav"]["category_links"].append(cat)
-                    break
 
     if not found_products:
         parsed = urlparse(base_url)
@@ -2952,284 +3337,6 @@ def _extract_json_ld(soup, base_url: str) -> dict[str, Any]:
     return result
 
 
-def _looks_like_product_url(url: str) -> bool:
-    """Filter out non-product URLs (category pages, promo pages, search pages).
-
-    A product URL typically contains:
-    - A product ID segment (numeric or alphanumeric with 4+ chars)
-    - Path segments like /p/, /product/, /item/, /pd/, /dp/, /sku/
-    - Long descriptive slugs with embedded product codes (SFCC, Shopify, etc.)
-    - NOT just category/collection names, promo pages, or homepage sections
-    """
-    from urllib.parse import urlparse
-
-    path = urlparse(url).path.lower()
-    if not path or path == "/" or path == "/search":
-        return False
-
-    _non_product_segments = [
-        "women", "men", "sale", "new-arrivals", "new-in", "bestsellers",
-        "underwear", "swimwear", "jeans", "t-shirts", "dresses", "shoes",
-        "bags", "accessories", "jackets", "outerwear", "sweatshirts",
-        "hoodies", "lingerie", "nightwear", "socks", "shapewear",
-        "special-collection", "pride-collection", "gift", "edit",
-        "careers", "about", "contact", "help", "faq", "stores",
-        "store-locator", "privacy", "terms", "cookie", "shipping",
-        "returns", "track", "order", "newsletter", "account",
-        "wishlist", "cart", "checkout", "search", "guide", "blog",
-    ]
-    segments = [s.strip("-") for s in path.strip("/").split("/") if s.strip("-")]
-    if segments and all(
-        any(s.startswith(seg) for seg in _non_product_segments)
-        for s in segments
-    ):
-        return False
-
-    product_patterns = [
-        r'/[+-]p\w*\d{4,}',
-        r'/[+-]p\d{4,}',
-        r'/pid[-_]\d',
-        r'/sku[-_]\d',
-        r'/product[-_/]\w',
-        r'/item[-_/]\w',
-        r'/pd[-_/]\w',
-        r'/dp[-_/]\w',
-        r'-c\.aspx$',
-        r'-c\.html$',
-        r'/p/\w',
-        r'/\d{6,}$',
-        r'/[a-z0-9]+-[a-z0-9]{6,}$',
-        r'/[a-z]+-[a-z]+-[\w-]*\d{4,}[\w-]*$',
-    ]
-    import re as _re
-    for pat in product_patterns:
-        if _re.search(pat, path):
-            return True
-    if len(path) > 20 and any(c.isdigit() for c in path):
-        return True
-    return False
-
-
-def _extract_product_links_bs(soup, base_url: str) -> list[dict]:
-    """Extract product links from a BeautifulSoup listing page.
-
-    Uses the same strategy as the JS version: try card selectors first,
-    then URL pattern matching, then generic link extraction.
-    """
-    from bs4 import Tag
-
-    product_links: list[dict] = []
-    seen: set[str] = set()
-
-    # Strategy 0: JSON-LD ItemList (most reliable, works on any site with structured data)
-    if soup and len(product_links) < 3:
-        for script in soup.select('script[type="application/ld+json"]'):
-            try:
-                data = json.loads(script.string)
-                if not isinstance(data, dict):
-                    continue
-                schema_type = data.get("@type", "")
-                items = data.get("itemListElement", [])
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    item_url = item.get("url", "")
-                    item_name = item.get("name", "")
-                    if not item_url:
-                        continue
-                    if item_url.startswith("/"):
-                        item_url = urljoin(base_url, item_url)
-                    if item_url in seen:
-                        continue
-                    if schema_type == "ItemList" or _looks_like_product_url(item_url):
-                        seen.add(item_url)
-                        product_links.append({"href": item_url, "text": item_name[:100]})
-                if len(product_links) >= 200:
-                    break
-            except (json.JSONDecodeError, TypeError, AttributeError):
-                continue
-
-    # Strategy 1: Card-based selectors (including SFCC/ecommerce platform-specific)
-    card_selectors = [
-        '[data-cy="product-grid-item"]',
-        "[data-product-id]",
-        "[data-productid]",
-        "[data-sku]",
-        ".product-card",
-        ".product-item",
-        ".item-card",
-        ".product-tile",
-        ".product-card--product",
-        ".c-product-tile",
-        "[ref=productTile]",
-        "[data-tileid]",
-        ".tile--product",
-        "[data-testid=product-tile]",
-        ".grid-item--product",
-        ".plp-card",
-        ".ae-plp-card",
-        ".c-grid-item",
-        '[class*="product-card"]',
-        '[class*="product-tile"]',
-        '[class*="product_tile"]',
-        '[class*="plp-product"]',
-        '[class*="grid-product"]',
-        '[data-testid*="product" i]',
-        '[data-testid*="tile" i]',
-        '[data-testid*="card" i]',
-        '[data-testid*="grid" i]',
-    ]
-    for sel in card_selectors:
-        cards = soup.select(sel)
-        if len(cards) >= 3:
-            for card in cards[:200]:
-                if not isinstance(card, Tag):
-                    continue
-                link = card.find("a", href=True)
-                if not link and card.name == "a" and card.get("href"):
-                    link = card
-                if not link:
-                    continue
-                href = urljoin(base_url, link["href"])
-                if href in seen:
-                    continue
-                seen.add(href)
-                text = (
-                    link.get("data-productname", "")
-                    or link.get("title", "")
-                    or link.get("aria-label", "")
-                    or card.get_text(strip=True)[:120]
-                    or link.get_text(strip=True)[:120]
-                )
-                card_data: dict = {"href": href, "text": text}
-                # Extract data attributes
-                for attr in [
-                    "data-sku",
-                    "data-productid",
-                    "data-product-id",
-                    "data-brand",
-                    "data-price",
-                    "data-productname",
-                ]:
-                    val = link.get(attr) or (
-                        card.get(attr) if isinstance(card, Tag) else None
-                    )
-                    if val:
-                        card_data[attr.replace("data-", "").replace("-", "_")] = val
-                # Try wishlist button for SKU
-                sku_btn = (
-                    card.find(attrs={"data-sku": True})
-                    if isinstance(card, Tag)
-                    else None
-                )
-                if sku_btn and "sku" not in card_data:
-                    card_data["sku"] = sku_btn.get("data-sku", "")
-                product_links.append(card_data)
-            if len(product_links) >= 3:
-                break
-
-    # Strategy 2: URL pattern selectors
-    if len(product_links) < 3:
-        pattern_selectors = [
-            'a[href*="/p/"]',
-            'a[href*="/product/"]',
-            'a[href*="/item/"]',
-            'a[href*="/pd/"]',
-            'a[href*="/dp/"]',
-            'a[href*="/sp-"]',
-            'a[href*="-c.aspx"]',
-            'a[href*="-c.html"]',
-        ]
-        for sel in pattern_selectors:
-            for a in soup.select(sel):
-                href = urljoin(base_url, a.get("href", ""))
-                if href in seen or not _looks_like_product_url(href):
-                    continue
-                seen.add(href)
-                text = a.get_text(strip=True)[:100]
-                product_links.append({"href": href, "text": text})
-            if len(product_links) >= 30:
-                break
-
-    # Strategy 2b: Regex pattern matching for product URLs not caught by selectors
-    if len(product_links) < 3:
-        import re as _re
-        product_patterns = [
-            r'/[+-]p\w*\d{4,}',       # -pK001, /p/387018890001, -pK00...
-            r'/[+-]p\d{4,}',           # -p12345, /p/387018890001
-            r'/pid[-_]\d',             # /pid-12345
-            r'/sku[-_]\d',             # /sku-12345
-            r'/product[-_/]\w',       # /product/abc123
-        ]
-        for a_tag in soup.select("a[href]"):
-            href = a_tag.get("href", "")
-            if not href:
-                continue
-            full_href = urljoin(base_url, href)
-            if full_href in seen:
-                continue
-            for pat in product_patterns:
-                if _re.search(pat, href):
-                    seen.add(full_href)
-                    text = a_tag.get_text(strip=True)[:100]
-                    product_links.append({"href": full_href, "text": text})
-                    break
-            if len(product_links) >= 30:
-                break
-
-    # Strategy 3 was removed — returning garbage category links downstream
-    # is worse than returning empty. If card selectors and URL patterns both
-    # fail, the two-phase scraper discovers URLs at runtime.
-
-    return product_links[:200]
-
-
-def _extract_pagination_bs(soup, base_url: str, listing_page: dict) -> None:
-    """Extract pagination info from BeautifulSoup listing page."""
-    # Next button
-    next_link = soup.select_one(
-        'a[rel="next"], .pagination .next, .next-page, '
-        "#load-more-component, [id^='load-more'] a"
-    )
-    if next_link and next_link.get("href"):
-        # Check if load-more pattern
-        is_load_more = next_link.find_parent(
-            id=lambda x: x and "load-more" in str(x).lower()
-        )
-        if is_load_more:
-            listing_page["pagination"] = {
-                "type": "load_more",
-                "selector": "#load-more-component",
-                "next_href": urljoin(base_url, next_link["href"]),
-            }
-        else:
-            listing_page["pagination"] = {
-                "type": "next_button",
-                "next_href": urljoin(base_url, next_link["href"]),
-            }
-
-    # Page numbers
-    page_links = soup.select(".pagination a, .page-numbers a, .pager a")
-    if page_links and "pagination" not in listing_page:
-        listing_page["pagination"] = {
-            "type": "page_numbers",
-            "sample_hrefs": [
-                urljoin(base_url, a.get("href", "")) for a in page_links[:5]
-            ],
-        }
-
-    # Load more button
-    load_more = soup.select_one(
-        "button[class*='load-more' i], a[class*='load-more' i], "
-        ".show-more, .ae-plp__button a"
-    )
-    if load_more and "pagination" not in listing_page:
-        listing_page["pagination"] = {
-            "type": "load_more",
-            "next_href": urljoin(base_url, load_more.get("href", "")),
-        }
-
-
 def _fetch_via_probe_html(url: str) -> str:
     """Fetch page HTML via browser_service /render endpoint.
 
@@ -3321,386 +3428,6 @@ def _needs_uc_chrome(site_analysis: dict) -> bool:
     if connectivity.get("needs_akamai_bypass"):
         return True
     return False
-
-
-def _do_explore_via_http(
-    base_url: str,
-    search_criteria: str,
-    site_analysis: dict,
-    fetch_fn=None,
-) -> dict[str, Any]:
-    """Fallback: explore using web_fetch + BeautifulSoup (no JS rendering).
-
-    When ``fetch_fn`` is provided, it is used instead of ``web_fetch`` to
-    obtain page HTML.  This allows the same parsing logic to work with
-    ``probe_html`` (UC Chrome) for Akamai-protected sites.
-    """
-    findings: dict[str, Any] = {
-        "method": "http_requests",
-        "homepage_url": base_url,
-        "homepage_nav": {},
-        "listing_page": {},
-        "search_attempted": False,
-        "errors": [],
-    }
-
-    if fetch_fn is None:
-        from agents.tools.web_tools import get_web_tools
-
-        web_tools = get_web_tools()
-        web_fetch = _get_tool_by_name(web_tools, "web_fetch")
-        fetch_fn = lambda u: _invoke_tool(web_fetch, url=u, format="text")
-        findings["method"] = "http_requests"
-    else:
-        findings["method"] = "probe_html"
-
-    # STEP 1: Fetch homepage
-    logger.info("navigate_explore: STEP 1 (html) — fetching homepage %s", base_url)
-    homepage_html = fetch_fn(base_url)
-
-    if not homepage_html or homepage_html.startswith("RENDER FAILED"):
-        findings["errors"].append(
-            f"Homepage fetch failed: {homepage_html[:200] if homepage_html else 'empty response'}"
-        )
-        logger.error(
-            "navigate_explore: homepage fetch returned error: %s",
-            (homepage_html[:200] if homepage_html else "(empty)"),
-        )
-        return findings
-
-    logger.info(
-        "navigate_explore: homepage HTML len=%d, first 100 chars: %s",
-        len(homepage_html),
-        repr(homepage_html[:100]),
-    )
-
-    # Parse with BeautifulSoup
-    try:
-        from bs4 import BeautifulSoup
-
-        soup = BeautifulSoup(homepage_html[:500000], "html.parser")
-    except Exception as exc:
-        findings["errors"].append(f"Cannot parse homepage HTML: {exc}")
-        return findings
-
-    # Verify locale — check <html lang="..."> matches expected locale
-    html_tag = soup.find("html")
-    expected_locale = ""
-    html_locale = ""
-    if html_tag and html_tag.get("lang"):
-        html_locale = html_tag["lang"].lower()
-        parsed_base = urlparse(base_url)
-        base_path = parsed_base.path.strip("/")
-        if base_path and "-" in base_path:
-            expected_locale = base_path.split("/")[0]
-    if (
-        expected_locale
-        and html_locale
-        and html_locale != expected_locale
-        and not html_locale.startswith(expected_locale + "-")
-        and not html_locale == expected_locale.split("-")[0]
-    ):
-        logger.info(
-            "navigate_explore: LOCALE NOTE — expected '%s' but HTML is '%s'. "
-            "Accepting as compatible locale variant.",
-            expected_locale,
-            html_locale,
-        )
-        findings["errors"].append(
-            f"Locale variant: expected '{expected_locale}' but page is '{html_locale}' (compatible)"
-        )
-
-    # STEP 2: Extract navigation links (also look for hidden mega menu panels)
-    category_links: list[dict] = []
-    nav_containers = soup.select(
-        "nav, [role=navigation], .menu, .navbar, .header-nav, "
-        ".main-nav, .category-nav, .categories, header ul, "
-        ".mega-menu, .dropdown-menu, .mega-nav, .utility-bar"
-    )
-    for container in nav_containers:
-        for a in container.find_all("a", href=True):
-            href = urljoin(base_url, a["href"])
-            text = a.get_text(strip=True)
-            if (
-                href
-                and text
-                and 1 < len(text) < 80
-                and not href.startswith(("#", "javascript:", "mailto:", "tel:"))
-            ):
-                category_links.append({"href": href, "text": text})
-
-    # Deduplicate
-    seen: set[str] = set()
-    category_links = [
-        link
-        for link in category_links
-        if link["href"] not in seen and not seen.add(link["href"])
-    ][:50]
-
-    # Fallback: if no nav containers matched (React/SPA with hashed classes),
-    # scan ALL links and filter to internal category-like URLs.
-    if not category_links:
-        logger.info(
-            "navigate_explore: no nav containers found, trying all-<a> fallback"
-        )
-        parsed_base = urlparse(base_url)
-        for a in soup.find_all("a", href=True)[:300]:
-            href = a["href"]
-            full_href = urljoin(base_url, href)
-            text = a.get_text(strip=True)
-            if not text or len(text) < 2 or len(text) > 60:
-                continue
-            if href.startswith(("#", "javascript:", "mailto:", "tel:")):
-                continue
-            parsed = urlparse(full_href)
-            if parsed.hostname != parsed_base.hostname:
-                continue
-            if _is_non_category_link(full_href, text):
-                continue
-            category_links.append({"href": full_href, "text": text})
-        seen2: set[str] = set()
-        category_links = [
-            link
-            for link in category_links
-            if link["href"] not in seen2 and not seen2.add(link["href"])
-        ][:50]
-        logger.info(
-            "navigate_explore: all-<a> fallback found %d category links",
-            len(category_links),
-        )
-
-    findings["homepage_nav"]["category_links"] = category_links
-
-    # Find search form
-    search_input = soup.select_one(
-        "input[type=search], input[name*=search i], input[name*=q i], "
-        "input[placeholder*=search i], .ae-searchbar__input, .site-search-text"
-    )
-    search_form_tag = None
-    if search_input:
-        search_form_tag = search_input.find_parent("form")
-    else:
-        search_form_tag = soup.select_one("form[action*=search i]")
-
-    search_form_info = None
-    if search_form_tag:
-        search_form_info = {
-            "action": search_form_tag.get("action", ""),
-            "method": (search_form_tag.get("method") or "get").lower(),
-            "search_input_name": (search_input.get("name") if search_input else "q"),
-            "search_input_selector": None,
-        }
-        if search_input:
-            if search_input.get("id"):
-                search_form_info["search_input_selector"] = f"#{search_input['id']}"
-            elif search_input.get("name"):
-                search_form_info["search_input_selector"] = (
-                    f"input[name='{search_input['name']}']"
-                )
-        findings["homepage_nav"]["search_form"] = search_form_info
-
-    # STEP 3: Try search URLs first if criteria provided, then category pages
-    visited = False
-    search_urls = _build_search_urls(
-        search_form_info, search_criteria, base_url, findings["homepage_nav"]
-    )
-
-    if search_criteria and search_urls:
-        findings["search_attempted"] = True
-        for search_url in search_urls[:10]:
-            logger.info(
-                "navigate_explore: STEP 3 (html) — trying search %s",
-                search_url[:120],
-            )
-            search_html = fetch_fn(search_url)
-
-            if not search_html or search_html.startswith("RENDER FAILED"):
-                logger.warning(
-                    "navigate_explore: search fetch failed for %s: %s",
-                    search_url[:100],
-                    (search_html[:100] if search_html else "(empty)"),
-                )
-                continue
-            if "oops!" in search_html[:5000].lower():
-                logger.info("navigate_explore: search %s returned 'oops!' page", search_url[:100])
-                findings.setdefault("errors", []).append(
-                    f"Search {search_url} returned 'oops!' page — session gating likely"
-                )
-                continue
-
-            logger.info(
-                "navigate_explore: search HTML len=%d for %s",
-                len(search_html),
-                search_url[:100],
-            )
-
-            try:
-                search_soup = BeautifulSoup(search_html[:500000], "html.parser")
-                product_links = _extract_product_links_bs(search_soup, base_url)
-                findings["listing_page"]["product_links"] = product_links
-
-                json_ld = _extract_json_ld(search_soup, base_url)
-                if json_ld.get("products"):
-                    findings["listing_page"]["json_ld"] = json_ld
-                    existing = set(p.get("href", "") for p in product_links)
-                    for p in json_ld["products"]:
-                        if p.get("href") and p["href"] not in existing:
-                            product_links.append(p)
-                            existing.add(p["href"])
-                    findings["listing_page"]["product_links"] = product_links
-                    logger.info(
-                        "navigate_explore: JSON-LD added %d product links from search",
-                        len(json_ld["products"]),
-                    )
-
-                if _has_real_product_links(findings):
-                    findings["listing_page"]["url"] = search_url
-                    visited = True
-                    break
-            except Exception:
-                pass
-
-    # STEP 3b: If search failed, try categories matching search_criteria
-    if not visited:
-        best_cat = _pick_category_to_visit(category_links, search_criteria, base_url)
-        if best_cat:
-            candidate_urls = [best_cat]
-        else:
-            candidate_urls = [link["href"] for link in category_links[:5]]
-
-        seen_cat_urls: set[str] = set()
-        for cat_url in candidate_urls:
-            if cat_url in seen_cat_urls:
-                continue
-            seen_cat_urls.add(cat_url)
-            logger.info(
-                "navigate_explore: STEP 3b — trying criteria-matched category %s",
-                cat_url,
-            )
-            cat_html = fetch_fn(cat_url)
-            if not cat_html or cat_html.startswith("RENDER FAILED"):
-                logger.warning(
-                    "navigate_explore: category fetch failed for %s",
-                    cat_url,
-                )
-                continue
-            if "oops!" in cat_html[:5000].lower():
-                logger.info(
-                    "navigate_explore: category %s returned 'oops!' page, skipping",
-                    cat_url,
-                )
-                findings.setdefault("errors", []).append(
-                    f"Category {cat_url} returned 'oops!' page — session gating likely"
-                )
-                continue
-            logger.info(
-                "navigate_explore: category HTML len=%d for %s",
-                len(cat_html),
-                cat_url,
-            )
-            try:
-                cat_soup = BeautifulSoup(cat_html[:500000], "html.parser")
-                cat_links = _extract_product_links_bs(cat_soup, base_url)
-                cat_json_ld = _extract_json_ld(cat_soup, base_url)
-                if cat_links or (cat_json_ld and cat_json_ld.get("products")):
-                    findings["listing_page"]["url"] = cat_url
-                    findings["listing_page"]["product_links"] = cat_links
-                    if cat_json_ld.get("products"):
-                        findings["listing_page"]["json_ld"] = cat_json_ld
-                        existing = set(p.get("href", "") for p in cat_links)
-                        for p in cat_json_ld["products"]:
-                            if p.get("href") and p["href"] not in existing:
-                                cat_links.append(p)
-                                existing.add(p["href"])
-                        findings["listing_page"]["product_links"] = cat_links
-                        logger.info(
-                            "navigate_explore: JSON-LD from category %s: %d products",
-                            cat_url,
-                            len(cat_json_ld["products"]),
-                        )
-                    if cat_json_ld.get("breadcrumbs"):
-                        findings["homepage_nav"]["breadcrumbs"] = cat_json_ld[
-                            "breadcrumbs"
-                        ]
-                    visited = True
-                    break
-            except Exception:
-                pass
-
-    if not visited:
-        category_to_visit = _pick_category_to_visit(
-            category_links, search_criteria, base_url
-        )
-        if category_to_visit:
-            logger.info(
-                "navigate_explore: STEP 3 (html) — visiting category %s",
-                category_to_visit,
-            )
-            listing_html = fetch_fn(category_to_visit)
-            findings["listing_page"]["url"] = category_to_visit
-
-            try:
-                listing_soup = BeautifulSoup(listing_html[:500000], "html.parser")
-            except Exception:
-                listing_soup = None
-
-            if listing_soup:
-                product_links = _extract_product_links_bs(listing_soup, base_url)
-                findings["listing_page"]["product_links"] = product_links
-
-                json_ld = _extract_json_ld(listing_soup, base_url)
-                if json_ld.get("products"):
-                    findings["listing_page"]["json_ld"] = json_ld
-                    existing = set(p.get("href", "") for p in product_links)
-                    for p in json_ld["products"]:
-                        if p.get("href") and p["href"] not in existing:
-                            product_links.append(p)
-                            existing.add(p["href"])
-                    findings["listing_page"]["product_links"] = product_links
-                    logger.info(
-                        "navigate_explore: JSON-LD added %d product links from category",
-                        len(json_ld["products"]),
-                    )
-
-                if json_ld.get("breadcrumbs"):
-                    findings["homepage_nav"]["breadcrumbs"] = json_ld["breadcrumbs"]
-
-                # Pagination
-                _extract_pagination_bs(listing_soup, base_url, findings["listing_page"])
-
-                # Page count and total products
-                page_count_input = listing_soup.select_one(
-                    'input[name="page-count"], input[name="pageCount"]'
-                )
-                if page_count_input and page_count_input.get("value", "").isdigit():
-                    findings["listing_page"]["page_count"] = int(
-                        page_count_input["value"]
-                    )
-
-                total_el = listing_soup.select_one(
-                    "#products_total, [id*='product-count'], .total-products"
-                )
-                if total_el:
-                    match = re.search(r"\d+", total_el.get_text())
-                    if match:
-                        findings["listing_page"]["total_products"] = int(match.group())
-
-                visited = True
-
-    if not visited and not category_links and not search_form_info:
-        findings["errors"].append(
-            "No categories or search available for HTTP exploration"
-        )
-
-    # URL pattern detection
-    all_links = category_links + findings.get("listing_page", {}).get(
-        "product_links", []
-    )
-    url_patterns = _detect_url_patterns(all_links, base_url)
-    if url_patterns:
-        findings["url_patterns"] = url_patterns
-
-    return findings
 
 
 # ── Graph node entry point ─────────────────────────────────────────────────
@@ -3802,6 +3529,7 @@ def navigate_explore(state: dict, config=None) -> dict[str, Any]:
                     site_analysis,
                     search_url=search_url,
                     is_job_site=is_job_site,
+                    content_type=ct_type,
                 )
             finally:
                 from agents.tools.context import clear_tool_context
@@ -3837,6 +3565,7 @@ def navigate_explore(state: dict, config=None) -> dict[str, Any]:
                             site_analysis,
                             search_url=search_url,
                             is_job_site=is_job_site,
+                            content_type=ct_type,
                         )
                     finally:
                         from agents.tools.context import clear_tool_context
@@ -3844,120 +3573,6 @@ def navigate_explore(state: dict, config=None) -> dict[str, Any]:
                         clear_tool_context()
             except Exception as exc:
                 logger.warning("navigate_explore: browser retry failed: %s", exc)
-
-    # ── PHASE 2: probe_html fallback for search page when Playwright finds
-    #    categories but 0 real products (Cloudflare/Akamai blocks JS rendering).
-    #    We keep the browser homepage_nav but replace listing_page with UC Chrome data.
-    browser_cats = len(findings.get("homepage_nav", {}).get("category_links", []))
-    browser_prods = len(findings.get("listing_page", {}).get("product_links", []))
-    has_real_prods = _has_real_product_links(findings)
-    if search_criteria and browser_cats > 0 and not has_real_prods:
-        if _needs_uc_chrome(site_analysis):
-            logger.info(
-                "navigate_explore: Playwright found %d categories but %d real products "
-                "on UC Chrome site — fetching search page via probe_html",
-                browser_cats,
-                len([p for p in findings.get("listing_page", {}).get("product_links", [])
-                     if not any(kw in (p.get("href", "") or "").lower()
-                                for kw in _PROMO_URL_KEYWORDS)]),
-            )
-            search_urls = _build_search_urls(
-                findings.get("homepage_nav", {}).get("search_form"),
-                search_criteria,
-                effective_url,
-                findings.get("homepage_nav", {}),
-            )
-            for surl in search_urls[:10]:
-                html = _fetch_via_probe_html(surl)
-                if not html or "RENDER FAILED" in html:
-                    continue
-                if "oops!" in html[:5000].lower():
-                    continue
-                try:
-                    from bs4 import BeautifulSoup
-
-                    search_soup = BeautifulSoup(html[:500000], "html.parser")
-                    product_links = _extract_product_links_bs(
-                        search_soup, effective_url
-                    )
-                    json_ld = _extract_json_ld(search_soup, effective_url)
-                    existing = set(p.get("href", "") for p in product_links)
-                    if json_ld.get("products"):
-                        for p in json_ld["products"]:
-                            if p.get("href") and p["href"] not in existing:
-                                product_links.append(p)
-                                existing.add(p["href"])
-                    real_prods = [p for p in product_links
-                                  if not any(kw in (p.get("href", "") or "").lower()
-                                                     for kw in _PROMO_URL_KEYWORDS)]
-                    if real_prods:
-                        listing = findings.setdefault("listing_page", {})
-                        listing["product_links"] = product_links
-                        listing["url"] = surl
-                        listing["json_ld"] = json_ld
-                        browser_prods = len(real_prods)
-                        logger.info(
-                            "navigate_explore: probe_html found %d real product links "
-                            "at %s, merged into browser findings",
-                            browser_prods,
-                            surl[:100],
-                        )
-                        break
-                except Exception as exc:
-                    logger.warning(
-                        "navigate_explore: probe_html search parse failed for %s: %s",
-                        surl[:100], exc
-                    )
-
-    # ── PHASE 3: Fall back to probe_html or HTTP if entirely empty ───
-    if not findings or not findings.get("homepage_nav", {}).get("category_links"):
-        if _needs_uc_chrome(site_analysis):
-            logger.info(
-                "navigate_explore: Playwright failed for UC Chrome site, trying probe_html"
-            )
-            http_findings = _do_explore_via_http(
-                effective_url,
-                search_criteria,
-                site_analysis,
-                fetch_fn=_fetch_via_probe_html,
-            )
-        else:
-            http_findings = _do_explore_via_http(url, search_criteria, site_analysis)
-
-        http_cats = len(
-            http_findings.get("homepage_nav", {}).get("category_links", [])
-        )
-        http_prods = len(
-            http_findings.get("listing_page", {}).get("product_links", [])
-        )
-        browser_cats = len(
-            findings.get("homepage_nav", {}).get("category_links", [])
-        )
-        browser_prods = len(
-            findings.get("listing_page", {}).get("product_links", [])
-        )
-        http_is_better = (
-            (http_cats > browser_cats and http_cats > 0)
-            or (http_prods > browser_prods and http_prods > 0)
-        )
-        if http_is_better:
-            logger.info(
-                "navigate_explore: HTTP found %d cats/%d prods vs browser %d cats/%d prods — using HTTP",
-                http_cats, http_prods, browser_cats, browser_prods,
-            )
-            findings = http_findings
-        else:
-            http_cat_links = http_findings.get("homepage_nav", {}).get(
-                "category_links", []
-            )
-            if http_cat_links:
-                findings.setdefault("homepage_nav", {}).setdefault(
-                    "category_links", []
-                ).extend(http_cat_links)
-                logger.info(
-                    "navigate_explore: merged %d HTTP categories into browser findings",
-                    len(http_cat_links),
-                )
 
     # Write findings to workspace
     findings_path = os.path.join(root, "workspace", slug, "navigation_findings.json")
@@ -3976,6 +3591,17 @@ def navigate_explore(state: dict, config=None) -> dict[str, Any]:
             "method_that_worked", "unknown"
         ),
     }
+
+    # Promote the data-richest visited listing into listing_page BEFORE the
+    # rendering check (so _verify_rendering evaluates the real listing), and drop
+    # the transient snapshot cache from the persisted findings.
+    _promote_data_richest_listing(findings)
+    findings.pop("_listing_snapshots", None)
+
+    # Determine whether the listing page needs JS rendering (raw-HTTP vs rendered
+    # item-link count). Drives _derive_strategy to pick a browser strategy upfront
+    # for CSR sites instead of http_requests. [plan: smarter deterministic picker]
+    _verify_rendering(findings)
 
     with open(findings_path, "w", encoding="utf-8") as f:
         json.dump(findings, f, indent=2, ensure_ascii=False)

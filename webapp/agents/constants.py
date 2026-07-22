@@ -8,15 +8,13 @@ to avoid circular import risks.
 # plus in-strategy fixes/re-maps. Bounded by the strategy space (≤4 strategies) +
 # MAX_REMAPS, so it can't loop forever. Each strategy switch records into
 # state.strategies_tried so a failed strategy is never re-picked.
-MAX_TEST_RETRIES: int = 6
-
-# Severity-aware caps for the code_reviewer feedback loop:
-# - critical issues (tester-invisible) get up to 3 fix attempts
-# - medium issues (tester-visible, code_tester will catch) get 1 attempt
-MAX_CRITICAL_REVIEW_RETRIES: int = 3
-MAX_MEDIUM_REVIEW_RETRIES: int = 1
+MAX_TEST_RETRIES: int = 2  # was 6 — cap the codegen loop so hard sites give up fast
 
 MAX_VALIDATE_RETRIES: int = 2
+# Cap on low-coverage (analysis exists but < MIN_COVERAGE) retry cycles through
+# product_analyzer. The low-coverage interrupt path previously had NO cap
+# (infinite loop risk). Mirrors MAX_VALIDATE_RETRIES / MAX_REANALYZE_CYCLES.
+MAX_COVERAGE_RETRIES: int = 2
 
 # How many times a failed field mapping can be re-done by product_analyzer
 # before giving up (a mapping failure routes back to product_analyzer instead

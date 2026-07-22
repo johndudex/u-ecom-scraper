@@ -104,4 +104,7 @@ urlpatterns = [
     path("health/", views.health_dashboard, name="health"),
     path("api/health/", views.health_api, name="health_api"),
     path("jobs-dashboard/", views.jobs_dashboard, name="jobs_dashboard"),
+    path("intake/", views.intake, name="intake"),
+    path("intake/check-site/", views.intake_check_site, name="intake_check_site"),
+    path("intake/create-job/", views.intake_create_job, name="intake_create_job"),
 ]

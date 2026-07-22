@@ -243,6 +243,12 @@ class BrowserPool:
             errors.append(f"MCP Chrome failed: {e}")
 
     def _start_scraper_chrome(self, errors: list):
+        # DEPRECATED: this Scraper Chrome instance (port 9223) exists only to
+        # serve the /scrape subprocess execution path for legacy Playwright
+        # scrapers. It is STAGED for removal alongside /scrape + scraper_runner
+        # once callers migrate to /navigate (which launches its own ephemeral
+        # browsers and does not need this persistent Chrome). Leave running for
+        # now. See docs/browser-service-rework-plan.md.
         if not self._xvfb_proc:
             errors.append("Skipping Scraper Chrome — Xvfb not running")
             return

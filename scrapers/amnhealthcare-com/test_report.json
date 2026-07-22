@@ -1,0 +1,261 @@
+{
+  "site_slug": "amnhealthcare-com",
+  "test_timestamp": "2026-07-16T07:20:00Z",
+  "scraper_file": "scraper_draft.py",
+  "sample_size": 5,
+  "phases_tested": {
+    "phase1_discovery": true,
+    "phase1_notes": "Discovery used internal API (api.amnhealthcare.io/ONEAmnJobSearch/v1/JobSearch). Successfully paginated 65+ pages collecting 6495+ Nursing jobs. Discovery works but did NOT apply Alabama state filter — returned jobs nationwide.",
+    "phase2_extraction": true,
+    "phase2_notes": "Extraction was done via API response parsing (not Playwright/JSON-LD). Limited field set compared to full page extraction — many expected fields are missing because the API response doesn't include them."
+  },
+  "results": {
+    "successful_extractions": 5,
+    "failed_extractions": 0,
+    "skipped_dead_urls": 0,
+    "field_coverage": {
+      "url": {
+        "count": 5,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent"
+      },
+      "src_url": {
+        "count": 5,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "good",
+        "notes": "Points to API endpoint rather than job page, but acceptable as discovery source."
+      },
+      "status_code": {
+        "count": 5,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent"
+      },
+      "scraped_at": {
+        "count": 5,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent"
+      },
+      "title": {
+        "count": 5,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent"
+      },
+      "job_id": {
+        "count": 0,
+        "coverage": "0%",
+        "status": "MISSING",
+        "quality": "none",
+        "notes": "Required field. Output has sequential 'id' (1,2,3...) but not actual job ID (e.g., 3504006). Job ID is parseable from the URL path."
+      },
+      "location_city": {
+        "count": 0,
+        "coverage": "0%",
+        "status": "MISSING",
+        "quality": "none",
+        "notes": "Required field. Combined 'location' field exists (e.g., 'Atlanta, GA') but city/state not split into separate fields."
+      },
+      "location_state": {
+        "count": 0,
+        "coverage": "0%",
+        "status": "MISSING",
+        "quality": "none",
+        "notes": "Required field. State is available in the combined 'location' field but not extracted separately."
+      },
+      "location": {
+        "count": 5,
+        "coverage": "100%",
+        "status": "WRONG_VALUE",
+        "quality": "poor",
+        "notes": "Filter violation: ALL 5 sample jobs are outside Alabama (GA, HI, KY, PA, SC). The scraper did not apply the required Alabama location filter to the API query."
+      },
+      "description": {
+        "count": 5,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "good"
+      },
+      "posted_date": {
+        "count": 5,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "excellent",
+        "notes": "All posted dates are within last 7 days (2026-07-09 to 2026-07-10). Date filter appears satisfied."
+      },
+      "salary_min": {
+        "count": 0,
+        "coverage": "0%",
+        "status": "MISSING",
+        "quality": "none",
+        "notes": "Optional field. Salary exists as combined string (e.g., '$1,981 - $2,082') but not parsed into min/max numbers."
+      },
+      "salary_max": {
+        "count": 0,
+        "coverage": "0%",
+        "status": "MISSING",
+        "quality": "none",
+        "notes": "Optional field. Same as salary_min — combined string not split."
+      },
+      "employment_type": {
+        "count": 0,
+        "coverage": "0%",
+        "status": "MISSING",
+        "quality": "none",
+        "notes": "Optional field. API response has 'job_type' (Travel) which differs from JSON-LD employmentType (TEMPORARY)."
+      },
+      "apply_url": {
+        "count": 0,
+        "coverage": "0%",
+        "status": "MISSING",
+        "quality": "none",
+        "notes": "Optional field. Empty string for all items. Constructible from job_id: /apply/?jobIds={id}"
+      },
+      "specialty": {
+        "count": 0,
+        "coverage": "0%",
+        "status": "MISSING",
+        "quality": "none",
+        "notes": "Optional field. Not available from API response."
+      },
+      "company": {
+        "count": 5,
+        "coverage": "100%",
+        "status": "CORRECT",
+        "quality": "good",
+        "notes": "Field name differs from expected 'hiring_organization' but value is present."
+      }
+    }
+  },
+  "issues": [
+    {
+      "severity": "high",
+      "field": "location",
+      "status": "WRONG_VALUE",
+      "problem": "Location filter not applied — all 5 sample jobs are outside Alabama (GA, HI, KY, PA, SC)",
+      "details": "Got: Atlanta, GA / Wailuku, HI / Lexington, KY / Erie, PA / Mount Pleasant, SC. Expected: All locations must be in Alabama per job filter requirements.",
+      "affected_samples": [0, 1, 2, 3, 4],
+      "suggested_fix": "Add a location filter to the API query, e.g., Filters=Communities:Nursing AND States:AL or filter results in Python after collection."
+    },
+    {
+      "severity": "high",
+      "field": "job_id",
+      "status": "MISSING",
+      "problem": "Required field job_id is missing — output uses sequential 'id' (1,2,3...) instead of actual job ID",
+      "details": "Got: sequential id values 1-5. Expected: actual job IDs like '3504006', '3537334', etc. Job ID is parseable from URL path /job-details/{id}/.",
+      "affected_samples": [0, 1, 2, 3, 4],
+      "suggested_fix": "Extract job_id from the URL field using regex: url_path.match(/job-details/(\\d+)/) or use the API response's job ID field if available."
+    },
+    {
+      "severity": "high",
+      "field": "location_city",
+      "status": "MISSING",
+      "problem": "Required field location_city not extracted — only combined location string available",
+      "details": "Got: empty/missing. Expected: city name like 'Atlanta'. The combined 'location' field has 'Atlanta, GA' from which city can be parsed.",
+      "affected_samples": [0, 1, 2, 3, 4],
+      "suggested_fix": "Parse the combined location field: city, state = location.split(', ') to populate location_city and location_state."
+    },
+    {
+      "severity": "high",
+      "field": "location_state",
+      "status": "MISSING",
+      "problem": "Required field location_state not extracted — only combined location string available",
+      "details": "Got: empty/missing. Expected: state code like 'GA'. Parseable from the combined 'location' field.",
+      "affected_samples": [0, 1, 2, 3, 4],
+      "suggested_fix": "Parse the combined location field: city, state = location.split(', ') to populate location_city and location_state."
+    },
+    {
+      "severity": "medium",
+      "field": "salary_min",
+      "status": "MISSING",
+      "problem": "Optional field salary_min not extracted — salary only available as combined string",
+      "details": "Got: empty. Expected: numeric value like 1981. The 'salary' field has '$1,981 - $2,082' which can be parsed.",
+      "affected_samples": [0, 1, 2, 3, 4],
+      "suggested_fix": "Parse salary string with regex: r'\\$(\\d[\\d,]+)' to extract min and max values as numbers."
+    },
+    {
+      "severity": "medium",
+      "field": "salary_max",
+      "status": "MISSING",
+      "problem": "Optional field salary_max not extracted — salary only available as combined string",
+      "details": "Got: empty. Expected: numeric value like 2082. Same parsing fix as salary_min.",
+      "affected_samples": [0, 1, 2, 3, 4],
+      "suggested_fix": "Parse salary string with regex to extract second dollar amount as max value."
+    },
+    {
+      "severity": "low",
+      "field": "apply_url",
+      "status": "MISSING",
+      "problem": "Optional field apply_url is empty for all items",
+      "details": "Got: empty string. Expected: URL like 'https://www.amnhealthcare.com/apply/?jobIds=3504006'. Can be constructed from job_id.",
+      "affected_samples": [0, 1, 2, 3, 4],
+      "suggested_fix": "Construct apply_url from job_id: f'https://www.amnhealthcare.com/apply/?jobIds={job_id}'"
+    },
+    {
+      "severity": "low",
+      "field": "employment_type",
+      "status": "MISSING",
+      "problem": "Optional field employment_type not populated — API provides job_type which is different",
+      "details": "Got: empty. Expected: 'TEMPORARY' or similar. API has 'job_type': 'Travel' which is not the same as JSON-LD employmentType.",
+      "affected_samples": [0, 1, 2, 3, 4],
+      "suggested_fix": "Either map 'Travel' job_type to employment_type, or add Phase 2 Playwright extraction to get the full JSON-LD employmentType field."
+    }
+  ],
+  "script_checks": {
+    "ran_successfully": true,
+    "output_valid_json": true,
+    "error_message": null,
+    "execution_notes": "Scraper ran successfully using internal API (not Playwright as product_analysis recommended). Discovery phase paginated 65+ pages collecting 6495+ jobs. Output limited to 5 samples via --sample flag. No crashes or errors."
+  },
+  "overall_assessment": "FAIL",
+  "confidence_score": 0.88,
+  "ready_for_execution": false,
+  "remediation": {
+    "target": "scraper",
+    "fields": ["job_id", "location_city", "location_state"],
+    "reason": "The scraper uses an internal API for discovery which works well, but it fails to: (1) apply the Alabama state filter to API queries, (2) extract job_id from URLs, (3) split the combined location field into city/state components, (4) parse salary string into numeric min/max. All mappings in product_analysis.json are tested:true with correct selectors — the issue is the scraper uses API extraction instead of page-level extraction and doesn't post-process the API data to populate required fields."
+  },
+  "feedback_for_writer": {
+    "summary": "Discovery works well via the internal API — 6495+ jobs found across 65+ pages. However, 3 required fields are completely missing (job_id, location_city, location_state), and the Alabama location filter is not applied to any API queries. The salary data exists as a combined string but is not parsed into separate min/max numeric fields.",
+    "field_fixes": {
+      "job_id": {
+        "issue": "Sequential 'id' (1,2,3) instead of actual job ID from URL",
+        "fix": "Parse job_id from the URL field: job_id = re.search(r'/job-details/(\\d+)/', url).group(1) or use the API response's job identifier field",
+        "priority": "high"
+      },
+      "location_city": {
+        "issue": "Required field not extracted — only combined location available",
+        "fix": "Parse from combined location: parts = location.split(', '); location_city = parts[0].strip(); location_state = parts[1].strip() if len(parts) > 1 else ''",
+        "priority": "high"
+      },
+      "location_state": {
+        "issue": "Required field not extracted — only combined location available",
+        "fix": "Same as location_city — parse from combined location string",
+        "priority": "high"
+      },
+      "location_filter": {
+        "issue": "Alabama state filter not applied — all sample jobs are from other states (GA, HI, KY, PA, SC)",
+        "fix": "Add state filter to API query. Try adding 'States:AL' to the Filters parameter, e.g., Filters=Communities:Nursing,States:AL. If the API doesn't support state filtering, filter results in Python after collection: keep only where location_state == 'AL'.",
+        "priority": "high"
+      },
+      "salary_min": {
+        "issue": "Not parsed from combined salary string",
+        "fix": "Parse salary string: amounts = re.findall(r'\\$([\\d,]+)', salary); salary_min = int(amounts[0].replace(',', '')) if amounts else None",
+        "priority": "medium"
+      },
+      "salary_max": {
+        "issue": "Not parsed from combined salary string",
+        "fix": "Parse salary string: amounts = re.findall(r'\\$([\\d,]+)', salary); salary_max = int(amounts[1].replace(',', '')) if len(amounts) > 1 else None",
+        "priority": "medium"
+      },
+      "apply_url": {
+        "issue": "Empty for all items — not constructed from job_id",
+        "fix": "After extracting job_id, construct: apply_url = f'https://www.amnhealthcare.com/apply/?jobIds={job_id}'",
+        "priority": "low"
+      }
+    }
+  }
+}

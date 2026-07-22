@@ -94,6 +94,10 @@ CELERY_BEAT_SCHEDULE = {
         "task": "scraper.tasks.schedule_next_site",
         "schedule": 300.0,
     },
+    "stuck-approved-watchdog": {
+        "task": "scraper.tasks.redispatch_stuck_approved_interrupts",
+        "schedule": 300.0,
+    },
 }
 
 ZAI_API_KEY = config("ZAI_API_KEY", default="")
@@ -106,12 +110,31 @@ ZAI_SMALL_MODEL = config("ZAI_SMALL_MODEL", default="glm-5-turbo")
 # of reading the full analysis JSONs. Set CODE_WRITER_MODEL=glm-4.7-flash to
 # A/B test the faster flash model on codegen.
 CODE_WRITER_MODEL = config("CODE_WRITER_MODEL", default="glm-5-turbo")
-# Stream code_writer's LLM output token-by-token (sync agent.stream). Gives
-# real-time visibility (no "looks idle"), a healthier streaming connection
-# (fewer mid-codegen drops), and an idle-timeout (no-token-for-N-sec) hang
-# signal. Set USE_STREAMING_CODEWRITER=False to revert to blocking invoke().
-USE_STREAMING_CODEWRITER = config("USE_STREAMING_CODEWRITER", default=True, cast=bool)
+# Per-call HTTP timeout for every LLM call (llm.py ChatOpenAI). The PRIMARY hang
+# guard — a stuck request dies here at 600s rather than hanging indefinitely.
+# Explicitly defined (previously only referenced in comments; llm.py fell back to
+# its getattr default, masking the intent). Override via env if needed.
+LLM_REQUEST_TIMEOUT = config("LLM_REQUEST_TIMEOUT", default=300, cast=int)
 PLAYWRIGHT_MCP_URL = config("PLAYWRIGHT_MCP_URL", default="http://browser_service:8111/sse")
+# Scraper execution routing (browser_service-rework Step 3). Controls how
+# run_execution + the run_scraper tool dispatch a generated scraper:
+#   "auto" (default) — _needs_browser decides per-scraper (sniff imports).
+#   "force_scrape"   — always route via browser_service POST /scrape (rollback
+#                      lane to the subprocess model; rework plan §4).
+#   "force_http"     — always run in-process via _run_in_process (forces the new
+#                      HTTP navigation model even for legacy Playwright scrapers,
+#                      post-migration Phase C).
+SCRAPER_EXECUTION_MODE = config("SCRAPER_EXECUTION_MODE", default="auto")
+# Execution fail-fast bounds (apply to ALL scrapers — template AND custom
+# code_writer code). The template DISCOVERY_DEADLINE_SECONDS only governs
+# template-based scrapers; custom scrapers had no bound and could hang for the
+# full (multi-hour) subprocess timeout on a JS-blocked/rate-limited site.
+#   EXECUTION_STALL_TIMEOUT — kill the scraper if it emits NO stderr output for
+#       this many seconds (productive scrapers log page/item progress; a hang
+#       stops). Default 300s (legit scrapes log every few seconds).
+#   EXECUTION_TIMEOUT — hard wall-clock backstop. Default 3600s (1h).
+EXECUTION_STALL_TIMEOUT = config("EXECUTION_STALL_TIMEOUT", default=300, cast=int)
+EXECUTION_TIMEOUT = config("EXECUTION_TIMEOUT", default=3600, cast=int)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 SCRAPERS_DIR = PROJECT_ROOT / "scrapers"

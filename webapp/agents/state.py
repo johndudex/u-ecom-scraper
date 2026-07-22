@@ -44,26 +44,15 @@ class ScrapeState(TypedDict, total=False):
 
     # ── Resume / skip flags (for resuming an in-progress job) ───────────
     skip_site_analysis: bool
-    skip_content_analysis: bool
     skip_product_analysis: bool
     skip_code_generation: bool
-
-    # ── Phase bookkeeping ───────────────────────────────────────────────
-    current_phase: Annotated[str, _last_write_wins]
-    phases_completed: list[str]
 
     # ── Retry counters ─────────────────────────────────────────────────
     site_analysis_retries: int
     content_analysis_retries: int
     product_analysis_retries: int
+    coverage_retry_count: int
     test_retry_count: int
-    # code_reviewer feedback loop: issues handed back to code_writer to fix.
-    # Severity-aware caps: critical issues (tester-invisible) get more attempts
-    # than medium (tester-visible). review_feedback carries the issues text.
-    review_feedback: Annotated[str, _last_write_wins]
-    critical_retries: int
-    medium_retries: int
-    code_review_verdict: str
     reanalyze_count: int
     # How many times product_analyzer has re-mapped failed fields in this run
     # (capped by MAX_REMAPS). Set when route_after_testing sends a mapping
@@ -75,8 +64,18 @@ class ScrapeState(TypedDict, total=False):
     # appends on an access/strategy-class failure; scraper_analyzer reads it to
     # pick the next strategy.
     strategies_tried: Annotated[list, operator.add]
+    # Per-phase budget-retry counters (a single shared budget_retry_count
+    # cross-contaminated phases: a site_analyzer exhaustion silently gave
+    # product_analyzer the extended budget + skipped its escalation interrupt).
+    # Kept (legacy alias) for back-compat; new code reads the per-phase fields.
     budget_retry_count: int
     budget_retry_summary: str
+    site_budget_retries: int
+    site_budget_retry_summary: str
+    product_budget_retries: int
+    product_budget_retry_summary: str
+    nav_budget_retries: int
+    nav_budget_retry_summary: str
 
     # ── Phase artifacts (JSON / code produced by each phase) ────────────
     site_analysis: Annotated[dict[str, Any], _last_write_wins]
@@ -100,6 +99,10 @@ class ScrapeState(TypedDict, total=False):
     output_file: Annotated[str, _last_write_wins]
     item_count: int
     product_count: int
+    # discovery_coverage block read from the scraper output metadata during
+    # execution (docs/discovery-coverage-gate-contract.md §1). Absent/None for
+    # url_list scrapers with no discovery phase. Read by the coverage gate.
+    discovery_coverage: dict[str, Any]
     scraping_method: Annotated[str, _last_write_wins]
     platform: Annotated[str, _last_write_wins]
     fields_extracted: Annotated[list[str], _last_write_wins]
@@ -127,7 +130,9 @@ class ScrapeState(TypedDict, total=False):
     # set when navigate_explore hands off to the LLM navigation_agent (form-driven
     # site the deterministic explorer couldn't drive); read by navigation_synthesize
     # to skip re-synthesizing the agent's already-written navigation_analysis.json.
-    handoff_reason: Annotated[str, _last_write_wins]
+    # Commented out: navigation_explore/agent/synthesize phases replaced by the
+    # single browser_traverse phase (other agents handle graph.py / subagents.py).
+    # handoff_reason: Annotated[str, _last_write_wins]
 
     # ── Error ───────────────────────────────────────────────────────────
     error_message: Annotated[str, _last_write_wins]

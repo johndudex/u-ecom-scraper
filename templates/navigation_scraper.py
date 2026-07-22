@@ -29,6 +29,8 @@ from playwright.sync_api import sync_playwright
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from src.proxy import build_proxy_url
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION - Update these values based on navigation_analysis.json
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -48,8 +50,15 @@ CATEGORY_URLS = {CATEGORY_URLS}  # list of category page URLs to crawl
 PAGINATION_TYPE = "{PAGINATION_TYPE}"  # "next_button", "page_param", "infinite_scroll"
 NEXT_BUTTON_SELECTOR = "{NEXT_BUTTON_SELECTOR}"  # e.g. "a.next-page"
 PAGE_PARAM_NAME = "{PAGE_PARAM_NAME}"  # e.g. "page"
+ITEMS_PER_PAGE = {ITEMS_PER_PAGE}  # page size (for offset-style pagination); null if unknown
 MAX_PAGES = {MAX_PAGES}  # null for unlimited
 TOTAL_COUNT_SELECTOR = "{TOTAL_COUNT_SELECTOR}"  # e.g. ".results-count"
+
+# Coverage target: site-reported total item count (coverage_target.total_items
+# from navigation_analysis). None when unknown → the discovery-coverage gate
+# falls back to Tier 1 (stop_reason) only. code_writer may replace the None
+# below with a concrete int when a trusted site-reported total exists.
+COVERAGE_TARGET_TOTAL: Optional[int] = None
 
 # Phase 1: Item Link Extraction
 ITEM_CONTAINER_SELECTOR = "{ITEM_CONTAINER_SELECTOR}"  # e.g. ".product-grid"
@@ -67,7 +76,9 @@ ROTATE_EVERY = 25  # relaunch the browser every N items/categories to avoid stea
 # If the scraper crashes (Chrome death → scraper_runner restarts Chrome +
 # retries), the retry reads this file and skips re-discovery → resumes
 # directly to Phase 2 (extraction). Generic: any navigation scraper.
-_CHECKPOINT_PATH = os.path.join(os.getcwd(), "discovered_urls_checkpoint.json")
+# Path is SCRIPT_DIR (not cwd) so the checkpoint never leaks across sites
+# when the working directory differs (contract §4 / L1).
+_CHECKPOINT_PATH = os.path.join(SCRIPT_DIR, "discovered_urls_checkpoint.json")
 
 
 def _write_checkpoint(urls: list[str]) -> None:
@@ -96,7 +107,6 @@ def _load_checkpoint() -> list[str]:
 PAGE_LOAD_TIMEOUT = 30000
 SRC_URL = SITE_URL
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_KEY = "{OUTPUT_KEY}"  # "products", "articles", "jobs", etc.
 CONTENT_TYPE = "{CONTENT_TYPE}"
 
@@ -132,20 +142,94 @@ logger = logging.getLogger(SITE_SLUG)
 # PHASE 1: URL DISCOVERY
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── Discovery-coverage signals (contract §1/§2) ────────────────────────
+# A boolean `exhausted` is FORBIDDEN (H4): it cannot distinguish "genuinely
+# exhausted" (short_page / no_new_items / no_next_link → PASS) from "gave up
+# due to errors" (navigate_error → FAIL). We thread a `stop_reason` enum
+# through every termination point so the gate can tell them apart.
+
+
+def _new_discovery_state() -> dict:
+    """Mutable accumulator for Phase-1 discovery-coverage signals.
+
+    Default ``stop_reason`` is ``"no_next_link"`` (contract §2: the default when
+    the loop completes without an explicit break). Each termination point
+    overwrites it with the matching enum value via :func:`_set_stop_reason`.
+    """
+    return {
+        "stop_reason": "no_next_link",
+        "max_pages_hit": False,   # True only when a NON-None MAX_PAGES cap stopped the loop
+        "dimensions_iterated": 0,
+        "dimensions_total": 0,
+    }
+
+
+def _set_stop_reason(state: dict, reason: str) -> None:
+    """Record why the discovery loop terminated.
+
+    ``navigate_error`` is sticky (H4): once any phase gave up due to a fetch /
+    block / rate-limit failure, it is preserved even if a later phase
+    terminated normally — a single gave-up signal means the whole discovery is
+    suspect and the gate must FAIL rather than PASS.
+    """
+    if state["stop_reason"] == "navigate_error" and reason != "navigate_error":
+        return
+    state["stop_reason"] = reason
+
+
+def _discovery_goto(page, url: str, state: dict) -> bool:
+    """Phase-1 page fetch for the discovery loop.
+
+    Returns True on success; False on navigate failure (HTTP error, rate-limit
+    429/502/503, gateway/5xx, timeout, or exception). On failure, sets the
+    loop's ``stop_reason`` to ``"navigate_error"`` so the gate can distinguish
+    a gave-up scraper from genuine exhaustion (H4 — the single most important
+    distinction in the whole gate).
+    """
+    try:
+        response = page.goto(url, timeout=PAGE_LOAD_TIMEOUT)
+    except Exception as exc:
+        logger.warning("Phase 1: navigate FAILED %s: %s", url[:80], exc)
+        _set_stop_reason(state, "navigate_error")
+        return False
+    if response is None:
+        logger.warning("Phase 1: navigate returned no response for %s", url[:80])
+        _set_stop_reason(state, "navigate_error")
+        return False
+    status = getattr(response, "status", 0) or 0
+    # Rate-limiting / gateway errors / server errors → gave up, NOT exhausted.
+    if status in (429, 502, 503) or status >= 500:
+        logger.warning("Phase 1: navigate HTTP %d on %s (rate-limit/block?)", status, url[:80])
+        _set_stop_reason(state, "navigate_error")
+        return False
+    try:
+        page.wait_for_load_state("domcontentloaded")
+        time.sleep(8)
+    except Exception as exc:
+        logger.warning("Phase 1: load-wait failed %s: %s", url[:80], exc)
+        _set_stop_reason(state, "navigate_error")
+        return False
+    return True
+
 
 def _discover_urls_via_search(
     page,
     query: str,
+    state: dict,
     max_pages: Optional[int] = None,
     limit: Optional[int] = None,
 ) -> list[str]:
-    """Phase 1a: Discover item URLs by searching the site."""
+    """Phase 1a: Discover item URLs by searching the site.
+
+    Threads ``state`` (discovery-coverage signals) so every termination point
+    records its ``stop_reason`` (contract §2). A ``navigate_error`` from
+    :func:`_discovery_goto` is kept distinct from genuine exhaustion (H4).
+    """
     search_url = SEARCH_URL_PATTERN.replace("{query}", query)
     logger.info("Phase 1: Searching for '%s' → %s", query, search_url)
 
-    page.goto(search_url, timeout=PAGE_LOAD_TIMEOUT)
-    page.wait_for_load_state("domcontentloaded")
-    time.sleep(8)
+    if not _discovery_goto(page, search_url, state):
+        return []  # navigate_error already stamped
 
     all_urls: list[str] = _extract_item_links(page)
 
@@ -153,20 +237,26 @@ def _discover_urls_via_search(
     while True:
         if max_pages and current_page >= max_pages:
             logger.info("Phase 1: Reached max_pages=%d", max_pages)
+            state["max_pages_hit"] = True
+            _set_stop_reason(state, "max_pages_hit")
             break
         if limit and len(all_urls) >= limit:
             logger.info("Phase 1: Reached limit=%d", limit)
+            # No `limit_hit` enum exists (contract §2); a user cap is an
+            # inconclusive termination, so it shares `max_pages_hit`. The
+            # boolean above stays False — MAX_PAGES was not the cause.
+            _set_stop_reason(state, "max_pages_hit")
             break
 
         next_url = _get_next_page_url(page, current_page + 1)
         if not next_url:
             logger.info("Phase 1: No more pages (page %d)", current_page)
+            _set_stop_reason(state, "no_next_link")
             break
 
         logger.info("Phase 1: Navigating to page %d", current_page + 1)
-        page.goto(next_url, timeout=PAGE_LOAD_TIMEOUT)
-        page.wait_for_load_state("domcontentloaded")
-        time.sleep(8)
+        if not _discovery_goto(page, next_url, state):
+            break  # navigate_error already stamped by _discovery_goto
 
         new_urls = _extract_item_links(page)
         new_count = len(set(new_urls) - set(all_urls))
@@ -174,6 +264,7 @@ def _discover_urls_via_search(
 
         if new_count == 0:
             logger.info("Phase 1: No new items on page %d, stopping", current_page + 1)
+            _set_stop_reason(state, "no_new_items")
             break
 
         all_urls.extend(new_urls)
@@ -189,35 +280,45 @@ def _discover_urls_via_search(
 def _discover_urls_via_category(
     page,
     category_url: str,
+    state: dict,
     max_pages: Optional[int] = None,
     limit: Optional[int] = None,
 ) -> list[str]:
-    """Phase 1b: Discover item URLs from a category page."""
+    """Phase 1b: Discover item URLs from a category page.
+
+    Threads ``state`` (discovery-coverage signals) so every termination point
+    records its ``stop_reason`` (contract §2). A ``navigate_error`` from
+    :func:`_discovery_goto` is kept distinct from genuine exhaustion (H4).
+    """
     logger.info("Phase 1: Browsing category → %s", category_url)
-    page.goto(category_url, timeout=PAGE_LOAD_TIMEOUT)
-    page.wait_for_load_state("domcontentloaded")
-    time.sleep(8)
+
+    if not _discovery_goto(page, category_url, state):
+        return []  # navigate_error already stamped
 
     all_urls: list[str] = _extract_item_links(page)
 
     current_page = 1
     while True:
         if max_pages and current_page >= max_pages:
+            state["max_pages_hit"] = True
+            _set_stop_reason(state, "max_pages_hit")
             break
         if limit and len(all_urls) >= limit:
+            _set_stop_reason(state, "max_pages_hit")  # cap → inconclusive (see search)
             break
 
         next_url = _get_next_page_url(page, current_page + 1)
         if not next_url:
+            _set_stop_reason(state, "no_next_link")
             break
 
         logger.info("Phase 1: Category page %d", current_page + 1)
-        page.goto(next_url, timeout=PAGE_LOAD_TIMEOUT)
-        page.wait_for_load_state("domcontentloaded")
-        time.sleep(8)
+        if not _discovery_goto(page, next_url, state):
+            break  # navigate_error already stamped by _discovery_goto
 
         new_urls = _extract_item_links(page)
         if not new_urls or not (set(new_urls) - set(all_urls)):
+            _set_stop_reason(state, "no_new_items")
             break
 
         all_urls.extend(new_urls)
@@ -313,9 +414,67 @@ def _is_product_url(href: str) -> bool:
     return True
 
 
+def _set_cascading_selects(page, ordered_fields) -> None:
+    """Set form ``<select>`` fields in DEPENDENCY order (parent before child).
+
+    Cascading/dependent dropdowns (Discipline→Specialty, Country→State,
+    Category→Subcategory) repopulate the child's options when the parent
+    changes — setting the parent AFTER the child wipes the child's selection.
+    Each field: ``{"selector": "...", "value": "..."}``, ordered parent-first.
+    A short sleep after each select lets the child repopulate before we set it.
+    Safe even for independent selects (sleep is harmless; order is arbitrary).
+    """
+    for f in ordered_fields:
+        try:
+            page.select_option(f["selector"], str(f["value"]))
+            time.sleep(0.5)
+        except Exception as _e:
+            logger.warning("select_option(%s, %s) failed: %s", f.get("selector"), f.get("value"), _e)
+
+
+def _set_query_param(url: str, param: str, value) -> str:
+    """Return ``url`` with the query ``param`` REPLACED (not appended).
+
+    Using urllib.parse ensures we never produce duplicate params
+    (``?pgNum=2&pgNum=3``) which servers resolve inconsistently and which
+    caused pagination to re-fetch earlier pages. Generic for any param name.
+    """
+    from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+
+    p = urlparse(url)
+    qs = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if k != param]
+    qs.append((param, str(value)))
+    return urlunparse(p._replace(query=urlencode(qs)))
+
+
+# Offset-style params (value = (page-1)*items_per_page, not the page number).
+_OFFSET_PARAMS = {"offset", "start", "skip", "begin", "from"}
+
+
 def _get_next_page_url(page, next_page_num: int) -> Optional[str]:
-    """Determine the URL for the next page of results."""
-    if PAGINATION_TYPE == "next_button":
+    """Determine the URL for the next page of results.
+
+    PREFERRED: construct ``?{PAGE_PARAM_NAME}=N`` directly when a page param
+    is known — deterministic, DOM-independent, immune to the first-match
+    pitfall of clicking numbered pager links (``a[href*='pgNum']`` matches
+    EVERY page link; the first is page 1 → re-fetching page 1 forever).
+    Only fall back to SEMANTIC click selectors (``a[rel="next"]``) when no
+    param is known or for cursor/infinite-scroll types.
+    """
+    # 1. CONSTRUCTION-FIRST whenever a page param is known (covers page_param
+    #    AND unknown-type sites where PAGE_PARAM_NAME happened to be filled).
+    if PAGE_PARAM_NAME and PAGE_PARAM_NAME not in ("", "{PAGE_PARAM_NAME}"):
+        if PAGINATION_TYPE in ("page_param", "", None) or (
+            PAGINATION_TYPE not in ("cursor", "infinite_scroll", "load_more")
+        ):
+            if PAGE_PARAM_NAME in _OFFSET_PARAMS:
+                value = (next_page_num - 1) * (ITEMS_PER_PAGE or 25)
+            else:
+                value = next_page_num
+            return _set_query_param(page.url, PAGE_PARAM_NAME, value)
+
+    # 2. Explicit next-button (selector-driven) — only when declared.
+    if PAGINATION_TYPE == "next_button" and NEXT_BUTTON_SELECTOR:
         try:
             btn = page.query_selector(NEXT_BUTTON_SELECTOR)
             if btn:
@@ -324,52 +483,41 @@ def _get_next_page_url(page, next_page_num: int) -> Optional[str]:
                     if href.startswith("/"):
                         href = SITE_URL.rstrip("/") + href
                     return href
-                # SPA-style: no href, click the element and return the new URL
                 try:
-                    btn.click()
-                    page.wait_for_load_state("domcontentloaded")
-                    time.sleep(8)
-                    new_url = page.url
-                    if new_url:
-                        return new_url
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        return None
-    elif PAGINATION_TYPE == "page_param":
-        current_url = page.url
-        separator = "&" if "?" in current_url else "?"
-        return f"{current_url}{separator}{PAGE_PARAM_NAME}={next_page_num}"
-    else:
-        # Unknown pagination type — try common patterns at runtime so we still
-        # collect the FULL catalog (not just page 1). The discovery loop stops
-        # when a page yields no NEW urls, so this is safe (bounded by MAX_PAGES
-        # + deduped). Generic: catches sites where navigation didn't detect
-        # the pagination mechanism (e.g. calvklein search). [#3 discovery completeness]
-        for sel in (
-            'a[rel="next"]', 'a.next', 'li.next a', '[aria-label*="next" i]',
-            'a:has-text("Next")', 'button:has-text("Next")', 'a:has-text(">")',
-        ):
-            try:
-                btn = page.query_selector(sel)
-                if btn:
-                    href = btn.get_attribute("href") or ""
-                    if href:
-                        if href.startswith("http"):
-                            return href
-                        return SITE_URL.rstrip("/") + (href if href.startswith("/") else "/" + href)
                     btn.click()
                     page.wait_for_load_state("domcontentloaded")
                     time.sleep(8)
                     if page.url:
                         return page.url
-            except Exception:
-                pass
-        # Param-based fallback: try ?page=N (most common). Loop stops if no new items.
-        current_url = page.url
-        sep = "&" if "?" in current_url else "?"
-        return f"{current_url}{sep}page={next_page_num}"
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return None
+
+    # 3. LAST RESORT: SEMANTIC next-button selectors (never substring-on-param).
+    #    Cursor/infinite_scroll/unknown types land here. The discovery loop
+    #    terminates on no-new-items, so this is bounded by MAX_PAGES + dedup.
+    for sel in (
+        'a[rel="next"]', 'a.next', 'li.next a', '[aria-label*="next" i]',
+        'a:has-text("Next")', 'button:has-text("Next")',
+    ):
+        try:
+            btn = page.query_selector(sel)
+            if btn:
+                href = btn.get_attribute("href") or ""
+                if href:
+                    if href.startswith("http"):
+                        return href
+                    return SITE_URL.rstrip("/") + (href if href.startswith("/") else "/" + href)
+                btn.click()
+                page.wait_for_load_state("domcontentloaded")
+                time.sleep(8)
+                if page.url:
+                    return page.url
+        except Exception:
+            pass
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -514,6 +662,13 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Max items to scrape")
     parser.add_argument("--no-proxy", action="store_true", help="Disable proxy")
     parser.add_argument("--headless", action="store_true", default=True, help="Headless mode")
+    # Discovery-coverage gate (contract §3):
+    #   --discover-only   run Phase 1 to exhaustion, emit discovery_coverage, SKIP Phase 2
+    #   --fresh-discovery ignore any existing checkpoint, run Phase 1 from scratch (H3)
+    parser.add_argument("--discover-only", action="store_true",
+                        help="Run Phase 1 discovery only; skip Phase 2 extraction")
+    parser.add_argument("--fresh-discovery", action="store_true",
+                        help="Ignore existing checkpoint; run Phase 1 from scratch")
     args = parser.parse_args()
 
     limit = 5 if args.sample else args.limit
@@ -524,12 +679,23 @@ def main():
 
     start_time = time.time()
     discovered_urls: list[str] = []
+    items: list[dict] = []
+
+    # Discovery-coverage accumulator (contract §1/§2). Threaded through every
+    # Phase-1 termination point so the gate can tell genuine exhaustion apart
+    # from a scraper that gave up (H4). `navigate_error` is sticky.
+    discovery_state = _new_discovery_state()
+    ran_phase1 = False
+    skipped_reason: Optional[str] = None
 
     # B-core: check for checkpoint from a previous (crashed) run.
-    # If found, skip Phase 1 entirely and resume at Phase 2 (extraction).
-    _checkpoint_urls = _load_checkpoint()
+    # If found (and --fresh-discovery not passed), skip Phase 1 entirely and
+    # resume at Phase 2 (extraction). --fresh-discovery ignores the checkpoint
+    # so the execution phase doesn't silently reuse the test phase's URLs (H3).
+    _checkpoint_urls = [] if args.fresh_discovery else _load_checkpoint()
     if _checkpoint_urls:
         discovered_urls = _checkpoint_urls
+        skipped_reason = "checkpoint_loaded"
         logger.info("Phase 1: SKIPPED (resumed from checkpoint with %d URLs)", len(discovered_urls))
 
     with sync_playwright() as p:
@@ -549,17 +715,18 @@ def main():
 
         # ── Phase 1: Discover URLs ───────────────────────────────────────
         if not discovered_urls:
+            ran_phase1 = True
             if args.query:
                 logger.info("Phase 1: discovering via search '%s'", args.query[:50])
-                discovered_urls = _discover_urls_via_search(page, args.query, MAX_PAGES, limit)
+                discovered_urls = _discover_urls_via_search(page, args.query, discovery_state, MAX_PAGES, limit)
                 src_url_base = SEARCH_URL_PATTERN.replace("{query}", args.query)
             elif args.category_url:
                 logger.info("Phase 1: discovering via category %s", args.category_url[:50])
-                discovered_urls = _discover_urls_via_category(page, args.category_url, MAX_PAGES, limit)
+                discovered_urls = _discover_urls_via_category(page, args.category_url, discovery_state, MAX_PAGES, limit)
                 src_url_base = args.category_url
             elif args.listing_url:
                 logger.info("Phase 1: discovering via listing %s", args.listing_url[:50])
-                discovered_urls = _discover_urls_via_category(page, args.listing_url, MAX_PAGES, limit)
+                discovered_urls = _discover_urls_via_category(page, args.listing_url, discovery_state, MAX_PAGES, limit)
                 src_url_base = args.listing_url
             else:
                 logger.error("No --query, --category-url, or --listing-url provided")
@@ -571,8 +738,12 @@ def main():
         else:
             src_url_base = args.query or args.category_url or args.listing_url or "(checkpoint)"
 
-        # ── Phase 1b: Also discover from CATEGORY_URLS ──────────────────
+        # ── Phase 1b: Also discover from CATEGORY_URLS (dimension loop) ──
+        # Each category is one "dimension" (contract §1: dimensions_iterated /
+        # dimensions_total). Skipped under --sample (bounded test probe) or
+        # when resuming from a checkpoint.
         if not args.sample and CATEGORY_URLS and not _checkpoint_urls:
+            discovery_state["dimensions_total"] = len(CATEGORY_URLS)
             _existing = set(discovered_urls)
             _search_q = (args.query or "").lower()
             _cat_idx = 0
@@ -584,7 +755,7 @@ def main():
                 _cat_idx += 1
                 try:
                     logger.info("Phase 1b [%d]: visiting category %s", _cat_idx, _cat_url[:60])
-                    _cat_urls = _discover_urls_via_category(page, _cat_url, MAX_PAGES, limit)
+                    _cat_urls = _discover_urls_via_category(page, _cat_url, discovery_state, MAX_PAGES, limit)
                     _new = [u for u in _cat_urls if u not in _existing]
                     if _new:
                         discovered_urls.extend(_new)
@@ -606,50 +777,62 @@ def main():
                     browser, context, page = _launch_browser()
                     time.sleep(3)
 
+            discovery_state["dimensions_iterated"] = _cat_idx
             discovered_urls = list(dict.fromkeys(discovered_urls))
             if limit:
                 discovered_urls = discovered_urls[:limit]
             # B-core: final checkpoint after all categories.
             _write_checkpoint(discovered_urls)
-            logger.info("Phase 1 complete: %d total URLs discovered", len(discovered_urls))
+            logger.info("Phase 1 complete: %d total URLs discovered (%d/%d dimensions)",
+                        len(discovered_urls), _cat_idx, len(CATEGORY_URLS))
+
+        # Stamp skipped state when Phase 1 never ran (checkpoint resume).
+        if not ran_phase1:
+            _set_stop_reason(discovery_state, "skipped")
+
+        # --discover-only (contract §3): Phase 1 ran; SKIP Phase 2 extraction.
+        # The output's item list stays empty; the consumer reads discovered_urls
+        # / stop_reason / dimensions_* from discovery_coverage. `found` is 0.
+        if args.discover_only:
+            logger.info("--discover-only: skipping Phase 2 extraction (discovery-only probe)")
 
         if not discovered_urls:
-            logger.warning("No item URLs discovered")
-            browser.close()
-            sys.exit(0)
+            # Discovery ran but found nothing (often navigate_error). Don't
+            # sys.exit — we still emit output so the gate can see the failure.
+            logger.warning("No item URLs discovered (stop_reason=%s)", discovery_state["stop_reason"])
 
-        # ── Phase 2: Extract data from each URL ────────────────────────
-        logger.info("Phase 2: Extracting data from %d items", len(discovered_urls))
-        items: list[dict] = []
-        total = len(discovered_urls)
+        if discovered_urls and not args.discover_only:
+            # ── Phase 2: Extract data from each URL ────────────────────
+            logger.info("Phase 2: Extracting data from %d items", len(discovered_urls))
+            total = len(discovered_urls)
 
-        for i, url in enumerate(discovered_urls, 1):
-            logger.info("Progress: [%d/%d] (%.1f%%", i, total, (i / total) * 100)
-            logger.info("Scraping: %s", url[:100])
+            for i, url in enumerate(discovered_urls, 1):
+                logger.info("Progress: [%d/%d] (%.1f%%", i, total, (i / total) * 100)
+                logger.info("Scraping: %s", url[:100])
 
-            # Detect a dead browser (stealth Chromium can crash under sustained
-            # load) and relaunch before attempting the item, so one mid-run crash
-            # doesn't fail every remaining URL. Proactively rotate the context
-            # every ROTATE_EVERY items to release memory buildup.
-            if (not _browser_alive(page)) or (i > 1 and (i - 1) % ROTATE_EVERY == 0):
-                if i > 1:
-                    logger.warning("Phase 2: relaunching browser at item %d (alive=%s)", i, _browser_alive(page))
-                    try:
-                        browser.close()
-                    except Exception:
-                        pass
-                    browser, context, page = _launch_browser()
-                    time.sleep(3)
+                # Detect a dead browser (stealth Chromium can crash under sustained
+                # load) and relaunch before attempting the item, so one mid-run crash
+                # doesn't fail every remaining URL. Proactively rotate the context
+                # every ROTATE_EVERY items to release memory buildup.
+                if (not _browser_alive(page)) or (i > 1 and (i - 1) % ROTATE_EVERY == 0):
+                    if i > 1:
+                        logger.warning("Phase 2: relaunching browser at item %d (alive=%s)", i, _browser_alive(page))
+                        try:
+                            browser.close()
+                        except Exception:
+                            pass
+                        browser, context, page = _launch_browser()
+                        time.sleep(3)
 
-            try:
-                item = _extract_item_data(page, url, src_url_base)
-                items.append(item)
-            except Exception as exc:
-                logger.error("Failed to extract %s: %s", url[:80], exc)
-                items.append(_error_item(url, src_url_base, str(exc)))
+                try:
+                    item = _extract_item_data(page, url, src_url_base)
+                    items.append(item)
+                except Exception as exc:
+                    logger.error("Failed to extract %s: %s", url[:80], exc)
+                    items.append(_error_item(url, src_url_base, str(exc)))
 
-            if i < total:
-                time.sleep(DELAY_BETWEEN_REQUESTS)
+                if i < total:
+                    time.sleep(DELAY_BETWEEN_REQUESTS)
 
         browser.close()
 
@@ -660,6 +843,21 @@ def main():
     items = [it for it in items if it.get("title") and (not _extra or any(it.get(f) for f in _extra))]
     if len(items) != _before:
         logger.info("output filter: %d → %d items (dropped %d without core fields)", _before, len(items), _before - len(items))
+
+    # Discovery-coverage block (contract §1). `found` is the POST-FILTER
+    # extracted item count (0 when Phase 2 was skipped via --discover-only or
+    # when discovery found nothing) — NOT raw len(discovered_urls).
+    discovery_coverage = {
+        "stop_reason": discovery_state["stop_reason"],
+        "found": len(items),
+        "discovered_urls": len(discovered_urls),
+        "expected_total": COVERAGE_TARGET_TOTAL,
+        "dimensions_iterated": discovery_state["dimensions_iterated"],
+        "dimensions_total": discovery_state["dimensions_total"],
+        "max_pages_hit": discovery_state["max_pages_hit"],
+        "ran_phase1": ran_phase1,
+        "skipped_reason": skipped_reason,
+    }
 
     output = {
         "site": {
@@ -674,6 +872,7 @@ def main():
             "scraping_duration_seconds": round(time.time() - start_time, 1),
             "discovered_urls": len(discovered_urls),
             "extracted_items": len(items),
+            "discovery_coverage": discovery_coverage,
         },
     }
 
@@ -684,10 +883,11 @@ def main():
         json.dump(output, f, indent=2, ensure_ascii=False, default=str)
 
     logger.info(
-        "Done: %d/%d items in %.1fs → %s",
+        "Done: %d/%d items in %.1fs (stop_reason=%s) → %s",
         len([i for i in items if i.get("title")]),
-        total,
+        len(discovered_urls),
         time.time() - start_time,
+        discovery_state["stop_reason"],
         output_filename,
     )
 

@@ -33,7 +33,7 @@ services:
     command: >
       sh -c "python manage.py migrate --noinput &&
              DJANGO_SUPERUSER_PASSWORD=${DJANGO_SUPERUSER_PASSWORD:-admin} python manage.py createsuperuser --noinput --username admin --email admin@example.com 2>/dev/null || true &&
-             python manage.py runserver 0.0.0.0:8000"
+             python manage.py runserver 0.0.0.0:8000 --noreload"
     volumes:
       - .:/app
     environment:
@@ -63,7 +63,7 @@ services:
         condition: service_healthy
       browser_service:
         condition: service_healthy
-    mem_limit: 512m
+    mem_limit: 1g
 
   celery-worker:
     profiles: ["full"]
@@ -83,6 +83,7 @@ services:
       ZAI_BASE_URL: ${ZAI_BASE_URL:-https://api.z.ai/api/coding/paas/v4/}
       ZAI_MAIN_MODEL: ${ZAI_MAIN_MODEL:-glm-5-turbo}
       ZAI_SMALL_MODEL: ${ZAI_SMALL_MODEL:-glm-5-turbo}
+      CODE_WRITER_MODEL: glm-5.2
       PLAYWRIGHT_MCP_URL: http://browser_service:8111/sse
       BROWSER_SERVICE_URL: http://browser_service:8001
       DJANGO_SETTINGS_MODULE: config.settings
@@ -97,7 +98,8 @@ services:
         condition: service_healthy
     deploy:
       replicas: 1
-    mem_limit: 1536m
+    mem_limit: 3g
+    memswap_limit: 4g
 
   celery-beat:
     profiles: ["full"]
@@ -151,7 +153,7 @@ services:
       context: .
       dockerfile: browser_service/Dockerfile
     init: true
-    shm_size: "256m"
+    shm_size: 2g
     volumes:
       - ./browser_service:/app/browser_service
       - ./scrapers:/app/scrapers
@@ -187,7 +189,8 @@ services:
       timeout: 10s
       start_period: 45s
     restart: unless-stopped
-    mem_limit: 1536m
+    mem_limit: 4g
+    memswap_limit: 6g
 
 volumes:
   pgdata:

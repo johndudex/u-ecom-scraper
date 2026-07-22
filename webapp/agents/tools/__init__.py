@@ -24,20 +24,16 @@ logger = logging.getLogger(__name__)
 AGENT_TOOL_MAP: dict[str, list[str]] = {
     "site_analyzer": ["playwright", "web", "write_file", "read_file", "probe", "load_skill", "list_skills"],
     "product_analyzer": ["playwright", "web", "write_file", "read_file", "probe", "probe_html", "load_skill", "list_skills"],
-    "navigation_agent": ["playwright", "web", "write_file", "read_file", "load_skill", "list_skills"],
-    "navigation_explore": ["playwright", "web", "write_file", "read_file"],
-    "navigation_synthesize": ["read_file", "write_file", "load_skill", "web"],
+    # ═══ ARCHIVED (replaced by browser_traverse) ═══
+    # "navigation_agent": ["playwright", "web", "write_file", "read_file", "load_skill", "list_skills"],
+    # "navigation_explore": ["playwright", "web", "write_file", "read_file"],
+    # ══════════════════════════════════════════════
     "nav_skill_review": [
         "read_file",
         "write_file",
         "edit_file",
         "load_skill",
         "list_skills",
-    ],
-    "scraper_analyzer": [
-        "read_file",
-        "write_file",
-        "load_skill",
     ],
     "code_writer": [
         "read_file",
@@ -47,18 +43,12 @@ AGENT_TOOL_MAP: dict[str, list[str]] = {
         "search_content",
         "load_skill",
         "list_skills",
+        "run_scraper",
     ],
     "code_tester": [
         "read_file",
         "write_file",
         "run_scraper",
-    ],
-    "code_review": [
-        "read_file",
-        "search_content",
-        "write_file",
-        "load_skill",
-        "list_skills",
     ],
     "cleanup": ["read_file", "write_file", "run_bash", "search_files"],
     "skill_learner": [
@@ -80,7 +70,6 @@ AGENT_TOOL_MAP: dict[str, list[str]] = {
 ALLOWED_PLAYWRIGHT_TOOLS: dict[str, list[str]] = {
     "site_analyzer": [
         "playwright_browser_navigate",
-        "playwright_browser_snapshot",
         "playwright_browser_evaluate",
         "playwright_browser_click",
         "playwright_browser_network_requests",
@@ -88,7 +77,6 @@ ALLOWED_PLAYWRIGHT_TOOLS: dict[str, list[str]] = {
     ],
     "product_analyzer": [
         "playwright_browser_navigate",
-        "playwright_browser_snapshot",
         "playwright_browser_evaluate",
         "playwright_browser_click",
         "playwright_browser_network_requests",
@@ -96,24 +84,18 @@ ALLOWED_PLAYWRIGHT_TOOLS: dict[str, list[str]] = {
         "playwright_browser_wait_for",
         "playwright_browser_tabs",
     ],
-    "navigation_agent": [
-        "playwright_browser_navigate",
-        "playwright_browser_snapshot",
-        "playwright_browser_evaluate",
-        "playwright_browser_click",
-        "playwright_browser_network_requests",
-        "playwright_browser_network_request",
-        "playwright_browser_wait_for",
-        "playwright_browser_tabs",
-    ],
-    "scraper_analyzer": [
-        "playwright_browser_navigate",
-        "playwright_browser_snapshot",
-        "playwright_browser_evaluate",
-        "playwright_browser_click",
-        "playwright_browser_network_requests",
-        "playwright_browser_wait_for",
-    ],
+    # ═══ ARCHIVED (replaced by browser_traverse) ═══
+    # "navigation_agent": [
+    #     "playwright_browser_navigate",
+    #     "playwright_browser_snapshot",
+    #     "playwright_browser_evaluate",
+    #     "playwright_browser_click",
+    #     "playwright_browser_network_requests",
+    #     "playwright_browser_network_request",
+    #     "playwright_browser_wait_for",
+    #     "playwright_browser_tabs",
+    # ],
+    # ══════════════════════════════════════════════
     "code_tester": [
         "playwright_browser_navigate",
         "playwright_browser_snapshot",
@@ -169,6 +151,14 @@ async def get_tools_for_agent(
     if needs_playwright:
         pw_tools = await get_playwright_tools()
         if pw_tools:
+            # Enforce the per-agent ALLOWED_PLAYWRIGHT_TOOLS whitelist. Previously
+            # this was dead code — every playwright-enabled agent received ALL MCP
+            # tools, including browser_snapshot, whose serialization stalls the
+            # @playwright/mcp Node event loop on heavy SPAs (the aya/myntra stall).
+            # Filtering here makes that stall unreachable for analysis agents.
+            _allowed = set(ALLOWED_PLAYWRIGHT_TOOLS.get(agent_name, []))
+            if _allowed:
+                pw_tools = [t for t in pw_tools if getattr(t, "name", "") in _allowed]
             tools.extend(pw_tools)
         else:
             logger.warning(

@@ -67,6 +67,7 @@ class {SiteName}Scraper(BaseTlsScraper):
 - **Preserve parsing logic faithfully** — same selectors, same regex, same field names, same output structure.
 - **Include helper methods** the parser needs (copied/adapted from the existing scraper).
 - **Import what you need** — `tls_client`, `requests`, `BeautifulSoup`, `re`, `json`, `playwright`, etc. The file is for the client's environment, not ours — include all imports.
+- **CRITICAL — base class import:** the file MUST begin with `from dagster_scraper_base import BaseTlsScraper` (the client's module — NOT `scrapers.base`, NOT commented out). If you're unsure of the module name, use `dagster_scraper_base` — it's the canonical name the client provides. NEVER comment out this import or add `# type: ignore` to suppress the undefined-name error. The generated file must pass an AST name-binding check (every `class X(BaseTlsScraper)` must have the import active, not commented).
 - **Note limitations** as comments (e.g., "This site requires JS rendering; scrape_one uses Playwright internally").
 - **Keep `discover_urls()` for navigation jobs** (iterate the filter options from navigation_analysis). Skip it (return []) for url_list jobs.
 - **Dedup by job/item ID** in `discover_urls()` (same as the original scraper).

@@ -126,9 +126,18 @@ def setup_workspace(state: ScrapeState) -> dict[str, Any]:
         except Exception as exc:
             logger.warning("setup_workspace: failed to write input_urls.json: %s", exc)
 
+    # Fail-fast: a url_list job with NO urls anywhere (Site.input_urls empty AND
+    # no production scrapers/{slug}/input_urls.json) would silently under-extract
+    # (the misleading "1 of N coverage gap"). Fail loud with an actionable message
+    # instead. (_build_initial_state already loaded the production file into state
+    # if it existed, so empty state here means truly no URLs.)
+    if (state.get("input_mode") == "url_list") and not input_urls:
+        raise RuntimeError(
+            f"url_list job for '{slug}' has no input URLs — Site.input_urls is empty "
+            f"and no scrapers/{slug}/input_urls.json exists. Provide a URL list or use "
+            f"a different input_mode (navigation/search_term)."
+        )
+
     logger.info("setup_workspace: ensured directories for %s", slug)
 
-    return {
-        "current_phase": "setup_workspace",
-        "phases_completed": state.get("phases_completed", []) + ["setup_workspace"],
-    }
+    return {}

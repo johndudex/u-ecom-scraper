@@ -65,7 +65,9 @@ docker compose exec django python manage.py createsuperuser
 
 Browser Service decouples agents from Chrome — communication via HTTP/JSON only.
 
-### Pipeline Flow (22 Nodes)
+### Pipeline Flow (25 nodes)
+
+> Node count is approximate — the graph registers ~26 nodes today (`code_review` is being removed in the current complexity audit; `dagster_converter` stays). The linear diagram below shows the main happy path and omits several branching/utility nodes (`update_tracker_analysis`, `validate_analysis`, `field_confirmation`, `dagster_converter`, `store_job_listings`, `human_approval`, `navigation_agent` fallback).
 
 ```
 parse_command → check_tracker → setup_workspace → check_accessibility
@@ -79,22 +81,22 @@ parse_command → check_tracker → setup_workspace → check_accessibility
 
 **Phases:**
 1. **Setup** — parse_command, check_tracker (resume logic), setup_workspace, check_accessibility (7-step probe)
-2. **Analysis** — site_analyzer (platform/anti-bot), navigation_explore (browse), navigation_synthesize, nav_skill_review, product_analyzer (field mapping)
+2. **Analysis** — site_analyzer (platform/anti-bot), navigation_explore (browse), navigation_synthesize (**deterministic** — no LLM), nav_skill_review, product_analyzer (field mapping)
 3. **Validation** — update_tracker_analysis, validate_analysis (confidence check), normalize_fields, validate_coverage, field_confirmation
-4. **Generation & Testing** — scraper_analyzer (strategy), code_writer (Python), code_tester (validate)
+4. **Generation & Testing** — scraper_analyzer (**deterministic strategy** — no LLM), code_writer (Python), code_tester (validate). (The read-only `code_reviewer` LLM that sat before `code_tester` has been removed.)
 5. **Execution & Cleanup** — pre_execution_approval, run_execution, cleanup, skill_learner
 
 **Two-phase architecture for navigation jobs:** Phase 1 discovers product URLs by browsing; Phase 2 (the generated scraper) reuses discovery logic at runtime.
 
 ### Agent Table
 
+LLM agents only. (`navigation_synthesize` and `scraper_analyzer` still exist as graph nodes but are now **deterministic** functions — they consume the same artifact filenames but no longer run an LLM. The `code_reviewer` LLM has been removed entirely.)
+
 | Agent | Role | Input | Output |
 |-------|------|-------|--------|
 | **site_analyzer** | Probes site, detects platform/scraping method | URL, search criteria | `site_analysis.json` |
 | **navigation_explore** | Browses via Playwright MCP, finds search/category | Homepage, search term | `navigation_findings.json` |
-| **navigation_synthesize** | Converts findings to structured strategy | Raw findings | `navigation_analysis.json` |
 | **product_analyzer** | Maps extractable fields from sample page | Product page | `product_analysis.json` |
-| **scraper_analyzer** | Synthesizes analyses into strategy | All artifacts | `scraper_analysis.json` |
 | **code_writer** | Generates Python scraper | Strategy + templates | `scraper_draft.py` |
 | **code_tester** | Tests scraper, validates output | Scraper + sample URLs | `test_report.json` |
 | **cleanup** | Moves scraper to production, updates tracker | Scraper + artifacts | `cleanup_report.json` |
@@ -157,13 +159,15 @@ Interrupt → approval type mapping in `webapp/scraper/services.py:INTERRUPT_TO_
 
 ### Agent Factories (`webapp/agents/subagents.py`)
 
-Each LLM phase is a `create_react_agent(langchain)`:
+Each **LLM** phase is wrapped as a `create_react_agent(langchain)`:
 - Factory functions (`create_site_analyzer`, etc.)
 - System prompts from `.opencode/agents/{name}.md`
 - Tool sets from `webapp/agents/tools/`
 - Temperature from `AGENT_TEMPERATURES` map
 - `AGENT_MAX_ITERATIONS` per agent
 - Tool guards applied via `_apply_guards()`
+
+**Not LLM agents** (deterministic functions, no `create_react_agent`): `scraper_analyzer`, `navigation_synthesize`. `code_reviewer` has been removed.
 
 Message builders (`build_*_message`) inject context: probe cache, content type config, navigation analysis, test reports, human feedback.
 
@@ -204,12 +208,13 @@ Agents see lightweight descriptions in system prompt, use `load_skill` tool for 
 Base scrapers per strategy. `code_writer` adapts these:
 - `undetected_chromedriver_scraper.py` — SeleniumBase UC mode with `uc_open_with_reconnect()`
 - `navigation_scraper.py` — Two-phase (discover → scrape)
+- `http_navigation_scraper.py` — Two-phase HTTP navigation (discover → scrape, browser-free discovery)
 - `api_scraper.py` — HTTP + JSON API
 - `playwright_scraper.py` — Playwright browser automation
 - `requests_scraper.py` — Simple HTTP requests
 - `shopify_scraper.py` — Shopify-specific
-- `akamai_stealth_scraper.py` — Akamai bypass
-- Plus article, job, forum, generic content templates
+
+The per-domain content templates (`article_scraper.py`, `forum_scraper.py`, `generic_content_scraper.py`, `akamai_stealth_scraper.py`) are dead/retired in the current audit and should not be referenced for new work.
 
 ## Important Development Notes
 
@@ -218,11 +223,11 @@ Base scrapers per strategy. `code_writer` adapts these:
 Test agents in isolation (see `docs/testing_guide.md`). Test sequentially — each agent produces files the next needs:
 1. `site_analyzer` — Produces `site_analysis.json`
 2. `navigation_explore` — Produces `navigation_findings.json`
-3. `navigation_synthesize` — Produces `navigation_analysis.json`
-4. `product_analyzer` — Produces `product_analysis.json`
-5. `scraper_analyzer` — Produces `scraper_analysis.json`
-6. `code_writer` — Produces `scraper_draft.py`
-7. `code_tester` — Produces `test_report.json`
+3. `product_analyzer` — Produces `product_analysis.json`
+4. `code_writer` — Produces `scraper_draft.py`
+5. `code_tester` — Produces `test_report.json`
+
+`navigation_synthesize` and `scraper_analyzer` are deterministic steps now (no LLM), so they are not exercised here; their output files (`navigation_analysis.json`, `scraper_analysis.json`) are produced by plain functions and can be crafted/inspected directly when seeding the next agent.
 
 **Do NOT clean workspace between sequential tests.** Each reads files written by the previous one.
 
@@ -249,7 +254,7 @@ Many nodes return `Command(goto=..., update=...)` instead of dicts. This bypasse
 - `require_same_domain` — Only allow URLs from original site
 - `require_target_url` — Must use provided sample URL
 
-Guards apply to `site_analyzer`, `product_analyzer`, `scraper_analyzer`, `navigation_agent` (with variations).
+Guards apply to `site_analyzer`, `product_analyzer`, `navigation_agent` (with variations). (`scraper_analyzer` no longer has guards — it is deterministic.)
 
 ### Workspace vs. Scrapers Directory
 

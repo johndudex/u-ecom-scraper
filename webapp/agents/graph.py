@@ -12,8 +12,13 @@ produced by the factories in ``subagents.py``.  Deterministic nodes come from
 
 Human-in-the-loop is handled via ``langgraph.types.interrupt()`` inside
 specific nodes (check_tracker, validate_analysis, validate_coverage,
-field_confirmation, pre_execution_approval, human_approval).  The graph
-pauses at these points and resumes when the user provides input.
+field_confirmation, human_approval).  The graph pauses at these points and
+resumes when the user provides input.
+
+Note: ``pre_execution_approval`` was a second consecutive gate after
+``field_confirmation`` (Wave 2 Cut 2 merged it into field_confirmation — the
+item-count estimate now appears in field_confirmation's interrupt and an approve
+there routes straight to run_execution). The node is no longer registered here.
 
 The compiled graph is stateful — checkpointed to PostgreSQL via
 ``checkpointer.py`` — so jobs can be resumed after interrupts.
@@ -34,7 +39,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import queue
 import re
 import time
 import functools
@@ -50,8 +54,6 @@ from langchain_core.runnables import RunnableConfig
 
 from .constants import (
     FINAL_RETRY_SENTINEL,
-    MAX_CRITICAL_REVIEW_RETRIES,
-    MAX_MEDIUM_REVIEW_RETRIES,
 )
 from .decisions import options_to_decisions
 from .nodes import (
@@ -60,7 +62,6 @@ from .nodes import (
     human_approval,
     normalize_fields,
     parse_command,
-    pre_execution_approval,
     route_after_cleanup,
     route_after_testing,
     run_execution,
@@ -69,25 +70,25 @@ from .nodes import (
     validate_analysis,
     validate_coverage,
 )
-from .nodes.run_execution import _find_newest_output
+from .nodes.run_execution import _find_newest_output, _read_discovery_coverage
 from .state import ScrapeState
 from .subagents import (
     build_cleanup_message,
-    build_code_reviewer_message,
     build_code_tester_message,
     build_code_writer_message,
-    build_navigation_agent_message,
+    # ═══ ARCHIVED NAVIGATION (replaced by browser_traverse) ═══
+    # build_navigation_agent_message,
+    # ═══ END ARCHIVED ═══
     build_product_analyzer_message,
-    build_scraper_analyzer_message,
     build_site_analyzer_message,
     build_dagster_converter_message,
     create_cleanup_agent,
-    create_code_reviewer,
     create_code_tester,
     create_code_writer,
-    create_navigation_agent,
+    # ═══ ARCHIVED NAVIGATION (replaced by browser_traverse) ═══
+    # create_navigation_agent,
+    # ═══ END ARCHIVED ═══
     create_product_analyzer,
-    create_scraper_analyzer,
     create_site_analyzer,
     create_skill_learner,
     build_skill_learner_message,
@@ -173,15 +174,16 @@ def _fix_json_artifact(slug: str, filename: str) -> None:
 
 
 def _enforce_anti_bot_strategy(analysis: dict, slug: str, filename: str) -> dict:
-    """For anti-bot sites, force the strategy fields to ``playwright`` (cloak).
+    """For anti-bot sites, force the strategy fields to ``http_navigation`` (cloak).
 
     Bot protection (Akamai/Cloudflare/PerimeterX) guards **API endpoints too**,
     not just HTML pages — a discovered ``internal_api``/``http_requests`` strategy
     403/400s exactly like direct HTTP does (verified: calvklein's b2c-api returns
-    400). So the only reliable strategy for an anti-bot site is playwright (cloak
-    is runtime-injected via STEALTH_BROWSER=cloak). code_writer is often tempted
-    by a discovered API endpoint despite prompt guidance, so this rewrites the
-    analysis fields deterministically before code_writer reads them.
+    400). So the only reliable strategy for an anti-bot site is a browser-backed
+    one. ``http_navigation`` is the preferred anti-bot strategy because the
+    browser_service ``/navigate`` endpoint supports ``stealth: "cloak"`` per call
+    (CloakBrowser's C++ fingerprint patches defeat Akamai). The legacy
+    ``playwright`` strategy is NOT in ``_bad`` — it stays for back-compat.
 
     KEPT after verify-then-delete: `run_node code_writer` showed code_writer picks
     ``internal_api`` for anti-bot sites even with the strengthened prompt, producing
@@ -198,7 +200,11 @@ def _enforce_anti_bot_strategy(analysis: dict, slug: str, filename: str) -> dict
     )
     if not detected:
         return analysis
-    # Strategies that won't work behind bot protection → playwright.
+    # Strategies that won't work behind bot protection → http_navigation (cloak).
+    # NOTE: ``playwright`` is deliberately NOT in ``_bad`` — it is retained as a
+    # legacy browser strategy. Only the explicitly-bad tokens (UC, HTTP/API) are
+    # rewritten to ``http_navigation``, the new preferred anti-bot strategy
+    # (the /navigate endpoint applies cloak server-side via ``stealth: "cloak"``).
     _bad = ("seleniumbase", "undetected", "stealth_browser", "uc_chrome",
             "internal_api", "http_requests", "requests", "api")
     _keys = ("scraping_mechanism", "scraping_method", "strategy",
@@ -209,7 +215,7 @@ def _enforce_anti_bot_strategy(analysis: dict, slug: str, filename: str) -> dict
         nonlocal changed
         for k, v in list(d.items()):
             if isinstance(v, str) and any(t in v.lower() for t in _bad):
-                d[k] = "playwright"
+                d[k] = "http_navigation"
                 changed = True
 
     _rewrite(analysis)
@@ -222,7 +228,7 @@ def _enforce_anti_bot_strategy(analysis: dict, slug: str, filename: str) -> dict
         path = os.path.join(_get_project_root(), "workspace", slug, filename)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(analysis, f, indent=2, ensure_ascii=False)
-        logger.info("_enforce_anti_bot_strategy: anti-bot → playwright in %s/%s", slug, filename)
+        logger.info("_enforce_anti_bot_strategy: anti-bot → http_navigation in %s/%s", slug, filename)
     except Exception as exc:
         logger.warning("_enforce_anti_bot_strategy: %s", exc)
     return analysis
@@ -306,6 +312,73 @@ def _patch_scraper_output_filter(slug: str, content_type: str = "") -> None:
         logger.warning("_patch_scraper_output_filter: %s", exc)
 
 
+def _warn_unaddressed_critical_fix(slug: str, scraper_analysis: dict) -> None:
+    """Deterministic backstop for the critical_fix loop.
+
+    After code_writer regenerates ``scraper_draft.py``, check whether any
+    selector documented as non-existent in ``scraper_analysis.critical_fix``
+    still appears in the generated code. If it does, log a prominent warning —
+    the documented defect was not addressed and the next code_tester run will
+    almost certainly crash the same way.
+
+    This does NOT mutate the scraper (selector choice is the LLM's call); it
+    surfaces the regression loudly so it is visible in logs and the code_review
+    loop can act on it. GENERIC — runs for any site whose analyzer wrote a
+    ``critical_fix`` block.
+    """
+    if not slug or not isinstance(scraper_analysis, dict):
+        return
+    critical_fix = scraper_analysis.get("critical_fix") or {}
+    if not isinstance(critical_fix, dict) or not critical_fix:
+        return
+    try:
+        root = _get_project_root()
+    except Exception:
+        return
+    scraper_path = os.path.join(root, "workspace", slug, "scraper_draft.py")
+    if not os.path.isfile(scraper_path):
+        return
+    try:
+        with open(scraper_path, "r", encoding="utf-8") as f:
+            code = f.read()
+        # Extract the FAILED selector from the crash message in `issue` — the
+        # pattern is `selector 'X'` / `selector "X"` (Playwright/Selenium
+        # wording). That selector is definitively broken on the page.
+        import re as _re
+
+        blob = " ".join(
+            str(critical_fix.get(k, ""))
+            for k in ("issue", "root_cause", "fix")
+            if critical_fix.get(k)
+        )
+        # Mark selectors flagged as non-existent; the issue text usually reads
+        # "DOES NOT EXIST" / "does not exist" near the broken selector.
+        forbidden: list[str] = []
+        for m in _re.finditer(r"selector\s*['\"]([^'\"]+)['\"]", blob, flags=_re.IGNORECASE):
+            forbidden.append(m.group(1))
+        # Dedupe while preserving order.
+        seen: set[str] = set()
+        forbidden = [s for s in forbidden if not (s in seen or seen.add(s))]
+        if not forbidden:
+            return
+        offenders = [s for s in forbidden if s in code]
+        if offenders:
+            logger.warning(
+                "_warn_unaddressed_critical_fix: %s STILL CONTAINS documented-"
+                "non-existent selector(s) %s despite critical_fix — code_tester "
+                "will likely crash again (slug=%s)",
+                os.path.basename(scraper_path), offenders, slug,
+            )
+        else:
+            logger.info(
+                "_warn_unaddressed_critical_fix: OK — documented-non-existent "
+                "selector(s) %s absent from regenerated scraper (slug=%s)",
+                forbidden, slug,
+            )
+    except Exception as exc:
+        logger.warning("_warn_unaddressed_critical_fix: %s", exc)
+
+
 
 
 def _load_test_report(slug: str) -> dict | None:
@@ -334,6 +407,51 @@ def _load_test_report(slug: str) -> dict | None:
     return None
 
 
+def _attach_discovery_coverage(report: dict, slug: str) -> dict:
+    """Deterministically attach the scraper's ``discovery_coverage`` to the test report.
+
+    code_tester's LLM-written ``test_report.json`` does not reliably carry the
+    ``discovery_coverage`` block the scraper emits in its output metadata. Read it
+    from the test scrape's output file and inject it so the coverage-aware
+    classifier (``route_after_testing._discovery_coverage_failure``) can see it.
+    No-op when there is no output file or no block (url_list scrapers, Phase 1 not
+    run) — keeps the gate dormant rather than erroring.
+    """
+    if not isinstance(report, dict) or not slug:
+        return report
+    try:
+        from django.conf import settings
+
+        root = settings.PROJECT_ROOT
+    except Exception:
+        root = "."
+    workspace_dir = os.path.join(root, "workspace", slug)
+    site_dir = os.path.join(root, "scrapers", slug)
+    try:
+        output_file = _find_newest_output(workspace_dir, site_dir)
+    except Exception as exc:
+        logger.debug("_attach_discovery_coverage: newest-output lookup failed: %s", exc)
+        output_file = None
+    if not output_file:
+        return report
+    try:
+        cov = _read_discovery_coverage(output_file)
+        if isinstance(cov, dict):
+            report["discovery_coverage"] = cov
+            logger.info(
+                "_attach_discovery_coverage: attached (stop_reason=%s, found=%s, "
+                "dims=%s/%s) from %s",
+                cov.get("stop_reason"),
+                cov.get("found"),
+                cov.get("dimensions_iterated"),
+                cov.get("dimensions_total"),
+                os.path.basename(output_file),
+            )
+    except Exception as exc:
+        logger.warning("_attach_discovery_coverage: failed to read %s: %s", output_file, exc)
+    return report
+
+
 def _preserve_test_report(slug: str) -> None:
     """Copy test_report.json from workspace to scrapers analysis/ for safekeeping."""
     if not slug:
@@ -355,45 +473,16 @@ def _preserve_test_report(slug: str) -> None:
         logger.warning("_preserve_test_report: failed: %s", exc)
 
 
-def _load_scraper_analysis(slug: str) -> dict | None:
-    """Load scraper_analysis.json from the agent's workspace folder."""
-    if not slug:
-        return None
-    for base in (".",):
-        path = os.path.join(base, "workspace", slug, "scraper_analysis.json")
-        if os.path.isfile(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.loads(f.read())
-                if isinstance(data, dict):
-                    return data
-            except Exception as exc:
-                logger.warning(
-                    "_load_scraper_analysis: failed to parse %s: %s", path, exc
-                )
-    try:
-        from django.conf import settings
-
-        path = os.path.join(
-            settings.PROJECT_ROOT, "workspace", slug, "scraper_analysis.json"
-        )
-        if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.loads(f.read())
-            if isinstance(data, dict):
-                return data
-    except Exception:
-        pass
-    return None
-
-
 AGENT_RECURSION_MAP: dict[str, int] = {
     "site_analyzer": 250,
     "product_analyzer": 200,
-    "navigation_agent": 200,
+    # ARCHIVED: "navigation_agent": 200,
     "nav_skill_review": 60,
     "scraper_analyzer": 160,
-    "code_writer": 120,
+    "code_writer": 120,  # recursion limit — high enough to finish (read+write+test+fix
+                         # needs ~25 steps). The wall-clock cap (_invoke_agent_with_timeout
+                         # at 900s) is the real backstop; this just prevents the react loop
+                         # from iterating past GraphRecursionError.
     "code_tester": 120,
     "cleanup": 80,
     "skill_learner": 80,
@@ -428,7 +517,11 @@ class _ToolCallLogger(BaseCallbackHandler):
             seq = SessionLog.objects.filter(job_id=self.job_id).count()
             SessionLog.objects.create(
                 job_id=self.job_id,
-                role=SessionLog.ROLE_ASSISTANT,
+                # P0-18: tool-call traces are NOT assistant messages. Writing
+                # them as ROLE_ASSISTANT polluted the agent-summary view (tool
+                # noise masqueraded as the agent's reasoning text). Use
+                # ROLE_SYSTEM so "assistant" means real LLM output only.
+                role=SessionLog.ROLE_SYSTEM,
                 agent=self.agent_name,
                 content=f"[TOOL] {name}: {(input_str or '')[:140]}",
                 seq=seq,
@@ -457,7 +550,14 @@ def _agent_config(config: RunnableConfig, agent_name: str = "") -> RunnableConfi
     # here (not per-invoke-site) covers all agents in one place.
     job_id = (config.get("metadata") or {}).get("job_id") if isinstance(config, dict) else None
     if job_id:
-        cb = _ToolCallLogger(int(job_id), agent_name)
+        # P0-18: Canonicalize the agent name to the hyphenated display form
+        # (matching _persist_agent_logs). Without this, _ToolCallLogger writes
+        # underscore names (code_writer) while _persist_agent_logs writes
+        # hyphen names (code-writer) — splitting every agent into two DB
+        # buckets. AGENT_PROMPT_MAP maps underscore → hyphen stem.
+        from .subagents import AGENT_PROMPT_MAP
+        _display_name = AGENT_PROMPT_MAP.get(agent_name, agent_name)
+        cb = _ToolCallLogger(int(job_id), _display_name)
         existing = agent_cfg.get("callbacks")
         # config["callbacks"] can be: None, a list of handlers, OR a
         # BaseCallbackManager (langgraph passes one; it's NOT iterable — calling
@@ -480,9 +580,12 @@ def _agent_config(config: RunnableConfig, agent_name: str = "") -> RunnableConfi
 
 PHASE_MAP: dict[str, str] = {
     "site_analyzer": "site_analysis",
-    "navigation_agent": "navigation_explore",
-    "navigation_explore": "navigation_explore",
-    "navigation_synthesize": "navigation_synthesize",
+    # ═══ ARCHIVED NAVIGATION (replaced by browser_traverse) ═══
+    # "navigation_explore": "navigation_explore",
+    # "navigation_agent": "navigation_agent",
+    # "navigation_synthesize": "navigation_synthesize",
+    # ═══ END ARCHIVED ═══
+    "browser_traverse": "Browser Navigation",
     "nav_skill_review": "navigation_skill_review",
     "product_analyzer": "product_analysis",
     "scraper_analyzer": "scraper_analysis",
@@ -490,6 +593,8 @@ PHASE_MAP: dict[str, str] = {
     "code_tester": "testing",
     "cleanup": "cleanup",
     "skill_learner": "skill_learning",
+    "dagster_converter": "dagster_converter",
+    "store_job_listings": "store_job_listings",
 }
 
 
@@ -740,6 +845,30 @@ def _clean_result_summary(raw: str, max_len: int = 300) -> str:
     return cleaned
 
 
+def _accessibility_goto(state: ScrapeState, update: dict[str, Any] | None = None) -> Command:
+    """Pick the next node after check_accessibility based on input_mode.
+
+    For navigation/list_page/search_term jobs, route directly to browser_traverse
+    and set ``skip_site_analysis``. site_analyzer's output is never consumed by
+    the browser path (browser_traverse reads url/page_type/search_criteria only),
+    so running it wastes ~5 minutes. url_list jobs still go through site_analyzer,
+    where site_analysis informs product/content analysis.
+    """
+    input_mode = state.get("input_mode", "url_list")
+    if input_mode in ("navigation", "list_page", "search_term"):
+        logger.info(
+            "check_accessibility: input_mode=%s → browser_traverse "
+            "(skipping site_analyzer)",
+            input_mode,
+        )
+        upd: dict[str, Any] = dict(update or {})
+        upd["skip_site_analysis"] = True
+        return Command(update=upd, goto="browser_traverse")
+    if update:
+        return Command(update=update, goto="site_analyzer")
+    return Command(goto="site_analyzer")
+
+
 def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
     """Probe the target URL with LLM-based captcha verification.
 
@@ -772,7 +901,7 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
     except Exception as exc:
         logger.warning("check_accessibility: probe failed, continuing: %s", exc)
         _notify_phase(job_id, "accessibility_check", "done")
-        return Command(goto="site_analyzer")
+        return _accessibility_goto(state)
 
     if data.get("captcha_detected"):
         methods = data.get("methods_tried", [])
@@ -854,35 +983,126 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
 
     update_probe_result(data)
 
-    return Command(update=probe_state, goto="site_analyzer")
+    return _accessibility_goto(state, probe_state)
 
 
-@_with_api_retry
-def _invoke_site_analyzer(
-    state: ScrapeState, config: RunnableConfig
+_AGENT_INVOKE_TIMEOUT = 900  # seconds — hard wall-clock cap per agent.invoke().
+                            # glm-5-turbo needs ~700-900s for code_writer (read
+                            # template + generate ~500 lines + self-test + fix).
+
+
+def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, timeout: int = _AGENT_INVOKE_TIMEOUT):
+    """Run agent.invoke with a wall-clock timeout.
+
+    Uses a raw daemon thread (NOT ThreadPoolExecutor — its context manager calls
+    shutdown(wait=True) which blocks until the thread finishes, defeating the
+    timeout). On timeout, returns an empty result (caller treats as
+    budget-exhausted). The daemon thread is abandoned — it will be killed when
+    the celery worker process exits.
+    """
+    import threading
+
+    result_box = [None]
+    def _run():
+        try:
+            result_box[0] = agent.invoke({"messages": messages}, agent_cfg)
+        except Exception as exc:
+            result_box[0] = {"_error": str(exc)[:200]}
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        logger.error(
+            "_invoke_agent_with_timeout[%s]: agent.invoke exceeded %ds wall-clock "
+            "— abandoning thread, returning empty (job %s)",
+            phase, timeout, job_id,
+        )
+        return {"messages": []}
+    return result_box[0] or {"messages": []}
+
+
+def _run_budgeted_agent(
+    state: ScrapeState,
+    config: RunnableConfig,
+    *,
+    phase: str,
+    display_name: str,
+    agent_factory,
+    message_builder,
+    artifact_name: str,
+    state_key: str,
+    budget: int,
+    budget_extended: int,
+    budget_max: int,
+    budget_exhausted_reason: str,
+    budget_exhausted_options: list[str],
+    budget_exhausted_message: str,
+    missing_artifact_reason: Optional[str] = None,
+    missing_retries_state_key: Optional[str] = None,
+    missing_redo_label: str = "",
+    missing_skip_label: str = "",
+    missing_message: str = "",
+    auto_extend_min_tool_calls: int = 5,
+    artifact_fix_fn=None,
+    on_success=None,
 ) -> dict[str, Any] | Command:
+    """Shared control flow for the three budgeted analysis agents
+    (site_analyzer, product_analyzer, navigation_agent).
+
+    Encapsulates the previously triplicated pattern:
+      budget-retry count math → optional budget-extension prompt → invoke →
+      (on missing artifact) auto-extend-if-≥N-tool-calls → re-invoke →
+      budget_exhausted_* interrupt → [missing_artifact_* interrupt].
+
+    Per-phase variation is passed via kwargs. The ``on_success`` hook (if given)
+    is applied in BOTH the primary and auto-extend success paths, normalising a
+    prior asymmetry where the auto-extend path skipped phase-specific
+    post-processing (e.g. product's anti-bot strategy enforcement, site's
+    probe_result surfacing) — both are idempotent/additive, so applying them
+    consistently is strictly safer.
+
+    Resume contract: the budget interrupts here only SET ``interrupt_reason``
+    and ``goto="human_approval"``; the actual ``interrupt()`` call site lives in
+    the ``human_approval`` node, so LangGraph's interrupt_id is assigned there
+    and is unaffected by this centralisation. Each phase's reason string
+    (budget_exhausted_site / _product / _navigation, missing_artifact_site /
+    _product) is preserved verbatim, so services.py INTERRUPT_TO_APPROVAL_TYPE
+    and route_from_human_approval resume routing keep working unchanged.
+    """
     job_id = state.get("job_id", 0)
     slug = state.get("site_slug", "")
-    is_budget_retry = state.get("interrupt_reason") == "budget_exhausted_site"
-    is_missing_artifact = state.get("interrupt_reason") == "missing_artifact_site"
-    budget_retries = (
+    is_budget_retry = state.get("interrupt_reason") == budget_exhausted_reason
+    is_missing_artifact = (
+        missing_artifact_reason is not None
+        and state.get("interrupt_reason") == missing_artifact_reason
+    )
+    # Reset on phase entry: only carry the count forward when THIS is a
+    # budget-retry re-entry for THIS phase. A stale count from a prior phase
+    # (e.g. site exhaustion → product reads count=1) corrupts the downstream
+    # budget + skips the escalation interrupt. P0-8.
+    _prior = (
         state.get("budget_retry_count", 0)
+        if (is_budget_retry or is_missing_artifact)
+        else 0
+    )
+    budget_retries = (
+        _prior
         + (1 if is_budget_retry else 0)
         + (1 if is_missing_artifact else 0)
     )
-    recursion_limit = (
-        SITE_ANALYSIS_BUDGET_EXTENDED if budget_retries > 0 else SITE_ANALYSIS_BUDGET
-    )
-    _notify_phase(job_id, "site_analyzer", "running")
-    set_tool_context(dict(state), agent_name="site_analyzer")
+    recursion_limit = budget_extended if budget_retries > 0 else budget
+    _notify_phase(job_id, phase, "running")
+    set_tool_context(dict(state), agent_name=phase)
     try:
         logger.info(
-            "_invoke_site_analyzer: starting (job %s, budget=%d, retry=%d)",
+            "_run_budgeted_agent[%s]: starting (job %s, budget=%d, retry=%d)",
+            phase,
             job_id,
             recursion_limit,
             budget_retries,
         )
-        messages = build_site_analyzer_message(state)
+        messages = message_builder(state)
 
         if budget_retries > 0:
             previous_summary = state.get("budget_retry_summary", "")
@@ -891,7 +1111,7 @@ def _invoke_site_analyzer(
                 f"Previous analysis ran out of the call budget. "
                 f"You now have {recursion_limit} calls.\n\n"
                 "### CRITICAL INSTRUCTION\n"
-                "You MUST write site_analysis.json before running out of calls. "
+                f"You MUST write {artifact_name} before running out of calls. "
                 "Write the file as soon as you have enough data — do NOT explore further.\n\n"
                 f"### Previous Findings\n"
                 f"Use these findings to skip re-discovery. Fill any gaps and write the output file.\n\n"
@@ -901,38 +1121,30 @@ def _invoke_site_analyzer(
             original_content = messages[0].content
             messages = [HumanMessage(content=augmented + original_content)]
 
-        _log_agent_context(state, "site-analyzer", messages)
-        agent = create_site_analyzer(site_slug=slug)
-        agent_cfg = _agent_config(config, "site_analyzer")
-        hb = _start_heartbeat(job_id, "site-analyzer")
-        result = agent.invoke({"messages": messages}, config=agent_cfg)
+        _log_agent_context(state, display_name, messages)
+        agent = agent_factory(site_slug=slug)
+        agent_cfg = _agent_config(config, phase)
+        hb = _start_heartbeat(job_id, display_name)
+        result = _invoke_agent_with_timeout(agent, messages, agent_cfg, phase, job_id)
         _stop_heartbeat(hb)
-        _persist_agent_logs(state, result, "site-analyzer", config)
-        _notify_phase(job_id, "site_analyzer", "done")
+        _persist_agent_logs(state, result, display_name, config)
 
+        if artifact_fix_fn is not None:
+            artifact_fix_fn(slug)
+
+        root = _get_project_root()
         output_exists = os.path.isfile(
-            os.path.join(_get_project_root(), "workspace", slug, "site_analysis.json")
+            os.path.join(root, "workspace", slug, artifact_name)
         )
 
         if output_exists:
-            analysis = _read_json_artifact(
-                _get_project_root(), slug, "site_analysis.json"
-            )
-            update: dict[str, Any] = {
-                "messages": [],
-                "site_analysis": analysis,
-            }
-            connectivity = analysis.get("connectivity", {})
-            if connectivity:
-                product_url = state.get("product_url") or ""
-                update["probe_result"] = {
-                    "url": product_url,
-                    "connectivity": connectivity,
-                    "platform": analysis.get("platform", ""),
-                    "anti_bot_detected": analysis.get("anti_bot_detected", False),
-                }
-                update["probe_url"] = product_url
-            return update
+            _notify_phase(job_id, phase, "done")
+            analysis = _read_json_artifact(root, slug, artifact_name)
+            if on_success is not None:
+                _ret = on_success(analysis, state)
+                if _ret is not None:
+                    return _ret
+            return {"messages": [], state_key: analysis}
 
         tool_call_count = sum(
             1
@@ -941,10 +1153,15 @@ def _invoke_site_analyzer(
         )
         summary = _extract_previous_findings(result)
 
-        if recursion_limit < SITE_ANALYSIS_MAX_BUDGET and tool_call_count >= 5:
-            extended_limit = min(recursion_limit + 10, SITE_ANALYSIS_MAX_BUDGET)
+        # Auto-extend: if the agent ran out of calls BUT made real progress
+        # (≥ N tool calls), give it +10 calls once and re-invoke with a
+        # "write the file NOW" instruction. This catches the common case where
+        # the agent was one step away from writing the artifact.
+        if recursion_limit < budget_max and tool_call_count >= auto_extend_min_tool_calls:
+            extended_limit = min(recursion_limit + 10, budget_max)
             logger.info(
-                "_invoke_site_analyzer: auto-extending budget %d -> %d for job %s (made %d tool calls)",
+                "_run_budgeted_agent[%s]: auto-extending budget %d -> %d for job %s (made %d tool calls)",
+                phase,
                 recursion_limit,
                 extended_limit,
                 job_id,
@@ -955,113 +1172,175 @@ def _invoke_site_analyzer(
                 f"You ran out of calls but made {tool_call_count} tool calls (progress detected).\n"
                 f"You now have {extended_limit} calls total.\n\n"
                 "### CRITICAL INSTRUCTION\n"
-                "You MUST write site_analysis.json NOW. You have all the data you need. "
+                f"You MUST write {artifact_name} NOW. You have all the data you need. "
                 "Do NOT explore further — write the output file immediately.\n\n"
                 f"### Previous Findings\n{summary}\n\n---\n\n"
             )
-            original_content = build_site_analyzer_message(state)[0].content
+            original_content = message_builder(state)[0].content
             retry_messages = [HumanMessage(content=augmented + original_content)]
-            agent_cfg2 = _agent_config(config, "site_analyzer")
-            result = agent.invoke({"messages": retry_messages}, config=agent_cfg2)
-            _persist_agent_logs(state, result, "site-analyzer", config)
-            _notify_phase(job_id, "site_analyzer", "done")
+            agent_cfg2 = _agent_config(config, phase)
+            result = _invoke_agent_with_timeout(agent, retry_messages, agent_cfg2, phase, job_id)
+            _persist_agent_logs(state, result, display_name, config)
+
+            if artifact_fix_fn is not None:
+                artifact_fix_fn(slug)
 
             output_exists = os.path.isfile(
-                os.path.join(
-                    _get_project_root(), "workspace", slug, "site_analysis.json"
-                )
+                os.path.join(root, "workspace", slug, artifact_name)
             )
             if output_exists:
-                analysis = _read_json_artifact(
-                    _get_project_root(), slug, "site_analysis.json"
-                )
-                return {
-                    "messages": [],
-                    "site_analysis": analysis,
-                }
+                _notify_phase(job_id, phase, "done")
+                analysis = _read_json_artifact(root, slug, artifact_name)
+                if on_success is not None:
+                    _ret = on_success(analysis, state)
+                    if _ret is not None:
+                        return _ret
+                return {"messages": [], state_key: analysis}
             summary = _extract_previous_findings(result)
 
+        # No artifact after invoke (+ optional auto-extend). First time around,
+        # surface a budget-escalation interrupt; on retry, fall through to the
+        # missing-artifact gate (or proceed) below.
         if budget_retries < 1:
             logger.warning(
-                "_invoke_site_analyzer: site_analysis.json missing after run (job %s). "
+                "_run_budgeted_agent[%s]: %s missing after run (job %s). "
                 "Routing to human_approval for budget escalation.",
+                phase,
+                artifact_name,
                 job_id,
             )
-            options = [
-                "Retry with higher budget (50 calls)",
-                "Continue anyway",
-                "Cancel",
-            ]
             return Command(
                 update={
                     "messages": [],
-                    "interrupt_reason": "budget_exhausted_site",
-                    "interrupt_message": (
-                        f"Site analysis did not complete — the agent used its call budget "
-                        f"({SITE_ANALYSIS_BUDGET} calls) without writing site_analysis.json. "
-                        f"This site may be complex. Choose how to proceed."
-                    ),
-                    "interrupt_options": options,
-                    "interrupt_decisions": options_to_decisions(options),
+                    "interrupt_reason": budget_exhausted_reason,
+                    "interrupt_message": budget_exhausted_message,
+                    "interrupt_options": budget_exhausted_options,
+                    "interrupt_decisions": options_to_decisions(budget_exhausted_options),
                     "budget_retry_count": budget_retries,
                     "budget_retry_summary": summary,
                 },
                 goto="human_approval",
             )
 
-        site_retries = state.get("site_analysis_retries", 0) + 1
-        if site_retries < MAX_OUTER_RETRIES:
+        if missing_artifact_reason is not None:
+            retries_now = int(state.get(missing_retries_state_key, 0)) + 1
+            if retries_now < MAX_OUTER_RETRIES:
+                logger.warning(
+                    "_run_budgeted_agent[%s]: still no output (job %s, retries=%d). Offering redo.",
+                    phase,
+                    job_id,
+                    retries_now,
+                )
+                options = [
+                    missing_redo_label,
+                    missing_skip_label,
+                    "Cancel entire job",
+                ]
+                return Command(
+                    update={
+                        "messages": [],
+                        "interrupt_reason": missing_artifact_reason,
+                        "interrupt_message": missing_message.format(summary=summary[:500]),
+                        "interrupt_options": options,
+                        "interrupt_decisions": options_to_decisions(options),
+                        "budget_retry_count": budget_retries,
+                        "budget_retry_summary": summary,
+                        missing_retries_state_key: retries_now,
+                    },
+                    goto="human_approval",
+                )
+
             logger.warning(
-                "_invoke_site_analyzer: still no output (job %s, site_retries=%d). Offering redo.",
+                "_run_budgeted_agent[%s]: still no output after %d retries (job %s). Proceeding.",
+                phase,
+                retries_now,
                 job_id,
-                site_retries,
             )
-            options = [
-                "Redo site analysis",
-                "Continue without site analysis",
-                "Cancel entire job",
-            ]
-            return Command(
-                update={
-                    "messages": [],
-                    "interrupt_reason": "missing_artifact_site",
-                    "interrupt_message": (
-                        f"Site analysis could not produce site_analysis.json after extended attempts. "
-                        f"The agent explored the site but didn't write the output file.\n\n"
-                        f"Previous findings summary:\n{summary[:500]}\n\n"
-                        f"Choose how to proceed."
-                    ),
-                    "interrupt_options": options,
-                    "interrupt_decisions": options_to_decisions(options),
-                    "budget_retry_count": budget_retries,
-                    "budget_retry_summary": summary,
-                    "site_analysis_retries": site_retries,
-                },
-                goto="human_approval",
-            )
+            return {
+                "messages": [],
+                missing_retries_state_key: retries_now,
+            }
 
+        # Navigation has no missing-artifact gate (Wave 1 removed
+        # missing_artifact_navigation) — proceed with whatever we have.
         logger.warning(
-            "_invoke_site_analyzer: still no output after %d retries (job %s). Proceeding.",
-            site_retries,
+            "_run_budgeted_agent[%s]: still no output after retries (job %s). Proceeding.",
+            phase,
             job_id,
         )
-        return {
-            "messages": [],
-            "site_analysis_retries": site_retries,
-        }
+        return {"messages": []}
     except Exception:
-        _notify_phase(job_id, "site_analyzer", "failed")
+        _notify_phase(job_id, phase, "failed")
         raise
     finally:
         clear_tool_context()
+
+
+NAVIGATION_ANALYSIS_BUDGET = 40
+NAVIGATION_ANALYSIS_BUDGET_EXTENDED = 60
+NAVIGATION_ANALYSIS_MAX_BUDGET = 60
+
+
+@_with_api_retry
+def _invoke_site_analyzer(
+    state: ScrapeState, config: RunnableConfig
+) -> dict[str, Any] | Command:
+    def _on_success(analysis: dict, st: ScrapeState):
+        update: dict[str, Any] = {"messages": [], "site_analysis": analysis}
+        connectivity = analysis.get("connectivity", {})
+        if connectivity:
+            product_url = st.get("product_url") or ""
+            update["probe_result"] = {
+                "url": product_url,
+                "connectivity": connectivity,
+                "platform": analysis.get("platform", ""),
+                "anti_bot_detected": analysis.get("anti_bot_detected", False),
+            }
+            update["probe_url"] = product_url
+        return update
+
+    return _run_budgeted_agent(
+        state,
+        config,
+        phase="site_analyzer",
+        display_name="site-analyzer",
+        agent_factory=create_site_analyzer,
+        message_builder=build_site_analyzer_message,
+        artifact_name="site_analysis.json",
+        state_key="site_analysis",
+        budget=SITE_ANALYSIS_BUDGET,
+        budget_extended=SITE_ANALYSIS_BUDGET_EXTENDED,
+        budget_max=SITE_ANALYSIS_MAX_BUDGET,
+        budget_exhausted_reason="budget_exhausted_site",
+        budget_exhausted_options=[
+            "Retry with higher budget (50 calls)",
+            "Continue anyway",
+            "Cancel",
+        ],
+        budget_exhausted_message=(
+            f"Site analysis did not complete — the agent used its call budget "
+            f"({SITE_ANALYSIS_BUDGET} calls) without writing site_analysis.json. "
+            f"This site may be complex. Choose how to proceed."
+        ),
+        missing_artifact_reason="missing_artifact_site",
+        missing_retries_state_key="site_analysis_retries",
+        missing_redo_label="Redo site analysis",
+        missing_skip_label="Continue without site analysis",
+        missing_message=(
+            "Site analysis could not produce site_analysis.json after extended attempts. "
+            "The agent explored the site but didn't write the output file.\n\n"
+            "Previous findings summary:\n{summary}\n\n"
+            "Choose how to proceed."
+        ),
+        auto_extend_min_tool_calls=5,
+        on_success=_on_success,
+    )
 
 
 @_with_api_retry
 def _invoke_product_analyzer(
     state: ScrapeState, config: RunnableConfig
 ) -> dict[str, Any] | Command:
-    job_id = state.get("job_id", 0)
-    slug = state.get("site_slug", "")
     # Re-map mode: route_after_testing sent us here because code_tester flagged a
     # MAPPING failure (test_report.remediation.target == "mapping"). After the
     # agent re-maps the failed fields, route straight to code_writer (skipping
@@ -1074,588 +1353,586 @@ def _invoke_product_analyzer(
     if is_remap:
         logger.info(
             "_invoke_product_analyzer: RE-MAP mode (job %s) — fields %s",
-            job_id, _pa_remediation.get("fields"),
+            state.get("job_id", 0),
+            _pa_remediation.get("fields"),
         )
-    is_budget_retry = state.get("interrupt_reason") == "budget_exhausted_product"
-    is_missing_artifact = state.get("interrupt_reason") == "missing_artifact_product"
-    budget_retries = (
-        state.get("budget_retry_count", 0)
-        + (1 if is_budget_retry else 0)
-        + (1 if is_missing_artifact else 0)
-    )
-    recursion_limit = (
-        PRODUCT_ANALYSIS_BUDGET_EXTENDED
-        if budget_retries > 0
-        else PRODUCT_ANALYSIS_BUDGET
-    )
-    _notify_phase(job_id, "product_analyzer", "running")
-    set_tool_context(dict(state), agent_name="product_analyzer")
-    try:
-        logger.info(
-            "_invoke_product_analyzer: starting (job %s, budget=%d, retry=%d)",
-            job_id,
-            recursion_limit,
-            budget_retries,
-        )
-        messages = build_product_analyzer_message(state)
 
-        if budget_retries > 0:
-            previous_summary = state.get("budget_retry_summary", "")
-            augmented = (
-                "## BUDGET EXTENSION\n"
-                f"Previous analysis ran out of the call budget. "
-                f"You now have {recursion_limit} calls.\n\n"
-                "### CRITICAL INSTRUCTION\n"
-                "You MUST write product_analysis.json before running out of calls. "
-                "Write the file as soon as you have enough data — do NOT explore further.\n\n"
-                f"### Previous Findings\n"
-                f"Use these findings to skip re-discovery. Fill any gaps and write the output file.\n\n"
-                f"{previous_summary}\n\n"
-                f"---\n\n"
+    def _on_success(analysis: dict, st: ScrapeState):
+        # Anti-bot ⇒ playwright (cloak). KEPT: code_writer otherwise picks the
+        # discovered API (which Akamai also guards → 400). Gated by _PATCHES_ENABLED.
+        # Applied in both the primary and auto-extend success paths (normalised
+        # by _run_budgeted_agent): previously the auto-extend path skipped this,
+        # leaking an un-enforced strategy when the second invoke produced output.
+        if _PATCHES_ENABLED:
+            _enforce_anti_bot_strategy(
+                analysis, st.get("site_slug", ""), "product_analysis.json"
             )
-            original_content = messages[0].content
-            messages = [HumanMessage(content=augmented + original_content)]
-
-        _log_agent_context(state, "product-analyzer", messages)
-        agent = create_product_analyzer(site_slug=slug)
-        agent_cfg = _agent_config(config, "product_analyzer")
-        hb = _start_heartbeat(job_id, "product-analyzer")
-        result = agent.invoke({"messages": messages}, config=agent_cfg)
-        _stop_heartbeat(hb)
-        _persist_agent_logs(state, result, "product-analyzer", config)
-        _notify_phase(job_id, "product_analyzer", "done")
-
-        _fix_json_artifact(slug, "product_analysis.json")
-
-        output_exists = os.path.isfile(
-            os.path.join(
-                _get_project_root(), "workspace", slug, "product_analysis.json"
-            )
-        )
-
-        if output_exists:
-            analysis = _read_json_artifact(
-                _get_project_root(), slug, "product_analysis.json"
-            )
-            # Anti-bot ⇒ playwright (cloak). KEPT: code_writer otherwise picks the
-            # discovered API (which Akamai also guards → 400). Gated by _PATCHES_ENABLED.
-            if _PATCHES_ENABLED:
-                analysis = _enforce_anti_bot_strategy(analysis, slug, "product_analysis.json")
-            update: dict[str, Any] = {
-                "messages": [],
-                "product_analysis": analysis,
-            }
-            if is_remap:
-                remap_count = int(state.get("remap_count", 0) or 0) + 1
-                logger.info(
-                    "_invoke_product_analyzer: re-mapped failed fields → code_writer "
-                    "(remap %d, job %s)", remap_count, job_id,
-                )
-                update["remap_count"] = remap_count
-                return Command(goto="code_writer", update=update)
-            return update
-
-        tool_call_count = sum(
-            1
-            for m in (result.get("messages") or [])
-            if m.__class__.__name__ == "ToolMessage"
-        )
-        summary = _extract_previous_findings(result)
-
-        if recursion_limit < PRODUCT_ANALYSIS_MAX_BUDGET and tool_call_count >= 5:
-            extended_limit = min(recursion_limit + 10, PRODUCT_ANALYSIS_MAX_BUDGET)
+        if is_remap:
+            remap_count = int(st.get("remap_count", 0) or 0) + 1
             logger.info(
-                "_invoke_product_analyzer: auto-extending budget %d -> %d for job %s (made %d tool calls)",
-                recursion_limit,
-                extended_limit,
-                job_id,
-                tool_call_count,
+                "_invoke_product_analyzer: re-mapped failed fields → code_writer "
+                "(remap %d, job %s)",
+                remap_count,
+                st.get("job_id", 0),
             )
-            augmented = (
-                "## BUDGET AUTO-EXTENSION\n"
-                f"You ran out of calls but made {tool_call_count} tool calls (progress detected).\n"
-                f"You now have {extended_limit} calls total.\n\n"
-                "### CRITICAL INSTRUCTION\n"
-                "You MUST write product_analysis.json NOW. You have all the data you need. "
-                "Do NOT explore further — write the output file immediately.\n\n"
-                f"### Previous Findings\n{summary}\n\n---\n\n"
-            )
-            original_content = build_product_analyzer_message(state)[0].content
-            retry_messages = [HumanMessage(content=augmented + original_content)]
-            agent_cfg2 = _agent_config(config, "product_analyzer")
-            result = agent.invoke({"messages": retry_messages}, config=agent_cfg2)
-            _persist_agent_logs(state, result, "product-analyzer", config)
-            _notify_phase(job_id, "product_analyzer", "done")
-
-            _fix_json_artifact(slug, "product_analysis.json")
-
-            output_exists = os.path.isfile(
-                os.path.join(
-                    _get_project_root(), "workspace", slug, "product_analysis.json"
-                )
-            )
-            if output_exists:
-                analysis = _read_json_artifact(
-                    _get_project_root(), slug, "product_analysis.json"
-                )
-                if is_remap:
-                    remap_count = int(state.get("remap_count", 0) or 0) + 1
-                    logger.info(
-                        "_invoke_product_analyzer: re-mapped (retry path) → code_writer "
-                        "(remap %d, job %s)", remap_count, job_id,
-                    )
-                    return Command(
-                        goto="code_writer",
-                        update={"messages": [], "product_analysis": analysis, "remap_count": remap_count},
-                    )
-                return {
+            return Command(
+                goto="code_writer",
+                update={
                     "messages": [],
                     "product_analysis": analysis,
-                }
-            summary = _extract_previous_findings(result)
-
-        if budget_retries < 1:
-            logger.warning(
-                "_invoke_product_analyzer: product_analysis.json missing after run (job %s). "
-                "Routing to human_approval for budget escalation.",
-                job_id,
-            )
-            options = [
-                "Retry with higher budget (70 calls)",
-                "Continue anyway",
-                "Cancel",
-            ]
-            return Command(
-                update={
-                    "messages": [],
-                    "interrupt_reason": "budget_exhausted_product",
-                    "interrupt_message": (
-                        f"Product analysis did not complete — the agent used its call budget "
-                        f"({PRODUCT_ANALYSIS_BUDGET} calls) without writing product_analysis.json. "
-                        f"This product page may be complex. Choose how to proceed."
-                    ),
-                    "interrupt_options": options,
-                    "interrupt_decisions": options_to_decisions(options),
-                    "budget_retry_count": budget_retries,
-                    "budget_retry_summary": summary,
+                    "remap_count": remap_count,
                 },
-                goto="human_approval",
             )
+        return {"messages": [], "product_analysis": analysis}
 
-        product_retries = state.get("product_analysis_retries", 0) + 1
-        if product_retries < MAX_OUTER_RETRIES:
-            logger.warning(
-                "_invoke_product_analyzer: still no output (job %s, product_retries=%d). Offering redo.",
-                job_id,
-                product_retries,
-            )
-            options = [
-                "Redo product analysis",
-                "Continue without product analysis",
-                "Cancel entire job",
-            ]
-            return Command(
-                update={
-                    "messages": [],
-                    "interrupt_reason": "missing_artifact_product",
-                    "interrupt_message": (
-                        f"Product analysis could not produce product_analysis.json after extended attempts. "
-                        f"The agent explored the page but didn't write the output file.\n\n"
-                        f"Previous findings summary:\n{summary[:500]}\n\n"
-                        f"Choose how to proceed."
-                    ),
-                    "interrupt_options": options,
-                    "interrupt_decisions": options_to_decisions(options),
-                    "budget_retry_count": budget_retries,
-                    "budget_retry_summary": summary,
-                    "product_analysis_retries": product_retries,
-                },
-                goto="human_approval",
-            )
-
-        logger.warning(
-            "_invoke_product_analyzer: still no output after %d retries (job %s). Proceeding.",
-            product_retries,
-            job_id,
-        )
-        return {
-            "messages": [],
-            "product_analysis_retries": product_retries,
-        }
-    except Exception:
-        _notify_phase(job_id, "product_analyzer", "failed")
-        raise
-    finally:
-        clear_tool_context()
+    return _run_budgeted_agent(
+        state,
+        config,
+        phase="product_analyzer",
+        display_name="product-analyzer",
+        agent_factory=create_product_analyzer,
+        message_builder=build_product_analyzer_message,
+        artifact_name="product_analysis.json",
+        state_key="product_analysis",
+        budget=PRODUCT_ANALYSIS_BUDGET,
+        budget_extended=PRODUCT_ANALYSIS_BUDGET_EXTENDED,
+        budget_max=PRODUCT_ANALYSIS_MAX_BUDGET,
+        budget_exhausted_reason="budget_exhausted_product",
+        budget_exhausted_options=[
+            "Retry with higher budget (70 calls)",
+            "Continue anyway",
+            "Cancel",
+        ],
+        budget_exhausted_message=(
+            f"Product analysis did not complete — the agent used its call budget "
+            f"({PRODUCT_ANALYSIS_BUDGET} calls) without writing product_analysis.json. "
+            f"This product page may be complex. Choose how to proceed."
+        ),
+        missing_artifact_reason="missing_artifact_product",
+        missing_retries_state_key="product_analysis_retries",
+        missing_redo_label="Redo product analysis",
+        missing_skip_label="Continue without product analysis",
+        missing_message=(
+            "Product analysis could not produce product_analysis.json after extended attempts. "
+            "The agent explored the page but didn't write the output file.\n\n"
+            "Previous findings summary:\n{summary}\n\n"
+            "Choose how to proceed."
+        ),
+        auto_extend_min_tool_calls=5,
+        artifact_fix_fn=lambda slug: _fix_json_artifact(slug, "product_analysis.json"),
+        on_success=_on_success,
+    )
 
 
-NAVIGATION_ANALYSIS_BUDGET = 40
-NAVIGATION_ANALYSIS_BUDGET_EXTENDED = 60
-NAVIGATION_ANALYSIS_MAX_BUDGET = 60
-
-
-@_with_api_retry
-def _invoke_navigation_agent(
+def _invoke_navigation_traverse(
     state: ScrapeState, config: RunnableConfig
 ) -> dict[str, Any] | Command:
+    """Graph wrapper for the browser-driven navigation traversal node.
+
+    Replaces the 3-node navigation_explore → navigation_agent → navigation_synthesize
+    pipeline with a single browser_traverse call (LLM-driven MCP browser walk from
+    the homepage to a listing page). The TraversalResult is converted to the same
+    navigation_analysis dict shape that downstream nodes (product_analyzer, etc.)
+    already consume. Falls back to the archived navigate_explore + navigate_synthesize
+    when the MCP browser is unavailable.
+    """
     job_id = state.get("job_id", 0)
     slug = state.get("site_slug", "")
-    is_budget_retry = state.get("interrupt_reason") == "budget_exhausted_navigation"
-    is_missing_artifact = state.get("interrupt_reason") == "missing_artifact_navigation"
-    budget_retries = (
-        state.get("budget_retry_count", 0)
-        + (1 if is_budget_retry else 0)
-        + (1 if is_missing_artifact else 0)
-    )
-    recursion_limit = (
-        NAVIGATION_ANALYSIS_BUDGET_EXTENDED
-        if budget_retries > 0
-        else NAVIGATION_ANALYSIS_BUDGET
-    )
-    _notify_phase(job_id, "navigation_agent", "running")
-    set_tool_context(dict(state), agent_name="navigation_agent")
+    url = state.get("url", "")
+    content_type = state.get("page_type", "product")
+    query = state.get("search_criteria", "") or ""
+
+    _notify_phase(job_id, "browser_traverse", "running")
     try:
-        logger.info(
-            "_invoke_navigation_agent: starting (job %s, budget=%d, retry=%d)",
-            job_id,
-            recursion_limit,
-            budget_retries,
-        )
-        messages = build_navigation_agent_message(state)
+        from experimental.nav_traversal.traversal import browser_traverse, traverse
 
-        if budget_retries > 0:
-            previous_summary = state.get("budget_retry_summary", "")
-            augmented = (
-                "## BUDGET EXTENSION\n"
-                f"Previous navigation analysis ran out of the call budget. "
-                f"You now have {recursion_limit} calls.\n\n"
-                "### CRITICAL INSTRUCTION\n"
-                "You MUST write navigation_analysis.json before running out of calls. "
-                "Write the file as soon as you have enough data — do NOT explore further.\n\n"
-                f"### Previous Findings\n"
-                f"Use these findings to skip re-discovery. Fill any gaps and write the output file.\n\n"
-                f"{previous_summary}\n\n"
-                f"---\n\n"
-            )
-            original_content = messages[0].content
-            messages = [HumanMessage(content=augmented + original_content)]
+        result = browser_traverse(url, content_type, query)
 
-        _log_agent_context(state, "navigation-agent", messages)
-        agent = create_navigation_agent(site_slug=slug)
-        agent_cfg = _agent_config(config, "navigation_agent")
-        hb = _start_heartbeat(job_id, "navigation-agent")
-        result = agent.invoke({"messages": messages}, config=agent_cfg)
-        _stop_heartbeat(hb)
-        _persist_agent_logs(state, result, "navigation-agent", config)
-        _notify_phase(job_id, "navigation_agent", "done")
-
-        output_exists = os.path.isfile(
-            os.path.join(
-                _get_project_root(), "workspace", slug, "navigation_analysis.json"
-            )
-        )
-
-        if output_exists:
-            analysis = _read_json_artifact(
-                _get_project_root(), slug, "navigation_analysis.json"
-            )
-            return {
-                "messages": [],
-                "navigation_analysis": analysis,
-            }
-
-        tool_call_count = sum(
-            1
-            for m in (result.get("messages") or [])
-            if m.__class__.__name__ == "ToolMessage"
-        )
-        summary = _extract_previous_findings(result)
-
-        if recursion_limit < NAVIGATION_ANALYSIS_MAX_BUDGET and tool_call_count >= 3:
-            extended_limit = min(recursion_limit + 10, NAVIGATION_ANALYSIS_MAX_BUDGET)
+        # MCP unavailable → fall back to the archived deterministic explorer +
+        # synthesizer (imported lazily here so the fallback path is self-contained).
+        if "MCP" in (result.notes or ""):
             logger.info(
-                "_invoke_navigation_agent: auto-extending budget %d -> %d for job %s (made %d tool calls)",
-                recursion_limit,
-                extended_limit,
-                job_id,
-                tool_call_count,
+                "browser_traverse: MCP unavailable (%s) — falling back to "
+                "navigate_explore + navigate_synthesize (job %s)",
+                result.notes, job_id,
             )
-            augmented = (
-                "## BUDGET AUTO-EXTENSION\n"
-                f"You ran out of calls but made {tool_call_count} tool calls (progress detected).\n"
-                f"You now have {extended_limit} calls total.\n\n"
-                "### CRITICAL INSTRUCTION\n"
-                "You MUST write navigation_analysis.json NOW. You have all the data you need. "
-                "Do NOT explore further — write the output file immediately.\n\n"
-                f"### Previous Findings\n{summary}\n\n---\n\n"
-            )
-            original_content = build_navigation_agent_message(state)[0].content
-            retry_messages = [HumanMessage(content=augmented + original_content)]
-            agent_cfg2 = _agent_config(config, "navigation_agent")
-            result = agent.invoke({"messages": retry_messages}, config=agent_cfg2)
-            _persist_agent_logs(state, result, "navigation-agent", config)
-            _notify_phase(job_id, "navigation_agent", "done")
+            from .nodes.navigate_explore import navigate_explore
+            from .nodes.navigate_synthesize import navigate_synthesize
 
-            output_exists = os.path.isfile(
-                os.path.join(
-                    _get_project_root(), "workspace", slug, "navigation_analysis.json"
+            explore_result = navigate_explore(dict(state), config)
+            if isinstance(explore_result, dict):
+                state.update(explore_result)
+            synth_result = navigate_synthesize(dict(state), config)
+            _notify_phase(job_id, "browser_traverse", "done")
+            return synth_result if isinstance(synth_result, dict) else {"messages": []}
+
+        # browser_traverse didn't reach the goal (but MCP was available) —
+        # fall back to the HTTP-first traverse() which handles form-driven
+        # sites (locumtenens QuickSearch) and API discovery (aya) that the
+        # LLM-driven browser approach couldn't complete within its budget.
+        if not result.reached:
+            logger.info(
+                "browser_traverse: didn't reach goal (%s) — falling back to "
+                "HTTP traverse() (job %s)",
+                result.notes, job_id,
+            )
+            fb_result = traverse(url, content_type, query)
+            if fb_result.reached:
+                result = fb_result  # use the fallback's result
+                logger.info(
+                    "HTTP traverse fallback reached goal: %s (job %s)",
+                    result.goal_url, job_id,
                 )
-            )
-            if output_exists:
-                analysis = _read_json_artifact(
-                    _get_project_root(), slug, "navigation_analysis.json"
+            else:
+                logger.info(
+                    "HTTP traverse also didn't reach goal — using best partial (job %s)",
+                    job_id,
                 )
-                return {
-                    "messages": [],
-                    "navigation_analysis": analysis,
-                }
-            summary = _extract_previous_findings(result)
 
-        if budget_retries < 1:
-            logger.warning(
-                "_invoke_navigation_agent: navigation_analysis.json missing after run (job %s). "
-                "Routing to human_approval for budget escalation.",
-                job_id,
-            )
-            options = [
-                "Retry with higher budget",
-                "Continue anyway",
-                "Cancel",
-            ]
-            return Command(
-                update={
-                    "messages": [],
-                    "interrupt_reason": "budget_exhausted_navigation",
-                    "interrupt_message": (
-                        f"Navigation analysis did not complete — the agent used its call budget "
-                        f"({NAVIGATION_ANALYSIS_BUDGET} calls) without writing navigation_analysis.json. "
-                        f"This site may have complex navigation. Choose how to proceed."
-                    ),
-                    "interrupt_options": options,
-                    "interrupt_decisions": options_to_decisions(options),
-                    "budget_retry_count": budget_retries,
-                    "budget_retry_summary": summary,
-                },
-                goto="human_approval",
-            )
+        # Extract item URL examples from the goal page so product_analyzer has
+        # ready-made sample URLs (avoids ~6.5 min of auto-discovery). Falls back
+        # to an empty list if the fetch or parse fails — non-fatal.
+        url_examples: list[str] = []
+        if result.goal_url:
+            try:
+                from experimental.nav_traversal.traversal import _default_fetch, extract_links
 
-        logger.warning(
-            "_invoke_navigation_agent: still no output after retries (job %s). Proceeding.",
-            job_id,
-        )
-        return {
-            "messages": [],
+                page_resp = _default_fetch(result.goal_url)
+                if page_resp.get("ok"):
+                    links = extract_links(page_resp.get("text", ""), result.goal_url)
+                    url_examples = [l["href"] for l in links[:5] if l.get("href")]
+            except Exception as exc:
+                logger.info(
+                    "browser_traverse: url_examples extraction failed (%s)", exc
+                )
+            if url_examples:
+                logger.info(
+                    "browser_traverse: extracted %d url_examples from goal page (job %s)",
+                    len(url_examples), job_id,
+                )
+
+        analysis = {
+            "discovery_method": "browser_traverse" if result.reached else "fallback",
+            "search": {
+                "working_url": result.goal_url,
+                "has_search": True,
+                # propagate form-POST replay info so code_writer can replay the search
+                "form_method": result.goal_method if hasattr(result, "goal_method") else "GET",
+                "form_data": dict(result.goal_data) if hasattr(result, "goal_data") and result.goal_data else {},
+                "form_action": result.goal_request_url if hasattr(result, "goal_request_url") else "",
+            },
+            "item_links": {
+                "url_examples": url_examples,
+                # propagate signals so code_writer has SOMETHING to work with
+                "signals": result.signals if hasattr(result, "signals") else {},
+            },
+            "data_source": getattr(result, "mechanism", "") or "unknown",
+            # Bug fix: use "url" key (what subagents.py:2208 checks), not "api_url"
+            "api_endpoint": {"url": result.api["url"]} if result.api and isinstance(result.api, dict) and result.api.get("url") else (result.api or {}),
+            "rendering_verified": "browser",
+            # propagate the full path so downstream can see how we got here
+            "traversal_path": result.path[:8] if hasattr(result, "path") else [],
         }
-    except Exception:
-        _notify_phase(job_id, "navigation_agent", "failed")
-        raise
-    finally:
-        clear_tool_context()
 
-
-def _invoke_navigation_explore(
-    state: ScrapeState, config: RunnableConfig
-) -> dict[str, Any] | Command:
-    """Graph wrapper for the deterministic navigation exploration node."""
-    from .nodes.navigate_explore import navigate_explore as _explore
-
-    job_id = state.get("job_id", 0)
-    _notify_phase(job_id, "navigation_explore", "running")
-    try:
-        result = _explore(dict(state), config)
-        _notify_phase(job_id, "navigation_explore", "done")
-
-        if isinstance(result, dict) and result.get("playwright_unavailable"):
-            logger.info(
-                "_invoke_navigation_explore: Playwright unavailable, "
-                "interrupting for user decision (job %s)",
-                job_id,
-            )
-            options = ["Use probe_html (no interaction)", "Retry Playwright", "Cancel"]
-            return Command(
-                update={
-                    "navigation_findings": result.get("navigation_findings"),
-                    "interrupt_reason": "playwright_unavailable",
-                    "interrupt_message": (
-                        "Playwright MCP is unavailable but the site is NOT Akamai-protected. "
-                        "The explore fell back to HTTP but may have missed JS-rendered content.\n\n"
-                        "Options:\n"
-                        "- **Use probe_html**: Proceed with single-page fetch (no clicking/scrolling)\n"
-                        "- **Retry Playwright**: Retry — check that the browser_service container is running\n"
-                        "- **Cancel**: Abort this job"
-                    ),
-                    "interrupt_options": options,
-                    "interrupt_decisions": options_to_decisions(options),
-                },
-                goto="human_approval",
-            )
-
-        # Handoff to the LLM navigation_agent when the deterministic explorer
-        # detected a search form (classic_search) but couldn't get many real item
-        # links from it — e.g. a JS/validation-gated POST form (locumtenens
-        # QuickSearch: required-specialty + decorative-vs-real submit button). The
-        # agent drives the form with browser tools + the navigation-patterns skill.
-        # Threshold is generous (< 30) because listing_page.product_links can be
-        # inflated by category/nav noise; classic_search detection (a multi-select
-        # form was found) is the real signal of a form-driven job board.
-        if isinstance(result, dict):
-            # navigate_explore has inconsistent return shapes — some paths return
-            # {"navigation_findings": findings, ...}, others return the bare
-            # findings dict. Handle both.
-            _f = result.get("navigation_findings") or result
-            _lp = _f.get("listing_page") or {}
-            _pl = len(_lp.get("product_links") or [])
-            _hn = _f.get("homepage_nav") or {}
-            _form = (
-                _f.get("classic_search")
-                or _hn.get("classic_search")
-                or _lp.get("classic_search")
-            )
-            # Anti-bot guard: don't hand off to navigation_agent for anti-bot sites —
-            # its MCP browser isn't cloak-enabled, so Akamai would block it. Anti-bot
-            # sites (e.g. calvklein) find few links at analysis time (truncated
-            # /render) but the RUNTIME scraper (cloak) gets the products, so a low
-            # analysis-time count is expected + not a failure there.
-            _probe = state.get("probe_result") or {}
-            _ab = _probe.get("anti_bot") if isinstance(_probe, dict) else None
-            _conn = _probe.get("connectivity") if isinstance(_probe, dict) else None
-            _meth = (
-                (_probe.get("method") if isinstance(_probe, dict) else "")
-                or (_conn.get("method_that_worked") if isinstance(_conn, dict) else "")
-                or ""
-            )
-            _anti_bot = bool(
-                state.get("anti_bot_detected")
-                or (isinstance(_ab, dict) and _ab.get("detected"))
-                or str(_meth).startswith(("uc_chrome", "cloak"))
-            )
-            # Hand off when navigate_explore clearly failed to discover the catalog:
-            # either a form was detected but yielded few links (form not driven well),
-            # OR very few links were found at all (explore missed the listing surface).
-            # The agent then decides HOW to recover — it may drive a form, re-capture
-            # a backend API (via playwright_browser_network_requests), or find SEO
-            # listing pages. It reads navigation_findings.json first, so a backend API
-            # navigate_explore already captured is visible to it. (anti_bot guard is a
-            # hard limit: the agent's MCP browser isn't cloak-enabled.)
-            if not _anti_bot and ((_form and _pl < 30) or (_pl < 5)):
-                logger.info(
-                    "_invoke_navigation_explore: only %d product link(s) found "
-                    "(form_detected=%s, anti_bot=%s) — handing off to navigation_agent (job %s)",
-                    _pl,
-                    bool(_form),
-                    _anti_bot,
-                    job_id,
-                )
-                return Command(
-                    update={
-                        "navigation_findings": _f,
-                        "handoff_reason": "form_driving_needed",
-                    },
-                    goto="navigation_agent",
-                )
-
-        return result
-    except Exception as exc:
-        logger.exception("_invoke_navigation_explore failed (job %s): %s", job_id, exc)
-        _notify_phase(job_id, "navigation_explore", "failed")
-        return {}
-
-
-def _invoke_navigation_synthesize(
-    state: ScrapeState, config: RunnableConfig
-) -> dict[str, Any] | Command:
-    """Graph wrapper for the navigation synthesis node."""
-    from .nodes.navigate_synthesize import navigate_synthesize as _synthesize
-
-    job_id = state.get("job_id", 0)
-
-    # If the LLM navigation_agent already wrote navigation_analysis.json (it runs
-    # on the form-driven handoff path), skip re-synthesizing from raw findings —
-    # the agent's structured output IS the analysis. Synthesize would otherwise
-    # overwrite the agent's work with a re-reading of the (sparse) raw findings.
-    try:
-        slug = state.get("site_slug", "")
-        na_path = os.path.join(_get_project_root(), "workspace", slug, "navigation_analysis.json")
-        if state.get("handoff_reason") and os.path.isfile(na_path):
-            analysis = _read_json_artifact(_get_project_root(), slug, "navigation_analysis.json")
-            if analysis:
-                logger.info(
-                    "_invoke_navigation_synthesize: navigation_analysis.json already "
-                    "written by navigation_agent (handoff) — skipping synthesis (job %s)",
-                    job_id,
-                )
-                _notify_phase(job_id, "navigation_synthesize", "done")
-                return {"messages": [], "navigation_analysis": analysis}
-    except Exception as exc:
-        logger.warning("_invoke_navigation_synthesize: skip-check failed: %s", exc)
-
-    _notify_phase(job_id, "navigation_synthesize", "running")
-    set_tool_context(dict(state), agent_name="navigation_synthesize")
-    try:
-        result = _synthesize(dict(state), config)
-        _notify_phase(job_id, "navigation_synthesize", "done")
-
-        # SOURCE FIX: navigation_synthesize (LLM) sometimes drops the product
-        # URLs discovered by navigation_explore. The product links are in
-        # navigation_findings.json > listing_page.product_links — merge them into
-        # navigation_analysis.json > item_links.urls if missing. This ensures
-        # code_writer has the correct URLs to build the scraper around, instead
-        # of generating broken discovery logic. [fix data flow at the source]
+        # Persist to workspace/{slug}/navigation_analysis.json
+        root = _get_project_root()
+        na_path = os.path.join(root, "workspace", slug, "navigation_analysis.json")
         try:
-            slug = state.get("site_slug", "")
-            root = _get_project_root()
-            nf_path = os.path.join(root, "workspace", slug, "navigation_findings.json")
-            na_path = os.path.join(root, "workspace", slug, "navigation_analysis.json")
-            if os.path.isfile(nf_path) and os.path.isfile(na_path):
-                import json as _json
-                nf = _json.load(open(nf_path))
-                na = _json.load(open(na_path))
-                # product URLs are nested in listing_page.product_links (list of dicts with 'href')
-                lp = nf.get("listing_page") or {}
-                _raw_links = lp.get("product_links") or []
-                product_urls = []
-                for _rl in _raw_links:
-                    if isinstance(_rl, str):
-                        product_urls.append(_rl)
-                    elif isinstance(_rl, dict) and _rl.get("href"):
-                        product_urls.append(_rl["href"])
-                if product_urls:
-                    il = na.get("item_links")
-                    if not isinstance(il, dict):
-                        il = {}
-                    existing = il.get("urls") or []
-                    # Filter to strings only (some items may be dicts)
-                    existing_str = [u for u in existing if isinstance(u, str)]
-                    product_str = [u for u in product_urls if isinstance(u, str)]
-                    if len(existing_str) < len(product_str):
-                        il["urls"] = list(dict.fromkeys(existing_str + product_str))
-                        na["item_links"] = il
-                        with open(na_path, "w") as f:
-                            _json.dump(na, f, indent=2, ensure_ascii=False)
-                        logger.info(
-                            "navigation_synthesize: merged %d product URLs from "
-                            "findings into analysis.item_links.urls (had %d)",
-                            len(product_urls), len(existing),
-                        )
-                        # ALSO update the state return value (result) so downstream
-                        # nodes (code_writer, etc.) see the URLs without needing to
-                        # re-read the file. This is the root-cause fix for the
-                        # state-loses-URLs bug that required the input_urls.json
-                        # workaround in _invoke_code_writer.
-                        if isinstance(result, dict):
-                            result["navigation_analysis"] = na
-        except Exception as exc_merge:
-            logger.warning("navigation_synthesize: URL merge failed: %s", exc_merge)
+            os.makedirs(os.path.dirname(na_path), exist_ok=True)
+            with open(na_path, "w", encoding="utf-8") as f:
+                json.dump(analysis, f, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning(
+                "browser_traverse: failed to write navigation_analysis.json: %s", exc
+            )
 
-        return result
+        _notify_phase(job_id, "browser_traverse", "done")
+        return {"navigation_analysis": analysis, "messages": []}
     except Exception as exc:
-        logger.exception(
-            "_invoke_navigation_synthesize failed (job %s): %s", job_id, exc
-        )
-        _notify_phase(job_id, "navigation_synthesize", "failed")
-        return {}
-    finally:
-        clear_tool_context()
+        logger.exception("_invoke_navigation_traverse failed (job %s): %s", job_id, exc)
+        _notify_phase(job_id, "browser_traverse", "failed")
+        return {"messages": []}
+
+
+# ═══ ARCHIVED NAVIGATION (replaced by browser_traverse) ═══
+# ARCHIVED @_with_api_retry
+# ARCHIVED def _invoke_navigation_agent(
+# ARCHIVED     state: ScrapeState, config: RunnableConfig
+# ARCHIVED ) -> dict[str, Any] | Command:
+# ARCHIVED     return _run_budgeted_agent(
+# ARCHIVED         state,
+# ARCHIVED         config,
+# ARCHIVED         phase="navigation_agent",
+# ARCHIVED         display_name="navigation-agent",
+# ARCHIVED         agent_factory=create_navigation_agent,
+# ARCHIVED         message_builder=build_navigation_agent_message,
+# ARCHIVED         artifact_name="navigation_analysis.json",
+# ARCHIVED         state_key="navigation_analysis",
+# ARCHIVED         budget=NAVIGATION_ANALYSIS_BUDGET,
+# ARCHIVED         budget_extended=NAVIGATION_ANALYSIS_BUDGET_EXTENDED,
+# ARCHIVED         budget_max=NAVIGATION_ANALYSIS_MAX_BUDGET,
+# ARCHIVED         budget_exhausted_reason="budget_exhausted_navigation",
+# ARCHIVED         budget_exhausted_options=[
+# ARCHIVED             "Retry with higher budget",
+# ARCHIVED             "Continue anyway",
+# ARCHIVED             "Cancel",
+# ARCHIVED         ],
+# ARCHIVED         budget_exhausted_message=(
+# ARCHIVED             f"Navigation analysis did not complete — the agent used its call budget "
+# ARCHIVED             f"({NAVIGATION_ANALYSIS_BUDGET} calls) without writing navigation_analysis.json. "
+# ARCHIVED             f"This site may have complex navigation. Choose how to proceed."
+# ARCHIVED         ),
+# ARCHIVED         missing_artifact_reason=None,
+# ARCHIVED         auto_extend_min_tool_calls=3,
+# ARCHIVED     )
+# ARCHIVED
+# ARCHIVED
+# ARCHIVED def _explore_findings_solid(findings: dict) -> bool:
+# ARCHIVED     """True when the deterministic explorer already found a real listing + data.
+# ARCHIVED
+# ARCHIVED     Used to decide whether to SKIP the heavy navigation_agent. "Solid" = a
+# ARCHIVED     working listing URL AND a real data signal: embedded-JSON blob, a captured
+# ARCHIVED     backend API endpoint, or >=10 real detail links. (Classic-search forms are
+# ARCHIVED     handled separately by ``_explore_has_classic_form`` — they still need the
+# ARCHIVED     agent to drive the form even when findings look solid.)
+# ARCHIVED     """
+# ARCHIVED     if not isinstance(findings, dict):
+# ARCHIVED         return False
+# ARCHIVED     lp = findings.get("listing_page") or {}
+# ARCHIVED     working_url = bool((lp.get("url") or "").strip())
+# ARCHIVED     ds = lp.get("data_source")
+# ARCHIVED     real_links = len(lp.get("product_links") or [])
+# ARCHIVED     has_api = bool(findings.get("api_endpoints") or lp.get("api_endpoints"))
+# ARCHIVED     solid_data = (
+# ARCHIVED         ds == "embedded_json"
+# ARCHIVED         or has_api
+# ARCHIVED         or (ds == "detail_links" and real_links >= 10)
+# ARCHIVED     )
+# ARCHIVED     return working_url and bool(solid_data)
+# ARCHIVED
+# ARCHIVED
+# ARCHIVED def _explore_has_classic_form(findings: dict) -> bool:
+# ARCHIVED     """True when explore detected a classic multi-select POST search form.
+# ARCHIVED
+# ARCHIVED     Those forms (e.g. locumtenens QuickSearch) need the agent's browser tools to
+# ARCHIVED     drive, so they trigger a navigation_agent handoff even when explore is solid.
+# ARCHIVED     """
+# ARCHIVED     if not isinstance(findings, dict):
+# ARCHIVED         return False
+# ARCHIVED     lp = findings.get("listing_page") or {}
+# ARCHIVED     hn = findings.get("homepage_nav") or {}
+# ARCHIVED     return bool(
+# ARCHIVED         findings.get("classic_search")
+# ARCHIVED         or (hn.get("classic_search") if isinstance(hn, dict) else None)
+# ARCHIVED         or (lp.get("classic_search") if isinstance(lp, dict) else None)
+# ARCHIVED     )
+# ARCHIVED
+# ARCHIVED
+# ARCHIVED def _navigation_handoff_decision(findings: dict, anti_bot: bool) -> tuple[bool, str | None]:
+# ARCHIVED     """Decide whether to hand off to the LLM navigation_agent after explore.
+# ARCHIVED
+# ARCHIVED     Returns ``(handoff, reason)``. ``handoff=False`` means SKIP the agent (explore
+# ARCHIVED     succeeded) and let ``navigation_synthesize`` build the analysis from findings.
+# ARCHIVED     Rules: never hand off for anti-bot (agent's MCP browser isn't cloak-enabled);
+# ARCHIVED     hand off when explore is NOT solid OR a classic POST form was detected.
+# ARCHIVED     """
+# ARCHIVED     if anti_bot:
+# ARCHIVED         return False, None
+# ARCHIVED     solid = _explore_findings_solid(findings)
+# ARCHIVED     form = _explore_has_classic_form(findings)
+# ARCHIVED     if (not solid) or form:
+# ARCHIVED         return True, ("form_driving_needed" if form else "explore_insufficient")
+# ARCHIVED     return False, None
+# ARCHIVED
+# ARCHIVED
+# ARCHIVED def _invoke_navigation_explore(
+# ARCHIVED     state: ScrapeState, config: RunnableConfig
+# ARCHIVED ) -> dict[str, Any] | Command:
+# ARCHIVED     """Graph wrapper for the deterministic navigation exploration node."""
+# ARCHIVED     from .nodes.navigate_explore import navigate_explore as _explore
+# ARCHIVED
+# ARCHIVED     job_id = state.get("job_id", 0)
+# ARCHIVED     _notify_phase(job_id, "navigation_explore", "running")
+# ARCHIVED     try:
+# ARCHIVED         result = _explore(dict(state), config)
+# ARCHIVED         _notify_phase(job_id, "navigation_explore", "done")
+# ARCHIVED
+# ARCHIVED         if isinstance(result, dict) and result.get("playwright_unavailable"):
+# ARCHIVED             logger.info(
+# ARCHIVED                 "_invoke_navigation_explore: Playwright unavailable, "
+# ARCHIVED                 "interrupting for user decision (job %s)",
+# ARCHIVED                 job_id,
+# ARCHIVED             )
+# ARCHIVED             options = ["Use probe_html (no interaction)", "Retry Playwright", "Cancel"]
+# ARCHIVED             return Command(
+# ARCHIVED                 update={
+# ARCHIVED                     "navigation_findings": result.get("navigation_findings"),
+# ARCHIVED                     "interrupt_reason": "playwright_unavailable",
+# ARCHIVED                     "interrupt_message": (
+# ARCHIVED                         "Playwright MCP is unavailable but the site is NOT Akamai-protected. "
+# ARCHIVED                         "The explore fell back to HTTP but may have missed JS-rendered content.\n\n"
+# ARCHIVED                         "Options:\n"
+# ARCHIVED                         "- **Use probe_html**: Proceed with single-page fetch (no clicking/scrolling)\n"
+# ARCHIVED                         "- **Retry Playwright**: Retry — check that the browser_service container is running\n"
+# ARCHIVED                         "- **Cancel**: Abort this job"
+# ARCHIVED                     ),
+# ARCHIVED                     "interrupt_options": options,
+# ARCHIVED                     "interrupt_decisions": options_to_decisions(options),
+# ARCHIVED                 },
+# ARCHIVED                 goto="human_approval",
+# ARCHIVED             )
+# ARCHIVED
+# ARCHIVED         # Handoff to the LLM navigation_agent when the deterministic explorer
+# ARCHIVED         # detected a search form (classic_search) but couldn't get many real item
+# ARCHIVED         # links from it — e.g. a JS/validation-gated POST form (locumtenens
+# ARCHIVED         # QuickSearch: required-specialty + decorative-vs-real submit button). The
+# ARCHIVED         # agent drives the form with browser tools + the navigation-patterns skill.
+# ARCHIVED         # Threshold is generous (< 30) because listing_page.product_links can be
+# ARCHIVED         # inflated by category/nav noise; classic_search detection (a multi-select
+# ARCHIVED         # form was found) is the real signal of a form-driven job board.
+# ARCHIVED         if isinstance(result, dict):
+# ARCHIVED             # navigate_explore has inconsistent return shapes — some paths return
+# ARCHIVED             # {"navigation_findings": findings, ...}, others return the bare
+# ARCHIVED             # findings dict. Handle both.
+# ARCHIVED             _f = result.get("navigation_findings") or result
+# ARCHIVED             _lp = _f.get("listing_page") or {}
+# ARCHIVED             _pl = len(_lp.get("product_links") or [])
+# ARCHIVED             # Anti-bot guard: don't hand off to navigation_agent for anti-bot sites —
+# ARCHIVED             # its MCP browser isn't cloak-enabled, so Akamai would block it. Anti-bot
+# ARCHIVED             # sites (e.g. calvklein) find few links at analysis time (truncated
+# ARCHIVED             # /render) but the RUNTIME scraper (cloak) gets the products, so a low
+# ARCHIVED             # analysis-time count is expected + not a failure there.
+# ARCHIVED             _probe = state.get("probe_result") or {}
+# ARCHIVED             _ab = _probe.get("anti_bot") if isinstance(_probe, dict) else None
+# ARCHIVED             _conn = _probe.get("connectivity") if isinstance(_probe, dict) else None
+# ARCHIVED             _meth = (
+# ARCHIVED                 (_probe.get("method") if isinstance(_probe, dict) else "")
+# ARCHIVED                 or (_conn.get("method_that_worked") if isinstance(_conn, dict) else "")
+# ARCHIVED                 or ""
+# ARCHIVED             )
+# ARCHIVED             _anti_bot = bool(
+# ARCHIVED                 state.get("anti_bot_detected")
+# ARCHIVED                 or (isinstance(_ab, dict) and _ab.get("detected"))
+# ARCHIVED                 or str(_meth).startswith(("uc_chrome", "cloak"))
+# ARCHIVED             )
+# ARCHIVED             # Decide whether the heavy LLM navigation_agent is needed. The
+# ARCHIVED             # deterministic explorer is now reliable (LLM URL selector + embedded-
+# ARCHIVED             # JSON detector), so SKIP the agent (~10-26 min) when explore already
+# ARCHIVED             # found a real listing with data — UNLESS a classic POST search form
+# ARCHIVED             # was detected (the agent drives those forms) or the site is anti-bot
+# ARCHIVED             # (the agent's MCP browser isn't cloak-enabled → never hand off there).
+# ARCHIVED             _handoff, _reason = _navigation_handoff_decision(_f, _anti_bot)
+# ARCHIVED             if _handoff:
+# ARCHIVED                 logger.info(
+# ARCHIVED                     "_invoke_navigation_explore: handing off to navigation_agent "
+# ARCHIVED                     "(reason=%s, anti_bot=%s, %d links) (job %s)",
+# ARCHIVED                     _reason, _anti_bot, _pl, job_id,
+# ARCHIVED                 )
+# ARCHIVED                 return Command(
+# ARCHIVED                     update={
+# ARCHIVED                         "navigation_findings": _f,
+# ARCHIVED                         "handoff_reason": _reason,
+# ARCHIVED                     },
+# ARCHIVED                     goto="navigation_agent",
+# ARCHIVED                 )
+# ARCHIVED             logger.info(
+# ARCHIVED                 "_invoke_navigation_explore: explore solid — SKIPPING "
+# ARCHIVED                 "navigation_agent → synthesize (anti_bot=%s, %d links) (job %s)",
+# ARCHIVED                 _anti_bot, _pl, job_id,
+# ARCHIVED             )
+# ARCHIVED
+# ARCHIVED         return result
+# ARCHIVED     except Exception as exc:
+# ARCHIVED         logger.exception("_invoke_navigation_explore failed (job %s): %s", job_id, exc)
+# ARCHIVED         _notify_phase(job_id, "navigation_explore", "failed")
+# ARCHIVED         return {}
+# ARCHIVED
+# ARCHIVED
+# ARCHIVED def _merge_explore_findings_into_analysis(analysis: dict, root: str, slug: str) -> dict:
+# ARCHIVED     """Fill gaps in the navigation_agent's analysis from the explorer's findings.
+# ARCHIVED
+# ARCHIVED     The agent re-discovers and can produce a sparse/wrong analysis (e.g. aya: it
+# ARCHIVED     overwrote a correct embedded-JSON finding with an empty analysis). Critical
+# ARCHIVED     fields the explorer reliably found — working URL, data_source, embedded_json,
+# ARCHIVED     item links, category links, api_endpoint — are merged in ONLY when the agent
+# ARCHIVED     left them missing/empty. Never overwrites a field the agent populated.
+# ARCHIVED     """
+# ARCHIVED     if not isinstance(analysis, dict):
+# ARCHIVED         return analysis
+# ARCHIVED     try:
+# ARCHIVED         nf_path = os.path.join(root, "workspace", slug, "navigation_findings.json")
+# ARCHIVED         if not os.path.isfile(nf_path):
+# ARCHIVED             return analysis
+# ARCHIVED         with open(nf_path, "r", encoding="utf-8") as f:
+# ARCHIVED             findings = json.load(f)
+# ARCHIVED     except Exception:
+# ARCHIVED         return analysis
+# ARCHIVED     lp = findings.get("listing_page") or {}
+# ARCHIVED     hn = findings.get("homepage_nav") or {}
+# ARCHIVED
+# ARCHIVED     # Top-level data-model signals from the listing page
+# ARCHIVED     for k in ("data_source", "embedded_json", "rendering_verified", "data_richness"):
+# ARCHIVED         v = lp.get(k)
+# ARCHIVED         if v not in (None, "", [], {}) and not analysis.get(k):
+# ARCHIVED             analysis[k] = v
+# ARCHIVED
+# ARCHIVED     # search.working_url / listing_url_used
+# ARCHIVED     search = analysis.get("search")
+# ARCHIVED     if not isinstance(search, dict):
+# ARCHIVED         search = {}
+# ARCHIVED     wurl = (lp.get("url") or "").strip()
+# ARCHIVED     if wurl and not (search.get("working_url") or search.get("listing_url_used")):
+# ARCHIVED         search["working_url"] = wurl
+# ARCHIVED         search["listing_url_used"] = wurl
+# ARCHIVED         analysis["search"] = search
+# ARCHIVED
+# ARCHIVED     # item_links.url_examples / urls
+# ARCHIVED     il = analysis.get("item_links")
+# ARCHIVED     if not isinstance(il, dict):
+# ARCHIVED         il = {}
+# ARCHIVED     if not (il.get("urls") or il.get("url_examples")):
+# ARCHIVED         hrefs = []
+# ARCHIVED         for p in (lp.get("product_links") or []):
+# ARCHIVED             h = p.get("href") if isinstance(p, dict) else p
+# ARCHIVED             if isinstance(h, str) and h:
+# ARCHIVED                 hrefs.append(h)
+# ARCHIVED         if hrefs:
+# ARCHIVED             il.setdefault("url_pattern", "")
+# ARCHIVED             il["url_examples"] = hrefs[:10]
+# ARCHIVED             il["urls"] = hrefs
+# ARCHIVED             analysis["item_links"] = il
+# ARCHIVED
+# ARCHIVED     # categories.category_links
+# ARCHIVED     cats = analysis.get("categories")
+# ARCHIVED     if not (isinstance(cats, dict) and (cats.get("category_links") or [])):
+# ARCHIVED         cat_links = [
+# ARCHIVED             c.get("href") for c in (hn.get("category_links") or [])
+# ARCHIVED             if isinstance(c, dict) and c.get("href")
+# ARCHIVED         ]
+# ARCHIVED         if cat_links:
+# ARCHIVED             cats = cats if isinstance(cats, dict) else {}
+# ARCHIVED             cats["category_links"] = cat_links[:20]
+# ARCHIVED             analysis["categories"] = cats
+# ARCHIVED
+# ARCHIVED     # api_endpoint
+# ARCHIVED     if not (isinstance(analysis.get("api_endpoint"), dict) and analysis["api_endpoint"].get("url")):
+# ARCHIVED         try:
+# ARCHIVED             from .nodes.navigate_synthesize import _best_api_endpoint
+# ARCHIVED
+# ARCHIVED             best = _best_api_endpoint(findings)
+# ARCHIVED             if isinstance(best, dict) and best.get("url"):
+# ARCHIVED                 analysis["api_endpoint"] = best
+# ARCHIVED         except Exception:
+# ARCHIVED             pass
+# ARCHIVED
+# ARCHIVED     return analysis
+# ARCHIVED
+# ARCHIVED
+# ARCHIVED def _invoke_navigation_synthesize(
+# ARCHIVED     state: ScrapeState, config: RunnableConfig
+# ARCHIVED ) -> dict[str, Any] | Command:
+# ARCHIVED     """Graph wrapper for the navigation synthesis node."""
+# ARCHIVED     from .nodes.navigate_synthesize import navigate_synthesize as _synthesize
+# ARCHIVED
+# ARCHIVED     job_id = state.get("job_id", 0)
+# ARCHIVED
+# ARCHIVED     # If the LLM navigation_agent already wrote navigation_analysis.json (it runs
+# ARCHIVED     # on the form-driven handoff path), skip re-synthesizing from raw findings —
+# ARCHIVED     # the agent's structured output IS the analysis. Synthesize would otherwise
+# ARCHIVED     # overwrite the agent's work with a re-reading of the (sparse) raw findings.
+# ARCHIVED     try:
+# ARCHIVED         slug = state.get("site_slug", "")
+# ARCHIVED         na_path = os.path.join(_get_project_root(), "workspace", slug, "navigation_analysis.json")
+# ARCHIVED         if state.get("handoff_reason") and os.path.isfile(na_path):
+# ARCHIVED             root = _get_project_root()
+# ARCHIVED             analysis = _read_json_artifact(root, slug, "navigation_analysis.json")
+# ARCHIVED             if analysis:
+# ARCHIVED                 # Merge guard: never let a sparse agent run discard the explorer's
+# ARCHIVED                 # reliable findings — fill missing fields from navigation_findings.
+# ARCHIVED                 analysis = _merge_explore_findings_into_analysis(analysis, root, slug)
+# ARCHIVED                 try:
+# ARCHIVED                     with open(na_path, "w", encoding="utf-8") as f:
+# ARCHIVED                         json.dump(analysis, f, indent=2, ensure_ascii=False)
+# ARCHIVED                 except Exception:
+# ARCHIVED                     pass
+# ARCHIVED                 logger.info(
+# ARCHIVED                     "_invoke_navigation_synthesize: navigation_analysis.json from "
+# ARCHIVED                     "navigation_agent (handoff) — merged with explore findings (job %s)",
+# ARCHIVED                     job_id,
+# ARCHIVED                 )
+# ARCHIVED                 _notify_phase(job_id, "navigation_synthesize", "done")
+# ARCHIVED                 return {"messages": [], "navigation_analysis": analysis}
+# ARCHIVED     except Exception as exc:
+# ARCHIVED         logger.warning("_invoke_navigation_synthesize: skip-check failed: %s", exc)
+# ARCHIVED
+# ARCHIVED     _notify_phase(job_id, "navigation_synthesize", "running")
+# ARCHIVED     set_tool_context(dict(state), agent_name="navigation_synthesize")
+# ARCHIVED     try:
+# ARCHIVED         result = _synthesize(dict(state), config)
+# ARCHIVED         _notify_phase(job_id, "navigation_synthesize", "done")
+# ARCHIVED
+# ARCHIVED         # SOURCE FIX: navigation_synthesize (LLM) sometimes drops the product
+# ARCHIVED         # URLs discovered by navigation_explore. The product links are in
+# ARCHIVED         # navigation_findings.json > listing_page.product_links — merge them into
+# ARCHIVED         # navigation_analysis.json > item_links.urls if missing. This ensures
+# ARCHIVED         # code_writer has the correct URLs to build the scraper around, instead
+# ARCHIVED         # of generating broken discovery logic. [fix data flow at the source]
+# ARCHIVED         try:
+# ARCHIVED             slug = state.get("site_slug", "")
+# ARCHIVED             root = _get_project_root()
+# ARCHIVED             nf_path = os.path.join(root, "workspace", slug, "navigation_findings.json")
+# ARCHIVED             na_path = os.path.join(root, "workspace", slug, "navigation_analysis.json")
+# ARCHIVED             if os.path.isfile(nf_path) and os.path.isfile(na_path):
+# ARCHIVED                 import json as _json
+# ARCHIVED                 nf = _json.load(open(nf_path))
+# ARCHIVED                 na = _json.load(open(na_path))
+# ARCHIVED                 # product URLs are nested in listing_page.product_links (list of dicts with 'href')
+# ARCHIVED                 lp = nf.get("listing_page") or {}
+# ARCHIVED                 _raw_links = lp.get("product_links") or []
+# ARCHIVED                 product_urls = []
+# ARCHIVED                 for _rl in _raw_links:
+# ARCHIVED                     if isinstance(_rl, str):
+# ARCHIVED                         product_urls.append(_rl)
+# ARCHIVED                     elif isinstance(_rl, dict) and _rl.get("href"):
+# ARCHIVED                         product_urls.append(_rl["href"])
+# ARCHIVED                 if product_urls:
+# ARCHIVED                     il = na.get("item_links")
+# ARCHIVED                     if not isinstance(il, dict):
+# ARCHIVED                         il = {}
+# ARCHIVED                     existing = il.get("urls") or []
+# ARCHIVED                     # Filter to strings only (some items may be dicts)
+# ARCHIVED                     existing_str = [u for u in existing if isinstance(u, str)]
+# ARCHIVED                     product_str = [u for u in product_urls if isinstance(u, str)]
+# ARCHIVED                     if len(existing_str) < len(product_str):
+# ARCHIVED                         il["urls"] = list(dict.fromkeys(existing_str + product_str))
+# ARCHIVED                         na["item_links"] = il
+# ARCHIVED                         with open(na_path, "w") as f:
+# ARCHIVED                             _json.dump(na, f, indent=2, ensure_ascii=False)
+# ARCHIVED                         logger.info(
+# ARCHIVED                             "navigation_synthesize: merged %d product URLs from "
+# ARCHIVED                             "findings into analysis.item_links.urls (had %d)",
+# ARCHIVED                             len(product_urls), len(existing),
+# ARCHIVED                         )
+# ARCHIVED                         # ALSO update the state return value (result) so downstream
+# ARCHIVED                         # nodes (code_writer, etc.) see the URLs without needing to
+# ARCHIVED                         # re-read the file. This is the root-cause fix for the
+# ARCHIVED                         # state-loses-URLs bug that required the input_urls.json
+# ARCHIVED                         # workaround in _invoke_code_writer.
+# ARCHIVED                         if isinstance(result, dict):
+# ARCHIVED                             result["navigation_analysis"] = na
+# ARCHIVED         except Exception as exc_merge:
+# ARCHIVED             logger.warning("navigation_synthesize: URL merge failed: %s", exc_merge)
+# ARCHIVED
+# ARCHIVED         return result
+# ARCHIVED     except Exception as exc:
+# ARCHIVED         logger.exception(
+# ARCHIVED             "_invoke_navigation_synthesize failed (job %s): %s", job_id, exc
+# ARCHIVED         )
+# ARCHIVED         _notify_phase(job_id, "navigation_synthesize", "failed")
+# ARCHIVED         return {}
+# ARCHIVED     finally:
+# ARCHIVED         clear_tool_context()
+# ═══ END ARCHIVED ═══
 
 
 def _invoke_nav_skill_review(
@@ -1669,6 +1946,14 @@ def _invoke_nav_skill_review(
     from .nodes.navigate_skill_review import navigate_skill_review as _review
 
     job_id = state.get("job_id", 0)
+    # Skip on non-SUCCESS (see _invoke_skill_learner guard for rationale).
+    if state.get("execution_status", "FAILED") != "SUCCESS":
+        logger.info(
+            "_invoke_nav_skill_review: skipping (execution_status=%s, job %s)",
+            state.get("execution_status"), job_id,
+        )
+        _notify_phase(job_id, "nav_skill_review", "skipped")
+        return {"messages": []}
     _notify_phase(job_id, "nav_skill_review", "running")
     set_tool_context(dict(state), agent_name="nav_skill_review")
     try:
@@ -1688,23 +1973,37 @@ def _invoke_nav_skill_review(
         clear_tool_context()
 
 
-@_with_api_retry
-def _invoke_scraper_analyzer(
-    state: ScrapeState, config: RunnableConfig
-) -> dict[str, Any]:
+def _decide_strategy(state: ScrapeState) -> dict[str, Any]:
+    """Deterministic strategy selection (replaces the LLM scraper_analyzer).
+
+    Derives the scraping strategy from ``probe_result.connectivity.method_that_worked``
+    (mirroring the old prompt's method -> strategy mapping), copies the proxy tier
+    from the probe, and carries a ``critical_fix`` synthesized from the prior test
+    crash on retry. ``_enforce_anti_bot_strategy`` remains the sole strategy
+    authority (rewrites bad tokens to http_navigation for anti-bot sites).
+    """
     job_id = state.get("job_id", 0)
     _notify_phase(job_id, "scraper_analyzer", "running")
-    set_tool_context(dict(state), agent_name="scraper_analyzer")
+    slug = state.get("site_slug", "")
     try:
-        slug = state.get("site_slug", "")
-        logger.info("_invoke_scraper_analyzer: starting (job %s)", job_id)
-        # ── Strategy cascade ── if re-running because the prior strategy failed
-        # testing, record it so the LLM picks a DIFFERENT strategy this time.
+        # ── Strategy cascade: record a failed prior strategy so it isn't re-picked.
         tried = list(state.get("strategies_tried") or [])
         _prior_strategy = (state.get("scraper_analysis") or {}).get("strategy", "")
         _prior_report = state.get("test_report") or {}
         _new_tried: list = []
-        if _prior_strategy and isinstance(_prior_report, dict) and _prior_report.get("overall_assessment") not in (None, "PASS"):
+        # A field-PASS can be downgraded by route_after_testing for insufficient
+        # discovery coverage. Record the strategy in that case too, so it isn't
+        # re-picked — otherwise the cascade loops on the same failed strategy.
+        _cov_bad = False
+        if isinstance(_prior_report, dict):
+            try:
+                from .nodes.route_after_testing import _discovery_coverage_failure
+                _cov_bad = bool(_discovery_coverage_failure(_prior_report))
+            except Exception as _e:
+                logger.debug("_decide_strategy: coverage check skipped: %s", _e)
+        if _prior_strategy and isinstance(_prior_report, dict) and (
+            _prior_report.get("overall_assessment") not in (None, "PASS") or _cov_bad
+        ):
             try:
                 from .nodes.route_after_testing import classify_test_failure
                 _action, _reason = classify_test_failure(_prior_report, _prior_strategy)
@@ -1714,112 +2013,203 @@ def _invoke_scraper_analyzer(
                 ):
                     _new_tried = [{"strategy": _prior_strategy, "reason": _reason}]
                     logger.info(
-                        "_invoke_scraper_analyzer: strategy '%s' failed (%s) — recording; "
-                        "will pick a different strategy (job %s)",
+                        "_decide_strategy: strategy '%s' failed (%s) — recording (job %s)",
                         _prior_strategy, _reason, job_id,
                     )
             except Exception as _e:
-                logger.warning("_invoke_scraper_analyzer: failure classify failed: %s", _e)
-        # Give the message builder the full tried-list (incl. the just-failed one).
-        _state_for_msg = dict(state)
-        if _new_tried:
-            _state_for_msg["strategies_tried"] = tried + _new_tried
-        messages = build_scraper_analyzer_message(_state_for_msg)
-        _log_agent_context(state, "scraper-analyzer", messages)
-        agent = create_scraper_analyzer(site_slug=slug)
-        hb = _start_heartbeat(job_id, "scraper-analyzer")
-        result = agent.invoke(
-            {"messages": messages}, config=_agent_config(config, "scraper_analyzer")
-        )
-        _stop_heartbeat(hb)
-        _persist_agent_logs(state, result, "scraper-analyzer", config)
-        _notify_phase(job_id, "scraper_analyzer", "done")
+                logger.warning("_decide_strategy: failure classify failed: %s", _e)
 
-        analysis = _load_scraper_analysis(slug)
-        # Anti-bot ⇒ playwright (cloak). KEPT (see _enforce_anti_bot_strategy note).
+        analysis = _derive_strategy(state)
+        # Anti-bot ⇒ http_navigation (cloak). Sole strategy authority.
         if _PATCHES_ENABLED:
             analysis = _enforce_anti_bot_strategy(analysis, slug, "scraper_analysis.json")
-        update: dict[str, Any] = {"messages": []}
-        if analysis:
-            try:
-                raw_conf = float(analysis.get("confidence_score", 1.0))
-            except (ValueError, TypeError):
-                raw_conf = 1.0
-            penalties = 0.0
-            nav_findings = state.get("navigation_findings") or {}
-            listing = nav_findings.get("listing_page", {})
-            if (
-                listing.get("product_links") is not None
-                and len(listing.get("product_links", [])) == 0
-            ):
-                penalties += 0.15
-                logger.info("confidence_adj: -0.15 (0 product links from navigation)")
-            verified_selectors = analysis.get("verified_selectors", {})
-            if verified_selectors:
-                verified_count = sum(
-                    1
-                    for s in verified_selectors.values()
-                    if isinstance(s, dict) and s.get("verified")
-                )
-                total_count = len(verified_selectors)
-                if total_count > 0 and verified_count == 0:
-                    penalties += 0.20
-                    logger.info("confidence_adj: -0.20 (0 verified selectors)")
-            if not analysis.get("jsonld_available", False) and not analysis.get(
-                "jsonld_fields"
-            ):
-                site_analysis = state.get("site_analysis") or {}
-                if not site_analysis.get("product_page_structure", {}).get(
-                    "json_ld_available"
-                ):
-                    penalties += 0.05
-                    logger.info("confidence_adj: -0.05 (no JSON-LD detected)")
+        # Escalation: _derive_strategy is a pure function of the probe method, so
+        # without this it re-picks the SAME failing strategy every retry (the old
+        # LLM analyzer read strategies_tried; the deterministic one must too). If
+        # the chosen strategy was already tried+failed, escalate to a more capable
+        # one (http_requests -> http_navigation -> playwright -> internal_api).
+        _all_tried = {
+            (_t.get("strategy") if isinstance(_t, dict) else _t)
+            for _t in (tried + _new_tried)
+        }
+        _ESCALATION = ["http_requests", "http_navigation", "playwright", "internal_api"]
+        _chosen = analysis.get("strategy")
+        if _chosen in _all_tried:
+            _idx = _ESCALATION.index(_chosen) if _chosen in _ESCALATION else -1
+            for _next in _ESCALATION[_idx + 1:]:
+                if _next not in _all_tried:
+                    for _k in ("strategy", "scraping_mechanism", "scraping_method", "recommended_strategy"):
+                        analysis[_k] = _next
+                    analysis["strategy_justification"] = (
+                        f"Deterministic escalation: {_chosen} tried+failed -> {_next}"
+                    )
+                    logger.info(
+                        "_decide_strategy: %s tried+failed -> escalating to %s (job %s)",
+                        _chosen, _next, job_id,
+                    )
+                    break
+        # Persist so downstream nodes/code_writer read the artifact from disk.
+        try:
+            root = _get_project_root()
+            with open(os.path.join(root, "workspace", slug, "scraper_analysis.json"),
+                      "w", encoding="utf-8") as f:
+                json.dump(analysis, f, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning("_decide_strategy: could not write scraper_analysis.json: %s", exc)
 
-            session_gated = any("oops" in e.lower() for e in nav_findings.get("errors", []))
-            if session_gated and not analysis.get("warmup_required"):
-                analysis["warmup_required"] = True
-                analysis["warmup_url"] = state.get("url", "")
-                analysis["warmup_wait_seconds"] = 5
-                analysis["warmup_details"] = (
-                    "Session gating detected — interior pages return 'oops!' "
-                    "without visiting homepage first. Navigate to homepage, wait, "
-                    "accept cookies, then proceed to product pages."
-                )
-                logger.info(
-                    "scraper_analyzer: overriding warmup_required=True (session gated)"
-                )
-            adjusted = max(0.1, min(1.0, raw_conf - penalties))
-            if adjusted < raw_conf:
-                analysis["confidence_score"] = adjusted
-                analysis["confidence_notes"] = (
-                    analysis.get("confidence_notes", "")
-                    + f" Adjusted from {raw_conf:.2f} to {adjusted:.2f} "
-                    f"(upstream failures: -{penalties:.2f})."
-                ).strip()
-                logger.info(
-                    "confidence_adj: %.2f -> %.2f (penalties=%.2f)",
-                    raw_conf,
-                    adjusted,
-                    penalties,
-                )
-            update["scraper_analysis"] = analysis
-            logger.info(
-                "_invoke_scraper_analyzer: loaded scraper_analysis from workspace/%s/",
-                slug,
-            )
-        else:
-            logger.warning(
-                "_invoke_scraper_analyzer: no scraper_analysis found at workspace/%s/",
-                slug,
-            )
+        update: dict[str, Any] = {"messages": [], "scraper_analysis": analysis}
         if _new_tried:
             update["strategies_tried"] = _new_tried  # append (Annotated[list, operator.add])
+        _notify_phase(job_id, "scraper_analyzer", "done")
         return update
     except Exception:
         _notify_phase(job_id, "scraper_analyzer", "failed")
         raise
-    finally:
-        clear_tool_context()
+
+
+def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
+    """Map probe_result.connectivity.method_that_worked to a scraping strategy.
+
+    Mirrors the mapping the old LLM scraper_analyzer was prompted with:
+      - direct_http  -> http_requests (proxy none), unless discovery is form-POST-only
+        (the requests template can't POST forms) -> http_navigation
+      - browser_none -> http_navigation (proxy none)
+      - uc_chrome_* / cloak_* -> http_navigation, proxy from the method suffix
+    """
+    probe = state.get("probe_result") or {}
+    if not isinstance(probe, dict):
+        probe = {}
+    conn = probe.get("connectivity") or {}
+    method = (conn.get("method_that_worked") if isinstance(conn, dict) else "") or ""
+    # Fallback to site_analysis connectivity (probe may be sparse on resume).
+    if not method:
+        _sa = state.get("site_analysis") or {}
+        _sa_conn = (_sa.get("connectivity") if isinstance(_sa, dict) else {}) or {}
+        method = (
+            (_sa_conn.get("method_that_worked") if isinstance(_sa_conn, dict) else "")
+            or ""
+        )
+    method = method or ""
+
+    # Anti-bot signal: explicit flag OR only-working-method is a stealth browser.
+    _ab = probe.get("anti_bot") or {}
+    anti_bot = isinstance(_ab, dict) and bool(_ab.get("detected"))
+    if not anti_bot and method.startswith(("uc_chrome", "cloak")):
+        anti_bot = True
+
+    # Proxy tier from the method suffix (mirrors the prompt mapping).
+    if "residential" in method:
+        proxy_tier = "residential"
+    elif "datacenter" in method:
+        proxy_tier = "datacenter"
+    else:
+        proxy_tier = "none"
+
+    meth = method.lower()
+    # Listing-page JS-rendering signal (navigate_explore._verify_rendering, propagated
+    # via navigate_synthesize). "csr" = item links only appear after JS rendering, so
+    # http_requests can't reach them → pick a browser strategy upfront. Fixes the
+    # ayahealthcare class: homepage reachable via direct_http but listings JS-rendered.
+    _nav = state.get("navigation_analysis") or {}
+    _rendering = (_nav.get("rendering_verified") if isinstance(_nav, dict) else None) or "unknown"
+    # Embedded-JSON data-model signal (navigate_explore detector → navigate_synthesize).
+    # Surfaced on scraper_analysis so code_writer sees it in one place and it survives
+    # retries. "embedded_json" = items live in a <script> JSON blob in the listing page,
+    # NOT detail pages — a third data model. The strategy itself still comes from the
+    # rendering cascade above (ssr→http_requests / csr→http_navigation); this only tags
+    # the model so code_writer extracts records from the listing JSON (no per-detail Phase 2).
+    _data_source = (_nav.get("data_source") if isinstance(_nav, dict) else None) or "none"
+    _embedded_json = (_nav.get("embedded_json") if isinstance(_nav, dict) else None) or None
+    if meth == "direct_http" and not _is_form_only_discovery(state, state.get("url", "")):
+        if _rendering == "csr":
+            strategy = "http_navigation"   # JS-rendered listings → browser upfront
+        else:
+            strategy = "http_requests"
+    else:
+        # browser_none, uc_chrome_*, cloak_*, or form-only direct_http -> browser-backed.
+        strategy = "http_navigation"
+
+    # API-strategy override: when browser_traverse captured a backend JSON data API
+    # (data_source == "api" + an api_endpoint), the items come from that API — use
+    # internal_api (HTTP + JSON paginated loop), NOT http_requests/http_navigation.
+    # This aligns scraper_analysis.strategy with the api_section + api_scraper.py
+    # template hint build_code_writer_message already emits; without it, code_writer
+    # follows the http_requests strategy field and builds a listing-paginating scraper
+    # that hangs on CSR pages with no paginated listing (aya).
+    _nav_api = (_nav.get("api_endpoint") if isinstance(_nav, dict) else None) or {}
+    _nav_api = _nav_api if isinstance(_nav_api, dict) else {}
+    if _data_source == "api" and (_nav_api.get("url") or _nav_api.get("api_url")):
+        strategy = "internal_api"
+
+    analysis: dict[str, Any] = {
+        "strategy": strategy,
+        "scraping_mechanism": strategy,
+        "scraping_method": strategy,
+        "recommended_strategy": strategy,
+        "proxy_tier": proxy_tier,
+        "connectivity": {"method_that_worked": method},
+        "anti_bot": {"detected": anti_bot},
+        "confidence_score": 0.9,
+        "data_source": _data_source,
+        "embedded_json": _embedded_json,
+        "api_endpoint": _nav_api,
+        "strategy_justification": (
+            f"Deterministic: method_that_worked={method or 'unknown'} -> {strategy} "
+            f"(proxy={proxy_tier}, anti_bot={anti_bot}, rendering={_rendering}, "
+            f"data_source={_data_source})"
+        ),
+    }
+
+    # On retry, carry a critical_fix synthesized from the prior crash so code_writer
+    # makes a targeted fix (the read-only analyzer that authored critical_fix is gone).
+    _tr = state.get("test_report") or {}
+    _crash = (_tr.get("crash_error") or "") if isinstance(_tr, dict) else ""
+    if _crash:
+        analysis["critical_fix"] = {
+            "issue": f"Previous scraper crashed: {str(_crash)[:300]}",
+            "root_cause": "See crash above — the scraper hit this error during testing.",
+            "fix": "Make a MINIMAL, targeted fix for THIS error; do NOT rewrite from scratch.",
+        }
+    return analysis
+
+
+def _is_form_only_discovery(state: dict, url: str) -> bool:
+    """True when discovery requires POSTing a form the requests template can't do.
+
+    Generic — keys on structural signals in navigation_analysis (no category_links
+    + POST/CSRF search or form-method filters), excluding sites with a same-domain
+    JSON API (those use internal_api). Mirrors the old prompt override.
+    """
+    nav = state.get("navigation_analysis") or {}
+    if not isinstance(nav, dict):
+        return False
+    categories = nav.get("categories") or {}
+    category_links = (
+        categories.get("category_links") if isinstance(categories, dict) else None
+    ) or []
+    search = nav.get("search") or {}
+    filters = nav.get("filters") or {}
+    form_only = (
+        (not category_links)
+        and (
+            (isinstance(search, dict) and search.get("classic_search_method") == "post")
+            or (isinstance(search, dict) and bool(search.get("classic_search_requires_csrf")))
+            or (isinstance(filters, dict) and filters.get("method") == "form")
+        )
+    )
+    if not form_only:
+        return False
+    from urllib.parse import urlparse as _urlparse
+
+    api = nav.get("api_endpoint") or {}
+    api_url = (api.get("url") or "") if isinstance(api, dict) else ""
+    if api_url:
+        api_host = _urlparse(api_url).hostname or ""
+        site_host = _urlparse(url).hostname or ""
+        if api_host and site_host and api_host == site_host:
+            return False
+    return True
+
 
 
 @_with_api_retry
@@ -1868,8 +2258,9 @@ def _fix_scraper_syntax(
             ))]
             hb = _start_heartbeat(job_id, "code-writer")
             try:
-                result = agent.invoke(
-                    {"messages": fix_msg}, config=_agent_config(config, "code_writer")
+                result = _invoke_agent_with_timeout(
+                    agent, fix_msg, _agent_config(config, "code_writer"),
+                    "code_writer", job_id,
                 )
                 _persist_agent_logs(state, result, "code-writer", config)
             finally:
@@ -1880,161 +2271,37 @@ def _fix_scraper_syntax(
     )
 
 
-# ── code_writer streaming ───────────────────────────────────────────────
-# Streaming code_writer's LLM output token-by-token (sync agent.stream) so the
-# large ~7,400-token codegen (a) is visible in real time (no "looks idle"),
-# (b) holds a healthier streaming connection (fewer mid-codegen drops), and
-# (c) gives a precise "no token for N sec" idle signal for stuck-call
-# detection. See plan: so-initially-when-i-quiet-owl.md.
-
-_STREAM_SENTINEL = object()
-# Exception class names that indicate a transient network/timeout failure worth
-# retrying the whole stream for (matched by name so we don't import every
-# vendor SDK — httpx/openai/requests all surface distinct classes).
-_STREAM_RETRYABLE_NAMES = {
-    "APIConnectionError",
-    "APITimeoutError",
-    "ReadTimeout",
-    "ReadTimeoutError",
-    "ConnectTimeout",
-    "ConnectError",
-    "ConnectionResetError",
-    "ConnectionError",
-    "RemoteProtocolError",
-    "ChunkedEncodingError",
-    "TransportError",
-    "StreamError",
-}
 
 
-def _is_stream_retryable(exc: Exception) -> bool:
-    """True if a stream exception looks transient (drop/timeout) → retry."""
-    if type(exc).__name__ in _STREAM_RETRYABLE_NAMES:
-        return True
-    return isinstance(exc, (ConnectionError, TimeoutError, OSError))
+def _select_template_file(state: ScrapeState) -> str:
+    """Return the template filename for this job's strategy/data_source.
 
-
-def _publish_code_writer_token(job_id: int, text: str) -> None:
-    """Best-effort publish a codegen token delta to the job SSE channel."""
-    if not text:
-        return
-    try:
-        from .scraper.services import LangGraphService
-
-        LangGraphService._publish_redis(
-            job_id, {"type": "agent_token", "agent": "code-writer", "text": text[:200]}
-        )
-    except Exception:
-        pass
-
-
-def _parse_stream_chunk(chunk: Any) -> tuple[str | None, Any]:
-    """Normalize a langgraph multi-mode stream chunk to (mode, data).
-
-    Multi-mode (stream_mode=[...]) yields ``(namespace, mode, data)`` in v1;
-    single-mode may yield a bare dict. Be defensive — the happy-path run_node
-    test confirms the real shape.
+    Simplified selection covering the 5 main templates. The message builder
+    (build_code_writer_message) has a more detailed selection (mechanism-based,
+    anti-bot notes, embedded_json variants) — that runs in parallel and its
+    template_hint still appears in the message. This function selects the
+    template for the SYSTEM PROMPT (where the full code is injected so it's
+    never summarized). For edge cases (undetected_chromedriver, navigation_scraper),
+    the LLM can still read_file the template — the system prompt's template is a
+    reference, not a replacement for the message's hint.
     """
-    if isinstance(chunk, (tuple, list)):
-        if len(chunk) >= 3:
-            return str(chunk[1]), chunk[2]
-        if len(chunk) == 2:
-            return str(chunk[0]), chunk[1]
-        return None, None
-    if isinstance(chunk, dict):
-        return "values", chunk
-    return None, None
+    nav = state.get("navigation_analysis") or {}
+    sa = state.get("scraper_analysis") or {}
+    strategy = (sa.get("strategy") or "").lower()
+    data_source = nav.get("data_source", "")
+    api_ep = nav.get("api_endpoint") or {}
 
-
-def _stream_code_writer_to_completion(
-    agent: Any,
-    messages: Any,
-    config: RunnableConfig,
-    job_id: int,
-    *,
-    max_attempts: int = 3,
-    idle_timeout: float = 120.0,
-) -> dict[str, Any]:
-    """Run the code_writer react agent as a **sync stream**, returning a result
-    dict shaped like ``agent.invoke()``'s (``{"messages": [...]}``) so
-    ``_persist_agent_logs`` works unchanged.
-
-    Runs the blocking generator on a daemon thread and consumes chunks from a
-    queue with an ``idle_timeout`` — "no chunk for idle_timeout sec" ⇒ the call
-    is stuck ⇒ retry. Producer exceptions (mid-stream drops) are forwarded via
-    ``exc_box`` and retried if transient. ``GraphRecursionError`` etc. are NOT
-    retried — they propagate to the existing approval/failure path.
-    """
-    last_exc: Exception | None = None
-    for attempt in range(1, max_attempts + 1):
-        q: queue.Queue = queue.Queue()
-        exc_box: list[Exception] = []
-        last_values: dict[str, Any] | None = None
-
-        def _producer() -> None:  # runs on a daemon thread; NO Django ORM here
-            try:
-                for chunk in agent.stream(
-                    {"messages": messages},
-                    config=config,
-                    stream_mode=["messages", "values"],
-                ):
-                    q.put(chunk)
-            except Exception as e:  # noqa: BLE001 — forward anything to main thread
-                exc_box.append(e)
-            finally:
-                q.put(_STREAM_SENTINEL)
-
-        producer = threading.Thread(target=_producer, daemon=True)
-        producer.start()
-
-        try:
-            while True:
-                try:
-                    item = q.get(timeout=idle_timeout)
-                except queue.Empty:
-                    # No chunk for idle_timeout sec ⇒ stuck call. Retry.
-                    raise TimeoutError(
-                        f"code_writer stream idle > {idle_timeout:.0f}s (attempt {attempt}/{max_attempts})"
-                    )
-                if item is _STREAM_SENTINEL:
-                    break
-                mode, data = _parse_stream_chunk(item)
-                if mode == "values" and isinstance(data, dict):
-                    last_values = data  # accumulate; last one == final state
-                elif mode == "messages":
-                    # data is (message_chunk, metadata); stream its text for visibility
-                    try:
-                        msg_chunk = data[0] if isinstance(data, (tuple, list)) else data
-                        _publish_code_writer_token(job_id, getattr(msg_chunk, "content", "") or "")
-                    except Exception:
-                        pass
-
-            # Producer finished — surface any exception it captured (mid-stream drop).
-            if exc_box:
-                raise exc_box[0]
-
-            if last_values is not None and last_values.get("messages") is not None:
-                return last_values  # drop-in replacement for invoke()'s result
-            # Defensive fallback if no values chunk arrived.
-            return {"messages": list(messages)}
-
-        except Exception as exc:
-            last_exc = exc
-            if _is_stream_retryable(exc) and attempt < max_attempts:
-                logger.warning(
-                    "code_writer stream attempt %d/%d failed (%s: %s); retrying",
-                    attempt,
-                    max_attempts,
-                    type(exc).__name__,
-                    str(exc)[:160],
-                )
-                continue
-            raise  # non-retryable (e.g. GraphRecursionError) or out of attempts → propagate
-
-    # Should be unreachable (loop raises on last attempt), but keep mypy happy.
-    if last_exc is not None:
-        raise last_exc
-    return {"messages": list(messages)}
+    if isinstance(api_ep, dict) and (api_ep.get("url") or api_ep.get("api_url")):
+        return "api_scraper.py"
+    if data_source == "ssr_div_list":
+        return "ssr_div_list_scraper.py"
+    if strategy in ("http_requests", "requests"):
+        return "requests_scraper.py"
+    if strategy in ("http_navigation", "playwright"):
+        return "http_navigation_scraper.py"
+    if strategy in ("internal_api", "api"):
+        return "api_scraper.py"
+    return "requests_scraper.py"
 
 
 def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
@@ -2044,6 +2311,9 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
     try:
         logger.info("_invoke_code_writer: starting (job %s)", job_id)
         update = {}
+        # Count a test-retry whenever re-entering from route_after_testing with a
+        # prior test_report (a real test failure). The test_retry_count budget
+        # caps the regenerate-test loop (MAX_TEST_RETRIES).
         if state.get("test_report"):
             current_count = state.get("test_retry_count", 0)
             if current_count != FINAL_RETRY_SENTINEL:
@@ -2070,8 +2340,37 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         try:
             import json as _json
             na = state.get("navigation_analysis") or {}
-            il = na.get("item_links") or {}
-            sample_urls = il.get("urls") or il.get("url_examples") or []
+            na = na if isinstance(na, dict) else {}
+            sample_urls: list = []
+            if na.get("data_source") == "embedded_json":
+                # Embedded-JSON model: the LISTING/category pages carry the data
+                # (not detail pages). Seed listing + category URLs so --input/--sample
+                # tests fetch listing pages and extract the embedded JSON — the correct
+                # test for this model. [plan: embedded-json model]
+                search = na.get("search") or {}
+                search = search if isinstance(search, dict) else {}
+                for k in ("working_url", "listing_url_used", "url_pattern", "search_url_pattern"):
+                    v = search.get(k)
+                    if isinstance(v, str) and v and not v.startswith(("javascript", "#")):
+                        sample_urls.append(v)
+                cats = na.get("categories") or {}
+                for c in (cats.get("category_links") or []) if isinstance(cats, dict) else []:
+                    if isinstance(c, str) and c:
+                        sample_urls.append(c)
+                sample_urls = list(dict.fromkeys(sample_urls))
+                logger.info(
+                    "_invoke_code_writer: embedded_json model — seeding %d listing/category URLs",
+                    len(sample_urls),
+                )
+            elif na.get("data_source") == "ssr_div_list":
+                # Seed the LISTING URL (not per-item URLs) — the ssr_div_list
+                # scraper fetches the listing page + extracts records from the
+                # DOM directly (no per-item detail pages).
+                search = na.get("search") or {}
+                sample_urls = [v for v in (search.get("working_url"), search.get("listing_url_used")) if v]
+            else:
+                il = na.get("item_links") or {}
+                sample_urls = il.get("urls") or il.get("url_examples") or []
             if sample_urls:
                 iu_path = os.path.join(_get_project_root(), "workspace", slug, "input_urls.json")
                 with open(iu_path, "w") as _f:
@@ -2082,18 +2381,27 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
 
         messages = build_code_writer_message(state)
         _log_agent_context(state, "code-writer", messages)
-        agent = create_code_writer(site_slug=slug)
+
+        # Read the selected template file + inject into the system prompt (so the
+        # template code is NEVER summarized by SummarizationMiddleware — the system
+        # prompt is always present in full, only the conversation history is
+        # summarized). This also saves a read_file round-trip (the LLM already has
+        # the template; no need to read_file it).
+        _template_file = _select_template_file(state)
+        _template_code = ""
+        try:
+            _tp = os.path.join(_get_project_root(), "templates", _template_file)
+            with open(_tp) as _tf:
+                _template_code = _tf.read()
+            logger.info("_invoke_code_writer: template %s (%d lines) injected into system prompt",
+                        _template_file, _template_code.count("\n"))
+        except Exception as _exc:
+            logger.warning("_invoke_code_writer: could not read template %s: %s", _template_file, _exc)
+
+        agent = create_code_writer(site_slug=slug, template_code=_template_code)
         hb = _start_heartbeat(job_id, "code-writer")
         _cw_cfg = _agent_config(config, "code_writer")
-        from django.conf import settings as _settings
-
-        if getattr(_settings, "USE_STREAMING_CODEWRITER", True):
-            # Stream code_writer token-by-token: real-time visibility + an
-            # idle-timeout hang signal + a healthier streaming connection.
-            result = _stream_code_writer_to_completion(agent, messages, _cw_cfg, job_id)
-            logger.info("_invoke_code_writer: streamed code_writer (token-level)")
-        else:
-            result = agent.invoke({"messages": messages}, config=_cw_cfg)
+        result = _invoke_agent_with_timeout(agent, messages, _cw_cfg, "code_writer", job_id)
         _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "code-writer", config)
         _notify_phase(job_id, "code_writer", "done")
@@ -2113,6 +2421,12 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     _ct = ""
             _patch_scraper_output_filter(slug, _ct)
 
+        # Deterministic backstop: if scraper_analysis documented a non-existent
+        # selector in critical_fix, warn loudly if the regenerated scraper still
+        # uses it (catches the regression the prompt-level fix in subagents.py
+        # is designed to prevent).
+        _warn_unaddressed_critical_fix(slug, state.get("scraper_analysis") or {})
+
         # Syntax guard: code_writer has no shell tool to self-validate, so the
         # node parses the scraper and feeds any SyntaxError back for an
         # immediate fix (keeps syntax errors out of code_tester's path).
@@ -2131,102 +2445,6 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         clear_tool_context()
 
 
-
-def _invoke_code_review(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
-    """Read-only review of scraper_draft.py between code_writer and code_tester.
-
-    Runs the code_reviewer agent (same context as code_writer + the written
-    scraper). On issues, hands the feedback back to code_writer via
-    state.review_feedback with severity-aware caps (critical: tester-invisible →
-    up to MAX_CRITICAL_REVIEW_RETRIES; medium: tester-visible →
-    MAX_MEDIUM_REVIEW_RETRIES then defers to code_tester). Catches logic/intent
-    errors the syntax guard can't see before the expensive code_tester run.
-    """
-    import json as _json
-
-    job_id = state.get("job_id", 0)
-    _notify_phase(job_id, "code_review", "running")
-    set_tool_context(dict(state), agent_name="code_review")
-    try:
-        logger.info("_invoke_code_review: starting (job %s)", job_id)
-        slug = state.get("site_slug", "")
-        messages = build_code_reviewer_message(state)
-        _log_agent_context(state, "code-reviewer", messages)
-        agent = create_code_reviewer(site_slug=slug)
-        hb = _start_heartbeat(job_id, "code-reviewer")
-        result = agent.invoke(
-            {"messages": messages}, config=_agent_config(config, "code_review")
-        )
-        _stop_heartbeat(hb)
-        _persist_agent_logs(state, result, "code-reviewer", config)
-        _notify_phase(job_id, "code_review", "done")
-
-        update: dict[str, Any] = {"messages": []}
-        review_path = os.path.join(_get_project_root(), "workspace", slug, "code_review.json")
-        verdict = "pass"
-        issues_text = ""
-        issues = []
-        try:
-            with open(review_path, "r") as fh:
-                rev = _json.load(fh)
-            verdict = (rev.get("verdict") or "pass").lower()
-            issues = rev.get("issues") or []
-            if isinstance(issues, list) and issues:
-                issues_text = "\n".join(
-                    f"- [{i.get('severity', '?')}] {i.get('area', '')}: {i.get('problem', '')}"
-                    f"  -> FIX: {i.get('fix', '')}"
-                    for i in issues if isinstance(i, dict)
-                )
-        except Exception as exc:
-            logger.warning(
-                "_invoke_code_review: could not read code_review.json (%s) — assuming pass",
-                exc,
-            )
-            verdict = "pass"
-
-        update["code_review_verdict"] = verdict
-        # Determine the max severity from the issues (robust — accept legacy
-        # "high" as critical, "low" as medium). Falls back to the reviewer's
-        # verdict field if issues lack severities.
-        _sevs = [(i.get("severity") or "").lower() for i in issues if isinstance(i, dict)] if isinstance(issues, list) else []
-        if any(s in ("critical", "high") for s in _sevs) or verdict == "critical":
-            max_sev = "critical"
-        elif any(s in ("medium", "low") for s in _sevs) or verdict == "medium":
-            max_sev = "medium"
-        else:
-            max_sev = "pass"
-
-        # Severity-aware routing (decided HERE, atomically via Command — the old
-        # conditional edge read a stale count and looped past the cap). Critical
-        # (tester-invisible) gets up to MAX_CRITICAL attempts; medium
-        # (tester-visible) gets MAX_MEDIUM, then defers to code_tester.
-        route_to = "code_tester"
-        if max_sev == "critical" and issues_text:
-            cnt = (state.get("critical_retries", 0) or 0) + 1
-            update["critical_retries"] = cnt
-            if cnt <= MAX_CRITICAL_REVIEW_RETRIES:
-                update["review_feedback"] = issues_text
-                route_to = "code_writer"
-                logger.info("_invoke_code_review: CRITICAL (attempt %d/%d) -> code_writer", cnt, MAX_CRITICAL_REVIEW_RETRIES)
-            else:
-                logger.info("_invoke_code_review: critical cap reached (%d/%d) -> code_tester", cnt, MAX_CRITICAL_REVIEW_RETRIES)
-        elif max_sev == "medium" and issues_text:
-            cnt = (state.get("medium_retries", 0) or 0) + 1
-            update["medium_retries"] = cnt
-            if cnt <= MAX_MEDIUM_REVIEW_RETRIES:
-                update["review_feedback"] = issues_text
-                route_to = "code_writer"
-                logger.info("_invoke_code_review: MEDIUM (attempt %d/%d) -> code_writer", cnt, MAX_MEDIUM_REVIEW_RETRIES)
-            else:
-                logger.info("_invoke_code_review: medium cap reached (%d/%d) -> code_tester (tester will catch)", cnt, MAX_MEDIUM_REVIEW_RETRIES)
-        else:
-            logger.info("_invoke_code_review: PASS -> code_tester")
-        return Command(goto=route_to, update=update)
-    except Exception:
-        _notify_phase(job_id, "code_review", "failed")
-        raise
-    finally:
-        clear_tool_context()
 
 
 def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
@@ -2262,6 +2480,10 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         update = {"messages": []}
         report = _load_test_report(slug)
         if report:
+            # Phase 4a: deterministically attach the scraper's discovery_coverage
+            # so the coverage-aware classifier sees it (the LLM-written report
+            # doesn't reliably carry it).
+            report = _attach_discovery_coverage(report, slug)
             update["test_report"] = report
             logger.info(
                 "_invoke_code_tester: loaded test_report from workspace/%s/", slug
@@ -2309,6 +2531,18 @@ def _invoke_cleanup(state: ScrapeState, config: RunnableConfig) -> dict[str, Any
 @_with_api_retry
 def _invoke_skill_learner(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
     job_id = state.get("job_id", 0)
+    # Skip on non-SUCCESS: learning from a failed/incomplete scrape injects
+    # garbage into the skill DB (skill_learner writes reusable skills +
+    # copies learning_report.json into scrapers/<slug>/analysis/). Mirrors
+    # _invoke_store_job_listings's guard. != SUCCESS is forward-compatible
+    # with a future PARTIAL status.
+    if state.get("execution_status", "FAILED") != "SUCCESS":
+        logger.info(
+            "_invoke_skill_learner: skipping (execution_status=%s, job %s)",
+            state.get("execution_status"), job_id,
+        )
+        _notify_phase(job_id, "skill_learner", "skipped")
+        return {"messages": []}
     _notify_phase(job_id, "skill_learner", "running")
     set_tool_context(dict(state), agent_name="skill_learner")
     try:
@@ -2372,6 +2606,7 @@ def _invoke_dagster_converter(
     the job status."""
     job_id = state.get("job_id", 0)
     slug = state.get("site_slug", "")
+    _notify_phase(job_id, "dagster_converter", "running")
 
     # Only run if the scraper exists + job succeeded
     try:
@@ -2402,20 +2637,52 @@ def _invoke_dagster_converter(
         ws_dagster = os.path.join(root, "workspace", slug, f"{slug}_dagster.py")
         scrapers_dagster = os.path.join(root, "scrapers", slug, f"{slug}_dagster.py")
         if os.path.isfile(ws_dagster):
-            # Syntax check
+            # Syntax + import-binding check (P0-5: ast.parse alone misses
+            # commented-out imports and undefined base classes — the file
+            # "syntax OK"s but NameErrors at import time).
             try:
                 import ast
                 with open(ws_dagster, "r") as f:
-                    ast.parse(f.read())
-                # Copy to scrapers/ (persistent — survives workspace cleans)
-                os.makedirs(os.path.dirname(scrapers_dagster), exist_ok=True)
-                import shutil
-                shutil.copy2(ws_dagster, scrapers_dagster)
-                logger.info(
-                    "_invoke_dagster_converter: generated %s_dagster.py (syntax OK, copied to scrapers/)",
-                    slug,
-                )
-                return {"messages": [], "dagster_path": scrapers_dagster}
+                    _src = f.read()
+                _tree = ast.parse(_src)
+                # Collect names bound by imports/classdefs/assignments at module scope.
+                _bound = set()
+                for _node in ast.iter_child_nodes(_tree):
+                    if isinstance(_node, (ast.Import, ast.ImportFrom)):
+                        for _alias in _node.names:
+                            _bound.add(_alias.asname or _alias.name.split(".")[0])
+                    elif isinstance(_node, ast.ClassDef):
+                        _bound.add(_node.name)
+                    elif isinstance(_node, ast.Assign):
+                        for _t in _node.targets:
+                            if isinstance(_t, ast.Name):
+                                _bound.add(_t.id)
+                # Check that every base class referenced in a ClassDef is bound
+                # (not commented out). Catches `class X(BaseTlsScraper):` when
+                # `# from dagster_scraper_base import BaseTlsScraper` is commented.
+                _unresolved = []
+                for _node in ast.walk(_tree):
+                    if isinstance(_node, ast.ClassDef):
+                        for _base in _node.bases:
+                            if isinstance(_base, ast.Name) and _base.id not in _bound:
+                                _unresolved.append(f"class {_node.name}: base '{_base.id}' not imported")
+                if _unresolved:
+                    logger.warning(
+                        "_invoke_dagster_converter: %s_dagster.py has unresolved "
+                        "names (won't import): %s — file NOT copied to scrapers/",
+                        slug, "; ".join(_unresolved[:3]),
+                    )
+                else:
+                    # Copy to scrapers/ (persistent — survives workspace cleans)
+                    os.makedirs(os.path.dirname(scrapers_dagster), exist_ok=True)
+                    import shutil
+                    shutil.copy2(ws_dagster, scrapers_dagster)
+                    logger.info(
+                        "_invoke_dagster_converter: generated %s_dagster.py "
+                        "(syntax + import OK, copied to scrapers/)",
+                        slug,
+                    )
+                    return {"messages": [], "dagster_path": scrapers_dagster}
             except SyntaxError as exc:
                 logger.warning(
                     "_invoke_dagster_converter: %s_dagster.py has syntax error: %s",
@@ -2443,6 +2710,8 @@ def _invoke_store_job_listings(
     and inserts/updates JobListing rows. Only runs for job content types.
     Non-blocking — failure is logged but doesn't affect the job.
     """
+    job_id = state.get("job_id", 0)
+    _notify_phase(job_id, "store_job_listings", "running")
     page_type = state.get("page_type", "")
     exec_status = state.get("execution_status", "")
     output_file = state.get("output_file", "")
@@ -2536,6 +2805,18 @@ def _invoke_store_job_listings(
             extra = {k: v for k, v in item.items() if k not in _KNOWN_FIELDS}
 
             # Dedup key: (site_slug, url) — or (site_slug, job_source_id) if no url
+            # P0-13: assess posted_date reliability. Sites that dynamically set
+            # datePosted to "today" produce fabricated freshness. Don't overwrite
+            # a prior reliable date with an unreliable one on update.
+            _scrape_date = _dt.now().date()
+            _date_str, _reliable, _reason = (None, True, "ok")
+            if posted_raw:
+                try:
+                    from src.job_fields import assess_date_reliability
+                    _date_str, _reliable, _reason = assess_date_reliability(str(posted_raw), _scrape_date)
+                except Exception:
+                    _reliable = True  # conservative: trust the date if assessment fails
+
             defaults = {
                 "title": (item.get("title") or "")[:500],
                 "company": (item.get("company") or "")[:300],
@@ -2544,7 +2825,7 @@ def _invoke_store_job_listings(
                 "salary": (item.get("salary") or "")[:300],
                 "job_type": (item.get("job_type") or "")[:100],
                 "employment_type": (item.get("employment_type") or item.get("employment_type") or "")[:100],
-                "posted_date": posted_date,
+                "date_posted_reliable": _reliable,
                 "valid_through": valid_through,
                 "site_name": site_name,
                 "site": site_obj,
@@ -2553,6 +2834,13 @@ def _invoke_store_job_listings(
             }
 
             # Dedup: prefer url, fall back to job_source_id
+            # P0-13: only set posted_date when reliable (avoids overwriting
+            # with a fabricated "today" on every re-scrape). When unreliable,
+            # leave posted_date as-is (NULL on first create) — the dashboard
+            # uses scraped_at (first_seen_at) as the freshness signal instead.
+            if _reliable and posted_date:
+                defaults["posted_date"] = posted_date
+
             if url:
                 defaults["url"] = url[:1000]
                 defaults["job_source_id"] = str(job_src_id)[:200]
@@ -2757,19 +3045,21 @@ def _persist_probe_summary(
         logger.warning("Failed to persist probe summary for job %s: %s", job_id, exc)
 
 
-def _route_after_navigation_explore(state: ScrapeState) -> str:
-    """Route after navigation_explore.
-
-    Normally proceeds to navigation_synthesize.  If navigate_explore
-    flagged playwright_unavailable, the node already issued a
-    Command(goto="human_approval") internally — this function only
-    handles the case where the state carries the flag without a Command
-    (defensive fallback).
-    """
-    if state.get("playwright_unavailable"):
-        logger.info("route_after_navigate_explore: routing to human_approval")
-        return "human_approval"
-    return "navigation_synthesize"
+# ═══ ARCHIVED NAVIGATION (replaced by browser_traverse) ═══
+# ARCHIVED def _route_after_navigation_explore(state: ScrapeState) -> str:
+# ARCHIVED     """Route after navigation_explore.
+# ARCHIVED
+# ARCHIVED     Normally proceeds to navigation_synthesize.  If navigate_explore
+# ARCHIVED     flagged playwright_unavailable, the node already issued a
+# ARCHIVED     Command(goto="human_approval") internally — this function only
+# ARCHIVED     handles the case where the state carries the flag without a Command
+# ARCHIVED     (defensive fallback).
+# ARCHIVED     """
+# ARCHIVED     if state.get("playwright_unavailable"):
+# ARCHIVED         logger.info("route_after_navigate_explore: routing to human_approval")
+# ARCHIVED         return "human_approval"
+# ARCHIVED     return "navigation_synthesize"
+# ═══ END ARCHIVED ═══
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2838,6 +3128,15 @@ def route_from_human_approval(state: ScrapeState) -> str:
         logger.info("route_from_human_approval: low_coverage -> proceed to scraper_analyzer")
         return "scraper_analyzer"
 
+    # coverage_exhausted (validate_coverage gate, after MAX_COVERAGE_RETRIES):
+    # "Continue anyway" -> proceed with partial coverage; "Abort"/cancel -> end.
+    if reason == "coverage_exhausted":
+        if choice in cancel_values:
+            logger.info("route_from_human_approval: coverage_exhausted -> abort (END)")
+            return "__end__"
+        logger.info("route_from_human_approval: coverage_exhausted -> proceed to scraper_analyzer")
+        return "scraper_analyzer"
+
     approve_values = {"approve", "yes", "ok", "continue", "continue anyway", "proceed"}
     if choice.lower() in approve_values:
         choice = "continue"
@@ -2850,10 +3149,12 @@ def route_from_human_approval(state: ScrapeState) -> str:
         "low_coverage": "code_writer",
         "validation_failed": "field_confirmation",
         "reanalyze_exhausted": "run_execution",
+        # pre_execution node was removed (Wave 2 Cut 2); keep this entry as a
+        # safety net so any in-flight job resuming a legacy pre_execution
+        # interrupt routes straight to run_execution (the merged behaviour).
         "pre_execution": "run_execution",
-        "skill_approval": "skill_learner",
         "field_confirmation": "run_execution",
-        "playwright_unavailable": "navigation_synthesize",
+        "playwright_unavailable": "browser_traverse",
         "review": "run_execution",
     }
 
@@ -2878,7 +3179,7 @@ def route_from_human_approval(state: ScrapeState) -> str:
                 "site_analyzer"
                 if "site" in reason
                 else (
-                    "navigation_explore"
+                    "browser_traverse"
                     if "navigation" in reason
                     else "product_analyzer"
                 )
@@ -2925,33 +3226,17 @@ def route_from_human_approval(state: ScrapeState) -> str:
         logger.info("route_from_human_approval: missing_artifact_product -> cancelled")
         return "__end__"
 
-    if reason == "missing_artifact_navigation":
-        if "redo" in (label or "").lower():
-            logger.info(
-                "route_from_human_approval: missing_artifact_navigation -> redo navigation_explore"
-            )
-            return "navigation_explore"
-        if "continue" in (label or "").lower():
-            logger.info(
-                "route_from_human_approval: missing_artifact_navigation -> continue without"
-            )
-            return "scraper_analyzer"
-        logger.info(
-            "route_from_human_approval: missing_artifact_navigation -> cancelled"
-        )
-        return "__end__"
-
     if reason == "playwright_unavailable":
         if "retry" in (label or "").lower() or "playwright" in (label or "").lower():
             logger.info(
-                "route_from_human_approval: playwright_unavailable -> retry navigation_explore"
+                "route_from_human_approval: playwright_unavailable -> retry browser_traverse"
             )
-            return "navigation_explore"
+            return "browser_traverse"
         if "probe_html" in (label or "").lower() or "continue" in (label or "").lower():
             logger.info(
                 "route_from_human_approval: playwright_unavailable -> proceed with probe_html"
             )
-            return "navigation_synthesize"
+            return "product_analyzer"
         logger.info("route_from_human_approval: playwright_unavailable -> cancelled")
         return "__end__"
 
@@ -2976,8 +3261,8 @@ def build_scrape_graph(
       code_tester, cleanup, skill_learner)
     * 12 deterministic nodes (parse_command, check_tracker, setup_workspace,
       update_tracker_analysis, validate_analysis, validate_coverage,
-      field_confirmation, pre_execution_approval, run_execution,
-      route_after_testing, route_after_cleanup, human_approval)
+      field_confirmation, run_execution, route_after_testing,
+      route_after_cleanup, human_approval)
     * 3 conditional edges (check_tracker → Command-based routing,
       route_after_testing, route_after_cleanup, route_from_human_approval)
 
@@ -3010,21 +3295,25 @@ def build_scrape_graph(
     workflow.add_node("check_accessibility", check_accessibility)
     # Analysis
     workflow.add_node("site_analyzer", _invoke_site_analyzer)
-    workflow.add_node("navigation_explore", _invoke_navigation_explore)
-    workflow.add_node("navigation_agent", _invoke_navigation_agent)
-    workflow.add_node("navigation_synthesize", _invoke_navigation_synthesize)
+    # ═══ ARCHIVED NAVIGATION (replaced by browser_traverse) ═══
+    # workflow.add_node("navigation_explore", _invoke_navigation_explore)
+    # workflow.add_node("navigation_agent", _invoke_navigation_agent)
+    # workflow.add_node("navigation_synthesize", _invoke_navigation_synthesize)
+    # ═══ END ARCHIVED ═══
+    workflow.add_node("browser_traverse", _invoke_navigation_traverse)
     workflow.add_node("product_analyzer", _invoke_product_analyzer)
     workflow.add_node("update_tracker_analysis", update_tracker_analysis)
     workflow.add_node("validate_analysis", validate_analysis)
     workflow.add_node("normalize_fields", normalize_fields)
     workflow.add_node("validate_coverage", validate_coverage)
     # Generation & testing
-    workflow.add_node("scraper_analyzer", _invoke_scraper_analyzer)
+    workflow.add_node("scraper_analyzer", _decide_strategy)
     workflow.add_node("code_writer", _invoke_code_writer)
-    workflow.add_node("code_review", _invoke_code_review)
     workflow.add_node("code_tester", _invoke_code_tester)
     workflow.add_node("field_confirmation", field_confirmation)
-    workflow.add_node("pre_execution_approval", pre_execution_approval)
+    # (Wave 2 Cut 2) pre_execution_approval node removed — its gate was merged
+    # into field_confirmation (item-count now shown there); field_confirmation
+    # routes straight to run_execution on approve.
     # Execution & post-completion
     workflow.add_node("run_execution", run_execution)
     workflow.add_node("cleanup", _invoke_cleanup)
@@ -3052,30 +3341,34 @@ def build_scrape_graph(
     # or probe result on first pass). goto may be: site_analyzer,
     # validate_analysis, scraper_analyzer, code_writer, code_tester, or END.
 
-    # site_analyzer → conditional (navigation_explore vs update_tracker_analysis)
+    # site_analyzer → conditional (browser_traverse vs update_tracker_analysis)
     workflow.add_conditional_edges(
         "site_analyzer",
         _route_after_site_analyzer,
         {
-            "navigation_explore": "navigation_explore",
+            "browser_traverse": "browser_traverse",
             "update_tracker_analysis": "update_tracker_analysis",
         },
     )
 
-    # navigation_explore → conditional (human_approval if Playwright down, else navigation_synthesize).
-    # navigate_explore may also return Command(goto="navigation_agent") when it detects a form-driven
-    # site it can't drive deterministically (low product links + form detected) — the LLM navigation_agent
-    # then drives the form with browser tools + skills, and flows into navigation_synthesize.
-    workflow.add_conditional_edges(
-        "navigation_explore",
-        _route_after_navigation_explore,
-        {
-            "navigation_synthesize": "navigation_synthesize",
-            "human_approval": "human_approval",
-        },
-    )
-    workflow.add_edge("navigation_agent", "navigation_synthesize")
-    workflow.add_edge("navigation_synthesize", "product_analyzer")
+    # browser_traverse → product_analyzer (replaces the 3-node navigation pipeline).
+    workflow.add_edge("browser_traverse", "product_analyzer")
+    # ═══ ARCHIVED NAVIGATION (replaced by browser_traverse) ═══
+    # # navigation_explore → conditional (human_approval if Playwright down, else navigation_synthesize).
+    # # navigate_explore may also return Command(goto="navigation_agent") when it detects a form-driven
+    # # site it can't drive deterministically (low product links + form detected) — the LLM navigation_agent
+    # # then drives the form with browser tools + skills, and flows into navigation_synthesize.
+    # workflow.add_conditional_edges(
+    #     "navigation_explore",
+    #     _route_after_navigation_explore,
+    #     {
+    #         "navigation_synthesize": "navigation_synthesize",
+    #         "human_approval": "human_approval",
+    #     },
+    # )
+    # workflow.add_edge("navigation_agent", "navigation_synthesize")
+    # workflow.add_edge("navigation_synthesize", "product_analyzer")
+    # ═══ END ARCHIVED ═══
 
     # update_tracker_analysis → validate_analysis
     workflow.add_edge("update_tracker_analysis", "validate_analysis")
@@ -3095,9 +3388,9 @@ def build_scrape_graph(
     # scraper_analyzer → code_writer
     workflow.add_edge("scraper_analyzer", "code_writer")
 
-    # code_writer → code_review. The node returns Command(goto=code_tester|code_writer)
-    # atomically (cap enforced in-node), so no conditional edge is needed here.
-    workflow.add_edge("code_writer", "code_review")
+    # code_writer → code_tester (the read-only code_review phase was removed;
+    # code_tester validates functionality and route_after_testing handles retries).
+    workflow.add_edge("code_writer", "code_tester")
 
     # code_tester → route_after_testing (conditional)
     workflow.add_conditional_edges(
@@ -3113,13 +3406,10 @@ def build_scrape_graph(
         },
     )
 
-    # field_confirmation uses Command-based routing internally (goto is
-    # either pre_execution_approval or product_analyzer).
+    # field_confirmation uses Command-based routing internally (goto is either
+    # run_execution on approve, or product_analyzer on reject for re-analysis).
     # No conditional edge needed — the Command decides.
-
-    # pre_execution_approval uses Command-based routing internally (goto is
-    # either run_execution or cleanup).
-    # No conditional edge needed — the Command decides.
+    # (Wave 2 Cut 2: the old pre_execution_approval hop in between was removed.)
 
     # run_execution → cleanup (B2: cleanup always runs, never throws)
     workflow.add_edge("run_execution", "cleanup")
@@ -3147,8 +3437,7 @@ def build_scrape_graph(
             "run_execution": "run_execution",
             "skill_learner": "skill_learner",
             "product_analyzer": "product_analyzer",
-            "navigation_explore": "navigation_explore",
-            "navigation_synthesize": "navigation_synthesize",
+            "browser_traverse": "browser_traverse",
             "nav_skill_review": "nav_skill_review",
             "site_analyzer": "site_analyzer",
             "update_tracker_analysis": "update_tracker_analysis",
@@ -3173,48 +3462,19 @@ def build_scrape_graph(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def route_from_setup_workspace(state: ScrapeState) -> str:
-    """Decide which analysis phase to enter after workspace setup.
-
-    Uses skip flags set by ``check_tracker`` for resume logic (B1).
-
-    IMPORTANT: Navigation jobs (input_mode=navigation|list_page) always need
-    to run navigation_explore even when site_analysis is skipped (re-scrape),
-    because navigation discovers the product URLs that the scraper needs.
-    """
-    input_mode = state.get("input_mode", "url_list")
-
-    # Navigation/list_page/search_term jobs always need navigation_explore,
-    # even on re-scrape, because navigation discovers the product URLs.
-    if input_mode in ("navigation", "list_page", "search_term") and not state.get(
-        "navigation_analysis"
-    ):
-        return "site_analyzer"  # → _route_after_site_analyzer → navigation_explore
-
-    if state.get("skip_site_analysis"):
-        if state.get("skip_product_analysis"):
-            if state.get("skip_code_generation"):
-                return "code_tester"
-            if state.get("scraper_analysis"):
-                return "code_writer"
-            return "scraper_analyzer"
-        return "validate_analysis"
-    return "site_analyzer"
-
-
 def _route_after_site_analyzer(state: ScrapeState) -> str:
     """Route after site_analyzer based on input_mode.
 
-    - navigation/list_page/search_term → navigation_explore (deterministic exploration + LLM synthesis)
+    - navigation/list_page/search_term → browser_traverse (browser-driven navigation)
     - url_list → update_tracker_analysis (existing product/content analysis flow)
     """
     input_mode = state.get("input_mode", "url_list")
     if input_mode in ("navigation", "list_page", "search_term"):
         logger.info(
-            "_route_after_site_analyzer: input_mode=%s → navigation_explore",
+            "_route_after_site_analyzer: input_mode=%s → browser_traverse",
             input_mode,
         )
-        return "navigation_explore"
+        return "browser_traverse"
     logger.info(
         "_route_after_site_analyzer: input_mode=%s → update_tracker_analysis",
         input_mode,

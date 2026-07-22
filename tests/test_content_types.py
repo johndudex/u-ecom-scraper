@@ -468,51 +468,14 @@ class TestNodeFunctions:
 
 
 class TestNavigationAgent:
-    def test_navigation_agent_prompt_exists(self):
-        import agents.subagents as sub_mod
-
-        assert "navigation_agent" in sub_mod.AGENT_PROMPT_MAP
-        assert sub_mod.AGENT_PROMPT_MAP["navigation_agent"] == "navigation-agent"
-        assert "navigation-agent" in sub_mod.AGENT_TEMPERATURES
-        assert "navigation_agent" in sub_mod.AGENT_MAX_ITERATIONS
-
-    def test_build_navigation_agent_message(self):
-        from agents.subagents import build_navigation_agent_message
-
-        state = {
-            "url": "https://test.com",
-            "site_slug": "test-com",
-            "input_mode": "navigation",
-            "search_criteria": "running shoes",
-            "content_type_config": {
-                "content_type": "product",
-                "output_key": "products",
-            },
-        }
-        msg = build_navigation_agent_message(state)
-        assert len(msg) == 1
-        content = msg[0].content
-        assert "navigation" in content.lower()
-        assert "running shoes" in content
-        assert "navigation_analysis.json" in content
-
-    def test_build_navigation_agent_message_list_page(self):
-        from agents.subagents import build_navigation_agent_message
-
-        state = {
-            "url": "https://test.com",
-            "site_slug": "test-com",
-            "input_mode": "list_page",
-            "sample_url": "https://test.com/shop",
-            "content_type_config": {
-                "content_type": "article",
-                "output_key": "articles",
-            },
-        }
-        msg = build_navigation_agent_message(state)
-        content = msg[0].content
-        assert "list page" in content.lower()
-        assert "20 tool calls" in content
+    # NOTE: navigation_agent / navigation_explore / navigation_synthesize LLM
+    # agents have been replaced by a single deterministic ``browser_traverse``
+    # node. The LLM-agent prompt/message-builder tests have been removed; the
+    # integration test (webapp/tests/test_browser_traverse_integration.py)
+    # covers the new node. Tests below exercise preserved surface area:
+    # _build_initial_state routing flags, code_writer/scraper_analyzer message
+    # builders (which still consume ``navigation_analysis`` state), and the
+    # runtime navigation scraper template.
 
     def test_route_after_site_analyzer_navigation(self):
         from agents.graph import _route_after_site_analyzer
@@ -523,8 +486,8 @@ class TestNavigationAgent:
         state_search = {"input_mode": "search_term"}
 
         assert _route_after_site_analyzer(state_url_list) == "update_tracker_analysis"
-        assert _route_after_site_analyzer(state_navigation) == "navigation_explore"
-        assert _route_after_site_analyzer(state_list_page) == "navigation_explore"
+        assert _route_after_site_analyzer(state_navigation) == "browser_traverse"
+        assert _route_after_site_analyzer(state_list_page) == "browser_traverse"
         assert _route_after_site_analyzer(state_search) == "update_tracker_analysis"
 
     def test_build_initial_state_navigation_mode(self):
@@ -669,30 +632,14 @@ class TestNavigationAgent:
     def test_pipeline_phases_includes_navigation(self):
         from scraper.tasks import PIPELINE_PHASES
 
-        assert "navigation_explore" in PIPELINE_PHASES
-        assert "navigation_synthesize" in PIPELINE_PHASES
-
-    def test_agent_tool_map_has_navigation(self):
-        from agents.tools import AGENT_TOOL_MAP
-
-        assert "navigation_agent" in AGENT_TOOL_MAP
-        assert "playwright" in AGENT_TOOL_MAP["navigation_agent"]
-        assert "probe" not in AGENT_TOOL_MAP["navigation_agent"]
-
-    def test_allowed_playwright_tools_has_navigation(self):
-        from agents.tools import ALLOWED_PLAYWRIGHT_TOOLS
-
-        assert "navigation_agent" in ALLOWED_PLAYWRIGHT_TOOLS
-        assert (
-            "playwright_browser_navigate"
-            in ALLOWED_PLAYWRIGHT_TOOLS["navigation_agent"]
-        )
+        # 3 old nodes (navigation_explore / navigation_agent /
+        # navigation_synthesize) collapsed into a single browser_traverse node.
+        assert "browser_traverse" in PIPELINE_PHASES
 
     def test_graph_phases_include_navigation(self):
         from agents.graph import PHASE_MAP
 
-        assert "navigation_explore" in PHASE_MAP
-        assert "navigation_synthesize" in PHASE_MAP
+        assert "browser_traverse" in PHASE_MAP
 
     def test_navigation_template_exists(self):
         template_path = os.path.join(
@@ -706,36 +653,22 @@ class TestNavigationAgent:
         )
 
     def test_navigation_explore_node_exists(self):
-        from agents.nodes.navigate_explore import navigate_explore
+        # The 3 old navigation nodes (navigate_explore / navigate_agent /
+        # navigate_synthesize) are archived — replaced by a single
+        # ``browser_traverse`` node. Existence is verified at the graph level
+        # (see webapp/tests/test_browser_traverse_integration.py).
+        import pytest
 
-        assert callable(navigate_explore)
+        pytest.skip(
+            "navigate_explore node archived — replaced by browser_traverse "
+            "(see test_browser_traverse_integration.py)"
+        )
 
     def test_navigation_synthesize_node_exists(self):
-        from agents.nodes.navigate_synthesize import navigate_synthesize
+        # See test_navigation_explore_node_exists note.
+        import pytest
 
-        assert callable(navigate_synthesize)
-
-    def test_navigation_synthesize_has_no_browser_tools(self):
-        from agents.tools import AGENT_TOOL_MAP
-
-        tools = AGENT_TOOL_MAP.get("navigation_synthesize", [])
-        assert "playwright" not in tools
-        assert "web" not in tools
-        assert "read_file" in tools
-        assert "write_file" in tools
-
-    def test_build_navigation_synthesize_message(self):
-        from agents.subagents import build_navigation_synthesize_message
-
-        state = {
-            "site_slug": "test-com",
-            "url": "https://www.test.com",
-            "search_criteria": "shoes",
-            "input_mode": "navigation",
-        }
-        messages = build_navigation_synthesize_message(state)
-        assert len(messages) == 1
-        content = messages[0].content
-        assert "navigation_findings.json" in content
-        assert "navigation_analysis.json" in content
-        assert "write_file" in content
+        pytest.skip(
+            "navigate_synthesize node archived — replaced by browser_traverse "
+            "(see test_browser_traverse_integration.py)"
+        )

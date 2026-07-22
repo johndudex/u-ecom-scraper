@@ -55,7 +55,6 @@ def auto_approve(interrupt_value):
         "validation_failed": "Continue anyway",
         "field_confirmation": "Approve",
         "pre_execution": "Proceed",
-        "skill_approval": "Skip",
         "reanalyze_exhausted": "Continue anyway",
     }
 

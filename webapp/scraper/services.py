@@ -54,13 +54,11 @@ INTERRUPT_TO_APPROVAL_TYPE: dict[str, str] = {
     "field_confirmation": "field_confirm",
     "pre_execution": "execution",
     "reanalyze_exhausted": "validation",
-    "skill_approval": "skill_update",
     "budget_exhausted_site": "validation",
     "budget_exhausted_product": "validation",
     "budget_exhausted_navigation": "validation",
     "missing_artifact_site": "validation",
     "missing_artifact_product": "validation",
-    "missing_artifact_navigation": "validation",
     "playwright_unavailable": "mechanism",
     "testing_exhausted": "validation",
     "review": "execution",
@@ -284,6 +282,40 @@ class LangGraphService:
                 # the targeted resume never fires (silent fallback to "resume
                 # all"). Do NOT use task.id here: that's a different UUID.
                 intr_id = getattr(interrupt_value, "id", "") or ""
+
+                # ── Dedup guard: prevent runaway duplicate Approvals.
+                # When a resume fails to consume an interrupt (checkpoint
+                # doesn't advance), the SAME interrupt_id persists in the
+                # snapshot and every _check_and_create_approval call would
+                # create a NEW Approval — observed: 505 duplicate APPROVED
+                # rows for one interrupt_id in ~4.5h. A legitimate new
+                # interrupt always gets a DIFFERENT interrupt_id (the
+                # checkpoint advanced between interrupt() calls), so this
+                # guard only blocks stuck-interrupt duplicates.
+                # Guard on PENDING+APPROVED (NOT exclude(SUPERSEDED)) so a
+                # human-REJECTED gate can still resurface via a fresh
+                # interrupt_id, and so terminal-job supersession doesn't
+                # mask a genuinely stuck interrupt.
+                if intr_id:
+                    _dup_exists = Approval.objects.filter(
+                        job=job,
+                        interrupt_id=str(intr_id),
+                        status__in=[
+                            Approval.STATUS_PENDING,
+                            Approval.STATUS_APPROVED,
+                        ],
+                    ).exists()
+                    if _dup_exists:
+                        logger.info(
+                            "Job %d: skipping duplicate Approval for "
+                            "interrupt_id=%s (PENDING/APPROVED already "
+                            "exists — resume likely failed to consume "
+                            "this interrupt)",
+                            job.id,
+                            intr_id,
+                        )
+                        found_interrupt = True
+                        continue
 
                 if not isinstance(interrupt_value, dict):
                     if hasattr(interrupt_value, "value"):

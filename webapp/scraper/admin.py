@@ -1,5 +1,8 @@
 from django.contrib import admin
 from django.utils import timezone
+import logging
+
+logger = logging.getLogger(__name__)
 
 from .models import (
     Approval,
@@ -115,41 +118,63 @@ class ApprovalAdmin(admin.ModelAdmin):
         ("Timing", {"fields": ("created_at", "resolved_at")}),
     )
 
+    def _build_decision(self, approval, approve: bool):
+        """Build a decision-dict resume value (consistent with views.py and
+        _auto_approve_stale_jobs) from the interrupt's decisions/options.
+        Reads `decisions` (current payload) falling back to `options` (legacy).
+        Returns (human_response_dict, label_for_display).
+        """
+        interrupt_data = approval.response_data or {}
+        decisions = interrupt_data.get("decisions") or interrupt_data.get("options") or []
+        # Cancel-ish labels for reject; approve-ish for approve.
+        if approve:
+            label = decisions[0] if isinstance(decisions, list) and decisions else "Approve"
+        else:
+            label = "Cancel"
+            if isinstance(decisions, list):
+                for d in decisions:
+                    if isinstance(d, str) and d.lower() in ("cancel", "abort", "no", "reject", "stop"):
+                        label = d
+                        break
+        return ({"decision": "approve" if approve else "reject",
+                 "label": label, "feedback": ""}, label)
+
     def approve_selected(self, request, queryset):
         for approval in queryset:
+            human_response, label = self._build_decision(approval, approve=True)
+            # STATUS_APPROVED means "answered" (the resume-targeting lookup in
+            # tasks.py filters on it); the approve intent lives in the dict.
             approval.status = Approval.STATUS_APPROVED
             approval.resolved_at = timezone.now()
-
-            interrupt_data = approval.response_data or {}
-            options = interrupt_data.get("options", [])
-            if len(options) == 1:
-                human_response = {"choice": options[0]}
-            else:
-                human_response = {"choice": "Approve"}
-
-            approval.human_response = human_response.get("choice", "Approve")
+            approval.human_response = label
             approval.save(update_fields=["status", "resolved_at", "human_response"])
             try:
                 from .tasks import resume_scrape_task
                 resume_scrape_task.delay(approval.job.id, human_response)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("approve_selected: resume dispatch failed for job %s: %s", approval.job_id, exc)
         self.message_user(request, f"Approved {queryset.count()} approval(s).")
 
     approve_selected.short_description = "Approve selected"
 
     def reject_selected(self, request, queryset):
         for approval in queryset:
-            approval.status = Approval.STATUS_REJECTED
+            human_response, label = self._build_decision(approval, approve=False)
+            # STATUS_APPROVED (NOT REJECTED): the targeted-resume lookup in
+            # tasks.py filters on STATUS_APPROVED, so the graph must see this
+            # resolved approval to route correctly (reject → re-analyze /
+            # cleanup / __end__ depending on the gate). The reject intent
+            # lives in the decision dict, not the status. Without dispatch
+            # the job hangs in WAITING_APPROVAL forever.
+            approval.status = Approval.STATUS_APPROVED
             approval.resolved_at = timezone.now()
-
-            interrupt_data = approval.response_data or {}
-            options = interrupt_data.get("options", [])
-            cancel_label = "Cancel" if "Cancel" in options else "Abort"
-            human_response = {"choice": cancel_label}
-
-            approval.human_response = cancel_label
+            approval.human_response = label
             approval.save(update_fields=["status", "resolved_at", "human_response"])
+            try:
+                from .tasks import resume_scrape_task
+                resume_scrape_task.delay(approval.job.id, human_response)
+            except Exception as exc:
+                logger.warning("reject_selected: resume dispatch failed for job %s: %s", approval.job_id, exc)
         self.message_user(request, f"Rejected {queryset.count()} approval(s).")
 
     reject_selected.short_description = "Reject selected"

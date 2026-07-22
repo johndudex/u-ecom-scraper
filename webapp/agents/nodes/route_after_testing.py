@@ -5,6 +5,7 @@
 
 import logging
 import re
+from typing import Optional
 
 from ..constants import DEAD_STATUS_CODES, FINAL_RETRY_SENTINEL, MAX_REMAPS, MAX_TEST_RETRIES
 from ..state import ScrapeState
@@ -13,7 +14,10 @@ logger = logging.getLogger(__name__)
 
 # Strategies where "0 items extracted" means ACCESS failed (the strategy can't
 # reach the content) — switch strategy, don't retry the same one.
-_HTTP_LIKE_STRATEGIES = {"http_requests", "internal_api", "api", "requests", "shopify_api"}
+_HTTP_LIKE_STRATEGIES = {
+    "http_requests", "internal_api", "api", "requests", "shopify_api",
+    "http_navigation",
+}
 _TRACEBACK_RE = re.compile(
     # any Python exception/warning name (NameError, RecursionError, PlaywrightError, …).
     # is_timeout takes precedence so TimeoutError is treated as access, not code-bug.
@@ -24,6 +28,17 @@ _TIMEOUT_RE = re.compile(r"\btimed?\s*out\b|\btimeout\b|\bexceeded\b", re.IGNORE
 _BLOCKED_RE = re.compile(
     r"\b(blocked|forbidden|403|captcha|access denied|unavailable|oop[s]!|"
     r"robot|rate[\s-]?limit)\b",
+    re.IGNORECASE,
+)
+# Playwright/Selenium "element not found" crashes — unambiguous CODE bugs (a
+# wrong selector), NOT access/strategy failures. Without this they fall through
+# to the generic "no items extracted — likely wrong strategy" branch and the
+# cascade abandons a viable strategy (e.g. locumtenens Playwright crash on a
+# non-existent `select[name='Specialties']`).
+_SELECTOR_CRASH_RE = re.compile(
+    r"failed to find element|eval_on_selector|query_selector|"
+    r"element.{0,20}not found|no element found|locator.{0,20}not found|"
+    r"waiting for selector|unable to find element",
     re.IGNORECASE,
 )
 
@@ -45,6 +60,34 @@ def _extracted_item_count(report: dict) -> int:
     return 0
 
 
+# Discovery-coverage gate (Phase 3). Tier 1 stop_reasons that mean the scraper
+# GAVE UP (errors / blocks / rate-limiting), NOT exhausted the source. A boolean
+# ``exhausted`` would have passed these — the H4 false-pass the gate exists to stop.
+_COVERAGE_FAIL_STOP_REASONS = {"navigate_error", "dedup_flat"}
+
+
+def _discovery_coverage_failure(report: dict) -> Optional[str]:
+    """Return a short reason if discovery coverage is insufficient, else None.
+
+    Reads ``test_report.discovery_coverage`` (code_tester copies it from the
+    scraper output's ``metadata.discovery_coverage``). Tier 1 (always on, fully
+    generic): ``stop_reason`` in {navigate_error, dedup_flat} → the scraper
+    stopped due to errors/blocks/rate-limiting, NOT exhaustion.
+
+    Returns None when discovery didn't run or signals are absent — the gate is a
+    NO-OP on missing data (never blocks).
+    """
+    if not isinstance(report, dict):
+        return None
+    cov = report.get("discovery_coverage")
+    if not isinstance(cov, dict) or not cov.get("ran_phase1", True):
+        return None
+    stop_reason = cov.get("stop_reason")
+    if stop_reason in _COVERAGE_FAIL_STOP_REASONS:
+        return f"discovery {stop_reason} (gave up, not exhausted)"
+    return None
+
+
 def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
     """Classify a failed test into an action + reason.
 
@@ -62,8 +105,16 @@ def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
     is_timeout = bool(_TIMEOUT_RE.search(crash))
     is_blocked = bool(_BLOCKED_RE.search(crash))
     is_traceback = bool(_TRACEBACK_RE.search(crash)) and not is_timeout
+    is_selector_crash = bool(_SELECTOR_CRASH_RE.search(crash))
     strat = (strategy or "").strip()
     is_http_like = strat in _HTTP_LIKE_STRATEGIES
+
+    # Code bug: a wrong CSS selector — the strategy is fine, the selector is
+    # wrong. This MUST be checked before the access/strategy branches below,
+    # otherwise a selector crash on a viable browser strategy gets misrouted to
+    # "switch strategy" and the cascade abandons the only working approach.
+    if is_selector_crash:
+        return ("scraper", f"selector crash — element not found ({crash[:80]})")
 
     # Access/strategy-class: the strategy can't reach the content.
     if is_timeout and strat in ("playwright", "stealth_browser", "seleniumbase_uc", ""):
@@ -78,6 +129,13 @@ def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
     # Items extracted but poor → let the caller decide mapping vs refine.
     if items == 0:
         return ("strategy", "no items extracted — likely wrong strategy")
+    # Discovery-coverage failure: items WERE extracted, but discovery gave up
+    # (navigate_error/dedup_flat). This is a strategy/access problem (the current
+    # approach can't cover the source), not a field-quality problem — switch
+    # strategy rather than "refine".
+    _cov = _discovery_coverage_failure(report)
+    if _cov:
+        return ("strategy", _cov)
     return ("refine", f"{items} items, low quality")
 
 MIN_CONFIDENCE_PASS = 0.85
@@ -279,15 +337,59 @@ def route_after_testing(state: ScrapeState) -> str:
             missing_core,
         )
 
+    # Discovery-coverage signal: computed once, used to (a) downgrade a
+    # field-PASS, (b) bypass the ground-truth override, and (c) exempt the cascade
+    # from the anti-bot downgrade. None ⇒ no coverage problem (gate is a no-op).
+    _cov_reason = _discovery_coverage_failure(report)
+
     if assessment == "PASS" and confidence >= MIN_CONFIDENCE_PASS and not high_severity:
-        logger.info("route_after_testing: PASS (confidence=%.2f)", confidence)
-        return "field_confirmation"
+        # Phase-coverage gate (deterministic backstop): for two-phase
+        # navigation scrapers, a PASS is only valid if Phase 1 discovery was
+        # actually exercised. code_tester historically ran `--input
+        # input_urls.json` (bypassing discovery) — so pagination,
+        # form-submit discovery, and dimension iteration all shipped
+        # unvalidated (the locumtenens 25-vs-1000 bug hid here for this
+        # reason). The tester reports phases_tested; if Phase 1 wasn't run,
+        # downgrade PASS → re-test via scraper_analyzer (which re-runs with
+        # discovery). Generic for any two-phase navigation/list_page/search_term job.
+        _input_mode = (state.get("input_mode") or "").strip()
+        if _input_mode in ("navigation", "list_page", "search_term"):
+            _phases = report.get("phases_tested") if isinstance(report, dict) else None
+            _phase1 = (
+                _phases.get("phase1_discovery")
+                if isinstance(_phases, dict)
+                else None
+            )
+            if not _phase1:
+                logger.warning(
+                    "route_after_testing: PASS rejected — Phase 1 discovery was NOT "
+                    "tested (tester used --input, bypassing discovery). Routing to "
+                    "scraper_analyzer for a discovery-validating re-test."
+                )
+                return "scraper_analyzer"
+        if _cov_reason:
+            # Field quality is fine BUT discovery coverage is insufficient (scraper
+            # gave up, or iterated too few dimensions). A field-PASS here would
+            # rubber-stamp the locumtenens failure (38 good jobs, 3733 missed).
+            # Fall through to the cascade so classify_test_failure routes to a
+            # strategy switch (overall_assessment stays "PASS" — graph.py's
+            # strategies_tried recording keys off _cov_bad too).
+            logger.warning(
+                "route_after_testing: field-PASS DOWNGRADED — discovery coverage "
+                "insufficient (%s). Falling through to strategy cascade.",
+                _cov_reason,
+            )
+        else:
+            logger.info("route_after_testing: PASS (confidence=%.2f)", confidence)
+            return "field_confirmation"
 
     # GROUND-TRUTH OVERRIDE (content-type-aware): if the scraper actually
     # extracted enough real items (title + a core field of the content type —
     # price for products, company/location for jobs), it WORKS — regardless of
     # code_tester's subjective high_severity flags. The output is the truth.
-    if _scraper_has_real_items(state, min_count=3):
+    # BUT: ≥3 real items does NOT mean full coverage (locumtenens had 38 real
+    # jobs, 3733 missed) — so a coverage failure overrides ground-truth too.
+    if not _cov_reason and _scraper_has_real_items(state, min_count=3):
         logger.info(
             "route_after_testing: GROUND-TRUTH PASS — scraper produced ≥3 real "
             "items (overriding code_tester's high_severity flags)"
@@ -308,7 +410,7 @@ def route_after_testing(state: ScrapeState) -> str:
     # code bug (fix) vs mapping (remap). Deterministic guards override code_tester
     # so an unambiguous signal (timeout / 0-item http run / traceback) always
     # routes correctly even if the LLM mis-diagnoses. The failed strategy is
-    # recorded into state.strategies_tried by _invoke_scraper_analyzer (the router
+    # recorded into state.strategies_tried by _decide_strategy (the router
     # can't update state), so scraper_analyzer picks a DIFFERENT strategy.
     _strategy = (state.get("scraper_analysis") or {}).get("strategy", "")
     _action, _reason = classify_test_failure(report, _strategy)
@@ -329,8 +431,13 @@ def route_after_testing(state: ScrapeState) -> str:
         or (isinstance(_ab, dict) and _ab.get("detected"))
         or str(_meth).startswith(("uc_chrome", "cloak"))
     )
-    if _action == "strategy" and _anti_bot and _strategy in ("playwright", "stealth_browser", "seleniumbase_uc", ""):
-        _action, _reason = "scraper", f"anti-bot site: fix playwright+cloak run ({_reason})"
+    if _action == "strategy" and _anti_bot and _strategy in ("playwright", "stealth_browser", "seleniumbase_uc", "http_navigation", "") and not _cov_reason:
+        # Coverage failures are exempt from the anti-bot downgrade: a coverage gap
+        # (gave-up / partial iteration) is a discovery-mechanics problem, not a
+        # cloak problem — downgrading to "scraper" would swallow the switch and
+        # silently rubber-stamp the under-coverage. (Only non-coverage strategy
+        # failures on anti-bot sites get downgraded, as before.)
+        _action, _reason = "scraper", f"anti-bot site: fix browser+cloak run ({_reason})"
     # code_tester's LLM diagnosis can refine an ambiguous "refine" into mapping.
     remediation = report.get("remediation") if isinstance(report, dict) else None
     if _action == "refine" and isinstance(remediation, dict):

@@ -97,9 +97,7 @@ def check_tracker(state: ScrapeState) -> Command:
         site.save(update_fields=["status"])
         return Command(
             update={
-                "site_status": "in_progress",
-                "current_phase": "check_tracker",
-                "skip_site_analysis": False,
+                "site_status": "in_progress",                "skip_site_analysis": False,
                 "skip_product_analysis": False,
                 "skip_code_generation": False,
             },
@@ -119,7 +117,6 @@ def check_tracker(state: ScrapeState) -> Command:
             return Command(
                 update={
                     "site_status": "in_progress",
-                    "current_phase": "check_tracker",
                     "skip_site_analysis": False,
                     "skip_product_analysis": False,
                     "skip_code_generation": False,
@@ -162,7 +159,6 @@ def _handle_new_site(url: str, slug: str, site_type: str = "shopping") -> Comman
     return Command(
         update={
             "site_status": "in_progress",
-            "current_phase": "check_tracker",
         },
         goto="setup_workspace",
     )
@@ -174,9 +170,7 @@ def _handle_complete(site, slug: str, full_extraction: bool) -> Command:
     if full_extraction:
         return Command(
             update={
-                "site_status": "in_progress",
-                "current_phase": "check_tracker",
-                "skip_site_analysis": False,
+                "site_status": "in_progress",                "skip_site_analysis": False,
                 "skip_product_analysis": False,
                 "skip_code_generation": False,
             },
@@ -261,9 +255,7 @@ def _handle_in_progress(site, slug: str, root: str, input_mode: str = "") -> Com
         _clean_workspace(root, slug)
         return Command(
             update={
-                "site_status": "in_progress",
-                "current_phase": "check_tracker",
-                "skip_site_analysis": False,
+                "site_status": "in_progress",                "skip_site_analysis": False,
                 "skip_product_analysis": False,
                 "skip_code_generation": False,
             },
@@ -282,9 +274,7 @@ def _handle_in_progress(site, slug: str, root: str, input_mode: str = "") -> Com
         )
         return Command(
             update={
-                "site_status": "in_progress",
-                "current_phase": "check_tracker",
-                "skip_site_analysis": True,
+                "site_status": "in_progress",                "skip_site_analysis": True,
                 "skip_product_analysis": True,
                 "skip_code_generation": True,
             },
@@ -295,9 +285,7 @@ def _handle_in_progress(site, slug: str, root: str, input_mode: str = "") -> Com
         logger.info("check_tracker: site+product analysis exist for %s, skipping to code gen", slug)
         return Command(
             update={
-                "site_status": "in_progress",
-                "current_phase": "check_tracker",
-                "skip_site_analysis": True,
+                "site_status": "in_progress",                "skip_site_analysis": True,
                 "skip_product_analysis": True,
                 "skip_code_generation": False,
             },
@@ -308,9 +296,7 @@ def _handle_in_progress(site, slug: str, root: str, input_mode: str = "") -> Com
         logger.info("check_tracker: site analysis exists for %s, skipping to product analysis", slug)
         return Command(
             update={
-                "site_status": "in_progress",
-                "current_phase": "check_tracker",
-                "skip_site_analysis": True,
+                "site_status": "in_progress",                "skip_site_analysis": True,
                 "skip_product_analysis": False,
                 "skip_code_generation": False,
             },
@@ -323,7 +309,6 @@ def _handle_in_progress(site, slug: str, root: str, input_mode: str = "") -> Com
     return Command(
         update={
             "site_status": "in_progress",
-            "current_phase": "check_tracker",
             "skip_site_analysis": False,
             "skip_product_analysis": False,
             "skip_code_generation": False,

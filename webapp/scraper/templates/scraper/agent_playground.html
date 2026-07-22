@@ -21,8 +21,7 @@
                         <label for="agent_name" class="input-label">Agent</label>
                         <select id="agent_name" name="agent_name" class="input-field">
                             <option value="site_analyzer">Site Analyzer</option>
-                            <option value="navigation_explore" selected>Navigation Explore (deterministic)</option>
-                            <option value="navigation_synthesize">Navigation Synthesize (read/write only)</option>
+                            <option value="browser_traverse" selected>Browser Navigation</option>
                             <option value="nav_skill_review">Navigation Skill Review (skills)</option>
                             <option value="product_analyzer">Product Analyzer</option>
                             <option value="scraper_analyzer">Scraper Analyzer</option>
@@ -129,7 +128,7 @@ function updatePrompt() {
     document.getElementById('prompt').value = prompt;
 
     // Show search_criteria only for navigation agents
-    var showSearch = (agent === 'navigation_explore' || agent === 'navigation_synthesize');
+    var showSearch = (agent === 'browser_traverse');
     document.getElementById('search-criteria-group').classList.toggle('hidden', !showSearch);
 }
 

@@ -15,7 +15,7 @@
             <span class="text-line-strong">/</span>
             <span class="text-sm font-medium text-ink font-mono">{{ filename }}</span>
         </div>
-        <p class="text-xs text-ink-muted">{{ product_count }} product{{ product_count|pluralize }}</p>
+        <p class="text-xs text-ink-muted">{{ item_count|default:product_count }} {{ item_label|default:"product" }}{{ item_count|default:product_count|pluralize }}</p>
     </div>
     <a href="{{ download_url }}" class="btn-secondary">Download</a>
 </div>

@@ -34,9 +34,7 @@ from django.core.management.base import BaseCommand, CommandError
 
 NODES = [
     "site_analyzer",
-    "navigation_explore",
-    "navigation_agent",
-    "navigation_synthesize",
+    "browser_traverse",
     "nav_skill_review",
     "product_analyzer",
     "scraper_analyzer",

@@ -1,84 +1,43 @@
-"""Pre-execution approval node.
+"""Pre-execution approval node (Wave 2 Cut 2: merged into field_confirmation).
 
-[HIP #8] Interrupts the user before running the full scraper:
-"Ready to scrape ~N items from '{slug}'. Proceed?"
+Historically this was a SECOND consecutive interrupt fired after
+``field_confirmation`` resolved — "Ready to scrape ~N items? Proceed?". That was
+redundant with field_confirmation's own "Approve to proceed with the full
+scrape" gate: two interrupts back-to-back for the same run/don't-run decision.
+
+Wave 2 Cut 2 merged the two:
+  * The item-count estimate (read from ``input_urls.json``) now appears in
+    ``field_confirmation``'s interrupt message, alongside the sample fields.
+  * ``field_confirmation`` routes straight to ``run_execution`` on approve
+    (and still loops back to ``product_analyzer`` on reject, preserving the
+    cancel/re-analyze path).
+  * This node is NO LONGER registered in the graph (``graph.build_scrape_graph``
+    does not ``add_node`` it).
+
+The function is kept as a pass-through so existing imports resolve — notably
+``webapp/agents/nodes/__init__.py`` still re-exports it, and an in-flight job
+whose checkpoint references this node can still load the symbol. It is not
+reached by fresh runs.
 """
 
-import json
 import logging
-import os
 
-from langgraph.types import Command, interrupt
+from langgraph.types import Command
 
-from ..decisions import _parse_decision, build_decisions, is_cancel
 from ..state import ScrapeState
 
 logger = logging.getLogger(__name__)
 
 
-def _get_project_root() -> str:
-    try:
-        from django.conf import settings
-
-        if hasattr(settings, "PROJECT_ROOT"):
-            return str(settings.PROJECT_ROOT)
-    except Exception:
-        pass
-    return os.getcwd()
-
-
-def _item_label(state: ScrapeState) -> str:
-    content_type_config = state.get("content_type_config", {})
-    if content_type_config and "output_key" in content_type_config:
-        key = content_type_config["output_key"]
-        if key == "products":
-            return "products"
-        return key.rstrip("s")
-    return "items"
-
-
 def pre_execution_approval(state: ScrapeState) -> Command:
-    if state.get("sample_only", False):
-        logger.info("pre_execution_approval: skipping execution (sample_only mode)")
-        return Command(goto="cleanup")
+    """Pass-through — the execution gate is now ``field_confirmation``.
 
-    slug = state["site_slug"]
-    item_count = state.get("item_count", 0) or state.get("product_count", 0)
-    label = _item_label(state)
-
-    input_path = os.path.join(_get_project_root(), "workspace", slug, "input_urls.json")
-    estimated_count = item_count
-    try:
-        with open(input_path) as fh:
-            data = json.load(fh)
-            estimated_count = len(data.get("urls", []))
-    except Exception:
-        pass
-
-    human_response = interrupt(
-        {
-            "reason": "pre_execution",
-            "message": (
-                f"Ready to scrape ~{estimated_count} {label} from '{slug}'. "
-                "Proceed with the full extraction?"
-            ),
-            "estimated_products": estimated_count,
-            "decisions": build_decisions(
-                approve_label="Proceed",
-                reject_label="Cancel",
-                reject_with_feedback=False,
-            ),
-        }
+    If ever invoked directly (legacy checkpoint / playground), route straight
+    to ``run_execution``. ``sample_only`` jobs already bypassed this node via
+    ``field_confirmation`` and continue to do so.
+    """
+    logger.info(
+        "pre_execution_approval: pass-through (merged into field_confirmation) — "
+        "routing to run_execution"
     )
-
-    decision = _parse_decision(human_response)
-
-    if not is_cancel(decision):
-        logger.info("pre_execution_approval: user approved execution")
-        return Command(goto="run_execution")
-
-    logger.info("pre_execution_approval: user cancelled execution")
-    return Command(
-        update={"execution_status": "FAILED"},
-        goto="cleanup",
-    )
+    return Command(goto="run_execution")

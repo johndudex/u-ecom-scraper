@@ -48,12 +48,32 @@ def _sync_input_urls_file(instance):
     try:
         from django.conf import settings
 
+        import json
+
+        import logging
+
         file_path = (
             Path(settings.PROJECT_ROOT) / "scrapers" / instance.slug / "input_urls.json"
         )
+        # Shrinkage guard: never overwrite the production file with FEWER urls
+        # than it already has. A job can briefly hold a subset (e.g. a 1-URL
+        # sample) on the Site row; syncing that would silently truncate the
+        # user's full list (the wildsecrets 50→1 / dollartree 5→1 / vistastaff
+        # 5→1 truncation). Skip + log instead.
+        if file_path.exists():
+            try:
+                with open(file_path, encoding="utf-8") as _f:
+                    _existing = json.load(_f).get("urls") or []
+                if len(_existing) > len(urls):
+                    logging.getLogger("scraper.models").warning(
+                        "input_urls sync skipped for %s: file has %d urls, new list "
+                        "has %d (refusing to shrink the production file)",
+                        instance.slug, len(_existing), len(urls),
+                    )
+                    return
+            except Exception:
+                pass
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        import json
-
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump({"urls": urls}, f, indent=2, ensure_ascii=False)
     except Exception:
@@ -68,6 +88,7 @@ class ContentType(models.Model):
     sort_order = models.IntegerField(default=0)
 
     class Meta:
+        app_label = 'scraper'
         ordering = ["sort_order", "group", "value"]
         verbose_name = "Content Type"
         verbose_name_plural = "Content Types"
@@ -122,6 +143,14 @@ class ScrapeJob(models.Model):
     full_extraction = models.BooleanField(default=False)
     auto_queued = models.BooleanField(default=False)
 
+    # Intake UI (templates/scraper-intake.html) — user-facing knobs surfaced to
+    # product_analyzer / code_writer as advisory hints. All default empty so
+    # legacy jobs and the home view are unaffected. [intake-ui]
+    target_fields = models.JSONField(default=list, blank=True)
+    scope = models.CharField(max_length=20, blank=True, default="")
+    scope_value = models.CharField(max_length=200, blank=True, default="")
+    notes = models.TextField(blank=True, default="")
+
     error_message = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     started_at = models.DateTimeField(null=True, blank=True)
@@ -173,19 +202,21 @@ class Step(models.Model):
     PHASE_CHOICES = [
         ("accessibility_check", "Accessibility Check"),
         ("site_analysis", "Site Analysis"),
-        ("navigation_explore", "Navigation Explore"),
-        ("navigation_synthesize", "Navigation Synthesis"),
+        ("browser_traverse", "Browser Navigation"),
         ("navigation_skill_review", "Navigation Skill Review"),
         ("navigation_analysis", "Navigation Analysis"),
         ("content_analysis", "Content Analysis"),
         ("product_analysis", "Product Analysis"),
         ("scraper_analysis", "Scraper Analysis"),
         ("code_generation", "Code Generation"),
+        ("code_review", "Code Review"),
         ("testing", "Testing"),
         ("field_confirmation", "Field Confirmation"),
         ("execution", "Execution"),
         ("cleanup", "Cleanup"),
         ("skill_learning", "Skill Learning"),
+        ("dagster_converter", "Dagster Conversion"),
+        ("store_job_listings", "Store Listings"),
     ]
 
     job = models.ForeignKey(ScrapeJob, related_name="steps", on_delete=models.CASCADE)
@@ -247,7 +278,13 @@ class Approval(models.Model):
     # resume ONLY this specific interrupt (not stale ones from earlier nodes
     # that accumulate in the checkpoint). Set when _check_and_create_approval
     # creates the approval from the snapshot.
-    interrupt_id = models.CharField(max_length=200, blank=True, default="")
+    interrupt_id = models.CharField(max_length=200, blank=True, default="", db_index=True)
+    # P0-10: stuck-approved watchdog fields. resume_value stores the exact
+    # decision dict passed to resume_scrape_task (so the watchdog can replay
+    # it if the resume failed to consume the interrupt). resume_attempts
+    # counts watchdog re-dispatches (capped at STUCK_APPROVED_MAX_RETRIES).
+    resume_value = models.JSONField(null=True, blank=True, default=dict)
+    resume_attempts = models.IntegerField(default=0)
     status = models.CharField(
         max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING
     )
@@ -408,8 +445,7 @@ class AgentPlayground(models.Model):
     # Available agents for testing (matches AGENT_TOOL_MAP keys)
     AGENT_CHOICES = [
         ("site_analyzer", "Site Analyzer"),
-        ("navigation_explore", "Navigation Explore"),
-        ("navigation_synthesize", "Navigation Synthesize"),
+        ("browser_traverse", "Browser Navigation"),
         ("nav_skill_review", "Navigation Skill Review"),
         ("product_analyzer", "Product Analyzer"),
         ("scraper_analyzer", "Scraper Analyzer"),
@@ -531,16 +567,20 @@ class JobListing(models.Model):
 
     # Date filtering (the key field for the dashboard)
     posted_date = models.DateField(null=True, blank=True, db_index=True)
+    date_posted_reliable = models.BooleanField(default=True)
     valid_through = models.DateField(null=True, blank=True)
 
     # Extra fields (flexible — store any site-specific fields not covered above)
     extra_data = models.JSONField(default=dict, blank=True)
 
-    # Metadata
+    # Metadata — scraped_at is auto_now_add (fires on INSERT only), so it
+    # IS first_seen_at (the first scrape run that discovered this job). It
+    # survives update_or_create (auto_now_add is INSERT-only). The system's
+    # authoritative freshness signal when posted_date is unreliable.
     scraped_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        ordering = ["-posted_date", "-scraped_at"]
+        ordering = ["-scraped_at", "-posted_date"]
         indexes = [
             models.Index(fields=["posted_date"]),
             models.Index(fields=["company"]),

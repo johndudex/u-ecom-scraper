@@ -10,6 +10,7 @@ For lightweight scrapers, runs in-process via subprocess.
 import json
 import logging
 import os
+import select
 import subprocess
 import time
 from typing import Any, Optional
@@ -179,6 +180,10 @@ def _stealth_env(state: ScrapeState) -> dict[str, str]:
 
 
 def run_execution(state: ScrapeState) -> dict:
+    from ..graph import _notify_phase
+
+    job_id = state.get("job_id", 0)
+    _notify_phase(job_id, "execution", "running")
     slug = state["site_slug"]
     root = _get_project_root()
     workspace_folder = os.path.join(root, "workspace", slug)
@@ -200,11 +205,39 @@ def run_execution(state: ScrapeState) -> dict:
 
     input_mode = state.get("input_mode", "")
     search_criteria = state.get("search_criteria", "")
-    if input_mode in ("navigation", "list_page", "search_term") and search_criteria:
+    # `search_criteria` semantics differ by input_mode (parse_command.py:31-36
+    # is the contract): it is a production FILTER only for `search_term` jobs
+    # (and url_list+criteria, which parse_command flips to search_term). For
+    # navigation/list_page it is a discovery HINT, not a filter — passing
+    # `--query` here collapses full taxonomy iteration into a single keyword
+    # search (e.g. locumtenens: 1000+ → 25). Route navigation/list_page to
+    # full discovery via the proven `--listing-url` (working results page).
+    if input_mode == "search_term" and search_criteria:
         args.extend(["--query", search_criteria])
-        logger.info(
-            "run_execution: navigation job, passing --query '%s'", search_criteria
+        logger.info("run_execution: search_term job, passing --query '%s'", search_criteria)
+    elif input_mode in ("navigation", "list_page"):
+        _nav = state.get("navigation_analysis") or {}
+        _search = _nav.get("search") or {}
+        _working_url = (
+            (_search.get("working_url") if isinstance(_search, dict) else "")
+            or (_search.get("listing_url_used") if isinstance(_search, dict) else "")
+            or ""
         )
+        if _working_url:
+            args.extend(["--listing-url", _working_url])
+            logger.info(
+                "run_execution: navigation job, passing --listing-url (full discovery) '%s'",
+                _working_url,
+            )
+
+    # H3 (checkpoint cross-contamination): code_tester writes a
+    # discovered_urls_checkpoint.json during its capped sample run, and without
+    # this flag the execution phase loads it and skips Phase 1 — silently
+    # extracting only the test sample (the locumtenens 38-of-3771 bug).
+    # --fresh-discovery makes the scraper ignore any existing checkpoint and run
+    # Phase 1 from scratch. The CLI-contract guard below drops this flag if the
+    # generated scraper's argparse doesn't define it yet. [discovery-coverage-gate §4]
+    args.append("--fresh-discovery")
 
     # CLI-contract guard: drop any flag the generated scraper doesn't define,
     # so an LLM-authored argparse can't exit(2) and silently zero the output.
@@ -221,7 +254,23 @@ def run_execution(state: ScrapeState) -> dict:
             )
         args = filtered
 
-    if _needs_browser(state, scraper_path):
+    # Execution-mode feature flag (settings.SCRAPER_EXECUTION_MODE):
+    #   "auto" (default) — _needs_browser decides per-scraper; today's behavior.
+    #   "force_scrape"   — always route via browser_service /scrape (rollback lane
+    #                      to the subprocess model; see rework plan §4).
+    #   "force_http"     — always run in-process (forces the new HTTP navigation
+    #                      model even for legacy Playwright scrapers, post-migration).
+    from django.conf import settings
+
+    exec_mode = getattr(settings, "SCRAPER_EXECUTION_MODE", "auto")
+    if exec_mode == "force_scrape":
+        needs_browser = True
+    elif exec_mode == "force_http":
+        needs_browser = False
+    else:
+        needs_browser = _needs_browser(state, scraper_path)
+
+    if needs_browser:
         logger.info("run_execution: browser-based scraper, dispatching to browser_service")
         result = _run_via_browser_service(scraper_path, args, site_folder, state)
 
@@ -236,7 +285,10 @@ def run_execution(state: ScrapeState) -> dict:
 
         return result
 
-    return _run_in_process(scraper_path, args, root, site_folder, workspace_folder)
+    return _run_in_process(
+        scraper_path, args, root, site_folder, workspace_folder, job_id=job_id,
+        env_overrides=_stealth_env(state),
+    )
 
 
 def _run_category_sources(state, scraper_path, base_args, site_folder, primary_result, search_term):
@@ -346,15 +398,23 @@ def _run_category_sources(state, scraper_path, base_args, site_folder, primary_r
             timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
             merged_path = _os.path.join(site_folder, f"output_merged_{timestamp}.json")
             site_block = primary_data.get("site", {}) if primary_file else {}
+            # discovery_coverage: Phase 5 will fully aggregate across sources
+            # (sum found, max dimensions_total, stop_reason precedence). For now
+            # propagate the primary source's block as-is so the gate has something
+            # to read on the merged output. [discovery-coverage-gate §6, H2]
+            primary_coverage = _read_discovery_coverage(primary_file)
+            merged_meta: dict = {
+                "scraping_method": "multisource_playwright",
+                "sources": 1 + min(len(relevant), 5),
+                "total_products": len(all_products),
+                "merged": True,
+            }
+            if isinstance(primary_coverage, dict):
+                merged_meta["discovery_coverage"] = primary_coverage
             merged = {
                 "site": site_block,
                 output_key: all_products,
-                "metadata": {
-                    "scraping_method": "multisource_playwright",
-                    "sources": 1 + min(len(relevant), 5),
-                    "total_products": len(all_products),
-                    "merged": True,
-                },
+                "metadata": merged_meta,
             }
             with open(merged_path, "w") as f:
                 _json.dump(merged, f, indent=2, ensure_ascii=False, default=str)
@@ -363,6 +423,7 @@ def _run_category_sources(state, scraper_path, base_args, site_folder, primary_r
                 "execution_status": "SUCCESS",
                 "output_file": merged_path,
                 "product_count": len(all_products),
+                "discovery_coverage": primary_coverage,
                 "error_message": "",
             }
 
@@ -374,43 +435,113 @@ def _run_category_sources(state, scraper_path, base_args, site_folder, primary_r
 
 def _run_in_process(
     scraper_path: str, args: list[str], cwd: str, site_folder: str,
-    workspace_folder: str = "",
+    workspace_folder: str = "", job_id: int = 0,
+    env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     cmd = ["python3", scraper_path] + args
     start = time.time()
 
+    # The in-process subprocess can run 30+ min on a long scrape (the HTTP
+    # navigation template's 200-page discovery is exactly that). The Celery
+    # watchdog (cleanup_stuck_jobs, tasks.py) reaps any RUNNING job whose
+    # newest SessionLog row is older than STUCK_JOB_ACTIVITY_TIMEOUT_MINUTES
+    # (30 min), so a bare subprocess.run is marked FAILED mid-scrape with the
+    # misleading "Worker process crashed ... Likely OOM killed" message even
+    # though the subprocess is still running. Mirror _run_via_browser_service's
+    # heartbeat (240 s) so the watchdog sees activity throughout. Lazy import
+    # avoids a circular dependency (graph imports this node module).
+    hb = None
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=3600, cwd=cwd,
-        )
+        from webapp.agents.graph import _start_heartbeat
 
+        if job_id:
+            hb = _start_heartbeat(job_id, "run_execution", interval=240)
+    except Exception as _hb_exc:
+        logger.warning("run_execution: heartbeat start failed: %s", _hb_exc)
+
+    try:
+        # Stall-bound execution — applies to ALL scrapers (template AND custom
+        # code_writer code). The template DISCOVERY_DEADLINE_SECONDS only governs
+        # template scrapers; a custom scraper had no internal bound and could hang
+        # for the full wall-clock timeout on a JS-blocked/rate-limited site. Monitor
+        # stderr (scrapers log page/item progress there): if no output for
+        # EXECUTION_STALL_TIMEOUT the scraper is stalled → kill it. Hard backstop
+        # EXECUTION_TIMEOUT. Binary pipes + os.read so a partial line can't block
+        # the stall timer.
+        from django.conf import settings as _settings
+        _stall = getattr(_settings, "EXECUTION_STALL_TIMEOUT", 300)
+        _hard = getattr(_settings, "EXECUTION_TIMEOUT", 3600)
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd,
+            env={**os.environ, **(env_overrides or {})},
+        )
+        err_fd = proc.stderr.fileno()
+        stderr_buf = bytearray()
+        last_activity = time.time()
+        stall_reason = ""
+        while True:
+            ready, _, _ = select.select([proc.stderr], [], [], 5.0)
+            if ready:
+                chunk = os.read(err_fd, 65536)
+                if chunk:
+                    last_activity = time.time()
+                    stderr_buf.extend(chunk)
+                    if len(stderr_buf) > 200_000:
+                        del stderr_buf[:100_000]
+                elif proc.poll() is not None:
+                    break  # EOF and process exited
+            elif proc.poll() is not None:
+                break  # no output this tick but process exited
+            if time.time() - last_activity > _stall:
+                stall_reason = (
+                    f"scraper stalled — no output for {_stall}s "
+                    f"(likely hung/blocked on a JS or rate-limited site)"
+                )
+                proc.kill()
+                break
+            if time.time() - start > _hard:
+                stall_reason = f"scraper exceeded {_hard}s wall-clock"
+                proc.kill()
+                break
+        try:
+            proc.communicate(timeout=30)  # drain + reap the killed/finished process
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        returncode = proc.returncode if proc.returncode is not None else -1
         elapsed = round(time.time() - start, 2)
-        logger.info(
-            "run_execution: scraper exited with code %d in %ds", result.returncode, elapsed
-        )
+        stderr = stderr_buf.decode("utf-8", "replace")
 
-        if result.returncode != 0:
-            stderr = result.stderr[:2000] if result.stderr else ""
+        if stall_reason:
+            logger.error("run_execution: %s after %ds", stall_reason, elapsed)
             return {
                 "execution_status": "FAILED",
-                "error_message": f"Scraper exited with code {result.returncode}. {stderr}",
+                "error_message": f"{stall_reason}. Last output: {stderr[-1500:]}",
+            }
+
+        logger.info("run_execution: scraper exited with code %d in %ds", returncode, elapsed)
+
+        if returncode != 0:
+            return {
+                "execution_status": "FAILED",
+                "error_message": f"Scraper exited with code {returncode}. {stderr[-2000:]}",
             }
 
         output_file = _find_newest_output(workspace_folder, site_folder)
         product_count = _count_products(output_file) if output_file else 0
+        discovery_coverage = _read_discovery_coverage(output_file)
+
+        # H3: in-process path owns its own checkpoint cleanup (no browser_service
+        # to do it). Delete so a subsequent invocation starts fresh. Tried in both
+        # the workspace dir (SCRIPT_DIR location) and the subprocess cwd, since
+        # the checkpoint location varies by template. [discovery-coverage-gate §4]
+        _delete_discovery_checkpoint(workspace_folder, cwd)
 
         return {
             "execution_status": "SUCCESS",
             "output_file": output_file or "",
             "product_count": product_count,
+            "discovery_coverage": discovery_coverage,
             "error_message": "",
-        }
-
-    except subprocess.TimeoutExpired:
-        logger.error("run_execution: scraper timed out after 3600s")
-        return {
-            "execution_status": "FAILED",
-            "error_message": "Scraper timed out (3600s limit)",
         }
     except Exception as exc:
         logger.exception("run_execution: unexpected error")
@@ -418,6 +549,14 @@ def _run_in_process(
             "execution_status": "FAILED",
             "error_message": str(exc),
         }
+    finally:
+        if hb is not None:
+            try:
+                from webapp.agents.graph import _stop_heartbeat
+
+                _stop_heartbeat(hb)
+            except Exception:
+                pass
 
 
 def _run_via_browser_service(
@@ -434,7 +573,10 @@ def _run_via_browser_service(
         bool(stealth_env),
     )
 
-    timeout = 7200
+    # Execution fail-fast bound (same EXECUTION_TIMEOUT backstop as the in-process
+    # path — bounds a hung browser_service scrape, applies to all scrapers).
+    from django.conf import settings as _settings
+    timeout = getattr(_settings, "EXECUTION_TIMEOUT", 3600)
     # The /scrape call blocks for the whole run (a 60-100 item scrape takes
     # 15-20 min). The celery watchdog (cleanup_stuck_jobs) kills jobs with no
     # SessionLog activity for STUCK_JOB_ACTIVITY_TIMEOUT_MINUTES, so without a
@@ -479,10 +621,17 @@ def _run_via_browser_service(
                 "error_message": f"Scraper exited with code {result['returncode']}. {stderr}",
             }
 
+        # The output lives on the shared volume, so we can read the
+        # discovery_coverage block the scraper emitted. Checkpoint cleanup for
+        # this path is owned by browser_service's scraper_runner (post-success).
+        output_file = result.get("output_file", "")
+        discovery_coverage = _read_discovery_coverage(output_file)
+
         return {
             "execution_status": "SUCCESS",
-            "output_file": result.get("output_file", ""),
+            "output_file": output_file,
             "product_count": result.get("product_count", 0),
+            "discovery_coverage": discovery_coverage,
             "error_message": "",
         }
 
@@ -565,3 +714,50 @@ def _count_products(output_path: str) -> int:
         return 0
     except Exception:
         return 0
+
+
+def _read_discovery_coverage(output_path: str) -> Optional[dict[str, Any]]:
+    """Read the ``discovery_coverage`` block from a scraper output's metadata.
+
+    Two-phase scrapers emit this block (see
+    docs/discovery-coverage-gate-contract.md §1) inside ``metadata``. Returns
+    None when absent (url_list scrapers with no discovery phase, older outputs,
+    or missing file) so the state field stays unset rather than polluted.
+    """
+    if not output_path or not os.path.isfile(output_path):
+        return None
+    try:
+        with open(output_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            metadata = data.get("metadata") or {}
+            if isinstance(metadata, dict):
+                block = metadata.get("discovery_coverage")
+                if isinstance(block, dict):
+                    return block
+    except Exception:
+        pass
+    return None
+
+
+def _delete_discovery_checkpoint(*candidate_dirs: str) -> None:
+    """Delete ``discovered_urls_checkpoint.json`` so the next run starts fresh (H3).
+
+    Without this, code_tester's capped-sample checkpoint persists into
+    run_execution, which loads it and skips Phase 1 — silently extracting only
+    the test sample (the locumtenens 38-of-3771 bug). Tried across all candidate
+    dirs because the checkpoint location varies by template (SCRIPT_DIR vs cwd).
+    Silent no-op when the file is absent. [discovery-coverage-gate §4]
+    """
+    for d in candidate_dirs:
+        if not d:
+            continue
+        path = os.path.join(d, "discovered_urls_checkpoint.json")
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                logger.info("run_execution: removed discovery checkpoint %s", path)
+        except OSError as exc:
+            logger.warning(
+                "run_execution: could not remove checkpoint %s: %s", path, exc
+            )

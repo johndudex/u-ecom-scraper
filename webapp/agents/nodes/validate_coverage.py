@@ -7,7 +7,7 @@ from typing import Any
 
 from langgraph.types import Command
 
-from ..constants import MAX_VALIDATE_RETRIES
+from ..constants import MAX_COVERAGE_RETRIES, MAX_VALIDATE_RETRIES
 from ..decisions import options_to_decisions
 from ..state import ScrapeState
 
@@ -182,9 +182,37 @@ def validate_coverage(state: ScrapeState) -> Command:
         return Command(update=state_update, goto="scraper_analyzer")
 
     if coverage_ratio < MIN_COVERAGE:
-        logger.info("validate_coverage: low coverage, missing fields: %s", missing)
+        # Cap the retry loop (the missing-file path uses MAX_VALIDATE_RETRIES;
+        # the low-coverage path previously had NO cap → infinite loop on
+        # repeated "Retry"). On exhaustion, interrupt with coverage_exhausted
+        # (human gate) rather than silently proceeding — the analysis EXISTS
+        # but is incomplete, so silent proceed would ship a scraper that
+        # drops core fields.
+        coverage_retries = (state.get("coverage_retry_count", 0) or 0) + 1
+        logger.info(
+            "validate_coverage: low coverage (retry %d/%d), missing: %s",
+            coverage_retries, MAX_COVERAGE_RETRIES, missing,
+        )
         missing_str = ", ".join(sorted(missing)) if missing else "(unknown)"
         covered_str = ", ".join(sorted(covered)) if covered else "(none)"
+        if coverage_retries >= MAX_COVERAGE_RETRIES:
+            options = ["Continue anyway", "Abort"]
+            return Command(
+                update={
+                    **state_update,
+                    "coverage_retry_count": coverage_retries,
+                    "interrupt_reason": "coverage_exhausted",
+                    "interrupt_message": (
+                        f"Field coverage still low after {coverage_retries} retry(s): "
+                        f"{len(covered)}/{len(core)} core fields ({coverage_ratio:.0%}). "
+                        f"Covered: {covered_str}. Missing: {missing_str}. "
+                        f"Continue with partial coverage, or abort?"
+                    ),
+                    "interrupt_options": options,
+                    "interrupt_decisions": options_to_decisions(options),
+                },
+                goto="human_approval",
+            )
         options = [
             "Continue anyway",
             "Retry content analysis",
@@ -193,9 +221,17 @@ def validate_coverage(state: ScrapeState) -> Command:
         return Command(
             update={
                 **state_update,
+                "coverage_retry_count": coverage_retries,
+                # Set test_report.remediation so build_product_analyzer_message's
+                # re-map directive fires on retry ("re-probe ONLY the failed
+                # fields — do NOT re-analyze from scratch"). Without this, the
+                # re-run gets a fresh OBJECTIVE, re-analyzes from scratch, and
+                # destructively overwrites the detailed analysis. P0-16.
+                "test_report": {"remediation": {"target": "mapping", "fields": sorted(missing)}},
                 "interrupt_reason": "low_coverage",
                 "interrupt_message": (
-                    f"Field coverage is low: {len(covered)}/{len(core)} core fields covered "
+                    f"Field coverage is low (retry {coverage_retries}/{MAX_COVERAGE_RETRIES}): "
+                    f"{len(covered)}/{len(core)} core fields covered "
                     f"({coverage_ratio:.0%}). "
                     f"Covered: {covered_str}. "
                     f"Missing: {missing_str}."

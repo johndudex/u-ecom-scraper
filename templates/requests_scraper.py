@@ -44,8 +44,30 @@ SITE_SLUG = "{SITE_SLUG}"
 
 PRODUCT_LISTING_URL = "{PRODUCT_LISTING_URL}"
 SRC_URL = "{PRODUCT_LISTING_URL}"
+# Pagination query param name (page, pgNum, p, offset, ...). code_writer
+# replaces the placeholder with the site's actual param (from
+# navigation_analysis.pagination.page_param_name); if left unfilled,
+# defaults to "page" (back-compat with single-listing sites).
+PAGE_PARAM_NAME = "{PAGE_PARAM_NAME}"
+if PAGE_PARAM_NAME.startswith("{") and PAGE_PARAM_NAME.endswith("}"):
+    PAGE_PARAM_NAME = "page"
+# Multi-listing enumeration: for sites with multiple category/listing pages,
+# code_writer edits this list to add each listing URL (e.g. 20 specialty
+# pages). Default: single listing — back-compat (single-listing sites behave
+# exactly as before: one URL, ?page=N).
+PRODUCT_LISTING_URLS = [PRODUCT_LISTING_URL]
 DELAY_BETWEEN_REQUESTS = {DELAY_BETWEEN_REQUESTS}
 MAX_RETRIES = 3
+# Safety cap on listing pagination (None = unlimited). code_writer may set this
+# to bound discovery on very large sites; hitting it yields stop_reason="max_pages_hit".
+MAX_PAGES = None
+# Fail-fast wall-clock deadline for Phase 1 discovery. A blocked strategy (e.g.
+# bare requests against an anti-bot site) can iterate many listings, each
+# retrying for ~100s, running unbounded. Exceeding this deadline yields
+# stop_reason="navigate_error" (the gate treats it as "gave up, not exhausted"
+# → strategy switch) instead of a multi-hour hang. Bounds discovery regardless
+# of the failure mode (blocking, infinite pagination, slow proxy escalation).
+DISCOVERY_DEADLINE_SECONDS = 300
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -211,36 +233,99 @@ def extract_product_from_page(soup: BeautifulSoup, url: str, status_code: int, s
 # DISCOVERY
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def discover_product_urls() -> list[str]:
+def discover_product_urls() -> tuple[list[str], dict]:
+    """Phase 1: discover product URLs by paginating through listing pages.
+
+    Returns ``(urls, discovery_meta)`` where ``discovery_meta`` carries the
+    signals required by the discovery-coverage gate (contract §1/§2):
+
+    - ``stop_reason``: why the loop terminated. ``navigate_error`` is sticky
+      across listings and distinguishable from exhaustion (H4).
+    - ``max_pages_hit``: True only when the loop stopped due to a non-None
+      ``MAX_PAGES`` cap.
+    - ``discovered_urls``: raw pre-filter URL count (== len(urls)).
+    """
     all_urls = []
     seen = set()
-    page = 1
+    # Default per contract §2: a loop that completes without an explicit break
+    # is treated as "ran off the end of pagination" (no next link).
+    stop_reason = "no_next_link"
+    saw_navigate_error = False
+    _deadline_start = time.monotonic()
 
-    while True:
-        paginated_url = f"{PRODUCT_LISTING_URL}?page={page}"
-        logger.info(f"Fetching listing page {page}: {paginated_url}")
+    # Enumerate every listing/category URL, paginating each until exhausted.
+    # Dedupe across listings via `seen`. For a single-listing site this is
+    # identical to the old ?page=N loop.
+    for listing_url in PRODUCT_LISTING_URLS:
+        page = 1
+        while True:
+            # Fail-fast: a blocked/slow discovery must not run unbounded.
+            if time.monotonic() - _deadline_start > DISCOVERY_DEADLINE_SECONDS:
+                logger.warning(
+                    "Discovery exceeded %ss deadline — stopping (navigate_error). "
+                    "A blocked strategy should fail fast so the gate switches.",
+                    DISCOVERY_DEADLINE_SECONDS,
+                )
+                saw_navigate_error = True
+                stop_reason = "navigate_error"
+                break
+            sep = "&" if "?" in listing_url else "?"
+            paginated_url = f"{listing_url}{sep}{PAGE_PARAM_NAME}={page}"
+            logger.info(f"Fetching listing page {page}: {paginated_url}")
 
-        result = fetch_page(paginated_url)
-        if not result:
-            break
+            result = fetch_page(paginated_url)
+            if not result:
+                # HTTP error / 429-502-503 / connection failure / rate-limit bail.
+                # This is NOT exhaustion — the loop gave up (H4). navigate_error
+                # is sticky: if any listing failed, the gate must FAIL.
+                saw_navigate_error = True
+                stop_reason = "navigate_error"
+                break
 
-        soup, _ = result
-        links = soup.select("{PRODUCT_LINK_SELECTOR}")
-        for link in links:
-            href = link.get("href", "")
-            absolute_url = make_absolute_url(href)
-            if absolute_url and absolute_url not in seen:
-                seen.add(absolute_url)
-                all_urls.append(absolute_url)
+            soup, _ = result
+            links = soup.select("{PRODUCT_LINK_SELECTOR}")
+            new_on_page = 0
+            for link in links:
+                href = link.get("href", "")
+                absolute_url = make_absolute_url(href)
+                if absolute_url and absolute_url not in seen:
+                    seen.add(absolute_url)
+                    all_urls.append(absolute_url)
+                    new_on_page += 1
 
-        logger.info(f"Page {page}: {len(links)} products found (total: {len(all_urls)})")
+            logger.info(
+                f"Listing {listing_url} page {page}: {len(links)} products "
+                f"found (total: {len(all_urls)})"
+            )
 
-        if len(links) == 0:
-            break
+            # Short page: fewer items than expected → genuine end of results.
+            if len(links) == 0:
+                stop_reason = "short_page"
+                break
 
-        page += 1
+            # Dedup worked: page returned items but none were new → exhausted.
+            if new_on_page == 0:
+                stop_reason = "no_new_items"
+                break
 
-    return all_urls
+            # MAX_PAGES safety cap (only fires when MAX_PAGES is non-None).
+            if MAX_PAGES is not None and page >= MAX_PAGES:
+                stop_reason = "max_pages_hit"
+                logger.info(f"Hit MAX_PAGES cap ({MAX_PAGES}) at {listing_url}, stopping")
+                break
+
+            page += 1
+
+    # navigate_error takes priority over later successes so the classifier sees FAIL.
+    if saw_navigate_error:
+        stop_reason = "navigate_error"
+
+    discovery_meta = {
+        "stop_reason": stop_reason,
+        "max_pages_hit": stop_reason == "max_pages_hit",
+        "discovered_urls": len(all_urls),
+    }
+    return all_urls, discovery_meta
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -269,6 +354,17 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Max products to scrape")
     parser.add_argument("--input", type=str, default=None, help="Path to input URLs JSON file")
     parser.add_argument("--urls", nargs="+", default=None, help="Product URLs as arguments")
+    parser.add_argument(
+        "--discover-only",
+        action="store_true",
+        help="Run Phase 1 discovery only; emit discovery_coverage, skip Phase 2 extraction",
+    )
+    parser.add_argument(
+        "--fresh-discovery",
+        action="store_true",
+        help="Ignore any discovery cache and re-run Phase 1 (accepted as a no-op here: "
+        "requests_scraper has no checkpoint file to skip)",
+    )
     args = parser.parse_args()
 
     start_time = time.time()
@@ -280,43 +376,100 @@ def main():
     logger.info(f"Output: {OUTPUT_FILE}")
     logger.info("=" * 80)
 
-    product_urls = []
+    if args.fresh_discovery:
+        logger.info(
+            "--fresh-discovery accepted (no-op: requests_scraper has no "
+            "discovered_urls_checkpoint.json to ignore; input_urls.json is rewritten on every discovery)"
+        )
 
-    if args.urls:
+    product_urls = []
+    discovered_urls_raw = 0
+    ran_phase1 = False
+    skipped_reason: Optional[str] = None
+    discovery_meta: dict = {"stop_reason": "skipped", "max_pages_hit": False}
+
+    # Phase 1: URL discovery (or load from input).
+    if args.discover_only:
+        logger.info("--discover-only: running Phase 1 discovery, skipping Phase 2 extraction")
+        product_urls, discovery_meta = discover_product_urls()
+        discovered_urls_raw = len(product_urls)
+        ran_phase1 = True
+        save_urls_to_file(INPUT_FILE, product_urls)
+    elif args.urls:
         product_urls = args.urls
+        skipped_reason = "url_list_mode"
     elif args.input:
         product_urls = load_urls_from_file(args.input)
+        skipped_reason = "url_list_mode"
     elif os.path.exists(INPUT_FILE):
+        logger.info(f"Loading previously discovered URLs from {INPUT_FILE}")
         product_urls = load_urls_from_file(INPUT_FILE)
+        # input_urls.json is this template's persisted discovery output; reusing it
+        # means Phase 1 did not run this invocation.
+        skipped_reason = "checkpoint_loaded"
     else:
         logger.info("No input_urls.json found. Discovering products from listing page...")
-        product_urls = discover_product_urls()
+        product_urls, discovery_meta = discover_product_urls()
+        discovered_urls_raw = len(product_urls)
+        ran_phase1 = True
         save_urls_to_file(INPUT_FILE, product_urls)
 
-    if args.sample:
-        product_urls = product_urls[:5]
-    if args.limit:
-        product_urls = product_urls[: args.limit]
+    # Raw discovered count is captured BEFORE any sample/limit slicing so it
+    # reflects true discovery yield (contract §1: "raw pre-filter discovered URL count").
+    if not ran_phase1:
+        discovered_urls_raw = len(product_urls)
+
+    # Sample/limit only apply when Phase 2 extraction will run.
+    if not args.discover_only:
+        if args.sample:
+            product_urls = product_urls[:5]
+        if args.limit:
+            product_urls = product_urls[: args.limit]
 
     logger.info(f"Total products to scrape: {len(product_urls)}")
 
     results = []
     failed = 0
 
-    for i, url in enumerate(product_urls):
-        result = fetch_page(url)
-        if result:
-            soup, status_code = result
-            product = extract_product_from_page(soup, url, status_code, SRC_URL)
-            product["id"] = i + 1
-            results.append(product)
-        else:
-            logger.error(f"Failed to fetch: {url}")
-            failed += 1
+    if not args.discover_only:
+        # Phase 2: extract fields from each discovered item page.
+        for i, url in enumerate(product_urls):
+            result = fetch_page(url)
+            if result:
+                soup, status_code = result
+                product = extract_product_from_page(soup, url, status_code, SRC_URL)
+                product["id"] = i + 1
+                results.append(product)
+            else:
+                logger.error(f"Failed to fetch: {url}")
+                failed += 1
 
-        if (i + 1) % 25 == 0:
-            percent = ((i + 1) / len(product_urls)) * 100
-            logger.info(f"Progress: [{i + 1}/{len(product_urls)}] ({percent:.1f}%)")
+            if (i + 1) % 25 == 0:
+                percent = ((i + 1) / len(product_urls)) * 100
+                logger.info(f"Progress: [{i + 1}/{len(product_urls)}] ({percent:.1f}%)")
+    else:
+        logger.info("--discover-only: skipping Phase 2 extraction (results list left empty)")
+
+    # discovery_coverage block — contract §1. Always emitted so the gate can read
+    # a uniform schema regardless of which path produced the output.
+    if ran_phase1:
+        stop_reason = discovery_meta.get("stop_reason", "no_next_link")
+    else:
+        stop_reason = "skipped"
+
+    discovery_coverage = {
+        "stop_reason": stop_reason,
+        "found": len(results),  # post-filter extracted item count (0 when Phase 2 skipped)
+        "discovered_urls": discovered_urls_raw,  # raw pre-filter count (diagnostic)
+        "expected_total": None,  # no baked-in coverage_target for this template
+        # No category/specialty enumeration in this strategy — listing URLs are
+        # not treated as a coverage dimension. Tier 2 is a no-op here.
+        "dimensions_iterated": 0,
+        "dimensions_total": 0,
+        "max_pages_hit": discovery_meta.get("max_pages_hit", False),
+        "ran_phase1": ran_phase1,
+        "skipped_reason": skipped_reason,
+    }
 
     output = {
         "site": {
@@ -331,6 +484,8 @@ def main():
             "scraping_duration_seconds": round(time.time() - start_time, 2),
             "failed_products": failed,
             "rate_limit_delay": DELAY_BETWEEN_REQUESTS,
+            "discovered_urls": discovered_urls_raw,
+            "discovery_coverage": discovery_coverage,
         },
     }
 
@@ -338,8 +493,13 @@ def main():
         json.dump(output, f, indent=2, ensure_ascii=False)
 
     logger.info("=" * 80)
-    logger.info("EXTRACTION COMPLETE")
+    logger.info("DISCOVERY COMPLETE (--discover-only)" if args.discover_only else "EXTRACTION COMPLETE")
     logger.info(f"Total: {len(results)}, Failed: {failed}")
+    logger.info(
+        f"Discovery coverage: stop_reason={stop_reason}, found={len(results)}, "
+        f"discovered_urls={discovered_urls_raw}, ran_phase1={ran_phase1}, "
+        f"skipped_reason={skipped_reason}"
+    )
     logger.info(f"Duration: {round(time.time() - start_time, 2)}s")
     logger.info(f"Output: {OUTPUT_FILE}")
     logger.info("=" * 80)

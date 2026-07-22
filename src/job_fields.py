@@ -77,6 +77,35 @@ def parse_posted_date(date_str: str) -> Optional[datetime]:
     """
     if not date_str:
         return None
+
+
+def assess_date_reliability(date_str: str, scraped_at_date) -> tuple:
+    """Assess whether a posted_date is reliable for age filtering (P0-13).
+
+    Sites that dynamically set JSON-LD datePosted to "today" on every page
+    load produce fabricated freshness. This detects: equals_scrape_date,
+    future_dated, missing. Returns (date_str_or_None, is_reliable: bool, reason: str).
+
+    Generic — works for any site. The only fully-generic fallback for
+    unreliable dates is the system-tracked first_seen_at (which the caller
+    should prefer when is_reliable=False).
+    """
+    from datetime import date as _date
+
+    dt = parse_posted_date(date_str if isinstance(date_str, str) else str(date_str))
+    if not dt:
+        return (None, False, "missing")
+    if isinstance(scraped_at_date, str):
+        try:
+            scraped_at_date = _date.fromisoformat(scraped_at_date[:10])
+        except (ValueError, TypeError):
+            scraped_at_date = _date.today()
+    posted = dt.date() if hasattr(dt, "date") else dt
+    if posted == scraped_at_date:
+        return (posted.isoformat(), False, "equals_scrape_date")
+    if posted > scraped_at_date:
+        return (posted.isoformat(), False, "future_dated")
+    return (posted.isoformat(), True, "ok")
     s = str(date_str).strip()
     if not s:
         return None

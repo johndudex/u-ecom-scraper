@@ -35,8 +35,7 @@ logger = logging.getLogger(__name__)
 PHASE_MAP: dict[str, str] = {
     "accessibility_check": "Accessibility Check",
     "site_analysis": "Site Analysis",
-    "navigation_explore": "Navigation Explore",
-    "navigation_synthesize": "Navigation Synthesis",
+    "browser_traverse": "Browser Navigation",
     "navigation_skill_review": "Navigation Skill Review",
     "navigation_analysis": "Navigation Analysis",
     "content_analysis": "Content Analysis",
@@ -52,9 +51,7 @@ PHASE_MAP: dict[str, str] = {
 
 AGENT_PHASE_MAP: dict[str, str] = {
     "site-analyzer": "site_analysis",
-    "navigation-agent": "navigation_explore",
-    "navigation-explore": "navigation_explore",
-    "navigation-synthesize": "navigation_synthesize",
+    "browser-traverse": "browser_traverse",
     "nav-skill-review": "navigation_skill_review",
     "product-analyzer": "product_analysis",
     "scraper-analyzer": "scraper_analysis",
@@ -80,6 +77,14 @@ def _publish_job_status(job_id: int, status: str) -> None:
 def run_scrape_task(self, job_id: int, rescrape: bool = False) -> None:
     """Celery entry-point: execute the full scrape graph for *job_id*."""
     job = ScrapeJob.objects.get(pk=job_id)
+
+    # Record this task's id so external monitors (e.g. the regression monitor)
+    # can revoke+terminate it on a per-phase timeout — otherwise a DB-only
+    # "cancel" leaves the celery task running as a zombie, clogging the worker.
+    _task_id = getattr(self.request, "id", "") or ""
+    if _task_id and job.celery_task_id != _task_id:
+        job.celery_task_id = _task_id
+        job.save(update_fields=["celery_task_id"])
 
     if job.status in (ScrapeJob.STATUS_RUNNING, ScrapeJob.STATUS_WAITING_APPROVAL):
         logger.warning(
@@ -119,17 +124,18 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False) -> None:
 PIPELINE_PHASES = [
     "accessibility_check",
     "site_analysis",
-    "navigation_explore",
-    "navigation_synthesize",
-    "navigation_skill_review",
+    "browser_traverse",
     "product_analysis",
     "scraper_analysis",
     "code_generation",
+    "code_review",
     "testing",
     "field_confirmation",
     "execution",
     "cleanup",
     "skill_learning",
+    "dagster_converter",
+    "store_job_listings",
 ]
 
 
@@ -287,8 +293,16 @@ def resume_scrape_task(job_id: int, human_response: Any) -> None:
                 if a.interrupt_id in pending_set:
                     target_iid = a.interrupt_id
                     break
-        except Exception:
-            pass
+        except Exception as exc:
+            # Was a bare `pass` — silently turned every target-iid lookup
+            # failure into a non-targeted resume, making stuck interrupts
+            # impossible to diagnose. Log it so the fallback is visible.
+            logger.warning(
+                "Job %d: target interrupt_id lookup failed, falling back "
+                "to non-targeted resume: %s",
+                job_id,
+                exc,
+            )
 
         if target_iid and target_iid in all_interrupt_ids:
             # Targeted resume: only the approved interrupt.
@@ -416,8 +430,34 @@ def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
     except Exception:
         input_mode = job.input_mode or "url_list"
 
+    # url_list fallback: when the Site row has no input_urls persisted (the
+    # common case — Site.input_urls is empty for most sites), load them from the
+    # production scrapers/{slug}/input_urls.json the user pre-populated. Without
+    # this, url_list jobs run with 0 URLs and silently under-extract (the
+    # "1 of N coverage gap" was actually "given ~0-1 URLs"). [data integrity]
+    if not site_input_urls and input_mode == "url_list":
+        try:
+            from django.conf import settings
+
+            _slug = _generate_slug(job.url)
+            _iu = os.path.join(
+                settings.PROJECT_ROOT, "scrapers", _slug, "input_urls.json"
+            )
+            if os.path.isfile(_iu):
+                with open(_iu, encoding="utf-8") as _f:
+                    _data = json.load(_f)
+                _urls = [u for u in (_data.get("urls") or []) if isinstance(u, str) and u]
+                if _urls:
+                    site_input_urls = _urls
+                    logger.info(
+                        "Loaded %d input_urls from production file for %s "
+                        "(Site.input_urls empty)",
+                        len(_urls), _slug,
+                    )
+        except Exception as _exc:
+            logger.warning("input_urls file fallback failed for %s: %s", job.url, _exc)
+
     sample_url = job.product_url or ""
-    skip_content = input_mode in ("navigation", "list_page")
     skip_product = False
 
     return {
@@ -434,15 +474,17 @@ def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
         "content_type_config": content_type_config,
         "search_criteria": search_criteria,
         "output_schema": output_schema,
+        # Intake-UI knobs (advisory; surfaced to product_analyzer / code_writer).
+        "target_fields": list(job.target_fields or []),
+        "scope": job.scope or "",
+        "scope_value": job.scope_value or "",
+        "user_notes": job.notes or "",
         "site_slug": _generate_slug(job.url),
         "site_name": "",
         "site_status": "new",
         "skip_site_analysis": False,
-        "skip_content_analysis": skip_content,
         "skip_product_analysis": skip_product,
         "skip_code_generation": False,
-        "current_phase": "",
-        "phases_completed": [],
         "site_analysis_retries": 0,
         "content_analysis_retries": 0,
         "product_analysis_retries": 0,
@@ -929,6 +971,92 @@ def schedule_next_site() -> None:
         logger.info("Scheduler: idle — %s", result["reason"])
 
 
+STUCK_APPROVED_MAX_RETRIES = 3
+STUCK_APPROVED_MIN_AGE_MINUTES = 5
+
+
+@shared_task
+def redispatch_stuck_approved_interrupts() -> None:
+    """Watchdog (P0-10): re-dispatch resume for APPROVED approvals whose
+    interrupt is still pending in the checkpoint (resume failed to consume it).
+
+    Complements the dedup guard: the guard stops the 505-row runaway; this
+    watchdog un-sticks the silent hang that replaces it. Capped at
+    STUCK_APPROVED_MAX_RETRIES per interrupt_id; then the job is FAILED.
+    """
+    from scraper.models import Approval
+    from scraper.services import LangGraphService
+
+    threshold = timezone.now() - timezone.timedelta(minutes=STUCK_APPROVED_MIN_AGE_MINUTES)
+    candidates = (
+        Approval.objects.filter(
+            status=Approval.STATUS_APPROVED,
+            interrupt_id__gt="",
+            job__status=ScrapeJob.STATUS_WAITING_APPROVAL,
+            resolved_at__lt=threshold,
+        )
+        .select_related("job")
+        .order_by("resolved_at")
+    )
+    if not candidates.exists():
+        return
+
+    service = LangGraphService()
+    graph = service.build_graph()
+    redispatched = 0
+
+    for approval in candidates:
+        job = approval.job
+        # Check if the interrupt_id is still in the checkpoint (truly stuck).
+        try:
+            config = service.get_config(job.id)
+            snapshot = graph.get_state(config)
+        except Exception as exc:
+            logger.warning("stuck-approved watchdog: job %d state read failed: %s", job.id, exc)
+            continue
+
+        pending_ids = set()
+        for task in getattr(snapshot, "tasks", []):
+            for intr in (getattr(task, "interrupts", None) or []):
+                iid = getattr(intr, "id", None)
+                if iid:
+                    pending_ids.add(str(iid))
+
+        if approval.interrupt_id not in pending_ids:
+            continue  # interrupt was consumed — not stuck
+
+        if approval.resume_attempts >= STUCK_APPROVED_MAX_RETRIES:
+            logger.error(
+                "stuck-approved watchdog: job %d failed — resume could not "
+                "consume interrupt %s after %d attempts",
+                job.id, approval.interrupt_id, approval.resume_attempts,
+            )
+            job.status = ScrapeJob.STATUS_FAILED
+            job.error_message = (
+                f"Resume failed to consume interrupt {approval.interrupt_id} "
+                f"after {approval.resume_attempts} attempts (checkpoint may be corrupt)."
+            )
+            job.completed_at = timezone.now()
+            job.save(update_fields=["status", "error_message", "completed_at"])
+            continue
+
+        approval.resume_attempts += 1
+        approval.save(update_fields=["resume_attempts"])
+        # Replay the stored decision; fall back to approve if not stored.
+        _value = approval.resume_value or {"decision": "approve", "label": "auto", "feedback": ""}
+        logger.warning(
+            "stuck-approved watchdog: job %d re-dispatching resume "
+            "(interrupt=%s, attempt %d/%d)",
+            job.id, approval.interrupt_id[:12],
+            approval.resume_attempts, STUCK_APPROVED_MAX_RETRIES,
+        )
+        resume_scrape_task.delay(job.id, _value)
+        redispatched += 1
+
+    if redispatched:
+        logger.info("stuck-approved watchdog: re-dispatched %d stuck resume(s)", redispatched)
+
+
 def _auto_approve_stale_jobs() -> None:
     """Auto-approve WAITING_APPROVAL jobs that were auto-queued.
 
@@ -963,7 +1091,11 @@ def _auto_approve_stale_jobs() -> None:
         approval.resolved_at = timezone.now()
         approval.save()
 
-        resume_scrape_task.delay(job.id, "approve")
+        # Pass a proper decision dict (not a bare string) so the resume
+        # value is consistent with the manual-approval path (views.py) and
+        # the admin batch-action path — _parse_decision handles both, but a
+        # bare string here was the only inconsistent trigger source.
+        resume_scrape_task.delay(job.id, {"decision": "approve", "label": "auto-approved", "feedback": ""})
         approved += 1
 
     if approved:
@@ -986,19 +1118,13 @@ def _build_playground_messages(agent_name: str, state: dict, user_prompt: str) -
     from agents.subagents import (
         build_code_writer_message,
         build_code_tester_message,
-        build_navigation_agent_message,
-        build_navigation_synthesize_message,
         build_product_analyzer_message,
-        build_scraper_analyzer_message,
         build_site_analyzer_message,
     )
 
     builders = {
         "site_analyzer": build_site_analyzer_message,
         "product_analyzer": build_product_analyzer_message,
-        "scraper_analyzer": build_scraper_analyzer_message,
-        "navigation_agent": build_navigation_agent_message,
-        "navigation_synthesize": build_navigation_synthesize_message,
         "code_writer": build_code_writer_message,
         "code_tester": build_code_tester_message,
     }
@@ -1076,25 +1202,15 @@ def run_agent_task(self, playground_id: int) -> None:
         try:
             result = None
 
-            if pg.agent_name == "navigation_explore":
-                # Deterministic explore — no LLM
-                from agents.nodes.navigate_explore import navigate_explore
+            # Use context-aware message builder for LLM agents
+            from agents.subagents import _build_agent
 
-                result = navigate_explore(state)
-            elif pg.agent_name == "navigation_synthesize":
-                from agents.nodes.navigate_synthesize import navigate_synthesize
-
-                result = navigate_synthesize(state)
-            else:
-                # Use context-aware message builder for LLM agents
-                from agents.subagents import _build_agent
-
-                agent = _build_agent(pg.agent_name, site_slug=slug)
-                messages = _build_playground_messages(pg.agent_name, state, pg.prompt)
-                budget = AGENT_MAX_ITERATIONS_LOOKUP.get(pg.agent_name, 25)
-                agent_cfg: dict[str, Any] = {"recursion_limit": budget}
-                agent_result = agent.invoke({"messages": messages}, config=agent_cfg)
-                result = {"messages": agent_result.get("messages", [])}
+            agent = _build_agent(pg.agent_name, site_slug=slug)
+            messages = _build_playground_messages(pg.agent_name, state, pg.prompt)
+            budget = AGENT_MAX_ITERATIONS_LOOKUP.get(pg.agent_name, 25)
+            agent_cfg: dict[str, Any] = {"recursion_limit": budget}
+            agent_result = agent.invoke({"messages": messages}, config=agent_cfg)
+            result = {"messages": agent_result.get("messages", [])}
 
             # Collect output artifacts
             artifacts: list[str] = []
@@ -1130,9 +1246,7 @@ def run_agent_task(self, playground_id: int) -> None:
 AGENT_MAX_ITERATIONS_LOOKUP: dict[str, int] = {
         "site_analyzer": 25,
     "product_analyzer": 50,
-    "navigation_agent": 50,
-    "navigation_explore": 30,
-    "navigation_synthesize": 25,
+    "browser_traverse": 50,
     "nav_skill_review": 30,
     "scraper_analyzer": 25,
     "code_writer": 30,

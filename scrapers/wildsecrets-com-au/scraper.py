@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
-"""Wild Secrets Australia product scraper.
+"""Scraper for https://www.wildsecrets.com.au
 
-Extracts product data from wildsecrets.com.au product pages using
-direct HTTP requests. Primary extraction from JSON-LD structured data
-with CSS fallback selectors. Fully server-rendered pages — no JS needed.
-
-Usage:
-    python3 scraper_draft.py                     # Full extraction
-    python3 scraper_draft.py --sample            # First 5 products only
-    python3 scraper_draft.py --limit 20           # Max 20 products
-    python3 scraper_draft.py --input urls.json   # Custom input file
-    python3 scraper_draft.py --urls <URL> ...     # CLI URLs
-    python3 scraper_draft.py --no-proxy           # Explicitly no proxy (default)
+Strategy: http_requests — JSON-LD primary, CSS fallback.
+No proxy (direct HTTP works). No anti-bot protection detected.
 """
 
 from __future__ import annotations
 
 import argparse
-import datetime
 import json
 import logging
 import os
@@ -26,8 +16,9 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Optional
-from urllib.parse import urljoin
+from datetime import datetime, timezone
+from typing import Any, Optional
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -36,53 +27,60 @@ from bs4 import BeautifulSoup
 # Constants
 # ---------------------------------------------------------------------------
 
-SITE_NAME = "Wild Secrets Australia"
+SITE_NAME = "Wild Secrets"
 SITE_URL = "https://www.wildsecrets.com.au"
 PLATFORM = "custom"
 SCRAPING_METHOD = "http_requests"
-DOMAIN = "https://www.wildsecrets.com.au"
-DELAY = 1.0  # seconds between requests
-MAX_WORKERS = 8
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-)
-HEADERS = {
-    "User-Agent": USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-AU,en-US;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate",
-    "Connection": "keep-alive",
-}
-
-# Schema.org availability mapping
-AVAILABILITY_MAP = {
-    "https://schema.org/instock": "In Stock",
-    "https://schema.org/limitedavailability": "Limited Stock",
-    "https://schema.org/outofstock": "Out of Stock",
-    "https://schema.org/preorder": "Pre-Order",
-    "https://schema.org/discontinued": "Discontinued",
-}
-
-# Soft-404 patterns
-SOFT_404_PATTERNS = re.compile(
-    r"page\s+not\s+found|product\s+not\s+found|item\s+not\s+found|"
-    r"no\s+longer\s+available|unavailable|discontinued|"
-    r"404\s+not\s+found|oops|error\s+occurred",
-    re.IGNORECASE,
-)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(SCRIPT_DIR, "logs", "wildsecrets-com-au.log")
 
+# Rate-limiting — conservative for a direct-HTTP site
+DELAY = 1.5
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-AU,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
+}
+
+# Image-URL skip patterns (banners / icons / emoji)
+_IMAGE_SKIP_RE = re.compile(
+    r"/(brand\.assets|emoji|flags|icon|navigation|logo)/", re.IGNORECASE
+)
+
+# Soft-404 phrases in <title> / <h1>
+_SOFT404_RE = re.compile(
+    r"not found|unavailable|discontinued|no longer available|page not found|404",
+    re.IGNORECASE,
+)
+
+# Availability normalisation
+_AVAIL_MAP: dict[str, str] = {
+    "instock": "In Stock",
+    "in stock": "In Stock",
+    "preorder": "Pre-order",
+    "pre-order": "Pre-order",
+    "out of stock": "Out of Stock",
+    "outofstock": "Out of Stock",
+    "https://schema.org/instock": "In Stock",
+    "https://schema.org/outofstock": "Out of Stock",
+    "https://schema.org/preorder": "Pre-order",
+}
+
 # ---------------------------------------------------------------------------
-# Data structures
+# Data classes
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class Product:
-    """Standardised product record."""
+    """Standard output product record."""
 
     id: int = 0
     title: str = ""
@@ -96,29 +94,13 @@ class Product:
     status_code: int = 0
     scraped_at: str = ""
     remarks: str = ""
-    # Extra fields (not in standard output but kept for richness)
+    # Extended fields
     brand: str = ""
     sku: str = ""
     description: str = ""
+    rating: str = ""
+    review_count: str = ""
     images: list[str] = field(default_factory=list)
-    condition: str = ""
-
-    def to_dict(self) -> dict:
-        """Serialise to output dict (standard fields only)."""
-        return {
-            "id": self.id,
-            "title": self.title,
-            "price": self.price,
-            "availability": self.availability,
-            "original_price": self.original_price,
-            "currency": self.currency,
-            "url": self.url,
-            "src_url": self.src_url,
-            "location": self.location,
-            "status_code": self.status_code,
-            "scraped_at": self.scraped_at,
-            "remarks": self.remarks,
-        }
 
 
 # ---------------------------------------------------------------------------
@@ -126,405 +108,263 @@ class Product:
 # ---------------------------------------------------------------------------
 
 
-def _setup_logging() -> logging.Logger:
-    """Configure file + console logging."""
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.FileHandler(LOG_FILE, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
-    return logging.getLogger(__name__)
+def _normalise_availability(raw: str | None) -> str:
+    """Map raw availability text/schema URI to standard label."""
+    if not raw:
+        return ""
+    stripped = raw.strip()
+    # Try exact match
+    if stripped.lower() in _AVAIL_MAP:
+        return _AVAIL_MAP[stripped.lower()]
+    # Try substring match for schema URIs
+    for key, val in _AVAIL_MAP.items():
+        if key in stripped.lower():
+            return val
+    return stripped
 
 
-logger = _setup_logging()
-
-
-def _format_price(raw_price: str | float | None, currency: str = "AUD") -> str:
-    """Convert a raw price value to formatted string with currency symbol.
-
-    Args:
-        raw_price: Price as string (e.g. '92.9900') or float.
-        currency: ISO 4217 code.
-
-    Returns:
-        Formatted price like '$92.99' or empty string on failure.
-    """
-    if raw_price is None or raw_price == "":
+def _format_price(raw_price: float | str | None, currency_code: str = "AUD") -> str:
+    """Return a formatted price string with the appropriate currency symbol."""
+    if raw_price is None:
         return ""
     try:
         val = float(raw_price)
     except (ValueError, TypeError):
         return ""
-    symbol = {"AUD": "$", "USD": "$", "EUR": "€", "GBP": "£"}.get(currency, "$")
+    symbol_map = {
+        "AUD": "A$",
+        "USD": "$",
+        "EUR": "€",
+        "GBP": "£",
+        "NZD": "NZ$",
+    }
+    symbol = symbol_map.get(currency_code, f"{currency_code} ")
     return f"{symbol}{val:,.2f}"
 
 
-def _parse_availability_schema(schema_url: str) -> str:
-    """Map schema.org availability URL to human-readable text."""
-    if not schema_url:
-        return ""
-    key = schema_url.strip().lower()
-    return AVAILABILITY_MAP.get(key, schema_url)
+def _filter_product_images(img_urls: list[str], sku: str = "") -> list[str]:
+    """Keep only gallery-worthy images, skip banners/icons/logos."""
+    filtered: list[str] = []
+    for u in img_urls:
+        if _IMAGE_SKIP_RE.search(u):
+            continue
+        if sku and sku.lower() in u.lower():
+            filtered.append(u)
+        elif not sku:
+            filtered.append(u)
+        # If sku provided and not in URL, still include if it looks like a product
+        # image path (contains /products/ and an image suffix)
+        elif sku and "/products/" in u.lower():
+            filtered.append(u)
+    return filtered
 
 
-def _normalise_availability(text: str) -> str:
-    """Normalise availability text to standard values."""
-    if not text:
-        return ""
-    lower = text.strip().lower()
-    if "in stock" in lower or "available" in lower:
-        return "In Stock"
-    if "out of stock" in lower or "unavailable" in lower:
-        return "Out of Stock"
-    if "preorder" in lower or "pre-order" in lower:
-        return "Pre-Order"
-    if "discontinued" in lower:
-        return "Discontinued"
-    if "limited" in lower:
-        return "Limited Stock"
-    return text.strip()
-
-
-def _fix_image_url(url: str) -> str:
-    """Prepend https: to protocol-relative image URLs."""
-    if url and url.startswith("//"):
-        return "https:" + url
-    return url
-
-
-def _detect_soft_404(soup: BeautifulSoup, requested_url: str, final_url: str) -> str:
-    """Detect soft-404 pages.
-
-    Returns:
-        Description string if soft-404 detected, else empty string.
-    """
-    # Check URL redirect
-    if final_url and final_url != requested_url:
-        parsed_final = final_url.rstrip("/")
-        parsed_requested = requested_url.rstrip("/")
-        if not parsed_final.endswith(parsed_requested.split("/")[-1]):
-            return "Soft 404: redirected away from product page"
-
-    # Check page title / H1
-    for selector in ["title", "h1"]:
-        el = soup.select_one(selector)
-        if el and el.get_text(strip=True):
-            text = el.get_text(strip=True)
-            if SOFT_404_PATTERNS.search(text):
-                return f"Soft 404: '{text}'"
-
-    # Check for lack of product container or JSON-LD
-    product_container = soup.select_one(".main-product-container")
-    if not product_container:
-        return "Soft 404: no product container found on page"
-
-    # Check for "no product" JSON-LD absence (only if page loaded OK)
-    jsonld = _extract_jsonld(soup)
-    if not jsonld:
-        # Could be a valid page without JSON-LD, so only flag if container
-        # is also empty
-        h1 = soup.select_one("h1.title")
-        if h1 and SOFT_404_PATTERNS.search(h1.get_text(strip=True)):
-            return "Soft 404: product not found in content"
-
-    return ""
-
-
-# ---------------------------------------------------------------------------
-# JSON-LD extraction
-# ---------------------------------------------------------------------------
-
-
-def _extract_jsonld(soup: BeautifulSoup) -> Optional[dict]:
-    """Extract the first Product-type JSON-LD block from the page."""
+def _extract_jsonld_product(soup: BeautifulSoup) -> dict[str, Any] | None:
+    """Find and return the first JSON-LD Product block."""
     for script in soup.find_all("script", type="application/ld+json"):
         try:
-            data = json.loads(script.string or "")
+            data = json.loads(script.string)
         except (json.JSONDecodeError, TypeError):
             continue
         if isinstance(data, dict) and data.get("@type") == "Product":
             return data
-        # Handle @graph arrays
-        if isinstance(data, dict) and "@graph" in data:
-            for item in data["@graph"]:
+        # Sometimes it's a list of entities
+        if isinstance(data, list):
+            for item in data:
                 if isinstance(item, dict) and item.get("@type") == "Product":
                     return item
     return None
 
 
+def _check_soft_404(soup: BeautifulSoup, final_url: str, request_url: str) -> str:
+    """Return a remarks string if the page looks like a soft 404."""
+    # Check title
+    title_tag = soup.find("title")
+    if title_tag and _SOFT404_RE.search(title_tag.get_text()):
+        return "Soft 404: product not found (title check)"
+    # Check H1
+    h1 = soup.find("h1")
+    if h1 and _SOFT404_RE.search(h1.get_text()):
+        return "Soft 404: product not found (H1 check)"
+    # Check URL redirect
+    parsed_req = urlparse(request_url)
+    parsed_fin = urlparse(final_url)
+    if parsed_req.path != parsed_fin.path and parsed_fin.path in ("/", "/search", "/404"):
+        return "Soft 404: redirected away from product page"
+    return ""
+
+
 # ---------------------------------------------------------------------------
-# Field extractors
+# Main extraction
 # ---------------------------------------------------------------------------
 
 
-def extract_from_jsonld(jsonld: dict) -> dict:
-    """Extract product fields from JSON-LD data.
+def fetch_page(url: str) -> tuple[int, str, str, BeautifulSoup | None]:
+    """Fetch a URL and return (status_code, final_url, text, soup).
 
-    Returns a dict of extracted field values (raw, unformatted).
+    Uses a thread-local session (created per-call) for thread safety.
     """
-    result: dict = {}
+    session = requests.Session()
+    session.headers.update(HEADERS)
     try:
-        result["title"] = jsonld.get("name", "")
-    except Exception:
-        result["title"] = ""
+        resp = session.get(url, timeout=20, allow_redirects=True)
+    except requests.RequestException as exc:
+        return 0, url, "", None
+    return resp.status_code, resp.url, resp.text, BeautifulSoup(resp.text, "html.parser")
 
-    try:
-        offers = jsonld.get("offers", {})
-        if isinstance(offers, dict):
-            result["price"] = offers.get("price", "")
-            result["currency"] = offers.get("priceCurrency", "")
-            result["availability"] = offers.get("availability", "")
-            result["condition"] = offers.get("itemCondition", "")
-            result["url"] = offers.get("url", "")
-        elif isinstance(offers, list) and offers:
-            result["price"] = offers[0].get("price", "")
-            result["currency"] = offers[0].get("priceCurrency", "")
-            result["availability"] = offers[0].get("availability", "")
-            result["condition"] = offers[0].get("itemCondition", "")
-            result["url"] = offers[0].get("url", "")
-    except Exception:
-        pass
 
-    try:
-        result["sku"] = jsonld.get("sku", "")
-    except Exception:
-        result["sku"] = ""
+def extract_product(url: str, idx: int) -> Product:
+    """Extract product data from a single URL.
 
-    try:
+    Primary: JSON-LD.  Fallback: CSS selectors + data-layer-model.
+    """
+    product = Product(id=idx, url=url, src_url=url)
+
+    status_code, final_url, html, soup = fetch_page(url)
+    product.status_code = status_code
+    product.scraped_at = datetime.now(timezone.utc).isoformat()
+
+    if soup is None:
+        product.remarks = f"Failed to fetch page (HTTP {status_code})"
+        return product
+
+    # --- Soft 404 check ---
+    soft404 = _check_soft_404(soup, final_url, url)
+    if soft404:
+        product.remarks = soft404
+        return product
+
+    # --- JSON-LD extraction (primary) ---
+    jsonld = _extract_jsonld_product(soup)
+
+    if jsonld:
+        # Title
+        product.title = jsonld.get("name", "")
+
+        # SKU
+        product.sku = jsonld.get("sku", "")
+
+        # Brand
         brand = jsonld.get("brand")
         if isinstance(brand, dict):
-            result["brand"] = brand.get("name", "")
+            product.brand = brand.get("name", "")
         elif isinstance(brand, str):
-            result["brand"] = brand
-        else:
-            result["brand"] = ""
-    except Exception:
-        result["brand"] = ""
+            product.brand = brand
 
-    try:
-        images = jsonld.get("image", [])
-        if isinstance(images, str):
-            images = [images]
-        result["images"] = [_fix_image_url(img) for img in images]
-    except Exception:
-        result["images"] = []
+        # Description
+        product.description = jsonld.get("description", "")
 
-    try:
-        result["description"] = jsonld.get("description", "")
-    except Exception:
-        result["description"] = ""
+        # Offers — can be a list or a single dict
+        offers = jsonld.get("offers", {})
+        if isinstance(offers, list):
+            offers = offers[0] if offers else {}
 
-    return result
+        # Currency
+        currency_code = offers.get("priceCurrency", "AUD")
+        product.currency = currency_code
 
+        # Price — stored as string like "179.9900"
+        raw_price = offers.get("price")
+        product.price = _format_price(raw_price, currency_code)
 
-def extract_from_css(soup: BeautifulSoup) -> dict:
-    """Extract product fields from CSS selectors (fallback).
+        # Availability
+        raw_avail = offers.get("availability", "")
+        product.availability = _normalise_availability(raw_avail)
 
-    Returns a dict of extracted field values.
-    """
-    result: dict = {}
+        # Rating
+        agg = jsonld.get("aggregateRating")
+        if isinstance(agg, dict):
+            product.rating = str(agg.get("ratingValue", ""))
+            product.review_count = str(agg.get("reviewCount", ""))
 
-    # Title
-    try:
-        el = soup.select_one("h1.title")
-        if el:
-            result["title"] = el.get_text(strip=True)
-    except Exception:
-        pass
+        # Images — may be a string or list
+        raw_images = jsonld.get("image", [])
+        if isinstance(raw_images, str):
+            raw_images = [raw_images]
+        # Normalise protocol-relative URLs
+        normalised: list[str] = []
+        for img_url in raw_images:
+            if img_url.startswith("//"):
+                img_url = f"https:{img_url}"
+            normalised.append(img_url)
+        product.images = _filter_product_images(normalised, product.sku)
 
-    # Price (combine .amount + .cents)
-    try:
-        amount_el = soup.select_one(".price-container .amount")
-        cents_el = soup.select_one(".price-container .cents")
-        if amount_el:
-            amount_text = amount_el.get_text(strip=True)
-            cents_text = cents_el.get_text(strip=True) if cents_el else ""
-            result["price_display"] = amount_text + cents_text
-    except Exception:
-        pass
+    # --- data-data-layer-model (original_price, isOnSale) ---
+    layer_el = soup.select_one("[data-data-layer-model]")
+    if layer_el:
+        try:
+            layer_data = json.loads(layer_el["data-data-layer-model"])
+            if layer_data.get("isOnSale"):
+                raw_op = layer_data.get("salePrice")
+                if raw_op is not None:
+                    product.original_price = _format_price(raw_op, product.currency or "AUD")
+        except (json.JSONDecodeError, TypeError, KeyError):
+            pass
 
-    # Original price ("Don't pay $XX.XX")
-    try:
-        el = soup.select_one(".dont-pay span")
-        if el:
-            result["original_price"] = el.get_text(strip=True)
-    except Exception:
-        pass
+    # --- CSS fallbacks for any missing fields ---
+    if not product.title:
+        h1 = soup.select_one(".product-information-container h1")
+        if h1:
+            product.title = h1.get_text(strip=True)
 
-    # Availability from add-to-cart container
-    try:
-        atc = soup.select_one("#add-to-cart-container")
-        if atc:
-            atc_text = atc.get_text()
-            match = re.search(r"Item\s*Code:\s*\S+\s*-\s*(.*)", atc_text, re.IGNORECASE)
-            if match:
-                result["availability"] = match.group(1).strip()
-    except Exception:
-        pass
+    if not product.price:
+        price_el = soup.select_one(".product-information-container .price")
+        if price_el:
+            product.price = price_el.get_text(strip=True)
 
-    # SKU from add-to-cart container
-    try:
-        atc = soup.select_one("#add-to-cart-container")
-        if atc:
-            atc_text = atc.get_text()
-            match = re.search(r"Item\s*Code:\s*(\S+)", atc_text, re.IGNORECASE)
-            if match:
-                result["sku"] = match.group(1).strip()
-    except Exception:
-        pass
+    if not product.brand:
+        brand_el = soup.select_one(".product-information-container .brand")
+        if brand_el:
+            product.brand = brand_el.get_text(strip=True)
 
-    # Description
-    try:
-        el = soup.select_one(".product-description")
-        if el:
-            result["description"] = el.get_text(strip=True)
-    except Exception:
-        pass
+    if not product.sku:
+        code_div = soup.select_one("div.code")
+        if code_div:
+            m = re.search(r"Item Code:\s*(\w+)", code_div.get_text())
+            if m:
+                product.sku = m.group(1)
 
-    # Canonical URL
-    try:
-        el = soup.select_one("link[rel='canonical']")
-        if el:
-            result["canonical_url"] = el.get("href", "")
-    except Exception:
-        pass
+    if not product.availability:
+        code_div = soup.select_one("div.code")
+        if code_div:
+            m = re.search(
+                r"Item Code:\s*\w+\s*-\s*(In stock|Out of stock|Pre-order)",
+                code_div.get_text(),
+                re.IGNORECASE,
+            )
+            if m:
+                product.availability = m.group(1).strip()
 
-    return result
+    if not product.description:
+        desc_pars = soup.select(".product-description p")
+        if desc_pars:
+            product.description = "\n\n".join(
+                p.get_text(strip=True) for p in desc_pars
+            )
 
-
-# ---------------------------------------------------------------------------
-# Main extraction per product
-# ---------------------------------------------------------------------------
-
-
-def extract_product(url: str, src_url: str, product_id: int, session: requests.Session) -> Product:
-    """Fetch and extract data from a single product page.
-
-    Args:
-        url: Product page URL.
-        src_url: Source listing URL (same as url for direct input).
-        product_id: Sequential product ID.
-        session: Thread-local requests.Session.
-
-    Returns:
-        Product dataclass with extracted data.
-    """
-    product = Product(
-        id=product_id,
-        url=url,
-        src_url=src_url,
-        scraped_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        status_code=0,
-    )
-
-    try:
-        resp = session.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
-        product.status_code = resp.status_code
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        product.remarks = f"Request failed: {e}"
-        logger.error(f"[{product_id}] Failed to fetch {url}: {e}")
-        return product
-
-    # Check for redirect away from product page
-    final_url = resp.url
-    soup = BeautifulSoup(resp.text, "lxml")
-
-    # Soft-404 detection
-    soft_404 = _detect_soft_404(soup, url, final_url)
-    if soft_404:
-        product.remarks = soft_404
-        product.status_code = resp.status_code
-        logger.warning(f"[{product_id}] {soft_404}: {url}")
-        return product
-
-    # --- JSON-LD primary extraction ---
-    jsonld = _extract_jsonld(soup)
-    jsonld_data = extract_from_jsonld(jsonld) if jsonld else {}
-
-    # --- CSS fallback extraction ---
-    css_data = extract_from_css(soup)
-
-    # --- Title ---
-    product.title = jsonld_data.get("title") or css_data.get("title") or ""
-
-    # --- Price (from JSON-LD, formatted with currency symbol) ---
-    raw_price = jsonld_data.get("price", "")
-    currency = jsonld_data.get("currency", "AUD")
-    if raw_price:
-        product.price = _format_price(raw_price, currency)
-        product.currency = currency
-    elif "price_display" in css_data:
-        product.price = css_data["price_display"]
-        product.currency = "AUD"
-
-    # --- Availability (prefer CSS for granular text, fall back to JSON-LD) ---
-    if css_data.get("availability"):
-        product.availability = _normalise_availability(css_data["availability"])
-    elif jsonld_data.get("availability"):
-        product.availability = _normalise_availability(
-            _parse_availability_schema(jsonld_data["availability"])
+    # Fallback images from CSS
+    if not product.images:
+        css_imgs = soup.select(
+            '.product-image-container img, [class*="gallery"] img'
         )
+        img_urls: list[str] = []
+        for img in css_imgs:
+            src = img.get("src") or img.get("data-src") or ""
+            if src:
+                if src.startswith("//"):
+                    src = f"https:{src}"
+                img_urls.append(src)
+        product.images = _filter_product_images(img_urls, product.sku)
 
-    # --- Original price (CSS only — "Don't pay" element) ---
-    product.original_price = css_data.get("original_price", "")
-
-    # --- URL ---
-    canonical = css_data.get("canonical_url", "")
-    if canonical:
-        product.url = canonical
-    elif jsonld_data.get("url"):
-        product.url = urljoin(DOMAIN, jsonld_data["url"])
-
-    # --- Store extra fields ---
-    product.brand = jsonld_data.get("brand", "")
-    product.sku = jsonld_data.get("sku") or css_data.get("sku", "")
-
-    # Description: prefer CSS (full marketing copy) over JSON-LD (may be just name)
-    css_desc = css_data.get("description", "")
-    jsonld_desc = jsonld_data.get("description", "")
-    if css_desc and len(css_desc) > len(jsonld_desc or ""):
-        product.description = css_desc
-    else:
-        product.description = jsonld_desc
-
-    product.images = jsonld_data.get("images", [])
-
-    # Condition
-    cond = jsonld_data.get("condition", "")
-    if cond:
-        product.condition = cond.split("/")[-1] if "/" in cond else cond
+    # --- Final: if no JSON-LD Product and no CSS title, likely not a product ---
+    if not product.title and not jsonld:
+        product.remarks = "Soft 404: no product data found on page"
 
     return product
 
 
 # ---------------------------------------------------------------------------
-# Thread worker
-# ---------------------------------------------------------------------------
-
-
-def _thread_worker(
-    index: int,
-    url: str,
-    src_url: str,
-    product_id: int,
-) -> tuple[int, Product]:
-    """Worker for ThreadPoolExecutor — creates its own Session."""
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    # Respect rate limiting: stagger by index
-    time.sleep(index * (DELAY / MAX_WORKERS))
-    product = extract_product(url, src_url, product_id, session)
-    session.close()
-    return (index, product)
-
-
-# ---------------------------------------------------------------------------
-# Main
+# Orchestration
 # ---------------------------------------------------------------------------
 
 
@@ -535,101 +375,110 @@ def load_urls(path: str) -> list[str]:
     return data.get("urls", [])
 
 
-def filter_products(products: list[Product]) -> list[Product]:
-    """Remove non-product entries (soft-404s, empty items).
-
-    Keep items that have a title AND at least one of: price, availability.
-    """
-    filtered = []
-    for p in products:
-        if p.remarks and ("soft 404" in p.remarks.lower() or "redirect" in p.remarks.lower()):
-            # Keep soft-404 items but with empty fields — they are in output
-            # as indicators of missing products
-            filtered.append(p)
-            continue
-        if p.title and (p.price or p.availability):
-            filtered.append(p)
-        elif p.title:
-            # Has title but no price/availability — still keep it
-            filtered.append(p)
-    return filtered
-
-
-def main() -> None:
-    """Entry point."""
-    parser = argparse.ArgumentParser(description="Wild Secrets Australia product scraper")
-    parser.add_argument("--input", type=str, default=None, help="Path to input URLs JSON file")
-    parser.add_argument("--urls", nargs="+", default=None, help="Product URLs as CLI arguments")
-    parser.add_argument("--sample", action="store_true", help="Scrape only first 5 products")
-    parser.add_argument("--limit", type=int, default=0, help="Max products to scrape")
-    parser.add_argument("--no-proxy", action="store_true", default=True, help="No proxy (default)")
-    args = parser.parse_args()
-
-    # Determine URL source
-    if args.urls:
-        urls = args.urls
-    elif args.input:
-        urls = load_urls(args.input)
-    else:
-        default_input = os.path.join(SCRIPT_DIR, "input_urls.json")
-        if os.path.exists(default_input):
-            urls = load_urls(default_input)
-        else:
-            logger.error(f"No input_urls.json found at {default_input}")
-            sys.exit(1)
-
-    # Apply --sample / --limit
-    if args.sample:
+def run_scraper(urls: list[str], sample: bool = False, limit: int | None = None) -> list[Product]:
+    """Run the scraper over the given URLs with concurrency."""
+    if sample:
         urls = urls[:5]
-    elif args.limit > 0:
-        urls = urls[: args.limit]
+    elif limit:
+        urls = urls[:limit]
 
+    total = len(urls)
     logger.info("=" * 80)
-    logger.info(f"Starting scraper for {SITE_NAME}")
-    logger.info(f"Total products: {len(urls)}")
-    logger.info(f"Scraping method: {SCRAPING_METHOD}")
-    logger.info(f"Rate limit delay: {DELAY}s")
-    logger.info(f"Concurrency: {MAX_WORKERS} workers")
+    logger.info("Starting scraper for %s", SITE_NAME)
+    logger.info("Total products: %d", total)
     logger.info("=" * 80)
 
-    start_time = time.time()
-    results: dict[int, Product] = {}
+    results: list[Product | None] = [None] * total
     success = 0
     failed = 0
 
-    # Concurrent extraction with thread-local sessions
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(_thread_worker, idx, url, url, idx + 1): idx
+    # Use ThreadPoolExecutor for concurrent HTTP extraction
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_map = {
+            executor.submit(extract_product, url, idx + 1): idx
             for idx, url in enumerate(urls)
         }
-
-        for future in as_completed(futures):
-            idx, product = future.result()
-            results[idx] = product
-            count = len(results)
-            if product.title and product.price:
-                success += 1
-            elif product.remarks:
+        completed = 0
+        for future in as_completed(future_map):
+            idx = future_map[future]
+            try:
+                product = future.result()
+                results[idx] = product
+                completed += 1
+                if product.title or product.price:
+                    success += 1
+                else:
+                    failed += 1
+            except Exception as exc:
+                logger.error("Error processing URL at index %d: %s", idx, exc)
                 failed += 1
-            else:
-                failed += 1
+                results[idx] = Product(
+                    id=idx + 1,
+                    remarks=f"Exception: {exc}",
+                    scraped_at=datetime.now(timezone.utc).isoformat(),
+                )
+                completed += 1
 
-            if count % 10 == 0 or count == len(urls):
-                pct = (count / len(urls)) * 100
-                logger.info(f"Progress: [{count}/{len(urls)}] ({pct:.1f}%)")
+            if completed % 25 == 0 or completed == total:
+                pct = (completed / total) * 100
+                logger.info(
+                    "Progress: [%d/%d] (%.1f%%) — success=%d, failed=%d",
+                    completed,
+                    total,
+                    pct,
+                    success,
+                    failed,
+                )
 
-    # Reconstruct ordered results
-    ordered = [results[i] for i in sorted(results.keys())]
-    ordered = filter_products(ordered)
+    # Filter out None entries (shouldn't happen)
+    final_results = [r for r in results if r is not None]
 
-    # Re-index after filtering
-    for i, p in enumerate(ordered, 1):
-        p.id = i
+    logger.info("=" * 80)
+    logger.info("EXTRACTION COMPLETE")
+    logger.info("Total: %d, Success: %d, Failed: %d", total, success, failed)
+    logger.info("=" * 80)
 
-    # Write output
-    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+    return final_results
+
+
+def write_output(products: list[Product], start_time: float) -> str:
+    """Write products to the output JSON file and return the path."""
+    os.makedirs(os.path.join(SCRIPT_DIR, "logs"), exist_ok=True)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
     output_file = os.path.join(SCRIPT_DIR, f"output_{timestamp}.json")
+
+    output_products: list[dict[str, Any]] = []
+    for p in products:
+        entry: dict[str, Any] = {
+            "id": p.id,
+            "title": p.title,
+            "price": p.price,
+            "availability": p.availability,
+            "original_price": p.original_price,
+            "currency": p.currency,
+            "url": p.url,
+            "src_url": p.src_url,
+            "location": p.location,
+            "status_code": p.status_code,
+            "scraped_at": p.scraped_at,
+            "remarks": p.remarks,
+        }
+        # Only include extended fields if they have values
+        if p.brand:
+            entry["brand"] = p.brand
+        if p.sku:
+            entry["sku"] = p.sku
+        if p.description:
+            entry["description"] = p.description
+        if p.rating:
+            entry["rating"] = p.rating
+        if p.review_count:
+            entry["review_count"] = p.review_count
+        if p.images:
+            entry["images"] = p.images
+
+        output_products.append(entry)
 
     output = {
         "site": {
@@ -637,12 +486,14 @@ def main() -> None:
             "url": SITE_URL,
             "platform": PLATFORM,
             "scraping_method": SCRAPING_METHOD,
-            "scraped_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "scraped_at": datetime.now(timezone.utc).isoformat(),
         },
-        "products": [p.to_dict() for p in ordered],
+        "products": output_products,
         "metadata": {
             "scraping_duration_seconds": round(time.time() - start_time, 2),
-            "failed_products": failed,
+            "failed_products": sum(
+                1 for p in products if not (p.title or p.price)
+            ),
             "rate_limit_delay": DELAY,
         },
     }
@@ -663,13 +514,107 @@ def main() -> None:
 
         json.dump(output, f, indent=2, ensure_ascii=False)
 
-    logger.info("=" * 80)
-    logger.info(f"EXTRACTION COMPLETE")
-    logger.info(f"Total: {len(ordered)}, Success: {success}, Failed: {failed}")
-    logger.info(f"Output: {output_file}")
-    logger.info(f"Duration: {round(time.time() - start_time, 2)}s")
-    logger.info("=" * 80)
+    logger.info("Output written to: %s (%d products)", output_file, len(output_products))
+    return output_file
+
+
+# ---------------------------------------------------------------------------
+# Module-level logger (configured in main)
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=f"Scraper for {SITE_NAME}")
+    parser.add_argument(
+        "--input",
+        type=str,
+        default=None,
+        help="Path to input URLs JSON file",
+    )
+    parser.add_argument(
+        "--urls",
+        nargs="+",
+        default=None,
+        help="Product URLs as CLI arguments",
+    )
+    parser.add_argument(
+        "--sample",
+        action="store_true",
+        default=False,
+        help="Scrape only 5 products",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Max products to scrape",
+    )
+    parser.add_argument(
+        "--no-proxy",
+        action="store_true",
+        default=True,
+        help="Do not use any proxy (default for this site)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+
+    # Ensure logs directory exists
+    os.makedirs(os.path.join(SCRIPT_DIR, "logs"), exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler(LOG_FILE),
+            logging.StreamHandler(),
+        ],
+    )
+    # Reconfigure module-level logger with the handlers above
+    logger.setLevel(logging.INFO)
+
+    # Determine URLs
+    urls: list[str] = []
+    if args.input:
+        urls = load_urls(args.input)
+        logger.info("Loaded %d URLs from %s", len(urls), args.input)
+    elif args.urls:
+        urls = args.urls
+        logger.info("Using %d URLs from CLI", len(urls))
+    else:
+        default_input = os.path.join(SCRIPT_DIR, "input_urls.json")
+        if os.path.exists(default_input):
+            urls = load_urls(default_input)
+            logger.info("Loaded %d URLs from default input_urls.json", len(urls))
+        else:
+            logger.error("No input URLs provided. Use --input, --urls, or create input_urls.json")
+            return 1
+
+    if not urls:
+        logger.error("No URLs to process")
+        return 1
+
+    start_time = time.time()
+
+    try:
+        products = run_scraper(urls, sample=args.sample, limit=args.limit)
+    except KeyboardInterrupt:
+        logger.info("Scraper interrupted by user")
+        return 130
+
+    write_output(products, start_time)
+
+    logger.info("Done in %.1f seconds", time.time() - start_time)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

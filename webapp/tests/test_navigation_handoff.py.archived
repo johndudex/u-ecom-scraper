@@ -1,0 +1,171 @@
+"""Unit tests for the improved navigation_agent handoff + merge guard.
+
+Covers: the conditional skip decision (``_navigation_handoff_decision``) and the
+merge-not-overwrite guard (``_merge_explore_findings_into_analysis``). Run inside
+the Django container::
+
+    docker compose exec django bash -c "cd /app/webapp && python -m pytest tests/test_navigation_handoff.py -q"
+"""
+
+import json
+import os
+import sys
+
+_WEBAPP = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _WEBAPP not in sys.path:
+    sys.path.insert(0, _WEBAPP)
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+
+import django  # noqa: E402
+
+if not getattr(django, "_setup_done_", False):
+    django.setup()
+
+
+from agents.graph import (  # noqa: E402
+    _explore_findings_solid,
+    _explore_has_classic_form,
+    _merge_explore_findings_into_analysis,
+    _navigation_handoff_decision,
+)
+
+
+# ── _explore_findings_solid ────────────────────────────────────────────────
+
+
+def test_solid_embedded_json():
+    f = {"listing_page": {"url": "https://x/jobs", "data_source": "embedded_json"}}
+    assert _explore_findings_solid(f) is True
+
+
+def test_solid_api_endpoint():
+    f = {"listing_page": {"url": "https://x/jobs"}, "api_endpoints": [{"url": "https://x/api/search"}]}
+    assert _explore_findings_solid(f) is True
+
+
+def test_solid_detail_links_meets_threshold():
+    f = {"listing_page": {"url": "https://x/shop", "data_source": "detail_links",
+                          "product_links": [{"href": f"https://x/p/{i}"} for i in range(10)]}}
+    assert _explore_findings_solid(f) is True
+
+
+def test_not_solid_detail_links_below_threshold():
+    f = {"listing_page": {"url": "https://x/shop", "data_source": "detail_links",
+                          "product_links": [{"href": "https://x/p/1"} for _ in range(3)]}}
+    assert _explore_findings_solid(f) is False
+
+
+def test_not_solid_no_working_url():
+    f = {"listing_page": {"data_source": "embedded_json"}}  # no url
+    assert _explore_findings_solid(f) is False
+
+
+def test_not_solid_none_data_source():
+    f = {"listing_page": {"url": "https://x", "data_source": "none"}}
+    assert _explore_findings_solid(f) is False
+
+
+# ── _explore_has_classic_form ──────────────────────────────────────────────
+
+
+def test_classic_form_detected():
+    assert _explore_has_classic_form({"homepage_nav": {"classic_search": {"action": "/q"}}}) is True
+    assert _explore_has_classic_form({"listing_page": {"classic_search": {"action": "/q"}}}) is True
+
+
+def test_classic_form_absent():
+    assert _explore_has_classic_form({"homepage_nav": {}}) is False
+
+
+# ── _navigation_handoff_decision (the routing rule) ────────────────────────
+
+
+def test_handoff_skip_when_solid_no_form():
+    assert _navigation_handoff_decision(
+        {"listing_page": {"url": "https://x/jobs", "data_source": "embedded_json"}}, anti_bot=False
+    ) == (False, None)
+
+
+def test_handoff_when_explore_insufficient():
+    f = {"listing_page": {"url": "https://x", "data_source": "none"}}
+    assert _navigation_handoff_decision(f, anti_bot=False) == (True, "explore_insufficient")
+
+
+def test_handoff_when_classic_form_even_if_solid():
+    # a solid embedded-json page BUT a classic form was also detected → agent drives the form
+    f = {"listing_page": {"url": "https://x/jobs", "data_source": "embedded_json"},
+         "homepage_nav": {"classic_search": {"action": "/q"}}}
+    assert _navigation_handoff_decision(f, anti_bot=False) == (True, "form_driving_needed")
+
+
+def test_no_handoff_for_anti_bot():
+    # anti-bot: never hand off (agent's MCP browser isn't cloak-enabled)
+    f = {"listing_page": {"url": "https://x", "data_source": "none"}}
+    assert _navigation_handoff_decision(f, anti_bot=True) == (False, None)
+
+
+def test_no_handoff_for_anti_bot_even_with_form():
+    f = {"homepage_nav": {"classic_search": {"action": "/q"}}}
+    assert _navigation_handoff_decision(f, anti_bot=True) == (False, None)
+
+
+# ── _merge_explore_findings_into_analysis ──────────────────────────────────
+
+
+def _write_findings(root, slug, findings):
+    ws = os.path.join(root, "workspace", slug)
+    os.makedirs(ws, exist_ok=True)
+    with open(os.path.join(ws, "navigation_findings.json"), "w") as f:
+        json.dump(findings, f)
+
+
+def test_merge_fills_missing_fields_from_findings(tmp_path):
+    slug = "mergetest"
+    _write_findings(str(tmp_path), slug, {
+        "listing_page": {
+            "url": "https://x/healthcare-jobs/nursing/",
+            "data_source": "embedded_json",
+            "embedded_json": {"best": {"record_count": 10}},
+            "rendering_verified": "ssr",
+            "product_links": [{"href": f"https://x/jobs/{i}"} for i in range(5)],
+        },
+        "homepage_nav": {"category_links": [{"href": "https://x/cat1"}, {"href": "https://x/cat2"}]},
+    })
+    # Sparse agent analysis (the aya failure shape): missing working_url, data_source, item_links
+    sparse = {"discovery_method": "category", "search": {}, "item_links": {}, "categories": {}}
+    out = _merge_explore_findings_into_analysis(sparse, str(tmp_path), slug)
+    assert out["data_source"] == "embedded_json"
+    assert out["embedded_json"]["best"]["record_count"] == 10
+    assert out["rendering_verified"] == "ssr"
+    assert out["search"]["working_url"] == "https://x/healthcare-jobs/nursing/"
+    assert out["item_links"]["urls"][:5] == [f"https://x/jobs/{i}" for i in range(5)]
+    assert out["categories"]["category_links"] == ["https://x/cat1", "https://x/cat2"]
+
+
+def test_merge_does_not_overwrite_agent_populated_fields(tmp_path):
+    slug = "mergetest2"
+    _write_findings(str(tmp_path), slug, {
+        "listing_page": {
+            "url": "https://x/explore-url",
+            "data_source": "embedded_json",
+            "product_links": [{"href": "https://x/explore/1"}],
+        },
+        "homepage_nav": {"category_links": [{"href": "https://x/explore-cat"}]},
+    })
+    # Agent found something BETTER — must be preserved (merge only fills gaps)
+    agent = {
+        "search": {"working_url": "https://x/agent-better-url"},
+        "data_source": "api",
+        "item_links": {"urls": ["https://x/agent/1"], "url_examples": ["https://x/agent/1"]},
+        "categories": {"category_links": ["https://x/agent-cat"]},
+    }
+    out = _merge_explore_findings_into_analysis(agent, str(tmp_path), slug)
+    assert out["search"]["working_url"] == "https://x/agent-better-url"  # agent wins
+    assert out["data_source"] == "api"  # agent wins (not overwritten by embedded_json)
+    assert out["item_links"]["urls"] == ["https://x/agent/1"]  # agent wins
+    assert out["categories"]["category_links"] == ["https://x/agent-cat"]  # agent wins
+
+
+def test_merge_noop_when_findings_file_missing(tmp_path):
+    out = _merge_explore_findings_into_analysis({"search": {}}, str(tmp_path), "nosuchslug")
+    assert out == {"search": {}}  # unchanged, no crash

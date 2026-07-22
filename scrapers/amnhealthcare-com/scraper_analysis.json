@@ -1,0 +1,15 @@
+{
+  "strategy": "http_requests",
+  "scraping_mechanism": "http_requests",
+  "scraping_method": "http_requests",
+  "recommended_strategy": "http_requests",
+  "proxy_tier": "none",
+  "connectivity": {
+    "method_that_worked": "direct_http"
+  },
+  "anti_bot": {
+    "detected": false
+  },
+  "confidence_score": 0.9,
+  "strategy_justification": "Deterministic: method_that_worked=direct_http -> http_requests (proxy=none, anti_bot=False)"
+}

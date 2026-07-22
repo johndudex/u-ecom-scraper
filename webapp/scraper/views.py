@@ -423,7 +423,13 @@ def job_output_view(request, job_id, filename):
     except (json.JSONDecodeError, OSError):
         raise Http404("Could not read file")
 
-    products = data.get("products", [])
+    from src.content_types import get_output_key_label, count_items_in_output
+
+    _output_key, _item_label = get_output_key_label(job.page_type)
+    products = data.get(_output_key, [])
+    if not products:
+        products = data.get("products", [])  # back-compat: try old key
+    _item_count = len(products) if products else count_items_in_output(data)
     download_url = reverse(
         "job_output_download", kwargs={"job_id": job.id, "filename": safe_name}
     )
@@ -434,7 +440,9 @@ def job_output_view(request, job_id, filename):
             "job": job,
             "filename": safe_name,
             "json_content": pretty,
-            "product_count": len(products),
+            "product_count": _item_count,
+            "item_count": _item_count,
+            "item_label": _item_label,
             "download_url": download_url,
         },
     )
@@ -465,15 +473,26 @@ def job_output_download(request, job_id, filename):
 @login_required
 def job_restart(request, job_id):
     job = get_object_or_404(ScrapeJob, pk=job_id)
+    is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
     if job.status in [
         ScrapeJob.STATUS_COMPLETED,
         ScrapeJob.STATUS_FAILED,
         ScrapeJob.STATUS_CANCELLED,
     ]:
+        # Intake "Re-run" sends an optional prompt → store as notes for the
+        # agents to see. Non-AJAX (job_detail button) sends nothing.
+        rerun_prompt = request.POST.get("prompt", "").strip() if request.method == "POST" else ""
         new_job = ScrapeJob.objects.create(
             url=job.url,
             product_url=job.product_url,
             currency=job.currency,
+            page_type=job.page_type,
+            input_mode=job.input_mode,
+            search_criteria=job.search_criteria,
+            target_fields=job.target_fields,
+            scope=job.scope,
+            scope_value=job.scope_value,
+            notes=(rerun_prompt or job.notes),
             full_extraction=job.full_extraction,
         )
 
@@ -482,7 +501,23 @@ def job_restart(request, job_id):
         task = run_scrape_task.delay(new_job.id, rescrape=True)
         new_job.celery_task_id = task.id
         new_job.save(update_fields=["celery_task_id"])
+        if is_ajax:
+            return JsonResponse(
+                {
+                    "job_id": new_job.id,
+                    "events_url": reverse("job_events", args=[new_job.id]),
+                    "api_url": reverse("job_api", args=[new_job.id]),
+                    "tool_calls_url": reverse("tool_calls_api", args=[new_job.id]),
+                    "scraper_code_url": reverse("scraper_code", args=[new_job.id]),
+                    "dagster_code_url": reverse("dagster_code", args=[new_job.id]),
+                    "cancel_url": reverse("job_cancel", args=[new_job.id]),
+                }
+            )
         return redirect("job_detail", job_id=new_job.id)
+    if is_ajax:
+        return JsonResponse(
+            {"error": "job is not in a restartable state"}, status=409
+        )
     return redirect("job_detail", job_id=job.id)
 
 
@@ -618,6 +653,63 @@ def scraper_code_json(request, job_id):
     return JsonResponse({"path": scraper_path, "code": code})
 
 
+def _job_output_preview(job) -> dict | None:
+    """Latest extracted output for a job, for the intake Sample Output card.
+
+    Returns {filename, output_key, item_label, count, records (first 3),
+    download_url} or None when no output exists yet. Caps records so the
+    job_api payload stays small (full output is via download_url). Looks in
+    scrapers/{slug} first, then workspace/{slug} (output exists mid-run before
+    cleanup finalizes the scraper folder).
+    """
+    slug = _resolve_job_slug(job)
+    if not slug:
+        # Running jobs haven't had site_folder/site_name set by cleanup yet —
+        # derive the slug the same way the workspace/scrapers dirs are named.
+        try:
+            from .tasks import _generate_slug
+
+            slug = _generate_slug(job.url)
+        except Exception:
+            slug = ""
+    if not slug:
+        return None
+    site_dir = None
+    for base in ("scrapers", "workspace"):
+        cand = os.path.join(settings.PROJECT_ROOT, base, slug)
+        if os.path.isdir(cand):
+            site_dir = cand
+            break
+    if not site_dir:
+        return None
+    outs = sorted(
+        [f for f in os.listdir(site_dir) if f.startswith("output_") and f.endswith(".json")],
+        reverse=True,
+    )
+    if not outs:
+        return None
+    fname = outs[0]
+    try:
+        with open(os.path.join(site_dir, fname), encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    from src.content_types import count_items_in_output, get_output_key_label
+
+    out_key, label = get_output_key_label(job.page_type)
+    items = data.get(out_key) or data.get("products") or []
+    count = len(items) if isinstance(items, list) and items else count_items_in_output(data)
+    records = items[:3] if isinstance(items, list) else []
+    return {
+        "filename": fname,
+        "output_key": out_key,
+        "item_label": label,
+        "count": count,
+        "records": records,
+        "download_url": f"/jobs/{job.id}/output/{fname}/download/",
+    }
+
+
 @login_required
 def job_api(request, job_id):
     job = get_object_or_404(ScrapeJob, pk=job_id)
@@ -631,6 +723,13 @@ def job_api(request, job_id):
             "status": job.status,
             "site_name": job.site_name,
             "platform": job.platform,
+            # Intake config (drives the Current Configuration panel on deep-link)
+            "target_fields": list(job.target_fields or []),
+            "input_mode": job.input_mode,
+            "search_criteria": job.search_criteria,
+            "scope": job.scope,
+            "scope_value": job.scope_value,
+            "notes": job.notes,
             "product_count": job.product_count,
             "output_file": job.output_file,
             "site_folder": job.site_folder,
@@ -672,6 +771,7 @@ def job_api(request, job_id):
                 for l in job.session_logs.filter(seq__gt=since_seq).order_by("seq")
             ],
             "total_log_count": job.session_logs.count(),
+            "output_preview": _job_output_preview(job),
         }
     )
 
@@ -875,36 +975,20 @@ def agent_summary(request, job_id: int):
         agents[agent]["logs"].append({"role": role_label, "content": content[:20000]})
 
     summaries = []
-    agent_order = [
-        "site-analyzer",
-        "navigation-explore",
-        "navigation-synthesize",
-        "product-analyzer",
-        "scraper-analyzer",
-        "code-writer",
-        "code-tester",
-        "cleanup",
-        "skill-learner",
-        "nav-skill-review",
-    ]
-    for agent_name in agent_order:
-        if agent_name not in agents:
-            continue
-        agent_data = agents[agent_name]
+    # P0-18: iterate ALL agents (no hardcoded allowlist — the old list missed
+    # navigation-agent, code-reviewer, dagster-converter, and the fallback
+    # branch DISCARDED available assistant messages to write "(No summary
+    # available)"). With canonical naming (Layer 1) and ROLE_SYSTEM for tool
+    # traces (Layer 2), every agent now has clean assistant messages.
+    for agent_name, agent_data in agents.items():
         summary_md = f"# {agent_name.replace('-', ' ').title()}\n\n"
         for msg in agent_data["assistant_msgs"]:
             summary_md += f"{msg}\n\n"
-        summary_md += f"---\n**Total tool calls:** {sum(1 for lg in agent_data['logs'] if lg['role'] == 'Tool')}\n"
+        _tool_calls = sum(1 for lg in agent_data["logs"] if lg["role"] == "Tool")
+        if not agent_data["assistant_msgs"] and _tool_calls:
+            summary_md += f"(tool-only run — {_tool_calls} tool calls)\n"
+        summary_md += f"---\n**Total tool calls:** {_tool_calls}\n"
         summaries.append({"agent": agent_name, "summary": summary_md})
-
-    for agent_name, agent_data in agents.items():
-        if agent_name not in [s["agent"] for s in summaries] and agent_data["assistant_msgs"]:
-            summaries.append(
-                {
-                    "agent": agent_name,
-                    "summary": f"# {agent_name.replace('-', ' ').title()}\n\n(No summary available)",
-                }
-            )
 
     return render(
         request,
@@ -1244,7 +1328,8 @@ def site_rerun(request, site_id):
                 if output_file:
                     with open(output_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                    product_count = len(data.get("products", []))
+                    from src.content_types import count_items_in_output
+                    product_count = count_items_in_output(data)
                 else:
                     product_count = 0
             else:
@@ -1352,7 +1437,9 @@ def site_output_view(request, site_id, filename):
     except (json.JSONDecodeError, OSError):
         raise Http404("Could not read file")
 
-    products = data.get("products", [])
+    from src.content_types import count_items_in_output
+
+    _item_count = count_items_in_output(data)
     download_url = reverse(
         "site_output_download", kwargs={"site_id": site.id, "filename": safe_name}
     )
@@ -1363,7 +1450,9 @@ def site_output_view(request, site_id, filename):
             "site": site,
             "filename": safe_name,
             "json_content": pretty,
-            "product_count": len(products),
+            "product_count": _item_count,
+            "item_count": _item_count,
+            "item_label": "item",
             "download_url": download_url,
         },
     )
@@ -1429,8 +1518,7 @@ def schedule_next(request):
 
 _DEFAULT_PROMPTS: dict[str, str] = {
     "site_analyzer": "Analyze the site structure of {url}. Detect the platform, scraping mechanism, anti-bot protection, and product discovery method. Write your findings to workspace/{slug}/site_analysis.json.",
-    "navigation_explore": "This is a deterministic exploration node — it will navigate to {url}, extract navigation structure, visit a category page, and write navigation_findings.json. No custom prompt needed.",
-    "navigation_synthesize": "Read workspace/{slug}/navigation_findings.json and site_analysis.json, then write the structured navigation_analysis.json. Choose the best discovery method and fill in all fields.",
+    "browser_traverse": "The browser-driven agent navigates the site to find the listing page.",
     "nav_skill_review": "Read workspace/{slug}/navigation_findings.json, compare against existing skills, and apply any new reusable navigation patterns. Write your report to workspace/{slug}/nav_learning_report.json.",
     "product_analyzer": "Analyze the product page structure at {url}. Map all extractable fields with exact CSS selectors, JSON-LD paths, and meta tag fallbacks. Write to workspace/{slug}/product_analysis.json.",
     "scraper_analyzer": "Verify the scraping strategy for {url}. Read existing analysis files and confirm the extraction approach. Write to workspace/{slug}/scraper_analysis.json.",
@@ -1760,3 +1848,287 @@ def jobs_dashboard(request):
         "site_filter": site,
     }
     return render(request, "scraper/jobs_dashboard.html", context)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Intake UI (templates/scraper-intake.html wired into the framework)
+#
+# Three endpoints back the two-screen intake prototype:
+#   intake            — renders the page (injects CSRF + URLs + known sites)
+#   intake_check_site — AJAX probe → suggested fields (reuses the real probe
+#                       stack so Celery/browser/proxy are all exercised; the
+#                       probe auto-warms ProbeCache for the later scrape)
+#   intake_create_job — AJAX job creation → JSON dashboard URLs (enqueues the
+#                       full LangGraph pipeline via run_scrape_task)
+# The dashboard itself reuses the existing /jobs/<id>/* endpoints verbatim.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+# Intake nav-method radio → canonical input_mode (see PAGE_TYPE_MAP in
+# src/content_types.py). "list" = url_list, "listing" = list_page,
+# "search" = search_term. The explicit input_mode wins in _build_initial_state.
+_INTAKE_NAV_TO_INPUT_MODE = {
+    "list": "url_list",
+    "listing": "list_page",
+    "search": "search_term",
+}
+
+
+def _types_of(value) -> list[str]:
+    """Normalize a JSON-LD @type value (str | list | None) to a list of str."""
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if isinstance(value, str):
+        return [value]
+    return []
+
+
+def _infer_fields_from_probe(probe: dict) -> tuple[list[str], str]:
+    """Infer extractable fields + content type from a probe result's JSON-LD.
+
+    Walks JSON-LD ``@type`` values (including ``@graph`` nodes) and scores them
+    against the CONTENT_TYPES registry's ``jsonld_types``. Returns
+    ``(field_names, content_type_name)``. Falls back to ``(["title","url"],
+    "page_content")`` when nothing matches. Generic across content domains
+    (products / jobs / articles / forum); no hardcoded site names.
+    """
+    from src.content_types import CONTENT_TYPES
+
+    type_strings: set[str] = set()
+    for block in probe.get("jsonld") or []:
+        if not isinstance(block, dict):
+            continue
+        type_strings.update(_types_of(block.get("@type")))
+        graph = block.get("@graph")
+        if isinstance(graph, list):
+            for node in graph:
+                if isinstance(node, dict):
+                    type_strings.update(_types_of(node.get("@type")))
+
+    best_ct, best_score = "", 0
+    for ct_name, cfg in CONTENT_TYPES.items():
+        jl = getattr(cfg, "jsonld_types", ()) or ()
+        if not jl:
+            continue  # skip content types with no JSON-LD signal (e.g. serp)
+        score = sum(1 for t in jl if t in type_strings)
+        if score > best_score:
+            best_ct, best_score = ct_name, score
+
+    if best_ct:
+        return list(CONTENT_TYPES[best_ct].core_field_names), best_ct
+    return ["title", "url"], "page_content"
+
+
+@login_required
+def intake(request):
+    """Render the intake page with known-site field hints injected."""
+    known: dict[str, list] = {}
+    for site in Site.objects.exclude(fields_extracted=[]):
+        if site.url:
+            known[site.url] = site.fields_extracted or []
+    return render(
+        request,
+        "scraper/intake.html",
+        {"known_site_fields": json.dumps(known)},
+    )
+
+
+@login_required
+def intake_check_site(request):
+    """AJAX: probe a sample URL → extractable fields + connectivity info.
+
+    Reuses ``run_probe_with_captcha_check`` (the same function the
+    ``check_accessibility`` graph node calls), so browser_service, Chrome, and
+    the proxy escalation chain run identically to a real job. With ``job_id=0``
+    it skips SessionLog writes but still warms ProbeCache (4h TTL by domain),
+    so the subsequent scrape's check_accessibility node is a cache hit.
+    """
+    if request.headers.get("x-requested-with") != "XMLHttpRequest":
+        return JsonResponse({"error": "AJAX required"}, status=400)
+    url = request.POST.get("url", "").strip()
+    if not url:
+        return JsonResponse({"error": "url required"}, status=400)
+
+    # Known-site short-circuit (reuse the check_tracker pattern).
+    site = Site.objects.filter(url=url.rstrip("/")).first()
+    if site and site.fields_extracted:
+        return JsonResponse(
+            {
+                "known_site": True,
+                "fields": site.fields_extracted,
+                "content_type": (site.output_schema or {}).get("content_type", ""),
+                "platform": site.platform,
+                "scraping_method": site.scraping_method,
+            }
+        )
+
+    try:
+        from agents.tools.probe_tools import run_probe_with_captcha_check
+
+        # max_steps=3 → only the cheap no-proxy tier (direct_http,
+        # playwright_none, uc_chrome_none). Check-site is a quick field-detection
+        # probe, NOT the full escalation (that runs in the real job's
+        # check_accessibility node via Celery). First success returns fast; an
+        # anti-bot site bails after 3 attempts instead of grinding through all 9
+        # proxy tiers (which could take 20+ minutes).
+        probe = run_probe_with_captcha_check(
+            url, render_js=True, job_id=0, max_steps=3
+        )
+    except Exception as exc:
+        logger.warning("intake_check_site probe failed for %s: %s", url[:80], exc)
+        return JsonResponse(
+            {
+                "known_site": False,
+                "reachable": False,
+                "fields": [],
+                "content_type": "",
+                "anti_bot_detected": False,
+                "error": str(exc)[:300],
+            }
+        )
+
+    fields, content_type = _infer_fields_from_probe(probe)
+    reachable = bool(probe.get("success"))
+    anti_bot = bool(probe.get("captcha_detected"))
+    # When the quick probe couldn't get through (anti-bot / all 3 steps failed),
+    # surface a clear message: the user can still add fields manually and the
+    # real build handles anti-bot escalation.
+    message = ""
+    if not reachable:
+        message = (
+            "Couldn't auto-detect fields — this site likely has anti-bot "
+            "protection. You can still add fields manually; the scrape build "
+            "handles anti-bot bypass automatically."
+            if anti_bot
+            else "Couldn't reach the page for auto-detection. You can still add fields manually."
+        )
+    return JsonResponse(
+        {
+            "known_site": False,
+            "reachable": reachable,
+            "fields": fields,
+            "content_type": content_type,
+            "method_that_worked": probe.get("method"),
+            "http_method": probe.get("http_method"),
+            "browser_method": probe.get("browser_method"),
+            "anti_bot_detected": anti_bot,
+            "message": message,
+        }
+    )
+
+
+def _parse_url_lines(text: str) -> list[str]:
+    """Parse a textarea/file of URLs (one per line) into a deduped list."""
+    urls: list[str] = []
+    for line in (text or "").splitlines():
+        line = line.strip().strip(",").strip('"').strip("'").strip()
+        if line and line.startswith(("http://", "https://")) and line not in urls:
+            urls.append(line)
+    return urls
+
+
+@login_required
+def intake_create_job(request):
+    """AJAX: create a ScrapeJob + enqueue the full pipeline.
+
+    Returns JSON with the dashboard URLs the intake page needs (SSE, API,
+    tool-calls, downloads, cancel). The actual scraping runs through the
+    existing 25-node LangGraph pipeline via ``run_scrape_task`` — no new
+    pipeline code.
+    """
+    if request.method != "POST" or request.headers.get("x-requested-with") != "XMLHttpRequest":
+        return JsonResponse({"error": "POST + AJAX required"}, status=400)
+
+    url = request.POST.get("url", "").strip()
+    nav_method = request.POST.get("nav_method", "list").strip()
+    content_type = request.POST.get("content_type", "").strip()
+    target_fields = request.POST.get("target_fields", "").strip()
+    scope = request.POST.get("scope", "all").strip()
+    scope_value = request.POST.get("scope_value", "").strip()
+    notes = request.POST.get("notes", "").strip()
+
+    if not url:
+        return JsonResponse({"error": "url required"}, status=400)
+
+    input_mode = _INTAKE_NAV_TO_INPUT_MODE.get(nav_method, "url_list")
+    page_type = content_type or "product"
+
+    # nav-specific discovery data → search_criteria (agents read it).
+    search_criteria = ""
+    if nav_method == "listing":
+        search_criteria = request.POST.get("listing_urls", "").strip()
+    elif nav_method == "search":
+        search_criteria = request.POST.get("search_keywords", "").strip()
+
+    existing = ScrapeJob.objects.filter(
+        url=url, status__in=[ScrapeJob.STATUS_PENDING, ScrapeJob.STATUS_RUNNING]
+    ).first()
+    if existing:
+        return JsonResponse(
+            {
+                "error": f"A job for this URL is already running (Job #{existing.id})",
+                "job_id": existing.id,
+            },
+            status=409,
+        )
+
+    fields_list = (
+        [f.strip() for f in target_fields.split(",") if f.strip()]
+        if target_fields
+        else []
+    )
+
+    job = ScrapeJob.objects.create(
+        url=url,
+        product_url=url,
+        page_type=page_type,
+        input_mode=input_mode,
+        search_criteria=search_criteria,
+        target_fields=fields_list,
+        scope=scope,
+        scope_value=scope_value,
+        notes=notes,
+        full_extraction=False,  # "sample" mode
+    )
+
+    # For "list" mode, persist the provided item URLs so the url_list pipeline
+    # finds them (_build_initial_state falls back to scrapers/{slug}/input_urls.json
+    # when Site.input_urls is empty).
+    if nav_method == "list":
+        urls = _parse_url_lines(request.POST.get("list_urls", ""))
+        if urls:
+            try:
+                from .tasks import _generate_slug
+
+                slug = _generate_slug(url)
+                iu_dir = os.path.join(settings.PROJECT_ROOT, "scrapers", slug)
+                os.makedirs(iu_dir, exist_ok=True)
+                iu_path = os.path.join(iu_dir, "input_urls.json")
+                with open(iu_path, "w", encoding="utf-8") as f:
+                    json.dump({"urls": urls}, f, indent=2, ensure_ascii=False)
+            except Exception as exc:
+                logger.warning(
+                    "intake: could not persist list URLs for %s: %s",
+                    url[:80],
+                    exc,
+                )
+
+    from .tasks import run_scrape_task
+
+    task = run_scrape_task.delay(job.id, rescrape=False)
+    job.celery_task_id = task.id
+    job.save(update_fields=["celery_task_id"])
+
+    return JsonResponse(
+        {
+            "job_id": job.id,
+            "events_url": reverse("job_events", args=[job.id]),
+            "api_url": reverse("job_api", args=[job.id]),
+            "tool_calls_url": reverse("tool_calls_api", args=[job.id]),
+            "scraper_code_url": reverse("scraper_code", args=[job.id]),
+            "dagster_code_url": reverse("dagster_code", args=[job.id]),
+            "job_detail_url": reverse("job_detail", args=[job.id]),
+            "cancel_url": reverse("job_cancel", args=[job.id]),
+            "restart_url": reverse("job_restart", args=[job.id]),
+        }
+    )

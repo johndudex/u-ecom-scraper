@@ -1,0 +1,1436 @@
+<!DOCTYPE html>
+<!--
+  EXTRACT — AI scraper intake & job dashboard (prototype/mockup, self-contained single file)
+
+  Structure:
+    #form-screen    Screen 1 — guided intake: sample URL → detect/enter fields → navigation
+                    method (exact list / listing page / search) → scope+notes → run sample.
+    #sample-screen  Screen 2 — job dashboard: hero (status/actions), collapsible re-run box,
+                    two-column grid (Current Configuration | Sample Output), Run History,
+                    and a collapsible Advanced Options section (Pipeline/Details/Code/Tools/Log).
+
+  Shared state (single source of truth rendered into multiple places):
+    fieldsArr        the field schema — rendered into both #chips (step 1) and #cfg-chips
+                     (Current Configuration) via chipContainers[].
+    nav method/text  step 1's radios/textareas and their #cfg-* mirrors are kept in sync via
+                     setNavMethod() and mirrorField().
+    listFileState    the one attached "exact list" file, shown as a chip (not injected into
+                     the textarea) and mirrored across both panels.
+
+  Everything under "generated artifacts (representative)" (SCRAPER_CODE, DAGSTER_CODE,
+  SAMPLE_JSON, PIPELINE, TOOLCALLS, LOG, RUNS) is static mock data standing in for a real
+  backend — swap these for live API calls when wiring this up for real.
+
+  No build step: vanilla HTML/CSS/JS, single IIFE, CSS custom properties for theming
+  (light/dark via prefers-color-scheme). Safe to edit directly.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Extract — data scraper setup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#f5f6f9; --surface:#ffffff; --surface-2:#eef0f5;
+  --ink:#1a1d24; --muted:#5b616e; --faint:#8b909c;
+  --border:#e2e5ec; --border-strong:#c9cdd8;
+  --accent:#4f46e5; --accent-hover:#4338ca; --accent-bg:#ecebfd; --accent-ink:#3730a3;
+  --warn:#9a5a05; --warn-bg:#fdf1de; --warn-ink:#7c4a05;
+  --ok:#047857; --ok-bg:#e4f4ee;
+  --radius:9px; --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --sans:"Inter",system-ui,-apple-system,Segoe UI,sans-serif;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0f1116; --surface:#171a21; --surface-2:#1e222b;
+    --ink:#e7e9ef; --muted:#a2a8b6; --faint:#727888;
+    --border:#272c37; --border-strong:#39404e;
+    --accent:#8b82f5; --accent-hover:#9c95f7; --accent-bg:#221f3a; --accent-ink:#c3bef9;
+    --warn:#e0a556; --warn-bg:#2e2413; --warn-ink:#f0c483;
+    --ok:#4cc79a; --ok-bg:#12281f;
+  }
+}
+*{box-sizing:border-box;}
+html{-webkit-text-size-adjust:100%;}
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font-family:var(--sans); font-size:15px; line-height:1.5;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{width:100%; box-sizing:border-box; padding:0 24px 80px;}
+#form-screen{max-width:720px; margin:0 auto;}
+.results-grid{display:grid; grid-template-columns:1fr 1fr; gap:16px; align-items:start; margin-bottom:16px;}
+.results-grid .panel{margin-bottom:0; display:flex; flex-direction:column; min-width:0;}
+@media (max-width:860px){ .results-grid{grid-template-columns:1fr;} }
+
+.topbar{
+  position:sticky; top:0; z-index:10; background:var(--bg);
+  border-bottom:1px solid var(--border);
+  padding:16px 20px; margin-bottom:28px;
+}
+.topbar-inner{width:100%; box-sizing:border-box; display:flex; align-items:center; justify-content:space-between; gap:16px;}
+.brand{display:flex; align-items:center; gap:9px; font-weight:600; letter-spacing:-0.01em;}
+.brand-mark{width:22px; height:22px; border-radius:6px; background:var(--accent); display:flex; align-items:center; justify-content:center; color:#fff; flex-shrink:0;}
+.steps{display:flex; align-items:center; gap:10px; font-size:13px; font-family:var(--mono);}
+.step{color:var(--faint); display:flex; align-items:center; gap:6px;}
+.step.on{color:var(--ink);}
+.step .dot{width:20px; height:20px; border-radius:50%; border:1px solid var(--border-strong); display:flex; align-items:center; justify-content:center; font-size:11px;}
+.step.on .dot{background:var(--accent); border-color:var(--accent); color:#fff;}
+.step.done .dot{background:var(--ok); border-color:var(--ok); color:#fff;}
+.step-sep{width:22px; height:1px; background:var(--border-strong);}
+
+h1{font-size:23px; font-weight:600; letter-spacing:-0.02em; margin:0 0 4px;}
+
+.q{display:flex; gap:14px; margin-bottom:26px;}
+.q-num{width:26px; height:26px; border-radius:50%; background:var(--surface-2); color:var(--muted); font-family:var(--mono); font-size:13px; font-weight:500; display:flex; align-items:center; justify-content:center; flex-shrink:0; margin-top:1px;}
+.q-body{flex:1; min-width:0;}
+.q-title{font-size:15px; font-weight:600; margin:2px 0 3px;}
+.q-help{font-size:13px; color:var(--muted); margin:0 0 11px;}
+
+label.field-label{display:block; font-size:13px; color:var(--muted); margin:0 0 6px;}
+input[type=text], textarea{
+  width:100%; font-family:var(--mono); font-size:13.5px; color:var(--ink);
+  background:var(--surface); border:1px solid var(--border); border-radius:var(--radius);
+  padding:10px 12px; transition:border-color .15s, box-shadow .15s;
+}
+input[type=text]::placeholder, textarea::placeholder{color:var(--faint); font-family:var(--mono);}
+input[type=text]:focus, textarea:focus{outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-bg);}
+textarea{resize:vertical; min-height:60px; line-height:1.55;}
+.stack > * + *{margin-top:9px;}
+
+.chips{display:flex; flex-wrap:wrap; gap:7px; margin-bottom:9px;}
+.chip{display:inline-flex; align-items:center; gap:6px; background:var(--accent-bg); color:var(--accent-ink); font-family:var(--mono); font-size:12.5px; padding:5px 8px 5px 11px; border-radius:7px;}
+.chip button{background:none; border:none; padding:0; cursor:pointer; color:var(--accent-ink); opacity:.65; display:flex; line-height:0;}
+.chip button:hover{opacity:1;}
+
+.navlist{display:flex; flex-direction:column; gap:9px;}
+.navcard{border:1px solid var(--border); border-radius:var(--radius); padding:13px 15px; cursor:pointer; display:flex; gap:12px; align-items:flex-start; transition:border-color .15s, background .15s; background:var(--surface);}
+.navcard:hover{border-color:var(--border-strong);}
+.navcard.sel{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent);}
+.navcard input{margin:2px 0 0; accent-color:var(--accent); flex-shrink:0;}
+.navcard .nc-text{display:flex; flex-direction:column; gap:3px;}
+.navcard .nc-title{display:block; font-size:14px; font-weight:500; line-height:1.35;}
+.navcard .nc-help{display:block; font-size:12.5px; color:var(--muted); line-height:1.4;}
+.subpanel{margin:2px 0 2px 12px; padding-left:16px; border-left:2px solid var(--accent);}
+.subpanel .note{font-size:12px; color:var(--faint); margin:7px 0 0; display:flex; gap:6px; align-items:flex-start;}
+
+.scope-row{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:9px;}
+.scope-opt{flex:1; min-width:130px; padding:11px 13px;}
+.scope-opt .nc-title{font-size:14px;}
+
+.actions{padding-left:40px; margin-top:6px;}
+.btn{font-family:var(--sans); font-size:14px; font-weight:500; padding:11px 20px; border-radius:var(--radius); cursor:pointer; border:1px solid transparent; display:inline-flex; align-items:center; gap:7px; transition:background .15s, border-color .15s, transform .05s;}
+.btn:active{transform:scale(.985);}
+.btn-primary{background:var(--accent); color:#fff; border-color:var(--accent);}
+.btn-primary.btn-deploying{background:var(--accent-hover); border-color:var(--accent-hover); cursor:wait;}
+.btn-primary.btn-deployed{background:var(--ok); border-color:var(--ok);}
+.btn-primary:hover{background:var(--accent-hover);}
+.btn-ghost{background:var(--surface); color:var(--ink); border-color:var(--border-strong);}
+.btn-ghost:hover{background:var(--surface-2);}
+.btn-link{background:none; border:none; color:var(--muted); font-size:13px; padding:10px 8px; cursor:pointer;}
+.btn-link:hover{color:var(--ink);}
+.hint{font-size:12.5px; color:var(--faint); margin:9px 0 0;}
+.domain-echo{font-size:12.5px; color:var(--muted); margin:9px 0 0; font-family:var(--mono); display:flex; align-items:center; gap:6px;}
+.domain-echo .de-ok{color:var(--ok); flex-shrink:0; display:flex;}
+.url-row{display:flex; gap:8px; align-items:stretch;}
+.url-row input{flex:1;}
+.url-row .btn{white-space:nowrap; padding:10px 15px;}
+.detect-status{display:flex; align-items:center; gap:9px; font-size:13px; color:var(--muted); margin:13px 0 0;}
+.spinner-sm{width:15px; height:15px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite; flex-shrink:0;}
+.fields-block{margin-top:15px;}
+.fields-label{font-size:13px; color:var(--muted); margin:0 0 10px;}
+#scope-input:not(.hidden){margin-top:2px;}
+#scope-hint:not(.hidden){margin-bottom:11px;}
+.demo-note{margin-top:28px; padding-top:18px; border-top:1px solid var(--border); font-size:12.5px; color:var(--muted); display:flex; gap:9px; align-items:flex-start; line-height:1.55;}
+.demo-note code{font-family:var(--mono); color:var(--accent); font-size:12px;}
+:focus-visible{outline:2px solid var(--accent); outline-offset:2px;}
+
+.hidden{display:none !important;}
+
+@keyframes spin{to{transform:rotate(360deg);}}
+.spin-ico{animation:spin .9s linear infinite; transform-origin:center;}
+@media (prefers-reduced-motion:reduce){.spinner-sm,.spin-ico{animation:none;}}
+.btn:disabled{opacity:.45; cursor:not-allowed; pointer-events:none;}
+.btn:disabled.btn-deploying, .btn:disabled.btn-deployed{opacity:1; cursor:wait;}
+
+.pill{flex-shrink:0; font-family:var(--mono); font-size:12px; padding:5px 11px; border-radius:20px; white-space:nowrap; display:inline-flex; align-items:center; gap:5px;}
+.pill-ok{background:var(--ok-bg); color:var(--ok);}
+.pill-running{background:var(--accent-bg); color:var(--accent);}
+.pill-cancelled{background:var(--warn-bg); color:var(--warn);}
+.cancel-run-btn{font-family:var(--sans); font-size:12.5px; color:var(--warn); background:none; border:1px solid var(--warn); border-radius:20px; padding:4px 12px; cursor:pointer; transition:background .15s;}
+.cancel-run-btn:hover{background:var(--warn-bg);}
+.output-loading{display:flex; align-items:center; justify-content:center; gap:9px; flex:1; min-height:220px; padding:16px 14px; color:var(--muted); font-size:13.5px; background:var(--surface-2); border-radius:10px; box-sizing:border-box;}
+
+.tablewrap{border:1px solid var(--border); border-radius:12px; overflow:hidden; margin-bottom:10px; background:var(--surface);}
+table{width:100%; border-collapse:collapse; font-family:var(--mono); font-size:12.5px;}
+thead th{background:var(--surface-2); text-align:left; padding:10px 13px; font-weight:500; color:var(--muted); white-space:nowrap;}
+tbody td{padding:9px 13px; border-top:1px solid var(--border); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:0;}
+
+@media (max-width:560px){
+  .steps .label{display:none;}
+}
+.url-error{font-size:12.5px; color:var(--warn); background:var(--warn-bg); border-radius:var(--radius); padding:9px 12px; margin:10px 0 0; line-height:1.45;}
+input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg);}
+
+/* ===== results page ===== */
+.hero{padding:20px 22px; background:var(--surface); border:1px solid var(--border); border-radius:14px; margin-bottom:16px;}
+.hero-row{display:flex; justify-content:space-between; gap:20px; align-items:flex-start; flex-wrap:wrap;}
+.hero-title-row{display:flex; align-items:center; gap:12px; margin-bottom:7px; flex-wrap:wrap;}
+.hero-title-row h1{font-size:22px; margin:0;}
+.hero-url{display:inline-block; font-family:var(--mono); font-size:13px; color:var(--accent); text-decoration:none; word-break:break-all; margin-bottom:13px;}
+.hero-url:hover{text-decoration:underline;}
+.hero-meta{display:flex; flex-wrap:wrap; gap:18px; font-size:13px; color:var(--muted);}
+.hero-meta b{color:var(--ink); font-weight:600;}
+.hero-actions{display:flex; gap:9px; flex-wrap:wrap; align-items:flex-start;}
+.btn-sm{font-size:13px; padding:8px 13px;}
+.hero-rerun{margin-top:18px; padding-top:18px; border-top:1px solid var(--border);}
+.hero-rerun-sub{font-size:12.5px; color:var(--muted); margin:0 0 11px;}
+
+.panel{background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:18px 20px; margin-bottom:16px;}
+.panel-head{display:flex; align-items:baseline; gap:10px; margin-bottom:14px; flex-wrap:wrap;}
+.panel-head h3{font-size:15px; font-weight:600; margin:0;}
+.panel-sub{font-size:12.5px; color:var(--muted); flex:1;}
+.panel-head.stacked{display:block; margin-bottom:14px;}
+.panel-head.stacked .panel-head-title-row{display:flex; align-items:center; justify-content:space-between; gap:10px;}
+.panel-head.stacked .panel-sub{display:block; flex:none; margin:4px 0 0;}
+
+.add-input-box{border:1px dashed var(--border-strong); border-radius:12px; padding:10px 12px 10px 14px; background:var(--surface); transition:border-color .15s;}
+.add-input-box:focus-within{border-color:var(--accent); border-style:solid;}
+.add-input-box textarea{border:none; padding:6px 0; background:none; resize:none; min-height:44px;}
+.add-input-box textarea:focus{box-shadow:none;}
+.add-input-actions{display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:6px; padding-top:8px; border-top:1px solid var(--border);}
+.icon-btn{width:32px; height:32px; border-radius:8px; background:var(--surface-2); display:inline-flex; align-items:center; justify-content:center; cursor:pointer; color:var(--muted); flex-shrink:0; transition:color .15s, background .15s;}
+.icon-btn:hover{color:var(--accent); background:var(--accent-bg);}
+.file-status{flex:1; min-width:0;}
+.file-chip{display:inline-flex; align-items:center; gap:7px; background:var(--accent-bg); color:var(--accent-ink); font-family:var(--mono); font-size:12px; padding:5px 6px 5px 10px; border-radius:20px; max-width:100%;}
+.file-chip .fc-ico{flex-shrink:0; display:flex;}
+.file-chip .fc-name{overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.file-chip .fc-del{background:none; border:none; padding:2px; cursor:pointer; color:var(--accent-ink); opacity:.65; display:flex; flex-shrink:0; border-radius:50%;}
+.file-chip .fc-del:hover{opacity:1; background:rgba(0,0,0,.08);}
+
+.cfg-block + .cfg-block{margin-top:22px; padding-top:20px; border-top:1px solid var(--border);}
+.cfg-nav-block .navlist{margin-top:2px;}
+
+#cfg-panel.cfg-locked .chip button{display:none;}
+#cfg-panel.cfg-locked #cfg-field-input{display:none;}
+#cfg-panel.cfg-locked .cfg-nav-block{pointer-events:none;}
+#cfg-panel.cfg-locked .cfg-nav-block .navcard:not(.sel){display:none;}
+#cfg-panel.cfg-locked .cfg-nav-block .navcard.sel{background:var(--surface-2); cursor:default;}
+#cfg-panel.cfg-locked .cfg-nav-block .navcard.sel input[type=radio]{visibility:hidden;}
+#cfg-panel.cfg-locked .add-input-box{background:var(--surface-2);}
+#cfg-panel.cfg-locked .icon-btn{visibility:hidden;}
+#cfg-panel:not(.cfg-locked){box-shadow:0 0 0 2px var(--accent-bg);}
+
+.runs-table td, .runs-table th{white-space:nowrap;}
+.runs-table td{font-size:12.5px; font-family:var(--sans);}
+.runs-table .rmono{font-family:var(--mono); font-size:12px;}
+.run-status-ok{font-family:var(--mono); font-size:11px; color:var(--ok);}
+.mini-btn{font-family:var(--sans); font-size:12px; padding:5px 9px; border:1px solid var(--border-strong); background:var(--surface); border-radius:6px; cursor:pointer; color:var(--ink); display:inline-flex; gap:5px; align-items:center;}
+.mini-btn:hover{background:var(--surface-2);}
+.mini-btn + .mini-btn{margin-left:6px;}
+
+#rerun-prompt{margin-bottom:12px; min-height:70px;}
+.rerun-actions{display:flex; align-items:center; gap:12px; flex-wrap:wrap;}
+
+.adv-toggle{width:100%; display:flex; align-items:center; gap:10px; justify-content:center; padding:13px; background:var(--accent); border:1px solid var(--accent); border-radius:12px; cursor:pointer; font-family:var(--sans); font-size:14px; font-weight:600; color:#fff; margin-bottom:16px; transition:background .15s;}
+.adv-toggle:hover{background:var(--accent-hover);}
+.adv-toggle .chev{transition:transform .2s;}
+.adv-toggle[aria-expanded="true"] .chev{transform:rotate(180deg);}
+
+.adv-section{background:var(--surface); border:1px solid var(--border); border-radius:14px; margin-bottom:16px; overflow:hidden;}
+.adv-note{font-size:12px; color:var(--faint); padding:12px 18px 0; line-height:1.5;}
+.tabs{display:flex; gap:2px; overflow-x:auto; border-bottom:1px solid var(--border); padding:6px 8px 0;}
+.tab{font-family:var(--sans); font-size:13px; padding:9px 13px; background:none; border:none; border-bottom:2px solid transparent; cursor:pointer; color:var(--muted); white-space:nowrap;}
+.tab:hover{color:var(--ink);}
+.tab.on{color:var(--accent); border-bottom-color:var(--accent); font-weight:500;}
+.tab-panel{padding:18px 20px;}
+
+.pipeline{display:flex; flex-direction:column;}
+.pipe-step{display:flex; align-items:center; gap:12px; padding:10px 0; border-bottom:1px solid var(--border);}
+.pipe-step:last-child{border-bottom:none;}
+.pipe-ico{width:22px; height:22px; border-radius:50%; background:var(--ok-bg); color:var(--ok); display:flex; align-items:center; justify-content:center; flex-shrink:0;}
+.pipe-name{flex:1; font-size:13.5px; font-weight:500;}
+.pipe-name .retry{font-family:var(--mono); font-size:10px; color:var(--warn); background:var(--warn-bg); padding:1px 6px; border-radius:10px; margin-left:8px; font-weight:400;}
+.pipe-status{font-family:var(--mono); font-size:10.5px; color:var(--ok); letter-spacing:.04em; width:46px;}
+.pipe-time{font-family:var(--mono); font-size:11px; color:var(--faint); width:160px; text-align:right;}
+.pipe-dur{font-family:var(--mono); font-size:11px; color:var(--muted); width:58px; text-align:right;}
+
+.kv{display:flex; gap:14px; padding:11px 0; border-bottom:1px solid var(--border); font-size:13px;}
+.kv:last-child{border-bottom:none;}
+.kv .kk{width:180px; color:var(--muted); flex-shrink:0;}
+.kv .kv-v{font-family:var(--mono); color:var(--ink); word-break:break-word;}
+
+.codeblock{border:1px solid var(--border); border-radius:10px; overflow:hidden; background:var(--surface-2);}
+.code-head{display:flex; align-items:center; justify-content:space-between; padding:9px 13px; border-bottom:1px solid var(--border); font-family:var(--mono); font-size:12px; color:var(--muted);}
+.codeblock pre{margin:0; padding:14px; overflow:auto; max-height:380px; font-family:var(--mono); font-size:12px; line-height:1.6; color:var(--ink); white-space:pre;}
+#output-content{display:flex; flex-direction:column; flex:1; min-height:0;}
+.json-view{margin:0; padding:14px; overflow:auto; flex:1; min-height:220px; box-sizing:border-box; font-family:var(--mono); font-size:12px; line-height:1.6; color:var(--ink); white-space:pre; background:var(--surface-2); border:1px solid var(--border); border-radius:10px; transition:max-height .2s ease;}
+.json-view.expanded{flex:none; max-height:640px;}
+#json-out{flex:none; height:auto; max-height:380px;}
+
+.tool-group{border-bottom:1px solid var(--border); padding:4px 0;}
+.tool-group:last-child{border-bottom:none;}
+.tool-group > summary{cursor:pointer; font-size:13px; font-weight:500; padding:9px 0; list-style:none; display:flex; align-items:center; gap:9px;}
+.tool-group > summary::-webkit-details-marker{display:none;}
+.tool-group > summary .tg-chev{transition:transform .2s; color:var(--faint); display:flex;}
+.tool-group[open] > summary .tg-chev{transform:rotate(90deg);}
+.tool-group > summary .cnt{font-family:var(--mono); font-size:11px; color:var(--muted); background:var(--surface-2); padding:2px 7px; border-radius:10px; margin-left:auto;}
+.tool-call{font-family:var(--mono); font-size:11.5px; padding:8px 12px; margin:6px 0 0 26px; background:var(--surface-2); border-radius:8px; border-left:2px solid var(--border-strong);}
+.tool-call .tc-name{color:var(--accent);}
+.tool-call .tc-res{color:var(--muted); display:block; margin-top:4px;}
+
+.log{font-family:var(--mono); font-size:11.5px; max-height:400px; overflow:auto;}
+.log-line{display:flex; gap:10px; padding:5px 0; border-bottom:1px solid var(--border); line-height:1.5;}
+.log-line:last-child{border-bottom:none;}
+.log-time{color:var(--faint); flex-shrink:0; width:66px;}
+.log-lvl{flex-shrink:0; width:46px; font-weight:500;}
+.log-lvl.info{color:var(--accent);}
+.log-lvl.ok{color:var(--ok);}
+.log-lvl.warn{color:var(--warn);}
+.log-msg{flex:1; color:var(--ink); word-break:break-word;}
+@media (max-width:600px){ .pipe-time{display:none;} .hero{flex-direction:column;} .kv .kk{width:130px;} }
+
+.sr-only{position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); border:0;}
+</style>
+<script>
+  // Injected by Django (scraper/intake view). Drives the AJAX calls below.
+  window.INTAKE_CONFIG = {
+    csrfToken: "{{ csrf_token }}",
+    checkSiteUrl: "{% url 'intake_check_site' %}",
+    createJobUrl: "{% url 'intake_create_job' %}",
+    knownSiteFields: {{ known_site_fields|safe }},
+  };
+</script>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+      </span>
+      <span id="header-title">Set up your extraction</span>
+    </div>
+    <div class="steps" aria-label="progress">
+      <span class="step on" id="st1"><span class="dot">1</span><span class="label">Define</span></span>
+      <span class="step-sep"></span>
+      <span class="step" id="st2"><span class="dot">2</span><span class="label">Sample</span></span>
+    </div>
+    <button class="btn btn-primary btn-sm" id="restart" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg> New extraction</button>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <!-- ============ SCREEN 1: INTAKE FORM ============ -->
+  <section id="form-screen">
+    <div class="q">
+      <div class="q-num">1</div>
+      <div class="q-body">
+        <p class="q-title">Paste a page that actually shows your data</p>
+        <p class="q-help">Open a real example — one product, listing, article, or profile — and paste that exact URL. A homepage or top-level category page won't work; we need the page where the data itself appears.</p>
+        <div class="url-row">
+          <input type="text" id="example-url" placeholder="https://books.example.com/catalogue/a-light-in-the-attic" aria-label="sample page URL">
+          <button class="btn btn-ghost" id="scan-btn" type="button">Check site</button>
+        </div>
+        <p class="domain-echo hidden" id="domain-echo"></p>
+        <p class="url-error hidden" id="url-error"></p>
+
+        <div class="detect-status hidden" id="detect-status">
+          <span class="spinner-sm" aria-hidden="true"></span> Checking the site… <span id="detect-sub">can take up to ~1 min on protected sites</span>
+        </div>
+
+        <div class="fields-block hidden" id="fields-block">
+          <p class="fields-label" id="fields-label"></p>
+          <div class="chips" id="chips" aria-label="fields to extract"></div>
+          <input type="text" id="field-input" placeholder="Add a field, press Enter" aria-label="add a field">
+        </div>
+      </div>
+    </div>
+
+    <div class="q">
+      <div class="q-num">2</div>
+      <div class="q-body">
+        <p class="q-title">How should we find all the other pages like this?</p>
+        <div class="navlist" id="navlist">
+          <label class="navcard" data-nav="list">
+            <input type="radio" name="nav" value="list">
+            <span class="nc-text"><span class="nc-title">I have the exact list</span><span class="nc-help">Paste or upload the URLs</span></span>
+          </label>
+          <div class="subpanel hidden" id="sub-list">
+            <div class="add-input-box">
+              <textarea id="nav-list-text" placeholder="One URL per line, or drop a CSV" aria-label="URL list"></textarea>
+              <div class="add-input-actions">
+                <label class="icon-btn" title="Attach a file of URLs" aria-label="attach file of URLs">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+                  <input type="file" id="nav-list-file" hidden accept=".csv,.txt">
+                </label>
+                <div class="file-status" id="nav-list-status">
+                  <span class="hint" style="margin:0">CSV or TXT — one URL per line</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <label class="navcard" data-nav="listing">
+            <input type="radio" name="nav" value="listing">
+            <span class="nc-text"><span class="nc-title">They're linked from a listing page</span><span class="nc-help">We follow the links and handle pagination</span></span>
+          </label>
+          <div class="subpanel hidden" id="sub-listing">
+            <textarea id="nav-listing-text" placeholder="One listing page per line, e.g.&#10;https://books.example.com/catalogue/category/travel&#10;https://books.example.com/catalogue/category/mystery" aria-label="listing page URLs" rows="3"></textarea>
+            <p class="note">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;margin-top:1px"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+              Add one or more listing pages, one per line. Pagination, next-buttons, and infinite scroll on each are detected automatically.
+            </p>
+          </div>
+
+          <label class="navcard" data-nav="search">
+            <input type="radio" name="nav" value="search">
+            <span class="nc-text"><span class="nc-title">I reach them by searching</span><span class="nc-help">Give the search page and keywords</span></span>
+          </label>
+          <div class="subpanel hidden" id="sub-search">
+            <div class="stack">
+              <input type="text" id="nav-search-url" placeholder="Search results page URL" aria-label="search page URL">
+              <input type="text" id="nav-search-kw" placeholder="Keywords, comma separated" aria-label="keywords">
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="q">
+      <div class="q-num">3</div>
+      <div class="q-body">
+        <p class="q-title">Scope and anything else</p>
+        <div class="scope-row" id="scope-row">
+          <label class="navcard scope-opt sel" data-scope="all"><input type="radio" name="scope" value="all" checked><span class="nc-title">Everything</span></label>
+          <label class="navcard scope-opt" data-scope="firstn"><input type="radio" name="scope" value="firstn"><span class="nc-title">First N records</span></label>
+          <label class="navcard scope-opt" data-scope="filter"><input type="radio" name="scope" value="filter"><span class="nc-title">Only matching…</span></label>
+        </div>
+        <input type="text" id="scope-input" class="hidden" aria-label="scope detail">
+        <p class="hint hidden" id="scope-hint"></p>
+        <textarea id="notes" placeholder="Anything special? e.g. prices in £, skip out-of-stock, phone is inside an image" aria-label="additional directions"></textarea>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="btn btn-primary" id="run-sample">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+        Run sample scrape
+      </button>
+      <p class="hint">We'll extract a small slice first. You pick output and run the rest once it looks right.</p>
+    </div>
+
+    <p class="demo-note">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;margin-top:1px"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+      <span>Prototype note: <code>books.example.com</code> is seeded as an already-supported site — paste a page from it (e.g. the placeholder URL above) to see fields auto-fill. Any other site follows the new-site path, where you add the fields yourself.</span>
+    </p>
+  </section>
+
+  <!-- ============ SCREEN 2: JOB DASHBOARD (hero, config, output, history, advanced) ============ -->
+  <section id="sample-screen" class="hidden">
+
+    <!-- HERO / OVERVIEW -->
+    <div class="hero">
+      <div class="hero-row">
+        <div class="hero-main">
+          <div class="hero-title-row">
+            <h1 id="job-title">Job #231</h1>
+            <span class="pill pill-ok" id="job-status">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
+              COMPLETED
+            </span>
+            <button class="cancel-run-btn hidden" id="cancel-run-btn" type="button">Cancel</button>
+          </div>
+          <a class="hero-url" id="job-url" href="#" target="_blank" rel="noopener">—</a>
+          <div class="hero-meta">
+            <span><b id="job-time">4m 12s</b> execution time</span>
+            <span><b id="job-records">3,512</b> records</span>
+            <span id="job-when">—</span>
+          </div>
+        </div>
+        <div class="hero-actions">
+          <button class="btn btn-ghost btn-sm" id="dl-output"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg> Output</button>
+          <button class="btn btn-ghost btn-sm" id="dl-scraper"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg> Scraper</button>
+          <button class="btn btn-ghost btn-sm" id="rerun-toggle" aria-expanded="false" aria-controls="rerun-box"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg> Re-run</button>
+          <button class="btn btn-primary btn-sm" id="run-full"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg> Deploy to Dagster</button>
+        </div>
+      </div>
+
+      <!-- RE-RUN WITH CUSTOM PROMPT — expands within the hero card itself, no new section -->
+      <div class="hero-rerun hidden" id="rerun-box">
+        <p class="hero-rerun-sub">Optional — tell the builder what to change. Leave it blank to just re-run as-is with the current configuration below.</p>
+        <textarea id="rerun-prompt" placeholder="Optional — e.g. the price field is dropping the £ symbol, keep it; also capture the posted date and the apply link."></textarea>
+        <div class="rerun-actions">
+          <button class="btn btn-primary" id="rerun-btn"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg> <span id="rerun-btn-label">Re-run as-is</span></button>
+          <span class="hint" id="rerun-hint">No notes yet — this will re-run using the schema and navigation you've set below.</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="results-grid">
+    <!-- CURRENT CONFIGURATION -->
+    <div class="panel cfg-locked" id="cfg-panel">
+      <div class="panel-head stacked">
+        <div class="panel-head-title-row">
+          <h3>Current configuration</h3>
+          <button class="btn btn-ghost btn-sm" id="cfg-edit-toggle" type="button" aria-pressed="false">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 013 3L12 15l-4 1 1-4z"/></svg>
+            Edit
+          </button>
+        </div>
+        <span class="panel-sub">The schema and navigation method this scraper uses.</span>
+      </div>
+
+      <div class="cfg-block">
+        <label class="field-label">Fields to extract</label>
+        <div class="chips" id="cfg-chips" aria-label="fields to extract (current configuration)"></div>
+        <input type="text" id="cfg-field-input" placeholder="Add a field, press Enter" aria-label="add a field (current configuration)">
+      </div>
+
+      <div class="cfg-block cfg-nav-block">
+        <label class="field-label">How we find pages</label>
+        <div class="navlist" id="cfg-navlist">
+          <label class="navcard" data-nav="list">
+            <input type="radio" name="cfg-nav" value="list">
+            <span class="nc-text"><span class="nc-title">I have the exact list</span><span class="nc-help">Paste or upload the URLs</span></span>
+          </label>
+          <div class="subpanel hidden" id="cfg-sub-list">
+            <div class="add-input-box">
+              <textarea id="cfg-list-text" placeholder="One URL per line, or drop a CSV" aria-label="URL list (current configuration)"></textarea>
+              <div class="add-input-actions">
+                <label class="icon-btn" title="Attach a file of URLs" aria-label="attach file of URLs (current configuration)">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+                  <input type="file" id="cfg-list-file" hidden accept=".csv,.txt">
+                </label>
+                <div class="file-status" id="cfg-list-status">
+                  <span class="hint" style="margin:0">CSV or TXT — one URL per line</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <label class="navcard" data-nav="listing">
+            <input type="radio" name="cfg-nav" value="listing">
+            <span class="nc-text"><span class="nc-title">They're linked from a listing page</span><span class="nc-help">We follow the links and handle pagination</span></span>
+          </label>
+          <div class="subpanel hidden" id="cfg-sub-listing">
+            <textarea id="cfg-listing-text" rows="3" placeholder="One listing page per line" aria-label="listing page URLs (current configuration)"></textarea>
+          </div>
+
+          <label class="navcard" data-nav="search">
+            <input type="radio" name="cfg-nav" value="search">
+            <span class="nc-text"><span class="nc-title">I reach them by searching</span><span class="nc-help">Give the search page and keywords</span></span>
+          </label>
+          <div class="subpanel hidden" id="cfg-sub-search">
+            <div class="stack">
+              <input type="text" id="cfg-search-url" placeholder="Search results page URL" aria-label="search page URL (current configuration)">
+              <input type="text" id="cfg-search-kw" placeholder="Keywords, comma separated" aria-label="keywords (current configuration)">
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- SAMPLE OUTPUT PREVIEW -->
+    <div class="panel">
+      <div class="panel-head stacked">
+        <div class="panel-head-title-row">
+          <h3>Sample output</h3>
+          <button class="btn-link hidden" id="json-expand-toggle" type="button">Expand</button>
+        </div>
+        <span class="panel-sub">Preview of the extracted records (JSON)</span>
+      </div>
+      <div class="output-loading" id="output-loading">
+        <svg class="spin-ico" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+        Building the scraper and extracting a sample…
+      </div>
+      <div class="hidden" id="output-content">
+        <pre class="json-view" id="sample-json-view"></pre>
+        <p class="hint">Navigation: <span id="stat-nav" style="font-family:var(--mono)">—</span> · ~3,500 rows across ~140 pages · from <span id="site-echo" style="font-family:var(--mono);color:var(--accent)">the site</span></p>
+      </div>
+    </div>
+    </div>
+
+    <!-- RUN HISTORY -->
+    <div class="panel">
+      <div class="panel-head"><h3>Run history</h3><span class="panel-sub">Previous executions of this job</span></div>
+      <div class="tablewrap">
+        <table class="runs-table"><thead><tr><th>Run</th><th>When</th><th>Status</th><th>Records</th><th>Duration</th><th>Scraper</th><th>Output</th></tr></thead><tbody id="runs-body"></tbody></table>
+      </div>
+    </div>
+
+    <!-- ADVANCED TOGGLE -->
+    <button class="adv-toggle" id="adv-toggle" aria-expanded="false" aria-controls="adv-section">
+      <svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+      Advanced options
+    </button>
+
+    <div class="adv-section hidden" id="adv-section">
+      <p class="adv-note">Generated artifacts and diagnostics from the build pipeline. Values shown are representative of a completed job.</p>
+      <div class="tabs" id="adv-tabs" role="tablist">
+        <button class="tab on" data-tab="pipeline" type="button">Pipeline</button>
+        <button class="tab" data-tab="details" type="button">Details</button>
+        <button class="tab" data-tab="scraper" type="button">Scraper Code</button>
+        <button class="tab" data-tab="dagster" type="button">Dagster Code</button>
+        <button class="tab" data-tab="output" type="button">Sample Output</button>
+        <button class="tab" data-tab="tools" type="button">Tool Calls</button>
+        <button class="tab" data-tab="log" type="button">Agent Log</button>
+      </div>
+      <div class="tab-panel" id="tab-pipeline"><div class="pipeline" id="pipeline"></div></div>
+      <div class="tab-panel hidden" id="tab-details"><div id="details-kv"></div></div>
+      <div class="tab-panel hidden" id="tab-scraper">
+        <div class="codeblock"><div class="code-head"><span>scraper.py</span><button class="mini-btn" id="dl-scraper-2" type="button"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg> Download</button></div><pre id="scraper-code"></pre></div>
+      </div>
+      <div class="tab-panel hidden" id="tab-dagster">
+        <div class="codeblock"><div class="code-head"><span>dagster_asset.py</span><button class="mini-btn" id="dl-dagster" type="button"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg> Download</button></div><pre id="dagster-code"></pre></div>
+      </div>
+      <div class="tab-panel hidden" id="tab-output">
+        <div class="panel-head" style="margin-bottom:10px"><span class="panel-sub">Raw JSON from the generated scraper</span><button class="mini-btn" id="dl-json" type="button"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg> Download JSON</button></div>
+        <pre class="json-view" id="json-out"></pre>
+      </div>
+      <div class="tab-panel hidden" id="tab-tools"><div id="toolcalls"></div></div>
+      <div class="tab-panel hidden" id="tab-log"><div class="log" id="agent-log"></div></div>
+    </div>
+
+  </section>
+
+</div>
+
+<script>
+(function(){
+  var X = function(s,r){return (r||document).querySelector(s);};
+  var chipContainers = [X('#chips')];
+
+  // Cross-function state for the wired flow (check-site → create-job → SSE dashboard).
+  var intakeState = {
+    contentType: '',     // from check-site response → sent on create-job
+    checkResult: null,   // last check-site payload (for anti-bot display)
+    job: null,           // create-job response (job_id + dashboard URLs)
+    jobId: null,
+    es: null,            // EventSource for SSE
+    poll: null,          // setInterval poll backstop
+    terminal: false,
+  };
+  function postJSON(url, formData, opts){
+    return fetch(url, {
+      method: 'POST',
+      headers: {'X-Requested-With':'XMLHttpRequest','X-CSRFToken':INTAKE_CONFIG.csrfToken},
+      body: formData,
+      signal: opts && opts.signal,
+    }).then(function(r){ return r.json().then(function(d){ d._status = r.status; return d; }); });
+  }
+
+  function icoX(){return '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>';}
+
+  var fieldsArr = [];
+  function renderFieldsAll(){
+    chipContainers.forEach(function(el){
+      if(!el) return;
+      el.innerHTML = '';
+      fieldsArr.forEach(function(name, idx){
+        var c = document.createElement('span');
+        c.className = 'chip';
+        c.dataset.name = name;
+        c.innerHTML = '<span>'+name+'</span><button aria-label="remove '+name+'">'+icoX()+'</button>';
+        c.querySelector('button').addEventListener('click', function(){ fieldsArr.splice(idx,1); renderFieldsAll(); });
+        el.appendChild(c);
+      });
+    });
+  }
+  function addChip(name){
+    name = (name||'').trim(); if(!name) return;
+    if(fieldsArr.some(function(f){ return f.toLowerCase() === name.toLowerCase(); })) return;
+    fieldsArr.push(name);
+    renderFieldsAll();
+  }
+  function clearChips(){ fieldsArr = []; renderFieldsAll(); }
+
+  var KNOWN_SITES = {
+    'books.example.com': ['product name','price','rating','availability','cover image URL','product URL']
+  };
+  function pathFromExample(){
+    var raw = X('#example-url').value.trim();
+    if(!raw) return null;
+    var c = /^https?:\/\//i.test(raw) ? raw : 'https://' + raw;
+    try { var u = new URL(c); return { path:u.pathname, query:u.search }; }
+    catch(e){ return null; }
+  }
+  function isHomepageOnly(){
+    var p = pathFromExample();
+    if(!p) return false;
+    var clean = p.path.replace(/\/+$/,'');            // strip trailing slashes
+    return clean === '' && !p.query;                  // bare domain, no path, no query
+  }
+  function showUrlError(msg){
+    var e = X('#url-error');
+    e.textContent = msg;
+    e.classList.remove('hidden');
+    X('#domain-echo').classList.add('hidden');
+    X('#fields-block').classList.add('hidden');
+    X('#example-url').classList.add('input-invalid');
+  }
+  function lookupSite(){
+    var host = hostFromExample();
+    if(!host){ X('#example-url').focus(); return; }
+    if(isHomepageOnly()){
+      showUrlError('That looks like the site\u2019s homepage. Open an actual page that shows the data \u2014 one product, listing, article, or profile \u2014 and paste that URL instead.');
+      X('#example-url').focus();
+      return;
+    }
+    X('#url-error').classList.add('hidden');
+    X('#example-url').classList.remove('input-invalid');
+    X('#detect-status').classList.remove('hidden');
+    X('#fields-block').classList.add('hidden');
+    clearChips();
+    intakeState.contentType = '';
+    intakeState.checkResult = null;
+    var fd = new FormData();
+    fd.append('url', X('#example-url').value.trim());
+    // Hard client-side cap so the spinner never spins forever on a slow/anti-bot
+    // site. The server probe is also bounded (max_steps=3); this is the UX backstop.
+    var controller = new AbortController();
+    var probeTimer = setTimeout(function(){ controller.abort(); }, 75000);
+    postJSON(INTAKE_CONFIG.checkSiteUrl, fd, {signal: controller.signal}).then(function(data){
+      clearTimeout(probeTimer);
+      X('#detect-status').classList.add('hidden');
+      if(data.error){ showUrlError(data.error); return; }
+      intakeState.contentType = data.content_type || '';
+      intakeState.checkResult = data;
+      (data.fields || []).forEach(addChip);
+      var hasFields = data.fields && data.fields.length;
+      if(data.known_site){
+        X('#fields-label').textContent = 'We already support ' + host + ' \u2014 remove any you don\u2019t need, or add more:';
+      } else if(hasFields){
+        X('#fields-label').textContent = 'We can detect these fields \u2014 remove any you don\u2019t need, or add more:';
+      } else if(data.message){
+        // Server couldn't auto-detect (anti-bot / unreachable) \u2014 show its message.
+        showUrlError(data.message);
+      } else {
+        X('#fields-label').textContent = 'New site \u2014 add the fields you want to extract:';
+      }
+      X('#field-input').placeholder = hasFields ? 'Add another field, press Enter' : 'e.g. product name, press Enter';
+      X('#fields-block').classList.remove('hidden');
+      if(!hasFields) X('#field-input').focus();
+    }).catch(function(err){
+      clearTimeout(probeTimer);
+      X('#detect-status').classList.add('hidden');
+      var msg = (err && err.name === 'AbortError')
+        ? 'Checking is taking too long (over 75s) \u2014 this site likely has anti-bot protection. You can still add fields manually below, or just run the scrape (the build handles anti-bot).'
+        : 'Could not check the site (' + err + '). You can still add fields manually below.';
+      showUrlError(msg);
+      X('#fields-block').classList.remove('hidden');
+      X('#fields-label').textContent = 'Add the fields you want to extract:';
+      X('#field-input').placeholder = 'e.g. product name, press Enter';
+      X('#field-input').focus();
+    });
+  }
+
+  X('#scan-btn').addEventListener('click', lookupSite);
+  X('#example-url').addEventListener('keydown', function(e){ if(e.key === 'Enter'){ e.preventDefault(); lookupSite(); } });
+
+  X('#field-input').addEventListener('keydown', function(e){
+    if(e.key === 'Enter' && this.value.trim()){ addChip(this.value.trim()); this.value=''; }
+  });
+
+  /* ---------- current configuration: shared schema + navigation state ---------- */
+  chipContainers.push(X('#cfg-chips'));
+  X('#cfg-field-input').addEventListener('keydown', function(e){
+    if(e.key === 'Enter' && this.value.trim()){ addChip(this.value.trim()); this.value=''; }
+  });
+
+  /* ---------- current configuration: lock/edit toggle to prevent accidental changes ---------- */
+  function setCfgEditable(editable){
+    X('#cfg-panel').classList.toggle('cfg-locked', !editable);
+    var btn = X('#cfg-edit-toggle');
+    btn.setAttribute('aria-pressed', String(editable));
+    btn.innerHTML = editable
+      ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg> Done'
+      : '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 013 3L12 15l-4 1 1-4z"/></svg> Edit';
+    X('#cfg-field-input').disabled = !editable;
+    document.querySelectorAll('input[name="cfg-nav"]').forEach(function(r){ r.disabled = !editable; });
+    ['cfg-list-text','cfg-listing-text','cfg-search-url','cfg-search-kw'].forEach(function(id){
+      var el = X('#'+id); if(el) el.readOnly = !editable;
+    });
+    var fileInput = X('#cfg-list-file'); if(fileInput) fileInput.disabled = !editable;
+  }
+  X('#cfg-edit-toggle').addEventListener('click', function(){
+    setCfgEditable(this.getAttribute('aria-pressed') !== 'true');
+  });
+  setCfgEditable(false);
+
+  function setNavMethod(method){
+    ['list','listing','search'].forEach(function(k){
+      var mainRadio = document.querySelector('input[name="nav"][value="'+k+'"]');
+      var cfgRadio = document.querySelector('input[name="cfg-nav"][value="'+k+'"]');
+      if(mainRadio) mainRadio.checked = (k === method);
+      if(cfgRadio) cfgRadio.checked = (k === method);
+      var mainCard = mainRadio && mainRadio.closest('.navcard'); if(mainCard) mainCard.classList.toggle('sel', k === method);
+      var cfgCard = cfgRadio && cfgRadio.closest('.navcard'); if(cfgCard) cfgCard.classList.toggle('sel', k === method);
+      var mainSub = X('#sub-'+k); if(mainSub) mainSub.classList.toggle('hidden', k !== method);
+      var cfgSub = X('#cfg-sub-'+k); if(cfgSub) cfgSub.classList.toggle('hidden', k !== method);
+    });
+  }
+  document.querySelectorAll('input[name=nav]').forEach(function(r){
+    r.addEventListener('change', function(){ setNavMethod(r.value); });
+  });
+  document.querySelectorAll('input[name="cfg-nav"]').forEach(function(r){
+    r.addEventListener('change', function(){ setNavMethod(r.value); });
+  });
+  function mirrorField(mainId, cfgId){
+    var a = X('#'+mainId), b = X('#'+cfgId);
+    if(!a || !b) return;
+    a.addEventListener('input', function(){ if(b.value !== a.value) b.value = a.value; });
+    b.addEventListener('input', function(){ if(a.value !== b.value) a.value = b.value; });
+  }
+  mirrorField('nav-list-text', 'cfg-list-text');
+  mirrorField('nav-listing-text', 'cfg-listing-text');
+  mirrorField('nav-search-url', 'cfg-search-url');
+  mirrorField('nav-search-kw', 'cfg-search-kw');
+
+  var listFileState = null; // { name, lines } — attached file for "exact list", kept separate from typed text
+  var listFileStatusEls = [X('#nav-list-status'), X('#cfg-list-status')];
+  function icoFileSm(){return '<svg class="fc-ico" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/></svg>';}
+  function renderListFileChip(){
+    listFileStatusEls.forEach(function(el){
+      if(!el) return;
+      if(listFileState){
+        el.innerHTML = '<span class="file-chip"><span class="fc-ico">'+icoFileSm()+'</span><span class="fc-name" title="'+listFileState.name+'">'+listFileState.name+'</span><button class="fc-del" type="button" aria-label="remove attached file">'+icoX()+'</button></span>';
+        el.querySelector('.fc-del').addEventListener('click', function(){ listFileState = null; renderListFileChip(); });
+      } else {
+        el.innerHTML = '<span class="hint" style="margin:0">CSV or TXT — one URL per line</span>';
+      }
+    });
+  }
+  function wireFileAttach(fileInputId){
+    var fi = X('#'+fileInputId);
+    if(!fi) return;
+    fi.addEventListener('change', function(){
+      var f = this.files && this.files[0];
+      this.value = '';
+      if(!f) return;
+      var reader = new FileReader();
+      reader.onload = function(){
+        var text = String(reader.result || '');
+        var lines = text.split(/\r?\n/).map(function(s){ return s.trim(); }).filter(Boolean);
+        listFileState = { name: f.name, lines: lines };
+        renderListFileChip();
+      };
+      reader.readAsText(f);
+    });
+  }
+  wireFileAttach('nav-list-file');
+  wireFileAttach('cfg-list-file');
+
+  var SCOPE_CFG = {
+    firstn: { ph:'Number of records, e.g. 500', hint:'We\u2019ll stop once we\u2019ve collected this many.', mode:'numeric', label:'how many records' },
+    filter: { ph:'Describe it in plain words, e.g. rating 4 and up, in stock only', hint:'Plain language is fine — we\u2019ll match records against it.', mode:'text', label:'which records to keep' }
+  };
+  document.querySelectorAll('input[name=scope]').forEach(function(r){
+    r.addEventListener('change', function(){
+      document.querySelectorAll('#scope-row .navcard').forEach(function(c){c.classList.remove('sel');});
+      r.closest('.navcard').classList.add('sel');
+      var inp = X('#scope-input'), hint = X('#scope-hint'), cfg = SCOPE_CFG[r.value];
+      if(cfg){
+        inp.value = '';
+        inp.placeholder = cfg.ph;
+        inp.setAttribute('inputmode', cfg.mode);
+        inp.setAttribute('aria-label', cfg.label);
+        inp.classList.remove('hidden');
+        hint.textContent = cfg.hint;
+        hint.classList.remove('hidden');
+        inp.focus();
+      } else {
+        inp.classList.add('hidden');
+        hint.classList.add('hidden');
+      }
+    });
+  });
+
+  function hostFromExample(){
+    var raw = X('#example-url').value.trim();
+    if(!raw) return '';
+    var candidate = /^https?:\/\//i.test(raw) ? raw : 'https://' + raw;
+    try { return new URL(candidate).hostname.replace(/^www\./,''); }
+    catch(e){ return ''; }
+  }
+  function icoCheckSm(){return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';}
+  X('#example-url').addEventListener('input', function(){
+    X('#url-error').classList.add('hidden');
+    this.classList.remove('input-invalid');
+    var host = hostFromExample();
+    var echo = X('#domain-echo');
+    if(host){
+      echo.innerHTML = '<span class="de-ok">'+icoCheckSm()+'</span> Site detected: ' + host;
+      echo.classList.remove('hidden');
+    } else {
+      echo.classList.add('hidden');
+    }
+  });
+
+  var HEADER_TITLES = { 'form-screen':'Set up your extraction', 'sample-screen':'Extract' };
+  function show(id){
+    ['form-screen','sample-screen'].forEach(function(s){
+      X('#'+s).classList.toggle('hidden', s !== id);
+    });
+    X('#header-title').textContent = HEADER_TITLES[id] || 'Extract';
+    window.scrollTo({top:0, behavior:'smooth'});
+  }
+  function stepState(active){
+    X('#st1').className = 'step ' + (active===1?'on':'done');
+    X('#st2').className = 'step ' + (active===2?'on':'');
+  }
+
+  /* ---------- icons ---------- */
+  function icoChevR(){return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>';}
+  function icoDlSm(){return '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>';}
+
+  /* ---------- generated artifacts (representative) ---------- */
+  var SCRAPER_CODE = [
+    'import requests',
+    'from bs4 import BeautifulSoup',
+    '',
+    'BASE = "https://books.example.com"',
+    '',
+    'def parse_record(html):',
+    '    soup = BeautifulSoup(html, "html.parser")',
+    '    return {',
+    '        "title":    soup.select_one("h1.job-title").get_text(strip=True),',
+    '        "company":  soup.select_one(".company").get_text(strip=True),',
+    '        "location": soup.select_one(".location").get_text(strip=True),',
+    '        "description": soup.select_one(".job-desc").get_text(" ", strip=True),',
+    '    }',
+    '',
+    'def crawl(listing_url):',
+    '    results, page = [], listing_url',
+    '    while page:',
+    '        r = requests.get(page, timeout=30)',
+    '        soup = BeautifulSoup(r.text, "html.parser")',
+    '        for a in soup.select("a.job-link"):',
+    '            jr = requests.get(a["href"], timeout=30)',
+    '            rec = parse_record(jr.text)',
+    '            rec["http_status"] = jr.status_code',
+    '            results.append(rec)',
+    '        nxt = soup.select_one("a.next")',
+    '        page = nxt["href"] if nxt else None',
+    '    return results',
+    '',
+    'if __name__ == "__main__":',
+    '    import json',
+    '    print(json.dumps(crawl(f"{BASE}/jobs"), indent=2))'
+  ].join('\n');
+
+  var DAGSTER_CODE = [
+    'from dagster import asset, Definitions, ScheduleDefinition, define_asset_job',
+    'import scraper',
+    '',
+    '@asset(group_name="extract")',
+    'def raw_records(context):',
+    '    data = scraper.crawl("https://books.example.com/jobs")',
+    '    context.log.info(f"scraped {len(data)} records")',
+    '    return data',
+    '',
+    'extract_job = define_asset_job("extract_job", selection=["raw_records"])',
+    '',
+    'daily = ScheduleDefinition(job=extract_job, cron_schedule="0 6 * * *")',
+    '',
+    'defs = Definitions(',
+    '    assets=[raw_records],',
+    '    jobs=[extract_job],',
+    '    schedules=[daily],',
+    ')'
+  ].join('\n');
+
+  var SAMPLE_JSON = JSON.stringify([
+    { title:"Senior Frontend Engineer", company:"Northwind Labs", location:"Remote (EU)", description:"Own our design system and component library across web apps.", http_status:200 },
+    { title:"Data Platform Engineer", company:"Cobalt Analytics", location:"Berlin, DE", description:"Build and operate ingestion pipelines on Dagster and dbt.", http_status:200 },
+    { title:"Product Designer", company:"Fern & Oak", location:"London, UK (hybrid)", description:"Shape end-to-end product flows for our marketplace.", http_status:200 },
+    { title:"Backend Engineer, Payments", company:"Northwind Labs", location:"Remote (Global)", description:"Design resilient payment services and reconciliation jobs.", http_status:200 }
+  ], null, 2);
+
+  var PIPELINE = [
+    {n:'Accessibility Check', t:'09:36:36 – 09:36:55', d:'19s'},
+    {n:'Site Analysis', t:'09:36:55 – 09:39:45', d:'2m 50s'},
+    {n:'Navigation Explore', t:'09:39:45 – 09:47:05', d:'7m 20s'},
+    {n:'Navigation Synthesis', t:'09:47:05 – 09:48:53', d:'1m 48s'},
+    {n:'Navigation Skill Review', t:'03:09:39 – 03:12:15', d:'2m 36s'},
+    {n:'Product Analysis', t:'09:48:53 – 09:51:49', d:'2m 56s'},
+    {n:'Scraper Analysis', t:'09:52:02 – 09:53:31', d:'1m 29s'},
+    {n:'Code Generation', t:'09:53:51 – 10:24:54', d:'31m 3s'},
+    {n:'Testing', t:'10:20:11 – 10:32:18', d:'12m 6s', retry:'retry cycle 1'},
+    {n:'Field Confirmation', t:'05:23:18', d:''},
+    {n:'Execution', t:'03:23:18', d:''},
+    {n:'Cleanup', t:'02:49:02 – 03:09:39', d:'20m 37s'},
+    {n:'Skill Learning', t:'03:12:15 – 03:14:08', d:'1m 53s'},
+    {n:'code_review', t:'10:04:24 – 10:29:48', d:'25m 24s'}
+  ];
+  var TOOLCALLS = [
+    {phase:'Site-Analyzer', calls:[
+      {name:'fetch_robots()', res:'200 OK · /jobs allowed · 14 rules parsed'},
+      {name:'detect_platform()', res:'WordPress + WP Job Manager + Elementor'},
+      {name:'probe_render()', res:'server-rendered HTML · no JS execution needed'} ]},
+    {phase:'Product-Analyzer', calls:[
+      {name:'sample_listing(page=1)', res:'42 job cards detected'},
+      {name:'infer_fields()', res:'title, company, location, description, posted_date'} ]},
+    {phase:'Code-Writer', calls:[
+      {name:'generate_scraper()', res:'scraper.py · 31 lines · method=http_requests'},
+      {name:'generate_dagster()', res:'dagster_asset.py · 18 lines'} ]},
+    {phase:'Code-Tester', calls:[
+      {name:'run_scraper(--limit 10)', res:'retry 1 → 10/10 rows extracted OK'},
+      {name:'validate_schema()', res:'all required fields present'} ]},
+    {phase:'Cleanup', calls:[
+      {name:'dedupe()', res:'0 duplicates removed'},
+      {name:'normalize_fields()', res:'trimmed whitespace · cast http_status → int'} ]}
+  ];
+  var LOG = [
+    {t:'09:36:36', l:'info', m:'Accessibility check passed (robots.txt allows /jobs)'},
+    {t:'09:36:55', l:'info', m:'Platform detected: WordPress + WP Job Manager + Elementor'},
+    {t:'09:39:45', l:'info', m:'Navigation resolved: listing → detail, pagination via ?paged='},
+    {t:'09:48:53', l:'ok',   m:'Field schema confirmed (5 fields)'},
+    {t:'09:53:51', l:'info', m:'Scraper generated → scraper.py'},
+    {t:'10:20:11', l:'warn', m:'Test cycle 1: selector .company flaky → retried with fallback'},
+    {t:'10:32:18', l:'ok',   m:'Test passed: 10/10 sample rows valid'},
+    {t:'03:23:18', l:'ok',   m:'Execution complete · 3,512 records'},
+    {t:'03:14:08', l:'info', m:'Skill learned and cached for this site'}
+  ];
+  var RUNS = [
+    {id:'#231', when:'Jul 21, 2026 · 09:36', rows:'3,512', dur:'4m 12s'},
+    {id:'#212', when:'Jul 14, 2026 · 09:36', rows:'3,488', dur:'4m 02s'},
+    {id:'#198', when:'Jul 07, 2026 · 09:36', rows:'3,401', dur:'3m 58s'}
+  ];
+
+  /* ---------- advanced renders ---------- */
+  var NAV_LABEL = {list:'exact list of URLs', listing:'listing → detail', search:'search + keywords'};
+  function navText(){ var v=(document.querySelector('input[name=nav]:checked')||{}).value; return v ? NAV_LABEL[v] : 'listing → detail'; }
+  function renderPipeline(){
+    X('#pipeline').innerHTML = PIPELINE.map(function(s){
+      return '<div class="pipe-step"><span class="pipe-ico">'+icoCheckSm()+'</span>'+
+        '<span class="pipe-name">'+s.n+(s.retry?'<span class="retry">'+s.retry+'</span>':'')+'</span>'+
+        '<span class="pipe-status">DONE</span>'+
+        '<span class="pipe-time">'+s.t+'</span>'+
+        '<span class="pipe-dur">'+(s.d||'')+'</span></div>';
+    }).join('');
+  }
+  function renderDetails(host){
+    var rows = [
+      ['Target platform','WordPress + WP Job Manager + Elementor'],
+      ['Method','http_requests'],
+      ['Records extracted','3,512'],
+      ['Execution mode','Full'],
+      ['Started','Jul 21, 2026 · 09:36:36'],
+      ['Finished','Jul 21, 2026 · 09:40:48'],
+      ['Source','https://'+host]
+    ];
+    X('#details-kv').innerHTML = rows.map(function(r){ return '<div class="kv"><span class="kk">'+r[0]+'</span><span class="kv-v">'+r[1]+'</span></div>'; }).join('');
+  }
+  function renderTools(){
+    X('#toolcalls').innerHTML = TOOLCALLS.map(function(g){
+      var calls = g.calls.map(function(c){ return '<div class="tool-call"><span class="tc-name">'+c.name+'</span><span class="tc-res">'+c.res+'</span></div>'; }).join('');
+      return '<details class="tool-group"><summary><span class="tg-chev">'+icoChevR()+'</span>'+g.phase+'<span class="cnt">'+g.calls.length+' calls</span></summary>'+calls+'</details>';
+    }).join('');
+  }
+  function renderLog(){
+    X('#agent-log').innerHTML = LOG.map(function(l){ return '<div class="log-line"><span class="log-time">'+l.t+'</span><span class="log-lvl '+l.l+'">'+l.l.toUpperCase()+'</span><span class="log-msg">'+l.m+'</span></div>'; }).join('');
+  }
+  function renderRuns(){
+    X('#runs-body').innerHTML = RUNS.map(function(r){
+      return '<tr><td class="rmono">'+r.id+'</td><td>'+r.when+'</td><td><span class="run-status-ok">COMPLETED</span></td><td class="rmono">'+r.rows+'</td><td class="rmono">'+r.dur+'</td>'+
+        '<td><button class="mini-btn" data-dl="scraper" type="button" aria-label="Download scraper for run '+r.id+'" title="Download scraper.py">'+icoDlSm()+'</button></td>'+
+        '<td><button class="mini-btn" data-dl="output" type="button" aria-label="Download output for run '+r.id+'" title="Download output.json">'+icoDlSm()+'</button></td></tr>';
+    }).join('');
+  }
+
+  /* ---------- downloads ---------- */
+  function download(name, text, mime){
+    var b = new Blob([text], {type:mime||'text/plain'});
+    var u = URL.createObjectURL(b);
+    var a = document.createElement('a'); a.href=u; a.download=name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function(){ URL.revokeObjectURL(u); }, 800);
+  }
+  function fetchDownload(url, filename){
+    if(!url) return;
+    fetch(url).then(function(r){ return r.text(); }).then(function(txt){ download(filename, txt); }).catch(function(){ /* not ready yet */ });
+  }
+  function currentSampleJson(){ return X('#sample-json-view').textContent || '[]'; }
+  // Output download: prefer the real output file (all records); fall back to the
+  // (possibly truncated) preview shown in the card.
+  function downloadOutput(){
+    if(intakeState.output_download_url){ fetchDownload(intakeState.output_download_url, 'output.json'); }
+    else { download('output.json', currentSampleJson(), 'application/json'); }
+  }
+  X('#dl-output').addEventListener('click', downloadOutput);
+  X('#dl-scraper').addEventListener('click', function(){ fetchDownload(intakeState.job && intakeState.job.scraper_code_url, 'scraper.py'); });
+  X('#dl-scraper-2').addEventListener('click', function(){ fetchDownload(intakeState.job && intakeState.job.scraper_code_url, 'scraper.py'); });
+  X('#dl-dagster').addEventListener('click', function(){ fetchDownload(intakeState.job && intakeState.job.dagster_code_url, 'dagster_asset.py'); });
+  X('#dl-json').addEventListener('click', downloadOutput);
+  X('#runs-body').addEventListener('click', function(e){
+    var b = e.target.closest('[data-dl]'); if(!b) return;
+    if(b.dataset.dl === 'scraper') fetchDownload(intakeState.job && intakeState.job.scraper_code_url, 'scraper.py');
+    else downloadOutput();
+  });
+
+  /* ---------- tabs + advanced toggle ---------- */
+  X('#adv-tabs').addEventListener('click', function(e){
+    var b = e.target.closest('.tab'); if(!b) return;
+    this.querySelectorAll('.tab').forEach(function(t){ t.classList.remove('on'); }); b.classList.add('on');
+    ['pipeline','details','scraper','dagster','output','tools','log'].forEach(function(k){
+      X('#tab-'+k).classList.toggle('hidden', k !== b.dataset.tab);
+    });
+  });
+  X('#adv-toggle').addEventListener('click', function(){
+    var open = this.getAttribute('aria-expanded') === 'true';
+    this.setAttribute('aria-expanded', String(!open));
+    X('#adv-section').classList.toggle('hidden', open);
+    if(!open) X('#adv-section').scrollIntoView({behavior:'smooth', block:'nearest'});
+  });
+
+  /* ---------- assemble results ---------- */
+  function renderResults(){
+    var host = hostFromExample() || 'the site';
+    var url = X('#example-url').value.trim() || host;
+    X('#site-echo').textContent = host;
+    X('#stat-nav').textContent = navText();
+    X('#job-url').textContent = url;
+    X('#job-url').href = /^https?:\/\//i.test(url) ? url : ('https://' + url);
+    X('#job-when').textContent = new Date().toLocaleDateString(undefined, {month:'short', day:'numeric', year:'numeric'});
+    // Empty states — the pipeline / details / tools / log / runs are populated
+    // from the live job API by refreshJobData() once the build runs. (Do NOT
+    // seed mock data here — it would flash bogus content and fake run history.)
+    X('#pipeline').innerHTML = '';
+    X('#details-kv').innerHTML = '';
+    X('#toolcalls').innerHTML = '';
+    X('#agent-log').innerHTML = '';
+    X('#runs-body').innerHTML = '';
+    X('#scraper-code').textContent = '';
+    X('#dagster-code').textContent = '';
+  }
+
+  /* ---------- re-run toggle in hero ---------- */
+  X('#rerun-toggle').addEventListener('click', function(){
+    var open = this.getAttribute('aria-expanded') === 'true';
+    this.setAttribute('aria-expanded', String(!open));
+    X('#rerun-box').classList.toggle('hidden', open);
+    if(!open){ X('#rerun-box').scrollIntoView({behavior:'smooth', block:'nearest'}); X('#rerun-prompt').focus(); }
+  });
+  X('#rerun-prompt').addEventListener('input', function(){
+    var has = this.value.trim().length > 0;
+    X('#rerun-btn-label').textContent = has ? 'Re-run with these changes' : 'Re-run as-is';
+    X('#rerun-hint').textContent = has
+      ? 'Regenerates the scraper using your notes, then re-runs the sample.'
+      : 'No notes yet — this will re-run using the schema and navigation you\u2019ve set below.';
+  });
+
+  /* ---------- in-progress state (job status pill + gated buttons + cancel) ---------- */
+  function icoSpinSm(){return '<svg class="spin-ico" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>';}
+  function icoCancelSm(){return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>';}
+  var GATED_BTNS = ['dl-output','dl-scraper','run-full','rerun-btn'];
+  var runTimer = null;
+  var runSnapshot = null;
+
+  function setRunning(isRunning){
+    var pill = X('#job-status');
+    GATED_BTNS.forEach(function(id){ var b = X('#'+id); if(b) b.disabled = isRunning; });
+    X('#cancel-run-btn').classList.toggle('hidden', !isRunning);
+    if(isRunning){
+      pill.className = 'pill pill-running';
+      pill.innerHTML = icoSpinSm() + ' IN PROGRESS';
+      X('#job-time').textContent = '—';
+      X('#job-records').textContent = '—';
+      X('#output-loading').classList.remove('hidden');
+      X('#output-content').classList.add('hidden');
+      X('#json-expand-toggle').classList.add('hidden');
+    } else {
+      pill.className = 'pill pill-ok';
+      pill.innerHTML = icoCheckSm() + ' COMPLETED';
+      X('#job-time').textContent = intakeState.timeStr || '—';
+      X('#job-records').textContent = intakeState.recordsStr || '—';
+      X('#output-loading').classList.add('hidden');
+      X('#output-content').classList.remove('hidden');
+      X('#sample-json-view').classList.remove('expanded');
+      X('#json-expand-toggle').textContent = 'Expand';
+      X('#json-expand-toggle').classList.remove('hidden');
+    }
+  }
+  X('#json-expand-toggle').addEventListener('click', function(){
+    var view = X('#sample-json-view');
+    var expanded = view.classList.toggle('expanded');
+    this.textContent = expanded ? 'Collapse' : 'Expand';
+  });
+
+  function cancelRun(){
+    if(intakeState.es){ try{ intakeState.es.close(); }catch(_){} intakeState.es = null; }
+    if(intakeState.poll){ clearInterval(intakeState.poll); intakeState.poll = null; }
+    if(intakeState.job && intakeState.job.cancel_url){
+      var fd = new FormData();
+      postJSON(intakeState.job.cancel_url, fd).catch(function(){});
+    }
+    GATED_BTNS.forEach(function(id){ var b = X('#'+id); if(b) b.disabled = false; });
+    X('#cancel-run-btn').classList.add('hidden');
+    var pill = X('#job-status');
+    pill.className = 'pill pill-cancelled';
+    pill.innerHTML = icoCancelSm() + ' CANCELLED';
+    X('#job-time').textContent = X('#job-time').textContent || '—';
+    X('#job-records').textContent = X('#job-records').textContent || '—';
+    X('#output-loading').classList.add('hidden');
+    X('#output-content').classList.add('hidden');
+    X('#json-expand-toggle').classList.add('hidden');
+    intakeState.terminal = true;
+  }
+  X('#cancel-run-btn').addEventListener('click', cancelRun);
+
+  /* ---------- live dashboard: SSE (job_events) + job_api polling ---------- */
+  var PHASE_TO_LABEL = {
+    accessibility_check:'Accessibility Check', site_analysis:'Site Analysis',
+    browser_traverse:'Browser Navigation', navigation_skill_review:'Navigation Skill Review',
+    navigation_analysis:'Navigation Analysis', content_analysis:'Content Analysis',
+    product_analysis:'Product Analysis', scraper_analysis:'Scraper Analysis',
+    code_generation:'Code Generation', code_review:'Code Review', testing:'Testing',
+    field_confirmation:'Field Confirmation', execution:'Execution', cleanup:'Cleanup',
+    skill_learning:'Skill Learning', dagster_converter:'Dagster Conversion',
+    store_job_listings:'Store Listings'
+  };
+  var TERMINAL = ['completed','failed','cancelled','captcha_blocked','akamai_blocked'];
+  function escHtml(s){ return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];}); }
+  function fmtDur(sec){ sec=Number(sec)||0; if(sec<60) return sec.toFixed(0)+'s'; if(sec<3600) return (sec/60).toFixed(0)+'m '+(sec%60).toFixed(0)+'s'; return (sec/3600).toFixed(0)+'h '+((sec%3600)/60).toFixed(0)+'m'; }
+  function updateJobStatus(status){
+    var pill = X('#job-status');
+    var isTerminal = TERMINAL.indexOf(status)>=0;
+    var icon = status==='completed' ? icoCheckSm() : (isTerminal ? icoCancelSm() : icoSpinSm());
+    var cls = 'pill pill-running', lbl=(status||'').toUpperCase().replace(/_/g,' ');
+    if(status==='completed'){cls='pill pill-ok'; lbl='COMPLETED';}
+    else if(status==='failed'||status==='cancelled'){cls='pill pill-cancelled'; lbl=lbl||'CANCELLED';}
+    else if(status==='captcha_blocked'||status==='akamai_blocked'){cls='pill pill-cancelled'; lbl=lbl;}
+    else if(status==='pending'){cls='pill'; lbl='PENDING';}
+    pill.className=cls; pill.innerHTML=icon+' '+lbl;
+    if(isTerminal){
+      intakeState.terminal=true;
+      GATED_BTNS.forEach(function(id){ var b=X('#'+id); if(b) b.disabled=false; });
+      X('#cancel-run-btn').classList.add('hidden');
+      // A terminal status can arrive via an SSE 'status' event (not just 'done'),
+      // which calls updateJobStatus but not the output-panel transition in
+      // refreshJobData — and the poll loop stops on terminal. Trigger a refresh
+      // here so the output panel (loading spinner / sample / code) always
+      // reflects the final state, whichever event delivered it.
+      if(intakeState.job){ refreshJobData(intakeState.job.api_url, intakeState.job.tool_calls_url); }
+    }
+  }
+  function refreshJobData(apiUrl, toolCallsUrl){
+    if(!apiUrl) return;
+    fetch(apiUrl).then(function(r){ return r.json(); }).then(function(j){
+      updateJobStatus(j.status);
+      if(j.url){ X('#job-url').textContent = j.url; X('#job-url').href = j.url; }
+      // Populate the Current Configuration panel once (fields + nav method) —
+      // essential on a deep-link (?job=N) where there was no form interaction.
+      if(!intakeState.cfgPopulated){
+        if(j.target_fields && j.target_fields.length){
+          clearChips();
+          j.target_fields.forEach(function(f){ addChip(f); });
+        }
+        var navmap={url_list:'list', list_page:'listing', navigation:'listing', search_term:'search'};
+        var m=navmap[j.input_mode];
+        if(m){ setNavMethod(m); }
+        if(j.search_criteria && m==='listing'){ var el=X('#cfg-listing-text'); if(el && !el.value.trim()) el.value=j.search_criteria; }
+        if(j.search_criteria && m==='search'){ var el=X('#cfg-search-kw'); if(el && !el.value.trim()) el.value=j.search_criteria; }
+        intakeState.cfgPopulated=true;
+      }
+      if(j.started_at && j.completed_at){
+        intakeState.timeStr = fmtDur((new Date(j.completed_at)-new Date(j.started_at))/1000);
+        X('#job-time').textContent = intakeState.timeStr;
+      }
+      intakeState.recordsStr = (j.product_count!=null && j.product_count!==undefined)? String(j.product_count) : '—';
+      X('#job-records').textContent = intakeState.recordsStr;
+      // Details tab — key facts from the job (always render, not just terminal)
+      var det = [];
+      if(j.site_name) det.push(['Site', j.site_name]);
+      if(j.platform) det.push(['Platform', j.platform]);
+      det.push(['Status', (j.status||'').replace(/_/g,' ')]);
+      det.push(['Records', intakeState.recordsStr]);
+      if(j.full_extraction!=null) det.push(['Mode', j.full_extraction?'Full':'Sample']);
+      if(j.started_at) det.push(['Started', new Date(j.started_at).toLocaleString()]);
+      if(j.completed_at) det.push(['Finished', new Date(j.completed_at).toLocaleString()]);
+      if(j.url) det.push(['Source', j.url]);
+      if(j.error_message) det.push(['Error', j.error_message]);
+      X('#details-kv').innerHTML = det.map(function(r){ return '<div class="kv"><span class="kk">'+escHtml(r[0])+'</span><span class="kv-v">'+escHtml(String(r[1]))+'</span></div>'; }).join('');
+      if(!X('#runs-body').innerHTML.trim()){
+        X('#runs-body').innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--faint);padding:14px;font-family:var(--sans)">No previous runs</td></tr>';
+      }
+      if(j.steps && j.steps.length){
+        X('#pipeline').innerHTML = j.steps.map(function(s){
+          var ico = s.status==='done'?icoCheckSm():s.status==='running'?icoSpinSm():s.status==='failed'?icoCancelSm():icoCheckSm();
+          var dur = (s.started_at&&s.completed_at)? fmtDur((new Date(s.completed_at)-new Date(s.started_at))/1000) : '';
+          return '<div class="pipe-step"><span class="pipe-ico">'+ico+'</span><span class="pipe-name">'+(PHASE_TO_LABEL[s.phase]||s.phase)+'</span><span class="pipe-status">'+(s.status||'').toUpperCase().slice(0,4)+'</span><span class="pipe-time">'+dur+'</span></div>';
+        }).join('');
+      }
+      if(j.logs && j.logs.length){
+        X('#agent-log').innerHTML = j.logs.slice(-200).map(function(l){
+          var lvl = (l.role==='assistant')?'ok':'info';
+          var t = (l.created_at||'').slice(11,19);
+          var who = l.agent?('['+l.agent+'] '):'';
+          return '<div class="log-line"><span class="log-time">'+t+'</span><span class="log-lvl '+lvl+'">'+(l.role||'').toUpperCase().slice(0,5)+'</span><span class="log-msg">'+escHtml(who+(l.content||''))+'</span></div>';
+        }).join('');
+        X('#agent-log').scrollTop = X('#agent-log').scrollHeight;
+      }
+      // Real extracted output — show as soon as it exists (even mid-run, e.g.
+      // right after testing/execution writes output_*.json), not only on terminal.
+      if(j.output_preview){
+        var op=j.output_preview;
+        X('#output-loading').classList.add('hidden');
+        X('#output-content').classList.remove('hidden');
+        X('#json-expand-toggle').classList.remove('hidden');
+        var note = op.count>3 ? ('first 3 of '+op.count+' '+op.item_label+(op.count===1?'':'s')+' — download for all') : '';
+        var pv={}; pv[op.output_key]=op.records; pv._count=op.count; if(note) pv._note=note;
+        var pretty=JSON.stringify(pv,null,2);
+        X('#sample-json-view').textContent=pretty;
+        X('#json-out').textContent=pretty;
+        intakeState.output_download_url=op.download_url;
+      }
+      if(TERMINAL.indexOf(j.status)>=0){
+        X('#output-loading').classList.add('hidden');
+        X('#output-content').classList.remove('hidden');
+        if(j.status==='completed'){
+          // Only a completed job has generated code. (Output is already shown
+          // above via j.output_preview if it exists.)
+          if(intakeState.job && intakeState.job.scraper_code_url){
+            fetch(intakeState.job.scraper_code_url).then(function(r){return r.text();}).then(function(t){ X('#scraper-code').textContent=t; }).catch(function(){});
+          }
+          if(intakeState.job && intakeState.job.dagster_code_url){
+            fetch(intakeState.job.dagster_code_url).then(function(r){return r.text();}).then(function(t){ X('#dagster-code').textContent=t; }).catch(function(){});
+          }
+          if(!j.output_preview){
+            X('#sample-json-view').textContent='{"status":"completed","records":'+(j.product_count||0)+',"note":"No output file found."}';
+            X('#json-out').textContent=X('#sample-json-view').textContent;
+          }
+        } else if(!j.output_preview){
+          // Failed / cancelled / blocked with no output.
+          X('#sample-json-view').textContent='{"status":"'+j.status+'","note":"Job did not complete — no output generated."}';
+          X('#json-out').textContent=X('#sample-json-view').textContent;
+        }
+      }
+      if(intakeState.terminal && intakeState.poll){ clearInterval(intakeState.poll); intakeState.poll=null; }
+    }).catch(function(){ /* transient fetch error */ });
+    if(toolCallsUrl){
+      fetch(toolCallsUrl).then(function(r){ return r.json(); }).then(function(d){
+        if(!d.tool_calls || !d.tool_calls.length) return;
+        var groups = {};
+        d.tool_calls.forEach(function(tc){ var a=tc.agent||'system'; (groups[a]=groups[a]||[]).push(tc); });
+        X('#toolcalls').innerHTML = Object.keys(groups).map(function(ag){
+          var calls = groups[ag].map(function(c){ return '<div class="tool-call"><span class="tc-name">'+escHtml(c.tool_name)+'</span><span class="tc-res">'+escHtml((c.args_summary||'').slice(0,200))+'</span></div>'; }).join('');
+          return '<details class="tool-group"><summary><span class="tg-chev">'+icoChevR()+'</span>'+escHtml(ag)+'<span class="cnt">'+groups[ag].length+' calls</span></summary>'+calls+'</details>';
+        }).join('');
+      }).catch(function(){});
+    }
+  }
+  function subscribeToJob(data){
+    if(intakeState.es){ try{ intakeState.es.close(); }catch(_){} }
+    if(intakeState.poll){ clearInterval(intakeState.poll); intakeState.poll=null; }
+    intakeState.terminal = false;
+    var es = new EventSource(data.events_url);
+    intakeState.es = es;
+    es.addEventListener('status', function(e){ try{ updateJobStatus(JSON.parse(e.data).status); }catch(_){} });
+    es.addEventListener('logs', function(){ refreshJobData(data.api_url, data.tool_calls_url); });
+    es.addEventListener('done', function(e){ try{ updateJobStatus(JSON.parse(e.data).status); }catch(_){} try{es.close();}catch(_){} refreshJobData(data.api_url, data.tool_calls_url); });
+    es.addEventListener('message', function(e){
+      try{ var m=JSON.parse(e.data);
+        if(m.type==='status') updateJobStatus(m.status);
+        else if(m.type==='logs') refreshJobData(data.api_url, data.tool_calls_url);
+        else if(m.type==='done'){ updateJobStatus(m.status); try{es.close();}catch(_){} refreshJobData(data.api_url, data.tool_calls_url); }
+      }catch(_){}
+    });
+    es.onerror = function(){ refreshJobData(data.api_url, data.tool_calls_url); };
+    intakeState.poll = setInterval(function(){ refreshJobData(data.api_url, data.tool_calls_url); if(intakeState.terminal){ clearInterval(intakeState.poll); intakeState.poll=null; } }, 4000);
+    refreshJobData(data.api_url, data.tool_calls_url);
+  }
+
+  /* ---------- build/run flow ---------- */
+  function runBuild(){
+    var url = X('#example-url').value.trim();
+    if(!url){ showUrlError('Enter a sample page URL first.'); X('#example-url').focus(); return; }
+    var navMethod = (document.querySelector('input[name=nav]:checked')||{}).value || 'list';
+    var scope = (document.querySelector('input[name=scope]:checked')||{}).value || 'all';
+    var fd = new FormData();
+    fd.append('url', url);
+    fd.append('nav_method', navMethod);
+    fd.append('content_type', intakeState.contentType || '');
+    fd.append('target_fields', fieldsArr.join(','));
+    fd.append('scope', scope);
+    fd.append('scope_value', X('#scope-input').value.trim());
+    fd.append('notes', X('#notes').value.trim());
+    if(navMethod==='list'){ fd.append('list_urls', X('#nav-list-text').value); }
+    else if(navMethod==='listing'){ fd.append('listing_urls', X('#nav-listing-text').value); }
+    else if(navMethod==='search'){ fd.append('search_keywords', X('#nav-search-kw').value); }
+    var btn = X('#run-sample'); btn.disabled = true;
+    postJSON(INTAKE_CONFIG.createJobUrl, fd).then(function(data){
+      btn.disabled = false;
+      if(data.error){ showUrlError(data.error); return; }
+      intakeState.job = data; intakeState.jobId = data.job_id; intakeState.terminal = false;
+      intakeState.timeStr = '—'; intakeState.recordsStr = '—';
+      X('#rerun-box').classList.add('hidden'); X('#rerun-toggle').setAttribute('aria-expanded','false');
+      renderResults();
+      X('#job-title').textContent = 'Job #' + data.job_id;
+      show('sample-screen'); stepState(2);
+      setRunning(true);
+      subscribeToJob(data);
+    }).catch(function(err){ btn.disabled = false; showUrlError('Could not start the job (' + err + ').'); });
+  }
+  X('#run-sample').addEventListener('click', runBuild);
+  X('#rerun-btn').addEventListener('click', function(){
+    if(!intakeState.job || !intakeState.job.restart_url){ runBuild(); return; }
+    var prompt = X('#rerun-prompt').value.trim();
+    var fd = new FormData();
+    if(prompt) fd.append('prompt', prompt);
+    postJSON(intakeState.job.restart_url, fd).then(function(data){
+      if(data.error){ X('#rerun-hint').textContent = data.error; return; }
+      Object.keys(data).forEach(function(k){ intakeState.job[k]=data[k]; });
+      intakeState.jobId = data.job_id; intakeState.terminal = false;
+      X('#job-title').textContent = 'Job #' + data.job_id;
+      X('#rerun-box').classList.add('hidden'); X('#rerun-toggle').setAttribute('aria-expanded','false');
+      setRunning(true);
+      subscribeToJob(data);
+    }).catch(function(err){ X('#rerun-hint').textContent = 'Re-run failed (' + err + ').'; });
+  });
+
+  /* ---------- deploy: export Dagster asset (full deploy is a future enhancement) ---------- */
+  X('#run-full').addEventListener('click', function(){
+    if(intakeState.job && intakeState.job.dagster_code_url){
+      fetchDownload(intakeState.job.dagster_code_url, 'dagster_asset.py');
+    } else {
+      X('#rerun-hint').textContent = 'Dagster code is generated after the build completes.';
+    }
+  });
+
+  X('#restart').addEventListener('click', function(){
+    listFileState = null; renderListFileChip();
+    X('#rerun-box').classList.add('hidden');
+    X('#rerun-toggle').setAttribute('aria-expanded','false');
+    show('form-screen'); stepState(1);
+  });
+
+  /* ---------- deep link: /intake/?job=N opens the dashboard for an existing job ---------- */
+  (function(){
+    var m = /(?:\?|&)job=(\d+)/.exec(location.search);
+    if(!m) return;
+    var jid = m[1], n = parseInt(jid, 10);
+    var data = {
+      job_id: n,
+      events_url: '/jobs/'+jid+'/events/',
+      api_url: '/jobs/'+jid+'/api/',
+      tool_calls_url: '/jobs/'+jid+'/tool-calls/',
+      scraper_code_url: '/jobs/'+jid+'/scraper-code/',
+      dagster_code_url: '/jobs/'+jid+'/dagster-code/',
+      cancel_url: '/jobs/'+jid+'/cancel/',
+      restart_url: '/jobs/'+jid+'/restart/',
+    };
+    intakeState.job = data; intakeState.jobId = n;
+    X('#job-title').textContent = 'Job #'+jid;
+    show('sample-screen'); stepState(2);
+    setRunning(true);
+    subscribeToJob(data);
+  })();
+})();
+</script>
+</body>
+</html>

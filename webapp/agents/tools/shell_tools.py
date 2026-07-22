@@ -179,7 +179,24 @@ def get_shell_tools(
                 list.  Some LLM providers emit ``extra_args`` instead of ``cli_args``.
         """
         full_path = scraper_path if os.path.isabs(scraper_path) else os.path.join(cwd, scraper_path)
-        needs_browser = _scraper_needs_browser(full_path)
+        # Respect the SCRAPER_EXECUTION_MODE feature flag (same switch as
+        # run_execution) so the testing path and the final execution path can
+        # never disagree on routing:
+        #   "force_scrape" — always /scrape (rollback lane)
+        #   "force_http"   — always in-process (forces the new HTTP model)
+        #   "auto" (default) — sniff the scraper imports (unchanged behavior)
+        try:
+            from django.conf import settings
+
+            exec_mode = getattr(settings, "SCRAPER_EXECUTION_MODE", "auto")
+        except Exception:
+            exec_mode = "auto"
+        if exec_mode == "force_scrape":
+            needs_browser = True
+        elif exec_mode == "force_http":
+            needs_browser = False
+        else:
+            needs_browser = _scraper_needs_browser(full_path)
 
         # Write a heartbeat SessionLog entry so the watchdog sees activity
         # during long scraper runs (UC Chrome + residential proxy can take 5+ min)

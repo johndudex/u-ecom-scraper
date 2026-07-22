@@ -160,6 +160,40 @@ def _format_output_products(output_path: str, output_key: str = "products") -> s
     return "\n".join(lines)[:4000]
 
 
+def _item_label(state: ScrapeState) -> str:
+    """Human-readable plural label for the content being scraped (e.g.
+    'products', 'jobs', 'articles'). Folded over from pre_execution_approval
+    during the Wave 2 Cut 2 gate merge."""
+    content_type_config = state.get("content_type_config", {})
+    if content_type_config and "output_key" in content_type_config:
+        key = content_type_config["output_key"]
+        if key == "products":
+            return "products"
+        return key.rstrip("s")
+    return "items"
+
+
+def _estimate_item_count(state: ScrapeState, slug: str, root: str) -> int:
+    """Estimate how many items the full scrape will process.
+
+    Mirrors pre_execution_approval's logic (now merged here): read
+    input_urls.json's ``urls`` list; fall back to ``item_count``/``product_count``
+    in state when the file is absent (e.g. discovery-driven jobs). Returns 0
+    only when neither source has data.
+    """
+    item_count = state.get("item_count", 0) or state.get("product_count", 0)
+    input_path = os.path.join(root, "workspace", slug, "input_urls.json")
+    try:
+        with open(input_path) as fh:
+            data = json.load(fh)
+            urls = data.get("urls", [])
+            if urls:
+                return len(urls)
+    except Exception:
+        pass
+    return item_count or 0
+
+
 def field_confirmation(state: ScrapeState) -> Command:
     slug = state["site_slug"]
     root = _get_project_root()
@@ -200,7 +234,10 @@ def field_confirmation(state: ScrapeState) -> Command:
     input_mode = state.get("input_mode", "url_list")
     search_criteria = state.get("search_criteria", "")
 
-    if input_mode in ("navigation", "list_page", "search_term") and search_criteria:
+    # `search_criteria` is a production filter ONLY for search_term jobs
+    # (run_execution.py has the same gate + rationale). For navigation/
+    # list_page it is a discovery hint — don't filter the sample by keyword.
+    if input_mode == "search_term" and search_criteria:
         cmd_args = [
             "--query",
             search_criteria,
@@ -286,14 +323,30 @@ def field_confirmation(state: ScrapeState) -> Command:
 
     _persist_field_confirmation_sample(state.get("job_id", 0), sample_text)
 
+    # (Wave 2 Cut 2) Fold the pre_execution_approval gate's item-count estimate
+    # into THIS interrupt so the single gate shows both the sample fields AND
+    # how many items the full scrape will process. An approve below routes
+    # straight to run_execution (the old second gate was removed).
+    estimated_count = _estimate_item_count(state, slug, root)
+    label = _item_label(state)
+    if estimated_count > 0:
+        message = (
+            f"Ready to scrape ~{estimated_count} {label} from '{slug}'. "
+            "Review the sample extraction below. Approve to proceed with the "
+            "full scrape, or reject to re-analyze."
+        )
+    else:
+        message = (
+            "Review the sample extraction below. Approve to proceed with the "
+            "full scrape, or reject to re-analyze."
+        )
+
     human_response = interrupt(
         {
             "reason": "field_confirmation",
-            "message": (
-                "Review the sample extraction below. Approve to proceed "
-                "with the full scrape, or reject to re-analyze."
-            ),
+            "message": message,
             "sample_output": sample_text,
+            "estimated_products": estimated_count,
             "decisions": build_decisions(
                 approve_label="Approve",
                 reject_label="Reject",
@@ -309,7 +362,10 @@ def field_confirmation(state: ScrapeState) -> Command:
 
     if decision.get("decision") == DECISION_APPROVE:
         logger.info("field_confirmation: user approved samples")
-        return Command(goto="pre_execution_approval")
+        # (Wave 2 Cut 2) the old second gate (pre_execution_approval) was merged
+        # into THIS interrupt — the item-count estimate is now shown above, so an
+        # approve routes straight to run_execution.
+        return Command(goto="run_execution")
 
     reanalyze = state.get("reanalyze_count", 0) + 1
     logger.info(

@@ -307,75 +307,12 @@ def navigate_synthesize(state: dict, config=None) -> dict[str, Any]:
         )
         return _fallback_synthesize(state, root, slug)
 
-    try:
-        from agents.subagents import (
-            build_navigation_synthesize_message,
-            create_navigation_synthesize,
-        )
-
-        messages = build_navigation_synthesize_message(state)
-        _log_agent_context(state, "navigation-synthesize", messages)
-        agent = create_navigation_synthesize(site_slug=slug)
-
-        agent_cfg: dict = {}
-        if config:
-            agent_cfg.update(config)
-
-        try:
-            result = agent.invoke({"messages": messages}, config=agent_cfg)
-        except Exception as exc:
-            logger.warning(
-                "navigate_synthesize: agent invocation error (job %s): %s — "
-                "checking if file was written before error",
-                job_id,
-                str(exc)[:200],
-            )
-            result = {"messages": []}
-
-        _persist_agent_logs(state, result, "navigation-synthesize", agent_cfg)
-
-        # Check if the agent wrote the file
-        analysis_path = os.path.join(
-            root, "workspace", slug, "navigation_analysis.json"
-        )
-        if os.path.isfile(analysis_path):
-            try:
-                with open(analysis_path, "r", encoding="utf-8") as f:
-                    analysis = json.load(f)
-                # Ensure a filters section exists (LLM may omit it)
-                analysis = _ensure_filters_in_analysis(analysis, root, slug)
-                # Ensure a discovered backend API endpoint is surfaced (SPAs)
-                analysis = _ensure_api_endpoint_in_analysis(analysis, root, slug)
-                try:
-                    with open(analysis_path, "w", encoding="utf-8") as f:
-                        json.dump(analysis, f, indent=2, ensure_ascii=False)
-                except OSError:
-                    pass
-                logger.info(
-                    "navigate_synthesize: success — navigation_analysis.json written "
-                    "(job %s)",
-                    job_id,
-                )
-                return {
-                    "navigation_analysis": analysis,
-                    "messages": [],
-                }
-            except json.JSONDecodeError as exc:
-                logger.warning(
-                    "navigate_synthesize: file written but invalid JSON: %s", exc
-                )
-
-        # Agent didn't write the file — use fallback
-        logger.warning(
-            "navigate_synthesize: agent did not write navigation_analysis.json "
-            "(job %s) — using fallback synthesizer",
-            job_id,
-        )
-        return _fallback_synthesize(state, root, slug)
-
-    except Exception as exc:
-        logger.exception("navigate_synthesize: failed: %s", exc)
-        return _fallback_synthesize(state, root, slug)
+    # Deterministic-only synthesis. The LLM synthesize agent was removed (complexity
+    # audit: a redundant middleman — skipped on the common navigation_agent handoff
+    # path, and its output was overwritten by the _ensure_* post-processors anyway).
+    # _fallback_synthesize produces a complete analysis (filters + api_endpoint
+    # ensured) from the raw findings deterministically.
+    return _fallback_synthesize(state, root, slug)
 
 
 def _fallback_synthesize(state: dict, root: str, slug: str) -> dict[str, Any]:
@@ -623,9 +560,30 @@ def _fallback_synthesize(state: dict, root: str, slug: str) -> dict[str, Any]:
                 else []
             ),
         },
+        # Listing-page JS-rendering signal (navigate_explore._verify_rendering).
+        # "csr" = item links only appear after JS → _derive_strategy picks a browser
+        # strategy upfront instead of http_requests. [plan: smarter deterministic picker]
+        "rendering_verified": listing_page.get("rendering_verified", "unknown"),
+        "raw_html_product_link_count": listing_page.get("raw_html_product_link_count"),
+        "rendered_item_link_count": listing_page.get("rendered_item_link_count"),
+        # Embedded-JSON data-model signal (navigate_explore listing-page detector).
+        # "embedded_json" = items live in a <script> JSON blob in the listing page,
+        # NOT in detail pages — a third data model. _derive_strategy surfaces it on
+        # scraper_analysis and code_writer extracts records from the listing JSON
+        # (no per-detail Phase 2). Generic across content types. [plan: embedded-json model]
+        "data_source": listing_page.get("data_source", "none"),
+        "data_richness": listing_page.get("data_richness"),
+        "embedded_json": listing_page.get("embedded_json"),
+        "embedded_json_reachable_via": listing_page.get("embedded_json_reachable_via"),
         "_fallback": True,
         "_findings_source": f"workspace/{slug}/navigation_findings.json",
     }
+
+    # Apply the same _ensure_* post-processors the (removed) LLM-success path used,
+    # so the deterministic analysis is as complete: filters section + surfaced API
+    # endpoint. (coverage_target ensure was removed with Phase 2.)
+    analysis = _ensure_filters_in_analysis(analysis, root, slug)
+    analysis = _ensure_api_endpoint_in_analysis(analysis, root, slug)
 
     # Write the fallback file
     analysis_path = os.path.join(root, "workspace", slug, "navigation_analysis.json")

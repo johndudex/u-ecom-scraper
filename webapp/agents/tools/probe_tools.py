@@ -272,7 +272,7 @@ def _classify_method(step_name: str) -> str:
 
 
 def run_probe_with_captcha_check(
-    url: str, render_js: bool = True, job_id: int = 0
+    url: str, render_js: bool = True, job_id: int = 0, max_steps: int | None = None
 ) -> dict:
     """Run probe with automatic LLM captcha verification and escalation.
 
@@ -283,6 +283,11 @@ def run_probe_with_captcha_check(
 
     Writes SessionLog entries for each escalation step so the watchdog
     sees activity and the user can see which tiers were tried.
+
+    ``max_steps`` caps the number of probe attempts (default None = full
+    ladder). The intake check-site view passes a small cap so a quick
+    "check site" doesn't grind through all 9 proxy tiers on an anti-bot
+    site; the real job's check_accessibility node leaves it uncapped.
 
     Returns a dict with:
       - method_that_worked: first successful method (backward compat)
@@ -472,6 +477,7 @@ def run_probe_with_captcha_check(
     phase1 = True  # Looking for first method
     phase2_type = None  # Type to search for in phase 2
 
+    attempts = 0  # actual probe attempts (excludes cache-skip iterations)
     for i, (step_name, proxy_tier) in enumerate(ESCALATION_STEPS):
         if i < skip_to:
             continue
@@ -479,6 +485,17 @@ def run_probe_with_captcha_check(
         # In phase 2, skip methods of same type as method_1
         if not phase1 and _classify_method(step_name) == phase2_type:
             continue
+
+        # max_steps caps the number of attempts — used by the intake check-site
+        # view to bound latency (the full 9-step ladder is for the real job's
+        # check_accessibility node, which runs in Celery and can be slow).
+        if max_steps is not None and attempts >= max_steps:
+            logger.info(
+                "probe_page[accessibility]: reached max_steps=%d, stopping escalation for %s",
+                max_steps, url[:80],
+            )
+            break
+        attempts += 1
 
         result = _try_single_step(step_name, proxy_tier)
         if result is not None:

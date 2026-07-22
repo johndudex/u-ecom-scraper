@@ -67,11 +67,47 @@ def _restart_scraper_chrome() -> None:
         logger.warning("Could not restart scraper Chrome: %s", exc)
 
 
+def _delete_discovery_checkpoint(scraper_dir: str) -> None:
+    """Delete ``discovered_urls_checkpoint.json`` after a successful run (H3).
+
+    Without this, a checkpoint written during one run (e.g. code_tester's
+    capped sample) persists and the next invocation loads it, skipping Phase 1
+    and silently extracting only the checkpointed URLs (locumtenens 38-of-3771
+    bug). The scraper writes the checkpoint to SCRIPT_DIR (=
+    os.path.dirname(scraper_path)) and this container runs the scraper with
+    cwd=scraper_dir, so both resolve here. Silent no-op when absent.
+    [discovery-coverage-gate §4]
+
+    IMPORTANT: only call after a SUCCESSFUL run. The Chrome-crash retry path
+    (returncode != 0) reloads the checkpoint to resume mid-run — deleting it
+    before a retry would discard discovered URLs and redo work.
+    """
+    if not scraper_dir:
+        return
+    path = os.path.join(scraper_dir, "discovered_urls_checkpoint.json")
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+            logger.info("scraper_runner: removed discovery checkpoint %s", path)
+    except OSError as exc:
+        logger.warning(
+            "scraper_runner: could not remove checkpoint %s: %s", path, exc
+        )
+
+
 def _post_run(result: Any, scraper_path: str, elapsed: float) -> dict[str, Any]:
     """Find output file, chown, build result dict. Shared by success + failure paths."""
     scraper_dir = os.path.dirname(scraper_path) or PROJECT_ROOT
     output_file = _find_output_file(scraper_dir)
     product_count = _count_products(output_file) if output_file else 0
+
+    # H3: after a SUCCESSFUL run, delete the discovery checkpoint so the next
+    # invocation starts fresh. Guarded on returncode == 0 because the Chrome-crash
+    # retry path (the ONLY legitimate mid-run checkpoint consumer) hits this hook
+    # with returncode != 0 between attempts — it must NOT lose its checkpoint.
+    # [discovery-coverage-gate §4]
+    if result.returncode == 0:
+        _delete_discovery_checkpoint(scraper_dir)
 
     if output_file:
         logger.info(

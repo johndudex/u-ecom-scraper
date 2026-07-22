@@ -92,34 +92,11 @@ def validate_analysis(state: ScrapeState) -> Command:
         )
     except (ValueError, TypeError):
         confidence = 0.0
-    mechanisms = analysis.get("scraping_mechanisms", [])
     primary_mechanism = analysis.get("scraping_mechanism", "")
-
-    if not mechanisms and primary_mechanism:
-        mechanisms = [primary_mechanism]
-
-    if len(mechanisms) > 1:
-        logger.info(
-            "validate_analysis: %d mechanisms available, interrupting", len(mechanisms)
-        )
-        return Command(
-            update={
-                **state_update,
-                "interrupt_reason": "choose_mechanism",
-                "interrupt_message": (
-                    f"Multiple scraping mechanisms detected: {', '.join(mechanisms)}. "
-                    f"Choose which mechanism to use."
-                ),
-                "interrupt_options": mechanisms,
-                "interrupt_decisions": options_to_decisions(mechanisms),
-            },
-            goto="human_approval",
-        )
 
     if confidence < MIN_CONFIDENCE:
         logger.info("validate_analysis: low confidence (%.2f)", confidence)
         platform = analysis.get("platform", "unknown")
-        primary = mechanisms[0] if mechanisms else "unknown"
         options = [
             "Continue anyway",
             "Retry with different approach",
@@ -131,7 +108,7 @@ def validate_analysis(state: ScrapeState) -> Command:
                 "interrupt_reason": "low_confidence",
                 "interrupt_message": (
                     f"Site analysis confidence is low: {confidence:.0%}. "
-                    f"Platform: {platform}, Mechanism: {primary}. "
+                    f"Platform: {platform}, Mechanism: {primary_mechanism}. "
                     f"Consider retrying or proceeding with caution."
                 ),
                 "interrupt_options": options,

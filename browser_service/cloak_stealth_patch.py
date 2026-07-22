@@ -1,5 +1,12 @@
 """Transparent CloakBrowser activation for generated Playwright scrapers.
 
+TODO(dies-with-/scrape): this global ``.pth`` monkeypatch exists ONLY to serve
+the /scrape subprocess execution path (legacy Playwright scrapers launched via
+scraper_runner with ``STEALTH_BROWSER=cloak``). Once /scrape + scraper_runner
+are removed and callers migrate to /navigate (which drives cloak via
+``_launch_page`` directly, no monkeypatch needed), delete this file AND its
+companion ``cloak_stealth.pth``. See docs/browser-service-rework-plan.md.
+
 Loaded automatically at Python startup via the companion ``cloak_stealth.pth``
 file (site-packages). When ``STEALTH_BROWSER=cloak`` is set (scraper_runner does
 this for anti-bot sites), it wraps ``playwright.BrowserType.launch`` (sync +
