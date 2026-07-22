@@ -1069,8 +1069,10 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
   X('#dl-json').addEventListener('click', downloadOutput);
   X('#runs-body').addEventListener('click', function(e){
     var b = e.target.closest('[data-dl]'); if(!b) return;
-    if(b.dataset.dl === 'scraper') fetchDownload(intakeState.job && intakeState.job.scraper_code_url, 'scraper.py');
-    else downloadOutput();
+    var url = b.getAttribute('data-url');
+    if(!url) return;
+    if(b.dataset.dl === 'scraper') fetchDownload(url, 'scraper.py');
+    else fetchDownload(url, 'output.json');
   });
 
   /* ---------- tabs + advanced toggle ---------- */
@@ -1235,6 +1237,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
         if(m){ setNavMethod(m); }
         if(j.search_criteria && m==='listing'){ var el=X('#cfg-listing-text'); if(el && !el.value.trim()) el.value=j.search_criteria; }
         if(j.search_criteria && m==='search'){ var el=X('#cfg-search-kw'); if(el && !el.value.trim()) el.value=j.search_criteria; }
+        if(j.search_url && m==='search'){ var el=X('#cfg-search-url'); if(el && !el.value.trim()) el.value=j.search_url; }
         intakeState.cfgPopulated=true;
       }
       if(j.started_at && j.completed_at){
@@ -1255,7 +1258,21 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       if(j.url) det.push(['Source', j.url]);
       if(j.error_message) det.push(['Error', j.error_message]);
       X('#details-kv').innerHTML = det.map(function(r){ return '<div class="kv"><span class="kk">'+escHtml(r[0])+'</span><span class="kv-v">'+escHtml(String(r[1]))+'</span></div>'; }).join('');
-      if(!X('#runs-body').innerHTML.trim()){
+      // Run history — real jobs for this site (includes the current run, so it
+      // appears and updates to COMPLETED + record count when it finishes).
+      if(j.run_history && j.run_history.length){
+        X('#runs-body').innerHTML = j.run_history.map(function(r){
+          var st=(r.status||'').toUpperCase().replace(/_/g,' ');
+          var stCls = r.status==='completed' ? 'run-status-ok' : (['failed','cancelled','captcha_blocked','akamai_blocked'].indexOf(r.status)>=0 ? 'run-status-ok' : 'run-status-ok');
+          var when = r.when ? new Date(r.when).toLocaleString() : '—';
+          var recs = (r.records!=null && r.records!==undefined) ? r.records : '—';
+          var dur = (r.duration_seconds!=null) ? fmtDur(r.duration_seconds) : '—';
+          var cur = r.current ? ' <span style="color:var(--accent)">(current)</span>' : '';
+          var scrBtn = r.scraper_url ? '<button class="mini-btn" data-dl="scraper" data-url="'+r.scraper_url+'" type="button" aria-label="Download scraper" title="Download scraper.py">'+icoDlSm()+'</button>' : '';
+          var outBtn = r.output_url ? '<button class="mini-btn" data-dl="output" data-url="'+r.output_url+'" type="button" aria-label="Download output" title="Download output.json">'+icoDlSm()+'</button>' : '';
+          return '<tr><td class="rmono">#'+r.id+cur+'</td><td>'+when+'</td><td><span class="'+stCls+'">'+st+'</span></td><td class="rmono">'+recs+'</td><td class="rmono">'+dur+'</td><td>'+scrBtn+'</td><td>'+outBtn+'</td></tr>';
+        }).join('');
+      } else if(!X('#runs-body').innerHTML.trim()){
         X('#runs-body').innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--faint);padding:14px;font-family:var(--sans)">No previous runs</td></tr>';
       }
       if(j.steps && j.steps.length){
@@ -1361,7 +1378,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
     fd.append('notes', X('#notes').value.trim());
     if(navMethod==='list'){ fd.append('list_urls', X('#nav-list-text').value); }
     else if(navMethod==='listing'){ fd.append('listing_urls', X('#nav-listing-text').value); }
-    else if(navMethod==='search'){ fd.append('search_keywords', X('#nav-search-kw').value); }
+    else if(navMethod==='search'){ fd.append('search_keywords', X('#nav-search-kw').value); fd.append('search_url', X('#nav-search-url').value); }
     var btn = X('#run-sample'); btn.disabled = true;
     postJSON(INTAKE_CONFIG.createJobUrl, fd).then(function(data){
       btn.disabled = false;

@@ -150,6 +150,9 @@ class ScrapeJob(models.Model):
     scope = models.CharField(max_length=20, blank=True, default="")
     scope_value = models.CharField(max_length=200, blank=True, default="")
     notes = models.TextField(blank=True, default="")
+    # search_term jobs: the search results page URL the user entered (distinct
+    # from `search_criteria`, which holds the keywords). [intake-ui]
+    search_url = models.URLField(max_length=1000, blank=True, default="")
 
     error_message = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)

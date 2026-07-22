@@ -710,6 +710,54 @@ def _job_output_preview(job) -> dict | None:
     }
 
 
+def _job_run_history(job, limit: int = 15) -> list:
+    """Recent jobs for the same site (URL) — the Run History table.
+
+    Includes the current job, so the current run always shows (and updates to
+    COMPLETED + record count when it finishes). Each row carries per-run
+    scraper/output download URLs.
+    """
+    runs: list = []
+    qs = ScrapeJob.objects.filter(url=job.url).order_by("-created_at")[:limit]
+    for j in qs:
+        slug = _resolve_job_slug(j)
+        if not slug:
+            try:
+                from .tasks import _generate_slug
+
+                slug = _generate_slug(j.url)
+            except Exception:
+                slug = ""
+        out_url = None
+        if slug:
+            for base in ("scrapers", "workspace"):
+                d = os.path.join(settings.PROJECT_ROOT, base, slug)
+                if os.path.isdir(d):
+                    outs = sorted(
+                        [f for f in os.listdir(d) if f.startswith("output_") and f.endswith(".json")],
+                        reverse=True,
+                    )
+                    if outs:
+                        out_url = f"/jobs/{j.id}/output/{outs[0]}/download/"
+                    break
+        dur = None
+        if j.started_at and j.completed_at:
+            dur = (j.completed_at - j.started_at).total_seconds()
+        runs.append(
+            {
+                "id": j.id,
+                "status": j.status,
+                "when": j.created_at.isoformat() if j.created_at else None,
+                "records": j.product_count,
+                "duration_seconds": dur,
+                "scraper_url": f"/jobs/{j.id}/scraper-code/",
+                "output_url": out_url,
+                "current": j.id == job.id,
+            }
+        )
+    return runs
+
+
 @login_required
 def job_api(request, job_id):
     job = get_object_or_404(ScrapeJob, pk=job_id)
@@ -727,6 +775,7 @@ def job_api(request, job_id):
             "target_fields": list(job.target_fields or []),
             "input_mode": job.input_mode,
             "search_criteria": job.search_criteria,
+            "search_url": job.search_url,
             "scope": job.scope,
             "scope_value": job.scope_value,
             "notes": job.notes,
@@ -772,6 +821,7 @@ def job_api(request, job_id):
             ],
             "total_log_count": job.session_logs.count(),
             "output_preview": _job_output_preview(job),
+            "run_history": _job_run_history(job),
         }
     )
 
@@ -2055,10 +2105,12 @@ def intake_create_job(request):
 
     # nav-specific discovery data → search_criteria (agents read it).
     search_criteria = ""
+    search_url = ""
     if nav_method == "listing":
         search_criteria = request.POST.get("listing_urls", "").strip()
     elif nav_method == "search":
         search_criteria = request.POST.get("search_keywords", "").strip()
+        search_url = request.POST.get("search_url", "").strip()
 
     existing = ScrapeJob.objects.filter(
         url=url, status__in=[ScrapeJob.STATUS_PENDING, ScrapeJob.STATUS_RUNNING]
@@ -2084,6 +2136,7 @@ def intake_create_job(request):
         page_type=page_type,
         input_mode=input_mode,
         search_criteria=search_criteria,
+        search_url=search_url,
         target_fields=fields_list,
         scope=scope,
         scope_value=scope_value,
