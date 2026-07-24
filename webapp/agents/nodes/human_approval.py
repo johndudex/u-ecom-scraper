@@ -111,6 +111,16 @@ def human_approval(state: ScrapeState) -> dict:
         "decisions": decisions,
     }
 
+    # Intake jobs run unattended — skip every human-approval gate (low
+    # confidence, coverage gaps, validation retries, etc.) and auto-proceed.
+    if state.get("skip_approvals", False):
+        logger.info("human_approval: skip_approvals → auto-approve '%s' (job %s)", reason, state.get("job_id"))
+        return {
+            "human_response": {"decision": "approve", "label": "Continue", "feedback": ""},
+            "human_feedback": "",
+            "interrupt_reason": reason,
+        }
+
     response = interrupt(payload)
 
     decision = _parse_decision(response)

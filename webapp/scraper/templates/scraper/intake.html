@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <!--
-  EXTRACT — AI scraper intake & job dashboard (prototype/mockup, self-contained single file)
+  EXTRACT — AI extractor intake & job dashboard (prototype/mockup, self-contained single file)
 
   Structure:
     #form-screen    Screen 1 — guided intake: sample URL → detect/enter fields → navigation
@@ -17,9 +17,11 @@
     listFileState    the one attached "exact list" file, shown as a chip (not injected into
                      the textarea) and mirrored across both panels.
 
-  Everything under "generated artifacts (representative)" (SCRAPER_CODE, DAGSTER_CODE,
-  SAMPLE_JSON, PIPELINE, TOOLCALLS, LOG, RUNS) is static mock data standing in for a real
-  backend — swap these for live API calls when wiring this up for real.
+  Everything under "generated artifacts (representative)" (EXTRACTOR_CODE, DAGSTER_CODE,
+  SAMPLE_JSON, PIPELINE, TOOLCALLS, LOG, RUNS) was static mock data standing in for a real
+  backend — the script below now talks to the real Django endpoints (intake_check_site,
+  intake_create_job, intake_jobs, job_api/events/tool-calls/scraper-code/dagster-code,
+  job_cancel/restart/update). Mock constants have been stripped.
 
   No build step: vanilla HTML/CSS/JS, single IIFE, CSS custom properties for theming
   (light/dark via prefers-color-scheme). Safe to edit directly.
@@ -28,7 +30,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Extract — data scraper setup</title>
+<title>Extract — data extractor setup</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -38,6 +40,7 @@
   --ink:#1a1d24; --muted:#5b616e; --faint:#8b909c;
   --border:#e2e5ec; --border-strong:#c9cdd8;
   --accent:#4f46e5; --accent-hover:#4338ca; --accent-bg:#ecebfd; --accent-ink:#3730a3;
+  --blue:#2563eb; --blue-hover:#1d4ed8;
   --warn:#9a5a05; --warn-bg:#fdf1de; --warn-ink:#7c4a05;
   --ok:#047857; --ok-bg:#e4f4ee;
   --radius:9px; --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
@@ -49,6 +52,7 @@
     --ink:#e7e9ef; --muted:#a2a8b6; --faint:#727888;
     --border:#272c37; --border-strong:#39404e;
     --accent:#8b82f5; --accent-hover:#9c95f7; --accent-bg:#221f3a; --accent-ink:#c3bef9;
+    --blue:#3b82f6; --blue-hover:#60a5fa;
     --warn:#e0a556; --warn-bg:#2e2413; --warn-ink:#f0c483;
     --ok:#4cc79a; --ok-bg:#12281f;
   }
@@ -75,6 +79,10 @@ body{
 .brand{display:flex; align-items:center; gap:9px; font-weight:600; letter-spacing:-0.01em;}
 .brand-mark{width:22px; height:22px; border-radius:6px; background:var(--accent); display:flex; align-items:center; justify-content:center; color:#fff; flex-shrink:0;}
 .steps{display:flex; align-items:center; gap:10px; font-size:13px; font-family:var(--mono);}
+.lib-context{display:flex; align-items:baseline; gap:8px; font-size:13px; min-width:0; overflow:hidden;}
+.lib-context strong{font-weight:600; white-space:nowrap;}
+.lib-context span{color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+@media (max-width:760px){ .lib-context span{display:none;} }
 .step{color:var(--faint); display:flex; align-items:center; gap:6px;}
 .step.on{color:var(--ink);}
 .step .dot{width:20px; height:20px; border-radius:50%; border:1px solid var(--border-strong); display:flex; align-items:center; justify-content:center; font-size:11px;}
@@ -115,7 +123,7 @@ textarea{resize:vertical; min-height:60px; line-height:1.55;}
 .navcard .nc-title{display:block; font-size:14px; font-weight:500; line-height:1.35;}
 .navcard .nc-help{display:block; font-size:12.5px; color:var(--muted); line-height:1.4;}
 .subpanel{margin:2px 0 2px 12px; padding-left:16px; border-left:2px solid var(--accent);}
-.subpanel .note{font-size:12px; color:var(--faint); margin:7px 0 0; display:flex; gap:6px; align-items:flex-start;}
+.note{font-size:12px; color:var(--faint); margin:7px 0 0; display:flex; gap:6px; align-items:flex-start;}
 
 .scope-row{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:9px;}
 .scope-opt{flex:1; min-width:130px; padding:11px 13px;}
@@ -125,8 +133,10 @@ textarea{resize:vertical; min-height:60px; line-height:1.55;}
 .btn{font-family:var(--sans); font-size:14px; font-weight:500; padding:11px 20px; border-radius:var(--radius); cursor:pointer; border:1px solid transparent; display:inline-flex; align-items:center; gap:7px; transition:background .15s, border-color .15s, transform .05s;}
 .btn:active{transform:scale(.985);}
 .btn-primary{background:var(--accent); color:#fff; border-color:var(--accent);}
-.btn-primary.btn-deploying{background:var(--accent-hover); border-color:var(--accent-hover); cursor:wait;}
-.btn-primary.btn-deployed{background:var(--ok); border-color:var(--ok);}
+.btn-primary.btn-blue{background:var(--blue); border-color:var(--blue);}
+.btn-primary.btn-blue:hover{background:var(--blue-hover); border-color:var(--blue-hover);}
+.btn.btn-busy{background:var(--accent-hover); color:#fff; border-color:var(--accent-hover); cursor:wait;}
+.btn.btn-confirmed{background:var(--ok); color:#fff; border-color:var(--ok);}
 .btn-primary:hover{background:var(--accent-hover);}
 .btn-ghost{background:var(--surface); color:var(--ink); border-color:var(--border-strong);}
 .btn-ghost:hover{background:var(--surface-2);}
@@ -135,9 +145,6 @@ textarea{resize:vertical; min-height:60px; line-height:1.55;}
 .hint{font-size:12.5px; color:var(--faint); margin:9px 0 0;}
 .domain-echo{font-size:12.5px; color:var(--muted); margin:9px 0 0; font-family:var(--mono); display:flex; align-items:center; gap:6px;}
 .domain-echo .de-ok{color:var(--ok); flex-shrink:0; display:flex;}
-.url-row{display:flex; gap:8px; align-items:stretch;}
-.url-row input{flex:1;}
-.url-row .btn{white-space:nowrap; padding:10px 15px;}
 .detect-status{display:flex; align-items:center; gap:9px; font-size:13px; color:var(--muted); margin:13px 0 0;}
 .spinner-sm{width:15px; height:15px; border:2px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin .8s linear infinite; flex-shrink:0;}
 .fields-block{margin-top:15px;}
@@ -154,7 +161,7 @@ textarea{resize:vertical; min-height:60px; line-height:1.55;}
 .spin-ico{animation:spin .9s linear infinite; transform-origin:center;}
 @media (prefers-reduced-motion:reduce){.spinner-sm,.spin-ico{animation:none;}}
 .btn:disabled{opacity:.45; cursor:not-allowed; pointer-events:none;}
-.btn:disabled.btn-deploying, .btn:disabled.btn-deployed{opacity:1; cursor:wait;}
+.btn:disabled.btn-busy, .btn:disabled.btn-confirmed{opacity:1; cursor:wait;}
 
 .pill{flex-shrink:0; font-family:var(--mono); font-size:12px; padding:5px 11px; border-radius:20px; white-space:nowrap; display:inline-flex; align-items:center; gap:5px;}
 .pill-ok{background:var(--ok-bg); color:var(--ok);}
@@ -180,6 +187,11 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
 .hero-row{display:flex; justify-content:space-between; gap:20px; align-items:flex-start; flex-wrap:wrap;}
 .hero-title-row{display:flex; align-items:center; gap:12px; margin-bottom:7px; flex-wrap:wrap;}
 .hero-title-row h1{font-size:22px; margin:0;}
+.job-id-badge{font-family:var(--mono); font-size:11px; color:var(--faint); background:var(--surface-2); padding:3px 9px; border-radius:20px; cursor:help;}
+.job-title-input, .rename-input{font-family:inherit; font-size:inherit; font-weight:inherit; color:var(--ink); background:var(--surface); border:1px solid var(--accent); border-radius:6px; padding:2px 8px; box-shadow:0 0 0 3px var(--accent-bg);}
+.rename-wrap{display:inline-flex; align-items:center; gap:6px;}
+.rename-btn{background:none; border:none; padding:2px; cursor:pointer; color:var(--faint); display:inline-flex; flex-shrink:0; border-radius:4px;}
+.rename-btn:hover{color:var(--accent); background:var(--accent-bg);}
 .hero-url{display:inline-block; font-family:var(--mono); font-size:13px; color:var(--accent); text-decoration:none; word-break:break-all; margin-bottom:13px;}
 .hero-url:hover{text-decoration:underline;}
 .hero-meta{display:flex; flex-wrap:wrap; gap:18px; font-size:13px; color:var(--muted);}
@@ -188,6 +200,23 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
 .btn-sm{font-size:13px; padding:8px 13px;}
 .hero-rerun{margin-top:18px; padding-top:18px; border-top:1px solid var(--border);}
 .hero-rerun-sub{font-size:12.5px; color:var(--muted); margin:0 0 11px;}
+#rerun-toggle.has-changes::after{content:''; position:absolute; top:-2px; right:-2px; width:8px; height:8px; border-radius:50%; background:var(--warn); border:2px solid var(--surface);}
+.cfg-changed-badge{display:inline-flex; align-items:center; font-family:var(--mono); font-size:10.5px; font-weight:500; color:var(--warn); background:var(--warn-bg); padding:2px 8px; border-radius:20px; vertical-align:middle; margin-left:2px;}
+.cfg-changed-note{display:flex; gap:7px; align-items:flex-start; font-size:12.5px; color:var(--warn-ink); background:var(--warn-bg); border-radius:var(--radius); padding:9px 12px; margin-bottom:12px; line-height:1.45;}
+.cfg-changed-note svg{flex-shrink:0; margin-top:1px; color:var(--warn);}
+.seg{display:inline-flex; flex-wrap:wrap; border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; background:var(--surface);}
+.seg button{font-family:var(--sans); font-size:13px; padding:8px 14px; background:none; border:none; cursor:pointer; color:var(--muted); border-right:1px solid var(--border);}
+.seg button:last-child{border-right:none;}
+.seg button.on{background:var(--accent); color:#fff;}
+.sched-detail{margin-top:14px; padding-top:14px; border-top:1px solid var(--border);}
+.sched-fields{display:flex; gap:12px; flex-wrap:wrap;}
+.sched-fields > div{flex:1; min-width:140px;}
+input[type=date], input[type=time], input[type=number]{width:100%; font-family:var(--mono); font-size:13.5px; color:var(--ink); background:var(--surface); border:1px solid var(--border); border-radius:var(--radius); padding:9px 11px; box-sizing:border-box;}
+input[type=date]:focus, input[type=time]:focus, input[type=number]:focus{outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-bg);}
+#sched-dom{max-width:110px;}
+.chip-select{display:flex; gap:6px; flex-wrap:wrap;}
+.chip-select button{font-family:var(--sans); font-size:12.5px; padding:7px 12px; border:1px solid var(--border); border-radius:20px; background:var(--surface); color:var(--muted); cursor:pointer;}
+.chip-select button.on{background:var(--accent); border-color:var(--accent); color:#fff;}
 
 .panel{background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:18px 20px; margin-bottom:16px;}
 .panel-head{display:flex; align-items:baseline; gap:10px; margin-bottom:14px; flex-wrap:wrap;}
@@ -204,6 +233,9 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
 .add-input-actions{display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:6px; padding-top:8px; border-top:1px solid var(--border);}
 .icon-btn{width:32px; height:32px; border-radius:8px; background:var(--surface-2); display:inline-flex; align-items:center; justify-content:center; cursor:pointer; color:var(--muted); flex-shrink:0; transition:color .15s, background .15s;}
 .icon-btn:hover{color:var(--accent); background:var(--accent-bg);}
+.icon-btn.locked{opacity:.35; cursor:not-allowed;}
+textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allowed;}
+.list-lock-msg{font-size:12px; color:var(--warn-ink); background:var(--warn-bg); border-radius:var(--radius); padding:8px 11px; margin:9px 0 0; line-height:1.45;}
 .file-status{flex:1; min-width:0;}
 .file-chip{display:inline-flex; align-items:center; gap:7px; background:var(--accent-bg); color:var(--accent-ink); font-family:var(--mono); font-size:12px; padding:5px 6px 5px 10px; border-radius:20px; max-width:100%;}
 .file-chip .fc-ico{flex-shrink:0; display:flex;}
@@ -228,6 +260,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
 .runs-table td{font-size:12.5px; font-family:var(--sans);}
 .runs-table .rmono{font-family:var(--mono); font-size:12px;}
 .run-status-ok{font-family:var(--mono); font-size:11px; color:var(--ok);}
+.run-status-fail{font-family:var(--mono); font-size:11px; color:var(--warn);}
 .mini-btn{font-family:var(--sans); font-size:12px; padding:5px 9px; border:1px solid var(--border-strong); background:var(--surface); border-radius:6px; cursor:pointer; color:var(--ink); display:inline-flex; gap:5px; align-items:center;}
 .mini-btn:hover{background:var(--surface-2);}
 .mini-btn + .mini-btn{margin-left:6px;}
@@ -294,6 +327,36 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
 @media (max-width:600px){ .pipe-time{display:none;} .hero{flex-direction:column;} .kv .kk{width:130px;} }
 
 .sr-only{position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); border:0;}
+
+.saved-head{margin-bottom:18px;}
+.lib-tab-desc{font-size:12.5px; color:var(--muted); margin:0 0 14px; max-width:640px;}
+.lib-filter-row{position:relative; max-width:320px; margin-bottom:16px;}
+.lib-filter-row .lib-filter-ico{position:absolute; left:11px; top:50%; transform:translateY(-50%); color:var(--faint); pointer-events:none;}
+.lib-filter-row input{padding-left:34px;}
+.saved-empty{color:var(--muted); font-size:14px; padding:40px 20px; text-align:center; background:var(--surface); border:1px dashed var(--border-strong); border-radius:14px;}
+.domain-group{border:1px solid var(--border); border-radius:12px; margin-bottom:12px; overflow:hidden; background:var(--surface);}
+.domain-group summary{cursor:pointer; list-style:none; display:flex; align-items:center; gap:10px; padding:14px 18px; font-weight:600; font-size:14px;}
+.domain-group summary::-webkit-details-marker{display:none;}
+.domain-group summary .dg-chev{color:var(--faint); display:flex; transition:transform .2s; flex-shrink:0;}
+.domain-group[open] summary .dg-chev{transform:rotate(90deg);}
+.domain-group .dg-domain{font-family:var(--mono); flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.domain-group .dg-count{font-family:var(--mono); font-size:11.5px; font-weight:500; color:var(--muted); background:var(--surface-2); padding:2px 9px; border-radius:20px; flex-shrink:0;}
+.domain-items{border-top:1px solid var(--border);}
+.saved-item{display:flex; align-items:center; gap:14px; padding:12px 18px; border-bottom:1px solid var(--border);}
+.saved-item:last-child{border-bottom:none;}
+.saved-item-main{flex:1; min-width:0;}
+.saved-item-name{font-size:13.5px; font-weight:500; margin:0 0 3px;}
+.saved-item-meta{font-size:12px; color:var(--muted); font-family:var(--mono); display:flex; align-items:baseline; gap:10px; flex-wrap:nowrap; min-width:0;}
+.saved-fields-list{overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; max-width:260px;}
+.saved-fields-list.expanded{max-width:none; white-space:normal; overflow:visible;}
+.saved-fields-more{flex-shrink:0; background:none; border:none; padding:0; cursor:pointer; color:var(--accent); font-family:var(--mono); font-size:11.5px;}
+.saved-fields-more:hover{text-decoration:underline;}
+.saved-nav{flex-shrink:0;}
+.saved-when{flex-shrink:0; margin-left:auto; color:var(--faint); white-space:nowrap;}
+@media (max-width:480px){
+  .saved-item-meta{flex-wrap:wrap;}
+  .saved-when{margin-left:0;}
+}
 </style>
 <script>
   // Injected by Django (scraper/intake view). Drives the AJAX calls below.
@@ -301,7 +364,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
     csrfToken: "{{ csrf_token }}",
     checkSiteUrl: "{% url 'intake_check_site' %}",
     createJobUrl: "{% url 'intake_create_job' %}",
-    knownSiteFields: {{ known_site_fields|safe }},
+    jobsLibraryUrl: "{% url 'intake_jobs' %}",
   };
 </script>
 </head>
@@ -315,12 +378,19 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       </span>
       <span id="header-title">Set up your extraction</span>
     </div>
-    <div class="steps" aria-label="progress">
+    <div class="steps" aria-label="progress" id="steps-ribbon">
       <span class="step on" id="st1"><span class="dot">1</span><span class="label">Define</span></span>
       <span class="step-sep"></span>
       <span class="step" id="st2"><span class="dot">2</span><span class="label">Sample</span></span>
     </div>
-    <button class="btn btn-primary btn-sm" id="restart" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg> New extraction</button>
+    <div class="lib-context hidden" id="lib-context">
+      <strong>Jobs &amp; saved extractors</strong>
+      <span>Every job that's run, and every extractor you've saved for later.</span>
+    </div>
+    <div style="display:flex; gap:10px; align-items:center;">
+      <button class="btn btn-ghost btn-sm" id="topbar-saved-link" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg> Jobs &amp; Saved</button>
+      <button class="btn btn-primary btn-sm" id="restart" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg> New extraction</button>
+    </div>
   </div>
 </div>
 
@@ -332,16 +402,13 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       <div class="q-num">1</div>
       <div class="q-body">
         <p class="q-title">Paste a page that actually shows your data</p>
-        <p class="q-help">Open a real example — one product, listing, article, or profile — and paste that exact URL. A homepage or top-level category page won't work; we need the page where the data itself appears.</p>
-        <div class="url-row">
-          <input type="text" id="example-url" placeholder="https://books.example.com/catalogue/a-light-in-the-attic" aria-label="sample page URL">
-          <button class="btn btn-ghost" id="scan-btn" type="button">Check site</button>
-        </div>
+        <p class="q-help">Open a real example — one product, listing, article, or profile — and paste that exact URL. A homepage or top-level category page won't work; we need the page where the data itself appears. We'll check it automatically once you move on.</p>
+        <input type="text" id="example-url" placeholder="https://books.example.com/catalogue/a-light-in-the-attic" aria-label="sample page URL">
         <p class="domain-echo hidden" id="domain-echo"></p>
         <p class="url-error hidden" id="url-error"></p>
 
         <div class="detect-status hidden" id="detect-status">
-          <span class="spinner-sm" aria-hidden="true"></span> Checking the site… <span id="detect-sub">can take up to ~1 min on protected sites</span>
+          <span class="spinner-sm" aria-hidden="true"></span> Checking if we already support this site…
         </div>
 
         <div class="fields-block hidden" id="fields-block">
@@ -365,7 +432,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
             <div class="add-input-box">
               <textarea id="nav-list-text" placeholder="One URL per line, or drop a CSV" aria-label="URL list"></textarea>
               <div class="add-input-actions">
-                <label class="icon-btn" title="Attach a file of URLs" aria-label="attach file of URLs">
+                <label class="icon-btn" id="nav-list-file-label" title="Attach a file of URLs" aria-label="attach file of URLs">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
                   <input type="file" id="nav-list-file" hidden accept=".csv,.txt">
                 </label>
@@ -374,6 +441,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
                 </div>
               </div>
             </div>
+            <p class="list-lock-msg hidden" id="nav-list-lock-msg" role="alert"></p>
           </div>
 
           <label class="navcard" data-nav="listing">
@@ -381,7 +449,19 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
             <span class="nc-text"><span class="nc-title">They're linked from a listing page</span><span class="nc-help">We follow the links and handle pagination</span></span>
           </label>
           <div class="subpanel hidden" id="sub-listing">
-            <textarea id="nav-listing-text" placeholder="One listing page per line, e.g.&#10;https://books.example.com/catalogue/category/travel&#10;https://books.example.com/catalogue/category/mystery" aria-label="listing page URLs" rows="3"></textarea>
+            <div class="add-input-box">
+              <textarea id="nav-listing-text" placeholder="One listing page per line, e.g.&#10;https://books.example.com/catalogue/category/travel&#10;https://books.example.com/catalogue/category/mystery" aria-label="listing page URLs" rows="3"></textarea>
+              <div class="add-input-actions">
+                <label class="icon-btn" id="nav-listing-file-label" title="Attach a file of listing page URLs" aria-label="attach file of listing page URLs">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+                  <input type="file" id="nav-listing-file" hidden accept=".csv,.txt">
+                </label>
+                <div class="file-status" id="nav-listing-status">
+                  <span class="hint" style="margin:0">CSV or TXT — one listing page per line</span>
+                </div>
+              </div>
+            </div>
+            <p class="list-lock-msg hidden" id="nav-listing-lock-msg" role="alert"></p>
             <p class="note">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;margin-top:1px"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
               Add one or more listing pages, one per line. Pagination, next-buttons, and infinite scroll on each are detected automatically.
@@ -407,11 +487,11 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       <div class="q-body">
         <p class="q-title">Scope and anything else</p>
         <div class="scope-row" id="scope-row">
-          <label class="navcard scope-opt sel" data-scope="all"><input type="radio" name="scope" value="all" checked><span class="nc-title">Everything</span></label>
-          <label class="navcard scope-opt" data-scope="firstn"><input type="radio" name="scope" value="firstn"><span class="nc-title">First N records</span></label>
+          <label class="navcard scope-opt sel" data-scope="firstn"><input type="radio" name="scope" value="firstn" checked><span class="nc-title">First N records</span></label>
           <label class="navcard scope-opt" data-scope="filter"><input type="radio" name="scope" value="filter"><span class="nc-title">Only matching…</span></label>
+          <label class="navcard scope-opt" data-scope="all"><input type="radio" name="scope" value="all"><span class="nc-title">Everything</span></label>
         </div>
-        <input type="text" id="scope-input" class="hidden" aria-label="scope detail">
+        <input type="text" id="scope-input" value="10" placeholder="Number of records, e.g. 500" inputmode="numeric" aria-label="how many records">
         <p class="hint hidden" id="scope-hint"></p>
         <textarea id="notes" placeholder="Anything special? e.g. prices in £, skip out-of-stock, phone is inside an image" aria-label="additional directions"></textarea>
       </div>
@@ -440,12 +520,19 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
         <div class="hero-main">
           <div class="hero-title-row">
             <h1 id="job-title">Job #231</h1>
+            <button class="rename-btn" id="job-rename-btn" type="button" title="Rename job" aria-label="Rename job">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 013 3L12 15l-4 1 1-4z"/></svg>
+            </button>
+            <span class="job-id-badge" id="job-id-badge" title="Internal job ID — used by the system, not affected by renaming">#231</span>
             <span class="pill pill-ok" id="job-status">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>
               COMPLETED
             </span>
             <button class="cancel-run-btn hidden" id="cancel-run-btn" type="button">Cancel</button>
           </div>
+          <!-- The job title above is a user-facing display name and is freely renamable (see startRenameJobTitle()).
+               The badge next to it (#job-id-badge) is the immutable backend/internal job ID, used by the system
+               for lookups and never changed by renaming — kept visible so the mapping stays clear to the user. -->
           <a class="hero-url" id="job-url" href="#" target="_blank" rel="noopener">—</a>
           <div class="hero-meta">
             <span><b id="job-time">4m 12s</b> execution time</span>
@@ -455,14 +542,20 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
         </div>
         <div class="hero-actions">
           <button class="btn btn-ghost btn-sm" id="dl-output"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg> Output</button>
-          <button class="btn btn-ghost btn-sm" id="dl-scraper"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg> Scraper</button>
-          <button class="btn btn-ghost btn-sm" id="rerun-toggle" aria-expanded="false" aria-controls="rerun-box"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg> Re-run</button>
-          <button class="btn btn-primary btn-sm" id="run-full"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg> Deploy to Dagster</button>
+          <button class="btn btn-ghost btn-sm" id="dl-extractor"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg> Extractor</button>
+          <button class="btn btn-ghost btn-sm" id="rerun-toggle" aria-expanded="false" aria-controls="rerun-box" style="position:relative"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg> Re-run</button>
+          <button class="btn btn-ghost btn-sm" id="save-btn"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/></svg> Save</button>
+          <button class="btn btn-primary btn-sm btn-blue" id="schedule-toggle" aria-expanded="false" aria-controls="schedule-box" title="Scheduling is coming soon" disabled><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg> <span id="schedule-toggle-label">Schedule</span></button>
+          <span class="hint" style="margin:0; font-size:11.5px; color:var(--faint); align-self:center; white-space:nowrap;">Scheduling is coming soon</span>
         </div>
       </div>
 
       <!-- RE-RUN WITH CUSTOM PROMPT — expands within the hero card itself, no new section -->
       <div class="hero-rerun hidden" id="rerun-box">
+        <p class="cfg-changed-note hidden" id="rerun-changed-note">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><path d="M12 9v4M12 17h.01"/></svg>
+          Configuration has changed since this job last ran — re-running will use the updated schema and navigation below.
+        </p>
         <p class="hero-rerun-sub">Optional — tell the builder what to change. Leave it blank to just re-run as-is with the current configuration below.</p>
         <textarea id="rerun-prompt" placeholder="Optional — e.g. the price field is dropping the £ symbol, keep it; also capture the posted date and the apply link."></textarea>
         <div class="rerun-actions">
@@ -470,6 +563,66 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
           <span class="hint" id="rerun-hint">No notes yet — this will re-run using the schema and navigation you've set below.</span>
         </div>
       </div>
+
+      <!-- SCHEDULE — same expand-within-hero pattern as Re-run.
+           Entire section DISABLED for now (toggle button above is also disabled):
+           scheduling via Dagster is a future enhancement, so no fetch is wired. -->
+      <div class="hero-rerun hidden" id="schedule-box">
+        <p class="hero-rerun-sub" id="schedule-hint">Scheduling is coming soon.</p>
+        <div class="seg" id="freq" role="group" aria-label="schedule frequency" aria-disabled="true">
+          <button class="on" data-v="now" disabled>Run now</button>
+          <button data-v="once" disabled>One-time</button>
+          <button data-v="hourly" disabled>Hourly</button>
+          <button data-v="daily" disabled>Daily</button>
+          <button data-v="weekly" disabled>Weekly</button>
+          <button data-v="monthly" disabled>Monthly</button>
+        </div>
+
+        <div class="sched-detail hidden" id="sched-once">
+          <div class="sched-fields">
+            <div><label class="field-label">Date</label><input type="date" id="sched-date" disabled></div>
+            <div><label class="field-label">Time</label><input type="time" id="sched-time-once" disabled></div>
+          </div>
+        </div>
+        <div class="sched-detail hidden" id="sched-hourly">
+          <label class="field-label">Starting at</label>
+          <input type="time" id="sched-time-hourly" disabled>
+          <p class="hint">Runs every hour from this time onward.</p>
+        </div>
+        <div class="sched-detail hidden" id="sched-daily">
+          <label class="field-label">Time of day</label>
+          <input type="time" id="sched-time-daily" disabled>
+        </div>
+        <div class="sched-detail hidden" id="sched-weekly">
+          <label class="field-label">Day of week</label>
+          <div class="chip-select" id="dow-select" aria-disabled="true">
+            <button type="button" data-d="Mon" disabled>Mon</button>
+            <button type="button" data-d="Tue" disabled>Tue</button>
+            <button type="button" data-d="Wed" class="on" disabled>Wed</button>
+            <button type="button" data-d="Thu" disabled>Thu</button>
+            <button type="button" data-d="Fri" disabled>Fri</button>
+            <button type="button" data-d="Sat" disabled>Sat</button>
+            <button type="button" data-d="Sun" disabled>Sun</button>
+          </div>
+          <label class="field-label" style="margin-top:12px">Time</label>
+          <input type="time" id="sched-time-weekly" disabled>
+        </div>
+        <div class="sched-detail hidden" id="sched-monthly">
+          <div class="sched-fields">
+            <div><label class="field-label">Day of month</label><input type="number" id="sched-dom" min="1" max="28" value="1" disabled></div>
+            <div><label class="field-label">Time</label><input type="time" id="sched-time-monthly" disabled></div>
+          </div>
+        </div>
+
+        <div class="rerun-actions" style="margin-top:14px;">
+          <button class="btn btn-primary btn-blue" id="schedule-commit-btn" disabled title="Scheduling is coming soon"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg> Schedule in Dagster</button>
+        </div>
+      </div>
+
+      <p class="hint hidden" id="view-saved-wrap" style="margin-top:14px; padding-top:14px; border-top:1px solid var(--border);">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px; color:var(--ok); margin-right:5px;"><path d="M20 6L9 17l-5-5"/></svg>
+        Saved. <a href="#" id="view-saved-link" style="color:var(--accent); font-weight:500;">View saved extractors →</a>
+      </p>
     </div>
 
     <div class="results-grid">
@@ -477,13 +630,13 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
     <div class="panel cfg-locked" id="cfg-panel">
       <div class="panel-head stacked">
         <div class="panel-head-title-row">
-          <h3>Current configuration</h3>
+          <h3>Current configuration <span class="cfg-changed-badge hidden" id="cfg-changed-badge">Modified since last run</span></h3>
           <button class="btn btn-ghost btn-sm" id="cfg-edit-toggle" type="button" aria-pressed="false">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 013 3L12 15l-4 1 1-4z"/></svg>
             Edit
           </button>
         </div>
-        <span class="panel-sub">The schema and navigation method this scraper uses.</span>
+        <span class="panel-sub">The schema and navigation method this extractor uses.</span>
       </div>
 
       <div class="cfg-block">
@@ -503,7 +656,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
             <div class="add-input-box">
               <textarea id="cfg-list-text" placeholder="One URL per line, or drop a CSV" aria-label="URL list (current configuration)"></textarea>
               <div class="add-input-actions">
-                <label class="icon-btn" title="Attach a file of URLs" aria-label="attach file of URLs (current configuration)">
+                <label class="icon-btn" id="cfg-list-file-label" title="Attach a file of URLs" aria-label="attach file of URLs (current configuration)">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
                   <input type="file" id="cfg-list-file" hidden accept=".csv,.txt">
                 </label>
@@ -512,6 +665,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
                 </div>
               </div>
             </div>
+            <p class="list-lock-msg hidden" id="cfg-list-lock-msg" role="alert"></p>
           </div>
 
           <label class="navcard" data-nav="listing">
@@ -519,7 +673,19 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
             <span class="nc-text"><span class="nc-title">They're linked from a listing page</span><span class="nc-help">We follow the links and handle pagination</span></span>
           </label>
           <div class="subpanel hidden" id="cfg-sub-listing">
-            <textarea id="cfg-listing-text" rows="3" placeholder="One listing page per line" aria-label="listing page URLs (current configuration)"></textarea>
+            <div class="add-input-box">
+              <textarea id="cfg-listing-text" rows="3" placeholder="One listing page per line" aria-label="listing page URLs (current configuration)"></textarea>
+              <div class="add-input-actions">
+                <label class="icon-btn" id="cfg-listing-file-label" title="Attach a file of listing page URLs" aria-label="attach file of listing page URLs (current configuration)">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+                  <input type="file" id="cfg-listing-file" hidden accept=".csv,.txt">
+                </label>
+                <div class="file-status" id="cfg-listing-status">
+                  <span class="hint" style="margin:0">CSV or TXT — one listing page per line</span>
+                </div>
+              </div>
+            </div>
+            <p class="list-lock-msg hidden" id="cfg-listing-lock-msg" role="alert"></p>
           </div>
 
           <label class="navcard" data-nav="search">
@@ -547,7 +713,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       </div>
       <div class="output-loading" id="output-loading">
         <svg class="spin-ico" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
-        Building the scraper and extracting a sample…
+        Building the extractor and extracting a sample…
       </div>
       <div class="hidden" id="output-content">
         <pre class="json-view" id="sample-json-view"></pre>
@@ -560,7 +726,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
     <div class="panel">
       <div class="panel-head"><h3>Run history</h3><span class="panel-sub">Previous executions of this job</span></div>
       <div class="tablewrap">
-        <table class="runs-table"><thead><tr><th>Run</th><th>When</th><th>Status</th><th>Records</th><th>Duration</th><th>Scraper</th><th>Output</th></tr></thead><tbody id="runs-body"></tbody></table>
+        <table class="runs-table"><thead><tr><th>Run</th><th>When</th><th>Status</th><th>Records</th><th>Duration</th><th>Extractor</th><th>Output</th></tr></thead><tbody id="runs-body"></tbody></table>
       </div>
     </div>
 
@@ -575,7 +741,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       <div class="tabs" id="adv-tabs" role="tablist">
         <button class="tab on" data-tab="pipeline" type="button">Pipeline</button>
         <button class="tab" data-tab="details" type="button">Details</button>
-        <button class="tab" data-tab="scraper" type="button">Scraper Code</button>
+        <button class="tab" data-tab="extractor" type="button">Extractor Code</button>
         <button class="tab" data-tab="dagster" type="button">Dagster Code</button>
         <button class="tab" data-tab="output" type="button">Sample Output</button>
         <button class="tab" data-tab="tools" type="button">Tool Calls</button>
@@ -583,20 +749,54 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       </div>
       <div class="tab-panel" id="tab-pipeline"><div class="pipeline" id="pipeline"></div></div>
       <div class="tab-panel hidden" id="tab-details"><div id="details-kv"></div></div>
-      <div class="tab-panel hidden" id="tab-scraper">
-        <div class="codeblock"><div class="code-head"><span>scraper.py</span><button class="mini-btn" id="dl-scraper-2" type="button"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg> Download</button></div><pre id="scraper-code"></pre></div>
+      <div class="tab-panel hidden" id="tab-extractor">
+        <div class="codeblock"><div class="code-head"><span>extractor.py</span><button class="mini-btn" id="dl-extractor-2" type="button"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg> Download</button></div><pre id="extractor-code"></pre></div>
       </div>
       <div class="tab-panel hidden" id="tab-dagster">
         <div class="codeblock"><div class="code-head"><span>dagster_asset.py</span><button class="mini-btn" id="dl-dagster" type="button"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg> Download</button></div><pre id="dagster-code"></pre></div>
       </div>
       <div class="tab-panel hidden" id="tab-output">
-        <div class="panel-head" style="margin-bottom:10px"><span class="panel-sub">Raw JSON from the generated scraper</span><button class="mini-btn" id="dl-json" type="button"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg> Download JSON</button></div>
+        <div class="panel-head" style="margin-bottom:10px"><span class="panel-sub">Raw JSON from the generated extractor</span><button class="mini-btn" id="dl-json" type="button"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg> Download JSON</button></div>
         <pre class="json-view" id="json-out"></pre>
       </div>
       <div class="tab-panel hidden" id="tab-tools"><div id="toolcalls"></div></div>
       <div class="tab-panel hidden" id="tab-log"><div class="log" id="agent-log"></div></div>
     </div>
 
+  </section>
+
+  <!-- ============ SCREEN 3: LIBRARY (Jobs + Saved Extractors) ============ -->
+  <section id="saved-screen" class="hidden">
+    <div class="saved-head">
+      <button class="btn-link" id="saved-back" type="button">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+        <span id="saved-back-label">Back to job</span>
+      </button>
+    </div>
+
+    <div class="tabs" id="library-tabs" role="tablist">
+      <button class="tab on" data-libtab="jobs" type="button">Jobs</button>
+      <button class="tab" data-libtab="saved" type="button">Saved extractors</button>
+    </div>
+    <div class="tab-panel" id="libtab-jobs" style="padding:18px 0 0;">
+      <p class="lib-tab-desc">All the recent builder jobs — every extraction that's been run in this system, with its status and result.</p>
+      <div class="tablewrap">
+        <table class="runs-table"><thead><tr><th>Job</th><th>Name</th><th>Site</th><th>When</th><th>Status</th><th>Records</th><th>Duration</th><th>Action</th></tr></thead><tbody id="jobs-lib-body"></tbody></table>
+      </div>
+    </div>
+    <div class="tab-panel hidden" id="libtab-saved" style="padding:18px 0 0;">
+      <p class="lib-tab-desc">A saved snapshot of a job's inputs, configuration, and generated extractor code — kept here for future reference, reuse, or modification. Grouped by domain, so multiple extractors for the same site sit together, ordered by most recent activity.</p>
+      <div class="lib-filter-row">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lib-filter-ico"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+        <input type="text" id="saved-domain-filter" list="saved-domain-options" placeholder="Filter by domain…" autocomplete="off" aria-label="filter saved extractors by domain">
+        <datalist id="saved-domain-options"></datalist>
+      </div>
+      <!-- Grouped by domain (not by job number): multiple saved extractors for one site collapse under a
+           single expandable domain group for a quick per-site view, sorted by each domain's most recent
+           save. The input above is a combo box (text + <datalist>) for searching/filtering by domain.
+           See renderSavedList(). -->
+      <div id="saved-list"></div>
+    </div>
   </section>
 
 </div>
@@ -606,7 +806,8 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
   var X = function(s,r){return (r||document).querySelector(s);};
   var chipContainers = [X('#chips')];
 
-  // Cross-function state for the wired flow (check-site → create-job → SSE dashboard).
+  /* ---------- cross-function state for the wired flow ---------- */
+  // check-site → create-job → SSE dashboard. Refreshed by every AJAX path below.
   var intakeState = {
     contentType: '',     // from check-site response → sent on create-job
     checkResult: null,   // last check-site payload (for anti-bot display)
@@ -615,6 +816,10 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
     es: null,            // EventSource for SSE
     poll: null,          // setInterval poll backstop
     terminal: false,
+    timeStr: '—',
+    recordsStr: '—',
+    cfgPopulated: false,
+    output_download_url: null,
   };
   function postJSON(url, formData, opts){
     return fetch(url, {
@@ -627,6 +832,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
 
   function icoX(){return '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>';}
 
+  /* ---------- field chips (shared across #chips + #cfg-chips via chipContainers) ---------- */
   var fieldsArr = [];
   function renderFieldsAll(){
     chipContainers.forEach(function(el){
@@ -641,6 +847,8 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
         el.appendChild(c);
       });
     });
+    updateConfigChangedIndicator();
+    if(typeof refreshRunSampleGate === 'function') refreshRunSampleGate();
   }
   function addChip(name){
     name = (name||'').trim(); if(!name) return;
@@ -650,9 +858,98 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
   }
   function clearChips(){ fieldsArr = []; renderFieldsAll(); }
 
-  var KNOWN_SITES = {
-    'books.example.com': ['product name','price','rating','availability','cover image URL','product URL']
-  };
+  /* ---------- detect config changes since the job was last run ---------- */
+  var configBaseline = null;
+  function getConfigSnapshot(){
+    var method = (document.querySelector('input[name=nav]:checked')||{}).value || '';
+    return JSON.stringify({
+      fields: fieldsArr,
+      method: method,
+      list: (X('#nav-list-text')||{}).value || '',
+      listFile: listFileState ? listFileState.name : '',
+      listing: (X('#nav-listing-text')||{}).value || '',
+      listingFile: listingFileState ? listingFileState.name : '',
+      searchUrl: (X('#nav-search-url')||{}).value || '',
+      searchKw: (X('#nav-search-kw')||{}).value || ''
+    });
+  }
+  function updateConfigChangedIndicator(){
+    var changed = configBaseline !== null && getConfigSnapshot() !== configBaseline;
+    var toggle = X('#rerun-toggle'); if(toggle) toggle.classList.toggle('has-changes', changed);
+    var badge = X('#cfg-changed-badge'); if(badge) badge.classList.toggle('hidden', !changed);
+    var note = X('#rerun-changed-note'); if(note) note.classList.toggle('hidden', !changed);
+    refreshGates();
+  }
+  function captureConfigBaseline(){ configBaseline = getConfigSnapshot(); updateConfigChangedIndicator(); }
+
+  /* ---------- action-button gating ---------- */
+  var isRunningNow = false;
+  function refreshGates(){
+    var changed = configBaseline !== null && getConfigSnapshot() !== configBaseline;
+    var lockSaveSchedule = isRunningNow || changed;
+    ['save-btn','schedule-toggle','schedule-commit-btn'].forEach(function(id){
+      var b = X('#'+id); if(!b) return;
+      // Schedule controls stay disabled (coming soon) — never re-enable them here.
+      if(id === 'schedule-toggle' || id === 'schedule-commit-btn') return;
+      b.disabled = lockSaveSchedule;
+      b.title = lockSaveSchedule
+        ? (isRunningNow ? 'A run is in progress' : 'Configuration has unsaved changes — re-run to apply them first')
+        : '';
+    });
+    var lockRerun = isRunningNow || cfgIsEditing;
+    ['rerun-toggle','rerun-btn'].forEach(function(id){
+      var b = X('#'+id); if(!b) return;
+      b.disabled = lockRerun;
+      b.title = lockRerun
+        ? (isRunningNow ? 'A run is in progress' : 'Click Done in Current Configuration before re-running')
+        : '';
+    });
+  }
+
+  /* ---------- run-sample readiness gate ---------- */
+  function isRunSampleReady(){
+    var urlEl = X('#example-url');
+    if(!urlEl || !urlEl.value.trim()) return false;
+    if(!X('#url-error').classList.contains('hidden')) return false;
+    if(!fieldsArr.length) return false;
+    var navMethod = (document.querySelector('input[name=nav]:checked')||{}).value;
+    if(!navMethod) return false;
+    if(navMethod === 'list'){
+      var hasListText = !!(X('#nav-list-text')||{}).value && !!X('#nav-list-text').value.trim();
+      var hasListFile = !!listFileState;
+      if(!hasListText && !hasListFile) return false;
+    } else if(navMethod === 'listing'){
+      var hasListingText = !!(X('#nav-listing-text')||{}).value && !!X('#nav-listing-text').value.trim();
+      var hasListingFile = !!listingFileState;
+      if(!hasListingText && !hasListingFile) return false;
+    } else if(navMethod === 'search'){
+      if(!(X('#nav-search-url')||{}).value || !X('#nav-search-url').value.trim()) return false;
+      if(!(X('#nav-search-kw')||{}).value || !X('#nav-search-kw').value.trim()) return false;
+    }
+    var scopeVal = (document.querySelector('input[name=scope]:checked')||{}).value;
+    if((scopeVal === 'firstn' || scopeVal === 'filter') && !X('#scope-input').value.trim()) return false;
+    return true;
+  }
+  function refreshRunSampleGate(){
+    var btn = X('#run-sample');
+    if(!btn) return;
+    var ready = isRunSampleReady();
+    btn.disabled = !ready;
+    btn.title = ready ? '' : 'Fill in the required fields above — example URL, at least one field to extract, and navigation details — before running a sample';
+  }
+  document.addEventListener('input', function(e){
+    if(e.target.matches('#nav-list-text,#nav-listing-text,#nav-search-url,#nav-search-kw,#cfg-list-text,#cfg-listing-text,#cfg-search-url,#cfg-search-kw')){
+      updateConfigChangedIndicator();
+    }
+    if(e.target.matches('#example-url,#nav-list-text,#nav-listing-text,#nav-search-url,#nav-search-kw,#scope-input,#field-input')){
+      refreshRunSampleGate();
+    }
+    if(e.target.matches('#scope-input') && typeof updateScopeSampleNote === 'function'){
+      updateScopeSampleNote();
+    }
+  });
+
+  /* ---------- URL validation + check-site lookup (real AJAX) ---------- */
   function pathFromExample(){
     var raw = X('#example-url').value.trim();
     if(!raw) return null;
@@ -663,8 +960,8 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
   function isHomepageOnly(){
     var p = pathFromExample();
     if(!p) return false;
-    var clean = p.path.replace(/\/+$/,'');            // strip trailing slashes
-    return clean === '' && !p.query;                  // bare domain, no path, no query
+    var clean = p.path.replace(/\/+$/,'');
+    return clean === '' && !p.query;
   }
   function showUrlError(msg){
     var e = X('#url-error');
@@ -673,15 +970,20 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
     X('#domain-echo').classList.add('hidden');
     X('#fields-block').classList.add('hidden');
     X('#example-url').classList.add('input-invalid');
+    refreshRunSampleGate();
   }
-  function lookupSite(){
+  var lastCheckedUrl = null; // guards against re-running the check when blur fires but the URL hasn't changed
+  function lookupSite(force){
     var host = hostFromExample();
-    if(!host){ X('#example-url').focus(); return; }
+    if(!host){ if(force) X('#example-url').focus(); return; }
+    var raw = X('#example-url').value.trim();
+    if(!force && raw === lastCheckedUrl) return; // e.g. clicking into the field input below blurs this field too — nothing to redo
     if(isHomepageOnly()){
-      showUrlError('That looks like the site\u2019s homepage. Open an actual page that shows the data \u2014 one product, listing, article, or profile \u2014 and paste that URL instead.');
+      showUrlError('That looks like the site’s homepage. Open an actual page that shows the data — one product, listing, article, or profile — and paste that URL instead.');
       X('#example-url').focus();
       return;
     }
+    lastCheckedUrl = raw;
     X('#url-error').classList.add('hidden');
     X('#example-url').classList.remove('input-invalid');
     X('#detect-status').classList.remove('hidden');
@@ -690,9 +992,9 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
     intakeState.contentType = '';
     intakeState.checkResult = null;
     var fd = new FormData();
-    fd.append('url', X('#example-url').value.trim());
+    fd.append('url', raw);
     // Hard client-side cap so the spinner never spins forever on a slow/anti-bot
-    // site. The server probe is also bounded (max_steps=3); this is the UX backstop.
+    // site. The server probe is also bounded; this is the UX backstop.
     var controller = new AbortController();
     var probeTimer = setTimeout(function(){ controller.abort(); }, 75000);
     postJSON(INTAKE_CONFIG.checkSiteUrl, fd, {signal: controller.signal}).then(function(data){
@@ -704,14 +1006,14 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       (data.fields || []).forEach(addChip);
       var hasFields = data.fields && data.fields.length;
       if(data.known_site){
-        X('#fields-label').textContent = 'We already support ' + host + ' \u2014 remove any you don\u2019t need, or add more:';
+        X('#fields-label').textContent = 'We already support ' + host + ' — remove any you don’t need, or add more:';
       } else if(hasFields){
-        X('#fields-label').textContent = 'We can detect these fields \u2014 remove any you don\u2019t need, or add more:';
+        X('#fields-label').textContent = 'We can detect these fields — remove any you don’t need, or add more:';
       } else if(data.message){
-        // Server couldn't auto-detect (anti-bot / unreachable) \u2014 show its message.
+        // Server couldn't auto-detect (anti-bot / unreachable) — show its message.
         showUrlError(data.message);
       } else {
-        X('#fields-label').textContent = 'New site \u2014 add the fields you want to extract:';
+        X('#fields-label').textContent = 'New site — add the fields you want to extract:';
       }
       X('#field-input').placeholder = hasFields ? 'Add another field, press Enter' : 'e.g. product name, press Enter';
       X('#fields-block').classList.remove('hidden');
@@ -720,7 +1022,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       clearTimeout(probeTimer);
       X('#detect-status').classList.add('hidden');
       var msg = (err && err.name === 'AbortError')
-        ? 'Checking is taking too long (over 75s) \u2014 this site likely has anti-bot protection. You can still add fields manually below, or just run the scrape (the build handles anti-bot).'
+        ? 'Checking is taking too long (over 75s) — this site likely has anti-bot protection. You can still add fields manually below, or just run the scrape (the build handles anti-bot).'
         : 'Could not check the site (' + err + '). You can still add fields manually below.';
       showUrlError(msg);
       X('#fields-block').classList.remove('hidden');
@@ -729,9 +1031,8 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       X('#field-input').focus();
     });
   }
-
-  X('#scan-btn').addEventListener('click', lookupSite);
-  X('#example-url').addEventListener('keydown', function(e){ if(e.key === 'Enter'){ e.preventDefault(); lookupSite(); } });
+  X('#example-url').addEventListener('keydown', function(e){ if(e.key === 'Enter'){ e.preventDefault(); lookupSite(true); } });
+  X('#example-url').addEventListener('blur', function(){ lookupSite(false); });
 
   X('#field-input').addEventListener('keydown', function(e){
     if(e.key === 'Enter' && this.value.trim()){ addChip(this.value.trim()); this.value=''; }
@@ -744,7 +1045,9 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
   });
 
   /* ---------- current configuration: lock/edit toggle to prevent accidental changes ---------- */
+  var cfgIsEditing = false; // tracks whether the Current Configuration panel is unlocked (Edit clicked, Done not yet clicked)
   function setCfgEditable(editable){
+    cfgIsEditing = editable;
     X('#cfg-panel').classList.toggle('cfg-locked', !editable);
     var btn = X('#cfg-edit-toggle');
     btn.setAttribute('aria-pressed', String(editable));
@@ -757,6 +1060,9 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       var el = X('#'+id); if(el) el.readOnly = !editable;
     });
     var fileInput = X('#cfg-list-file'); if(fileInput) fileInput.disabled = !editable;
+    var listingFileInput = X('#cfg-listing-file'); if(listingFileInput) listingFileInput.disabled = !editable;
+    if(typeof refreshListLocks === 'function') refreshListLocks();
+    if(typeof refreshGates === 'function') refreshGates();
   }
   X('#cfg-edit-toggle').addEventListener('click', function(){
     setCfgEditable(this.getAttribute('aria-pressed') !== 'true');
@@ -774,6 +1080,9 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       var mainSub = X('#sub-'+k); if(mainSub) mainSub.classList.toggle('hidden', k !== method);
       var cfgSub = X('#cfg-sub-'+k); if(cfgSub) cfgSub.classList.toggle('hidden', k !== method);
     });
+    updateConfigChangedIndicator();
+    if(typeof refreshRunSampleGate === 'function') refreshRunSampleGate();
+    if(typeof updateScopeSampleNote === 'function') updateScopeSampleNote();
   }
   document.querySelectorAll('input[name=nav]').forEach(function(r){
     r.addEventListener('change', function(){ setNavMethod(r.value); });
@@ -792,21 +1101,31 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
   mirrorField('nav-search-url', 'cfg-search-url');
   mirrorField('nav-search-kw', 'cfg-search-kw');
 
-  var listFileState = null; // { name, lines } — attached file for "exact list", kept separate from typed text
+  /* ---------- file attach (list + listing) ----------
+     Both panels share one attached file each — the file's lines are kept separate
+     from typed/pasted text and joined into the form submission at runBuild(). */
+  var listFileState = null;    // { name, lines } — attached file for "exact list"
+  var listingFileState = null; // { name, lines } — same idea, for "listing page" URLs
   var listFileStatusEls = [X('#nav-list-status'), X('#cfg-list-status')];
+  var listingFileStatusEls = [X('#nav-listing-status'), X('#cfg-listing-status')];
   function icoFileSm(){return '<svg class="fc-ico" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/></svg>';}
-  function renderListFileChip(){
-    listFileStatusEls.forEach(function(el){
+  function renderFileChip(statusEls, fileState, clearFn, defaultHint){
+    statusEls.forEach(function(el){
       if(!el) return;
-      if(listFileState){
-        el.innerHTML = '<span class="file-chip"><span class="fc-ico">'+icoFileSm()+'</span><span class="fc-name" title="'+listFileState.name+'">'+listFileState.name+'</span><button class="fc-del" type="button" aria-label="remove attached file">'+icoX()+'</button></span>';
-        el.querySelector('.fc-del').addEventListener('click', function(){ listFileState = null; renderListFileChip(); });
+      if(fileState){
+        el.innerHTML = '<span class="file-chip"><span class="fc-ico">'+icoFileSm()+'</span><span class="fc-name" title="'+fileState.name+'">'+fileState.name+'</span><button class="fc-del" type="button" aria-label="remove attached file">'+icoX()+'</button></span>';
+        el.querySelector('.fc-del').addEventListener('click', function(){ clearFn(); refreshListLocks(); });
       } else {
-        el.innerHTML = '<span class="hint" style="margin:0">CSV or TXT — one URL per line</span>';
+        el.innerHTML = '<span class="hint" style="margin:0">'+defaultHint+'</span>';
       }
     });
+    updateConfigChangedIndicator();
+    refreshListLocks();
+    if(typeof refreshRunSampleGate === 'function') refreshRunSampleGate();
   }
-  function wireFileAttach(fileInputId){
+  function renderListFileChip(){ renderFileChip(listFileStatusEls, listFileState, function(){ listFileState = null; }, 'CSV or TXT — one URL per line'); }
+  function renderListingFileChip(){ renderFileChip(listingFileStatusEls, listingFileState, function(){ listingFileState = null; }, 'CSV or TXT — one listing page per line'); }
+  function wireFileAttach(fileInputId, setState, renderFn){
     var fi = X('#'+fileInputId);
     if(!fi) return;
     fi.addEventListener('change', function(){
@@ -817,37 +1136,137 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       reader.onload = function(){
         var text = String(reader.result || '');
         var lines = text.split(/\r?\n/).map(function(s){ return s.trim(); }).filter(Boolean);
-        listFileState = { name: f.name, lines: lines };
-        renderListFileChip();
+        setState({ name: f.name, lines: lines });
+        renderFn();
       };
       reader.readAsText(f);
     });
   }
-  wireFileAttach('nav-list-file');
-  wireFileAttach('cfg-list-file');
+  wireFileAttach('nav-list-file', function(v){ listFileState = v; }, renderListFileChip);
+  wireFileAttach('cfg-list-file', function(v){ listFileState = v; }, renderListFileChip);
+  wireFileAttach('nav-listing-file', function(v){ listingFileState = v; }, renderListingFileChip);
+  wireFileAttach('cfg-listing-file', function(v){ listingFileState = v; }, renderListingFileChip);
 
+  /* ---------- mutual exclusion: typed/pasted URLs vs an attached file ---------- */
+  var LIST_LOCK_GROUPS = [
+    {
+      getFile: function(){ return listFileState; },
+      pairs: [
+        { text:'nav-list-text', label:'nav-list-file-label', file:'nav-list-file', msg:'nav-list-lock-msg' },
+        { text:'cfg-list-text', label:'cfg-list-file-label', file:'cfg-list-file', msg:'cfg-list-lock-msg' }
+      ]
+    },
+    {
+      getFile: function(){ return listingFileState; },
+      pairs: [
+        { text:'nav-listing-text', label:'nav-listing-file-label', file:'nav-listing-file', msg:'nav-listing-lock-msg' },
+        { text:'cfg-listing-text', label:'cfg-listing-file-label', file:'cfg-listing-file', msg:'cfg-listing-lock-msg' }
+      ]
+    }
+  ];
+  function flashListLockMsg(msgId, msg){
+    var el = X('#'+msgId); if(!el) return;
+    el.textContent = msg;
+    el.classList.remove('hidden');
+    clearTimeout(el._hideTimer);
+    el._hideTimer = setTimeout(function(){ el.classList.add('hidden'); }, 3500);
+  }
+  function refreshListLocks(){
+    if(typeof LIST_LOCK_GROUPS === 'undefined') return;
+    LIST_LOCK_GROUPS.forEach(function(group){
+      var hasFile = !!group.getFile();
+      var mainTaEl = X('#'+group.pairs[0].text);
+      var hasText = !!(mainTaEl && mainTaEl.value.trim());
+      var textLocked = hasFile;
+      var fileLocked = hasText && !hasFile;
+      group.pairs.forEach(function(p){
+        var ta = X('#'+p.text), label = X('#'+p.label), fi = X('#'+p.file);
+        var cfgGate = (p.text.indexOf('cfg-') === 0) ? !cfgIsEditing : false;
+        if(ta){
+          ta.readOnly = textLocked || cfgGate;
+          ta.classList.toggle('locked', textLocked);
+        }
+        if(label) label.classList.toggle('locked', fileLocked || cfgGate);
+        if(fi) fi.disabled = fileLocked || cfgGate;
+      });
+    });
+  }
+  LIST_LOCK_GROUPS.forEach(function(group){
+    group.pairs.forEach(function(p){
+      var ta = X('#'+p.text), label = X('#'+p.label);
+      if(ta){
+        ta.addEventListener('mousedown', function(e){
+          if(group.getFile()){ e.preventDefault(); ta.blur(); flashListLockMsg(p.msg, 'Remove the attached file below before typing or pasting URLs here.'); }
+        });
+        ta.addEventListener('paste', function(e){
+          if(group.getFile()){ e.preventDefault(); flashListLockMsg(p.msg, 'Remove the attached file below before pasting URLs here.'); }
+        });
+      }
+      if(label){
+        label.addEventListener('click', function(e){
+          var mainTaEl = X('#'+group.pairs[0].text);
+          var hasText = !!(mainTaEl && mainTaEl.value.trim());
+          if(hasText && !group.getFile()){ e.preventDefault(); flashListLockMsg(p.msg, 'Remove the pasted URLs above before attaching a file.'); }
+        });
+      }
+    });
+  });
+  document.addEventListener('input', function(e){
+    if(e.target.matches('#nav-list-text,#cfg-list-text,#nav-listing-text,#cfg-listing-text')) refreshListLocks();
+  });
+  refreshListLocks();
+
+  /* ---------- scope selection + sample-size hint ---------- */
   var SCOPE_CFG = {
-    firstn: { ph:'Number of records, e.g. 500', hint:'We\u2019ll stop once we\u2019ve collected this many.', mode:'numeric', label:'how many records' },
-    filter: { ph:'Describe it in plain words, e.g. rating 4 and up, in stock only', hint:'Plain language is fine — we\u2019ll match records against it.', mode:'text', label:'which records to keep' }
+    firstn: { ph:'Number of records, e.g. 500', mode:'numeric', label:'how many records' },
+    filter: { ph:'Describe it in plain words, e.g. rating 4 and up, in stock only', hint:'Plain language is fine — we’ll match records against it.', mode:'text', label:'which records to keep' }
   };
+  var NAV_SAMPLE_NOTE = {
+    list: function(n){ return 'For the sample run, we’ll use the first ' + n + ' URL' + (n === '1' ? '' : 's') + ' from your list.'; },
+    listing: function(n){ return 'For the sample run, we’ll collect up to ' + n + ' record' + (n === '1' ? '' : 's') + ' from each listing page you provide.'; }
+  };
+  var NOTE_ICO = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;margin-top:1px"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>';
+  function updateScopeSampleNote(){
+    var hint = X('#scope-hint');
+    if(!hint) return;
+    var scopeVal = (document.querySelector('input[name=scope]:checked')||{}).value;
+    if(scopeVal === 'filter'){
+      hint.className = 'hint';
+      hint.textContent = SCOPE_CFG.filter.hint;
+      hint.classList.remove('hidden');
+      return;
+    }
+    if(scopeVal === 'firstn'){
+      var navMethod = (document.querySelector('input[name=nav]:checked')||{}).value;
+      var n = X('#scope-input').value.trim();
+      var template = navMethod ? NAV_SAMPLE_NOTE[navMethod] : null;
+      if(template && n){
+        hint.className = 'note';
+        hint.innerHTML = NOTE_ICO + '<span>' + template(n) + '</span>';
+        hint.classList.remove('hidden');
+        return;
+      }
+    }
+    hint.classList.add('hidden');
+    hint.innerHTML = '';
+  }
   document.querySelectorAll('input[name=scope]').forEach(function(r){
     r.addEventListener('change', function(){
       document.querySelectorAll('#scope-row .navcard').forEach(function(c){c.classList.remove('sel');});
       r.closest('.navcard').classList.add('sel');
-      var inp = X('#scope-input'), hint = X('#scope-hint'), cfg = SCOPE_CFG[r.value];
+      var inp = X('#scope-input'), cfg = SCOPE_CFG[r.value];
       if(cfg){
         inp.value = '';
         inp.placeholder = cfg.ph;
         inp.setAttribute('inputmode', cfg.mode);
         inp.setAttribute('aria-label', cfg.label);
         inp.classList.remove('hidden');
-        hint.textContent = cfg.hint;
-        hint.classList.remove('hidden');
         inp.focus();
       } else {
         inp.classList.add('hidden');
-        hint.classList.add('hidden');
       }
+      refreshRunSampleGate();
+      updateScopeSampleNote();
     });
   });
 
@@ -870,14 +1289,19 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
     } else {
       echo.classList.add('hidden');
     }
+    refreshRunSampleGate();
   });
 
-  var HEADER_TITLES = { 'form-screen':'Set up your extraction', 'sample-screen':'Extract' };
+  var HEADER_TITLES = { 'form-screen':'Set up your extraction', 'sample-screen':'Extract', 'saved-screen':'Extract' };
+  var lastPrimaryScreen = 'form-screen';
   function show(id){
-    ['form-screen','sample-screen'].forEach(function(s){
+    ['form-screen','sample-screen','saved-screen'].forEach(function(s){
       X('#'+s).classList.toggle('hidden', s !== id);
     });
+    if(id === 'form-screen' || id === 'sample-screen') lastPrimaryScreen = id;
     X('#header-title').textContent = HEADER_TITLES[id] || 'Extract';
+    X('#steps-ribbon').classList.toggle('hidden', id === 'saved-screen');
+    X('#lib-context').classList.toggle('hidden', id !== 'saved-screen');
     window.scrollTo({top:0, behavior:'smooth'});
   }
   function stepState(active){
@@ -888,163 +1312,13 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
   /* ---------- icons ---------- */
   function icoChevR(){return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg>';}
   function icoDlSm(){return '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>';}
+  function icoEditSm(){return '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 013 3L12 15l-4 1 1-4z"/></svg>';}
 
-  /* ---------- generated artifacts (representative) ---------- */
-  var SCRAPER_CODE = [
-    'import requests',
-    'from bs4 import BeautifulSoup',
-    '',
-    'BASE = "https://books.example.com"',
-    '',
-    'def parse_record(html):',
-    '    soup = BeautifulSoup(html, "html.parser")',
-    '    return {',
-    '        "title":    soup.select_one("h1.job-title").get_text(strip=True),',
-    '        "company":  soup.select_one(".company").get_text(strip=True),',
-    '        "location": soup.select_one(".location").get_text(strip=True),',
-    '        "description": soup.select_one(".job-desc").get_text(" ", strip=True),',
-    '    }',
-    '',
-    'def crawl(listing_url):',
-    '    results, page = [], listing_url',
-    '    while page:',
-    '        r = requests.get(page, timeout=30)',
-    '        soup = BeautifulSoup(r.text, "html.parser")',
-    '        for a in soup.select("a.job-link"):',
-    '            jr = requests.get(a["href"], timeout=30)',
-    '            rec = parse_record(jr.text)',
-    '            rec["http_status"] = jr.status_code',
-    '            results.append(rec)',
-    '        nxt = soup.select_one("a.next")',
-    '        page = nxt["href"] if nxt else None',
-    '    return results',
-    '',
-    'if __name__ == "__main__":',
-    '    import json',
-    '    print(json.dumps(crawl(f"{BASE}/jobs"), indent=2))'
-  ].join('\n');
-
-  var DAGSTER_CODE = [
-    'from dagster import asset, Definitions, ScheduleDefinition, define_asset_job',
-    'import scraper',
-    '',
-    '@asset(group_name="extract")',
-    'def raw_records(context):',
-    '    data = scraper.crawl("https://books.example.com/jobs")',
-    '    context.log.info(f"scraped {len(data)} records")',
-    '    return data',
-    '',
-    'extract_job = define_asset_job("extract_job", selection=["raw_records"])',
-    '',
-    'daily = ScheduleDefinition(job=extract_job, cron_schedule="0 6 * * *")',
-    '',
-    'defs = Definitions(',
-    '    assets=[raw_records],',
-    '    jobs=[extract_job],',
-    '    schedules=[daily],',
-    ')'
-  ].join('\n');
-
-  var SAMPLE_JSON = JSON.stringify([
-    { title:"Senior Frontend Engineer", company:"Northwind Labs", location:"Remote (EU)", description:"Own our design system and component library across web apps.", http_status:200 },
-    { title:"Data Platform Engineer", company:"Cobalt Analytics", location:"Berlin, DE", description:"Build and operate ingestion pipelines on Dagster and dbt.", http_status:200 },
-    { title:"Product Designer", company:"Fern & Oak", location:"London, UK (hybrid)", description:"Shape end-to-end product flows for our marketplace.", http_status:200 },
-    { title:"Backend Engineer, Payments", company:"Northwind Labs", location:"Remote (Global)", description:"Design resilient payment services and reconciliation jobs.", http_status:200 }
-  ], null, 2);
-
-  var PIPELINE = [
-    {n:'Accessibility Check', t:'09:36:36 – 09:36:55', d:'19s'},
-    {n:'Site Analysis', t:'09:36:55 – 09:39:45', d:'2m 50s'},
-    {n:'Navigation Explore', t:'09:39:45 – 09:47:05', d:'7m 20s'},
-    {n:'Navigation Synthesis', t:'09:47:05 – 09:48:53', d:'1m 48s'},
-    {n:'Navigation Skill Review', t:'03:09:39 – 03:12:15', d:'2m 36s'},
-    {n:'Product Analysis', t:'09:48:53 – 09:51:49', d:'2m 56s'},
-    {n:'Scraper Analysis', t:'09:52:02 – 09:53:31', d:'1m 29s'},
-    {n:'Code Generation', t:'09:53:51 – 10:24:54', d:'31m 3s'},
-    {n:'Testing', t:'10:20:11 – 10:32:18', d:'12m 6s', retry:'retry cycle 1'},
-    {n:'Field Confirmation', t:'05:23:18', d:''},
-    {n:'Execution', t:'03:23:18', d:''},
-    {n:'Cleanup', t:'02:49:02 – 03:09:39', d:'20m 37s'},
-    {n:'Skill Learning', t:'03:12:15 – 03:14:08', d:'1m 53s'},
-    {n:'code_review', t:'10:04:24 – 10:29:48', d:'25m 24s'}
-  ];
-  var TOOLCALLS = [
-    {phase:'Site-Analyzer', calls:[
-      {name:'fetch_robots()', res:'200 OK · /jobs allowed · 14 rules parsed'},
-      {name:'detect_platform()', res:'WordPress + WP Job Manager + Elementor'},
-      {name:'probe_render()', res:'server-rendered HTML · no JS execution needed'} ]},
-    {phase:'Product-Analyzer', calls:[
-      {name:'sample_listing(page=1)', res:'42 job cards detected'},
-      {name:'infer_fields()', res:'title, company, location, description, posted_date'} ]},
-    {phase:'Code-Writer', calls:[
-      {name:'generate_scraper()', res:'scraper.py · 31 lines · method=http_requests'},
-      {name:'generate_dagster()', res:'dagster_asset.py · 18 lines'} ]},
-    {phase:'Code-Tester', calls:[
-      {name:'run_scraper(--limit 10)', res:'retry 1 → 10/10 rows extracted OK'},
-      {name:'validate_schema()', res:'all required fields present'} ]},
-    {phase:'Cleanup', calls:[
-      {name:'dedupe()', res:'0 duplicates removed'},
-      {name:'normalize_fields()', res:'trimmed whitespace · cast http_status → int'} ]}
-  ];
-  var LOG = [
-    {t:'09:36:36', l:'info', m:'Accessibility check passed (robots.txt allows /jobs)'},
-    {t:'09:36:55', l:'info', m:'Platform detected: WordPress + WP Job Manager + Elementor'},
-    {t:'09:39:45', l:'info', m:'Navigation resolved: listing → detail, pagination via ?paged='},
-    {t:'09:48:53', l:'ok',   m:'Field schema confirmed (5 fields)'},
-    {t:'09:53:51', l:'info', m:'Scraper generated → scraper.py'},
-    {t:'10:20:11', l:'warn', m:'Test cycle 1: selector .company flaky → retried with fallback'},
-    {t:'10:32:18', l:'ok',   m:'Test passed: 10/10 sample rows valid'},
-    {t:'03:23:18', l:'ok',   m:'Execution complete · 3,512 records'},
-    {t:'03:14:08', l:'info', m:'Skill learned and cached for this site'}
-  ];
-  var RUNS = [
-    {id:'#231', when:'Jul 21, 2026 · 09:36', rows:'3,512', dur:'4m 12s'},
-    {id:'#212', when:'Jul 14, 2026 · 09:36', rows:'3,488', dur:'4m 02s'},
-    {id:'#198', when:'Jul 07, 2026 · 09:36', rows:'3,401', dur:'3m 58s'}
-  ];
-
-  /* ---------- advanced renders ---------- */
+  /* ---------- advanced renders (driven by live job data — see refreshJobData) ---------- */
   var NAV_LABEL = {list:'exact list of URLs', listing:'listing → detail', search:'search + keywords'};
   function navText(){ var v=(document.querySelector('input[name=nav]:checked')||{}).value; return v ? NAV_LABEL[v] : 'listing → detail'; }
-  function renderPipeline(){
-    X('#pipeline').innerHTML = PIPELINE.map(function(s){
-      return '<div class="pipe-step"><span class="pipe-ico">'+icoCheckSm()+'</span>'+
-        '<span class="pipe-name">'+s.n+(s.retry?'<span class="retry">'+s.retry+'</span>':'')+'</span>'+
-        '<span class="pipe-status">DONE</span>'+
-        '<span class="pipe-time">'+s.t+'</span>'+
-        '<span class="pipe-dur">'+(s.d||'')+'</span></div>';
-    }).join('');
-  }
-  function renderDetails(host){
-    var rows = [
-      ['Target platform','WordPress + WP Job Manager + Elementor'],
-      ['Method','http_requests'],
-      ['Records extracted','3,512'],
-      ['Execution mode','Full'],
-      ['Started','Jul 21, 2026 · 09:36:36'],
-      ['Finished','Jul 21, 2026 · 09:40:48'],
-      ['Source','https://'+host]
-    ];
-    X('#details-kv').innerHTML = rows.map(function(r){ return '<div class="kv"><span class="kk">'+r[0]+'</span><span class="kv-v">'+r[1]+'</span></div>'; }).join('');
-  }
-  function renderTools(){
-    X('#toolcalls').innerHTML = TOOLCALLS.map(function(g){
-      var calls = g.calls.map(function(c){ return '<div class="tool-call"><span class="tc-name">'+c.name+'</span><span class="tc-res">'+c.res+'</span></div>'; }).join('');
-      return '<details class="tool-group"><summary><span class="tg-chev">'+icoChevR()+'</span>'+g.phase+'<span class="cnt">'+g.calls.length+' calls</span></summary>'+calls+'</details>';
-    }).join('');
-  }
-  function renderLog(){
-    X('#agent-log').innerHTML = LOG.map(function(l){ return '<div class="log-line"><span class="log-time">'+l.t+'</span><span class="log-lvl '+l.l+'">'+l.l.toUpperCase()+'</span><span class="log-msg">'+l.m+'</span></div>'; }).join('');
-  }
-  function renderRuns(){
-    X('#runs-body').innerHTML = RUNS.map(function(r){
-      return '<tr><td class="rmono">'+r.id+'</td><td>'+r.when+'</td><td><span class="run-status-ok">COMPLETED</span></td><td class="rmono">'+r.rows+'</td><td class="rmono">'+r.dur+'</td>'+
-        '<td><button class="mini-btn" data-dl="scraper" type="button" aria-label="Download scraper for run '+r.id+'" title="Download scraper.py">'+icoDlSm()+'</button></td>'+
-        '<td><button class="mini-btn" data-dl="output" type="button" aria-label="Download output for run '+r.id+'" title="Download output.json">'+icoDlSm()+'</button></td></tr>';
-    }).join('');
-  }
 
-  /* ---------- downloads ---------- */
+  /* ---------- downloads (real: scraper-code/dagster-code/output endpoints) ---------- */
   function download(name, text, mime){
     var b = new Blob([text], {type:mime||'text/plain'});
     var u = URL.createObjectURL(b);
@@ -1053,7 +1327,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
   }
   function fetchDownload(url, filename){
     if(!url) return;
-    fetch(url).then(function(r){ return r.text(); }).then(function(txt){ download(filename, txt); }).catch(function(){ /* not ready yet */ });
+    fetch(url).then(function(r){ if(!r.ok) return null; return r.text(); }).then(function(txt){ if(txt) download(filename, txt); }).catch(function(){ /* not ready yet */ });
   }
   function currentSampleJson(){ return X('#sample-json-view').textContent || '[]'; }
   // Output download: prefer the real output file (all records); fall back to the
@@ -1063,15 +1337,15 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
     else { download('output.json', currentSampleJson(), 'application/json'); }
   }
   X('#dl-output').addEventListener('click', downloadOutput);
-  X('#dl-scraper').addEventListener('click', function(){ fetchDownload(intakeState.job && intakeState.job.scraper_code_url, 'scraper.py'); });
-  X('#dl-scraper-2').addEventListener('click', function(){ fetchDownload(intakeState.job && intakeState.job.scraper_code_url, 'scraper.py'); });
+  X('#dl-extractor').addEventListener('click', function(){ fetchDownload(intakeState.job && intakeState.job.scraper_code_url, 'extractor.py'); });
+  X('#dl-extractor-2').addEventListener('click', function(){ fetchDownload(intakeState.job && intakeState.job.scraper_code_url, 'extractor.py'); });
   X('#dl-dagster').addEventListener('click', function(){ fetchDownload(intakeState.job && intakeState.job.dagster_code_url, 'dagster_asset.py'); });
   X('#dl-json').addEventListener('click', downloadOutput);
   X('#runs-body').addEventListener('click', function(e){
     var b = e.target.closest('[data-dl]'); if(!b) return;
     var url = b.getAttribute('data-url');
     if(!url) return;
-    if(b.dataset.dl === 'scraper') fetchDownload(url, 'scraper.py');
+    if(b.dataset.dl === 'extractor') fetchDownload(url, 'extractor.py');
     else fetchDownload(url, 'output.json');
   });
 
@@ -1079,7 +1353,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
   X('#adv-tabs').addEventListener('click', function(e){
     var b = e.target.closest('.tab'); if(!b) return;
     this.querySelectorAll('.tab').forEach(function(t){ t.classList.remove('on'); }); b.classList.add('on');
-    ['pipeline','details','scraper','dagster','output','tools','log'].forEach(function(k){
+    ['pipeline','details','extractor','dagster','output','tools','log'].forEach(function(k){
       X('#tab-'+k).classList.toggle('hidden', k !== b.dataset.tab);
     });
   });
@@ -1090,7 +1364,10 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
     if(!open) X('#adv-section').scrollIntoView({behavior:'smooth', block:'nearest'});
   });
 
-  /* ---------- assemble results ---------- */
+  /* ---------- assemble results — BLANK the panels ----------
+     The pipeline / details / tools / log / runs / code panels are populated
+     from the live job API by refreshJobData() once the build runs. (Do NOT
+     seed mock data here — it would flash bogus content and fake run history.) */
   function renderResults(){
     var host = hostFromExample() || 'the site';
     var url = X('#example-url').value.trim() || host;
@@ -1099,15 +1376,12 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
     X('#job-url').textContent = url;
     X('#job-url').href = /^https?:\/\//i.test(url) ? url : ('https://' + url);
     X('#job-when').textContent = new Date().toLocaleDateString(undefined, {month:'short', day:'numeric', year:'numeric'});
-    // Empty states — the pipeline / details / tools / log / runs are populated
-    // from the live job API by refreshJobData() once the build runs. (Do NOT
-    // seed mock data here — it would flash bogus content and fake run history.)
     X('#pipeline').innerHTML = '';
     X('#details-kv').innerHTML = '';
     X('#toolcalls').innerHTML = '';
     X('#agent-log').innerHTML = '';
     X('#runs-body').innerHTML = '';
-    X('#scraper-code').textContent = '';
+    X('#extractor-code').textContent = '';
     X('#dagster-code').textContent = '';
   }
 
@@ -1122,18 +1396,147 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
     var has = this.value.trim().length > 0;
     X('#rerun-btn-label').textContent = has ? 'Re-run with these changes' : 'Re-run as-is';
     X('#rerun-hint').textContent = has
-      ? 'Regenerates the scraper using your notes, then re-runs the sample.'
-      : 'No notes yet — this will re-run using the schema and navigation you\u2019ve set below.';
+      ? 'Regenerates the extractor using your notes, then re-runs the sample.'
+      : 'No notes yet — this will re-run using the schema and navigation you’ve set below.';
   });
+
+  /* ---------- schedule UI (DISABLED — coming soon; no fetch wired) ----------
+     The toggle/commit/freq/time inputs are disabled in the DOM. The wiring
+     below only keeps the labels in sync if the section is ever opened for
+     inspection — clicking commit is inert because the button is disabled. */
+  (function(){
+    var now = new Date();
+    var pad = function(n){ return String(n).padStart(2,'0'); };
+    var hh = pad(now.getHours()), mm = pad(now.getMinutes());
+    var iso = now.getFullYear()+'-'+pad(now.getMonth()+1)+'-'+pad(now.getDate());
+    var d = X('#sched-date'); if(d) d.value = iso;
+    ['sched-time-once','sched-time-hourly','sched-time-daily','sched-time-weekly','sched-time-monthly'].forEach(function(id){
+      var e = X('#'+id); if(e) e.value = hh+':'+mm;
+    });
+  })();
+  function schedFreq(){ var b = document.querySelector('#freq button.on'); return b ? b.dataset.v : 'now'; }
+  function dowSelected(){ var b = document.querySelector('#dow-select button.on'); return b ? b.dataset.d : 'Mon'; }
+  function scheduleLabel(f){
+    return { now:'Run now', once:'One-time', hourly:'Hourly', daily:'Daily', weekly:'Weekly', monthly:'Monthly' }[f] || 'Schedule';
+  }
+  function updateScheduleHint(){
+    var f = schedFreq(), hint = X('#schedule-hint');
+    if(!hint) return;
+    hint.textContent = 'Scheduling is coming soon.';
+  }
+
+  /* ---------- rename job title (display name only — #job-id-badge stays fixed) ---------- */
+  function startRenameJobTitle(){
+    var h1 = X('#job-title');
+    if(!h1 || h1.tagName !== 'H1') return; // already mid-edit
+    var original = h1.textContent;
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'job-title-input';
+    input.value = original;
+    input.setAttribute('aria-label', 'job name');
+    h1.replaceWith(input);
+    input.focus(); input.select();
+    var done = false;
+    function finish(save){
+      if(done) return; done = true;
+      var newTitle = save && input.value.trim() ? input.value.trim() : original;
+      var newH1 = document.createElement('h1');
+      newH1.id = 'job-title';
+      // Optimistically show the new title; revert only if the server rejects.
+      newH1.textContent = newTitle;
+      input.replaceWith(newH1);
+      if(save && newTitle !== original){
+        if(intakeState.jobId && INTAKE_CONFIG){
+          var fd = new FormData();
+          fd.append('title', newTitle);
+          postJSON('/jobs/'+intakeState.jobId+'/update/', fd).then(function(data){
+            if(data.error || data._status >= 400){
+              // Revert on failure.
+              var cur = X('#job-title'); if(cur) cur.textContent = original;
+            } else {
+              // Keep the new title; library cache will reflect on next refresh.
+            }
+          }).catch(function(){
+            var cur = X('#job-title'); if(cur) cur.textContent = original;
+          });
+        }
+      }
+    }
+    input.addEventListener('keydown', function(e){
+      if(e.key === 'Enter'){ e.preventDefault(); finish(true); }
+      else if(e.key === 'Escape'){ e.preventDefault(); finish(false); }
+    });
+    input.addEventListener('blur', function(){ finish(true); });
+  }
+  X('#job-rename-btn').addEventListener('click', startRenameJobTitle);
+
+  /* ---------- shared inline-rename for library rows (Jobs tab + Saved tab) ----------
+     Renames the display name only — each record's own id stays stable. Persists via
+     /jobs/<id>/update/ (title); DOM is updated only on success, reverted on failure. */
+  function wireRenameDelegation(containerId, getRecordById, onRenamed){
+    var container = X('#'+containerId);
+    if(!container) return;
+    container.addEventListener('click', function(e){
+      var btn = e.target.closest('.rename-btn'); if(!btn) return;
+      var wrap = btn.closest('.rename-wrap');
+      var textEl = wrap && wrap.querySelector('.rename-text');
+      var record = getRecordById(btn.dataset.id);
+      if(!record || !textEl) return;
+      var original = record.name;
+      var input = document.createElement('input');
+      input.type = 'text'; input.className = 'rename-input'; input.value = original;
+      wrap.replaceChild(input, textEl);
+      btn.style.visibility = 'hidden';
+      input.focus(); input.select();
+      var done = false;
+      function finish(save){
+        if(done) return; done = true;
+        var newName = save && input.value.trim() ? input.value.trim() : original;
+        // Restore the text element first (with the optimistic new name) so the
+        // row remains clickable; revert the record if the server rejects.
+        var span = document.createElement('span');
+        span.className = 'rename-text';
+        span.textContent = newName;
+        wrap.replaceChild(span, input);
+        btn.style.visibility = '';
+        if(save && newName !== original){
+          var fd = new FormData();
+          fd.append('title', newName);
+          postJSON('/jobs/'+record.id+'/update/', fd).then(function(data){
+            if(data.error || data._status >= 400){
+              record.name = original;
+              span.textContent = original;
+            } else {
+              record.name = newName;
+            }
+            onRenamed();
+          }).catch(function(){
+            record.name = original;
+            span.textContent = original;
+            onRenamed();
+          });
+        }
+      }
+      input.addEventListener('keydown', function(ev){
+        if(ev.key === 'Enter'){ ev.preventDefault(); finish(true); }
+        else if(ev.key === 'Escape'){ ev.preventDefault(); finish(false); }
+      });
+      input.addEventListener('blur', function(){ finish(true); });
+    });
+  }
 
   /* ---------- in-progress state (job status pill + gated buttons + cancel) ---------- */
   function icoSpinSm(){return '<svg class="spin-ico" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>';}
   function icoCancelSm(){return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18M6 6l12 12"/></svg>';}
-  var GATED_BTNS = ['dl-output','dl-scraper','run-full','rerun-btn'];
-  var runTimer = null;
+  // GATED_BTNS: toggle/commit are gated separately by refreshGates() (and Schedule
+  // is permanently disabled). dl-output, dl-extractor, and rerun-btn are gated by
+  // run-state here.
+  var GATED_BTNS = ['dl-output','dl-extractor','rerun-btn'];
   var runSnapshot = null;
 
   function setRunning(isRunning){
+    isRunningNow = isRunning;
     var pill = X('#job-status');
     GATED_BTNS.forEach(function(id){ var b = X('#'+id); if(b) b.disabled = isRunning; });
     X('#cancel-run-btn').classList.toggle('hidden', !isRunning);
@@ -1156,6 +1559,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       X('#json-expand-toggle').textContent = 'Expand';
       X('#json-expand-toggle').classList.remove('hidden');
     }
+    refreshGates();
   }
   X('#json-expand-toggle').addEventListener('click', function(){
     var view = X('#sample-json-view');
@@ -1170,6 +1574,8 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       var fd = new FormData();
       postJSON(intakeState.job.cancel_url, fd).catch(function(){});
     }
+    intakeState.terminal = true;
+    isRunningNow = false;
     GATED_BTNS.forEach(function(id){ var b = X('#'+id); if(b) b.disabled = false; });
     X('#cancel-run-btn').classList.add('hidden');
     var pill = X('#job-status');
@@ -1180,7 +1586,7 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
     X('#output-loading').classList.add('hidden');
     X('#output-content').classList.add('hidden');
     X('#json-expand-toggle').classList.add('hidden');
-    intakeState.terminal = true;
+    refreshGates();
   }
   X('#cancel-run-btn').addEventListener('click', cancelRun);
 
@@ -1210,8 +1616,10 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
     pill.className=cls; pill.innerHTML=icon+' '+lbl;
     if(isTerminal){
       intakeState.terminal=true;
+      isRunningNow = false;
       GATED_BTNS.forEach(function(id){ var b=X('#'+id); if(b) b.disabled=false; });
       X('#cancel-run-btn').classList.add('hidden');
+      if(typeof refreshGates === 'function'){ refreshGates(); }
       // A terminal status can arrive via an SSE 'status' event (not just 'done'),
       // which calls updateJobStatus but not the output-panel transition in
       // refreshJobData — and the poll loop stops on terminal. Trigger a refresh
@@ -1263,12 +1671,12 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       if(j.run_history && j.run_history.length){
         X('#runs-body').innerHTML = j.run_history.map(function(r){
           var st=(r.status||'').toUpperCase().replace(/_/g,' ');
-          var stCls = r.status==='completed' ? 'run-status-ok' : (['failed','cancelled','captcha_blocked','akamai_blocked'].indexOf(r.status)>=0 ? 'run-status-ok' : 'run-status-ok');
+          var stCls = r.status==='completed' ? 'run-status-ok' : (['failed','cancelled','captcha_blocked','akamai_blocked'].indexOf(r.status)>=0 ? 'run-status-fail' : 'run-status-ok');
           var when = r.when ? new Date(r.when).toLocaleString() : '—';
           var recs = (r.records!=null && r.records!==undefined) ? r.records : '—';
           var dur = (r.duration_seconds!=null) ? fmtDur(r.duration_seconds) : '—';
           var cur = r.current ? ' <span style="color:var(--accent)">(current)</span>' : '';
-          var scrBtn = r.scraper_url ? '<button class="mini-btn" data-dl="scraper" data-url="'+r.scraper_url+'" type="button" aria-label="Download scraper" title="Download scraper.py">'+icoDlSm()+'</button>' : '';
+          var scrBtn = r.scraper_url ? '<button class="mini-btn" data-dl="extractor" data-url="'+r.scraper_url+'" type="button" aria-label="Download extractor" title="Download extractor.py">'+icoDlSm()+'</button>' : '';
           var outBtn = r.output_url ? '<button class="mini-btn" data-dl="output" data-url="'+r.output_url+'" type="button" aria-label="Download output" title="Download output.json">'+icoDlSm()+'</button>' : '';
           return '<tr><td class="rmono">#'+r.id+cur+'</td><td>'+when+'</td><td><span class="'+stCls+'">'+st+'</span></td><td class="rmono">'+recs+'</td><td class="rmono">'+dur+'</td><td>'+scrBtn+'</td><td>'+outBtn+'</td></tr>';
         }).join('');
@@ -1312,10 +1720,10 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
           // Only a completed job has generated code. (Output is already shown
           // above via j.output_preview if it exists.)
           if(intakeState.job && intakeState.job.scraper_code_url){
-            fetch(intakeState.job.scraper_code_url).then(function(r){return r.text();}).then(function(t){ X('#scraper-code').textContent=t; }).catch(function(){});
+            fetch(intakeState.job.scraper_code_url).then(function(r){ if(!r.ok) return null; return r.text(); }).then(function(t){ if(t) X('#extractor-code').textContent=t; }).catch(function(){});
           }
           if(intakeState.job && intakeState.job.dagster_code_url){
-            fetch(intakeState.job.dagster_code_url).then(function(r){return r.text();}).then(function(t){ X('#dagster-code').textContent=t; }).catch(function(){});
+            fetch(intakeState.job.dagster_code_url).then(function(r){ if(!r.ok) return null; return r.text(); }).then(function(t){ if(t) X('#dagster-code').textContent=t; }).catch(function(){});
           }
           if(!j.output_preview){
             X('#sample-json-view').textContent='{"status":"completed","records":'+(j.product_count||0)+',"note":"No output file found."}';
@@ -1376,20 +1784,33 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
     fd.append('scope', scope);
     fd.append('scope_value', X('#scope-input').value.trim());
     fd.append('notes', X('#notes').value.trim());
-    if(navMethod==='list'){ fd.append('list_urls', X('#nav-list-text').value); }
-    else if(navMethod==='listing'){ fd.append('listing_urls', X('#nav-listing-text').value); }
-    else if(navMethod==='search'){ fd.append('search_keywords', X('#nav-search-kw').value); fd.append('search_url', X('#nav-search-url').value); }
+    if(navMethod==='list'){
+      // Prefer attached file lines; fall back to typed/pasted text.
+      if(listFileState && listFileState.lines.length){
+        fd.append('list_urls', listFileState.lines.join('\n'));
+      } else {
+        fd.append('list_urls', X('#nav-list-text').value);
+      }
+    } else if(navMethod==='listing'){
+      if(listingFileState && listingFileState.lines.length){
+        fd.append('listing_urls', listingFileState.lines.join('\n'));
+      } else {
+        fd.append('listing_urls', X('#nav-listing-text').value);
+      }
+    } else if(navMethod==='search'){ fd.append('search_keywords', X('#nav-search-kw').value); fd.append('search_url', X('#nav-search-url').value); }
     var btn = X('#run-sample'); btn.disabled = true;
     postJSON(INTAKE_CONFIG.createJobUrl, fd).then(function(data){
       btn.disabled = false;
       if(data.error){ showUrlError(data.error); return; }
       intakeState.job = data; intakeState.jobId = data.job_id; intakeState.terminal = false;
-      intakeState.timeStr = '—'; intakeState.recordsStr = '—';
+      intakeState.timeStr = '—'; intakeState.recordsStr = '—'; intakeState.cfgPopulated = true;
       X('#rerun-box').classList.add('hidden'); X('#rerun-toggle').setAttribute('aria-expanded','false');
       renderResults();
       X('#job-title').textContent = 'Job #' + data.job_id;
+      X('#job-id-badge').textContent = '#' + data.job_id;
       show('sample-screen'); stepState(2);
       setRunning(true);
+      captureConfigBaseline(); // re-baseline so the changed-badge resets after the create-job fires
       subscribeToJob(data);
     }).catch(function(err){ btn.disabled = false; showUrlError('Could not start the job (' + err + ').'); });
   }
@@ -1404,30 +1825,279 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       Object.keys(data).forEach(function(k){ intakeState.job[k]=data[k]; });
       intakeState.jobId = data.job_id; intakeState.terminal = false;
       X('#job-title').textContent = 'Job #' + data.job_id;
+      X('#job-id-badge').textContent = '#' + data.job_id;
       X('#rerun-box').classList.add('hidden'); X('#rerun-toggle').setAttribute('aria-expanded','false');
       setRunning(true);
+      captureConfigBaseline(); // re-baseline after a successful re-run kick-off
       subscribeToJob(data);
     }).catch(function(err){ X('#rerun-hint').textContent = 'Re-run failed (' + err + ').'; });
   });
 
-  /* ---------- deploy: export Dagster asset (full deploy is a future enhancement) ---------- */
-  X('#run-full').addEventListener('click', function(){
-    if(intakeState.job && intakeState.job.dagster_code_url){
-      fetchDownload(intakeState.job.dagster_code_url, 'dagster_asset.py');
-    } else {
-      X('#rerun-hint').textContent = 'Dagster code is generated after the build completes.';
-    }
+  /* ---------- generic busy → confirmed button flash (Save) ---------- */
+  function flashButton(btn, opts){
+    if(btn.dataset.busy === '1') return;
+    btn.dataset.busy = '1';
+    var origHTML = btn.innerHTML;
+    var reduce = window.matchMedia('(prefers-reduced-motion:reduce)').matches;
+    btn.disabled = true;
+    btn.classList.add('btn-busy');
+    btn.innerHTML = icoSpinSm() + ' ' + opts.busyLabel;
+    setTimeout(function(){
+      btn.classList.remove('btn-busy'); btn.classList.add('btn-confirmed');
+      btn.innerHTML = icoCheckSm() + ' ' + (typeof opts.confirmedLabel === 'function' ? opts.confirmedLabel() : opts.confirmedLabel);
+      if(opts.onConfirmed) opts.onConfirmed();
+      setTimeout(function(){
+        btn.classList.remove('btn-confirmed');
+        btn.innerHTML = origHTML;
+        btn.disabled = false;
+        btn.dataset.busy = '';
+        if(opts.onDone) opts.onDone();
+      }, reduce ? 300 : (opts.holdMs || 2200));
+    }, reduce ? 200 : (opts.busyMs || 1300));
+  }
+
+  /* ---------- save button → POST /jobs/<id>/update/ with current config ---------- */
+  X('#save-btn').addEventListener('click', function(){
+    if(!intakeState.jobId){ return; }
+    var saveBtn = this;
+    flashButton(saveBtn, {
+      busyLabel: 'Saving…',
+      confirmedLabel: 'Saved',
+      holdMs: 1800,
+      onConfirmed: function(){
+        var fd = new FormData();
+        fd.append('target_fields', fieldsArr.join(','));
+        var scope = (document.querySelector('input[name=scope]:checked')||{}).value || 'all';
+        fd.append('scope', scope);
+        fd.append('scope_value', X('#scope-input').value.trim());
+        fd.append('notes', X('#notes').value.trim());
+        var navMethod = (document.querySelector('input[name=nav]:checked')||{}).value;
+        if(navMethod === 'search'){
+          fd.append('search_criteria', X('#nav-search-kw').value);
+          fd.append('search_url', X('#nav-search-url').value);
+        } else if(navMethod === 'listing'){
+          fd.append('search_criteria', X('#nav-listing-text').value);
+        }
+        fd.append('is_saved', '1');
+        postJSON('/jobs/'+intakeState.jobId+'/update/', fd).then(function(data){
+          if(data.error || data._status >= 400){ return; }
+          X('#view-saved-wrap').classList.remove('hidden');
+          captureConfigBaseline(); // config is now persisted server-side — reset the changed-badge
+          refreshLibrary();
+        }).catch(function(){});
+      }
+    });
   });
+
+  /* ---------- library: Jobs tab + Saved Extractors (bootstrapped from /intake/jobs/) ---------- */
+  // SAVED_EXTRACTORS is the client-side cache for the Saved tab (filter: is_saved).
+  // ALL_JOBS is the same data unfiltered, for the Jobs tab. Both come from a single
+  // GET /intake/jobs/ on page load and after each save.
+  var SAVED_EXTRACTORS = [];
+  var ALL_JOBS = [];
+  var savedDomainFilter = '';
+
+  function siteOf(job){
+    // Prefer the server-provided site_name; fall back to the URL's hostname.
+    if(job.site_name) return job.site_name;
+    if(job.url){ try { return new URL(/^https?:\/\//i.test(job.url) ? job.url : ('https://'+job.url)).hostname.replace(/^www\./,''); } catch(_){ return job.url; } }
+    return 'the site';
+  }
+  function navLabelOf(job){
+    var m = {url_list:'exact list of URLs', list_page:'listing → detail', navigation:'listing → detail', search_term:'search + keywords'};
+    return m[job.input_mode] || 'listing → detail';
+  }
+  function relativeWhen(iso){
+    if(!iso) return '—';
+    var then = new Date(iso).getTime();
+    if(isNaN(then)) return '—';
+    var diff = Date.now() - then;
+    var sec = Math.round(diff/1000);
+    if(sec < 60) return 'just now';
+    var min = Math.round(sec/60);
+    if(min < 60) return min+'m ago';
+    var hr = Math.round(min/60);
+    if(hr < 24) return hr+'h ago';
+    var day = Math.round(hr/24);
+    if(day < 30) return day+'d ago';
+    return new Date(iso).toLocaleDateString(undefined, {month:'short', day:'numeric', year:'numeric'});
+  }
+  function jobToSaved(job){
+    return {
+      id: job.id,
+      ts: new Date(job.created_at||Date.now()).getTime(),
+      name: job.title || ('Job #'+job.id),
+      site: siteOf(job),
+      fields: Array.isArray(job.target_fields) ? job.target_fields : [],
+      nav: navLabelOf(job),
+      when: relativeWhen(job.created_at)
+    };
+  }
+  function refreshLibrary(){
+    if(!INTAKE_CONFIG.jobsLibraryUrl) return;
+    fetch(INTAKE_CONFIG.jobsLibraryUrl).then(function(r){ return r.json(); }).then(function(d){
+      var jobs = (d && d.jobs) || [];
+      ALL_JOBS = jobs.slice();
+      SAVED_EXTRACTORS = jobs.filter(function(j){ return j.is_saved; }).map(jobToSaved);
+      renderSavedList();
+      renderJobsLib();
+    }).catch(function(){ /* library will just stay empty */ });
+  }
+
+  function renderSavedList(){
+    var wrap = X('#saved-list');
+    var datalist = X('#saved-domain-options');
+    if(!wrap || !datalist) return;
+
+    if(!SAVED_EXTRACTORS.length){
+      datalist.innerHTML = '';
+      wrap.innerHTML = '<div class="saved-empty">No saved extractors yet — use Save on a job to add one here.</div>';
+      return;
+    }
+
+    var groups = {};
+    SAVED_EXTRACTORS.forEach(function(s){
+      (groups[s.site] = groups[s.site] || []).push(s);
+    });
+
+    // populate the combo box's suggestions with every known domain, alphabetically
+    var allDomains = Object.keys(groups).sort();
+    datalist.innerHTML = allDomains.map(function(d){ return '<option value="'+escHtml(d)+'">'; }).join('');
+
+    // order domain groups by most recent save within each domain (recency first)
+    var domains = allDomains.slice().sort(function(a, b){
+      var aMax = Math.max.apply(null, groups[a].map(function(s){ return s.ts || 0; }));
+      var bMax = Math.max.apply(null, groups[b].map(function(s){ return s.ts || 0; }));
+      return bMax - aMax;
+    });
+
+    var q = savedDomainFilter.trim().toLowerCase();
+    if(q) domains = domains.filter(function(d){ return d.toLowerCase().indexOf(q) > -1; });
+
+    if(!domains.length){
+      wrap.innerHTML = '<div class="saved-empty">No saved extractors match “'+escHtml(savedDomainFilter)+'”.</div>';
+      return;
+    }
+
+    wrap.innerHTML = domains.map(function(domain){
+      var items = groups[domain].slice().sort(function(a,b){ return (b.ts||0) - (a.ts||0); });
+      var count = items.length;
+      var rows = items.map(function(s){
+        var sfields = Array.isArray(s.fields) ? s.fields : [];
+        var fieldsStr = sfields.length ? sfields.join(', ') : 'no fields';
+        var fieldsDomId = 'sf-' + s.id;
+        var needsToggle = sfields.length > 4;
+        return '<div class="saved-item">'
+          + '<div class="saved-item-main">'
+          +   '<p class="saved-item-name"><span class="rename-wrap"><span class="rename-text">'+escHtml(s.name)+'</span>'
+          +     '<button class="rename-btn" type="button" data-id="'+escHtml(s.id)+'" title="Rename" aria-label="Rename saved extractor">'+icoEditSm()+'</button></span></p>'
+          +   '<div class="saved-item-meta">'
+          +     '<span class="saved-fields-list" id="'+fieldsDomId+'" title="'+escHtml(fieldsStr)+'">'+escHtml(fieldsStr)+'</span>'
+          +     (needsToggle ? '<button class="saved-fields-more" type="button" data-fields-toggle="'+fieldsDomId+'" data-fields-count="'+sfields.length+'">Show all ('+sfields.length+')</button>' : '')
+          +     '<span class="saved-nav">'+escHtml(s.nav)+'</span>'
+          +     '<span class="saved-when">saved '+escHtml(s.when)+'</span>'
+          +   '</div>'
+          + '</div>'
+          + '<button class="mini-btn" type="button" data-open="'+escHtml(s.id)+'">Open</button>'
+        + '</div>';
+      }).join('');
+      return '<details class="domain-group" open>'
+        + '<summary><span class="dg-chev">'+icoChevR()+'</span><span class="dg-domain">'+escHtml(domain)+'</span><span class="dg-count">'+count+(count===1?' extractor':' extractors')+'</span></summary>'
+        + '<div class="domain-items">'+rows+'</div>'
+      + '</details>';
+    }).join('');
+  }
+  X('#saved-domain-filter').addEventListener('input', function(){
+    savedDomainFilter = this.value;
+    renderSavedList();
+  });
+  X('#saved-list').addEventListener('click', function(e){
+    var t = e.target.closest('[data-fields-toggle]'); if(!t) return;
+    var el = document.getElementById(t.dataset.fieldsToggle);
+    if(!el) return;
+    var expanded = el.classList.toggle('expanded');
+    t.textContent = expanded ? 'Show less' : ('Show all (' + t.dataset.fieldsCount + ')');
+  });
+  function getSavedById(id){ return SAVED_EXTRACTORS.filter(function(s){ return String(s.id) === String(id); })[0]; }
+  wireRenameDelegation('saved-list', getSavedById, renderSavedList);
+
+  function renderJobsLib(){
+    var body = X('#jobs-lib-body');
+    if(!body) return;
+    if(!ALL_JOBS.length){
+      body.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--faint);padding:14px;font-family:var(--sans)">No jobs yet.</td></tr>';
+      return;
+    }
+    body.innerHTML = ALL_JOBS.map(function(j){
+      var status = (j.status||'').toUpperCase().replace(/_/g,' ');
+      var statusClass = j.status==='completed' ? 'run-status-ok' : (['failed','cancelled','captcha_blocked','akamai_blocked'].indexOf(j.status)>=0 ? 'run-status-fail' : 'run-status-ok');
+      var recs = (j.product_count!=null && j.product_count!==undefined) ? j.product_count : '—';
+      var dur = (j.duration_seconds!=null) ? fmtDur(j.duration_seconds) : '—';
+      var when = relativeWhen(j.created_at);
+      var name = j.title || ('Job #'+j.id);
+      return '<tr><td class="rmono">#'+j.id+'</td>'
+        + '<td><span class="rename-wrap"><span class="rename-text">'+escHtml(name)+'</span>'
+        +   '<button class="rename-btn" type="button" data-id="'+j.id+'" title="Rename" aria-label="Rename job">'+icoEditSm()+'</button></span></td>'
+        + '<td class="rmono">'+escHtml(siteOf(j))+'</td><td>'+escHtml(when)+'</td>'
+        + '<td><span class="'+statusClass+'">'+escHtml(status)+'</span></td>'
+        + '<td class="rmono">'+recs+'</td><td class="rmono">'+dur+'</td>'
+        + '<td><button class="mini-btn" type="button" data-open-job="'+j.id+'">Open</button></td></tr>';
+    }).join('');
+  }
+  function getJobById(id){ return ALL_JOBS.filter(function(j){ return String(j.id) === String(id); })[0]; }
+  wireRenameDelegation('jobs-lib-body', getJobById, renderJobsLib);
+  X('#jobs-lib-body').addEventListener('click', function(e){
+    var b = e.target.closest('[data-open-job]'); if(!b) return;
+    var id = b.getAttribute('data-open-job');
+    if(!id) return;
+    // Deep-link to the selected job and re-run the loader below.
+    history.pushState(null, '', '?job='+id);
+    loadDeepLinkedJob();
+  });
+  X('#saved-list').addEventListener('click', function(e){
+    var b = e.target.closest('[data-open]'); if(!b) return;
+    var id = b.getAttribute('data-open');
+    if(!id) return;
+    history.pushState(null, '', '?job='+id);
+    loadDeepLinkedJob();
+  });
+  function switchLibTab(tab){
+    document.querySelectorAll('#library-tabs .tab').forEach(function(t){ t.classList.toggle('on', t.dataset.libtab === tab); });
+    X('#libtab-jobs').classList.toggle('hidden', tab !== 'jobs');
+    X('#libtab-saved').classList.toggle('hidden', tab !== 'saved');
+  }
+  X('#library-tabs').addEventListener('click', function(e){
+    var b = e.target.closest('.tab'); if(!b) return;
+    switchLibTab(b.dataset.libtab);
+  });
+  function showLibrary(tab){
+    switchLibTab(tab || 'jobs');
+    X('#saved-back-label').textContent = lastPrimaryScreen === 'sample-screen' ? 'Back to job' : 'Back to setup';
+    show('saved-screen');
+  }
+  X('#view-saved-link').addEventListener('click', function(e){ e.preventDefault(); showLibrary('saved'); });
+  X('#topbar-saved-link').addEventListener('click', function(){ showLibrary('jobs'); });
+  X('#saved-back').addEventListener('click', function(){ show(lastPrimaryScreen); });
 
   X('#restart').addEventListener('click', function(){
     listFileState = null; renderListFileChip();
+    listingFileState = null; renderListingFileChip();
     X('#rerun-box').classList.add('hidden');
     X('#rerun-toggle').setAttribute('aria-expanded','false');
+    X('#schedule-box').classList.add('hidden');
+    X('#schedule-toggle').setAttribute('aria-expanded','false');
+    X('#schedule-toggle-label').textContent = 'Schedule';
+    X('#view-saved-wrap').classList.add('hidden');
+    configBaseline = null;
+    lastCheckedUrl = null;
+    intakeState.job = null; intakeState.jobId = null; intakeState.cfgPopulated = false;
+    updateConfigChangedIndicator();
     show('form-screen'); stepState(1);
+    refreshRunSampleGate();
   });
 
   /* ---------- deep link: /intake/?job=N opens the dashboard for an existing job ---------- */
-  (function(){
+  function loadDeepLinkedJob(){
     var m = /(?:\?|&)job=(\d+)/.exec(location.search);
     if(!m) return;
     var jid = m[1], n = parseInt(jid, 10);
@@ -1441,12 +2111,20 @@ input.input-invalid{border-color:var(--warn); box-shadow:0 0 0 3px var(--warn-bg
       cancel_url: '/jobs/'+jid+'/cancel/',
       restart_url: '/jobs/'+jid+'/restart/',
     };
-    intakeState.job = data; intakeState.jobId = n;
+    intakeState.job = data; intakeState.jobId = n; intakeState.terminal = false;
+    intakeState.cfgPopulated = false;
     X('#job-title').textContent = 'Job #'+jid;
+    X('#job-id-badge').textContent = '#'+jid;
     show('sample-screen'); stepState(2);
     setRunning(true);
     subscribeToJob(data);
-  })();
+  }
+  loadDeepLinkedJob();
+
+  /* ---------- boot ---------- */
+  refreshRunSampleGate();
+  updateScopeSampleNote();
+  refreshLibrary();
 })();
 </script>
 </body>

@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 from pathlib import Path
 import re
@@ -139,9 +140,26 @@ class ScrapeJob(models.Model):
     scraping_method = models.CharField(max_length=100, blank=True, default="")
     product_count = models.IntegerField(default=0)
     output_file = models.CharField(max_length=500, blank=True, default="")
+    # Per-job scraper/dagster artifact paths (attributed — each job remembers its
+    # own generated files, independent of the shared scrapers/{slug}/scraper.py
+    # which later jobs can overwrite). [per-job-attribution]
+    scraper_file = models.CharField(max_length=500, blank=True, default="")
+    dagster_file = models.CharField(max_length=500, blank=True, default="")
     site_folder = models.CharField(max_length=500, blank=True, default="")
     full_extraction = models.BooleanField(default=False)
     auto_queued = models.BooleanField(default=False)
+    # Jobs created from the intake UI skip ALL human-approval gates (they run
+    # unattended); homepage jobs keep the approval stage. [intake-ui]
+    skip_approvals = models.BooleanField(default=False)
+    # User-facing display name (rename) + library bookmark. Title falls back to
+    # "Job #<id>" in the UI when empty. [intake-revision]
+    title = models.CharField(max_length=200, blank=True, default="")
+    is_saved = models.BooleanField(default=False)
+    # Per-user ownership (nullable for system/auto-queued jobs).
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.CASCADE, related_name="scrape_jobs",
+    )
 
     # Intake UI (templates/scraper-intake.html) — user-facing knobs surfaced to
     # product_analyzer / code_writer as advisory hints. All default empty so

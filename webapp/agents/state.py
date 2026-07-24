@@ -28,6 +28,8 @@ class ScrapeState(TypedDict, total=False):
     currency: str
     sample_only: bool
     rescrape: bool
+    # Intake-UI jobs skip all human-approval gates (run unattended).
+    skip_approvals: bool
 
     # ── Content type ──────────────────────────────────────────────────
     page_type: str
@@ -97,6 +99,8 @@ class ScrapeState(TypedDict, total=False):
     # ── Execution metadata ─────────────────────────────────────────────
     execution_status: Annotated[str, _last_write_wins]
     output_file: Annotated[str, _last_write_wins]
+    # Per-job scraper artifact path (attributed; set by _invoke_cleanup).
+    scraper_path: Annotated[Optional[str], _last_write_wins]
     item_count: int
     product_count: int
     # discovery_coverage block read from the scraper output metadata during

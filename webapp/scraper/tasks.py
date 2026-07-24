@@ -468,6 +468,7 @@ def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
         "currency": job.currency or "",
         "sample_only": not job.full_extraction,
         "rescrape": False,
+        "skip_approvals": bool(job.skip_approvals),
         "page_type": page_type,
         "input_mode": input_mode,
         "site_type": site_type,
@@ -509,6 +510,41 @@ def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _prune_output_to_schema(output_file: str, allowed: set[str]) -> bool:
+    """Drop any per-record key not in ``allowed`` from the output JSON.
+
+    Operates on the first top-level key whose value is a list of dicts (the
+    records — e.g. ``products``/``jobs``); top-level ``site``/``metadata`` are
+    left intact. Rewrites the file in place. Returns True if any keys were
+    dropped. This is the deterministic, LLM-independent schema guarantee.
+    """
+    p = output_file if os.path.isabs(output_file) else os.path.join(
+        settings.PROJECT_ROOT, output_file
+    )
+    if not os.path.isfile(p):
+        return False
+    try:
+        with open(p, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return False
+    pruned = False
+    for key, val in list(data.items()):
+        if isinstance(val, list) and val and isinstance(val[0], dict):
+            before = set(val[0].keys())
+            data[key] = [
+                {k: v for k, v in rec.items() if k in allowed} for rec in val
+            ]
+            if set(data[key][0].keys()) != before:
+                pruned = True
+            break  # only the records list
+    if pruned:
+        with open(p, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+        logger.info("schema prune: trimmed output records to %d allowed fields", len(allowed))
+    return pruned
+
+
 def _finalize_job(job: ScrapeJob) -> None:
     """Read the final graph checkpoint and persist results to the job.
 
@@ -544,6 +580,12 @@ def _finalize_job(job: ScrapeJob) -> None:
     job.scraping_method = final_state.get("scraping_method", job.scraping_method)
     job.product_count = final_state.get("product_count", job.product_count)
     job.output_file = final_state.get("output_file", job.output_file)
+    # Per-job scraper/dagster attribution (set by _invoke_cleanup /
+    # _invoke_dagster_converter). Each job remembers its own generated files.
+    if final_state.get("scraper_path"):
+        job.scraper_file = final_state.get("scraper_path")
+    if final_state.get("dagster_path"):
+        job.dagster_file = final_state.get("dagster_path")
     job.site_name = final_state.get("site_name", job.site_name)
     job.site_folder = f"scrapers/{site_slug}" if site_slug else job.site_folder
     job.error_message = final_state.get("error_message", job.error_message)
@@ -689,6 +731,37 @@ def _finalize_job(job: ScrapeJob) -> None:
     else:
         job.status = ScrapeJob.STATUS_COMPLETED
 
+    # ── Enforce the requested schema (prune output + resolve for DB persist) ──
+    # target_fields is authoritative; falls back to the Site's stored DB schema
+    # (so re-runs of a schema'd site stay pruned). None → no schema → no prune.
+    _schema_fields: list[str] = []
+    _allowed_fields: set[str] | None = None
+    if job.status == ScrapeJob.STATUS_COMPLETED:
+        try:
+            from src.content_types import resolve_allowed_fields, schema_field_names
+            from scraper.models import Site as _Site
+
+            _site_for_schema = _Site.objects.filter(
+                url=job.url.rstrip("/")
+            ).first()
+            _db_os = (
+                (_site_for_schema.output_schema or {})
+                if _site_for_schema
+                else (final_state.get("output_schema") or {})
+            )
+            _schema_fields = schema_field_names(job.target_fields or [], _db_os)
+            _allowed_fields = resolve_allowed_fields(job.target_fields or [], _db_os)
+        except Exception as exc:
+            logger.warning("Job %d: schema resolve failed: %s", job.id, exc)
+
+    # Deterministic prune — the guarantee that the output matches the schema,
+    # regardless of what the agents extracted.
+    if _allowed_fields and job.output_file:
+        try:
+            _prune_output_to_schema(job.output_file, _allowed_fields)
+        except Exception as exc:
+            logger.warning("Job %d: schema prune failed: %s", job.id, exc)
+
     # ── Update Site model with ground truth ───────────────────────────
     if site_slug:
         try:
@@ -712,6 +785,47 @@ def _finalize_job(job: ScrapeJob) -> None:
                 if os.path.isfile(scraper_path):
                     db_site.has_scraper = True
                     db_site.default_scraper_path = scraper_path
+
+                # Persist the resolved schema to the DB (revives Site.output_schema
+                # as the integration point the older framework + future re-runs read).
+                if job.status == ScrapeJob.STATUS_COMPLETED and _schema_fields:
+                    try:
+                        from src.content_types import get_content_type, get_output_key_label
+
+                        _ct = get_content_type(job.page_type)
+                        _out_key, _ = get_output_key_label(job.page_type)
+                        db_site.output_schema = {
+                            "output_key": _out_key,
+                            "content_type": (_ct.name if _ct else ""),
+                            "fields": [{"name": f} for f in _schema_fields],
+                        }
+                    except Exception as exc:
+                        logger.warning("Job %d: Site.output_schema persist failed: %s", job.id, exc)
+
+                # Accumulate actual extracted fields across ALL runs (grows
+                # Site.fields_extracted with each completed job's output record
+                # keys — the union that check-site reads for historical lookup).
+                try:
+                    _out_path = job.output_file
+                    if _out_path and not os.path.isabs(_out_path):
+                        _out_path = os.path.join(settings.PROJECT_ROOT, _out_path)
+                    if _out_path and os.path.isfile(_out_path):
+                        with open(_out_path, "r", encoding="utf-8") as _fh:
+                            _out = json.load(_fh)
+                        for _ck in ("products", "jobs", "articles", "results", "items", "threads", "pages"):
+                            _items = _out.get(_ck)
+                            if isinstance(_items, list) and _items and isinstance(_items[0], dict):
+                                _existing = set(db_site.fields_extracted or [])
+                                db_site.fields_extracted = sorted(
+                                    _existing | set(_items[0].keys())
+                                )
+                                logger.info(
+                                    "Job %d: accumulated %d fields into Site.fields_extracted (total %d)",
+                                    job.id, len(_items[0]), len(db_site.fields_extracted),
+                                )
+                                break
+                except Exception:
+                    pass
 
                 db_site.save()
                 logger.info(
@@ -935,6 +1049,7 @@ def _do_schedule_next_site() -> dict:
         currency=new_site.currency or "",
         full_extraction=True,
         auto_queued=True,
+        user=None,  # system-queued job, no owner
     )
 
     new_site.status = "in_progress"

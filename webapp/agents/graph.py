@@ -711,10 +711,14 @@ def _get_project_root() -> str:
     return os.getcwd()
 
 
-def _archive_existing_scraper(slug: str) -> None:
-    """Archive the current scraper.py before cleanup overwrites it."""
+def _archive_existing_scraper(slug: str) -> str | None:
+    """Archive the current scraper.py before cleanup overwrites it.
+
+    Returns the archive path (or None if there was nothing to archive) so the
+    caller can restore the prior good scraper on a failed run.
+    """
     if not slug:
-        return
+        return None
     try:
         import shutil
         from datetime import datetime, timezone as dt_timezone
@@ -722,14 +726,76 @@ def _archive_existing_scraper(slug: str) -> None:
         root = _get_project_root()
         scraper_path = os.path.join(root, "scrapers", slug, "scraper.py")
         if not os.path.isfile(scraper_path):
-            return
+            return None
         ts = datetime.now(dt_timezone.utc).strftime("%Y-%m-%d_%H%M%S")
         archive_name = f"scraper-{slug}-{ts}.py"
         archive_path = os.path.join(root, "scrapers", slug, archive_name)
         shutil.copy2(scraper_path, archive_path)
         logger.info("_archive_existing_scraper: archived → %s", archive_name)
+        return archive_path
     except Exception as exc:
         logger.warning("_archive_existing_scraper: failed: %s", exc)
+        return None
+
+
+def _promote_scraper(
+    slug: str, job_id: int, execution_status: str, archive_path: str | None
+) -> str | None:
+    """Deterministic, failure-safe scraper finalization (replaces the LLM cp).
+
+    1. Always copy this job's `workspace/{slug}/scraper_draft.py` to a per-job
+       file `scrapers/{slug}/jobs/scraper-{job_id}.py` (attributed, survives
+       later jobs) — so each job's download is stable.
+    2. Promote to the production `scrapers/{slug}/scraper.py` ONLY when the job
+       succeeded. On non-success, leave production untouched and restore the
+       prior good scraper from the archive (defends against any stray clobber).
+
+    Returns the per-job scraper path (or None if no draft was produced).
+    """
+    if not slug:
+        return None
+    try:
+        import shutil
+
+        root = _get_project_root()
+        draft = os.path.join(root, "workspace", slug, "scraper_draft.py")
+        site_dir = os.path.join(root, "scrapers", slug)
+        jobs_dir = os.path.join(site_dir, "jobs")
+        per_job = os.path.join(jobs_dir, f"scraper-{job_id}.py")
+        production = os.path.join(site_dir, "scraper.py")
+
+        if os.path.isfile(draft):
+            os.makedirs(jobs_dir, exist_ok=True)
+            shutil.copy2(draft, per_job)
+            logger.info("_promote_scraper: per-job copy → jobs/scraper-%s.py", job_id)
+        else:
+            per_job = None
+
+        if execution_status == "SUCCESS":
+            if per_job and os.path.isfile(per_job):
+                os.makedirs(site_dir, exist_ok=True)
+                shutil.copy2(per_job, production)
+                logger.info(
+                    "_promote_scraper: SUCCESS → promoted to scraper.py (job %s)", job_id
+                )
+        else:
+            # Non-success: do NOT promote the (possibly broken) draft. Restore
+            # the prior good production scraper if anything clobbered it.
+            if archive_path and os.path.isfile(archive_path) and os.path.isfile(production):
+                shutil.copy2(archive_path, production)
+                logger.info(
+                    "_promote_scraper: non-SUCCESS → restored scraper.py from archive (job %s)",
+                    job_id,
+                )
+            logger.info(
+                "_promote_scraper: non-SUCCESS (execution_status=%s) → production "
+                "scraper.py left as-is (job %s)",
+                execution_status, job_id,
+            )
+        return per_job
+    except Exception as exc:
+        logger.warning("_promote_scraper: failed: %s", exc)
+        return None
 
 
 def _extract_previous_findings(
@@ -2447,6 +2513,63 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
 
 
 
+def _probe_phase1_discovery(slug: str, state: dict, job_id: int) -> tuple[bool, str | None]:
+    """Deterministically run the draft's Phase-1 discovery to catch discovery-path
+    bugs that ``--sample`` testing skips.
+
+    ``--sample`` scrapes pre-seeded URLs and never enters Phase 1, so a crash in
+    discovery/pagination (e.g. a hallucinated ``session.url``) sails through
+    testing and only blows up at execution. This probe runs
+    ``scraper_draft.py --discover-only --fresh-discovery`` (Phase 1 only, skips
+    the expensive Phase 2 extraction) and fails the test on a real crash.
+
+    Returns ``(crashed, traceback_tail)``. Timeouts / unsupported flags are
+    inconclusive (``crashed=False``) — we don't fail on slow or opaque discovery.
+    """
+    if not slug:
+        return False, None
+    # Only jobs with a discovery phase (nav modes); url_list has no Phase 1.
+    if state.get("input_mode") not in ("search_term", "list_page", "navigation"):
+        return False, None
+    import subprocess
+
+    try:
+        root = _get_project_root()
+        draft = os.path.join(root, "workspace", slug, "scraper_draft.py")
+        if not os.path.isfile(draft):
+            return False, None
+        # Only probe if the draft actually supports --discover-only (static AST check).
+        from agents.nodes.run_execution import _accepted_cli_flags
+
+        accepted = _accepted_cli_flags(draft)
+        if accepted is not None and "discover-only" not in accepted:
+            return False, None
+        logger.info("_probe_phase1_discovery: running --discover-only (job %s)", job_id)
+        proc = subprocess.run(
+            ["python3", draft, "--discover-only", "--fresh-discovery"],
+            cwd=os.path.join(root, "workspace", slug),
+            capture_output=True, text=True, timeout=180,
+        )
+        if proc.returncode != 0 and "Traceback" in (proc.stderr or ""):
+            lines = (proc.stderr or "").strip().splitlines()
+            tail = "\n".join(lines[-12:]) if lines else (proc.stderr or "")[:800]
+            logger.warning(
+                "_probe_phase1_discovery: CRASHED (job %s, rc=%s):\n%s",
+                job_id, proc.returncode, tail,
+            )
+            return True, tail
+        logger.info(
+            "_probe_phase1_discovery: OK (job %s, rc=%s)", job_id, proc.returncode
+        )
+    except subprocess.TimeoutExpired:
+        logger.info(
+            "_probe_phase1_discovery: timed out (job %s) — inconclusive", job_id
+        )
+    except Exception as exc:
+        logger.warning("_probe_phase1_discovery: errored (job %s): %s", job_id, exc)
+    return False, None
+
+
 def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
     job_id = state.get("job_id", 0)
     retry_count = state.get("test_retry_count", 0)
@@ -2493,6 +2616,32 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             logger.warning(
                 "_invoke_code_tester: no test_report found at workspace/%s/", slug
             )
+
+        # Deterministic Phase-1 discovery probe: catches discovery-path crashes
+        # that --sample testing skips (e.g. session.url phantom attributes). On a
+        # real crash, force the test to FAIL so route_after_testing retries
+        # code_writer with the traceback.
+        crashed, tb = _probe_phase1_discovery(slug, dict(state), job_id)
+        if crashed:
+            report = report or {}
+            report["overall_assessment"] = "FAIL"
+            report["confidence_score"] = 0.0
+            report["ready_for_execution"] = False
+            report.setdefault("issues", []).insert(
+                0, {"severity": "high", "message": "Phase-1 discovery crashed: " + (tb or "")}
+            )
+            report["feedback_for_writer"] = (
+                "PHASE-1 DISCOVERY CRASH — caught by the deterministic discovery "
+                "probe (which --sample skips, since --sample uses pre-seeded URLs "
+                "and never enters Phase 1):\n" + (tb or "")
+                + "\nFix the discovery/pagination code. Do NOT re-signature the "
+                "template's helpers or reference nonexistent attributes (e.g. "
+                "`session.url` — capture the URL from the response instead)."
+            )
+            update["test_report"] = report
+            logger.warning(
+                "_invoke_code_tester: discovery probe FAILED the test (job %s) → retry", job_id
+            )
         return update
     except Exception:
         _notify_phase(job_id, "code_tester", "failed")
@@ -2510,7 +2659,9 @@ def _invoke_cleanup(state: ScrapeState, config: RunnableConfig) -> dict[str, Any
         logger.info("_invoke_cleanup: starting (job %s)", job_id)
 
         slug = state.get("site_slug", "")
-        _archive_existing_scraper(slug)
+        # Archive the current production scraper BEFORE the agent runs, so we can
+        # restore it on failure (the agent used to clobber it unconditionally).
+        archive_path = _archive_existing_scraper(slug)
 
         messages = build_cleanup_message(state)
         _log_agent_context(state, "cleanup", messages)
@@ -2519,8 +2670,17 @@ def _invoke_cleanup(state: ScrapeState, config: RunnableConfig) -> dict[str, Any
             {"messages": messages}, config=_agent_config(config, "cleanup")
         )
         _persist_agent_logs(state, result, "cleanup", config)
+
+        # Deterministic, failure-safe scraper promotion (the agent no longer cp's
+        # scraper.py — see build_cleanup_message). Per-job copy + success gate.
+        scraper_path = _promote_scraper(
+            slug, job_id, state.get("execution_status", ""), archive_path
+        )
         _notify_phase(job_id, "cleanup", "done")
-        return {"messages": []}
+        out: dict[str, Any] = {"messages": []}
+        if scraper_path:
+            out["scraper_path"] = scraper_path
+        return out
     except Exception:
         _notify_phase(job_id, "cleanup", "failed")
         raise
@@ -2673,16 +2833,29 @@ def _invoke_dagster_converter(
                         slug, "; ".join(_unresolved[:3]),
                     )
                 else:
-                    # Copy to scrapers/ (persistent — survives workspace cleans)
-                    os.makedirs(os.path.dirname(scrapers_dagster), exist_ok=True)
+                    # Per-job copy (attributed, survives later jobs) always;
+                    # promote to the production {slug}_dagster.py only on success
+                    # (mirrors _promote_scraper — don't clobber a good dagster
+                    # file with a failed job's output).
                     import shutil
-                    shutil.copy2(ws_dagster, scrapers_dagster)
-                    logger.info(
-                        "_invoke_dagster_converter: generated %s_dagster.py "
-                        "(syntax + import OK, copied to scrapers/)",
-                        slug,
-                    )
-                    return {"messages": [], "dagster_path": scrapers_dagster}
+                    jobs_dir = os.path.join(root, "scrapers", slug, "jobs")
+                    os.makedirs(jobs_dir, exist_ok=True)
+                    per_job_dagster = os.path.join(jobs_dir, f"dagster-{job_id}.py")
+                    shutil.copy2(ws_dagster, per_job_dagster)
+                    if state.get("execution_status") == "SUCCESS":
+                        os.makedirs(os.path.dirname(scrapers_dagster), exist_ok=True)
+                        shutil.copy2(per_job_dagster, scrapers_dagster)
+                        logger.info(
+                            "_invoke_dagster_converter: SUCCESS → promoted %s_dagster.py (job %s)",
+                            slug, job_id,
+                        )
+                    else:
+                        logger.info(
+                            "_invoke_dagster_converter: non-SUCCESS → %s_dagster.py "
+                            "left as-is, per-job copy at jobs/dagster-%s.py",
+                            slug, job_id,
+                        )
+                    return {"messages": [], "dagster_path": per_job_dagster}
             except SyntaxError as exc:
                 logger.warning(
                     "_invoke_dagster_converter: %s_dagster.py has syntax error: %s",

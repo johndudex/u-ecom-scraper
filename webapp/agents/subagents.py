@@ -122,7 +122,7 @@ def _build_content_type_context(state: dict) -> str:
     return "\n".join(lines) + "\n\n"
 
 
-def _summarize_product_analysis(pa: dict) -> str:
+def _summarize_product_analysis(pa: dict, allowed: set[str] | None = None) -> str:
     """Complete-but-lean summary of product_analysis for code_writer.
 
     Replaces ``read_file`` of the full product_analysis.json (20K+). Includes
@@ -149,6 +149,14 @@ def _summarize_product_analysis(pa: dict) -> str:
     fields = pa.get("fields") or {}
     if not isinstance(fields, dict) or not fields:
         return ""
+    # Schema enforcement: when a requested schema exists, narrow the Field
+    # Extraction Map to it (code_writer can't emit what it can't see). If the
+    # schema has no overlap with the mapped fields, leave the map unchanged
+    # (the gap is surfaced by validate_coverage).
+    if allowed:
+        _filtered = {k: v for k, v in fields.items() if k in allowed}
+        if _filtered:
+            fields = _filtered
     lines = ["\n### Product Analysis (COMPLETE summary — do NOT read the file)\n"]
     # Per-field extraction map (compact). Cap at core + top-12 non-core to keep
     # the generated scraper concise (35+ fields → 972-line scraper blows up context).
@@ -1119,11 +1127,12 @@ def _fetch_rendered_jsonld(url: str) -> str:
 
 
 def _user_requirements_section(state: dict) -> str:
-    """Advisory block: surface intake-UI field chips + notes to the agent.
+    """Surface intake-UI field chips + notes to the agent.
 
-    The pipeline still infers the real field map from page analysis — these are
-    HINTS, not constraints (intake jobs use advisory mode). Returns "" for jobs
-    that came from the legacy home view (no target_fields / user_notes).
+    When the user specified fields (target_fields), the schema is ENFORCED:
+    extract ONLY those (+ standard bookkeeping); extra fields are pruned from
+    the output. With only notes (no fields) it stays advisory. Returns "" for
+    jobs with neither (legacy home view).
     """
     target_fields = state.get("target_fields") or []
     notes = (state.get("user_notes") or "").strip()
@@ -1134,6 +1143,16 @@ def _user_requirements_section(state: dict) -> str:
         parts.append("User notes: " + notes)
     if not parts:
         return ""
+    if target_fields:
+        return (
+            "### User Requirements (schema — ENFORCE)\n"
+            + "\n".join(parts)
+            + "\n\nThe user requires ONLY these fields. Map and extract exactly "
+            "them (the standard bookkeeping fields — url, src_url, scraped_at, "
+            "status_code — are always kept automatically). Do NOT include any "
+            "other fields the page exposes; extras are pruned from the final "
+            "output. If a requested field is absent on the page, omit it.\n\n"
+        )
     return (
         "### User Requirements (advisory)\n"
         + "\n".join(parts)
@@ -2918,7 +2937,19 @@ def build_code_writer_message(state: dict) -> list:
     # 8K, scraper_analysis 4K) bloat the conversation past the context budget and
     # thrash truncation — these summaries carry every extraction method/selector
     # and discovery mechanic losslessly at ~10x smaller. [code_writer bloat]
-    pa_summary = _summarize_product_analysis(state.get("product_analysis") or {})
+    # Schema enforcement: narrow the field map to the requested schema so the
+    # generated scraper only extracts what the user asked for.
+    try:
+        from src.content_types import resolve_allowed_fields
+
+        _cw_allowed = resolve_allowed_fields(
+            state.get("target_fields") or [], state.get("output_schema") or {}
+        )
+    except Exception:
+        _cw_allowed = None
+    pa_summary = _summarize_product_analysis(
+        state.get("product_analysis") or {}, allowed=_cw_allowed
+    )
     if pa_summary:
         pa_summary += (
             "\n### DO NOT read_file the analysis JSONs\n"
@@ -2931,6 +2962,18 @@ def build_code_writer_message(state: dict) -> list:
     _user_req = _user_requirements_section(state)
     if _user_req:
         content = _user_req + content
+    # Reinforce template-fidelity for discovery/pagination (prevents execution-time
+    # crashes that --sample testing can't see — e.g. session.url phantom attributes).
+    content = (
+        "\n### Template fidelity — discovery & pagination\n"
+        "Do NOT re-signature or redefine the template's discovery/pagination helpers "
+        "(`_get_next_page_url`, `_discover_urls_via_*`, `_fetch_html`, checkpoint "
+        "load/save). Call them exactly as the template does. NEVER reference attributes "
+        "that don't exist on an object — `requests.Session`/`httpx.Client` have NO `.url`; "
+        "capture the current URL from the response (`final_url = str(resp.url)`) and pass "
+        "the string. A scratch run exercises Phase 1 discovery end-to-end; a wrong call "
+        "there crashes the job at execution even though --sample passed.\n"
+    ) + content
     return [HumanMessage(content=content)]
 
 
@@ -3191,10 +3234,10 @@ def build_cleanup_message(state: dict) -> list:
         f"**Save cleanup report to:** workspace/{slug}/cleanup_report.json\n\n"
         f"### Workflow\n"
         f"1. Use `run_bash` to copy files (NOT read_file — you don't need to read their contents):\n"
-        f"   - `cp workspace/{slug}/scraper_draft.py scrapers/{slug}/scraper.py`\n"
         f"   - `cp workspace/{slug}/input_urls.json scrapers/{slug}/input_urls.json` (if it exists)\n"
         f"   - `cp workspace/{slug}/output_*.json scrapers/{slug}/` (if any exist)\n"
         f"   - `cp -r workspace/{slug}/analysis scrapers/{slug}/analysis` (if it exists)\n"
+        f"   - Do NOT copy scraper_draft.py → scraper.py yourself; the pipeline promotes the scraper deterministically (and only on success).\n"
         f"2. Use `search_files` to list what's in the workspace (NOT read_file).\n"
         f"3. write_file to save cleanup report (1 call).\n\n"
         f"### BUDGET: 10 tool calls maximum.\n\n"

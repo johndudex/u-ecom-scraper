@@ -107,7 +107,13 @@ From the probe result's selector tests and JSON-LD data, map each field:
 
 ### 5. Field Extraction Plan
 
-Map these standard output fields (extract WHATEVER IS AVAILABLE):
+> **If the message includes a "User Requirements (schema — ENFORCE)" block,
+> map ONLY those requested fields** (+ the standard bookkeeping fields are
+> always added automatically). Skip the broad extraction below — the output is
+> pruned to the requested schema regardless, so don't waste effort on extras.
+
+Map these standard output fields (extract WHATEVER IS AVAILABLE, unless a
+schema is enforced above):
 
 | Field | Type | Description | Look For |
 |-------|------|-------------|----------|

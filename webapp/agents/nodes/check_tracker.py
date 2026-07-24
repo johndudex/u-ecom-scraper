@@ -104,9 +104,9 @@ def check_tracker(state: ScrapeState) -> Command:
             goto="setup_workspace",
         )
     if site.status == "complete":
-        return _handle_complete(site, slug, full_extraction)
+        return _handle_complete(site, slug, full_extraction, state.get("skip_approvals", False))
     if site.status == "failed":
-        return _handle_failed(site, slug)
+        return _handle_failed(site, slug, state.get("skip_approvals", False))
     if site.status == "in_progress":
         if rescrape:
             logger.info(
@@ -164,8 +164,18 @@ def _handle_new_site(url: str, slug: str, site_type: str = "shopping") -> Comman
     )
 
 
-def _handle_complete(site, slug: str, full_extraction: bool) -> Command:
+def _handle_complete(site, slug: str, full_extraction: bool, skip: bool = False) -> Command:
     logger.info("check_tracker: site '%s' already complete", slug)
+
+    # Intake jobs run unattended — skip the re-scrape confirmation, proceed.
+    if skip:
+        logger.info("check_tracker: skip_approvals → auto re-scrape '%s'", slug)
+        site.status = "in_progress"
+        site.save(update_fields=["status"])
+        return Command(
+            update={"site_status": "in_progress", "human_response": {"decision": "approve"}},
+            goto="setup_workspace",
+        )
 
     if full_extraction:
         return Command(
@@ -210,8 +220,18 @@ def _handle_complete(site, slug: str, full_extraction: bool) -> Command:
     )
 
 
-def _handle_failed(site, slug: str) -> Command:
+def _handle_failed(site, slug: str, skip: bool = False) -> Command:
     logger.info("check_tracker: site '%s' previously failed, asking user", slug)
+
+    # Intake jobs run unattended — skip the retry confirmation, proceed.
+    if skip:
+        logger.info("check_tracker: skip_approvals → auto retry '%s'", slug)
+        site.status = "in_progress"
+        site.save(update_fields=["status"])
+        return Command(
+            update={"site_status": "in_progress", "human_response": {"decision": "approve"}},
+            goto="setup_workspace",
+        )
 
     human_response = interrupt({
         "reason": "retry_failed",

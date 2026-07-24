@@ -62,6 +62,27 @@ extraction functions** with the field map provided — NOT to rewrite the templa
 If the template has `_extract_item(html, url)` or similar, replace ITS BODY with
 the field map's selectors/methods. Keep the function signature + all surrounding code.
 
+### Discovery & pagination helpers — DO NOT re-signature (CRITICAL)
+
+The template's Phase-1 discovery and pagination helpers (`_discover_urls_via_search`,
+`_discover_urls_via_form_search`, `_discover_urls_via_category`, `_get_next_page_url`,
+`_fetch_html`, `_http_get`, `_http_post`, the checkpoint load/save, etc.) are **correct
+as written**. Three hard rules:
+
+1. **Never redefine or change a template function's signature.** If the template
+   defines `_get_next_page_url(final_url, next_page_num, html)`, you MUST call it with
+   exactly those arguments. Do not invent a different signature like
+   `_get_next_page_url(html, current_url)`.
+2. **Never reference an attribute you have not seen defined on that object.**
+   `requests.Session` / `httpx.Client` have **no `.url` attribute** — the current URL
+   lives on the *response* (`resp.url`) or must be captured into a string variable
+   (`final_url = str(resp.url)`). When a helper needs the current URL, capture it from
+   the response and pass the string — never `session.url` / `client.url`.
+3. **Preserve the template's discovery/pagination call sites verbatim** — change only
+   selectors, field names, and the extraction body. A scratch run executes Phase 1
+   discovery end-to-end; a wrong call there crashes the whole job at execution time
+   even though `--sample` (which skips discovery) passed testing.
+
 ## Output Contract
 
 - **Save to:** `workspace/{slug}/scraper_draft.py`

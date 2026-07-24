@@ -95,7 +95,7 @@ def home(request):
             "form_currency": currency,
             "form_page_type": page_type,
             "form_search_criteria": search_criteria,
-            "recent_jobs": ScrapeJob.objects.all()[:10],
+            "recent_jobs": ScrapeJob.objects.filter(user=request.user)[:10],
             "content_types": content_types,
         }
 
@@ -104,7 +104,8 @@ def home(request):
             return render(request, "scraper/home.html", context)
 
         existing = ScrapeJob.objects.filter(
-            url=url, status__in=[ScrapeJob.STATUS_PENDING, ScrapeJob.STATUS_RUNNING]
+            url=url, status__in=[ScrapeJob.STATUS_PENDING, ScrapeJob.STATUS_RUNNING],
+            user=request.user,
         ).first()
         if existing:
             context["error"] = (
@@ -131,6 +132,7 @@ def home(request):
             page_type=page_type,
             input_mode=input_mode,
             search_criteria=search_criteria,
+            user=request.user,
         )
 
         from .tasks import run_scrape_task
@@ -140,13 +142,13 @@ def home(request):
         job.save(update_fields=["celery_task_id"])
         return redirect("job_detail", job_id=job.id)
 
-    recent_jobs = ScrapeJob.objects.all()[:10]
+    recent_jobs = ScrapeJob.objects.filter(user=request.user)[:10]
     return render(request, "scraper/home.html", {"recent_jobs": recent_jobs, "content_types": content_types})
 
 
 @login_required
 def job_list(request):
-    jobs = ScrapeJob.objects.prefetch_related("steps", "approvals")[:]
+    jobs = ScrapeJob.objects.filter(user=request.user).prefetch_related("steps", "approvals")[:]
     active_statuses = {
         ScrapeJob.STATUS_RUNNING,
         ScrapeJob.STATUS_WAITING_APPROVAL,
@@ -172,7 +174,7 @@ def job_list(request):
 
 @login_required
 def job_detail(request, job_id):
-    job = get_object_or_404(ScrapeJob, pk=job_id)
+    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
     steps = _ordered_steps(job)
     for step in steps:
         if step.started_at and step.completed_at:
@@ -317,7 +319,7 @@ def job_detail(request, job_id):
 
 @login_required
 def job_cancel(request, job_id):
-    job = get_object_or_404(ScrapeJob, pk=job_id)
+    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
     if job.status in [
         ScrapeJob.STATUS_PENDING,
         ScrapeJob.STATUS_RUNNING,
@@ -337,9 +339,30 @@ def job_cancel(request, job_id):
     return redirect("job_detail", job_id=job.id)
 
 
+def _resolve_stored_path(stored: str) -> str | None:
+    """Resolve a job's stored artifact path (scraper_file/dagster_file) to an
+    absolute path that exists, or None. Handles absolute (/app/...) + relative.
+    """
+    if not stored:
+        return None
+    p = stored if os.path.isabs(stored) else os.path.join(settings.PROJECT_ROOT, stored)
+    return p if os.path.isfile(p) else None
+
+
 @login_required
 def scraper_code(request, job_id):
-    job = get_object_or_404(ScrapeJob, pk=job_id)
+    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+
+    # Per-job attribution: this job's own scraper (if recorded) wins over the
+    # shared scrapers/{slug}/scraper.py (which later jobs may overwrite).
+    own = _resolve_stored_path(job.scraper_file)
+    if own:
+        with open(own, "r") as f:
+            content = f.read()
+        slug = _resolve_job_slug(job) or "scraper"
+        resp = HttpResponse(content, content_type="text/x-python")
+        resp["Content-Disposition"] = f'attachment; filename="{slug}_scraper.py"'
+        return resp
 
     slug_candidates = []
     if job.site_folder:
@@ -368,7 +391,16 @@ def scraper_code(request, job_id):
 @login_required
 def dagster_code(request, job_id):
     """Download the Dagster-format scraper ({slug}_dagster.py)."""
-    job = get_object_or_404(ScrapeJob, pk=job_id)
+    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    # Per-job attribution first (this job's own dagster file).
+    own = _resolve_stored_path(job.dagster_file)
+    if own:
+        with open(own, "r") as f:
+            content = f.read()
+        slug = _resolve_job_slug(job) or "scraper"
+        resp = HttpResponse(content, content_type="text/x-python")
+        resp["Content-Disposition"] = f'attachment; filename="{slug}_dagster.py"'
+        return resp
     slug = _resolve_job_slug(job)
     if not slug:
         return HttpResponseNotFound("Could not resolve site slug")
@@ -404,7 +436,7 @@ def _resolve_job_slug(job):
 
 @login_required
 def job_output_view(request, job_id, filename):
-    job = get_object_or_404(ScrapeJob, pk=job_id)
+    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
     safe_name = os.path.basename(filename)
     if not safe_name.endswith(".json"):
         raise Http404("Only JSON files can be viewed")
@@ -450,7 +482,7 @@ def job_output_view(request, job_id, filename):
 
 @login_required
 def job_output_download(request, job_id, filename):
-    job = get_object_or_404(ScrapeJob, pk=job_id)
+    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
     safe_name = os.path.basename(filename)
     if not safe_name.endswith(".json"):
         raise Http404("Only JSON files can be downloaded")
@@ -472,7 +504,7 @@ def job_output_download(request, job_id, filename):
 
 @login_required
 def job_restart(request, job_id):
-    job = get_object_or_404(ScrapeJob, pk=job_id)
+    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
     is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
     if job.status in [
         ScrapeJob.STATUS_COMPLETED,
@@ -494,6 +526,7 @@ def job_restart(request, job_id):
             scope_value=job.scope_value,
             notes=(rerun_prompt or job.notes),
             full_extraction=job.full_extraction,
+            user=request.user,
         )
 
         from .tasks import run_scrape_task
@@ -521,6 +554,57 @@ def job_restart(request, job_id):
     return redirect("job_detail", job_id=job.id)
 
 
+@login_required
+def job_update(request, job_id):
+    """AJAX: in-place update of a ScrapeJob's mutable fields.
+
+    The first generic job-mutation endpoint — hosts rename (title), config-save
+    (target_fields/scope/notes/nav), and bookmark (is_saved). Strict allowlist;
+    unknown fields are ignored.
+    """
+    if request.method != "POST" or request.headers.get("x-requested-with") != "XMLHttpRequest":
+        return JsonResponse({"error": "POST + AJAX required"}, status=400)
+    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    update_fields = []
+
+    if "title" in request.POST:
+        job.title = (request.POST.get("title") or "").strip()[:200]
+        update_fields.append("title")
+
+    if "target_fields" in request.POST:
+        tf = (request.POST.get("target_fields") or "").strip()
+        job.target_fields = [f.strip() for f in tf.split(",") if f.strip()] if tf else []
+        update_fields.append("target_fields")
+
+    for fld in ("scope", "scope_value", "notes", "search_criteria", "search_url"):
+        if fld in request.POST:
+            setattr(job, fld, (request.POST.get(fld) or "").strip())
+            update_fields.append(fld)
+
+    if "is_saved" in request.POST:
+        v = (request.POST.get("is_saved") or "").strip().lower()
+        job.is_saved = v in ("1", "true", "yes", "on")
+        update_fields.append("is_saved")
+
+    if update_fields:
+        job.save(update_fields=update_fields)
+        logger.info("job_update: job %d updated %s", job.id, update_fields)
+
+    return JsonResponse(
+        {
+            "id": job.id,
+            "title": job.title,
+            "is_saved": job.is_saved,
+            "target_fields": job.target_fields,
+            "scope": job.scope,
+            "scope_value": job.scope_value,
+            "notes": job.notes,
+            "search_criteria": job.search_criteria,
+            "search_url": job.search_url,
+        }
+    )
+
+
 def _build_resume_value(approval: Approval, choice: str, feedback: str) -> dict:
     response_data = approval.response_data or {}
     decisions = response_data.get("decisions", [])
@@ -540,7 +624,7 @@ def _build_resume_value(approval: Approval, choice: str, feedback: str) -> dict:
 
 @login_required
 def approval_inline(request, job_id, approval_id):
-    approval = get_object_or_404(Approval, pk=approval_id, job_id=job_id)
+    approval = get_object_or_404(Approval, pk=approval_id, job_id=job_id, job__user=request.user)
     choice = request.POST.get("choice", "")
     feedback = request.POST.get("feedback", "").strip()
 
@@ -587,7 +671,7 @@ def pending_approvals_fragment(request, job_id):
 @login_required
 def approval_list(request):
     approvals = (
-        Approval.objects.filter(status=Approval.STATUS_PENDING)
+        Approval.objects.filter(status=Approval.STATUS_PENDING, job__user=request.user)
         .select_related("job")
         .order_by("-created_at")
     )
@@ -596,13 +680,13 @@ def approval_list(request):
 
 @login_required
 def approval_count(request):
-    count = Approval.objects.filter(status=Approval.STATUS_PENDING).count()
+    count = Approval.objects.filter(status=Approval.STATUS_PENDING, job__user=request.user).count()
     return JsonResponse({"count": count})
 
 
 @login_required
 def approval_detail(request, approval_id):
-    approval = get_object_or_404(Approval, pk=approval_id)
+    approval = get_object_or_404(Approval, pk=approval_id, job__user=request.user)
     if request.method == "POST":
         choice = request.POST.get("choice", "")
         feedback = request.POST.get("feedback", "").strip()
@@ -634,9 +718,13 @@ def approval_detail(request, approval_id):
 
 @login_required
 def scraper_code_json(request, job_id):
-    job = get_object_or_404(ScrapeJob, pk=job_id)
+    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
     scraper_path = None
-    if job.site_folder:
+    # Per-job attribution first.
+    own = _resolve_stored_path(job.scraper_file)
+    if own:
+        scraper_path = own
+    elif job.site_folder:
         candidate = os.path.join("scrapers", job.site_folder.removeprefix("scrapers/"), "scraper.py")
         if os.path.isfile(candidate):
             scraper_path = candidate
@@ -653,19 +741,23 @@ def scraper_code_json(request, job_id):
     return JsonResponse({"path": scraper_path, "code": code})
 
 
-def _job_output_preview(job) -> dict | None:
-    """Latest extracted output for a job, for the intake Sample Output card.
+def _resolve_job_output(job):
+    """Return (site_dir, filename) for THIS job's output file, or (None, None).
 
-    Returns {filename, output_key, item_label, count, records (first 3),
-    download_url} or None when no output exists yet. Caps records so the
-    job_api payload stays small (full output is via download_url). Looks in
-    scrapers/{slug} first, then workspace/{slug} (output exists mid-run before
-    cleanup finalizes the scraper folder).
+    All runs for a site share one scrapers/{slug}/ dir, so picking the newest
+    file there would show another job's output. We prefer the job's own
+    `output_file` (authoritative); else the newest output_*.json whose timestamp
+    falls within this job's run window (matching job_detail's logic).
     """
+    # 1. authoritative output_file
+    of = (job.output_file or "").strip()
+    if of:
+        cand = of if os.path.isabs(of) else os.path.join(settings.PROJECT_ROOT, of)
+        if os.path.isfile(cand):
+            return os.path.dirname(cand), os.path.basename(cand)
+    # 2. slug dir + started_at window
     slug = _resolve_job_slug(job)
     if not slug:
-        # Running jobs haven't had site_folder/site_name set by cleanup yet —
-        # derive the slug the same way the workspace/scrapers dirs are named.
         try:
             from .tasks import _generate_slug
 
@@ -673,22 +765,54 @@ def _job_output_preview(job) -> dict | None:
         except Exception:
             slug = ""
     if not slug:
-        return None
+        return None, None
     site_dir = None
     for base in ("scrapers", "workspace"):
-        cand = os.path.join(settings.PROJECT_ROOT, base, slug)
-        if os.path.isdir(cand):
-            site_dir = cand
+        d = os.path.join(settings.PROJECT_ROOT, base, slug)
+        if os.path.isdir(d):
+            site_dir = d
             break
     if not site_dir:
-        return None
+        return None, None
     outs = sorted(
         [f for f in os.listdir(site_dir) if f.startswith("output_") and f.endswith(".json")],
         reverse=True,
     )
     if not outs:
+        return None, None
+    if job.started_at:
+        cutoff = job.started_at - timedelta(seconds=120)
+        in_window = []
+        for f in outs:
+            try:
+                ts = datetime.strptime(f, "output_%Y-%m-%d_%H%M%S.json").replace(
+                    tzinfo=dt_timezone.utc
+                )
+            except ValueError:
+                continue
+            if ts >= cutoff:
+                in_window.append(f)
+        if in_window:
+            return site_dir, in_window[0]
+        # started_at is known but NO file falls in this job's window → this job
+        # hasn't produced output yet. Return None rather than another job's
+        # newest file (which would show stale/wrong data mid-run).
+        return None, None
+    # No started_at (legacy/unknown start) → can't window; fall back to newest.
+    return site_dir, outs[0]
+
+
+def _job_output_preview(job) -> dict | None:
+    """This job's extracted output, for the intake Sample Output card.
+
+    Returns {filename, output_key, item_label, count, records (first 3),
+    download_url} or None when no output exists yet. Uses _resolve_job_output so
+    the preview is always THIS job's output, not another run's. Caps records so
+    the job_api payload stays small (full output is via download_url).
+    """
+    site_dir, fname = _resolve_job_output(job)
+    if not site_dir or not fname:
         return None
-    fname = outs[0]
     try:
         with open(os.path.join(site_dir, fname), encoding="utf-8") as f:
             data = json.load(f)
@@ -718,28 +842,11 @@ def _job_run_history(job, limit: int = 15) -> list:
     scraper/output download URLs.
     """
     runs: list = []
-    qs = ScrapeJob.objects.filter(url=job.url).order_by("-created_at")[:limit]
+    qs = ScrapeJob.objects.filter(url=job.url, user=job.user).order_by("-created_at")[:limit]
     for j in qs:
-        slug = _resolve_job_slug(j)
-        if not slug:
-            try:
-                from .tasks import _generate_slug
-
-                slug = _generate_slug(j.url)
-            except Exception:
-                slug = ""
-        out_url = None
-        if slug:
-            for base in ("scrapers", "workspace"):
-                d = os.path.join(settings.PROJECT_ROOT, base, slug)
-                if os.path.isdir(d):
-                    outs = sorted(
-                        [f for f in os.listdir(d) if f.startswith("output_") and f.endswith(".json")],
-                        reverse=True,
-                    )
-                    if outs:
-                        out_url = f"/jobs/{j.id}/output/{outs[0]}/download/"
-                    break
+        # per-run output: this run's own output_file / window, not the site's latest
+        _sd, out_fname = _resolve_job_output(j)
+        out_url = f"/jobs/{j.id}/output/{out_fname}/download/" if out_fname else None
         dur = None
         if j.started_at and j.completed_at:
             dur = (j.completed_at - j.started_at).total_seconds()
@@ -760,7 +867,7 @@ def _job_run_history(job, limit: int = 15) -> list:
 
 @login_required
 def job_api(request, job_id):
-    job = get_object_or_404(ScrapeJob, pk=job_id)
+    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
     since_seq = int(request.GET.get("since_seq", 0))
     return JsonResponse(
         {
@@ -771,6 +878,9 @@ def job_api(request, job_id):
             "status": job.status,
             "site_name": job.site_name,
             "platform": job.platform,
+            # Intake-revision: display title + saved bookmark.
+            "title": job.title,
+            "is_saved": job.is_saved,
             # Intake config (drives the Current Configuration panel on deep-link)
             "target_fields": list(job.target_fields or []),
             "input_mode": job.input_mode,
@@ -828,8 +938,8 @@ def job_api(request, job_id):
 
 @login_required
 def job_logs_api(request, job_id):
-    get_object_or_404(ScrapeJob, pk=job_id)
-    job = get_object_or_404(ScrapeJob, pk=job_id)
+    get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
     since_seq = int(request.GET.get("since_seq", 0))
     logs = [
         {
@@ -846,7 +956,7 @@ def job_logs_api(request, job_id):
 
 @login_required
 def job_events(request, job_id):
-    get_object_or_404(ScrapeJob, pk=job_id)
+    get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
     terminal_states = {
         ScrapeJob.STATUS_COMPLETED,
         ScrapeJob.STATUS_FAILED,
@@ -940,7 +1050,7 @@ def job_events(request, job_id):
 
 @login_required
 def job_resume(request, job_id):
-    job = get_object_or_404(ScrapeJob, pk=job_id)
+    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
 
     if request.method == "POST":
         try:
@@ -979,7 +1089,7 @@ def job_resume(request, job_id):
 
 @login_required
 def tool_calls_api(request, job_id):
-    job = get_object_or_404(ScrapeJob, pk=job_id)
+    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
     agent_filter = request.GET.get("agent", "")
     qs = job.tool_call_logs.order_by("call_seq")
     if agent_filter:
@@ -1001,7 +1111,7 @@ def tool_calls_api(request, job_id):
 
 @login_required
 def agent_summary(request, job_id: int):
-    job = get_object_or_404(ScrapeJob, pk=job_id)
+    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
     agent_filter = request.GET.get("agent", "")
     logs = SessionLog.objects.filter(job=job)
     if agent_filter:
@@ -1225,7 +1335,7 @@ def site_edit(request, site_id):
 @login_required
 def site_detail(request, site_id):
     site = get_object_or_404(Site, pk=site_id)
-    jobs = ScrapeJob.objects.filter(url__iexact=site.url)
+    jobs = ScrapeJob.objects.filter(url__iexact=site.url, user=request.user)
     scraper_code = ""
     if site.default_scraper_path and os.path.isfile(site.default_scraper_path):
         try:
@@ -1274,7 +1384,8 @@ def site_scrape(request, site_id):
     full_extraction = request.POST.get("full_extraction") == "on"
 
     existing = ScrapeJob.objects.filter(
-        url=site.url, status__in=[ScrapeJob.STATUS_PENDING, ScrapeJob.STATUS_RUNNING]
+        url=site.url, status__in=[ScrapeJob.STATUS_PENDING, ScrapeJob.STATUS_RUNNING],
+        user=request.user,
     ).first()
     if existing:
         return redirect("job_detail", job_id=existing.id)
@@ -1284,6 +1395,7 @@ def site_scrape(request, site_id):
         product_url=site.sample_url,
         currency=site.currency,
         full_extraction=full_extraction,
+        user=request.user,
     )
 
     if site.input_urls:
@@ -1858,9 +1970,9 @@ def jobs_dashboard(request):
     days = max(1, min(days, 365))
 
     cutoff = timezone.now().date() - timedelta(days=days)
-    listings = JobListing.objects.filter(posted_date__gte=cutoff).select_related(
-        "scrape_job", "site"
-    )
+    listings = JobListing.objects.filter(
+        posted_date__gte=cutoff, scrape_job__user=request.user
+    ).select_related("scrape_job", "site")
 
     # Optional filters
     company = request.GET.get("company", "").strip()
@@ -1879,7 +1991,8 @@ def jobs_dashboard(request):
 
     # Site choices for the filter dropdown
     site_choices = (
-        JobListing.objects.exclude(site_slug="")
+        JobListing.objects.filter(scrape_job__user=request.user)
+        .exclude(site_slug="")
         .values_list("site_slug", flat=True)
         .distinct()
         .order_by("site_slug")
@@ -1985,13 +2098,16 @@ def intake(request):
 
 @login_required
 def intake_check_site(request):
-    """AJAX: probe a sample URL → extractable fields + connectivity info.
+    """AJAX: look up extractable fields from previously-run scrapers (no probe).
 
-    Reuses ``run_probe_with_captcha_check`` (the same function the
-    ``check_accessibility`` graph node calls), so browser_service, Chrome, and
-    the proxy escalation chain run identically to a real job. With ``job_id=0``
-    it skips SessionLog writes but still warms ProbeCache (4h TTL by domain),
-    so the subsequent scrape's check_accessibility node is a cache hit.
+    Instead of hitting the website (which was slow + hit anti-bot), reads the
+    union of fields extracted/requested across ALL runs + ALL users for this
+    domain. Three DB sources:
+    - Site.output_schema (the latest run's resolved schema)
+    - Site.fields_extracted (accumulated actual output record keys across runs)
+    - ScrapeJob.target_fields (all users' requested fields for this host)
+
+    If no prior data → fields=[] → the JS shows "New site — add the fields".
     """
     if request.headers.get("x-requested-with") != "XMLHttpRequest":
         return JsonResponse({"error": "AJAX required"}, status=400)
@@ -1999,72 +2115,50 @@ def intake_check_site(request):
     if not url:
         return JsonResponse({"error": "url required"}, status=400)
 
-    # Known-site short-circuit (reuse the check_tracker pattern).
-    site = Site.objects.filter(url=url.rstrip("/")).first()
-    if site and site.fields_extracted:
+    from .tasks import _generate_slug
+    from urllib.parse import urlparse as _urlparse
+
+    slug = _generate_slug(url)
+    host = (_urlparse(url).hostname or "").replace("www.", "")
+    fields: set = set()
+    content_type = ""
+    platform = ""
+    scraping_method = ""
+
+    # 1. Site-level: output_schema (latest schema) + fields_extracted (accumulated union)
+    site = Site.objects.filter(slug=slug).first()
+    if site:
+        platform = site.platform
+        scraping_method = site.scraping_method
+        if site.output_schema:
+            content_type = site.output_schema.get("content_type", "")
+            for f in (site.output_schema.get("fields") or []):
+                if isinstance(f, dict) and f.get("name"):
+                    fields.add(f["name"])
+        if site.fields_extracted:
+            fields.update(site.fields_extracted)
+
+    # 2. All users' target_fields for this host (shared field knowledge)
+    if host:
+        for tf in ScrapeJob.objects.filter(url__icontains=host).values_list(
+            "target_fields", flat=True
+        ):
+            if tf:
+                fields.update(tf)
+
+    if fields:
         return JsonResponse(
             {
                 "known_site": True,
-                "fields": site.fields_extracted,
-                "content_type": (site.output_schema or {}).get("content_type", ""),
-                "platform": site.platform,
-                "scraping_method": site.scraping_method,
+                "fields": sorted(fields),
+                "content_type": content_type,
+                "platform": platform,
+                "scraping_method": scraping_method,
             }
         )
 
-    try:
-        from agents.tools.probe_tools import run_probe_with_captcha_check
-
-        # max_steps=3 → only the cheap no-proxy tier (direct_http,
-        # playwright_none, uc_chrome_none). Check-site is a quick field-detection
-        # probe, NOT the full escalation (that runs in the real job's
-        # check_accessibility node via Celery). First success returns fast; an
-        # anti-bot site bails after 3 attempts instead of grinding through all 9
-        # proxy tiers (which could take 20+ minutes).
-        probe = run_probe_with_captcha_check(
-            url, render_js=True, job_id=0, max_steps=3
-        )
-    except Exception as exc:
-        logger.warning("intake_check_site probe failed for %s: %s", url[:80], exc)
-        return JsonResponse(
-            {
-                "known_site": False,
-                "reachable": False,
-                "fields": [],
-                "content_type": "",
-                "anti_bot_detected": False,
-                "error": str(exc)[:300],
-            }
-        )
-
-    fields, content_type = _infer_fields_from_probe(probe)
-    reachable = bool(probe.get("success"))
-    anti_bot = bool(probe.get("captcha_detected"))
-    # When the quick probe couldn't get through (anti-bot / all 3 steps failed),
-    # surface a clear message: the user can still add fields manually and the
-    # real build handles anti-bot escalation.
-    message = ""
-    if not reachable:
-        message = (
-            "Couldn't auto-detect fields — this site likely has anti-bot "
-            "protection. You can still add fields manually; the scrape build "
-            "handles anti-bot bypass automatically."
-            if anti_bot
-            else "Couldn't reach the page for auto-detection. You can still add fields manually."
-        )
-    return JsonResponse(
-        {
-            "known_site": False,
-            "reachable": reachable,
-            "fields": fields,
-            "content_type": content_type,
-            "method_that_worked": probe.get("method"),
-            "http_method": probe.get("http_method"),
-            "browser_method": probe.get("browser_method"),
-            "anti_bot_detected": anti_bot,
-            "message": message,
-        }
-    )
+    # No prior data → the JS shows "New site — add the fields you want to extract"
+    return JsonResponse({"known_site": False, "fields": [], "content_type": ""})
 
 
 def _parse_url_lines(text: str) -> list[str]:
@@ -2113,7 +2207,8 @@ def intake_create_job(request):
         search_url = request.POST.get("search_url", "").strip()
 
     existing = ScrapeJob.objects.filter(
-        url=url, status__in=[ScrapeJob.STATUS_PENDING, ScrapeJob.STATUS_RUNNING]
+        url=url, status__in=[ScrapeJob.STATUS_PENDING, ScrapeJob.STATUS_RUNNING],
+        user=request.user,
     ).first()
     if existing:
         return JsonResponse(
@@ -2142,6 +2237,8 @@ def intake_create_job(request):
         scope_value=scope_value,
         notes=notes,
         full_extraction=False,  # "sample" mode
+        skip_approvals=True,  # intake jobs run unattended — skip approval gates
+        user=request.user,
     )
 
     # For "list" mode, persist the provided item URLs so the url_list pipeline
@@ -2185,3 +2282,44 @@ def intake_create_job(request):
             "restart_url": reverse("job_restart", args=[job.id]),
         }
     )
+
+
+@login_required
+def intake_jobs(request):
+    """AJAX: recent ScrapeJobs for the Jobs & Saved library view.
+
+    Returns a flat list (the client groups for the Saved tab by site and filters
+    on is_saved). Saved jobs are always included even if older.
+    """
+    recent = list(ScrapeJob.objects.filter(user=request.user).order_by("-created_at")[:100])
+    saved_ids = set(
+        ScrapeJob.objects.filter(is_saved=True, user=request.user).values_list("id", flat=True)
+    )
+    # merge any saved jobs that fell outside the recent-100 window
+    extra = [j for j in ScrapeJob.objects.filter(is_saved=True, user=request.user).order_by("-created_at")
+             if j.id not in {j.id for j in recent}]
+    jobs = recent + extra[:50]
+
+    def _dur(j):
+        if j.started_at and j.completed_at:
+            return (j.completed_at - j.started_at).total_seconds()
+        return None
+
+    data = [
+        {
+            "id": j.id,
+            "title": j.title,
+            "url": j.url,
+            "status": j.status,
+            "product_count": j.product_count,
+            "duration_seconds": _dur(j),
+            "created_at": j.created_at.isoformat() if j.created_at else None,
+            "is_saved": j.is_saved,
+            "target_fields": j.target_fields or [],
+            "input_mode": j.input_mode,
+            "site_name": j.site_name,
+        }
+        for j in jobs
+    ]
+    return JsonResponse({"jobs": data})
+

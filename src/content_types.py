@@ -306,6 +306,49 @@ def get_output_key_label(page_type: str) -> tuple[str, str]:
     return ("products", "product")
 
 
+# Standard bookkeeping fields always retained on every record (needed for the
+# output to be traceable), regardless of the user's requested schema.
+BOOKKEEPING_FIELDS: tuple[str, ...] = ("url", "src_url", "scraped_at", "status_code")
+
+
+def schema_field_names(
+    target_fields, output_schema: dict | None = None
+) -> list[str]:
+    """The user's requested schema field names (no bookkeeping).
+
+    Priority: explicit ``target_fields`` (the intake UI chips) → the DB
+    ``output_schema["fields"]`` names → ``[]`` (no schema → extract everything).
+    """
+    if target_fields:
+        return [str(f) for f in target_fields if f]
+    if output_schema and isinstance(output_schema, dict):
+        fields = output_schema.get("fields")
+        if isinstance(fields, list) and fields:
+            names = [
+                f.get("name")
+                for f in fields
+                if isinstance(f, dict) and f.get("name")
+            ]
+            if names:
+                return [str(n) for n in names]
+    return []
+
+
+def resolve_allowed_fields(
+    target_fields, output_schema: dict | None = None
+) -> set[str] | None:
+    """Set of field names a job's output records may contain (the enforced schema).
+
+    ``schema_field_names(...)`` ∪ ``BOOKKEEPING_FIELDS``, or ``None`` when no
+    explicit schema exists (→ caller skips pruning; today's "extract everything"
+    behavior is preserved for schema-less jobs).
+    """
+    names = schema_field_names(target_fields, output_schema)
+    if not names:
+        return None
+    return set(names) | set(BOOKKEEPING_FIELDS)
+
+
 def count_items_in_output(data: dict) -> int:
     """Count items in an output JSON, trying all known output keys.
 

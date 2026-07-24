@@ -323,6 +323,12 @@ def field_confirmation(state: ScrapeState) -> Command:
 
     _persist_field_confirmation_sample(state.get("job_id", 0), sample_text)
 
+    # Intake jobs run unattended — skip the sample-approval gate, proceed to
+    # execution. (Homepage jobs still pause here for review.)
+    if state.get("skip_approvals", False):
+        logger.info("field_confirmation: skip_approvals → auto-approve (job %s)", state.get("job_id"))
+        return Command(goto="run_execution")
+
     # (Wave 2 Cut 2) Fold the pre_execution_approval gate's item-count estimate
     # into THIS interrupt so the single gate shows both the sample fields AND
     # how many items the full scrape will process. An approve below routes
