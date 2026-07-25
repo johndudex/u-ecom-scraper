@@ -749,6 +749,10 @@ def _resolve_job_output(job):
     `output_file` (authoritative); else the newest output_*.json whose timestamp
     falls within this job's run window (matching job_detail's logic).
     """
+    # A PENDING job has not started; its output cannot exist yet. Returning
+    # the newest file would leak a PRIOR run's data into this job's preview.
+    if job.status == ScrapeJob.STATUS_PENDING:
+        return None, None
     # 1. authoritative output_file
     of = (job.output_file or "").strip()
     if of:

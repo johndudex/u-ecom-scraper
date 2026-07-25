@@ -239,6 +239,19 @@ def run_execution(state: ScrapeState) -> dict:
     # generated scraper's argparse doesn't define it yet. [discovery-coverage-gate §4]
     args.append("--fresh-discovery")
 
+    # Enforce scope=firstn (intake UI): cap extraction at the user's N records.
+    # scope_value is a CharField → parse defensively. The _filter_supported_args
+    # guard below drops --limit if the generated scraper doesn't declare it.
+    if (state.get("scope") or "").strip() == "firstn":
+        _sv = (state.get("scope_value") or "").strip()
+        try:
+            _n = int(_sv)
+        except (ValueError, TypeError):
+            _n = 0
+        if _n > 0:
+            args.extend(["--limit", str(_n)])
+            logger.info("run_execution: scope=firstn, passing --limit %d", _n)
+
     # CLI-contract guard: drop any flag the generated scraper doesn't define,
     # so an LLM-authored argparse can't exit(2) and silently zero the output.
     if args:

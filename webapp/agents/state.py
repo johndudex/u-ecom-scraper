@@ -30,6 +30,13 @@ class ScrapeState(TypedDict, total=False):
     rescrape: bool
     # Intake-UI jobs skip all human-approval gates (run unattended).
     skip_approvals: bool
+    # Intake-UI schema knobs. target_fields ENFORCES the output schema (the
+    # agents + validate_coverage + normalize_fields read these). Declared here
+    # so LangGraph persists them in the graph state (otherwise they'd be stripped).
+    target_fields: list
+    scope: str
+    scope_value: str
+    user_notes: str
 
     # ── Content type ──────────────────────────────────────────────────
     page_type: str

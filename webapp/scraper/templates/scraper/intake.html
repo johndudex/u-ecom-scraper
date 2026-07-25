@@ -1803,6 +1803,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       btn.disabled = false;
       if(data.error){ showUrlError(data.error); return; }
       intakeState.job = data; intakeState.jobId = data.job_id; intakeState.terminal = false;
+      if(data.job_id){ history.replaceState(null, '', location.pathname + '?job=' + data.job_id); }
       intakeState.timeStr = '—'; intakeState.recordsStr = '—'; intakeState.cfgPopulated = true;
       X('#rerun-box').classList.add('hidden'); X('#rerun-toggle').setAttribute('aria-expanded','false');
       renderResults();
@@ -1824,6 +1825,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       if(data.error){ X('#rerun-hint').textContent = data.error; return; }
       Object.keys(data).forEach(function(k){ intakeState.job[k]=data[k]; });
       intakeState.jobId = data.job_id; intakeState.terminal = false;
+      if(data.job_id){ history.replaceState(null, '', location.pathname + '?job=' + data.job_id); }
       X('#job-title').textContent = 'Job #' + data.job_id;
       X('#job-id-badge').textContent = '#' + data.job_id;
       X('#rerun-box').classList.add('hidden'); X('#rerun-toggle').setAttribute('aria-expanded','false');

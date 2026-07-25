@@ -112,6 +112,23 @@ def _merge_fields(existing: dict, mapped: dict, direct: dict) -> dict:
     return merged
 
 
+def _prune_to_schema(merged: dict, state) -> dict:
+    """If the user provided a custom schema (target_fields), prune the merged
+    field map to schema ∪ bookkeeping (DIRECT_FIELDS). Prevents non-schema
+    fields from flowing through to code_writer."""
+    target_fields = state.get("target_fields") or []
+    if not target_fields:
+        return merged
+    allowed = set(target_fields) | set(DIRECT_FIELDS.keys())
+    pruned = {k: v for k, v in merged.items() if k in allowed}
+    if len(pruned) < len(merged):
+        logger.info(
+            "normalize_fields: pruned %d → %d fields (custom schema)",
+            len(merged), len(pruned),
+        )
+    return pruned
+
+
 def _deterministic_job_mapping(analysis: dict, content_type_config: dict) -> dict:
     """Map job fields with the generic resolver (src.job_fields) — deterministic,
     no LLM.  Builds a sample list from the raw data sections in product_analysis
@@ -172,6 +189,7 @@ def normalize_fields(state: ScrapeState) -> dict[str, Any]:
         job_mapped = _deterministic_job_mapping(analysis, content_type_config)
         if job_mapped:
             merged = _merge_fields(existing_fields, job_mapped, DIRECT_FIELDS)
+            merged = _prune_to_schema(merged, state)
             analysis["fields"] = merged
             _save_analysis(slug, analysis)
             logger.info(
@@ -188,6 +206,7 @@ def normalize_fields(state: ScrapeState) -> dict[str, Any]:
     # fields (no LLM mapping). The analyzer is responsible for emitting the
     # field extraction map; we only augment with scraper-direct fields.
     merged = _merge_fields(existing_fields, {}, DIRECT_FIELDS)
+    merged = _prune_to_schema(merged, state)
     analysis["fields"] = merged
     _save_analysis(slug, analysis)
 

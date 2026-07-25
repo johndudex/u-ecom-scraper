@@ -1147,11 +1147,14 @@ def _user_requirements_section(state: dict) -> str:
         return (
             "### User Requirements (schema — ENFORCE)\n"
             + "\n".join(parts)
-            + "\n\nThe user requires ONLY these fields. Map and extract exactly "
-            "them (the standard bookkeeping fields — url, src_url, scraped_at, "
-            "status_code — are always kept automatically). Do NOT include any "
-            "other fields the page exposes; extras are pruned from the final "
-            "output. If a requested field is absent on the page, omit it.\n\n"
+            + "\n\n**The user requires ONLY these fields.** The standard field "
+            "table in your system prompt (title, price, availability, currency, "
+            "brand, category, images, sku, rating, etc.) **DOES NOT APPLY** to "
+            "this job — ignore it entirely. Map and extract ONLY the fields "
+            "listed above. The standard bookkeeping fields (url, src_url, "
+            "scraped_at, status_code) are always kept automatically. If a "
+            "requested field is absent on the page, omit it — do NOT substitute "
+            "a field from the system prompt's table.\n\n"
         )
     return (
         "### User Requirements (advisory)\n"

@@ -92,6 +92,27 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False) -> None:
         )
         return
 
+    # Same-site serialization: if another job is already RUNNING for this URL,
+    # requeue with a delay (workspace/{slug}/ is shared → concurrent writes
+    # race, and _finalize_job's rmtree would destroy the sibling's artifacts).
+    # The stuck-job watchdog (30 min) ensures the blocking job eventually ends.
+    running_sibling = (
+        ScrapeJob.objects
+        .filter(url=job.url, status=ScrapeJob.STATUS_RUNNING)
+        .exclude(pk=job.id)
+        .exists()
+    )
+    if running_sibling:
+        logger.info(
+            "Job %d: another job is already running for %s — requeueing in 60s",
+            job_id, job.url[:60],
+        )
+        raise self.retry(
+            exc=RuntimeError("same-site job already running"),
+            countdown=60,
+            max_retries=None,
+        )
+
     try:
         _run_graph_job(job, rescrape=rescrape)
     except Exception as exc:
@@ -460,6 +481,19 @@ def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
     sample_url = job.product_url or ""
     skip_product = False
 
+    # If the user provided a custom schema (target_fields), make it AUTHORITATIVE:
+    # override the content_type_config so every downstream stage (content_type_context,
+    # normalize_fields, validate_coverage) uses the user's fields, not the registry
+    # defaults. This prevents the pipeline from defaulting to product fields (title,
+    # price, availability) when the user asked for something different.
+    _target_fields = list(job.target_fields or [])
+    if _target_fields and content_type_config:
+        content_type_config = dict(content_type_config)
+        content_type_config["fields"] = [
+            {"name": str(f), "label": str(f), "type": "text", "required": True}
+            for f in _target_fields
+        ]
+
     return {
         "job_id": job.id,
         "url": job.url,
@@ -675,7 +709,22 @@ def _finalize_job(job: ScrapeJob) -> None:
                         site_slug,
                     )
 
-                shutil.rmtree(ws, ignore_errors=True)
+                # Defense-in-depth: don't rmtree if another job for this URL is
+                # mid-flight (the dispatch guard should prevent this, but a
+                # bypassed/played-with workspace would lose its artifacts).
+                other_running = (
+                    ScrapeJob.objects
+                    .filter(url=job.url, status=ScrapeJob.STATUS_RUNNING)
+                    .exclude(pk=job.id)
+                    .exists()
+                )
+                if other_running:
+                    logger.warning(
+                        "Job %d: NOT removing workspace/%s/ — another job is running",
+                        job.id, site_slug,
+                    )
+                else:
+                    shutil.rmtree(ws, ignore_errors=True)
                 logger.info("Job %d: cleaned workspace/%s/", job.id, site_slug)
         except Exception as exc:
             logger.warning("Job %d: workspace cleanup failed: %s", job.id, exc)

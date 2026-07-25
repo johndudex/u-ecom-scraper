@@ -446,6 +446,25 @@ def route_after_testing(state: ScrapeState) -> str:
         elif remediation.get("target") == "strategy":
             _action, _reason = "strategy", "code_tester: strategy"
 
+    # Cap on the strategy/scraper cascade: the early-return branches below
+    # previously bypassed MAX_TEST_RETRIES (only the LLM fallback enforced it).
+    # Reuse the same exhausted-cap fallback: partial-valid → field_confirmation,
+    # else human_approval.
+    if retry_count >= MAX_TEST_RETRIES:
+        if confidence >= MIN_CONFIDENCE_PARTIAL and _scraper_produced_valid_output(state):
+            logger.warning(
+                "route_after_testing: retries exhausted in cascade (count=%d, "
+                "action=%s) → field_confirmation (partial valid output)",
+                retry_count, _action,
+            )
+            return "field_confirmation"
+        logger.warning(
+            "route_after_testing: retries exhausted in cascade (count=%d, "
+            "action=%s, reason=%s) → human_approval",
+            retry_count, _action, _reason,
+        )
+        return "human_approval"
+
     if _action == "strategy":
         logger.info(
             "route_after_testing: STRATEGY switch — '%s' failed (%s) → scraper_analyzer "

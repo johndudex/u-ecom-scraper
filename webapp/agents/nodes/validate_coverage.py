@@ -112,6 +112,13 @@ def validate_coverage(state: ScrapeState) -> Command:
     if content_type_config and "core_field_names" in content_type_config:
         core = set(content_type_config["core_field_names"])
 
+    # If the user provided a custom schema (target_fields), use THOSE as the
+    # coverage target, not the registry defaults. Prevents false "price not
+    # covered" gaps when the user didn't ask for price.
+    target_fields = state.get("target_fields") or []
+    if target_fields:
+        core = set(target_fields)
+
     analysis = _load_product_analysis(slug)
     if analysis is None:
         product_retries = state.get("product_analysis_retries", 0) + 1
