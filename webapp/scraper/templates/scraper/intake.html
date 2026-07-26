@@ -886,14 +886,17 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
   var isRunningNow = false;
   function refreshGates(){
     var changed = configBaseline !== null && getConfigSnapshot() !== configBaseline;
-    var lockSaveSchedule = isRunningNow || changed;
+    // Save is enabled when NOT running and NOT mid-edit. The `changed` flag
+    // previously disabled Save (inverted logic — the user couldn't persist
+    // edits they'd just made). Now Save is ENABLED when there are changes to save.
+    var lockSaveSchedule = isRunningNow || cfgIsEditing;
     ['save-btn','schedule-toggle','schedule-commit-btn'].forEach(function(id){
       var b = X('#'+id); if(!b) return;
       // Schedule controls stay disabled (coming soon) — never re-enable them here.
       if(id === 'schedule-toggle' || id === 'schedule-commit-btn') return;
       b.disabled = lockSaveSchedule;
       b.title = lockSaveSchedule
-        ? (isRunningNow ? 'A run is in progress' : 'Configuration has unsaved changes — re-run to apply them first')
+        ? (isRunningNow ? 'A run is in progress' : 'Click Done in Current Configuration first')
         : '';
     });
     var lockRerun = isRunningNow || cfgIsEditing;
@@ -1821,6 +1824,17 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     var prompt = X('#rerun-prompt').value.trim();
     var fd = new FormData();
     if(prompt) fd.append('prompt', prompt);
+    // Send the edited config from the dashboard's cfg panel so the new job
+    // picks up the user's field/nav edits (without this, the new job would
+    // copy the OLD job's config and silently drop the edits).
+    fd.append('target_fields', fieldsArr.join(','));
+    var navMethod = (document.querySelector('input[name=cfg-nav]:checked')||{}).value || '';
+    if(navMethod==='search'){
+      fd.append('search_criteria', X('#cfg-search-kw').value);
+      fd.append('search_url', X('#cfg-search-url').value);
+    } else if(navMethod==='listing'){
+      fd.append('search_criteria', X('#cfg-listing-text').value);
+    }
     postJSON(intakeState.job.restart_url, fd).then(function(data){
       if(data.error){ X('#rerun-hint').textContent = data.error; return; }
       Object.keys(data).forEach(function(k){ intakeState.job[k]=data[k]; });

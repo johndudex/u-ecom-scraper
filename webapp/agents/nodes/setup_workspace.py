@@ -62,6 +62,22 @@ def _clean_stale_artifacts(workspace_dir: str, preserve: set[str] | None = None)
     return removed
 
 
+def _restore_from_archive(analysis_dir: str, workspace_dir: str, filename: str) -> bool:
+    """Copy an artifact from scrapers/{slug}/analysis/ to workspace/{slug}/
+    if it exists in the archive but not in the workspace (re-hydration for
+    selective re-run — the workspace was rmtree'd by _finalize_job)."""
+    src = os.path.join(analysis_dir, filename)
+    dst = os.path.join(workspace_dir, filename)
+    if os.path.isfile(src) and not os.path.isfile(dst):
+        try:
+            shutil.copy2(src, dst)
+            logger.info("setup_workspace: re-hydrated %s from analysis/", filename)
+            return True
+        except Exception as exc:
+            logger.warning("setup_workspace: failed to re-hydrate %s: %s", filename, exc)
+    return False
+
+
 def setup_workspace(state: ScrapeState) -> dict[str, Any]:
     """Ensure ``workspace/{slug}/``, ``scrapers/{slug}/``, and ``logs/`` exist.
 
@@ -115,6 +131,20 @@ def setup_workspace(state: ScrapeState) -> dict[str, Any]:
                     logger.warning(
                         "setup_workspace: failed to restore scraper_draft.py: %s", exc
                     )
+
+    # Re-hydrate analysis artifacts from scrapers/{slug}/analysis/ (the workspace
+    # was rmtree'd by _finalize_job at the end of the prior run — the analysis/
+    # archive preserves them for selective re-run reuse).
+    analysis_dir = os.path.join(scrapers_dir, "analysis")
+    if os.path.isdir(analysis_dir):
+        if state.get("skip_site_analysis"):
+            _restore_from_archive(analysis_dir, workspace_dir, "site_analysis.json")
+        if state.get("skip_product_analysis"):
+            _restore_from_archive(analysis_dir, workspace_dir, "product_analysis.json")
+            _restore_from_archive(analysis_dir, workspace_dir, "navigation_analysis.json")
+        if state.get("skip_code_generation"):
+            _restore_from_archive(analysis_dir, workspace_dir, "scraper_analysis.json")
+            _restore_from_archive(analysis_dir, workspace_dir, "test_report.json")
 
     input_urls = state.get("input_urls") or []
     if input_urls:

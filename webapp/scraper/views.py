@@ -512,20 +512,35 @@ def job_restart(request, job_id):
         ScrapeJob.STATUS_CANCELLED,
     ]:
         # Intake "Re-run" sends an optional prompt → store as notes for the
-        # agents to see. Non-AJAX (job_detail button) sends nothing.
+        # agents to see. It ALSO sends the edited config (target_fields, scope,
+        # etc.) so the new job picks up the user's dashboard edits. Non-AJAX
+        # (job_detail button) sends nothing → falls back to old job's config.
         rerun_prompt = request.POST.get("prompt", "").strip() if request.method == "POST" else ""
+
+        def _post_or_old(field, old_val):
+            v = request.POST.get(field)
+            return v if v is not None else old_val
+
+        _tf = request.POST.get("target_fields", "")
+        if _tf:
+            _tf = [f.strip() for f in _tf.split(",") if f.strip()]
+        else:
+            _tf = job.target_fields
+
         new_job = ScrapeJob.objects.create(
             url=job.url,
             product_url=job.product_url,
             currency=job.currency,
             page_type=job.page_type,
             input_mode=job.input_mode,
-            search_criteria=job.search_criteria,
-            target_fields=job.target_fields,
-            scope=job.scope,
-            scope_value=job.scope_value,
-            notes=(rerun_prompt or job.notes),
+            search_criteria=_post_or_old("search_criteria", job.search_criteria),
+            search_url=_post_or_old("search_url", job.search_url),
+            target_fields=_tf,
+            scope=_post_or_old("scope", job.scope),
+            scope_value=_post_or_old("scope_value", job.scope_value),
+            notes=(rerun_prompt or _post_or_old("notes", job.notes)),
             full_extraction=job.full_extraction,
+            skip_approvals=job.skip_approvals,
             user=request.user,
         )
 

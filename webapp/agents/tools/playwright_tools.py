@@ -238,15 +238,37 @@ async def _close_session() -> None:
     directly on failure, accepting the small race window in exchange for
     simplicity: the next ``_get_session`` will recreate the session under
     the lock.
+
+    **Cross-loop safety**: when the session was created on a now-dead event
+    loop (common with the ``asyncio.run``-per-call pattern in sync tool
+    dispatch), ``stack.aclose()`` triggers anyio's cross-task cancel-scope
+    error (``RuntimeError: generator didn't stop after athrow()``) and can
+    hang indefinitely. In that case we skip ``aclose`` — the dead loop's
+    ``shutdown_asyncgens`` already finalized the underlying SSE/httpx
+    connections. For same-loop sessions we ``aclose`` with a 10s timeout so
+    a half-dead connection can't block cleanup.
     """
     global _session, _session_stack, _session_loop
     _session = None
+    old_loop = _session_loop
     _session_loop = None
     stack = _session_stack
     _session_stack = None
     if stack is not None:
         try:
-            await stack.aclose()
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if old_loop is not None and old_loop is not running_loop:
+                logger.debug(
+                    "_close_session: discarding stale session (loop mismatch) "
+                    "— dead loop already cleaned up connections"
+                )
+            else:
+                await asyncio.wait_for(stack.aclose(), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("_close_session: aclose timed out after 10s — discarding")
         except Exception as exc:
             logger.warning("Error closing MCP session stack: %s", exc)
 

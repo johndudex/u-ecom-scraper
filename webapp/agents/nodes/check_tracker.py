@@ -65,6 +65,51 @@ def _clean_workspace(root: str, slug: str) -> None:
         logger.info("check_tracker: cleaned scrapers/%s (kept output files)", slug)
 
 
+def _compute_rescrape_skip_flags(state, url: str):
+    """Compute selective skip flags for a rescrape based on config diff vs the
+    prior completed job for this URL. Returns (skip_site, skip_product, skip_code).
+
+    - site_analyzer is ALWAYS skippable (reads zero config fields; the site
+      structure hasn't changed).
+    - product_analyzer is skippable unless nav/search changed (the page-level
+      field map is invariant to target_fields changes — normalize_fields re-filters).
+    - code_writer is skippable unless fields or nav changed (the generated
+      scraper bakes in the field map).
+    """
+    try:
+        from scraper.models import ScrapeJob
+
+        prior = (
+            ScrapeJob.objects
+            .filter(url=url, status=ScrapeJob.STATUS_COMPLETED)
+            .exclude(pk=state.get("job_id", 0))
+            .order_by("-completed_at")
+            .first()
+        )
+        if not prior:
+            logger.info("_compute_rescrape_skip_flags: no prior completed job → full run")
+            return False, False, False
+
+        fields_changed = set(state.get("target_fields") or []) != set(prior.target_fields or [])
+        nav_changed = (
+            (state.get("input_mode") or "") != (prior.input_mode or "")
+            or (state.get("search_criteria") or "") != (prior.search_criteria or "")
+        )
+
+        skip_site = True
+        skip_product = not nav_changed
+        skip_code = skip_product and not fields_changed
+
+        logger.info(
+            "_compute_rescrape_skip_flags: fields_changed=%s nav_changed=%s → skip(%s/%s/%s)",
+            fields_changed, nav_changed, skip_site, skip_product, skip_code,
+        )
+        return skip_site, skip_product, skip_code
+    except Exception as exc:
+        logger.warning("_compute_rescrape_skip_flags: errored (%s) → full run", exc)
+        return False, False, False
+
+
 def check_tracker(state: ScrapeState) -> Command:
     """Read the Site model, set skip-flags, and route appropriately.
 
@@ -90,39 +135,37 @@ def check_tracker(state: ScrapeState) -> Command:
 
     if site is None:
         return _handle_new_site(url, slug, site_type)
-    if site.status == "complete" and rescrape:
-        logger.info("check_tracker: rescrape=True for complete site '%s', starting fresh", slug)
-        _clean_workspace(root, slug)
-        site.status = "in_progress"
-        site.save(update_fields=["status"])
+
+    # ── Selective rescrape: skip stages whose inputs didn't change ───────
+    # Instead of wiping + re-running everything, compute a config diff vs the
+    # prior completed job for this URL and set selective skip flags. The
+    # existing check_accessibility cascade + setup_workspace preserve-set
+    # handle the rest. DON'T call _clean_workspace — preserve the analysis
+    # archive in scrapers/{slug}/analysis/ for setup_workspace to re-hydrate.
+    if rescrape and site.status in ("complete", "in_progress"):
+        skip_site, skip_product, skip_code = _compute_rescrape_skip_flags(state, url)
+        logger.info(
+            "check_tracker: selective rescrape for '%s' → skip_site=%s skip_product=%s skip_code=%s",
+            slug, skip_site, skip_product, skip_code,
+        )
+        if site.status != "in_progress":
+            site.status = "in_progress"
+            site.save(update_fields=["status"])
         return Command(
             update={
-                "site_status": "in_progress",                "skip_site_analysis": False,
-                "skip_product_analysis": False,
-                "skip_code_generation": False,
+                "site_status": "in_progress",
+                "skip_site_analysis": skip_site,
+                "skip_product_analysis": skip_product,
+                "skip_code_generation": skip_code,
             },
             goto="setup_workspace",
         )
+
     if site.status == "complete":
         return _handle_complete(site, slug, full_extraction, state.get("skip_approvals", False))
     if site.status == "failed":
         return _handle_failed(site, slug, state.get("skip_approvals", False))
     if site.status == "in_progress":
-        if rescrape:
-            logger.info(
-                "check_tracker: rescrape=True for in_progress site '%s', starting fresh",
-                slug,
-            )
-            _clean_workspace(root, slug)
-            return Command(
-                update={
-                    "site_status": "in_progress",
-                    "skip_site_analysis": False,
-                    "skip_product_analysis": False,
-                    "skip_code_generation": False,
-                },
-                goto="setup_workspace",
-            )
         return _handle_in_progress(site, slug, root, input_mode)
 
     logger.warning("check_tracker: unknown status '%s' for %s, treating as new", site.status, url)

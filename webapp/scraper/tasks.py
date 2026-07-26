@@ -992,7 +992,13 @@ def cleanup_stuck_jobs() -> None:
 
     failed = 0
     for job in stuck_jobs:
-        latest_activity_qs = SessionLog.objects.filter(job=job).order_by("-created_at")
+        latest_activity_qs = (
+            SessionLog.objects
+            .filter(job=job)
+            .exclude(content__startswith="[HEARTBEAT]")
+            .exclude(content__startswith="[PROBE]")
+            .order_by("-created_at")
+        )
         if latest_activity_qs.exists():
             last_activity = latest_activity_qs.first().created_at
         else:
