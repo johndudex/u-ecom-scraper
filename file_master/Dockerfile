@@ -5,10 +5,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 
 WORKDIR /app
 
-COPY file_master/requirements.txt /tmp/requirements.txt
+COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY file_master/app.py /app/app.py
+COPY app.py /app/app.py
 
 RUN mkdir -p /data
 
