@@ -771,6 +771,27 @@ def _finalize_job(job: ScrapeJob) -> None:
         except Exception as exc:
             logger.warning("Job %d: workspace publish failed: %s", job.id, exc)
 
+    # ── Prune old outputs in the File Master (keep newest 5 per site) ──
+    if site_slug:
+        try:
+            import src.artifacts as artifacts
+            _outs = [
+                k for k in artifacts.list_keys(f"scrapers/{site_slug}/")
+                if k.split("/")[-1].startswith("output_") and k.endswith(".json")
+            ]
+            if len(_outs) > 5:
+                for _old in sorted(_outs)[:-5]:
+                    try:
+                        artifacts.delete(_old)
+                    except Exception:
+                        pass
+                logger.info(
+                    "Job %d: pruned %d old output(s) from FM (kept newest 5)",
+                    job.id, len(_outs) - 5,
+                )
+        except Exception:
+            pass
+
     # ── Guard production input_urls.json against silent shrinkage ───────
     # A job's workspace input_urls.json can be a subset (e.g. a sample/manual
     # run), and the cleanup agent may copy it over the production file —
