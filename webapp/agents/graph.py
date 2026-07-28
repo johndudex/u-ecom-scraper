@@ -2960,13 +2960,19 @@ def _probe_phase1_discovery(slug: str, state: dict, job_id: int) -> tuple[bool, 
             import httpx
 
             try:
+                # Stateless /scrape: read the local draft source, POST it.
+                try:
+                    with open(draft, "r", encoding="utf-8", errors="replace") as _pf:
+                        _draft_source = _pf.read()
+                except OSError:
+                    _draft_source = ""
                 resp = httpx.post(
                     f"{_get_browser_service_url()}/scrape",
                     # max_retries=1: the probe only needs a crash/not-crash signal.
                     # Default 3 retries × 180s = 540s would outlive the /scrape
                     # wait_for (300s), orphaning a subprocess that wedges the shared
                     # Scraper Chrome (9223) and hangs the subsequent run_execution.
-                    json={"scraper_path": draft, "args": probe_args, "timeout": 180, "max_retries": 1},
+                    json={"scraper_source": _draft_source, "scraper_name": os.path.basename(draft), "args": probe_args, "timeout": 180, "max_retries": 1},
                     timeout=180 + 60,
                 )
                 resp.raise_for_status()

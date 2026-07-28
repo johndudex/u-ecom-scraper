@@ -293,10 +293,18 @@ def get_shell_tools(
             logger.info("run_scraper: browser-based, dispatching to browser_service: %s", scraper_path)
             try:
                 service_url = _get_browser_service_url()
+                # Stateless /scrape: send the scraper SOURCE (not a path). Read
+                # the local file the caller built (workspace/{slug}/scraper_draft.py).
+                try:
+                    with open(full_path, "r", encoding="utf-8", errors="replace") as _f:
+                        _source = _f.read()
+                except OSError as exc:
+                    return f"Error: could not read scraper source {full_path}: {exc}"
                 resp = httpx.post(
                     f"{service_url}/scrape",
                     json={
-                        "scraper_path": full_path,
+                        "scraper_source": _source,
+                        "scraper_name": os.path.basename(full_path),
                         "args": cmd_args,
                         "timeout": timeout,
                         "env_overrides": env_overrides,
@@ -304,9 +312,24 @@ def get_shell_tools(
                     timeout=timeout + 60,
                 )
                 if resp.status_code == 404:
-                    return f"Scraper not found at {full_path} on browser_service"
+                    return f"Scraper rejected by browser_service (source invalid)"
                 resp.raise_for_status()
                 result = resp.json()
+                # browser_service returns output CONTENT (no shared FS). Persist
+                # it to the local workspace so downstream (route_after_testing
+                # ground-truth, which reads workspace/{slug}/output_*.json) works.
+                _output_content = result.get("output_content") or ""
+                _output_name = result.get("output_name") or ""
+                if _output_content and _output_name:
+                    _scraper_dir = os.path.dirname(full_path) or cwd
+                    _local_output = os.path.join(_scraper_dir, _output_name)
+                    try:
+                        os.makedirs(_scraper_dir, exist_ok=True)
+                        with open(_local_output, "w", encoding="utf-8") as _of:
+                            _of.write(_output_content)
+                        result["output_file"] = _local_output
+                    except OSError as exc:
+                        logger.warning("run_scraper: could not persist output locally: %s", exc)
                 output = _format_result(result)
                 output += f"\n[ran on browser_service, duration: {result.get('duration', '?')}s]"
                 if result.get("output_file"):

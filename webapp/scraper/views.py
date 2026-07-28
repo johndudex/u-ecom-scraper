@@ -1466,11 +1466,18 @@ def site_rerun(request, site_id):
             settings, "BROWSER_SERVICE_URL", "http://browser_service:8001"
         )
         # Anti-bot/Akamai sites: route the scraper through CloakBrowser stealth.
+        # Stateless /scrape: read the scraper SOURCE from disk and POST it.
         scrape_json = {
-            "scraper_path": scraper_path,
+            "scraper_source": "",
+            "scraper_name": os.path.basename(scraper_path),
             "args": [],
             "timeout": 3600,
         }
+        try:
+            with open(scraper_path, "r", encoding="utf-8", errors="replace") as _f:
+                scrape_json["scraper_source"] = _f.read()
+        except OSError as e:
+            logger.error("site_rerun: could not read scraper source %s: %s", scraper_path, e)
         if getattr(site, "needs_akamai_bypass", False):
             scrape_json["env_overrides"] = {"STEALTH_BROWSER": "cloak"}
         try:
@@ -1481,7 +1488,17 @@ def site_rerun(request, site_id):
             )
             resp.raise_for_status()
             result = resp.json()
-            output_file = result.get("output_file", "")
+            # browser_service returns output CONTENT; persist locally for counting.
+            _content = result.get("output_content") or ""
+            _name = result.get("output_name") or ""
+            output_file = ""
+            if _content and _name:
+                output_file = os.path.join(os.path.dirname(scraper_path), _name)
+                try:
+                    with open(output_file, "w", encoding="utf-8") as _of:
+                        _of.write(_content)
+                except OSError:
+                    output_file = ""
             product_count = result.get("product_count", 0)
         except Exception as e:
             logger.error("site_rerun: browser_service failed: %s", e)

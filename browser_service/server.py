@@ -337,7 +337,12 @@ class SingleProbeRequest(BaseModel):
 
 
 class ScrapeRequest(BaseModel):
-    scraper_path: str
+    # Stateless /scrape: the caller sends the scraper SOURCE (not a filesystem
+    # path). browser_service stages it to a private /tmp dir, runs it, and
+    # returns the output CONTENT in the response — so it needs no shared volume
+    # and no File Master access.
+    scraper_source: str
+    scraper_name: str = "scraper.py"   # filename to stage as (for SCRIPT_DIR output naming)
     args: Optional[list[str]] = Field(default_factory=list)
     timeout: int = Field(default=3600, ge=30, le=7200)
     env_overrides: Optional[dict[str, str]] = Field(default_factory=dict)
@@ -899,64 +904,86 @@ async def scrape(request: ScrapeRequest):
     # Step 5 Phase A — observation: log every /scrape invocation so we can
     # track when the subprocess model is no longer needed and safely remove it.
     logger.info(
-        "DEPRECATED /scrape invoked: scraper=%s args=%s",
-        request.scraper_path,
+        "DEPRECATED /scrape invoked (stateless): scraper_name=%s args=%s source=%dB",
+        request.scraper_name,
         getattr(request, "args", [])[:5],
+        len(request.scraper_source or ""),
     )
-    if not os.path.isfile(request.scraper_path):
-        return JSONResponse(
-            status_code=404,
-            content={
-                "returncode": -1,
-                "stderr": f"Scraper not found: {request.scraper_path}",
-                "stdout": "",
-                "output_file": "",
-                "product_count": 0,
-                "duration": 0,
-            },
-        )
+    # Stateless staging: write the caller-supplied source to a private /tmp dir
+    # (one per call — no cross-call collision), run it, capture output CONTENT,
+    # then clean up. No shared filesystem, no File Master access.
+    import uuid
+    import shutil
+    run_dir = os.path.join("/tmp", f"scrape_{uuid.uuid4().hex}")
     try:
-        loop = asyncio.get_event_loop()
-        result = await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                lambda: run_scraper_script(
-                    scraper_path=request.scraper_path,
-                    args=request.args,
-                    timeout=request.timeout,
-                    env_overrides=request.env_overrides,
-                    max_retries=request.max_retries,
+        os.makedirs(run_dir, exist_ok=True)
+        scraper_path = os.path.join(run_dir, request.scraper_name or "scraper.py")
+        try:
+            with open(scraper_path, "w", encoding="utf-8") as f:
+                f.write(request.scraper_source or "")
+        except OSError as exc:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "returncode": -1,
+                    "stderr": f"Failed to stage scraper source: {exc}",
+                    "stdout": "",
+                    "output_content": "",
+                    "output_name": "",
+                    "product_count": 0,
+                    "duration": 0,
+                },
+            )
+        try:
+            loop = asyncio.get_event_loop()
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: run_scraper_script(
+                        scraper_path=scraper_path,
+                        args=request.args,
+                        timeout=request.timeout,
+                        env_overrides=request.env_overrides,
+                        max_retries=request.max_retries,
+                    ),
                 ),
-            ),
-            timeout=request.timeout + 120,
-        )
-        return JSONResponse(content=result)
-    except asyncio.TimeoutError:
-        logger.error("Scraper timed out for %s (lock released)", request.scraper_path)
-        return JSONResponse(
-            status_code=504,
-            content={
-                "returncode": -1,
+                timeout=request.timeout + 120,
+            )
+            return JSONResponse(content=result)
+        except asyncio.TimeoutError:
+            logger.error("Scraper timed out for %s (lock released)", scraper_path)
+            return JSONResponse(
+                status_code=504,
+                content={
+                    "returncode": -1,
                 "stderr": f"Timed out after {request.timeout + 120}s",
                 "stdout": "",
-                "output_file": "",
+                "output_content": "",
+                "output_name": "",
                 "product_count": 0,
                 "duration": request.timeout + 120,
             },
         )
     except Exception as exc:
-        logger.exception("Scrape failed for %s", request.scraper_path)
+        logger.exception("Scrape failed for %s", scraper_path)
         return JSONResponse(
             status_code=500,
             content={
                 "returncode": -1,
                 "stderr": str(exc),
                 "stdout": "",
-                "output_file": "",
+                "output_content": "",
+                "output_name": "",
                 "product_count": 0,
                 "duration": 0,
             },
         )
+    finally:
+        # Stateless: reap the staged /tmp dir (output content already captured
+        # into the response). Best-effort — a racing subprocess on timeout may
+        # hold a file open; /tmp is ephemeral anyway.
+        import shutil as _shutil
+        _shutil.rmtree(run_dir, ignore_errors=True)
 
 
 # ── POST /navigate ───────────────────────────────────────────────────────

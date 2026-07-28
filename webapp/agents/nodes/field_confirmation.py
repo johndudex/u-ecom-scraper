@@ -436,10 +436,17 @@ def _run_sample_via_queue(scraper_path: str, args: list[str]) -> str:
         browser_service_url = getattr(
             settings, "BROWSER_SERVICE_URL", "http://browser_service:8001"
         )
+        # Stateless /scrape: send the local scraper source (not a path).
+        try:
+            with open(scraper_path, "r", encoding="utf-8", errors="replace") as _f:
+                _source = _f.read()
+        except OSError as exc:
+            return f"[queue error] could not read scraper source: {exc}"
         resp = httpx.post(
             f"{browser_service_url}/scrape",
             json={
-                "scraper_path": scraper_path,
+                "scraper_source": _source,
+                "scraper_name": os.path.basename(scraper_path),
                 "args": args,
                 "timeout": 300,
             },

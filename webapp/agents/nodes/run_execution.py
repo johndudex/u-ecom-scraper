@@ -445,15 +445,24 @@ def _run_category_sources(state, scraper_path, base_args, site_folder, primary_r
             logger.info("multisource: running scraper on category %s", cat_url[:60])
             try:
                 cat_args = ["--category-url", cat_url]
+                # Stateless /scrape: read local source, POST it; parse output content directly.
+                try:
+                    with open(scraper_path, "r", encoding="utf-8", errors="replace") as _cf:
+                        _cat_source = _cf.read()
+                except OSError:
+                    _cat_source = ""
                 resp = httpx.post(
                     f"{service_url}/scrape",
-                    json={"scraper_path": scraper_path, "args": cat_args, "timeout": 600, "env_overrides": stealth_env},
+                    json={"scraper_source": _cat_source, "scraper_name": os.path.basename(scraper_path), "args": cat_args, "timeout": 600, "env_overrides": stealth_env},
                     timeout=620,
                 )
                 cat_result = resp.json()
-                cat_output = cat_result.get("output_file", "")
-                if cat_output and _os.path.isfile(cat_output):
-                    cat_data = _json.load(open(cat_output))
+                cat_content = cat_result.get("output_content") or ""
+                if cat_content:
+                    try:
+                        cat_data = _json.loads(cat_content)
+                    except Exception:
+                        cat_data = {}
                     cat_products = cat_data.get(output_key, [])
                     new_count = 0
                     for p in cat_products:
@@ -715,10 +724,23 @@ def _run_via_browser_service(
         logger.warning("run_execution: heartbeat start failed: %s", _hb_exc)
 
     try:
+        # Stateless /scrape: read the local scraper source, POST it; browser_service
+        # returns output CONTENT (no shared FS). Persist it next to the scraper
+        # draft (workspace/{slug}/) so downstream reads + _finalize_job's
+        # workspace→scrapers promotion keep working unchanged.
+        try:
+            with open(scraper_path, "r", encoding="utf-8", errors="replace") as _f:
+                _source = _f.read()
+        except OSError as exc:
+            return {
+                "execution_status": "FAILED",
+                "error_message": f"Could not read scraper source {scraper_path}: {exc}",
+            }
         resp = httpx.post(
             f"{service_url}/scrape",
             json={
-                "scraper_path": scraper_path,
+                "scraper_source": _source,
+                "scraper_name": os.path.basename(scraper_path),
                 "args": args,
                 "timeout": timeout,
                 "env_overrides": stealth_env,
@@ -729,7 +751,7 @@ def _run_via_browser_service(
         if resp.status_code == 404:
             return {
                 "execution_status": "FAILED",
-                "error_message": f"Scraper not found on browser_service: {scraper_path}",
+                "error_message": "Scraper rejected by browser_service (source invalid)",
             }
 
         resp.raise_for_status()
@@ -742,11 +764,19 @@ def _run_via_browser_service(
                 "error_message": f"Scraper exited with code {result['returncode']}. {stderr}",
             }
 
-        # The output lives on the shared volume, so we can read the
-        # discovery_coverage block the scraper emitted. Checkpoint cleanup for
-        # this path is owned by browser_service's scraper_runner (post-success).
-        output_file = result.get("output_file", "")
-        discovery_coverage = _read_discovery_coverage(output_file)
+        # Persist the returned output content locally; discovery_coverage is read
+        # from it. Checkpoint cleanup is owned by browser_service's scraper_runner.
+        _output_content = result.get("output_content") or ""
+        _output_name = result.get("output_name") or ""
+        output_file = ""
+        if _output_content and _output_name:
+            output_file = os.path.join(os.path.dirname(scraper_path), _output_name)
+            try:
+                with open(output_file, "w", encoding="utf-8") as _of:
+                    _of.write(_output_content)
+            except OSError as exc:
+                logger.warning("run_execution: could not persist output locally: %s", exc)
+        discovery_coverage = _read_discovery_coverage(output_file) if output_file else {}
 
         return {
             "execution_status": "SUCCESS",

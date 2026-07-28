@@ -103,7 +103,13 @@ def _delete_discovery_checkpoint(scraper_dir: str) -> None:
 
 
 def _post_run(result: Any, scraper_path: str, elapsed: float) -> dict[str, Any]:
-    """Find output file, chown, build result dict. Shared by success + failure paths."""
+    """Find output file, read its CONTENT, build result dict. Shared by success + failure paths.
+
+    Stateless /scrape: returns the output CONTENT (not a filesystem path) so the
+    caller never needs access to browser_service's /tmp staging dir. The chown
+    block that lived here (root→uid1000 for the old shared volume) is gone — no
+    shared volume means no uid mismatch to fix.
+    """
     scraper_dir = os.path.dirname(scraper_path) or PROJECT_ROOT
     output_file = _find_output_file(scraper_dir)
     product_count = _count_products(output_file) if output_file else 0
@@ -116,35 +122,27 @@ def _post_run(result: Any, scraper_path: str, elapsed: float) -> dict[str, Any]:
     if result.returncode == 0:
         _delete_discovery_checkpoint(scraper_dir)
 
+    output_content = ""
+    output_name = ""
     if output_file:
         logger.info(
             "Post-run: output=%s, items=%d (partial=%s)",
             os.path.basename(output_file), product_count,
             result.returncode != 0,
         )
-
-    # Fix file ownership: browser_service runs as root, but celery/django
-    # run as uid 1000 (scraper). Chown output + any new files to 1000:1000.
-    try:
-        import pwd
-        os.chown(scraper_dir, 1000, 1000)
-        for _name in os.listdir(scraper_dir):
-            _fpath = os.path.join(scraper_dir, _name)
-            os.chown(_fpath, 1000, 1000)
-            if os.path.isdir(_fpath):
-                for _sub in os.listdir(_fpath):
-                    try:
-                        os.chown(os.path.join(_fpath, _sub), 1000, 1000)
-                    except OSError:
-                        pass
-    except (PermissionError, OSError):
-        pass
+        try:
+            with open(output_file, "r", encoding="utf-8", errors="replace") as f:
+                output_content = f.read()
+            output_name = os.path.basename(output_file)
+        except OSError as exc:
+            logger.warning("Post-run: could not read output %s: %s", output_file, exc)
 
     return {
         "returncode": result.returncode,
         "stdout": (result.stdout or "")[:50000],  # cap to avoid bloating the response
         "stderr": (result.stderr or "")[:50000],
-        "output_file": output_file,
+        "output_content": output_content,   # full output JSON text (caller persists it)
+        "output_name": output_name,         # e.g. "output_2026-...json"
         "product_count": product_count,
         "duration": elapsed,
     }
