@@ -645,7 +645,8 @@ def _run_in_process(
                 "error_message": f"Scraper exited with code {returncode}. {stderr[-2000:]}",
             }
 
-        output_file = _find_newest_output(workspace_folder, site_folder)
+        _slug = os.path.basename(site_folder.rstrip("/")) if site_folder else None
+        output_file = _find_newest_output(workspace_folder, site_folder, slug=_slug)
         product_count = _count_products(output_file) if output_file else 0
         discovery_coverage = _read_discovery_coverage(output_file)
 
@@ -810,18 +811,20 @@ def _run_via_browser_service(
                 pass
 
 
-def _find_newest_output(*directories: str) -> str:
-    """Return the newest-mtime ``output_*.json`` across the given directories.
+def _find_newest_output(*directories: str, slug: str | None = None) -> str:
+    """Return the newest-mtime ``output_*.json`` across the given LOCAL directories.
 
     The scraper writes its output next to itself (``SCRIPT_DIR`` = dirname of
     the scraper file), which during a run is ``workspace/{slug}/``. Selecting by
     name OR scanning ``scrapers/{slug}/`` first returns a *stale* output from a
-    prior job on a re-scrape (that dir already holds old outputs), so the
-    current run's freshly-written file is never picked — and the wrong file
-    propagates to ScrapeJob.output_file / product_count / store_job_listings
-    (e.g. 1 job recorded instead of 69). Picking the newest mtime across all
-    relevant dirs reliably identifies the file THIS run just wrote, regardless
-    of which dir it landed in.
+    prior job on a re-scrape, so picking the newest mtime reliably identifies the
+    file THIS run just wrote.
+
+    If nothing is found locally and ``slug`` is given, fall back to the File
+    Master's latest published output for the site (downloaded to a tmp file so
+    downstream readers that open a path — ``_count_products``,
+    ``_read_discovery_coverage`` — keep working). This covers the resume case
+    where the workspace was rmtree'd.
     """
     best_mtime = -1.0
     best_path = ""
@@ -842,6 +845,21 @@ def _find_newest_output(*directories: str) -> str:
                 continue
             if mtime > best_mtime:
                 best_mtime, best_path = mtime, path
+    if not best_path and slug:
+        try:
+            import src.artifacts as artifacts
+            import tempfile
+
+            fm_key = artifacts.latest_output_key(slug)
+            if fm_key:
+                _tmp = tempfile.NamedTemporaryFile(
+                    prefix="fm_output_", suffix=".json", delete=False
+                )
+                _tmp.write(artifacts.read(fm_key))
+                _tmp.close()
+                best_path = _tmp.name
+        except Exception as exc:
+            logger.debug("_find_newest_output: FM fallback failed: %s", exc)
     return best_path
 
 

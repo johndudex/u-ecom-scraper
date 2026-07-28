@@ -532,7 +532,7 @@ def _attach_discovery_coverage(report: dict, slug: str) -> dict:
     workspace_dir = os.path.join(root, "workspace", slug)
     site_dir = os.path.join(root, "scrapers", slug)
     try:
-        output_file = _find_newest_output(workspace_dir, site_dir)
+        output_file = _find_newest_output(workspace_dir, site_dir, slug=slug)
     except Exception as exc:
         logger.debug("_attach_discovery_coverage: newest-output lookup failed: %s", exc)
         output_file = None
@@ -3330,7 +3330,7 @@ def _invoke_store_job_listings(
             root = _get_project_root()
             site_folder = os.path.join(root, "scrapers", slug)
             workspace_folder = os.path.join(root, "workspace", slug)
-            output_file = _find_newest_output(workspace_folder, site_folder)
+            output_file = _find_newest_output(workspace_folder, site_folder, slug=slug)
         except Exception:
             output_file = ""
     if not output_file or not os.path.isfile(output_file):

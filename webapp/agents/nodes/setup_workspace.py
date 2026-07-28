@@ -1,4 +1,9 @@
-"""Create the workspace and output directories required by downstream nodes."""
+"""Create the workspace and output directories required by downstream nodes.
+
+The LOCAL ``workspace/{slug}/`` tree stays on the worker's own volume (internal
+pipeline scratch). Published artifacts (``scrapers/``) live in the File Master —
+so workspace↔scrapers moves are now local↔FM round-trips.
+"""
 
 import json
 import logging
@@ -24,21 +29,28 @@ def _get_project_root() -> str:
     return os.getcwd()
 
 
-def _move_output_files(workspace_dir: str, scrapers_dir: str) -> int:
+def _publish_leftover_outputs(workspace_dir: str, slug: str) -> int:
+    """Publish any leftover workspace output_*.json to the File Master.
+
+    Safety net for outputs left in workspace by a crashed prior run (the normal
+    publish happens in _finalize_job). Reads local, writes FM key, removes local.
+    """
+    import src.artifacts as artifacts
+
     moved = 0
     if not os.path.isdir(workspace_dir):
         return moved
     for fname in os.listdir(workspace_dir):
         if fname.startswith("output_") and fname.endswith(".json"):
             src = os.path.join(workspace_dir, fname)
-            dst = os.path.join(scrapers_dir, fname)
             if os.path.isfile(src):
                 try:
-                    os.makedirs(scrapers_dir, exist_ok=True)
-                    shutil.move(src, dst)
+                    with open(src, "rb") as _f:
+                        artifacts.write(artifacts.scrapers_key(slug, fname), _f.read())
+                    os.remove(src)
                     moved += 1
                 except Exception as exc:
-                    logger.warning("setup_workspace: failed to move %s: %s", src, exc)
+                    logger.warning("setup_workspace: failed to publish %s: %s", src, exc)
     return moved
 
 
@@ -62,47 +74,47 @@ def _clean_stale_artifacts(workspace_dir: str, preserve: set[str] | None = None)
     return removed
 
 
-def _restore_from_archive(analysis_dir: str, workspace_dir: str, filename: str) -> bool:
-    """Copy an artifact from scrapers/{slug}/analysis/ to workspace/{slug}/
-    if it exists in the archive but not in the workspace (re-hydration for
-    selective re-run — the workspace was rmtree'd by _finalize_job)."""
-    src = os.path.join(analysis_dir, filename)
+def _restore_from_archive(slug: str, workspace_dir: str, filename: str) -> bool:
+    """Re-hydrate an artifact from the File Master (scrapers/{slug}/analysis/)
+    into the LOCAL workspace, if the workspace copy is missing (selective re-run
+    — the workspace was rmtree'd by _finalize_job)."""
+    import src.artifacts as artifacts
+
     dst = os.path.join(workspace_dir, filename)
-    if os.path.isfile(src) and not os.path.isfile(dst):
-        try:
-            shutil.copy2(src, dst)
-            logger.info("setup_workspace: re-hydrated %s from analysis/", filename)
+    if os.path.isfile(dst):
+        return False
+    key = artifacts.scrapers_key(slug, "analysis", filename)
+    try:
+        if artifacts.exists(key):
+            os.makedirs(workspace_dir, exist_ok=True)
+            with open(dst, "wb") as _f:
+                _f.write(artifacts.read(key))
+            logger.info("setup_workspace: re-hydrated %s from FM analysis/", filename)
             return True
-        except Exception as exc:
-            logger.warning("setup_workspace: failed to re-hydrate %s: %s", filename, exc)
+    except Exception as exc:
+        logger.warning("setup_workspace: failed to re-hydrate %s: %s", filename, exc)
     return False
 
 
 def setup_workspace(state: ScrapeState) -> dict[str, Any]:
-    """Ensure ``workspace/{slug}/``, ``scrapers/{slug}/``, and ``logs/`` exist.
+    """Ensure ``workspace/{slug}/`` and ``logs/`` exist (LOCAL), publish any
+    leftover outputs to the File Master, and re-hydrate skipped analysis
+    artifacts from FM for selective re-runs.
 
-    All directory creation is idempotent (``exist_ok=True``).
-    Moves output files to scrapers/ folder and removes stale artifacts
-    while preserving analysis files that check_tracker said to skip.
+    All directory creation is idempotent (``exist_ok=True``). ``workspace/`` is
+    the worker's own scratch volume; ``scrapers/`` lives in the File Master.
     """
     slug = state["site_slug"]
     root = _get_project_root()
 
     workspace_dir = os.path.join(root, "workspace", slug)
-    scrapers_dir = os.path.join(root, "scrapers", slug)
 
-    dirs_to_create = [
-        workspace_dir,
-        scrapers_dir,
-        os.path.join(root, "logs"),
-    ]
-
-    for d in dirs_to_create:
+    for d in (workspace_dir, os.path.join(root, "logs")):
         os.makedirs(d, exist_ok=True)
 
-    moved = _move_output_files(workspace_dir, scrapers_dir)
+    moved = _publish_leftover_outputs(workspace_dir, slug)
     if moved:
-        logger.info("setup_workspace: moved %d output files to scrapers/%s/", moved, slug)
+        logger.info("setup_workspace: published %d leftover output files to FM for %s", moved, slug)
 
     skip_files: set[str] = set(PRESERVE_FILES)
     if state.get("skip_site_analysis"):
@@ -119,32 +131,28 @@ def setup_workspace(state: ScrapeState) -> dict[str, Any]:
     if state.get("skip_code_generation"):
         draft_in_ws = os.path.join(workspace_dir, "scraper_draft.py")
         if not os.path.isfile(draft_in_ws):
-            scraper_in_final = os.path.join(scrapers_dir, "scraper.py")
-            if os.path.isfile(scraper_in_final):
-                try:
-                    shutil.copy2(scraper_in_final, draft_in_ws)
+            import src.artifacts as artifacts
+            try:
+                _key = artifacts.scrapers_key(slug, "scraper.py")
+                if artifacts.exists(_key):
+                    with open(draft_in_ws, "wb") as _f:
+                        _f.write(artifacts.read(_key))
                     logger.info(
-                        "setup_workspace: restored scraper_draft.py from %s (cleanup had moved it)",
-                        scraper_in_final,
+                        "setup_workspace: restored scraper_draft.py from FM scraper.py (skip_code_generation)"
                     )
-                except Exception as exc:
-                    logger.warning(
-                        "setup_workspace: failed to restore scraper_draft.py: %s", exc
-                    )
+            except Exception as exc:
+                logger.warning("setup_workspace: failed to restore scraper_draft.py: %s", exc)
 
-    # Re-hydrate analysis artifacts from scrapers/{slug}/analysis/ (the workspace
-    # was rmtree'd by _finalize_job at the end of the prior run — the analysis/
-    # archive preserves them for selective re-run reuse).
-    analysis_dir = os.path.join(scrapers_dir, "analysis")
-    if os.path.isdir(analysis_dir):
-        if state.get("skip_site_analysis"):
-            _restore_from_archive(analysis_dir, workspace_dir, "site_analysis.json")
-        if state.get("skip_product_analysis"):
-            _restore_from_archive(analysis_dir, workspace_dir, "product_analysis.json")
-            _restore_from_archive(analysis_dir, workspace_dir, "navigation_analysis.json")
-        if state.get("skip_code_generation"):
-            _restore_from_archive(analysis_dir, workspace_dir, "scraper_analysis.json")
-            _restore_from_archive(analysis_dir, workspace_dir, "test_report.json")
+    # Re-hydrate analysis artifacts from FM (scrapers/{slug}/analysis/) for the
+    # selective re-run case (workspace was rmtree'd by _finalize_job last run).
+    if state.get("skip_site_analysis"):
+        _restore_from_archive(slug, workspace_dir, "site_analysis.json")
+    if state.get("skip_product_analysis"):
+        _restore_from_archive(slug, workspace_dir, "product_analysis.json")
+        _restore_from_archive(slug, workspace_dir, "navigation_analysis.json")
+    if state.get("skip_code_generation"):
+        _restore_from_archive(slug, workspace_dir, "scraper_analysis.json")
+        _restore_from_archive(slug, workspace_dir, "test_report.json")
 
     input_urls = state.get("input_urls") or []
     if input_urls:
@@ -156,11 +164,7 @@ def setup_workspace(state: ScrapeState) -> dict[str, Any]:
         except Exception as exc:
             logger.warning("setup_workspace: failed to write input_urls.json: %s", exc)
 
-    # Fail-fast: a url_list job with NO urls anywhere (Site.input_urls empty AND
-    # no production scrapers/{slug}/input_urls.json) would silently under-extract
-    # (the misleading "1 of N coverage gap"). Fail loud with an actionable message
-    # instead. (_build_initial_state already loaded the production file into state
-    # if it existed, so empty state here means truly no URLs.)
+    # Fail-fast: a url_list job with NO urls anywhere would silently under-extract.
     if (state.get("input_mode") == "url_list") and not input_urls:
         raise RuntimeError(
             f"url_list job for '{slug}' has no input URLs — Site.input_urls is empty "
