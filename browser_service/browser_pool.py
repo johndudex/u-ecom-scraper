@@ -1,6 +1,7 @@
 import logging
 import os
 import subprocess
+import threading
 import time
 from typing import Optional
 
@@ -20,6 +21,14 @@ class BrowserPool:
         self._mcp_chrome_proc: Optional[subprocess.Popen] = None
         self._scraper_chrome_proc: Optional[subprocess.Popen] = None
         self._ready = False
+        # Serializes restart_chrome across concurrent callers (the CDP liveness
+        # loop, /restart-cdp, and the scraper retry path can all call it). Without
+        # this, two callers racing terminate()+restart() on the same Chrome
+        # produce "NoneType" / "Opening in existing browser session" 500s and
+        # corrupt the singleton state. A single lock is correct: restarts are
+        # rare (only on death) so serializing mcp vs scraper costs nothing, and
+        # it's the cross-thread/cross-loop boundary that needs guarding.
+        self._restart_lock = threading.Lock()
 
     def startup(self) -> dict:
         errors = []
@@ -127,25 +136,29 @@ class BrowserPool:
             if not errors or display_label not in " ".join(errors):
                 result["restarted"].append(display_label.lower())
 
-        # Always run restarts off the event loop thread so async callers
-        # (FastAPI handlers) don't block on the multi-second Chrome startup.
-        if label in ("mcp", "all"):
-            _do_restart("_mcp_chrome_proc", "_start_mcp_chrome", "MCP")
-        if label in ("scraper", "all"):
-            _do_restart("_scraper_chrome_proc", "_start_scraper_chrome", "Scraper")
+        # Hold the restart lock for the whole op so concurrent callers can't
+        # tear down / relaunch Chrome simultaneously. (Blocking acquire — restart
+        # is rare and the multi-second Chrome startup already dominates latency.)
+        with self._restart_lock:
+            # Always run restarts off the event loop thread so async callers
+            # (FastAPI handlers) don't block on the multi-second Chrome startup.
+            if label in ("mcp", "all"):
+                _do_restart("_mcp_chrome_proc", "_start_mcp_chrome", "MCP")
+            if label in ("scraper", "all"):
+                _do_restart("_scraper_chrome_proc", "_start_scraper_chrome", "Scraper")
 
-        if not result["errors"]:
-            logger.info(
-                "restart_chrome(%s) completed successfully: %s",
-                label,
-                result["restarted"],
-            )
-        else:
-            logger.error(
-                "restart_chrome(%s) finished with errors: %s", label, result["errors"]
-            )
+            if not result["errors"]:
+                logger.info(
+                    "restart_chrome(%s) completed successfully: %s",
+                    label,
+                    result["restarted"],
+                )
+            else:
+                logger.error(
+                    "restart_chrome(%s) finished with errors: %s", label, result["errors"]
+                )
 
-        return result
+            return result
 
     def shutdown(self):
         for proc in [self._scraper_chrome_proc, self._mcp_chrome_proc, self._xvfb_proc]:

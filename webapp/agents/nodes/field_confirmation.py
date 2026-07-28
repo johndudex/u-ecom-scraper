@@ -280,25 +280,22 @@ def field_confirmation(state: ScrapeState) -> Command:
                 sample_text = _format_output_products(output_file, output_key)
     else:
         logger.info(
-            "field_confirmation: input_urls.json not found, running scraper with sample URL"
+            "field_confirmation: input_urls.json not found, reading latest output"
         )
-        product_url = state.get("product_url", "") or state.get("sample_url", "")
-        if product_url:
-            cmd_args = ["--urls", product_url]
-            scraping_method = state.get("scraping_method", "")
-            if _needs_browser_queue(scraper_path, scraping_method):
-                output = _run_sample_via_queue(scraper_path, cmd_args)
-            else:
-                output = _run_sample_in_process(scraper_path, cmd_args, root)
-            sample_text = output[:3000] if output.strip() else ""
-
-            if not sample_text:
-                output_file = _find_latest_output(slug, root)
-                if output_file:
-                    logger.info(
-                        "field_confirmation: reading output file %s", output_file
-                    )
-                    sample_text = _format_output_products(output_file, output_key)
+        # Bug C fix (deterministic): the OLD code ran the scraper with --urls
+        # <single sample URL> → ALWAYS extracted exactly 1 item (manny-abascal)
+        # → 1 < 3 ground-truth → cascade → the whack-a-mole root cause. Instead,
+        # just read the latest output file that code_tester already produced
+        # (which may have 5+ items from --input testing). If no output exists,
+        # skip the sample — do NOT poison the gate with a 1-item --urls run.
+        output_file = _find_latest_output(slug, root)
+        if output_file:
+            logger.info(
+                "field_confirmation: reading output file %s", output_file
+            )
+            sample_text = _format_output_products(output_file, output_key)
+        else:
+            sample_text = ""
 
     if not sample_text:
         report = state.get("test_report")

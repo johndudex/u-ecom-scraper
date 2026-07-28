@@ -21,6 +21,9 @@ BROWSER_SERVICE_URL = os.environ.get("BROWSER_SERVICE_URL", "http://127.0.0.1:80
 # restart Chrome + retry. Code bugs (Python Traceback) are NOT retried
 # (left to code_tester). [browser resilience: B-service]
 
+# Real Chrome/CDP PROCESS death — the browser/tab closed or the endpoint died.
+# Only these benefit from a Chrome restart + retry (a fresh browser recovers
+# them). Per-page errors are deliberately EXCLUDED (see below).
 _CHROME_CRASH_MARKERS = (
     "Target page, has been closed",
     "Target closed",
@@ -28,12 +31,16 @@ _CHROME_CRASH_MARKERS = (
     "Browser closed",
     "connect ECONNREFUSED",
     "playwright._impl._api_types.Error: Target",
-    "net::ERR_CONNECTION_",
     "Page.goto: Target closed",
     "Execution context was destroyed",
-    "Navigation failed because",
-    "CDP",
 )
+# Deliberately EXCLUDED — these are per-page/network errors, NOT Chrome crashes,
+# so a Chrome restart + full-scrape retry cannot fix them (the same URL is still
+# slow/down). Retrying just burns retries × the time limit and wedges the shared
+# Chrome for the next caller:
+#   "net::ERR_CONNECTION_"      — one URL failed to load (site slow/down/blocked)
+#   "Navigation failed because" — single-page navigation failure
+#   "CDP"                       — far too broad (matches any CDP log line)
 
 _PYTHON_TRACEBACK_RE = re.compile(r"Traceback \(most recent call last\)")
 
@@ -243,26 +250,28 @@ def run_scraper_script(
             return _post_run(result, scraper_path, round(time.time() - start, 2))
 
         except subprocess.TimeoutExpired:
+            # A timeout means the scraper is SLOW or HUNG — NOT a Chrome crash.
+            # Retrying the SAME work in the SAME time budget finishes neither
+            # (locumtenens' slow form-POST discovery retried 3×180s here for
+            # zero benefit, and the intervening Chrome restarts wedged the shared
+            # Scraper Chrome so run_execution hung on it). So: do NOT retry.
+            # Restart Chrome once so a wedged browser doesn't hang the NEXT
+            # caller, then return the timeout to the caller (code_tester/probe
+            # treat it as inconclusive; run_execution applies its own budget).
             logger.error(
-                "Scraper timed out after %ds (attempt %d/%d)",
-                timeout, attempt, max_retries,
+                "Scraper timed out after %ds — slow/hung work, not a Chrome crash; "
+                "NOT retrying (same work would time out again). Restarting Chrome "
+                "to clear any wedge for the next caller.",
+                timeout,
             )
-            if attempt < max_retries:
-                logger.info(
-                    "Scraper: restarting Chrome + retrying after timeout in %ds...",
-                    backoff,
-                )
-                _restart_scraper_chrome()
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-                continue
+            _restart_scraper_chrome()
             return {
                 "returncode": -1,
                 "stdout": "",
-                "stderr": f"Timed out after {timeout}s (exhausted {max_retries} retries)",
+                "stderr": f"Timed out after {timeout}s",
                 "output_file": "",
                 "product_count": 0,
-                "duration": timeout,
+                "duration": round(time.time() - start, 2),
             }
 
         except Exception as exc:

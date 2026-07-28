@@ -424,6 +424,23 @@ def assess_query_match(query: str, items: list, title_field: str = "title") -> d
 _ALWAYS_PRESENT_FIELDS = {"title", "url", "src_url", "scraped_at", "status_code", "remarks", "id"}
 
 
+def has_substantive_field(item: dict) -> bool:
+    """True if the item has ≥1 substantive (non-bookkeeping) field with a value.
+
+    Content-type-AGNOSTIC success predicate. An item is 'real' if it carries ANY
+    data beyond the bookkeeping fields (url/src_url/scraped_at/status_code/remarks/id/title).
+    This rescues non-product content types (people directories like lw.com, job
+    boards, article archives) whose identifier field is 'Name'/'company'/'author'
+    — NOT 'title'. The pipeline's ~7 hardcoded title/price success gates silently
+    discard their extractions, scoring a 20/20 perfect extraction as 0/FAIL.
+    This predicate replaces those gates so success is recognized regardless of
+    the content type.
+    """
+    if not isinstance(item, dict):
+        return False
+    return any(k not in _ALWAYS_PRESENT_FIELDS and v for k, v in item.items())
+
+
 def output_filter_fields(content_type: str) -> list[str]:
     """Fields whose presence indicates a real item of this content type — used by
     output filters to drop nav/category pages and extraction failures (e.g. a

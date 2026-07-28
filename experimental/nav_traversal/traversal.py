@@ -647,6 +647,8 @@ class TraversalResult:
     goal_method: str = "GET"             # how the goal page was reached (for replay)
     goal_data: dict = field(default_factory=dict)
     goal_request_url: str = ""           # the URL the winning action hit (form action)
+    item_links: list = field(default_factory=list)  # real item/detail hrefs from the rendered goal page
+    discovery: dict = field(default_factory=dict)  # {listing_url, listing_reached, pagination} — the contract
 
 
 def _pick_mechanism(reached_by: str, signals: dict) -> str:
@@ -1558,6 +1560,138 @@ def _do_action(action: dict, nav, click, ev, wait, type_t=None) -> str:
     return desc
 
 
+def _read_page_state_with_retry(ev, wait, *, waits=(0, 5, 8)):
+    """Evaluate ``_PAGE_STATE_JS`` with progressive waits on empty results.
+
+    JS-rendered listing pages (Coveo, React, Vue) mount their results AFTER the
+    browser's ``load``/``networkidle`` events fire — the first evaluate can run
+    on a page whose results container is still empty, yielding an unparseable
+    result (``_parse_mcp_json`` returns ``{}``). It also covers transient MCP
+    session errors: each ``ev.invoke`` runs via ``asyncio.run`` on a fresh event
+    loop, so a retry gets a fresh SSE session + connection.
+
+    Waits progressively longer between attempts (default: immediate, then 5s,
+    then 8s) so a slow render has time to complete before we declare the page
+    empty. Returns the parsed surface dict, or ``{}`` if every attempt fails.
+    """
+    for idx, delay_s in enumerate(waits):
+        if delay_s and wait:
+            try:
+                wait.invoke({"time": delay_s})
+            except Exception as wait_exc:
+                logger.debug("page-state retry wait failed: %s", wait_exc)
+        try:
+            raw = ev.invoke({"function": _PAGE_STATE_JS})
+        except Exception as exc:
+            logger.warning(
+                "browser_traverse: page-state evaluate error (attempt %d/%d): %s",
+                idx + 1, len(waits), exc,
+            )
+            continue
+        surface = _parse_mcp_json(raw)
+        if surface:
+            if idx > 0:
+                logger.info(
+                    "browser_traverse: page-state recovered on attempt %d (after %ss wait)",
+                    idx + 1, delay_s,
+                )
+            return surface
+    return {}
+
+
+_ITEM_LINKS_JS = r"""
+() => {
+  // Mirror _PAGE_STATE_JS's DOM-STRUCTURE detection (not bare href-prefixing):
+  // find the sibling-group container whose children anchor to distinct hrefs
+  // sharing a path prefix — that is the listing's item grid. Bare href-prefix
+  // grouping picks the WRONG set on pages that also list offices/filters/etc.
+  // (lw.com: ~30 /offices links outnumber the 20 /people cards, but the cards
+  // are the actual result grid). Returns up to 25 absolute item hrefs.
+  function commonPrefixDepth(uA, uB) {
+    try {
+      var pa = new URL(uA, location.href).pathname.replace(/^\/+/, '').split('/');
+      var pb = new URL(uB, location.href).pathname.replace(/^\/+/, '').split('/');
+    } catch (e) { return 0; }
+    var n = 0;
+    for (var i = 0; i < Math.min(pa.length, pb.length, 5); i++) {
+      if (pa[i] === pb[i] && pa[i]) n++; else break;
+    }
+    return n;
+  }
+  var NAVISH = /^(NAV|FOOTER|ASIDE|HEADER)$/i;
+  var containers = document.querySelectorAll('ul,ol,div,section,tbody,main');
+  var best = [], bestN = 0;
+  for (var ci = 0; ci < containers.length && bestN < 60; ci++) {
+    var p = containers[ci];
+    if (NAVISH.test(p.tagName)) continue;
+    var groups = {};
+    for (var chi = 0; chi < p.children.length; chi++) {
+      var c = p.children[chi];
+      var cls = (c.className || '').toString().trim().split(/\s+/)[0] || '';
+      cls = cls.replace(/[_-][a-z0-9]*\d[a-z0-9]*$/i, '');
+      var key = c.tagName + '|' + cls;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(c);
+    }
+    for (var gk in groups) {
+      var sibs = groups[gk];
+      if (sibs.length < 5) continue;
+      var hrefs = [];
+      for (var si = 0; si < sibs.length; si++) {
+        var a = sibs[si].querySelector('a[href]');
+        if (a && a.href && !/^(javascript|mailto|tel|#)/i.test(a.href))
+          hrefs.push(a.href.split('#')[0]);
+      }
+      var distinct = hrefs.filter(function (v, i, arr) { return arr.indexOf(v) === i; });
+      if (distinct.length >= 5) {
+        var pref = 99;
+        for (var di = 1; di < distinct.length && di < 10; di++)
+          pref = Math.min(pref, commonPrefixDepth(distinct[0], distinct[di]));
+        if (pref >= 1 && distinct.length > bestN) { bestN = distinct.length; best = distinct; }
+      }
+    }
+  }
+  return best.slice(0, 25);
+}
+"""
+
+
+def _extract_item_links(ev) -> list[str]:
+    """Extract real item/detail hrefs from the rendered goal page via evaluate.
+
+    Called from browser_traverse's is_listing branch while the browser is still
+    on the goal page, so it sees the JS-rendered items (Coveo/React/Vue) — unlike
+    a plain HTTP fetch, which only sees the pre-render template's nav links.
+    Returns up to 25 absolute item URLs, or ``[]`` on any failure (non-fatal).
+    """
+    import json as _json
+
+    try:
+        raw = ev.invoke({"function": _ITEM_LINKS_JS})
+    except Exception as exc:
+        logger.warning("_extract_item_links: evaluate raised: %s", exc)
+        return []
+    content = getattr(raw, "content", None) or (raw if isinstance(raw, str) else str(raw))
+    m = re.search(r"### Result\s*\n(.+?)(?:\n###|\Z)", content, re.DOTALL)
+    blob = m.group(1).strip() if m else content.strip()
+    if blob.startswith('"') and blob.endswith('"'):
+        try:
+            blob = _json.loads(blob)
+        except Exception:
+            pass
+    try:
+        arr = _json.loads(blob) if isinstance(blob, str) else blob
+    except Exception as exc:
+        logger.warning("_extract_item_links: parse failed (blob[:120]=%r): %s", str(blob)[:120], exc)
+        return []
+    if not isinstance(arr, list):
+        logger.warning("_extract_item_links: expected list, got %s", type(arr).__name__)
+        return []
+    out = [str(u) for u in arr if isinstance(u, str) and u.startswith("http")]
+    logger.info("_extract_item_links: parsed %d item links (raw_len=%d)", len(out), len(content))
+    return out
+
+
 def browser_traverse(
     start_url: str,
     content_type: str,
@@ -1630,13 +1764,12 @@ def browser_traverse(
             # closed"). The evaluate is a single fast page.evaluate() that avoids
             # that path entirely, and its `signals` give a reliable in-browser
             # goal check (no LLM judgment needed for is_listing).
-            ps_raw = ev.invoke({"function": _PAGE_STATE_JS})
-            surface = _parse_mcp_json(ps_raw)
+            surface = _read_page_state_with_retry(ev, wait)
         except Exception as exc:
             logger.warning("browser_traverse: page-state read failed at step %d: %s", step_num, exc)
             break
         if not surface:
-            logger.warning("browser_traverse: empty page-state at step %d", step_num)
+            logger.warning("browser_traverse: empty page-state at step %d after retries", step_num)
             break
         signals = surface.get("signals") or {}
 
@@ -1701,7 +1834,43 @@ def browser_traverse(
             #      endpoint lives as a literal in a JS bundle).
             api = _capture_api_from_session(ev, url, query)
 
+            # Capture real item/detail hrefs from the RENDERED goal page (the
+            # browser is on it now). These become url_examples for product_analyzer
+            # + code_tester sample URLs — a plain HTTP fetch would only see the
+            # pre-render nav links on CSR pages (Coveo/React/Vue).
+            item_links = _extract_item_links(ev)
+            if item_links:
+                logger.info(
+                    "browser_traverse: captured %d item links from rendered goal page",
+                    len(item_links),
+                )
+
             _is_div_listing = bool((signals or {}).get("div_listing"))
+            # Build the discovery CONTRACT: pagination type from the surface's
+            # has_load_more / scroll_hint signals (captured by _PAGE_STATE_JS).
+            # These are DROPPED by the signals={"is_listing":True,...} overwrite
+            # below — capture them NOW. This is the fix for the JS-listing+pagination
+            # class (lw.com/Coveo): the navigator ALREADY detects the mechanism; the
+            # graph just never carried it forward.
+            _has_lm = bool(surface.get("has_load_more"))
+            _scroll_hint = bool(surface.get("scroll_hint"))
+            if _has_lm:
+                _pag_type = "load_more"
+            elif _scroll_hint:
+                # scroll_hint is a tall-page heuristic, NOT a real IS detector —
+                # label it distinctly so the scraper doesn't blindly scroll tall
+                # non-listing pages (Phase 4 adds a real IS probe).
+                _pag_type = "infinite_scroll_tall"
+            else:
+                _pag_type = "page_param"
+            _discovery = {
+                "listing_url": url,
+                "listing_reached": True,
+                "pagination": {
+                    "type": _pag_type,
+                    "items_per_page": int((signals or {}).get("results_items", 0)),
+                },
+            }
             return TraversalResult(
                 reached=True, goal_url=url, path=path,
                 mechanism="api" if api else ("ssr_div_list" if _is_div_listing else "browser_llm"),
@@ -1713,6 +1882,8 @@ def browser_traverse(
                 goal_method=_last_form_replay.get("method", "GET"),
                 goal_data=_last_form_replay.get("data", {}),
                 goal_request_url=_last_form_replay.get("action", ""),
+                item_links=item_links,
+                discovery=_discovery,
             )
 
         if result.get("action") == "done":
@@ -1726,6 +1897,12 @@ def browser_traverse(
         mechanism="unknown", api=None, signals={},
         visited=path, pruned=[],
         notes=f"budget exhausted after {len(history)} actions",
+        # CRITICAL: a nav failure must NOT be disguised as a discovered listing.
+        # listing_reached=False tells run_execution to OMIT --listing-url (so the
+        # scraper's DEFAULT_LISTING_URL drives discovery, not the sample detail URL
+        # that goal_url=start_url carries). This is the dominant fix for the
+        # 0-item outcomes on JS-listing sites (lw.com: ~67% of runs).
+        discovery={"listing_url": None, "listing_reached": False, "pagination": None},
     )
 
 

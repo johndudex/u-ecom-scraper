@@ -561,3 +561,149 @@ const url = `${baseUrl}?profession=361&specialty=22&state=AZ`;
 2. No server-side session — filter params are self-contained
 3. Direct HTTP construction without form submission
 4. Common on WordPress-based job boards with custom post types
+
+## Learned: Coveo Search Platform — Button-Click Pagination and Result Containers
+**Source:** https://www.lw.com/en/people (2026-07-26)
+**Applicability:** Any site using Coveo enterprise search for people directories, knowledge bases, or product catalogs (common on law firms, consulting firms, universities, and large corporate intranets).
+
+Coveo is an enterprise search platform used by many corporate/professional sites for
+people directories, knowledge bases, and product catalogs. It renders results client-side
+via its JavaScript framework, so Playwright is required for Phase 1 discovery.
+
+**Detection markers:**
+- CSS classes: `.CoveoResult`, `.coveo-result-frame`, `.coveo-pager-next`, `.coveo-results-header`
+- Coveo JS framework in page source (`Coveo.` namespace, `coveo-` prefixed classes)
+
+**Result containers:**
+- Individual result items: `.CoveoResult` or `.coveo-result-frame`
+- Item links: standard `<a>` elements within result containers — filter by URL pattern (e.g., `/en/people/<slug>`)
+
+**Pagination (button-click, NOT URL-parameter based):**
+- Next button selector: `.coveo-pager-next`
+- Button is **disabled** when exhausted: check `aria-disabled="true"` or `disabled` in class attribute
+- Must **click** the button to load next page (no `href` or page-number URL)
+- After clicking, wait for `domcontentloaded` + ~8 seconds for Coveo JS to render new results
+- The page URL may change (hash-based or query params) after navigation — use `page.url` as the new page reference
+- New items must be compared against already-discovered set (stop when `new_count == 0`)
+
+**Strategy for scraping:**
+```python
+NEXT_BUTTON_SELECTOR = ".coveo-pager-next"
+
+def get_next_page_url(page):
+    for sel in [NEXT_BUTTON_SELECTOR, 'a[rel="next"]', '[aria-label*="next" i]']:
+        btn = page.query_selector(sel)
+        if not btn:
+            continue
+        # Check disabled state
+        aria_disabled = btn.get_attribute("aria-disabled") or ""
+        class_attr = btn.get_attribute("class") or ""
+        if "disabled" in class_attr.lower() or aria_disabled.lower() == "true":
+            return None  # No more pages
+        btn.click()
+        page.wait_for_load_state("domcontentloaded")
+        time.sleep(8)  # Coveo JS render time
+        return page.url
+    return None
+```
+
+**Key tips:**
+- Coveo's heavy JS rendering causes memory leaks during long discovery runs — rotate the browser every 25 pages (see playwright-navigation skill's browser rotation pattern).
+- Combine with checkpoint/resume (write discovered URLs to file periodically) so a browser crash doesn't lose progress.
+- Result links may appear in the initial page load OR be rendered by Coveo JS — always wait after navigation before extracting.
+- Coveo listing URLs often use hash fragments for sort/filter state (e.g., `#sort=@field ascending`), not query parameters.
+
+### Coveo REST API — Direct HTTP Discovery (no browser needed)
+
+Some Coveo-powered sites expose a **public REST API** at `/coveo/rest/search` that can be queried
+directly via HTTP POST (or GET as fallback) — bypassing the need for Playwright/browser-based
+navigation entirely. This is the fastest discovery method when available.
+
+**Detection:** Look for the endpoint in page source or probe `https://{domain}/coveo/rest/search`.
+
+**Endpoint pattern:**
+```
+POST https://{domain}/coveo/rest/search
+Content-Type: application/json
+```
+
+**Request body (standard Coveo REST API format):**
+```json
+{
+  "q": "",
+  "firstResult": 0,
+  "numberOfResults": 100,
+  "sortCriteria": "relevancy",
+  "locale": "en"
+}
+```
+
+**Key parameters:**
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `q` | Search query (empty string = all results) | `""` |
+| `firstResult` | Offset for pagination (0-indexed) | `0` |
+| `numberOfResults` | Results per page (max varies, typically 100-200) | `100` |
+| `sortCriteria` | Sort order (`relevancy`, `@field ascending`, etc.) | `relevancy` |
+| `locale` | Locale for results | `en` |
+
+**Response structure:**
+```json
+{
+  "totalCount": 5000,
+  "results": [
+    {
+      "clickUri": "https://www.example.com/en/people/john-doe",
+      "uri": "https://www.example.com/en/people/john-doe",
+      "raw": {
+        "printableuri": "https://www.example.com/en/people/john-doe",
+        "clickableuri": "https://www.example.com/en/people/john-doe"
+      },
+      "title": "John Doe",
+      ...
+    }
+  ]
+}
+```
+
+**URL extraction from results:**
+```python
+def extract_urls_from_coveo_results(data: dict, url_filter: str) -> list[str]:
+    """Extract URLs from Coveo search results, filtering by URL pattern.
+
+    URL is found in: clickUri > uri > raw.printableuri > raw.clickableuri
+    """
+    urls = []
+    for r in data.get("results", []):
+        uri = r.get("clickUri") or r.get("uri") or ""
+        if not uri:
+            raw = r.get("raw", {})
+            uri = raw.get("printableuri") or raw.get("clickableuri") or ""
+        if url_filter and url_filter in uri:
+            urls.append(uri)
+    return urls
+```
+
+**Pagination:** Standard offset-based — increment `firstResult` by `numberOfResults` each request until:
+- `results` array is empty
+- `results` count < `numberOfResults` (last page)
+- Cumulative count reaches `totalCount`
+
+**Required headers (mimic browser):**
+```python
+headers = {
+    "User-Agent": "Mozilla/5.0 ...",
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "Origin": "https://{domain}",
+    "Referer": "https://{domain}/en/people",
+}
+```
+
+**Proven on:** lw.com (Latham & Watkins law firm) — 5000+ people profiles discovered via API.
+
+**Important caveats:**
+- The REST API may not be available on all Coveo deployments (some lock it down with tokens).
+- GET fallback: if POST returns 405/403, try GET with query params (`?q=&firstResult=0&numberOfResults=100`).
+- Some Coveo setups require an `authorization` header or access token — check page source for `coveoAccessToken` or similar.
+- Rate limit: use 300-500ms delays between requests.

@@ -32,19 +32,42 @@ logger = logging.getLogger(__name__)
 
 # ── Temperature mapping from .opencode/agents/*.md frontmatter ──────────────
 
-AGENT_TEMPERATURES: dict[str, float] = {
-    "site-analyzer": 0.2,
-    "product-analyzer": 0.2,
-    # ═══ ARCHIVED (replaced by browser_traverse) ═══
-    # "navigation-agent": 0.2,
-    # ══════════════════════════════════════════════
-    "nav-skill-review": 0.2,
-    "code-writer": 0.4,
-    "code-tester": 0.1,
-    "cleanup": 0.1,
-    "skill-learner": 0.3,
-    "dagster-converter": 0.1,
-}
+# Per-agent sampling temperatures (Phase 5: configurable for A/B determinism).
+# When LLM_CODEGEN_DETERMINISTIC is True, code-writer + product-analyzer are
+# forced to temperature 0 to narrow the codegen distribution (NOTE: z.ai does
+# not reliably honor seed, so this narrows but does not guarantee determinism;
+# the behavioral floor lives in route_after_testing's ground-truth + coverage
+# gates + the _probe_phase1_discovery probe). Default False — temp=0 can reduce
+# code_writer's exploration on hard sites, so keep current temps unless A/B
+# testing shows temp=0 helps.
+def _agent_temperatures() -> dict[str, float]:
+    base = {
+        "site-analyzer": 0.2,
+        "product-analyzer": 0.2,
+        "nav-skill-review": 0.2,
+        "code-writer": 0.4,
+        "code-tester": 0.1,
+        "cleanup": 0.1,
+        "skill-learner": 0.3,
+        "dagster-converter": 0.1,
+    }
+    try:
+        from django.conf import settings
+
+        # Per-agent env overrides: CODE_WRITER_TEMP etc.
+        for stem in list(base):
+            env_val = getattr(settings, f"AGENT_TEMP_{stem.upper().replace('-', '_')}", None)
+            if env_val is not None:
+                base[stem] = float(env_val)
+        if getattr(settings, "LLM_CODEGEN_DETERMINISTIC", False):
+            base["code-writer"] = 0.0
+            base["product-analyzer"] = 0.0
+    except Exception:
+        pass
+    return base
+
+
+AGENT_TEMPERATURES: dict[str, float] = _agent_temperatures()
 
 # Per-agent model overrides (keyed by prompt_stem, like AGENT_TEMPERATURES).
 # Value is the NAME of a settings attr holding the model; resolved lazily in
@@ -491,86 +514,106 @@ def create_dagster_converter(site_slug: str = "") -> object:
 # ── Shared builder ────────────────────────────────────────────────────────
 
 
-def _truncate_messages(input_dict: dict) -> dict:
-    """Pre-model hook: compress then truncate messages when context is large.
+def _trunc_settings():
+    """Truncation config (lazy settings read). LLM_TRUNCATION_MODE:
+    'deterministic' (default, no LLM call) | 'off' (no-op, emergency rollback)."""
+    try:
+        from django.conf import settings
 
-    Uses headroom.compress to intelligently summarize large tool messages,
-    then drops oldest messages if still over budget.  Prevents
-    ``Prompt exceeds max length`` errors in long-running agents.
+        return (
+            str(getattr(settings, "LLM_TRUNCATION_MODE", "deterministic")).lower(),
+            int(getattr(settings, "LLM_TRUNCATION_MAX_CHARS", 180_000)),
+            int(getattr(settings, "LLM_TRUNCATION_PER_MSG_CAP", 8000)),
+        )
+    except Exception:
+        return "deterministic", 180_000, 8000
+
+
+def _truncate_messages(input_dict: dict) -> dict:
+    """Pre-model hook: **deterministic** context truncation (no LLM calls).
+
+    Phase 2 (Per-Phase Execution Contract): replaces the prior
+    ``headroom.compress``-based hook, which (a) made a SYNC z.ai call inside the
+    ONLY cancellation path — defeating ``asyncio.wait_for`` in Phase 4 (the P0
+    precondition) — and (b) added run-to-run non-determinism (LLM summarization
+    varies between runs, a contributor to codegen variance). This version is
+    purely deterministic:
+
+    1. **Trim oversized messages in place** to a head+tail preview (per-msg cap,
+       default 8000). Prevents one huge tool/page dump from blowing the budget —
+       the old "drop oldest" step hit the "15→0 amnesia" bug (one message >
+       budget → the loop broke immediately → ALL conversation history lost).
+    2. **If still over budget**, drop OLDEST non-system messages while ALWAYS
+       retaining the most recent N, so the agent never loses its last few turns.
+
+    No network, no LLM, no variance. Kill-switch ``LLM_TRUNCATION_MODE='off'`` →
+    no-op (emergency rollback to pre-truncation behavior).
     """
+    mode, max_chars, per_msg_cap = _trunc_settings()
+    if mode == "off":
+        return input_dict
+
     messages = input_dict.get("messages", [])
     if not messages:
         return input_dict
 
-    max_chars = 180_000
+    _MIN_KEEP_RECENT = 6  # always retain the most recent N non-system messages
 
-    def _total_chars(msgs):
-        return sum(len(str(m.content)) if hasattr(m, "content") else 0 for m in msgs)
+    def _clen(m) -> int:
+        return len(str(m.content)) if hasattr(m, "content") else 0
 
-    total_chars = _total_chars(messages)
-    if total_chars <= max_chars:
-        return input_dict
+    def _trim(m):
+        content = str(m.content) if hasattr(m, "content") else ""
+        if len(content) <= per_msg_cap:
+            return m
+        half = per_msg_cap // 2
+        new_content = (
+            content[:half]
+            + f"\n\n…[deterministic-truncated {len(content)}→{per_msg_cap} chars]"
+            + content[-half:]
+        )
+        try:
+            # ToolMessage needs tool_call_id; other message types take content only.
+            if hasattr(m, "tool_call_id"):
+                return type(m)(content=new_content, tool_call_id=m.tool_call_id)
+            return type(m)(content=new_content)
+        except Exception:
+            return m  # fall back to the original if reconstruction fails
 
-    # Step 1: Compress large tool messages with headroom
-    try:
-        from headroom import compress as _compress
-        from django.conf import settings
+    before_total = sum(_clen(m) for m in messages)
 
-        model_name = getattr(settings, "ZAI_MAIN_MODEL", "glm-5-turbo")
-        compressed_msgs = []
-        compressed_count = 0
-        for m in messages:
-            content = str(m.content) if hasattr(m, "content") else ""
-            if len(content) > 3000 and hasattr(m, "type") and m.type == "tool":
-                try:
-                    cr = _compress(
-                        [{"role": m.type, "content": content}],
-                        model=model_name,
-                    )
-                    new_content = cr.messages[0]["content"]
-                    if len(content) - len(new_content) > 200:
-                        compressed_msgs.append(type(m)(content=new_content))
-                        compressed_count += 1
-                        continue
-                except Exception:
-                    pass
-            compressed_msgs.append(m)
-
-        if compressed_count > 0:
-            messages = compressed_msgs
+    # Step 1: deterministically trim oversized messages in place.
+    trimmed = [_trim(m) for m in messages]
+    total = sum(_clen(m) for m in trimmed)
+    if total <= max_chars:
+        if total < before_total:
             logger.info(
-                "headroom: compressed %d tool messages (%d → %d chars)",
-                compressed_count,
-                total_chars,
-                _total_chars(messages),
+                "truncate: deterministically trimmed oversized messages (%d → %d chars)",
+                before_total, total,
             )
-    except ImportError:
-        pass
+        return {"messages": trimmed}
 
-    total_chars = _total_chars(messages)
-    if total_chars <= max_chars:
-        return {"messages": messages}
+    # Step 2: still over budget — drop oldest non-system, keep system + recent N.
+    system_msgs = [m for m in trimmed if hasattr(m, "type") and m.type == "system"]
+    other = [m for m in trimmed if not (hasattr(m, "type") and m.type == "system")]
+    kept_recent = other[-_MIN_KEEP_RECENT:] if len(other) > _MIN_KEEP_RECENT else list(other)
 
-    # Step 2: Drop oldest messages (keep system + recent)
-    system_msgs = [m for m in messages if hasattr(m, "type") and m.type == "system"]
-    other_msgs = [m for m in messages if not (hasattr(m, "type") and m.type == "system")]
-
-    kept = list(system_msgs)
-    budget = max_chars - sum(len(str(m.content)) for m in kept)
+    budget = max_chars - sum(_clen(m) for m in system_msgs)
+    selected = []
     acc = 0
-
-    for msg in reversed(other_msgs):
-        msg_len = len(str(msg.content)) if hasattr(msg, "content") else 0
-        if acc + msg_len > budget:
+    for m in reversed(kept_recent):
+        ml = _clen(m)
+        if acc + ml > budget:
             break
-        kept.insert(len(kept), msg)
-        acc += msg_len
+        selected.append(m)
+        acc += ml
+    selected.reverse()  # back to chronological order
+    kept = system_msgs + selected
 
     logger.info(
-        "Truncated messages: %d → %d (was %d chars, budget %d)",
-        len(messages), len(kept), total_chars, budget,
+        "Truncated messages: %d → %d (was %d chars, budget %d, deterministic)",
+        len(messages), len(kept), total, budget,
     )
-
     return {"messages": kept}
 
 
@@ -587,6 +630,25 @@ def _build_agent(agent_name: str, site_slug: str = "", use_create_agent: bool = 
         )
 
     system_prompt = _append_skill_descriptions(system_prompt)
+
+    # Bug 3a fix: actually inject template_code into the system prompt. This
+    # parameter was declared but NEVER used — code_writer had to read_file the
+    # template (extra round-trip) and could paraphrase/drop pieces. Now the full
+    # template is in the system prompt (never summarized), so code_writer SEES
+    # the `from src.discovery import ...` line and the `discover_item_urls(...)`
+    # call — and copies them instead of reimplementing.
+    if template_code:
+        system_prompt += (
+            "\n\n### Template (use VERBATIM — do not rewrite discovery/pagination)\n"
+            "The template below is the scraper skeleton. Fill in the site-specific "
+            "parts (EXTRACT_PRODUCT_URLS_JS selectors, field extraction). KEEP the "
+            "`from src.discovery import ...` line, the `discover_item_urls(...)` call, "
+            "the argparse, and the env-var gate UNCHANGED. Do NOT define "
+            "`_click_load_more`, `_get_next_page_url`, or any pagination loop inline.\n\n"
+            "```python\n"
+            + template_code
+            + "\n```\n"
+        )
 
     tools = _get_tools_sync(agent_name, workspace_scope=site_slug)
 
@@ -2080,6 +2142,8 @@ def build_code_writer_message(state: dict) -> list:
     if input_mode in ("navigation", "list_page", "search_term") and mechanism in _browser_strategies:
         if mechanism == "http_navigation":
             template_file = "http_navigation_scraper.py"
+        elif mechanism == "playwright":
+            template_file = "playwright_scraper.py"
         else:
             template_file = "navigation_scraper.py"
     elif mechanism:
@@ -2313,7 +2377,7 @@ def build_code_writer_message(state: dict) -> list:
         input_mode = state.get("input_mode", "url_list")
         discovery = navigation_analysis.get("discovery_method", "unknown")
         search_info = navigation_analysis.get("search", {})
-        pagination_info = navigation_analysis.get("pagination", {})
+        pagination_info = navigation_analysis.get("pagination") or {}
         item_links_info = navigation_analysis.get("item_links", {})
         search_criteria = state.get("search_criteria", "")
 
@@ -2447,11 +2511,21 @@ def build_code_writer_message(state: dict) -> list:
         )
 
         _template_family = "navigation"
-        # Strategy-aware template: http_navigation uses the new httpx-based
-        # template (calls browser_service /navigate); legacy playwright/UC keeps
-        # the Playwright navigation_scraper.py template.
+        # Strategy-aware template selection (Phase 2, JS-listing+pagination fix):
+        # align this hint with graph.py:_select_template_file (the authoritative
+        # source). The old code forced navigation_scraper.py for EVERY nav job
+        # regardless of strategy — so playwright-strategy jobs (lw.com/Coveo)
+        # got a template with no load-more clicker, while the verified
+        # _click_load_more lived in the playwright template they were prevented
+        # from using. Now: playwright strategy → playwright_scraper.py; http_navigation
+        # → http_navigation_scraper.py; else (http_requests form-POST etc.) → navigation_scraper.py.
+        _strategy = (
+            ((state.get("scraper_analysis") or {}).get("strategy") or "").lower()
+            if isinstance(state, dict) else ""
+        )
         _nav_template_file = (
             "http_navigation_scraper.py" if mechanism == "http_navigation"
+            else "playwright_scraper.py" if _strategy == "playwright"
             else "navigation_scraper.py"
         )
         nav_template_hint = (
@@ -3166,11 +3240,13 @@ def build_code_tester_message(state: dict) -> list:
         f"sample_values, known_bad_values, format_hint). Do NOT re-fetch live pages.\n\n"
         f"### IMPORTANT: Non-Product URLs Are Expected\n"
         f"The scraper uses BROAD link discovery (captures all same-domain links). Some discovered "
-        f"URLs will be category/nav/non-product pages — the scraper's output filter removes items "
-        f"without a price. **This is correct behavior, not a failure.** Judge the scraper ONLY by "
-        f"the PRICED products in the output. If the priced products have correctly populated "
-        f"title/price/availability, it's a PASS — do NOT flag missing items from non-product URLs "
-        f"as high severity. A sample of 5 URLs that yields 3-5 priced products with good fields is a PASS.\n\n"
+        f"URLs will be category/nav/non-item pages — the scraper's output filter removes items "
+        f"without substantive data. **This is correct behavior, not a failure.** Judge the scraper "
+        f"ONLY by items with real, substantive data (NOT just 'title' or 'price' — this site may "
+        f"be a people directory, job board, or article archive whose fields are Name/email/phone, "
+        f"company/location, or author/content). If the real items have correctly populated core "
+        f"fields for THIS content type, it's a PASS. A sample that yields 3+ items with good "
+        f"substantive data is a PASS.\n\n"
         f"### BUDGET: 10 tool calls maximum.\n\n"
         f"### How Scraper Execution Works\n"
         f"The `run_scraper` tool automatically detects browser-based scrapers (Playwright, "
@@ -3182,7 +3258,10 @@ def build_code_tester_message(state: dict) -> list:
         f"- Do NOT re-fetch live product pages — validate against product_analysis expectations\n"
         f"- Do NOT run the scraper more than 2 times\n"
         f"- Do NOT install packages, run bash commands, or load skills\n"
-        f"- Do NOT read input_urls.json — that file is not your concern\n\n"
+        f"- Do NOT read input_urls.json — that file is not your concern\n"
+        f"- **NEVER use `--urls <single_url>` — ALWAYS use `--input input_urls.json`** "
+        f"for Phase 2 testing. Using --urls with a single URL tests only 1 item, which "
+        f"will ALWAYS fail the >= 3-item ground-truth threshold and cause a false cascade.\n\n"
         f"### Dead URLs\n"
         f"Products with status_code in {sorted(DEAD_STATUS_CODES)} are dead URLs "
         f"— exclude from quality assessment. If ALL are dead, set PASS with confidence 1.0.\n\n"

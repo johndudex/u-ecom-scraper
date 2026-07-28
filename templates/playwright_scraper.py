@@ -31,6 +31,7 @@ from playwright.sync_api import sync_playwright
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from src.proxy import ProxyConfig, build_proxy_url
 from src.geo import detect_country
+from src.discovery import discover_item_urls, config_for_load_more, config_from_dict
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION - Update these values
@@ -40,6 +41,10 @@ SITE_NAME = "{SITE_NAME}"
 SITE_URL = "{SITE_URL}"
 PLATFORM = "{PLATFORM}"
 SCRAPING_METHOD = "playwright"
+# OUTPUT_KEY consumed by _patch_scraper_output_filter's injected block (and the
+# output filter) — without it, the patcher's output.get(OUTPUT_KEY, []) is a
+# silent NameError-caught no-op on every playwright-strategy scraper.
+OUTPUT_KEY = "products"
 SITE_SLUG = "{SITE_SLUG}"
 
 PRODUCT_LISTING_URL = "{PRODUCT_LISTING_URL}"
@@ -130,7 +135,9 @@ EXTRACT_PRODUCT_JS = """
     for (const script of jsonldScripts) {
         try {
             const data = JSON.parse(script.textContent);
-            if (data['@type'] === 'Product') { jsonld = data; break; }
+            // Content-type-agnostic: accept any typed JSON-LD entity with a name/title
+            // (Product, Person, JobPosting, Article, etc.) — not just 'Product'.
+            if (data['@type'] && (data.name || data.title)) { jsonld = data; break; }
             if (Array.isArray(data)) {
                 for (const item of data) {
                     if (item['@type'] === 'Product') { jsonld = item; break; }
@@ -211,10 +218,49 @@ def scrape_product(page, url: str, src_url: str, index: int) -> dict:
     }
 
 
+# SHARED DISCOVERY: pagination is imported from src/discovery.py, NOT defined
+# inline. This prevents code_writer from rewriting/breaking the pagination loop
+# (the root cause of the 20+ run whack-a-mole: code_writer treated the loop as
+# editable prose and altered selectors, thresholds, and control flow every run).
+# code_writer copies what it SEES — an import + call — so pagination stays
+# deterministic. Only the extract_urls callback (EXTRACT_PRODUCT_URLS_JS) is
+# site-specific and remains in this file for code_writer to adapt.
+MAX_DISCOVER_PAGES = 200
+
+
 def discover_product_urls(page) -> list[str]:
-    page.goto(PRODUCT_LISTING_URL, wait_until="networkidle", timeout=PAGE_LOAD_TIMEOUT)
-    page.wait_for_timeout(3000)
-    return page.evaluate(EXTRACT_PRODUCT_URLS_JS) or []
+    def _extract(p):
+        try:
+            return p.evaluate(EXTRACT_PRODUCT_URLS_JS) or []
+        except Exception:
+            return []
+
+    # Discovery config: read from sibling discovery_config.json (written by
+    # scraper_analyzer → _invoke_code_writer) if present, else default to
+    # load_more. This makes the pagination type DETERMINISTIC — driven by the
+    # navigator's observation, not code_writer's guess. Falls back to
+    # config_for_load_more when no config file exists (backward compat).
+    import json as _dj
+    _cfg = None
+    _cfg_path = os.path.join(SCRIPT_DIR, "discovery_config.json")
+    try:
+        if os.path.isfile(_cfg_path):
+            with open(_cfg_path) as _cf:
+                _cfg = config_from_dict(_dj.load(_cf))
+    except Exception:
+        pass
+    if _cfg is None:
+        _cfg = config_for_load_more(max_pages=MAX_DISCOVER_PAGES)
+    else:
+        _cfg.max_pages = _cfg.max_pages or MAX_DISCOVER_PAGES
+
+    result = discover_item_urls(page, PRODUCT_LISTING_URL, _extract, _cfg)
+    logger.info(
+        "discovery: stop_reason=%s pages=%d urls=%d strategies=%s",
+        result.stop_reason, result.pages_visited, len(result.urls),
+        _cfg.strategies,
+    )
+    return result.urls
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -244,6 +290,12 @@ def main():
     parser.add_argument("--input", type=str, default=None, help="Path to input URLs JSON file")
     parser.add_argument("--urls", nargs="+", default=None, help="Product URLs as arguments")
     parser.add_argument("--headless", action="store_true", help="Run in headless mode")
+    parser.add_argument("--listing-url", type=str, default=None,
+                        help="Listing page URL for Phase 1 discovery (pagination)")
+    parser.add_argument("--fresh-discovery", action="store_true",
+                        help="Force Phase 1 discovery even if input_urls.json exists")
+    parser.add_argument("--discover-only", action="store_true",
+                        help="Run Phase 1 discovery only (capped), skip Phase 2 extraction")
     args = parser.parse_args()
 
     start_time = time.time()
@@ -256,17 +308,38 @@ def main():
 
     product_urls = []
 
-    if args.urls:
+    # DETERMINISTIC DISCOVERY GATE (env-var driven, bypasses argparse/codegen):
+    # run_execution sets SCRAPER_LISTING_URL=<url> for nav/list_page/search_term
+    # jobs. When set, ALWAYS run Phase 1 discovery from that URL — regardless of
+    # CLI flags (which code_writer may or may not declare) or input_urls.json
+    # (which always exists with seed URLs and suppresses discovery in the old
+    # `if not product_urls:` gate). This makes discovery DETERMINISTIC — not
+    # dependent on code_writer faithfully copying --listing-url/--fresh-discovery
+    # into argparse (it doesn't — verified across lw.com + uindex runs).
+    _env_listing = os.environ.get("SCRAPER_LISTING_URL", "").strip()
+    _env_force = os.environ.get("SCRAPER_FORCE_DISCOVERY", "").strip().lower() in ("1", "true", "yes")
+    if _env_listing or _env_force or args.fresh_discovery or args.listing_url:
+        global PRODUCT_LISTING_URL
+        _listing = _env_listing or (args.listing_url if args.listing_url else "") or PRODUCT_LISTING_URL
+        logger.info("Phase 1 discovery triggered (env/flag). Listing URL: %s", _listing)
+        PRODUCT_LISTING_URL = _listing
+        with sync_playwright() as p:
+            browser = get_browser(p)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                viewport={"width": 1920, "height": 1080},
+            )
+            page = context.new_page()
+            product_urls = discover_product_urls(page)
+            browser.close()
+        if product_urls:
+            save_urls_to_file(INPUT_FILE, product_urls)
+    elif args.urls:
         product_urls = args.urls
     elif args.input:
         product_urls = load_urls_from_file(args.input)
     elif os.path.exists(INPUT_FILE):
         product_urls = load_urls_from_file(INPUT_FILE)
-
-    if args.sample:
-        product_urls = product_urls[:5]
-    if args.limit:
-        product_urls = product_urls[: args.limit]
 
     if not product_urls:
         logger.info("No input URLs found. Discovering products via browser...")
@@ -280,6 +353,59 @@ def main():
             product_urls = discover_product_urls(page)
             browser.close()
         save_urls_to_file(INPUT_FILE, product_urls)
+
+    # --discover-only: run a CAPPED Phase 1 discovery (5 pages max) for testing,
+    # then exit without Phase 2. This lets _probe_phase1_discovery verify that
+    # discovery actually works (finds >0 URLs, paginates past page 1) without
+    # needing the full ~800s for 200 pages. The probe has a 180s budget — plenty
+    # for 5 pages × ~4s = ~20s.
+    if args.discover_only:
+        _dcfg = None
+        try:
+            import json as _dj2
+            _dcfg_path2 = os.path.join(SCRIPT_DIR, "discovery_config.json")
+            if os.path.isfile(_dcfg_path2):
+                with open(_dcfg_path2) as _cf2:
+                    _dcfg = config_from_dict(_dj2.load(_cf2))
+        except Exception:
+            pass
+        if _dcfg is None:
+            _dcfg = config_for_load_more(max_pages=5)
+        else:
+            _dcfg.max_pages = 5  # cap for testing
+
+        def _extract_probe(p):
+            try:
+                return p.evaluate(EXTRACT_PRODUCT_URLS_JS) or []
+            except Exception:
+                return []
+
+        _probe_result = discover_item_urls(page, PRODUCT_LISTING_URL, _extract_probe, _dcfg)
+        logger.info(
+            "discover-only: stop_reason=%s pages=%d urls=%d",
+            _probe_result.stop_reason, _probe_result.pages_visited, len(_probe_result.urls),
+        )
+        output = {
+            "site": SITE_NAME,
+            "products": [],
+            "metadata": {
+                "total_discovered": len(_probe_result.urls),
+                "discovery_coverage": {
+                    "ran_phase1": True,
+                    "stop_reason": str(_probe_result.stop_reason),
+                    "found": len(_probe_result.urls),
+                },
+            },
+        }
+        with open(OUTPUT_FILE, "w") as _of:
+            json.dump(output, _of, indent=2)
+        logger.info("discover-only: wrote %d discovered URLs to %s", len(_probe_result.urls), OUTPUT_FILE)
+        return
+
+    if args.sample:
+        product_urls = product_urls[:20]
+    if args.limit:
+        product_urls = product_urls[: args.limit]
 
     logger.info(f"Total products to scrape: {len(product_urls)}")
 
@@ -313,10 +439,13 @@ def main():
         for i, url in enumerate(product_urls):
             try:
                 product = scrape_product(page, url, SRC_URL, i + 1)
-                if product.get("title"):
+                # Content-type-agnostic validity: accept if ANY substantive field
+                # (not just 'title') is present — rescues Person/job/article items.
+                _BK = {"url", "src_url", "scraped_at", "status_code", "remarks", "id", "title"}
+                if any(v for k, v in product.items() if k not in _BK):
                     results.append(product)
                 else:
-                    logger.warning(f"No title extracted from: {url}")
+                    logger.warning(f"No substantive data extracted from: {url}")
                     failed += 1
             except Exception as e:
                 logger.error(f"Error processing {url}: {e}")

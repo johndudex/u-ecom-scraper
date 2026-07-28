@@ -114,35 +114,6 @@ API_RETRY_DELAYS = [5, 15, 30]
 _PATCHES_ENABLED = True
 
 
-def _with_api_retry(func):
-    """Decorator that retries on transient API connection errors."""
-
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        last_exc = None
-        for attempt in range(API_MAX_RETRIES + 1):
-            try:
-                return func(*args, **kwargs)
-            except Exception as exc:
-                exc_name = type(exc).__name__
-                if exc_name == "APIConnectionError" and attempt < API_MAX_RETRIES:
-                    delay = API_RETRY_DELAYS[attempt]
-                    logger.warning(
-                        "%s: API connection error (attempt %d/%d), retrying in %ds",
-                        func.__name__,
-                        attempt + 1,
-                        API_MAX_RETRIES,
-                        delay,
-                    )
-                    time.sleep(delay)
-                    last_exc = exc
-                else:
-                    raise
-        raise last_exc
-
-    return wrapper
-
-
 def _fix_json_artifact(slug: str, filename: str) -> None:
     if not slug:
         return
@@ -234,7 +205,9 @@ def _enforce_anti_bot_strategy(analysis: dict, slug: str, filename: str) -> dict
     return analysis
 
 
-def _patch_scraper_output_filter(slug: str, content_type: str = "") -> None:
+def _patch_scraper_output_filter(
+    slug: str, content_type: str = "", target_fields: list | None = None
+) -> None:
     """Insert a content-type-aware output filter in scraper_draft.py.
 
     Discovery can capture non-item pages (nav/category roots, soft-404s). This
@@ -259,17 +232,25 @@ def _patch_scraper_output_filter(slug: str, content_type: str = "") -> None:
             code = f.read()
         if "_OUTPUT_FILTER_APPLIED" in code or "_OUTPUT_PRICE_FILTER_APPLIED" in code:
             return
-        from src.content_types import output_filter_fields
-
-        fields = [f for f in output_filter_fields(content_type) if isinstance(f, str)]
-        # build: keep items with a title AND any of the content type's filter fields.
-        if fields:
-            checks = " or ".join(f"p.get({f!r})" for f in fields)
-            cond = f"p.get('title') and ({checks})"
-            label = f"title+{','.join(fields)}"
+        if target_fields:
+            # Custom schema: keep items with ANY of the user's requested fields.
+            # Don't require title/price (product-specific) — that would strip
+            # every record on non-product sites (profiles, jobs, articles).
+            checks = " or ".join(f"p.get({f!r})" for f in target_fields)
+            cond = checks
+            label = f"any of {','.join(target_fields)}"
+            fields = list(target_fields)
         else:
-            cond = "p.get('title')"
-            label = "title"
+            from src.content_types import output_filter_fields
+
+            fields = [f for f in output_filter_fields(content_type) if isinstance(f, str)]
+            if fields:
+                checks = " or ".join(f"p.get({f!r})" for f in fields)
+                cond = f"p.get('title') and ({checks})"
+                label = f"title+{','.join(fields)}"
+            else:
+                cond = "p.get('title')"
+                label = "title"
         filter_code = (
             "# _OUTPUT_FILTER_APPLIED — drop non-item pages (content-type aware)\n"
             f"_FILTER_FIELDS = {fields!r}\n"
@@ -310,6 +291,129 @@ def _patch_scraper_output_filter(slug: str, content_type: str = "") -> None:
             logger.warning("_patch_scraper_output_filter: could not find output write location")
     except Exception as exc:
         logger.warning("_patch_scraper_output_filter: %s", exc)
+
+
+def _enforce_discovery_import(slug: str) -> None:
+    """Post-generation enforcement: ensure the generated scraper imports src.discovery.
+
+    Modeled on _patch_scraper_output_filter (string-marker injection + idempotency
+    sentinel). code_writer frequently drops the `from src.discovery import` line
+    and hand-rolls inline pagination (verified across lw.com scraper-177/179/181).
+    Prompt rules mandate keeping it but cannot reliably constrain codegen — this
+    deterministic backstop catches the drift after generation and injects the
+    import if missing.
+    """
+    if not slug:
+        return
+    try:
+        draft_path = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
+        if not os.path.isfile(draft_path):
+            return
+        with open(draft_path, "r", encoding="utf-8") as f:
+            code = f.read()
+
+        # Already compliant?
+        if "from src.discovery import" in code and "discover_item_urls(" in code:
+            return
+
+        # Hand-rolled pagination detected (inline _click_load_more / _get_next_page_url)?
+        has_inline_pagination = any(
+            marker in code
+            for marker in ("def _click_load_more", "def _get_next_page_url", "_click_load_more(page)")
+        )
+
+        if has_inline_pagination:
+            logger.warning(
+                "_enforce_discovery_import: %s has INLINE pagination (_click_load_more/"
+                "_get_next_page_url defined) instead of src.discovery import — "
+                "code_writer drifted from the template. Injecting the import as a "
+                "backstop, but the inline code may still break.",
+                slug,
+            )
+
+        # Inject the import after the last `from src.` or `from playwright` line
+        # (top of file, column 0 — no indent needed).
+        import_line = (
+            "from src.discovery import discover_item_urls, config_for_load_more  "
+            "# _DISCOVERY_IMPORT_APPLIED (enforced — do not remove)"
+        )
+        if "from src.discovery import" not in code:
+            # Find insertion point: after last top-level import
+            last_import = max(
+                code.rfind("\nfrom src."),
+                code.rfind("\nfrom playwright"),
+                code.rfind("\nimport "),
+            )
+            if last_import > 0:
+                # Insert after the import line (find the newline after it)
+                line_end = code.find("\n", last_import + 1)
+                if line_end > 0:
+                    code = code[:line_end + 1] + import_line + "\n" + code[line_end + 1:]
+                else:
+                    code = import_line + "\n" + code
+            else:
+                code = import_line + "\n" + code
+            logger.info("_enforce_discovery_import: injected src.discovery import into %s", slug)
+
+        with open(draft_path, "w", encoding="utf-8") as f:
+            f.write(code)
+    except Exception as exc:
+        logger.warning("_enforce_discovery_import: %s", exc)
+
+
+def _enforce_env_discovery_gate(slug: str) -> None:
+    """Post-generation enforcement: ensure the SCRAPER_LISTING_URL env-var gate
+    has its initializer lines.
+
+    code_writer drops the ``_env_listing = os.environ.get("SCRAPER_LISTING_URL"…)``
+    and ``_env_force = …`` assignments but KEEPS the consumer
+    (``if/elif _env_listing or _env_force or args.fresh_discovery…``). Any
+    ``--listing-url`` / ``--fresh-discovery`` / ``SCRAPER_LISTING_URL`` invocation
+    then raises ``NameError`` before discovery runs (verified: lw.com scraper-187
+    crashed at run_execution, exit code 1 in 0s). Invisible to code_tester
+    because ``--sample`` takes a different branch — the classic scratch-vs-exec
+    blind-spot. Modeled on _enforce_discovery_import.
+    """
+    if not slug:
+        return
+    try:
+        draft_path = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
+        if not os.path.isfile(draft_path):
+            return
+        with open(draft_path, "r", encoding="utf-8") as f:
+            code = f.read()
+
+        # Already compliant?
+        if "_ENV_GATE_APPLIED" in code or '_env_listing = os.environ.get("SCRAPER_LISTING_URL"' in code:
+            return
+
+        # Find the consumer: the if/elif that references _env_listing / _env_force.
+        consumer_re = re.compile(r"(?m)^(\s*)(elif|if)\s+_env_listing\b.*:\s*$")
+        m = consumer_re.search(code)
+        if not m:
+            return  # no env-gate consumer → nothing to enforce
+        indent, kw = m.group(1), m.group(2)
+
+        # If it's an `elif`, the initializers must be defined before the WHOLE
+        # if/elif chain evaluates, so insert before the chain's leading `if`.
+        insert_pos = m.start()
+        if kw == "elif":
+            chain_re = re.compile(r"(?m)^" + re.escape(indent) + r"if\b.*:\s*$")
+            chain_matches = list(chain_re.finditer(code, 0, m.start()))
+            if chain_matches:
+                insert_pos = chain_matches[-1].start()
+
+        init_lines = (
+            f'{indent}_env_listing = os.environ.get("SCRAPER_LISTING_URL", "").strip()'
+            "  # _ENV_GATE_APPLIED (enforced — do not remove)\n"
+            f'{indent}_env_force = os.environ.get("SCRAPER_FORCE_DISCOVERY", "").strip().lower() in ("1", "true", "yes")\n'
+        )
+        code = code[:insert_pos] + init_lines + code[insert_pos:]
+        with open(draft_path, "w", encoding="utf-8") as f:
+            f.write(code)
+        logger.info("_enforce_env_discovery_gate: injected env-var initializers into %s", slug)
+    except Exception as exc:
+        logger.warning("_enforce_env_discovery_gate: %s", exc)
 
 
 def _warn_unaddressed_critical_fix(slug: str, scraper_analysis: dict) -> None:
@@ -558,19 +662,25 @@ def _agent_config(config: RunnableConfig, agent_name: str = "") -> RunnableConfi
         from .subagents import AGENT_PROMPT_MAP
         _display_name = AGENT_PROMPT_MAP.get(agent_name, agent_name)
         cb = _ToolCallLogger(int(job_id), _display_name)
+        # Circuit-breaker observation: records per-LLM-call success/failure so
+        # a stalling model trips the breaker (llm_breaker) and traffic routes
+        # to ZAI_FALLBACK_MODEL. Attached here so every agent's LLM calls feed it.
+        from .llm_breaker import CircuitBreakerCallback
+
+        cb_breaker = CircuitBreakerCallback()
         existing = agent_cfg.get("callbacks")
         # config["callbacks"] can be: None, a list of handlers, OR a
         # BaseCallbackManager (langgraph passes one; it's NOT iterable — calling
         # list() on it raises TypeError). Normalise to a flat handler list so
         # langgraph's run-tracking handlers are preserved alongside ours.
         if existing is None:
-            agent_cfg["callbacks"] = [cb]
+            agent_cfg["callbacks"] = [cb, cb_breaker]
         elif isinstance(existing, list):
-            agent_cfg["callbacks"] = [*existing, cb]
+            agent_cfg["callbacks"] = [*existing, cb, cb_breaker]
         elif isinstance(existing, BaseCallbackManager):
-            agent_cfg["callbacks"] = [*existing.handlers, cb]
+            agent_cfg["callbacks"] = [*existing.handlers, cb, cb_breaker]
         else:
-            agent_cfg["callbacks"] = [existing, cb]
+            agent_cfg["callbacks"] = [existing, cb, cb_breaker]
     return agent_cfg
 
 
@@ -601,9 +711,25 @@ PHASE_MAP: dict[str, str] = {
 import threading
 
 
+class _HeartbeatHandle:
+    """Per-invocation heartbeat state.
+
+    Holds a stop flag + the live timers so ``_stop_heartbeat`` can cancel
+    EVERY rescheduled timer (not just the initial one) AND signal ``_beat`` to
+    stop rescheduling. Per-invocation (not a module-global list) so the
+    concurrency=2 worker's two in-flight jobs don't clobber each other's timers.
+    """
+
+    __slots__ = ("stop", "timers")
+
+    def __init__(self) -> None:
+        self.stop = threading.Event()
+        self.timers: list = []
+
+
 def _start_heartbeat(
     job_id: int, agent_name: str, interval: int = 300
-) -> threading.Timer:
+) -> _HeartbeatHandle:
     """Start a background heartbeat that writes a SessionLog entry every
     ``interval`` seconds during long agent executions.
 
@@ -612,10 +738,16 @@ def _start_heartbeat(
     can run 15+ minutes without producing SessionLog entries. This heartbeat
     keeps the watchdog informed.
 
-    Returns a threading.Timer that must be cancelled when the agent finishes.
+    Returns a ``_HeartbeatHandle`` that must be passed to ``_stop_heartbeat``
+    when the agent finishes. The handle's stop flag is what actually ends the
+    chain — ``_beat`` checks it before rescheduling, so cancellation is reliable
+    even if a beat fires mid-cancel.
     """
+    handle = _HeartbeatHandle()
 
     def _beat() -> None:
+        if handle.stop.is_set():
+            return
         try:
             from scraper.models import SessionLog
 
@@ -629,28 +761,41 @@ def _start_heartbeat(
             )
         except Exception:
             pass
-        # Schedule next beat
+        # Re-check before rescheduling — _stop_heartbeat may have fired while
+        # the SessionLog write was in flight.
+        if handle.stop.is_set():
+            return
         timer = threading.Timer(interval, _beat)
         timer.daemon = True
+        handle.timers.append(timer)
         timer.start()
-        _store_heartbeat_timer(timer)
 
     timer = threading.Timer(interval, _beat)
     timer.daemon = True
+    handle.timers.append(timer)
     timer.start()
-    return timer
+    return handle
 
 
-_heartbeat_timer_holder: list = []
+def _stop_heartbeat(handle: _HeartbeatHandle | None) -> None:
+    """Stop the heartbeat: set the stop flag (any in-flight ``_beat`` won't
+    reschedule) and cancel every live timer.
 
-
-def _store_heartbeat_timer(timer: threading.Timer) -> None:
-    _heartbeat_timer_holder.append(timer)
-
-
-def _stop_heartbeat(timer: threading.Timer) -> None:
-    timer.cancel()
-    _heartbeat_timer_holder.clear()
+    The old version cancelled only the INITIAL timer and then ``clear()``-ed a
+    shared module-global list — which (a) left the self-rescheduled timers
+    firing forever (an immortal chain that masked agent hangs from the watchdog
+    AND was ~30% of all SessionLog writes), and (b) under concurrency=2 let one
+    job's stop clear another job's timers. The per-handle stop flag fixes both.
+    """
+    if handle is None:
+        return
+    handle.stop.set()
+    for t in handle.timers:
+        try:
+            t.cancel()
+        except Exception:
+            pass
+    handle.timers.clear()
 
 
 def _notify_phase(job_id: int, node_name: str, status: str) -> None:
@@ -680,13 +825,31 @@ def _notify_phase(job_id: int, node_name: str, status: str) -> None:
         pass
 
 
-SITE_ANALYSIS_BUDGET = 10
-SITE_ANALYSIS_BUDGET_EXTENDED = 20
-SITE_ANALYSIS_MAX_BUDGET = 50
-PRODUCT_ANALYSIS_BUDGET = 50
-PRODUCT_ANALYSIS_BUDGET_EXTENDED = 70
-PRODUCT_ANALYSIS_MAX_BUDGET = 70
-MAX_OUTER_RETRIES = 2
+def _budget_setting(name: str, default: int) -> int:
+    """Budget/timeout constant, env-overridable via Django settings.
+
+    Lets the Phase-1 gate tune per-agent budgets from measured per-step latency
+    WITHOUT a code change. The structural mismatch to fix: PRODUCT_ANALYSIS_BUDGET
+    (recursion steps) × ~per-step latency can exceed _AGENT_INVOKE_TIMEOUT (the
+    wall-clock cap), so the wall-clock abandons mid-budget → empty result →
+    budget-escalation cascade. Tuning lowers the budget to fit, NOT raises the
+    wall-clock (which would widen the leaked-thread window).
+    """
+    try:
+        from django.conf import settings
+
+        return int(getattr(settings, name, default))
+    except Exception:
+        return default
+
+
+SITE_ANALYSIS_BUDGET = _budget_setting("SITE_ANALYSIS_BUDGET", 10)
+SITE_ANALYSIS_BUDGET_EXTENDED = _budget_setting("SITE_ANALYSIS_BUDGET_EXTENDED", 20)
+SITE_ANALYSIS_MAX_BUDGET = _budget_setting("SITE_ANALYSIS_MAX_BUDGET", 50)
+PRODUCT_ANALYSIS_BUDGET = _budget_setting("PRODUCT_ANALYSIS_BUDGET", 50)
+PRODUCT_ANALYSIS_BUDGET_EXTENDED = _budget_setting("PRODUCT_ANALYSIS_BUDGET_EXTENDED", 70)
+PRODUCT_ANALYSIS_MAX_BUDGET = _budget_setting("PRODUCT_ANALYSIS_MAX_BUDGET", 70)
+MAX_OUTER_RETRIES = _budget_setting("MAX_OUTER_RETRIES", 2)
 
 MAX_RETRY_SUMMARY_CHARS = 8000
 
@@ -1057,15 +1220,81 @@ _AGENT_INVOKE_TIMEOUT = 900  # seconds — hard wall-clock cap per agent.invoke(
                             # template + generate ~500 lines + self-test + fix).
 
 
-def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, timeout: int = _AGENT_INVOKE_TIMEOUT):
-    """Run agent.invoke with a wall-clock timeout.
+def _async_execution_enabled() -> bool:
+    """Kill-switch for Phase 4 async cancellation (Per-Phase Execution Contract).
 
-    Uses a raw daemon thread (NOT ThreadPoolExecutor — its context manager calls
-    shutdown(wait=True) which blocks until the thread finishes, defeating the
-    timeout). On timeout, returns an empty result (caller treats as
-    budget-exhausted). The daemon thread is abandoned — it will be killed when
-    the celery worker process exits.
+    True → ``_invoke_agent_with_timeout`` runs ``agent.ainvoke`` under
+    ``asyncio.wait_for``: on timeout, ``CancelledError`` propagates into the
+    react loop and the async httpx client CLOSES the in-flight z.ai socket —
+    the work actually stops (vs the sync path's daemon-thread abandon-then-leak
+    that held the socket + ~180K-char context until the Celery time_limit
+    SIGKILLed the worker). This is the contract's real cancellation.
+
+    Default False: the async path is new; keep sync as the safe default until a
+    regression (lw.com/locumtenens/aya) verifies it. Phase 2 already removed the
+    sync ``headroom.compress`` call from the cancellation path (the P0
+    precondition), so a timeout during the LLM call cancels cleanly; a timeout
+    during a sync tool (run_in_executor) abandons that tool's executor thread
+    (bounded by the per-tool guards; same shape as today's thread abandon).
     """
+    try:
+        from django.conf import settings
+
+        return bool(getattr(settings, "LLM_ASYNC_EXECUTION", False))
+    except Exception:
+        return False
+
+
+def _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout):
+    """Run ``agent.ainvoke`` under ``asyncio.wait_for`` in a fresh event loop.
+
+    The graph runs synchronously today (graph.invoke from the Celery task), so
+    there is no running event loop when this node executes — ``asyncio.run`` is
+    safe. On timeout the ``wait_for`` cancels the ainvoke await; for an in-flight
+    LLM call the CancelledError reaches the async httpx client which closes the
+    z.ai socket (verified cancellable). Returns ``{"messages": []}`` on timeout
+    (callers treat as budget-exhausted), ``{"_error": ...}`` on other errors —
+    matching the sync path's contract.
+    """
+    import asyncio
+
+    async def _run():
+        return await asyncio.wait_for(
+            agent.ainvoke({"messages": messages}, agent_cfg), timeout=timeout
+        )
+
+    try:
+        return asyncio.run(_run())
+    except asyncio.TimeoutError:
+        logger.error(
+            "_invoke_agent_with_timeout[%s]: ainvoke exceeded %ds wall-clock "
+            "— cancelled (socket closed), returning empty (job %s)",
+            phase, timeout, job_id,
+        )
+        return {"messages": []}
+    except Exception as exc:
+        return {"_error": str(exc)[:200]}
+
+
+def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, timeout: int = _AGENT_INVOKE_TIMEOUT):
+    """Run the agent with a wall-clock timeout.
+
+    Two modes (kill-switch ``LLM_ASYNC_EXECUTION``, see
+    ``_async_execution_enabled``):
+
+    - **async** (default off): ``agent.ainvoke`` under ``asyncio.wait_for`` — on
+      timeout the in-flight z.ai call is genuinely CANCELLED (httpx closes the
+      socket), no abandoned thread leaks its context.
+    - **sync** (default): raw daemon thread + ``thread.join``; on timeout the
+      thread is abandoned (leaks until the Celery ``time_limit`` reclaims the
+      worker). Pre-Phase-4 behavior.
+
+    Both return ``{"messages": []}`` on timeout (callers treat as
+    budget-exhausted).
+    """
+    if _async_execution_enabled():
+        return _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout)
+
     import threading
 
     result_box = [None]
@@ -1347,7 +1576,6 @@ NAVIGATION_ANALYSIS_BUDGET_EXTENDED = 60
 NAVIGATION_ANALYSIS_MAX_BUDGET = 60
 
 
-@_with_api_retry
 def _invoke_site_analyzer(
     state: ScrapeState, config: RunnableConfig
 ) -> dict[str, Any] | Command:
@@ -1403,7 +1631,6 @@ def _invoke_site_analyzer(
     )
 
 
-@_with_api_retry
 def _invoke_product_analyzer(
     state: ScrapeState, config: RunnableConfig
 ) -> dict[str, Any] | Command:
@@ -1555,18 +1782,21 @@ def _invoke_navigation_traverse(
                     job_id,
                 )
 
-        # Extract item URL examples from the goal page so product_analyzer has
-        # ready-made sample URLs (avoids ~6.5 min of auto-discovery). Falls back
-        # to an empty list if the fetch or parse fails — non-fatal.
-        url_examples: list[str] = []
-        if result.goal_url:
+        # Extract item URL examples so product_analyzer + code_tester have
+        # ready-made sample URLs (avoids ~6.5 min of auto-discovery). Prefer the
+        # real item hrefs browser_traverse captured from the RENDERED goal page
+        # (correct for CSR/JS-rendered listings — Coveo/React/Vue). Fall back to a
+        # plain HTTP fetch + link parse ONLY when no browser item links exist
+        # (SSR pages where the raw HTML already contains the item anchors).
+        url_examples: list[str] = list(getattr(result, "item_links", []) or [])[:20]
+        if not url_examples and result.goal_url:
             try:
                 from experimental.nav_traversal.traversal import _default_fetch, extract_links
 
                 page_resp = _default_fetch(result.goal_url)
                 if page_resp.get("ok"):
                     links = extract_links(page_resp.get("text", ""), result.goal_url)
-                    url_examples = [l["href"] for l in links[:5] if l.get("href")]
+                    url_examples = [l["href"] for l in links[:20] if l.get("href")]
             except Exception as exc:
                 logger.info(
                     "browser_traverse: url_examples extraction failed (%s)", exc
@@ -1576,6 +1806,57 @@ def _invoke_navigation_traverse(
                     "browser_traverse: extracted %d url_examples from goal page (job %s)",
                     len(url_examples), job_id,
                 )
+        elif url_examples:
+            logger.info(
+                "browser_traverse: using %d browser-captured item links as url_examples (job %s)",
+                len(url_examples), job_id,
+            )
+
+        # ── Listing-reachability fallback (uindex class) ────────────────────
+        # browser_traverse can exhaust its budget without judging any page a
+        # listing (Cloudflare wall, JS gate, slow render) → discovery comes back
+        # {listing_url: null, listing_reached: false}. That cascades to no
+        # discovery_config, a detail-page sample, and 0 items — even when the
+        # site ROOT is a perfectly good listing (uindex homepage: 120 torrents,
+        # HTTP 200). When the navigator didn't reach a listing but the site root
+        # is already proven reachable (probe_result.connectivity.method_that_worked,
+        # populated upstream by check_accessibility — ZERO new network calls),
+        # fall back to the root as the listing. Fixes the value at the source so
+        # every downstream consumer (run_execution, _derive_strategy, code_writer)
+        # reads the corrected URL. url_list mode is exempt — it has no listing.
+        _disc_fb = dict(getattr(result, "discovery", {}) or {})
+        _input_mode = (state.get("input_mode") or "").strip()
+        _probe = state.get("probe_result") or {}
+        _conn = _probe.get("connectivity") if isinstance(_probe, dict) else None
+        _root_method = ""
+        if isinstance(_conn, dict):
+            _root_method = str(_conn.get("method_that_worked") or "").strip()
+        # Site ORIGIN (scheme+host), NOT state.url verbatim — the input URL can be
+        # a detail/sample page (uindex job 184 submitted a details.php?id=... URL).
+        # Falling back to that would point discovery at a single detail page.
+        _site_root = ""
+        try:
+            from urllib.parse import urlparse as _urlparse
+            _p = _urlparse((state.get("url") or "").strip())
+            if _p.scheme in ("http", "https") and _p.netloc:
+                _site_root = f"{_p.scheme}://{_p.netloc}/"
+        except Exception:
+            _site_root = ""
+        if (
+            _input_mode in ("navigation", "list_page", "search_term")
+            and _site_root
+            and _root_method
+            and not _disc_fb.get("listing_reached")
+        ):
+            _disc_fb = {
+                "listing_url": _site_root,
+                "listing_reached": True,
+                "pagination": _disc_fb.get("pagination") or {"type": "load_more"},
+            }
+            logger.warning(
+                "browser_traverse: listing not reached — falling back to reachable site origin %s (via %s, job %s)",
+                _site_root, _root_method, job_id,
+            )
 
         analysis = {
             "discovery_method": "browser_traverse" if result.reached else "fallback",
@@ -1593,11 +1874,28 @@ def _invoke_navigation_traverse(
                 "signals": result.signals if hasattr(result, "signals") else {},
             },
             "data_source": getattr(result, "mechanism", "") or "unknown",
-            # Bug fix: use "url" key (what subagents.py:2208 checks), not "api_url"
-            "api_endpoint": {"url": result.api["url"]} if result.api and isinstance(result.api, dict) and result.api.get("url") else (result.api or {}),
+            # Bug fix: use "url" key (what subagents.py:2208 checks), not "api_url".
+            # Preserve count/items_per_page so _derive_strategy can gate the
+            # internal_api override on the API having DEMONSTRABLY returned records
+            # (items_per_page>0) — a bare URL with 0 results (Coveo /coveo/rest/search
+            # returns totalCount=0 without the browser's filter) must NOT trigger
+            # internal_api, or the job diverts from playwright to a doomed strategy.
+            "api_endpoint": (
+                {"url": result.api["url"],
+                 "count": result.api.get("count"),
+                 "items_per_page": result.api.get("items_per_page")}
+                if result.api and isinstance(result.api, dict) and result.api.get("url")
+                else (result.api or {})
+            ),
             "rendering_verified": "browser",
             # propagate the full path so downstream can see how we got here
             "traversal_path": result.path[:8] if hasattr(result, "path") else [],
+            # Phase 1 (JS-listing+pagination class fix): carry the discovery
+            # contract (listing_reached, listing_url, pagination type) from the
+            # navigator through state to run_execution + code_writer. The
+            # navigator ALREADY detects these; the graph must not drop them.
+            "discovery": _disc_fb,
+            "pagination": _disc_fb.get("pagination") or {},
         }
 
         # Persist to workspace/{slug}/navigation_analysis.json
@@ -2186,13 +2484,33 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
     # the model so code_writer extracts records from the listing JSON (no per-detail Phase 2).
     _data_source = (_nav.get("data_source") if isinstance(_nav, dict) else None) or "none"
     _embedded_json = (_nav.get("embedded_json") if isinstance(_nav, dict) else None) or None
-    if meth == "direct_http" and not _is_form_only_discovery(state, state.get("url", "")):
-        if _rendering == "csr":
-            strategy = "http_navigation"   # JS-rendered listings → browser upfront
-        else:
-            strategy = "http_requests"
+    # JS-rendered listing → browser-backed strategy, REGARDLESS of how the probe
+    # reached the page (method_that_worked). The listing's render need is
+    # independent of probe access: a site whose homepage is reachable via
+    # cloak_none can still have a Coveo/React listing that http_navigation's
+    # /navigate (2s render wait) can't surface. The previous gate nested this
+    # inside `if meth == "direct_http"`, so a cloak_none probe bypassed it and
+    # picked http_navigation for a Coveo site → 0 discovered.
+    if _rendering == "browser":
+        # browser_traverse ran (rendering=browser), but that ALONE doesn't mean the
+        # listing is JS-rendered — a form-POST→SSR site (locumtenens) is HTTP-
+        # reachable via POST replay and must stay on http_requests. Only a GET-
+        # navigated listing that needed the browser to render (Coveo/React) needs
+        # playwright. Distinguish by the discovery form method the traverser recorded:
+        # POST → SSR results → http_requests; GET → JS-rendered listing → playwright.
+        _form_method = ""
+        _search = _nav.get("search") if isinstance(_nav, dict) else None
+        if isinstance(_search, dict):
+            _form_method = (_search.get("form_method") or "").upper()
+        strategy = "http_requests" if _form_method == "POST" else "playwright"
+    elif _rendering == "csr":
+        # navigate_explore._verify_rendering: lighter CSR where the server-side
+        # /navigate render surfaces the links.
+        strategy = "http_navigation"
+    elif meth == "direct_http" and not _is_form_only_discovery(state, state.get("url", "")):
+        strategy = "http_requests"
     else:
-        # browser_none, uc_chrome_*, cloak_*, or form-only direct_http -> browser-backed.
+        # browser_none, uc_chrome_*, cloak_*, or form-only direct_http → browser-backed.
         strategy = "http_navigation"
 
     # API-strategy override: when browser_traverse captured a backend JSON data API
@@ -2204,8 +2522,43 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
     # that hangs on CSR pages with no paginated listing (aya).
     _nav_api = (_nav.get("api_endpoint") if isinstance(_nav, dict) else None) or {}
     _nav_api = _nav_api if isinstance(_nav_api, dict) else {}
-    if _data_source == "api" and (_nav_api.get("url") or _nav_api.get("api_url")):
+    # Gate on the API being a REAL data source for this query. Two signals, both
+    # required:
+    #   - items_per_page > 0  (verify_api's probe got actual records), AND
+    #   - count != 0          (the API's reported total isn't explicitly zero).
+    # The count!=0 check is load-bearing: Coveo /coveo/rest/search reports
+    # totalCount=0 for the generic query yet returns ~15 default-sample items to
+    # verify_api's limit/pageSize probe — items_per_page>0 ALONE wrongly picks
+    # internal_api, then the api_scraper (which can't reconstruct the browser's
+    # @filter) gets ~0-1 items (lw.com regression: 1 item vs playwright's 20).
+    # count>0 (aya: 26955) OR count is None (an API that doesn't report a total
+    # but returns real items) both pass; only an EXPLICIT zero total is rejected.
+    _api_items = _nav_api.get("items_per_page")
+    _api_count = _nav_api.get("count")
+    if (
+        _data_source == "api"
+        and (_nav_api.get("url") or _nav_api.get("api_url"))
+        and isinstance(_api_items, int)
+        and _api_items > 0
+        and _api_count != 0
+    ):
         strategy = "internal_api"
+
+    # Discovery config: propagate the navigator's pagination detection so the
+    # template uses the RIGHT config_for_* preset (load_more vs page_param vs
+    # next_button) — deterministic, not code_writer's guess.
+    _disc_pag = (_nav.get("discovery") or {}).get("pagination") if isinstance(_nav, dict) else None
+    if not _disc_pag:
+        _disc_pag = _nav.get("pagination") if isinstance(_nav, dict) else None
+    _discovery_config = None
+    if isinstance(_disc_pag, dict) and _disc_pag.get("type"):
+        _discovery_config = {
+            "type": _disc_pag.get("type"),
+            "page_param_name": _disc_pag.get("page_param_name"),
+            "items_per_page": _disc_pag.get("items_per_page"),
+            "next_button_selector": _disc_pag.get("next_button_selector"),
+            "max_pages": _disc_pag.get("max_pages"),
+        }
 
     analysis: dict[str, Any] = {
         "strategy": strategy,
@@ -2219,6 +2572,7 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
         "data_source": _data_source,
         "embedded_json": _embedded_json,
         "api_endpoint": _nav_api,
+        "discovery_config": _discovery_config,
         "strategy_justification": (
             f"Deterministic: method_that_worked={method or 'unknown'} -> {strategy} "
             f"(proxy={proxy_tier}, anti_bot={anti_bot}, rendering={_rendering}, "
@@ -2278,7 +2632,6 @@ def _is_form_only_discovery(state: dict, url: str) -> bool:
 
 
 
-@_with_api_retry
 def _fix_scraper_syntax(
     agent, state: ScrapeState, config: RunnableConfig, job_id: int, slug: str,
     max_tries: int = 3,
@@ -2362,9 +2715,23 @@ def _select_template_file(state: ScrapeState) -> str:
     if data_source == "ssr_div_list":
         return "ssr_div_list_scraper.py"
     if strategy in ("http_requests", "requests"):
+        # Form-POST sites (locumtenens: QuickSearch POST → SSR) need the
+        # navigation template (playwright form-POST replay + FORM_ACTION),
+        # not the plain requests template. Verified: locumtenens' working
+        # scraper imports playwright.sync_api + uses FORM_ACTION.
+        _nav_fm = state.get("navigation_analysis") or {}
+        _form_method = ((_nav_fm.get("search") or {}).get("form_method") or "").upper()
+        if _form_method == "POST":
+            return "navigation_scraper.py"
         return "requests_scraper.py"
-    if strategy in ("http_navigation", "playwright"):
+    if strategy == "http_navigation":
         return "http_navigation_scraper.py"
+    if strategy == "playwright":
+        # Playwright strategy → playwright_scraper.py (its discover step
+        # render-polls, which is what surfaces JS-rendered listings like Coveo
+        # that http_navigation's /navigate 2s wait cannot). Mapping playwright
+        # to http_navigation_scraper.py silently defeated the strategy.
+        return "playwright_scraper.py"
     if strategy in ("internal_api", "api"):
         return "api_scraper.py"
     return "requests_scraper.py"
@@ -2439,11 +2806,45 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 sample_urls = il.get("urls") or il.get("url_examples") or []
             if sample_urls:
                 iu_path = os.path.join(_get_project_root(), "workspace", slug, "input_urls.json")
-                with open(iu_path, "w") as _f:
-                    _json.dump({"urls": sample_urls}, _f, indent=2)
-                logger.info("_invoke_code_writer: wrote %d sample URLs to input_urls.json", len(sample_urls))
+                # Bug 1 fix: don't overwrite input_urls.json if it already has MORE
+                # URLs than the seed set. code_tester's discovery may have saved
+                # hundreds/thousands of URLs; overwriting with 5-20 seeds destroys
+                # them before run_execution can use them. Only overwrite when the
+                # seed set is richer (first run or navigation found more URLs).
+                try:
+                    if os.path.isfile(iu_path):
+                        with open(iu_path, "r") as _ef:
+                            _existing = _json.load(_ef).get("urls", [])
+                        if len(_existing) > len(sample_urls):
+                            logger.info(
+                                "_invoke_code_writer: preserving existing input_urls.json "
+                                "(%d URLs > %d seeds) — not overwriting",
+                                len(_existing), len(sample_urls),
+                            )
+                            sample_urls = []  # skip the write
+                except Exception:
+                    pass
+                if sample_urls:
+                    with open(iu_path, "w") as _f:
+                        _json.dump({"urls": sample_urls}, _f, indent=2)
+                    logger.info("_invoke_code_writer: wrote %d sample URLs to input_urls.json", len(sample_urls))
         except Exception as _exc:
             logger.warning("_invoke_code_writer: failed to write input_urls.json: %s", _exc)
+
+        # Write discovery_config.json (from scraper_analysis) so the template's
+        # discover_product_urls can select the RIGHT config_for_* preset
+        # deterministically (load_more vs page_param vs next_button) — driven by
+        # the navigator's observation, not code_writer's guess.
+        try:
+            _sa = state.get("scraper_analysis") or {}
+            _dc = _sa.get("discovery_config") if isinstance(_sa, dict) else None
+            if _dc and isinstance(_dc, dict) and _dc.get("type"):
+                _dc_path = os.path.join(_get_project_root(), "workspace", slug, "discovery_config.json")
+                with open(_dc_path, "w") as _df:
+                    _json.dump(_dc, _df, indent=2)
+                logger.info("_invoke_code_writer: wrote discovery_config.json (type=%s)", _dc.get("type"))
+        except Exception as _exc:
+            logger.warning("_invoke_code_writer: failed to write discovery_config.json: %s", _exc)
 
         messages = build_code_writer_message(state)
         _log_agent_context(state, "code-writer", messages)
@@ -2485,7 +2886,9 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     _ct = _cfg.name if _cfg else ""
                 except Exception:
                     _ct = ""
-            _patch_scraper_output_filter(slug, _ct)
+            _patch_scraper_output_filter(slug, _ct, state.get("target_fields") or [])
+            _enforce_discovery_import(slug)
+            _enforce_env_discovery_gate(slug)
 
         # Deterministic backstop: if scraper_analysis documented a non-existent
         # selector in critical_fix, warn loudly if the regenerated scraper still
@@ -2545,21 +2948,55 @@ def _probe_phase1_discovery(slug: str, state: dict, job_id: int) -> tuple[bool, 
         if accepted is not None and "discover-only" not in accepted:
             return False, None
         logger.info("_probe_phase1_discovery: running --discover-only (job %s)", job_id)
-        proc = subprocess.run(
-            ["python3", draft, "--discover-only", "--fresh-discovery"],
-            cwd=os.path.join(root, "workspace", slug),
-            capture_output=True, text=True, timeout=180,
-        )
-        if proc.returncode != 0 and "Traceback" in (proc.stderr or ""):
-            lines = (proc.stderr or "").strip().splitlines()
-            tail = "\n".join(lines[-12:]) if lines else (proc.stderr or "")[:800]
+        probe_args = ["--discover-only", "--fresh-discovery"]
+        # Browser scrapers (Playwright/Selenium) can ONLY run in browser_service —
+        # celery-worker has neither installed. Running the draft directly here
+        # ModuleNotFoundError-crashes every browser draft, which route_after_testing
+        # reads as "playwright failed (no items)" → wrong strategy switch. Mirror
+        # run_scraper's dispatch: browser draft → browser_service /scrape; else local.
+        from agents.tools.shell_tools import _scraper_needs_browser, _get_browser_service_url
+
+        if _scraper_needs_browser(draft):
+            import httpx
+
+            try:
+                resp = httpx.post(
+                    f"{_get_browser_service_url()}/scrape",
+                    # max_retries=1: the probe only needs a crash/not-crash signal.
+                    # Default 3 retries × 180s = 540s would outlive the /scrape
+                    # wait_for (300s), orphaning a subprocess that wedges the shared
+                    # Scraper Chrome (9223) and hangs the subsequent run_execution.
+                    json={"scraper_path": draft, "args": probe_args, "timeout": 180, "max_retries": 1},
+                    timeout=180 + 60,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                rc = result.get("returncode", 0)
+                stderr = result.get("stderr") or ""
+            except Exception as exc:
+                logger.warning(
+                    "_probe_phase1_discovery: browser_service dispatch failed (%s) — inconclusive",
+                    exc,
+                )
+                return False, None
+        else:
+            proc = subprocess.run(
+                ["python3", draft] + probe_args,
+                cwd=os.path.join(root, "workspace", slug),
+                capture_output=True, text=True, timeout=180,
+            )
+            rc = proc.returncode
+            stderr = proc.stderr or ""
+        if rc != 0 and "Traceback" in stderr:
+            lines = stderr.strip().splitlines()
+            tail = "\n".join(lines[-12:]) if lines else stderr[:800]
             logger.warning(
                 "_probe_phase1_discovery: CRASHED (job %s, rc=%s):\n%s",
-                job_id, proc.returncode, tail,
+                job_id, rc, tail,
             )
             return True, tail
         logger.info(
-            "_probe_phase1_discovery: OK (job %s, rc=%s)", job_id, proc.returncode
+            "_probe_phase1_discovery: OK (job %s, rc=%s)", job_id, rc
         )
     except subprocess.TimeoutExpired:
         logger.info(
@@ -2650,7 +3087,6 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         clear_tool_context()
 
 
-@_with_api_retry
 def _invoke_cleanup(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
     job_id = state.get("job_id", 0)
     _notify_phase(job_id, "cleanup", "running")
@@ -2688,7 +3124,6 @@ def _invoke_cleanup(state: ScrapeState, config: RunnableConfig) -> dict[str, Any
         clear_tool_context()
 
 
-@_with_api_retry
 def _invoke_skill_learner(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
     job_id = state.get("job_id", 0)
     # Skip on non-SUCCESS: learning from a failed/incomplete scrape injects
@@ -3026,11 +3461,27 @@ def _invoke_store_job_listings(
                     site_slug=slug, job_source_id=str(job_src_id)[:200], defaults=defaults
                 )
             else:
-                # No dedup key — just create
-                obj = JobListing.objects.create(
-                    site_slug=slug, url="", job_source_id="", **defaults
+                # No natural dedup key — synthesize a DETERMINISTIC one from the
+                # stable fields so re-scrapes (and acks_late redeliveries in
+                # Phase 3) UPDATE instead of creating duplicates. The old bare
+                # .create(url="", job_source_id="", ...) produced a fresh row per
+                # item per run (the locumtenens-style dup explosion).
+                import hashlib as _hashlib
+
+                _key_src = "␟".join(
+                    [
+                        str(item.get("title") or ""),
+                        str(item.get("company") or ""),
+                        str(item.get("location") or ""),
+                    ]
                 )
-                created = True
+                _synth_id = "synth:" + _hashlib.sha1(
+                    _key_src.encode("utf-8")
+                ).hexdigest()[:24]
+                defaults["job_source_id"] = _synth_id
+                obj, created = JobListing.objects.update_or_create(
+                    site_slug=slug, job_source_id=_synth_id, defaults=defaults
+                )
 
             if created:
                 created_count += 1

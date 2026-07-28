@@ -112,6 +112,57 @@ for block in json_ld_blocks:
 - `mainEntity` — Main content (varies)
 - `dateModified` — Last modified date
 
+### Profile Page (Person Profiles / Professional Directories)
+
+| Block | @type | Contains |
+|-------|-------|----------|
+| Profile | `ProfilePage` | mainEntity → `Person` with name, email, jobTitle, workLocation |
+
+Professional and people directory sites (law firms, consulting firms, university faculty,
+corporate "Our Team" pages) use the `ProfilePage` schema.org type with `mainEntity` pointing
+to a `Person` object. This distinguishes person profile pages from other `Person` blocks
+(e.g., article authors embedded in Article JSON-LD).
+
+```python
+for block in json_ld_blocks:
+    if block.get("@type") == "ProfilePage":
+        person = block.get("mainEntity", {})
+        if isinstance(person, dict) and person.get("@type") == "Person":
+            return person
+    elif block.get("@type") == "Person":
+        # Fallback: some sites emit Person directly without ProfilePage wrapper
+        return block
+```
+
+**Key fields (from the Person object):**
+- `name` — Full name (e.g., "Manuel (Manny) A. Abascal")
+- `email` — Direct email address
+- `jobTitle` — Position/title (e.g., "Partner")
+- `affiliation` — Organization name
+- `workLocation` — Office location; **can be a single object OR an array of objects**
+- `workLocation[].telephone` — Phone number (check each location for a telephone field)
+- `workLocation[].name` — Office city/location name
+- `knowsAbout` — Areas of expertise (array of strings)
+
+**workLocation handling (array vs object):**
+```python
+work_locations = person.get("workLocation", [])
+if isinstance(work_locations, list):
+    for loc in work_locations:
+        if isinstance(loc, dict) and loc.get("telephone"):
+            phone = loc["telephone"]
+            break
+elif isinstance(work_locations, dict):
+    phone = work_locations.get("telephone", "")
+```
+
+**Important limitation:** JSON-LD `ProfilePage`/`Person` typically provides **contact info
+only** (name, email, phone, title). Biographical text, qualifications, education, and other
+detailed profile sections are usually **NOT** in JSON-LD — they require CSS selector
+extraction as a fallback. Always plan for a hybrid extraction strategy:
+- JSON-LD → name, email, phone, jobTitle
+- CSS → biography/profile text, education, bar qualifications, practice areas
+
 ### Disambiguation Strategy
 
 ```python
@@ -755,6 +806,80 @@ def normalize_jsonld_keys(obj):
 ```
 
 **Detection heuristic:** If `json.loads()` succeeds but `block.get("name")` returns `None` while `block.get("Name")` works, the block uses PascalCase.
+
+## Learned: og:description may contain HTML-entity-encoded <p> tags
+**Source:** https://www.lw.com/en/people/manny-abascal (2026-07-28)
+**Applicability:** any site where `og:description` or `meta[name=description]` contains HTML-entity-encoded paragraphs instead of plain text.
+
+Some enterprise CMS platforms (notably Sitecore and similar) encode multi-paragraph descriptions
+in `og:description` using HTML entities: `&lt;p&gt;First paragraph.&lt;/p&gt;&lt;p&gt;Second paragraph.&lt;/p&gt;`.
+Using the raw `content` attribute directly produces ugly encoded text like `&lt;p&gt;Manny Abascal...&lt;/p&gt;`.
+
+**Guard:** Unescape HTML entities, parse as HTML, and extract paragraph text:
+
+```python
+from html import unescape as html_unescape
+from bs4 import BeautifulSoup
+
+def parse_og_description_with_html(raw_desc: str) -> str:
+    """Parse og:description that may contain HTML-entity-encoded paragraphs."""
+    if not raw_desc:
+        return ""
+    unescaped = html_unescape(raw_desc)
+    frag = BeautifulSoup(unescaped, "html.parser")
+    paragraphs = frag.find_all("p")
+    if paragraphs:
+        return "\n\n".join(
+            p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True)
+        )
+    text = frag.get_text(separator=" ", strip=True)
+    return text if text else unescaped.strip()
+```
+
+**Usage context:** This is useful when JSON-LD doesn't provide the full bio/description text
+but `og:description` does. Common on law firm and professional directory profile pages.
+
+## Learned: <br> tags inside <li> cause text concatenation artifacts
+**Source:** https://www.lw.com/en/people/manny-abascal (2026-07-28)
+**Applicability:** any site where list items (`<li>`) use `<br>` tags to separate sub-fields within a single item (common in education, qualifications, experience sections).
+
+BeautifulSoup's `get_text(strip=True)` concatenates text on both sides of a `<br>` tag with
+no separator, producing artifacts like `1992Articles Editor` when the actual content should
+be `1992; Articles Editor`. This is especially common in education/qualification sections
+where a single `<li>` contains degree, school, year, and honors separated by `<br>` tags.
+
+**Guard:** Replace `<br>` tags with a separator before extracting text:
+
+```python
+def extract_li_text(li, separator="; ") -> str:
+    """Extract text from an <li>, properly handling <br>-separated spans.
+
+    Replaces each <br> with the separator before get_text() to avoid
+    concatenation artifacts like '1992Articles Editor'.
+    """
+    for br in li.find_all("br"):
+        br.replace_with(separator)
+    return li.get_text(separator=" ", strip=True)
+```
+
+**Also normalize multiple separators** after extraction (collapses `;;`, ` ; `, trailing separators):
+
+```python
+import re
+
+def normalize_separators(text: str, sep="; ") -> str:
+    """Normalize separator artifacts after multi-line list extraction."""
+    if not text:
+        return text
+    text = re.sub(r'\s*;;\s*', sep, text)
+    text = re.sub(r'\s*;\s*', sep, text)
+    text = re.sub(r'(;;?\s*)+$', '', text)
+    return text.strip()
+```
+
+**When to use:** Any site with structured list data (education, qualifications, experience,
+awards) where `<br>` tags create multi-line content within single `<li>` elements. This is a
+general BeautifulSoup pattern, not site-specific.
 
 ## When NOT to Use
 

@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import select
+import signal
 import subprocess
 import time
 from typing import Any, Optional
@@ -217,17 +218,40 @@ def run_execution(state: ScrapeState) -> dict:
         logger.info("run_execution: search_term job, passing --query '%s'", search_criteria)
     elif input_mode in ("navigation", "list_page"):
         _nav = state.get("navigation_analysis") or {}
-        _search = _nav.get("search") or {}
-        _working_url = (
-            (_search.get("working_url") if isinstance(_search, dict) else "")
-            or (_search.get("listing_url_used") if isinstance(_search, dict) else "")
-            or ""
-        )
-        if _working_url:
-            args.extend(["--listing-url", _working_url])
-            logger.info(
-                "run_execution: navigation job, passing --listing-url (full discovery) '%s'",
-                _working_url,
+        _discovery = (_nav.get("discovery") if isinstance(_nav, dict) else None) or {}
+        _listing_reached = bool(_discovery.get("listing_reached", False))
+        try:
+            from django.conf import settings as _settings
+            _respect_flag = bool(getattr(_settings, "RESPECT_LISTING_REACHED_FLAG", True))
+        except Exception:
+            _respect_flag = True
+
+        if _listing_reached or not _respect_flag:
+            # Nav reached the listing → working_url IS the listing URL → pass it.
+            # (Or kill-switch off → old behavior: always pass working_url.)
+            _search = _nav.get("search") or {}
+            _working_url = (
+                (_search.get("working_url") if isinstance(_search, dict) else "")
+                or (_search.get("listing_url_used") if isinstance(_search, dict) else "")
+                or ""
+            )
+            if _working_url:
+                args.extend(["--listing-url", _working_url])
+                logger.info(
+                    "run_execution: navigation job, passing --listing-url (full discovery) '%s'",
+                    _working_url,
+                )
+        else:
+            # Nav did NOT reach the listing (budget exhausted / render race).
+            # OMIT --listing-url so the scraper's DEFAULT_LISTING_URL (which
+            # code_writer sets from the user's search_criteria) drives discovery.
+            # Without this, goal_url=start_url (the sample detail URL) is passed
+            # → discovery on a profile page → 0 items (the dominant failure for
+            # the JS-listing+pagination class — lw.com: ~67% of runs were 0/1).
+            logger.warning(
+                "run_execution: navigation did NOT reach the listing "
+                "(listing_reached=False) — OMITTING --listing-url; the scraper's "
+                "DEFAULT_LISTING_URL will drive discovery"
             )
 
     # H3 (checkpoint cross-contamination): code_tester writes a
@@ -238,6 +262,25 @@ def run_execution(state: ScrapeState) -> dict:
     # Phase 1 from scratch. The CLI-contract guard below drops this flag if the
     # generated scraper's argparse doesn't define it yet. [discovery-coverage-gate §4]
     args.append("--fresh-discovery")
+
+    # DETERMINISTIC DISCOVERY (env-var): compute the listing URL for env-var
+    # injection. This bypasses the argparse + _filter_supported_args chain —
+    # code_writer's per-run argparse may or may not declare --listing-url/
+    # --fresh-discovery, but env vars always reach the scraper. The template's
+    # main() checks SCRAPER_LISTING_URL before the seed-file gate.
+    _listing_url_env = ""
+    if input_mode in ("navigation", "list_page", "search_term"):
+        _nav_env = state.get("navigation_analysis") or {}
+        _disc = (_nav_env.get("discovery") if isinstance(_nav_env, dict) else None) or {}
+        # Use ONLY discovery.listing_url (the navigator's authoritative contract).
+        # Do NOT fall back to working_url (may be a detail page — the uindex
+        # root cause: discovery scraped a detail page's sidebar links instead of
+        # the listing) or search_criteria (may be a search query, not a URL).
+        # When null, the scraper's own PRODUCT_LISTING_URL / DEFAULT_LISTING_URL
+        # (which code_writer sets from the navigation findings) drives discovery.
+        _listing_url_env = (_disc.get("listing_url") if isinstance(_disc, dict) else "") or ""
+        if _listing_url_env:
+            logger.info("run_execution: setting SCRAPER_LISTING_URL=%s (env-var, deterministic discovery)", _listing_url_env[:80])
 
     # Enforce scope=firstn (intake UI): cap extraction at the user's N records.
     # scope_value is a CharField → parse defensively. The _filter_supported_args
@@ -254,10 +297,16 @@ def run_execution(state: ScrapeState) -> dict:
 
     # CLI-contract guard: drop any flag the generated scraper doesn't define,
     # so an LLM-authored argparse can't exit(2) and silently zero the output.
+    # CRITICAL: if discovery-forcing flags (--listing-url for nav/list_page,
+    # --query for search_term) are stripped, the scraper silently falls back to
+    # reading input_urls.json (the seed file) — discovery (pagination) is never
+    # called, output == seed count (the 1-item root cause). Warn loudly so the
+    # operator knows discovery was suppressed.
     if args:
         accepted = _accepted_cli_flags(scraper_path)
         filtered = _filter_supported_args(args, accepted)
         if filtered != args:
+            _stripped = [a for a in args if a.startswith("--") and a[2:] not in (accepted or set())]
             logger.warning(
                 "run_execution: scraper doesn't accept some flags — "
                 "passed %s, accepted %s, filtering to %s",
@@ -265,6 +314,20 @@ def run_execution(state: ScrapeState) -> dict:
                 sorted(accepted) if accepted else "unknown",
                 filtered,
             )
+            # Flag discovery-critical flag stripping (the root cause of 1-item
+            # outputs). This doesn't FAIL the job (the scraper still runs with
+            # the seed file) but makes the suppression LOUD.
+            _discovery_critical = {"listing-url", "fresh-discovery", "query"}
+            _stripped_critical = [f for f in _stripped if f[2:] in _discovery_critical]
+            if _stripped_critical:
+                logger.error(
+                    "run_execution: DISCOVERY-CRITICAL flags stripped: %s — "
+                    "the scraper will fall back to input_urls.json (seed file) "
+                    "and discovery/pagination will NOT run. Output will be "
+                    "limited to the seed count. The scraper's argparse must "
+                    "declare these flags for discovery to work.",
+                    _stripped_critical,
+                )
         args = filtered
 
     # Execution-mode feature flag (settings.SCRAPER_EXECUTION_MODE):
@@ -446,6 +509,29 @@ def _run_category_sources(state, scraper_path, base_args, site_folder, primary_r
         return primary_result
 
 
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the scraper's whole process group so its Chrome grandchildren die
+    with it.
+
+    ``proc.kill()`` only SIGKILLs the python3 child; the browser subprocesses it
+    spawned (Playwright/Selenium connecting to/launching Chrome) are in a
+    different process group and survive as orphans — holding the shared Scraper
+    Chrome (9223) and wedging subsequent scrapers. ``start_new_session=True`` on
+    the Popen makes the child its own process-group leader, so ``os.getpgid`` is
+    the child's pgid and ``killpg`` reaches everyone it spawned.
+
+    Safe to call on an already-exited process: a dead leader's pgid is gone, so
+    we fall back to ``proc.kill()`` (which is itself a no-op if already reaped).
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def _run_in_process(
     scraper_path: str, args: list[str], cwd: str, site_folder: str,
     workspace_folder: str = "", job_id: int = 0,
@@ -486,7 +572,18 @@ def _run_in_process(
         _hard = getattr(_settings, "EXECUTION_TIMEOUT", 3600)
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd,
-            env={**os.environ, **(env_overrides or {})},
+            env={**os.environ, **(env_overrides or {}),
+                 # DETERMINISTIC DISCOVERY: set SCRAPER_LISTING_URL for nav/list_page
+                 # jobs so the template's main() runs Phase 1 discovery (env-var gate)
+                 # regardless of CLI flags (which code_writer may not declare). This
+                 # bypasses the argparse + _filter_supported_args chain that silently
+                 # suppresses discovery → output == seed count (the 1-item root cause).
+                 **({"SCRAPER_LISTING_URL": _listing_url_env} if _listing_url_env else {})},
+            # Make the scraper its own process-group leader so a timeout/stall
+            # kill can reach its Chrome grandchildren too. Without this, killpg
+            # can't target them and proc.kill() only reaps the python3 child,
+            # leaving browser subprocesses orphaned (holding the shared Chrome).
+            start_new_session=True,
         )
         err_fd = proc.stderr.fileno()
         stderr_buf = bytearray()
@@ -510,16 +607,16 @@ def _run_in_process(
                     f"scraper stalled — no output for {_stall}s "
                     f"(likely hung/blocked on a JS or rate-limited site)"
                 )
-                proc.kill()
+                _kill_process_group(proc)
                 break
             if time.time() - start > _hard:
                 stall_reason = f"scraper exceeded {_hard}s wall-clock"
-                proc.kill()
+                _kill_process_group(proc)
                 break
         try:
             proc.communicate(timeout=30)  # drain + reap the killed/finished process
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _kill_process_group(proc)
         returncode = proc.returncode if proc.returncode is not None else -1
         elapsed = round(time.time() - start, 2)
         stderr = stderr_buf.decode("utf-8", "replace")
@@ -579,6 +676,17 @@ def _run_via_browser_service(
 
     service_url = _get_browser_service_url()
     stealth_env = _stealth_env(state) if state else {}
+    # DETERMINISTIC DISCOVERY: inject SCRAPER_LISTING_URL into the browser_service
+    # env_overrides so it reaches the scraper subprocess. Computed upstream in
+    # run_execution and stored on state by the caller — but _run_via_browser_service
+    # is called with `state`, so we re-derive from navigation_analysis here too.
+    _nav_bs = (state or {}).get("navigation_analysis") or {}
+    _disc_bs = (_nav_bs.get("discovery") if isinstance(_nav_bs, dict) else None) or {}
+    # Use ONLY discovery.listing_url (not working_url/search_criteria — see
+    # run_execution fix above for rationale).
+    _listing_env_bs = (_disc_bs.get("listing_url") if isinstance(_disc_bs, dict) else "") or ""
+    if _listing_env_bs and (state or {}).get("input_mode") in ("navigation", "list_page", "search_term"):
+        stealth_env["SCRAPER_LISTING_URL"] = _listing_env_bs
     logger.info(
         "run_execution: dispatching to browser_service at %s: %s (cloak=%s)",
         service_url,

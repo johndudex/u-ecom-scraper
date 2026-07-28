@@ -44,9 +44,19 @@ _SELECTOR_CRASH_RE = re.compile(
 
 
 def _extracted_item_count(report: dict) -> int:
-    """Best-effort count of items the scraper actually extracted."""
+    """Best-effort count of items the scraper actually extracted.
+
+    Reads both top-level AND nested under ``results`` — code-tester writes
+    ``successful_extractions`` nested in ``results`` (code-tester.md:99-100), so
+    a top-level-only read returns 0 for a successful extraction and misroutes a
+    viable strategy to "no items extracted" (the uindex false strategy-switch
+    bug). The sibling _core_field_zero_coverage already reads the nested path.
+    """
+    results = report.get("results") if isinstance(report, dict) else None
     for key in ("successful_extractions", "extracted_items", "item_count"):
         v = report.get(key)
+        if v is None and isinstance(results, dict):
+            v = results.get(key)
         if isinstance(v, (int, float)) and v:
             return int(v)
     sp = report.get("sample_products") or []
@@ -166,7 +176,11 @@ def _scraper_produced_valid_output(state: ScrapeState) -> bool:
     if not sample_products:
         return False
     live_products = [p for p in sample_products if not _is_dead_product(p)]
-    valid = [p for p in live_products if p.get("title") and p.get("price")]
+    try:
+        from src.content_types import has_substantive_field
+        valid = [p for p in live_products if has_substantive_field(p)]
+    except Exception:
+        valid = [p for p in live_products if p.get("title") and p.get("price")]
     return len(valid) > 0
 
 
@@ -206,11 +220,23 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
                     key=lambda f: _os.path.getmtime(_os.path.join(ws, f)),
                     reverse=True,
                 )
-                if outs:
-                    data = _json.load(open(_os.path.join(ws, outs[0])))
-                    ct_config = state.get("content_type_config") or {}
-                    output_key = ct_config.get("output_key", "products") if ct_config else "products"
-                    sample_products = data.get(output_key) or data.get("products", [])
+                ct_config = state.get("content_type_config") or {}
+                output_key = ct_config.get("output_key", "products") if ct_config else "products"
+                # Bug A fix: take the BEST output file (max real items), not the
+                # newest. code_tester runs Phase 2 first (5 items) then Phase 1
+                # (1 item — discovery crash). The newest file is always the WORST
+                # result → 1 < 3 → cascade. Taking MAX across the last 5 files
+                # lets the 5-item Phase-2 result pass the gate.
+                _best_items = []
+                for _out_name in outs[:5]:
+                    try:
+                        _data = _json.load(open(_os.path.join(ws, _out_name)))
+                        _items = _data.get(output_key) or _data.get("products", [])
+                        if len(_items) > len(_best_items):
+                            _best_items = _items
+                    except Exception:
+                        pass
+                sample_products = _best_items
         except Exception:
             pass
 
@@ -224,11 +250,54 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
     except Exception:
         fields = []
     live = [p for p in sample_products if not _is_dead_product(p)]
+    try:
+        from src.content_types import has_substantive_field
+    except Exception:
+        has_substantive_field = lambda p: bool(p.get("title"))  # type: ignore
     if fields:
-        good = [p for p in live if p.get("title") and any(p.get(f) for f in fields)]
+        good = [p for p in live if any(p.get(f) for f in fields) or has_substantive_field(p)]
     else:
-        good = [p for p in live if p.get("title")]
-    return len(good) >= min_count
+        good = [p for p in live if has_substantive_field(p)]
+    if len(good) >= min_count:
+        return True
+
+    # OUTPUT-AS-TRUTH FALLBACK: code_tester is an LLM that independently
+    # re-derives "what counts as success" — it may report sample_products=[]
+    # despite the output file having real items (the whack-a-mole root cause:
+    # every stage independently judges). The output file is the GROUND TRUTH.
+    # Read it directly + count real items with the content-type-agnostic
+    # has_substantive_field predicate. This bypasses the LLM's summary.
+    try:
+        import os as _os, glob as _glob, json as _json
+        _slug = state.get("site_slug", "")
+        if _slug:
+            _root = _os.environ.get("PROJECT_ROOT", "/app")
+            _pattern = _os.path.join(_root, "workspace", _slug, "output_*.json")
+            _outputs = sorted(_glob.glob(_pattern), key=lambda f: _os.path.getmtime(f), reverse=True)
+            # Bug A fix: iterate the last 5 outputs, take the one with the MOST
+            # real items (not the newest — the newest may be the 1-item Phase-1
+            # crash file while a 5-item Phase-2 file exists alongside it).
+            for _out_path in _outputs[:5]:
+                try:
+                    with open(_out_path, "r") as _f:
+                        _out = _json.load(_f)
+                    for _ck in ("products", "jobs", "articles", "results", "items", "threads", "pages"):
+                        _items = _out.get(_ck)
+                        if isinstance(_items, list) and _items:
+                            _live = [p for p in _items if not _is_dead_product(p)]
+                            _good = [p for p in _live if has_substantive_field(p)]
+                            if len(_good) >= min_count:
+                                logger.info(
+                                    "route_after_testing: OUTPUT-AS-TRUTH rescue — found %d real "
+                                    "items in %s (≥%d) → PASS",
+                                    len(_good), _os.path.basename(_out_path), min_count,
+                                )
+                                return True
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return False
 
 
 # Back-compat alias for any external callers.
@@ -448,8 +517,6 @@ def route_after_testing(state: ScrapeState) -> str:
 
     # Cap on the strategy/scraper cascade: the early-return branches below
     # previously bypassed MAX_TEST_RETRIES (only the LLM fallback enforced it).
-    # Reuse the same exhausted-cap fallback: partial-valid → field_confirmation,
-    # else human_approval.
     if retry_count >= MAX_TEST_RETRIES:
         if confidence >= MIN_CONFIDENCE_PARTIAL and _scraper_produced_valid_output(state):
             logger.warning(
@@ -458,6 +525,16 @@ def route_after_testing(state: ScrapeState) -> str:
                 retry_count, _action,
             )
             return "field_confirmation"
+        # For skip_approvals jobs (intake), human_approval auto-approves and
+        # loops back to scraper_analyzer — creating an infinite retry cycle.
+        # Fail the job instead so the user can investigate + re-run with fixes.
+        if state.get("skip_approvals", False):
+            logger.error(
+                "route_after_testing: retries exhausted in cascade (count=%d, "
+                "action=%s, reason=%s) → FAIL (skip_approvals job, no human to break the loop)",
+                retry_count, _action, _reason,
+            )
+            return "cleanup"
         logger.warning(
             "route_after_testing: retries exhausted in cascade (count=%d, "
             "action=%s, reason=%s) → human_approval",

@@ -85,6 +85,28 @@ CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = "UTC"
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
+# Phase 3 (Per-Phase Execution Contract) — worker recycling. Reclaims leaked
+# memory (abandoned threads, large contexts, aya's 26K-record parse) by warm-
+# recycling the worker after a task if its RSS exceeds the ceiling, or after N
+# tasks. Warm recycle = finish the current task, THEN recycle → no task loss,
+# so acks_late is NOT required for this. Ceiling is set below the 3g mem_limit
+# (2.5g = 2621440 KiB) so the recycle fires before the kernel OOM-kills the
+# worker (the 16% celery-OOM failure class). Tune from measured aya peak.
+CELERY_WORKER_MAX_MEMORY_PER_CHILD = config(
+    "CELERY_WORKER_MAX_MEMORY_PER_CHILD", default=2621440, cast=int
+)
+CELERY_WORKER_MAX_TASKS_PER_CHILD = config(
+    "CELERY_WORKER_MAX_TASKS_PER_CHILD", default=10, cast=int
+)
+# acks_late (at-least-once delivery) — DEFAULT OFF. Enabling changes delivery
+# semantics: a hard-crashed/lost worker's task is redelivered. Correct ONLY with
+# the cleanup_stuck_jobs "mark FAILED before revoke" reorder (so the dedup guard
+# lets the redelivery resume from the langgraph checkpoint) + idempotent side
+# effects. Keep off until that path is regression-verified; flip per-deploy.
+CELERY_TASK_ACKS_LATE = config("CELERY_TASK_ACKS_LATE", default=False, cast=bool)
+CELERY_TASK_REJECT_ON_WORKER_LOST = config(
+    "CELERY_TASK_REJECT_ON_WORKER_LOST", default=False, cast=bool
+)
 CELERY_BEAT_SCHEDULE = {
     "cleanup-stuck-jobs": {
         "task": "scraper.tasks.cleanup_stuck_jobs",
@@ -110,6 +132,41 @@ ZAI_SMALL_MODEL = config("ZAI_SMALL_MODEL", default="glm-5-turbo")
 # of reading the full analysis JSONs. Set CODE_WRITER_MODEL=glm-4.7-flash to
 # A/B test the faster flash model on codegen.
 CODE_WRITER_MODEL = config("CODE_WRITER_MODEL", default="glm-5-turbo")
+# Fallback model when the primary trips the per-model circuit breaker (Phase 1,
+# contract rollout). Defaults to the small model. The breaker bounds how long a
+# bad/stalling model receives traffic: after LLM_CIRCUIT_BREAKER_THRESHOLD
+# consecutive failures it routes to this model for LLM_CIRCUIT_BREAKER_COOLDOWN.
+ZAI_FALLBACK_MODEL = config("ZAI_FALLBACK_MODEL", default="glm-5-turbo")
+LLM_CIRCUIT_BREAKER_ENABLED = config("LLM_CIRCUIT_BREAKER_ENABLED", default=True, cast=bool)
+LLM_CIRCUIT_BREAKER_THRESHOLD = config("LLM_CIRCUIT_BREAKER_THRESHOLD", default=4, cast=int)
+LLM_CIRCUIT_BREAKER_COOLDOWN = config("LLM_CIRCUIT_BREAKER_COOLDOWN", default=60, cast=int)
+# Phase 2 classified retry (Per-Phase Execution Contract). Kill-switch off →
+# revert to pre-Phase-2 plain ChatOpenAI with the blind max_retries below.
+LLM_CLASSIFIED_RETRY = config("LLM_CLASSIFIED_RETRY", default=True, cast=bool)
+LLM_MAX_RETRIES = config("LLM_MAX_RETRIES", default=5, cast=int)  # only used when classified retry OFF
+LLM_RETRY_TRANSIENT_MAX = config("LLM_RETRY_TRANSIENT_MAX", default=2, cast=int)   # timeout/conn/5xx
+LLM_RETRY_RATELIMIT_MAX = config("LLM_RETRY_RATELIMIT_MAX", default=3, cast=int)   # 429 (honors Retry-After)
+LLM_RETRY_BACKOFF_BASE = config("LLM_RETRY_BACKOFF_BASE", default=1.5, cast=float)
+LLM_RETRY_BACKOFF_CAP = config("LLM_RETRY_BACKOFF_CAP", default=30.0, cast=float)
+# Phase 2 deterministic context truncation. Replaces the headroom.compress-based
+# pre-model hook (which made a SYNC LLM call inside the cancellation path + added
+# run-to-run variance). 'deterministic' (default) | 'off' (no-op rollback).
+LLM_TRUNCATION_MODE = config("LLM_TRUNCATION_MODE", default="deterministic")
+LLM_TRUNCATION_MAX_CHARS = config("LLM_TRUNCATION_MAX_CHARS", default=180000, cast=int)
+LLM_TRUNCATION_PER_MSG_CAP = config("LLM_TRUNCATION_PER_MSG_CAP", default=8000, cast=int)
+# Phase 4 async cancellation (Per-Phase Execution Contract). Default OFF: the
+# async path (agent.ainvoke under asyncio.wait_for → CancelledError closes the
+# z.ai socket) is new; keep the sync thread.join default until a regression
+# verifies it. Flip True to enable real per-phase cancellation.
+LLM_ASYNC_EXECUTION = config("LLM_ASYNC_EXECUTION", default=False, cast=bool)
+# Phase 5 determinism A/B switch. When True, code-writer + product-analyzer use
+# temperature 0 (narrows the codegen distribution; z.ai doesn't reliably honor
+# seed, so this narrows but doesn't guarantee). Default False.
+LLM_CODEGEN_DETERMINISTIC = config("LLM_CODEGEN_DETERMINISTIC", default=False, cast=bool)
+# Phase 1 (JS-listing+pagination class fix): when navigation doesn't reach the
+# listing (listing_reached=False), OMIT --listing-url so the scraper's
+# DEFAULT_LISTING_URL drives discovery (not the sample detail URL). Default True.
+RESPECT_LISTING_REACHED_FLAG = config("RESPECT_LISTING_REACHED_FLAG", default=True, cast=bool)
 # Per-call HTTP timeout for every LLM call (llm.py ChatOpenAI). The PRIMARY hang
 # guard — a stuck request dies here at 600s rather than hanging indefinitely.
 # Explicitly defined (previously only referenced in comments; llm.py fell back to

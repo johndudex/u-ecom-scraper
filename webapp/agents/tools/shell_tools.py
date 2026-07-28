@@ -198,6 +198,17 @@ def get_shell_tools(
         else:
             needs_browser = _scraper_needs_browser(full_path)
 
+        # Floor the timeout for browser-based scrapers. code_tester's LLM often
+        # passes a tight timeout (or the browser_service /scrape 120s default
+        # applies), but JS-heavy sites (lw.com Coveo, ~15s/page on networkidle)
+        # need ~160s+ even for a small sample — under-budgeting SIGKILLs the run
+        # mid-extraction (exit -1) and triggers a false strategy cascade
+        # (playwright→internal_api). 240s sits within /scrape's 300s cap and
+        # preserves the +60s httpx margin. HTTP runs are unaffected.
+        if needs_browser and timeout < 240:
+            logger.info("run_scraper: flooring browser timeout %ds → 240s", timeout)
+            timeout = 240
+
         # Write a heartbeat SessionLog entry so the watchdog sees activity
         # during long scraper runs (UC Chrome + residential proxy can take 5+ min)
         try:
@@ -223,22 +234,65 @@ def get_shell_tools(
         else:
             cmd_args = shlex.split(cli_args) if cli_args else []
 
+        # Bug C guard (deterministic): if the caller passed --urls <single_url>
+        # (the 1-item trap — always extracts exactly 1, fails the ≥3 ground-truth
+        # gate, causes a false cascade), AND input_urls.json exists alongside the
+        # scraper, redirect to --input input_urls.json so the test covers the
+        # full sample set. The LLM code_tester ignores prompt-level prohibitions;
+        # this guard is at the tool level so it CANNOT be bypassed.
+        if "--urls" in cmd_args:
+            _ws_dir = os.path.dirname(full_path)
+            _iu = os.path.join(_ws_dir, "input_urls.json")
+            if os.path.isfile(_iu):
+                # Replace --urls <url> with --input input_urls.json
+                _idx = cmd_args.index("--urls")
+                # Remove --urls + its value (next arg if not a flag)
+                cmd_args.pop(_idx)
+                if _idx < len(cmd_args) and not cmd_args[_idx].startswith("--"):
+                    cmd_args.pop(_idx)
+                cmd_args.extend(["--input", "input_urls.json"])
+                logger.info(
+                    "run_scraper: Bug C guard — redirected --urls <single> to "
+                    "--input input_urls.json (prevents the 1-item trap)"
+                )
+
+        # Discovery env overrides — computed ONCE for BOTH paths. (Previously
+        # this block lived inside `if needs_browser:`, so the HTTP/local branch
+        # below referenced an unassigned `env_overrides` → UnboundLocalError on
+        # every http_requests/internal_api run — the known env_overrides bug.)
+        env_overrides = None
+        try:
+            from agents.tools.context import is_anti_bot_detected
+
+            if is_anti_bot_detected():
+                env_overrides = {"STEALTH_BROWSER": "cloak"}
+                logger.info("run_scraper: anti-bot detected → STEALTH_BROWSER=cloak")
+        except Exception:
+            pass
+        # DETERMINISTIC DISCOVERY: inject SCRAPER_LISTING_URL so the scraper's
+        # main() env-var gate triggers Phase 1 discovery even during code_tester's
+        # run (not just run_execution). Without this, code_tester falls into the
+        # seed-file path (input_urls.json) → 1-5 items → route_after_testing
+        # fails → cascade. The env var bypasses argparse stripping entirely.
+        try:
+            from agents.tools.context import get_state
+            _ts = get_state() or {}
+            _nav_ts = _ts.get("navigation_analysis") or {}
+            _disc_ts = (_nav_ts.get("discovery") if isinstance(_nav_ts, dict) else None) or {}
+            _listing_ts = (
+                (_disc_ts.get("listing_url") if isinstance(_disc_ts, dict) else "")
+                or ""
+            )
+            if _listing_ts and _ts.get("input_mode") in ("navigation", "list_page", "search_term"):
+                env_overrides = dict(env_overrides or {})
+                env_overrides["SCRAPER_LISTING_URL"] = _listing_ts
+        except Exception:
+            pass
+
         if needs_browser:
             logger.info("run_scraper: browser-based, dispatching to browser_service: %s", scraper_path)
             try:
                 service_url = _get_browser_service_url()
-                # Anti-bot/Akamai sites: route the scraper's Playwright launch
-                # through CloakBrowser (stealth Chromium) instead of plain Chrome.
-                # The scraper reads STEALTH_BROWSER and swaps in cloak's launch().
-                env_overrides = None
-                try:
-                    from agents.tools.context import is_anti_bot_detected
-
-                    if is_anti_bot_detected():
-                        env_overrides = {"STEALTH_BROWSER": "cloak"}
-                        logger.info("run_scraper: anti-bot detected → STEALTH_BROWSER=cloak")
-                except Exception:
-                    pass
                 resp = httpx.post(
                     f"{service_url}/scrape",
                     json={
@@ -269,12 +323,16 @@ def get_shell_tools(
             logger.info("run_scraper: http-based, running locally: %s", scraper_path)
             try:
                 cmd = ["python3", full_path] + cmd_args
+                # Inherit env + inject discovery env vars (same as browser path).
+                _run_env = dict(os.environ)
+                _run_env.update(env_overrides or {})
                 result = subprocess.run(
                     cmd,
                     capture_output=True,
                     text=True,
                     timeout=timeout,
                     cwd=cwd,
+                    env=_run_env,
                 )
                 return _format_result({
                     "returncode": result.returncode,

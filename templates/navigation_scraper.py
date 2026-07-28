@@ -52,6 +52,38 @@ NEXT_BUTTON_SELECTOR = "{NEXT_BUTTON_SELECTOR}"  # e.g. "a.next-page"
 PAGE_PARAM_NAME = "{PAGE_PARAM_NAME}"  # e.g. "page"
 ITEMS_PER_PAGE = {ITEMS_PER_PAGE}  # page size (for offset-style pagination); null if unknown
 MAX_PAGES = {MAX_PAGES}  # null for unlimited
+
+# Phase 3 (JS-listing+pagination class fix): load-more pagination support.
+# Ported from playwright_scraper.py (verified: +20 items/click on lw.com's
+# Coveo listing, reaching ~3000 profiles). Navigation_scraper.py is the template
+# code_writer actually uses for nav jobs (the playwright template was unreachable
+# per the analysis); this ports the verified clicker into the reachable template.
+MAX_DISCOVER_PAGES = 200
+
+_LOAD_MORE_SELECTORS = [
+    "[class*='load-more' i]", "[class*='loadMore' i]",
+    "[class*='show-more' i]", "[class*='showMore' i]",
+    "[class*='pager-next' i]", "[class*='pagerNext' i]",
+    "button[aria-label*='more' i]", "a[aria-label*='next' i]",
+    ".coveo-magicbox-load-more",
+]
+
+
+def _click_load_more(page) -> bool:
+    """Click a visible+enabled load-more/show-more button if present.
+
+    Returns True if clicked. Uses the 9-selector set from playwright_scraper.py
+    (broad enough for Coveo, Algolia, React, Vue load-more patterns).
+    """
+    try:
+        for sel in _LOAD_MORE_SELECTORS:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible() and btn.is_enabled():
+                btn.click()
+                return True
+    except Exception:
+        pass
+    return False
 TOTAL_COUNT_SELECTOR = "{TOTAL_COUNT_SELECTOR}"  # e.g. ".results-count"
 
 # Coverage target: site-reported total item count (coverage_target.total_items
@@ -248,6 +280,27 @@ def _discover_urls_via_search(
             _set_stop_reason(state, "max_pages_hit")
             break
 
+        # Phase 3: load-more pagination (Coveo/React/Vue load-more button).
+        # Click the button + re-extract on the SAME page (no URL navigation).
+        # Falls through to _get_next_page_url (page_param/next_button) if no
+        # load-more button is found.
+        if PAGINATION_TYPE in ("", "load_more", "infinite_scroll_tall"):
+            if _click_load_more(page):
+                page.wait_for_timeout(2500)
+                new_urls = _extract_item_links(page)
+                new_count = len(set(new_urls) - set(all_urls))
+                logger.info(
+                    "Phase 1: load-more click → %d new items (page %d)",
+                    new_count, current_page + 1,
+                )
+                if new_count == 0:
+                    _set_stop_reason(state, "no_new_items")
+                    break
+                all_urls.extend(new_urls)
+                current_page += 1
+                continue
+            # No load-more button found → fall through to _get_next_page_url.
+
         next_url = _get_next_page_url(page, current_page + 1)
         if not next_url:
             logger.info("Phase 1: No more pages (page %d)", current_page)
@@ -306,6 +359,27 @@ def _discover_urls_via_category(
         if limit and len(all_urls) >= limit:
             _set_stop_reason(state, "max_pages_hit")  # cap → inconclusive (see search)
             break
+
+        # Phase 3: load-more pagination (Coveo/React/Vue load-more button).
+        # Click the button + re-extract on the SAME page (no URL navigation).
+        # Falls through to _get_next_page_url (page_param/next_button) if no
+        # load-more button is found.
+        if PAGINATION_TYPE in ("", "load_more", "infinite_scroll_tall"):
+            if _click_load_more(page):
+                page.wait_for_timeout(2500)
+                new_urls = _extract_item_links(page)
+                new_count = len(set(new_urls) - set(all_urls))
+                logger.info(
+                    "Phase 1: load-more click → %d new items (page %d)",
+                    new_count, current_page + 1,
+                )
+                if new_count == 0:
+                    _set_stop_reason(state, "no_new_items")
+                    break
+                all_urls.extend(new_urls)
+                current_page += 1
+                continue
+            # No load-more button found → fall through to _get_next_page_url.
 
         next_url = _get_next_page_url(page, current_page + 1)
         if not next_url:

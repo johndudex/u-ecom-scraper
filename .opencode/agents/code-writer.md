@@ -62,12 +62,49 @@ extraction functions** with the field map provided — NOT to rewrite the templa
 If the template has `_extract_item(html, url)` or similar, replace ITS BODY with
 the field map's selectors/methods. Keep the function signature + all surrounding code.
 
-### Discovery & pagination helpers — DO NOT re-signature (CRITICAL)
+### Discovery & pagination — SHARED IMPORT (CRITICAL)
 
-The template's Phase-1 discovery and pagination helpers (`_discover_urls_via_search`,
-`_discover_urls_via_form_search`, `_discover_urls_via_category`, `_get_next_page_url`,
-`_fetch_html`, `_http_get`, `_http_post`, the checkpoint load/save, etc.) are **correct
-as written**. Three hard rules:
+The template's Phase-1 discovery (pagination, load-more, page-param) is now an
+**imported module**, NOT inline code you can edit. The template contains:
+
+```python
+from src.discovery import discover_item_urls, config_for_load_more
+```
+
+**THREE HARD RULES:**
+
+1. **KEEP the `from src.discovery import ...` line verbatim.** Do NOT remove it,
+   do NOT replace it with your own pagination loop, do NOT reimplement
+   `_click_load_more` or `_get_next_page_url` inline. The shared module has
+   been verified to work (620+ URLs on lw.com live). Your reimplementation will break.
+2. **KEEP the `discover_item_urls(page, url, extract_fn, cfg)` call verbatim.**
+   The ONLY thing you adapt is the `extract_fn` callback (which calls
+   `page.evaluate(EXTRACT_PRODUCT_URLS_JS)`) — that is the site-specific
+   part. The loop, the selectors, the render-poll, the no_progress counter,
+   the error handling are all inside `src.discovery` and are NOT yours to edit.
+3. **NEVER define `_click_load_more`, `_safe_eval`, `_get_next_page_url`, or
+   any pagination loop inline.** If the template doesn't have the import,
+   something is wrong — use the template as-is.
+4. **KEEP the `main()` discovery gate initializers verbatim, in place.** The
+   template's `main()` has, immediately before the discovery `if/elif`:
+   ```python
+   _env_listing = os.environ.get("SCRAPER_LISTING_URL", "").strip()
+   _env_force = os.environ.get("SCRAPER_FORCE_DISCOVERY", "").strip().lower() in ("1","true","yes")
+   if _env_listing or _env_force or args.fresh_discovery or args.listing_url:
+       global PRODUCT_LISTING_URL
+       ...
+   ```
+   Do NOT drop these two `_env_*` assignments, and do NOT merge the `if` into
+   an `elif` of an `if args.sample:` chain. The consumer (`... _env_listing or
+   _env_force ...`) is kept verbatim, so dropping the initializers raises
+   `NameError` on every `--listing-url`/`--fresh-discovery`/`SCRAPER_LISTING_URL`
+   invocation — crashing run_execution. `--sample` testing will NOT catch it
+   (different branch). A post-gen patcher backstops this, but keep it intact.
+
+### Other discovery helpers — DO NOT re-signature
+
+The template's other helpers (`_fetch_html`, `_http_get`, `_http_post`,
+checkpoint load/save, etc.) are **correct as written**. Three hard rules:
 
 1. **Never redefine or change a template function's signature.** If the template
    defines `_get_next_page_url(final_url, next_page_num, html)`, you MUST call it with

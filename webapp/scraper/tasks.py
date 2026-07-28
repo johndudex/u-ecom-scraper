@@ -73,7 +73,30 @@ def _publish_job_status(job_id: int, status: str) -> None:
         pass
 
 
-@shared_task(bind=True, max_retries=1)
+# Celery-level deadline for a scrape job. The dominant job-level failure is
+# LLM-phase hangs (code_generation / product_analysis): the per-phase
+# _AGENT_INVOKE_TIMEOUT abandons its daemon thread on timeout, but the thread
+# KEEPS RUNNING, so only a process-level kill reclaims it (and the worker slot).
+# soft_time_limit → SoftTimeLimitExceeded (task can catch + finalize the job);
+# time_limit → Celery SIGKILLs the worker (reclaims the abandoned thread + any
+# leaked resources). Defaults (2h / 2h6m) sit well above any legitimate run
+# (aya's 26k-job extraction finishes <1h); tune via settings if a site needs more.
+try:
+    from django.conf import settings as _settings
+    _RUN_TASK_SOFT_TIME_LIMIT = int(
+        getattr(_settings, "CELERY_TASK_SOFT_TIME_LIMIT", 7200)
+    )
+    _RUN_TASK_TIME_LIMIT = int(getattr(_settings, "CELERY_TASK_TIME_LIMIT", 7560))
+except Exception:
+    _RUN_TASK_SOFT_TIME_LIMIT, _RUN_TASK_TIME_LIMIT = 7200, 7560
+
+
+@shared_task(
+    bind=True,
+    max_retries=1,
+    soft_time_limit=_RUN_TASK_SOFT_TIME_LIMIT,
+    time_limit=_RUN_TASK_TIME_LIMIT,
+)
 def run_scrape_task(self, job_id: int, rescrape: bool = False) -> None:
     """Celery entry-point: execute the full scrape graph for *job_id*."""
     job = ScrapeJob.objects.get(pk=job_id)
@@ -237,8 +260,12 @@ def _run_graph_job(job: ScrapeJob, rescrape: bool = False) -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-@shared_task
-def resume_scrape_task(job_id: int, human_response: Any) -> None:
+@shared_task(
+    bind=True,
+    soft_time_limit=_RUN_TASK_SOFT_TIME_LIMIT,
+    time_limit=_RUN_TASK_TIME_LIMIT,
+)
+def resume_scrape_task(self, job_id: int, human_response: Any) -> None:
     """Resume a graph that was interrupted for human approval.
 
     *human_response* is the value to pass to ``Command(resume=...)``.  It
@@ -652,10 +679,11 @@ def _finalize_job(job: ScrapeJob) -> None:
                         items = _v
                         break
                 if items:
+                    from src.content_types import has_substantive_field
                     successful = [
                         prod
                         for prod in items
-                        if prod.get("title") and prod.get("status_code", 0) > 0
+                        if has_substantive_field(prod) and prod.get("status_code", 0) > 0
                     ]
                     job.product_count = len(successful)
                 if site_block.get("name"):
@@ -1008,10 +1036,25 @@ def cleanup_stuck_jobs() -> None:
             continue
 
         idle_minutes = int((timezone.now() - last_activity).total_seconds() / 60)
-        error_msg = f"Worker process crashed (no activity for {idle_minutes} min). Likely OOM killed."
 
+        # Actually terminate the Celery task, not just the DB row. Without this,
+        # the worker keeps running the hung graph (LLM-phase hangs, abandoned
+        # agent threads, an in-process 200-page discovery loop) while the DB row
+        # says failed — the worker slot stays occupied until the (separate)
+        # task time_limit backstop fires. terminate=True + SIGKILL reclaims it.
+        #
+        # ORDER: mark the job FAILED BEFORE revoking. Under acks_late (if enabled)
+        # the terminated task is redelivered, and the dispatch dedup guard skips
+        # redelivery while status==RUNNING — so marking FAILED first lets the
+        # redelivery resume from the langgraph checkpoint instead of being
+        # silently dropped (and the job stuck RUNNING forever). Harmless when
+        # acks_late is off (today's default).
+        error_msg = (
+            f"No activity for {idle_minutes} min — job appears hung "
+            f"(stalled agent phase or wedged scrape); celery task revoked."
+        )
         logger.error(
-            "Stuck job %d: no activity for %d min (last: %s), marking as failed",
+            "Stuck job %d: no activity for %d min (last: %s), marking failed + revoking",
             job.id,
             idle_minutes,
             last_activity.isoformat(timespec="seconds"),
@@ -1020,6 +1063,20 @@ def cleanup_stuck_jobs() -> None:
         job.error_message = error_msg
         job.completed_at = timezone.now()
         job.save(update_fields=["status", "error_message", "completed_at"])
+
+        _task_id = getattr(job, "celery_task_id", "") or ""
+        if _task_id:
+            try:
+                from celery import current_app
+
+                current_app.control.revoke(_task_id, terminate=True, signal="SIGKILL")
+                logger.info(
+                    "Stuck job %d: revoked celery task %s (terminate)",
+                    job.id,
+                    _task_id,
+                )
+            except Exception as exc:
+                logger.warning("Stuck job %d: revoke failed: %s", job.id, exc)
 
         Step.objects.filter(
             job=job, status__in=(Step.STATUS_RUNNING, Step.STATUS_PENDING)

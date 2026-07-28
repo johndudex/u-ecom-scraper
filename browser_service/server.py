@@ -31,7 +31,14 @@ AKAMAI_SEMAPHORE = asyncio.Semaphore(2)
 
 CLEANUP_INTERVAL = 1800
 CDP_LIVENESS_INTERVAL = 15
-CDP_MAX_CONSECUTIVE_FAILURES = 1
+# Require N consecutive probe misses before restarting Chrome. The old value of
+# 1 meant a single transient 3s-timeout probe blip (Chrome busy serving a real
+# /scrape, or a momentary stall) SIGTERM'd a healthy Chrome — and since the
+# liveness loop is NOT gated on /scrape activity, this manufactured a ~30-min
+# restart storm that showed up as "CDP liveness DOWN" in 81 events with ZERO
+# real Chrome crashes in 111 jobs. 3 tolerates blips without masking a real
+# sustained death (3 × 15s = 45s of confirmed unresponsiveness).
+CDP_MAX_CONSECUTIVE_FAILURES = 3
 
 PERSISTENT_CHROME_PIDS: set[int] = set()
 mcp_process: Optional[subprocess.Popen] = None
@@ -334,6 +341,12 @@ class ScrapeRequest(BaseModel):
     args: Optional[list[str]] = Field(default_factory=list)
     timeout: int = Field(default=3600, ge=30, le=7200)
     env_overrides: Optional[dict[str, str]] = Field(default_factory=dict)
+    # Cap run_scraper_script's Chrome-crash retries. Callers that only need a
+    # crash/not-crash signal (the code_tester discovery probe) pass max_retries=1
+    # so a slow discovery doesn't fan out to 3×timeout of orphaned subprocess
+    # work after the /scrape wait_for already returned — those orphans share the
+    # single Scraper Chrome (port 9223) and wedge subsequent scrapers (run_execution).
+    max_retries: int = Field(default=3, ge=1, le=5)
 
 
 class RenderRequest(BaseModel):
@@ -912,6 +925,7 @@ async def scrape(request: ScrapeRequest):
                     args=request.args,
                     timeout=request.timeout,
                     env_overrides=request.env_overrides,
+                    max_retries=request.max_retries,
                 ),
             ),
             timeout=request.timeout + 120,

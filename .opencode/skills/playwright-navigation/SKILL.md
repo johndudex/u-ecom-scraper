@@ -296,3 +296,65 @@ if not _browser_alive(page) or (pages_since_restart >= ROTATE_EVERY):
 3. **Popup blocking analysis**: Dismiss cookie consent, newsletter popups first
 4. **Redirected to challenge page**: Anti-bot detected, note and report
 5. **Elements not found**: Page structure different than expected, re-snapshot
+
+## Learned: CDP "Target Page Closed" Error Recovery for Phase 2 Extraction
+**Source:** https://uindex.org (2026-07-28)
+**Applicability:** Any Playwright scraper using remote CDP (connect_over_cdp) that runs long Phase 2 extraction loops iterating over hundreds of detail pages.
+
+When using Playwright with remote CDP connections, the browser page or context can
+unexpectedly close mid-loop — producing errors like "Target page, context or browser
+has been closed" or "Connection closed" or "browser has been disconnected". These are
+distinct from memory-related crashes (covered by the browser rotation pattern above)
+and instead stem from network instability, CDP timeout, or the remote browser service
+recycling tabs.
+
+**Error detection pattern:**
+```python
+def _is_closed_error(exc) -> bool:
+    """Check if the exception indicates a closed/disconnected page."""
+    return any(s in str(exc).lower() for s in ("closed", "disconnected", "target page"))
+```
+
+**Recovery pattern (wrap each extraction attempt in the Phase 2 loop):**
+```python
+for i, url in enumerate(page_urls):
+    try:
+        item = scrape_page(page, url, src_url, i + 1)
+        if item.get("title"):
+            results.append(item)
+        else:
+            failed += 1
+    except Exception as e:
+        if _is_closed_error(e):
+            logger.info("Page/context closed — recreating browser...")
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+            # Relaunch browser and context
+            browser = get_browser(p, headless=headless)
+            context, page = _make_context_and_page(browser)
+            # Retry the failed URL
+            try:
+                item = scrape_page(page, url, src_url, i + 1)
+                if item.get("title"):
+                    results.append(item)
+                else:
+                    failed += 1
+            except Exception as e2:
+                logger.error(f"Retry also failed for {url}: {e2}")
+                failed += 1
+        else:
+            failed += 1
+    time.sleep(DELAY_BETWEEN_REQUESTS)
+```
+
+**Key tips:**
+- The `_is_closed_error` check must come **before** generic exception handling — a closed page means all subsequent page.evaluate() calls will fail, so you must recreate the browser before retrying.
+- Always try to close old context/browser before relaunching; wrap in try/except since they may already be dead.
+- The retry is for the **same URL** that failed, so no items are lost.
+- This complements the browser rotation pattern: use rotation proactively every N pages for memory, and this recovery reactively when closed errors occur.
