@@ -28,6 +28,80 @@ from .models import Approval, JobListing, ProbeCache, ScrapeJob, SessionLog, Sit
 
 logger = logging.getLogger(__name__)
 
+
+# ── File Master helpers (cross-service artifact store) ──────────────────────
+# Published artifacts (scrapers/{slug}/...) live in the File Master, not on a
+# shared disk. These wrappers keep views terse and centralize the locator logic.
+
+
+def _fm_key_for(stored: str) -> str | None:
+    """Normalize a DB-stored artifact locator to a File Master key (or None).
+
+    Handles legacy absolute paths under PROJECT_ROOT, relative ``scrapers/...``
+    (already a key), and bare paths. Returns None for non-scrapers/workspace or
+    empty input.
+    """
+    if not stored:
+        return None
+    s = stored.strip()
+    try:
+        pr = str(settings.PROJECT_ROOT)
+        if s.startswith(pr):
+            s = s[len(pr):].lstrip("/")
+    except Exception:
+        pass
+    if s.startswith("scrapers/") or s.startswith("workspace/"):
+        return s
+    return None
+
+
+def _fm_read_text(key: str) -> str | None:
+    try:
+        import src.artifacts as artifacts
+        return artifacts.read_text(key)
+    except Exception:
+        return None
+
+
+def _fm_read_json(key: str):
+    try:
+        import src.artifacts as artifacts
+        return artifacts.read_json(key)
+    except Exception:
+        return None
+
+
+def _fm_exists(key: str) -> bool:
+    try:
+        import src.artifacts as artifacts
+        return artifacts.exists(key)
+    except Exception:
+        return False
+
+
+def _fm_list(prefix: str) -> list[str]:
+    try:
+        import src.artifacts as artifacts
+        return artifacts.list_keys(prefix)
+    except Exception:
+        return []
+
+
+@login_required
+def fm_artifact(request, key):
+    """Stream an artifact from the File Master (users never hit FM directly)."""
+    import src.artifacts as artifacts
+    try:
+        data = artifacts.read(key)
+    except FileNotFoundError:
+        raise Http404("artifact not found")
+    except Exception as exc:
+        return HttpResponse(status=502, content=str(exc)[:200])
+    resp = HttpResponse(data, content_type="application/octet-stream")
+    resp["Content-Disposition"] = f'attachment; filename="{os.path.basename(key)}"'
+    return resp
+
+
 try:
     import redis as redis_lib
 
@@ -226,43 +300,25 @@ def job_detail(request, job_id):
         slug_candidates.append(job.site_folder.removeprefix("scrapers/"))
     if job.site_name:
         name_slug = job.site_name.lower().replace(" ", "-").replace(".", "-")
-        for char in name_slug:
-            if not char.isalnum() and char != "-":
-                name_slug = name_slug.replace(char, "-")
+        name_slug = "".join(c if c.isalnum() or c == "-" else "-" for c in name_slug)
         slug_candidates.append(name_slug)
     for slug in slug_candidates:
-        scraper_path = os.path.join(
-            settings.PROJECT_ROOT, "scrapers", slug, "scraper.py"
-        )
-        if os.path.exists(scraper_path):
-            try:
-                with open(scraper_path, "r") as f:
-                    scraper_code_display = f.read()
-                has_scraper_code = True
-                scraper_slug = slug
-                # Check for dagster file (scrapers/ or workspace/)
-                dagster_path = os.path.join(
-                    settings.PROJECT_ROOT, "scrapers", slug, f"{slug}_dagster.py"
-                )
-                if not os.path.exists(dagster_path):
-                    dagster_path = os.path.join(
-                        settings.PROJECT_ROOT, "workspace", slug, f"{slug}_dagster.py"
-                    )
-                if os.path.exists(dagster_path):
-                    has_dagster_code = True
-                break
-            except Exception:
-                pass
+        code = _fm_read_text(f"scrapers/{slug}/scraper.py")
+        if code is not None:
+            scraper_code_display = code
+            has_scraper_code = True
+            scraper_slug = slug
+            has_dagster_code = _fm_exists(f"scrapers/{slug}/{slug}_dagster.py")
+            break
 
     if scraper_slug:
-        site_dir = os.path.join(settings.PROJECT_ROOT, "scrapers", scraper_slug)
-        if os.path.isdir(site_dir):
-            job_start = job.started_at
-            all_output = [
-                f
-                for f in os.listdir(site_dir)
-                if f.startswith("output_") and f.endswith(".json")
-            ]
+        all_output = [
+            k.split("/")[-1]
+            for k in _fm_list(f"scrapers/{scraper_slug}/")
+            if k.split("/")[-1].startswith("output_") and k.endswith(".json")
+        ]
+        job_start = job.started_at
+        if all_output:
             if job_start:
                 filtered = []
                 for f in all_output:
@@ -340,13 +396,26 @@ def job_cancel(request, job_id):
 
 
 def _resolve_stored_path(stored: str) -> str | None:
-    """Resolve a job's stored artifact path (scraper_file/dagster_file) to an
-    absolute path that exists, or None. Handles absolute (/app/...) + relative.
-    """
-    if not stored:
-        return None
-    p = stored if os.path.isabs(stored) else os.path.join(settings.PROJECT_ROOT, stored)
-    return p if os.path.isfile(p) else None
+    """Resolve a job's stored artifact locator (scraper_file/dagster_file) to a
+    File Master KEY that exists, or None. Handles legacy absolute paths + keys."""
+    key = _fm_key_for(stored)
+    if key and _fm_exists(key):
+        return key
+    return None
+
+
+def _slug_candidates(job) -> list[str]:
+    """Candidate site slugs for resolving a job's artifacts (site_folder, name, slug)."""
+    cands: list[str] = []
+    if job.site_folder:
+        cands.append(job.site_folder.removeprefix("scrapers/"))
+    if getattr(job, "site_slug", ""):
+        cands.append(job.site_slug)
+    if job.site_name:
+        name_slug = job.site_name.lower().replace(" ", "-").replace(".", "-")
+        name_slug = "".join(c if c.isalnum() or c == "-" else "-" for c in name_slug)
+        cands.append(name_slug)
+    return [c for c in cands if c]
 
 
 @login_required
@@ -357,29 +426,16 @@ def scraper_code(request, job_id):
     # shared scrapers/{slug}/scraper.py (which later jobs may overwrite).
     own = _resolve_stored_path(job.scraper_file)
     if own:
-        with open(own, "r") as f:
-            content = f.read()
-        slug = _resolve_job_slug(job) or "scraper"
-        resp = HttpResponse(content, content_type="text/x-python")
-        resp["Content-Disposition"] = f'attachment; filename="{slug}_scraper.py"'
-        return resp
+        content = _fm_read_text(own)
+        if content is not None:
+            slug = _resolve_job_slug(job) or "scraper"
+            resp = HttpResponse(content, content_type="text/x-python")
+            resp["Content-Disposition"] = f'attachment; filename="{slug}_scraper.py"'
+            return resp
 
-    slug_candidates = []
-    if job.site_folder:
-        slug_candidates.append(job.site_folder.removeprefix("scrapers/"))
-    if job.site_name:
-        name_slug = job.site_name.lower().replace(" ", "-").replace(".", "-")
-        for char in name_slug:
-            if not char.isalnum() and char != "-":
-                name_slug = name_slug.replace(char, "-")
-        slug_candidates.append(name_slug)
-    for slug in slug_candidates:
-        scraper_path = os.path.join(
-            settings.PROJECT_ROOT, "scrapers", slug, "scraper.py"
-        )
-        if os.path.exists(scraper_path):
-            with open(scraper_path, "r") as f:
-                content = f.read()
+    for slug in _slug_candidates(job):
+        content = _fm_read_text(f"scrapers/{slug}/scraper.py")
+        if content is not None:
             response = HttpResponse(content, content_type="text/x-python")
             response["Content-Disposition"] = (
                 f'attachment; filename="{slug}_scraper.py"'
@@ -395,27 +451,18 @@ def dagster_code(request, job_id):
     # Per-job attribution first (this job's own dagster file).
     own = _resolve_stored_path(job.dagster_file)
     if own:
-        with open(own, "r") as f:
-            content = f.read()
-        slug = _resolve_job_slug(job) or "scraper"
-        resp = HttpResponse(content, content_type="text/x-python")
-        resp["Content-Disposition"] = f'attachment; filename="{slug}_dagster.py"'
-        return resp
+        content = _fm_read_text(own)
+        if content is not None:
+            slug = _resolve_job_slug(job) or "scraper"
+            resp = HttpResponse(content, content_type="text/x-python")
+            resp["Content-Disposition"] = f'attachment; filename="{slug}_dagster.py"'
+            return resp
     slug = _resolve_job_slug(job)
     if not slug:
         return HttpResponseNotFound("Could not resolve site slug")
-    dagster_path = os.path.join(
-        settings.PROJECT_ROOT, "scrapers", slug, f"{slug}_dagster.py"
-    )
-    if not os.path.exists(dagster_path):
-        # fallback: workspace
-        dagster_path = os.path.join(
-            settings.PROJECT_ROOT, "workspace", slug, f"{slug}_dagster.py"
-        )
-    if not os.path.exists(dagster_path):
+    content = _fm_read_text(f"scrapers/{slug}/{slug}_dagster.py")
+    if content is None:
         return HttpResponseNotFound("Dagster code not generated yet")
-    with open(dagster_path, "r") as f:
-        content = f.read()
     response = HttpResponse(content, content_type="text/x-python")
     response["Content-Disposition"] = f'attachment; filename="{slug}_dagster.py"'
     return response
@@ -445,14 +492,13 @@ def job_output_view(request, job_id, filename):
     slug = _resolve_job_slug(job)
     if not slug:
         raise Http404("No scraper folder for this job")
-    file_path = os.path.join(settings.PROJECT_ROOT, "scrapers", slug, safe_name)
-    if not os.path.isfile(file_path):
+    key = f"scrapers/{slug}/{safe_name}"
+    data = _fm_read_json(key)
+    if data is None:
         raise Http404("File not found")
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
         pretty = json.dumps(data, indent=2, ensure_ascii=False)
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, TypeError):
         raise Http404("Could not read file")
 
     from src.content_types import get_output_key_label, count_items_in_output
@@ -491,15 +537,15 @@ def job_output_download(request, job_id, filename):
     slug = _resolve_job_slug(job)
     if not slug:
         raise Http404("No scraper folder for this job")
-    file_path = os.path.join(settings.PROJECT_ROOT, "scrapers", slug, safe_name)
-    if not os.path.isfile(file_path):
+    key = f"scrapers/{slug}/{safe_name}"
+    import src.artifacts as artifacts
+    try:
+        data = artifacts.read(key)
+    except FileNotFoundError:
         raise Http404("File not found")
-    return FileResponse(
-        open(file_path, "rb"),
-        content_type="application/json",
-        as_attachment=True,
-        filename=safe_name,
-    )
+    resp = HttpResponse(data, content_type="application/json")
+    resp["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+    return resp
 
 
 @login_required
@@ -734,47 +780,36 @@ def approval_detail(request, approval_id):
 @login_required
 def scraper_code_json(request, job_id):
     job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
-    scraper_path = None
-    # Per-job attribution first.
-    own = _resolve_stored_path(job.scraper_file)
-    if own:
-        scraper_path = own
-    elif job.site_folder:
-        candidate = os.path.join("scrapers", job.site_folder.removeprefix("scrapers/"), "scraper.py")
-        if os.path.isfile(candidate):
-            scraper_path = candidate
-
-    if not scraper_path:
+    # Per-job attribution first; then the shared production scraper.
+    key = _resolve_stored_path(job.scraper_file)
+    if not key and job.site_folder:
+        _k = f"scrapers/{job.site_folder.removeprefix('scrapers/')}/scraper.py"
+        if _fm_exists(_k):
+            key = _k
+    if not key:
         return JsonResponse({"error": "Scraper file not found"}, status=404)
-
-    try:
-        with open(scraper_path, "r", encoding="utf-8") as f:
-            code = f.read()
-    except Exception as e:
-        return JsonResponse({"error": str(e)}, status=500)
-
-    return JsonResponse({"path": scraper_path, "code": code})
+    code = _fm_read_text(key)
+    if code is None:
+        return JsonResponse({"error": "Scraper file not readable"}, status=500)
+    return JsonResponse({"path": key, "code": code})
 
 
 def _resolve_job_output(job):
-    """Return (site_dir, filename) for THIS job's output file, or (None, None).
+    """Return (fm_key, filename) for THIS job's output file, or (None, None).
 
-    All runs for a site share one scrapers/{slug}/ dir, so picking the newest
-    file there would show another job's output. We prefer the job's own
-    `output_file` (authoritative); else the newest output_*.json whose timestamp
-    falls within this job's run window (matching job_detail's logic).
+    All runs for a site share one scrapers/{slug}/ prefix in the File Master, so
+    picking the newest there would show another job's output. We prefer the job's
+    own ``output_file`` (authoritative, now an FM key); else the newest
+    output_*.json whose timestamp falls within this job's run window.
     """
-    # A PENDING job has not started; its output cannot exist yet. Returning
-    # the newest file would leak a PRIOR run's data into this job's preview.
     if job.status == ScrapeJob.STATUS_PENDING:
         return None, None
-    # 1. authoritative output_file
+    # 1. authoritative output_file (FM key now)
     of = (job.output_file or "").strip()
-    if of:
-        cand = of if os.path.isabs(of) else os.path.join(settings.PROJECT_ROOT, of)
-        if os.path.isfile(cand):
-            return os.path.dirname(cand), os.path.basename(cand)
-    # 2. slug dir + started_at window
+    key = _fm_key_for(of)
+    if key and _fm_exists(key):
+        return key, os.path.basename(key)
+    # 2. slug → outputs in FM within the run window
     slug = _resolve_job_slug(job)
     if not slug:
         try:
@@ -785,40 +820,33 @@ def _resolve_job_output(job):
             slug = ""
     if not slug:
         return None, None
-    site_dir = None
-    for base in ("scrapers", "workspace"):
-        d = os.path.join(settings.PROJECT_ROOT, base, slug)
-        if os.path.isdir(d):
-            site_dir = d
-            break
-    if not site_dir:
-        return None, None
-    outs = sorted(
-        [f for f in os.listdir(site_dir) if f.startswith("output_") and f.endswith(".json")],
-        reverse=True,
-    )
+    outs = [
+        k for k in _fm_list(f"scrapers/{slug}/")
+        if k.split("/")[-1].startswith("output_") and k.endswith(".json")
+    ]
     if not outs:
         return None, None
+
+    def _fname(k):
+        return k.split("/")[-1]
+
     if job.started_at:
         cutoff = job.started_at - timedelta(seconds=120)
         in_window = []
-        for f in outs:
+        for k in outs:
             try:
-                ts = datetime.strptime(f, "output_%Y-%m-%d_%H%M%S.json").replace(
+                ts = datetime.strptime(_fname(k), "output_%Y-%m-%d_%H%M%S.json").replace(
                     tzinfo=dt_timezone.utc
                 )
             except ValueError:
                 continue
             if ts >= cutoff:
-                in_window.append(f)
+                in_window.append(k)
         if in_window:
-            return site_dir, in_window[0]
-        # started_at is known but NO file falls in this job's window → this job
-        # hasn't produced output yet. Return None rather than another job's
-        # newest file (which would show stale/wrong data mid-run).
+            return in_window[0], _fname(in_window[0])
         return None, None
-    # No started_at (legacy/unknown start) → can't window; fall back to newest.
-    return site_dir, outs[0]
+    newest = sorted(outs, key=_fname)[-1]
+    return newest, _fname(newest)
 
 
 def _job_output_preview(job) -> dict | None:
@@ -829,13 +857,11 @@ def _job_output_preview(job) -> dict | None:
     the preview is always THIS job's output, not another run's. Caps records so
     the job_api payload stays small (full output is via download_url).
     """
-    site_dir, fname = _resolve_job_output(job)
-    if not site_dir or not fname:
+    key, fname = _resolve_job_output(job)
+    if not key:
         return None
-    try:
-        with open(os.path.join(site_dir, fname), encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError):
+    data = _fm_read_json(key)
+    if data is None:
         return None
     from src.content_types import count_items_in_output, get_output_key_label
 
@@ -1356,29 +1382,18 @@ def site_detail(request, site_id):
     site = get_object_or_404(Site, pk=site_id)
     jobs = ScrapeJob.objects.filter(url__iexact=site.url, user=request.user)
     scraper_code = ""
-    if site.default_scraper_path and os.path.isfile(site.default_scraper_path):
-        try:
-            with open(site.default_scraper_path, "r", encoding="utf-8") as f:
-                scraper_code = f.read()
-        except Exception:
-            pass
+    if site.default_scraper_path:
+        scraper_code = _fm_read_text(site.default_scraper_path) or ""
 
     output_files = []
     scraper_archives = []
     if site.slug:
-        scrapers_dir = Path(settings.PROJECT_ROOT) / "scrapers" / site.slug
-        if scrapers_dir.is_dir():
-            for f in sorted(scrapers_dir.iterdir(), reverse=True):
-                if not f.is_file():
-                    continue
-                try:
-                    size = f.stat().st_size
-                except Exception:
-                    continue
-                if f.name.startswith("output_") and f.name.endswith(".json"):
-                    output_files.append({"name": f.name, "size": size})
-                elif f.name.startswith("scraper-") and f.name.endswith(".py"):
-                    scraper_archives.append({"name": f.name, "size": size})
+        for k in sorted(_fm_list(f"scrapers/{site.slug}/"), reverse=True):
+            name = k.split("/")[-1]
+            if name.startswith("output_") and name.endswith(".json"):
+                output_files.append({"name": name, "size": 0})
+            elif name.startswith("scraper-") and name.endswith(".py"):
+                scraper_archives.append({"name": name, "size": 0})
 
     return render(
         request,
@@ -1417,12 +1432,12 @@ def site_scrape(request, site_id):
         user=request.user,
     )
 
-    if site.input_urls:
-        scrapers_dir = os.path.join(settings.PROJECT_ROOT, "scrapers", site.slug)
-        os.makedirs(scrapers_dir, exist_ok=True)
-        input_urls_path = os.path.join(scrapers_dir, "input_urls.json")
-        with open(input_urls_path, "w", encoding="utf-8") as f:
-            json.dump({"urls": site.input_urls}, f, indent=2, ensure_ascii=False)
+    if site.input_urls and site.slug:
+        import src.artifacts as artifacts
+        artifacts.write_json(
+            artifacts.scrapers_key(site.slug, "input_urls.json"),
+            {"urls": site.input_urls},
+        )
 
     from .tasks import run_scrape_task
 
@@ -1441,14 +1456,16 @@ def site_rerun(request, site_id):
     if not site.has_scraper or not site.default_scraper_path:
         return redirect("site_detail", site_id=site.id)
 
-    scraper_path = site.default_scraper_path
-    scrapers_dir = os.path.dirname(scraper_path)
-    os.makedirs(scrapers_dir, exist_ok=True)
+    import src.artifacts as artifacts
+    scraper_key = site.default_scraper_path  # FM key now
+    slug = site.slug or ""
+    _source = _fm_read_text(scraper_key) or ""
 
-    if site.input_urls:
-        input_urls_path = os.path.join(scrapers_dir, "input_urls.json")
-        with open(input_urls_path, "w", encoding="utf-8") as f:
-            json.dump({"urls": site.input_urls}, f, indent=2, ensure_ascii=False)
+    if site.input_urls and slug:
+        artifacts.write_json(
+            artifacts.scrapers_key(slug, "input_urls.json"),
+            {"urls": site.input_urls},
+        )
 
     BROWSER_METHODS = {
         "undetected_chromedriver",
@@ -1466,18 +1483,14 @@ def site_rerun(request, site_id):
             settings, "BROWSER_SERVICE_URL", "http://browser_service:8001"
         )
         # Anti-bot/Akamai sites: route the scraper through CloakBrowser stealth.
-        # Stateless /scrape: read the scraper SOURCE from disk and POST it.
+        # Stateless /scrape: POST the scraper SOURCE (read from FM) + persist the
+        # returned output back to FM.
         scrape_json = {
-            "scraper_source": "",
-            "scraper_name": os.path.basename(scraper_path),
+            "scraper_source": _source,
+            "scraper_name": os.path.basename(scraper_key),
             "args": [],
             "timeout": 3600,
         }
-        try:
-            with open(scraper_path, "r", encoding="utf-8", errors="replace") as _f:
-                scrape_json["scraper_source"] = _f.read()
-        except OSError as e:
-            logger.error("site_rerun: could not read scraper source %s: %s", scraper_path, e)
         if getattr(site, "needs_akamai_bypass", False):
             scrape_json["env_overrides"] = {"STEALTH_BROWSER": "cloak"}
         try:
@@ -1488,53 +1501,50 @@ def site_rerun(request, site_id):
             )
             resp.raise_for_status()
             result = resp.json()
-            # browser_service returns output CONTENT; persist locally for counting.
             _content = result.get("output_content") or ""
             _name = result.get("output_name") or ""
-            output_file = ""
-            if _content and _name:
-                output_file = os.path.join(os.path.dirname(scraper_path), _name)
+            if _content and _name and slug:
                 try:
-                    with open(output_file, "w", encoding="utf-8") as _of:
-                        _of.write(_content)
-                except OSError:
-                    output_file = ""
+                    artifacts.write(artifacts.scrapers_key(slug, _name), _content.encode("utf-8"))
+                except Exception:
+                    pass
             product_count = result.get("product_count", 0)
         except Exception as e:
             logger.error("site_rerun: browser_service failed: %s", e)
-            output_file = ""
             product_count = 0
     else:
+        # Local exec: stage the FM source to a tmp dir, run it, publish the output.
         try:
-            result = subprocess.run(
-                ["python3", scraper_path],
-                capture_output=True,
-                text=True,
-                timeout=3600,
-                cwd=os.path.dirname(scraper_path),
-            )
-            output_file = ""
-            if result.returncode == 0:
-                candidates = sorted(
-                    [
-                        os.path.join(scrapers_dir, f)
-                        for f in os.listdir(scrapers_dir)
-                        if f.startswith("output_") and f.endswith(".json")
-                    ]
+            import tempfile
+            with tempfile.TemporaryDirectory() as _td:
+                _local = os.path.join(_td, os.path.basename(scraper_key) or "scraper.py")
+                with open(_local, "w", encoding="utf-8") as _f:
+                    _f.write(_source)
+                result = subprocess.run(
+                    ["python3", _local],
+                    capture_output=True,
+                    text=True,
+                    timeout=3600,
+                    cwd=_td,
                 )
-                output_file = candidates[-1] if candidates else ""
-                if output_file:
-                    with open(output_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    from src.content_types import count_items_in_output
-                    product_count = count_items_in_output(data)
-                else:
-                    product_count = 0
-            else:
                 product_count = 0
+                if result.returncode == 0:
+                    outs = sorted(
+                        f for f in os.listdir(_td)
+                        if f.startswith("output_") and f.endswith(".json")
+                    )
+                    if outs:
+                        with open(os.path.join(_td, outs[-1]), "r", encoding="utf-8") as f:
+                            _data = json.load(f)
+                        if slug:
+                            try:
+                                artifacts.write_json(artifacts.scrapers_key(slug, outs[-1]), _data)
+                            except Exception:
+                                pass
+                        from src.content_types import count_items_in_output
+                        product_count = count_items_in_output(_data)
         except Exception as e:
             logger.error("site_rerun: local execution failed: %s", e)
-            output_file = ""
             product_count = 0
 
     site.last_scraped_at = timezone.now()
@@ -1547,14 +1557,16 @@ def site_rerun(request, site_id):
 @login_required
 def site_scraper_code(request, site_id):
     site = get_object_or_404(Site, pk=site_id)
-    if not site.default_scraper_path or not os.path.isfile(site.default_scraper_path):
+    if not site.default_scraper_path:
         raise Http404("Scraper code not found")
-    return FileResponse(
-        open(site.default_scraper_path, "rb"),
-        content_type="text/x-python",
-        as_attachment=True,
-        filename=f"{site.slug}_scraper.py",
-    )
+    import src.artifacts as artifacts
+    try:
+        data = artifacts.read(site.default_scraper_path)
+    except FileNotFoundError:
+        raise Http404("Scraper code not found")
+    resp = HttpResponse(data, content_type="text/x-python")
+    resp["Content-Disposition"] = f'attachment; filename="{site.slug}_scraper.py"'
+    return resp
 
 
 @login_required
@@ -1565,14 +1577,10 @@ def site_scraper_archive_view(request, site_id, filename):
         raise Http404("Only Python files can be viewed")
     if "/" in safe_name or "\\" in safe_name:
         raise Http404("Invalid filename")
-    file_path = os.path.join(settings.PROJECT_ROOT, "scrapers", site.slug, safe_name)
-    if not os.path.isfile(file_path):
+    key = f"scrapers/{site.slug}/{safe_name}"
+    code = _fm_read_text(key)
+    if code is None:
         raise Http404("File not found")
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            code = f.read()
-    except OSError:
-        raise Http404("Could not read file")
     download_url = reverse(
         "site_scraper_archive_download",
         kwargs={"site_id": site.id, "filename": safe_name},
@@ -1597,15 +1605,15 @@ def site_scraper_archive_download(request, site_id, filename):
         raise Http404("Only Python files can be downloaded")
     if "/" in safe_name or "\\" in safe_name:
         raise Http404("Invalid filename")
-    file_path = os.path.join(settings.PROJECT_ROOT, "scrapers", site.slug, safe_name)
-    if not os.path.isfile(file_path):
+    key = f"scrapers/{site.slug}/{safe_name}"
+    import src.artifacts as artifacts
+    try:
+        data = artifacts.read(key)
+    except FileNotFoundError:
         raise Http404("File not found")
-    return FileResponse(
-        open(file_path, "rb"),
-        content_type="text/x-python",
-        as_attachment=True,
-        filename=safe_name,
-    )
+    resp = HttpResponse(data, content_type="text/x-python")
+    resp["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+    return resp
 
 
 @login_required
@@ -1625,14 +1633,13 @@ def site_output_view(request, site_id, filename):
         raise Http404("Only JSON files can be viewed")
     if "/" in safe_name or "\\" in safe_name:
         raise Http404("Invalid filename")
-    file_path = os.path.join(settings.PROJECT_ROOT, "scrapers", site.slug, safe_name)
-    if not os.path.isfile(file_path):
+    key = f"scrapers/{site.slug}/{safe_name}"
+    data = _fm_read_json(key)
+    if data is None:
         raise Http404("File not found")
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
         pretty = json.dumps(data, indent=2, ensure_ascii=False)
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, TypeError):
         raise Http404("Could not read file")
 
     from src.content_types import count_items_in_output
@@ -1664,15 +1671,15 @@ def site_output_download(request, site_id, filename):
         raise Http404("Only JSON files can be downloaded")
     if "/" in safe_name or "\\" in safe_name:
         raise Http404("Invalid filename")
-    file_path = os.path.join(settings.PROJECT_ROOT, "scrapers", site.slug, safe_name)
-    if not os.path.isfile(file_path):
+    key = f"scrapers/{site.slug}/{safe_name}"
+    import src.artifacts as artifacts
+    try:
+        data = artifacts.read(key)
+    except FileNotFoundError:
         raise Http404("File not found")
-    return FileResponse(
-        open(file_path, "rb"),
-        content_type="application/json",
-        as_attachment=True,
-        filename=safe_name,
-    )
+    resp = HttpResponse(data, content_type="application/json")
+    resp["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+    return resp
 
 
 @login_required
@@ -1683,12 +1690,10 @@ def site_sync_urls(request, site_id):
     urls = site.input_urls or []
     if not urls:
         return redirect("site_detail", site_id=site.id)
-    scrapers_dir = os.path.join(settings.PROJECT_ROOT, "scrapers", site.slug)
-    os.makedirs(scrapers_dir, exist_ok=True)
-    input_path = os.path.join(scrapers_dir, "input_urls.json")
-    with open(input_path, "w", encoding="utf-8") as f:
-        json.dump({"urls": urls}, f, indent=2, ensure_ascii=False)
-    logger.info("Synced %d URLs to %s", len(urls), input_path)
+    import src.artifacts as artifacts
+    _key = artifacts.scrapers_key(site.slug, "input_urls.json")
+    artifacts.write_json(_key, {"urls": urls})
+    logger.info("Synced %d URLs to %s", len(urls), _key)
     return redirect("site_detail", site_id=site.id)
 
 
@@ -2287,11 +2292,11 @@ def intake_create_job(request):
                 from .tasks import _generate_slug
 
                 slug = _generate_slug(url)
-                iu_dir = os.path.join(settings.PROJECT_ROOT, "scrapers", slug)
-                os.makedirs(iu_dir, exist_ok=True)
-                iu_path = os.path.join(iu_dir, "input_urls.json")
-                with open(iu_path, "w", encoding="utf-8") as f:
-                    json.dump({"urls": urls}, f, indent=2, ensure_ascii=False)
+                import src.artifacts as artifacts
+                artifacts.write_json(
+                    artifacts.scrapers_key(slug, "input_urls.json"),
+                    {"urls": urls},
+                )
             except Exception as exc:
                 logger.warning(
                     "intake: could not persist list URLs for %s: %s",

@@ -4,6 +4,7 @@ from . import views
 
 urlpatterns = [
     path("", views.home, name="home"),
+    path("fm/artifact/<path:key>/", views.fm_artifact, name="fm_artifact"),
     path("sites/", views.site_list, name="site_list"),
     path("sites/add/", views.site_add, name="site_add"),
     path("sites/<int:site_id>/", views.site_detail, name="site_detail"),
