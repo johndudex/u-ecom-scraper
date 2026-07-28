@@ -50,6 +50,7 @@ services:
       DJANGO_SUPERUSER_PASSWORD: ${DJANGO_SUPERUSER_PASSWORD:-admin}
       PLAYWRIGHT_MCP_URL: http://browser_service:8111/sse
       BROWSER_SERVICE_URL: http://browser_service:8001
+      FILE_MASTER_URL: http://file-master:8002
       DEBUG: "True"
       DJANGO_SETTINGS_MODULE: config.settings
       SECRET_KEY: dev-secret-key-change-in-production
@@ -86,6 +87,7 @@ services:
       CODE_WRITER_MODEL: glm-5.2
       PLAYWRIGHT_MCP_URL: http://browser_service:8111/sse
       BROWSER_SERVICE_URL: http://browser_service:8001
+      FILE_MASTER_URL: http://file-master:8002
       DJANGO_SETTINGS_MODULE: config.settings
       SECRET_KEY: dev-secret-key-change-in-production
       PYTHONPATH: /app
@@ -156,14 +158,12 @@ services:
     shm_size: 2g
     volumes:
       - ./browser_service:/app/browser_service
-      - ./scrapers:/app/scrapers
       - ./src:/app/src:ro
       - ./config:/app/config:ro
       - ./scripts:/app/scripts:ro
       - ./templates:/app/templates:ro
       - ./data:/app/data
       - ./logs:/app/logs
-      - ./workspace:/app/workspace
     environment:
       DISPLAY: ":98"
       BROWSER_SERVICE_PORT: "8001"
@@ -191,6 +191,21 @@ services:
     restart: unless-stopped
     mem_limit: 4g
     memswap_limit: 6g
+
+  file-master:
+    profiles: ["full"]
+    build: ./file_master
+    volumes:
+      - ./shared-data:/data
+    ports:
+      - "8002:8002"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8002/health"]
+      interval: 10s
+      retries: 3
+      timeout: 5s
+    restart: unless-stopped
+    mem_limit: 256m
 
 volumes:
   pgdata:
