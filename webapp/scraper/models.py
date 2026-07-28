@@ -53,18 +53,17 @@ def _sync_input_urls_file(instance):
 
         import logging
 
-        file_path = (
-            Path(settings.PROJECT_ROOT) / "scrapers" / instance.slug / "input_urls.json"
-        )
+        import src.artifacts as artifacts
+
+        key = artifacts.scrapers_key(instance.slug, "input_urls.json")
         # Shrinkage guard: never overwrite the production file with FEWER urls
         # than it already has. A job can briefly hold a subset (e.g. a 1-URL
         # sample) on the Site row; syncing that would silently truncate the
         # user's full list (the wildsecrets 50→1 / dollartree 5→1 / vistastaff
         # 5→1 truncation). Skip + log instead.
-        if file_path.exists():
+        if artifacts.exists(key):
             try:
-                with open(file_path, encoding="utf-8") as _f:
-                    _existing = json.load(_f).get("urls") or []
+                _existing = (artifacts.read_json(key) or {}).get("urls") or []
                 if len(_existing) > len(urls):
                     logging.getLogger("scraper.models").warning(
                         "input_urls sync skipped for %s: file has %d urls, new list "
@@ -74,9 +73,7 @@ def _sync_input_urls_file(instance):
                     return
             except Exception:
                 pass
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump({"urls": urls}, f, indent=2, ensure_ascii=False)
+        artifacts.write_json(key, {"urls": urls})
     except Exception:
         pass
 

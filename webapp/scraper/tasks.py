@@ -485,15 +485,12 @@ def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
     # "1 of N coverage gap" was actually "given ~0-1 URLs"). [data integrity]
     if not site_input_urls and input_mode == "url_list":
         try:
-            from django.conf import settings
+            import src.artifacts as artifacts
 
             _slug = _generate_slug(job.url)
-            _iu = os.path.join(
-                settings.PROJECT_ROOT, "scrapers", _slug, "input_urls.json"
-            )
-            if os.path.isfile(_iu):
-                with open(_iu, encoding="utf-8") as _f:
-                    _data = json.load(_f)
+            _iu_key = artifacts.scrapers_key(_slug, "input_urls.json")
+            if artifacts.exists(_iu_key):
+                _data = artifacts.read_json(_iu_key)
                 _urls = [u for u in (_data.get("urls") or []) if isinstance(u, str) and u]
                 if _urls:
                     site_input_urls = _urls
@@ -576,18 +573,24 @@ def _prune_output_to_schema(output_file: str, allowed: set[str]) -> bool:
 
     Operates on the first top-level key whose value is a list of dicts (the
     records — e.g. ``products``/``jobs``); top-level ``site``/``metadata`` are
-    left intact. Rewrites the file in place. Returns True if any keys were
-    dropped. This is the deterministic, LLM-independent schema guarantee.
+    left intact. Rewrites the artifact. Returns True if any keys were dropped.
+    This is the deterministic, LLM-independent schema guarantee.
+
+    ``output_file`` is now a File Master key (post-finalize); falls back to a
+    local path for the workspace-phase case.
     """
-    p = output_file if os.path.isabs(output_file) else os.path.join(
-        settings.PROJECT_ROOT, output_file
-    )
-    if not os.path.isfile(p):
-        return False
+    import src.artifacts as artifacts
+
+    data = None
     try:
-        with open(p, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (json.JSONDecodeError, OSError):
+        data = artifacts.read_json(output_file)
+    except Exception:
+        try:
+            with open(output_file, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError, FileNotFoundError):
+            return False
+    if data is None:
         return False
     pruned = False
     for key, val in list(data.items()):
@@ -600,8 +603,14 @@ def _prune_output_to_schema(output_file: str, allowed: set[str]) -> bool:
                 pruned = True
             break  # only the records list
     if pruned:
-        with open(p, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, ensure_ascii=False)
+        try:
+            artifacts.write_json(output_file, data)
+        except Exception:
+            try:
+                with open(output_file, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
         logger.info("schema prune: trimmed output records to %d allowed fields", len(allowed))
     return pruned
 
@@ -651,21 +660,19 @@ def _finalize_job(job: ScrapeJob) -> None:
     job.site_folder = f"scrapers/{site_slug}" if site_slug else job.site_folder
     job.error_message = final_state.get("error_message", job.error_message)
 
-    # ── Override from output file (ground truth from scraper) ───────────
+    # ── Ground-truth override from the LOCAL workspace output (Phase 4 wrote it
+    #    there). The output is published to the File Master (and job.output_file
+    #    repointed to its key) by the publish block below.
     if job.output_file:
         try:
             import pathlib
 
-            root = pathlib.Path(settings.PROJECT_ROOT)
             p = pathlib.Path(job.output_file)
-            scrapers_p = root / "scrapers" / site_slug / p.name if site_slug else p
-            if scrapers_p.is_file():
-                p = scrapers_p
-            elif not p.is_file():
-                p = scrapers_p
+            out_data = None
             if p.is_file():
                 with open(p, "r", encoding="utf-8") as fh:
                     out_data = json.load(fh)
+            if out_data:
                 site_block = out_data.get("site", {})
                 if site_block.get("platform"):
                     job.platform = site_block["platform"]
@@ -688,9 +695,8 @@ def _finalize_job(job: ScrapeJob) -> None:
                     job.product_count = len(successful)
                 if site_block.get("name"):
                     job.site_name = site_block["name"]
-                job.output_file = str(p)
                 logger.info(
-                    "Job %d: updated from output file — platform=%s, method=%s, products=%d",
+                    "Job %d: ground-truth from output — platform=%s, method=%s, products=%d",
                     job.id,
                     job.platform,
                     job.scraping_method,
@@ -701,17 +707,29 @@ def _finalize_job(job: ScrapeJob) -> None:
                 "Job %d: could not read output file for overrides: %s", job.id, exc
             )
 
-    # ── Move analysis artifacts to scrapers folder (preserve for debugging) ──
+    # ── Publish outputs + analysis to the File Master; repoint job.output_file ──
     if site_slug:
         try:
-            import shutil
+            import src.artifacts as artifacts
+            from pathlib import Path as _P
 
-            ws = Path(settings.PROJECT_ROOT) / "workspace" / site_slug
-            analysis_dir = (
-                Path(settings.PROJECT_ROOT) / "scrapers" / site_slug / "analysis"
-            )
+            ws = _P(settings.PROJECT_ROOT) / "workspace" / site_slug
+            _matched_key = None
             if ws.is_dir():
-                analysis_dir.mkdir(parents=True, exist_ok=True)
+                # outputs → FM
+                for f in ws.glob("output_*.json"):
+                    _key = artifacts.scrapers_key(site_slug, f.name)
+                    try:
+                        artifacts.write(_key, f.read_bytes())
+                        logger.info(
+                            "Job %d: preserved %s to scrapers/%s/",
+                            job.id, f.name, site_slug,
+                        )
+                    except Exception as exc:
+                        logger.warning("Job %d: preserve output %s failed: %s", job.id, f.name, exc)
+                    if job.output_file and _P(job.output_file).name == f.name:
+                        _matched_key = _key
+                # analysis → FM
                 for artifact in [
                     "site_analysis.json",
                     "navigation_analysis.json",
@@ -721,25 +739,19 @@ def _finalize_job(job: ScrapeJob) -> None:
                 ]:
                     src = ws / artifact
                     if src.is_file():
-                        shutil.copy2(src, analysis_dir / artifact)
-                        logger.info(
-                            "Job %d: preserved %s to analysis/", job.id, artifact
-                        )
-
-                site_dir = Path(settings.PROJECT_ROOT) / "scrapers" / site_slug
-                site_dir.mkdir(parents=True, exist_ok=True)
-                for f in ws.glob("output_*.json"):
-                    shutil.copy2(str(f), site_dir / f.name)
-                    logger.info(
-                        "Job %d: preserved %s to scrapers/%s/",
-                        job.id,
-                        f.name,
-                        site_slug,
-                    )
-
+                        try:
+                            artifacts.write(
+                                artifacts.scrapers_key(site_slug, "analysis", artifact),
+                                src.read_bytes(),
+                            )
+                            logger.info("Job %d: preserved %s to analysis/", job.id, artifact)
+                        except Exception:
+                            pass
                 # Defense-in-depth: don't rmtree if another job for this URL is
                 # mid-flight (the dispatch guard should prevent this, but a
                 # bypassed/played-with workspace would lose its artifacts).
+                import shutil
+
                 other_running = (
                     ScrapeJob.objects
                     .filter(url=job.url, status=ScrapeJob.STATUS_RUNNING)
@@ -754,8 +766,10 @@ def _finalize_job(job: ScrapeJob) -> None:
                 else:
                     shutil.rmtree(ws, ignore_errors=True)
                 logger.info("Job %d: cleaned workspace/%s/", job.id, site_slug)
+            if _matched_key:
+                job.output_file = _matched_key
         except Exception as exc:
-            logger.warning("Job %d: workspace cleanup failed: %s", job.id, exc)
+            logger.warning("Job %d: workspace publish failed: %s", job.id, exc)
 
     # ── Guard production input_urls.json against silent shrinkage ───────
     # A job's workspace input_urls.json can be a subset (e.g. a sample/manual
@@ -766,27 +780,22 @@ def _finalize_job(job: ScrapeJob) -> None:
     # jobs whose Site has no input_urls.  Generic. [data integrity]
     if site_slug:
         try:
+            import src.artifacts as artifacts
             from scraper.models import Site as _Site
 
             _site = _Site.objects.filter(slug=site_slug).first()
             if _site and _site.input_urls:
-                _site_dir = Path(settings.PROJECT_ROOT) / "scrapers" / site_slug
-                _iu_path = _site_dir / "input_urls.json"
+                _iu_key = artifacts.scrapers_key(site_slug, "input_urls.json")
                 _existing = []
-                if _iu_path.is_file():
+                if artifacts.exists(_iu_key):
                     try:
                         _existing = (
-                            json.loads(_iu_path.read_text(encoding="utf-8")).get("urls", [])
-                            or []
-                        )
+                            artifacts.read_json(_iu_key) or {}
+                        ).get("urls", []) or []
                     except Exception:
                         _existing = []
                 if len(_site.input_urls) > len(_existing):
-                    _site_dir.mkdir(parents=True, exist_ok=True)
-                    with open(_iu_path, "w", encoding="utf-8") as fh:
-                        json.dump(
-                            {"urls": _site.input_urls}, fh, indent=2, ensure_ascii=False
-                        )
+                    artifacts.write_json(_iu_key, {"urls": _site.input_urls})
                     logger.info(
                         "Job %d: re-synced input_urls.json from Site "
                         "(%d → %d URLs, was shrunk)",
@@ -856,12 +865,11 @@ def _finalize_job(job: ScrapeJob) -> None:
                 if job.site_name:
                     db_site.name = job.site_name
 
-                scraper_path = os.path.join(
-                    settings.PROJECT_ROOT, "scrapers", site_slug, "scraper.py"
-                )
-                if os.path.isfile(scraper_path):
+                import src.artifacts as artifacts
+                _prod_key = artifacts.scrapers_key(site_slug, "scraper.py")
+                if artifacts.exists(_prod_key):
                     db_site.has_scraper = True
-                    db_site.default_scraper_path = scraper_path
+                    db_site.default_scraper_path = _prod_key  # store the KEY
 
                 # Persist the resolved schema to the DB (revives Site.output_schema
                 # as the integration point the older framework + future re-runs read).
@@ -883,12 +891,14 @@ def _finalize_job(job: ScrapeJob) -> None:
                 # Site.fields_extracted with each completed job's output record
                 # keys — the union that check-site reads for historical lookup).
                 try:
-                    _out_path = job.output_file
-                    if _out_path and not os.path.isabs(_out_path):
-                        _out_path = os.path.join(settings.PROJECT_ROOT, _out_path)
-                    if _out_path and os.path.isfile(_out_path):
-                        with open(_out_path, "r", encoding="utf-8") as _fh:
-                            _out = json.load(_fh)
+                    import src.artifacts as artifacts
+                    _out = None
+                    if job.output_file:
+                        try:
+                            _out = artifacts.read_json(job.output_file)
+                        except Exception:
+                            _out = None
+                    if _out:
                         for _ck in ("products", "jobs", "articles", "results", "items", "threads", "pages"):
                             _items = _out.get(_ck)
                             if isinstance(_items, list) and _items and isinstance(_items[0], dict):
@@ -1148,12 +1158,12 @@ def _do_schedule_next_site() -> dict:
         new_site = failed_site
 
     slug = new_site.slug or _generate_slug(new_site.url)
-    scrapers_dir = os.path.join(settings.PROJECT_ROOT, "scrapers", slug)
-    os.makedirs(scrapers_dir, exist_ok=True)
-    input_urls_path = os.path.join(scrapers_dir, "input_urls.json")
     if new_site.input_urls:
-        with open(input_urls_path, "w", encoding="utf-8") as f:
-            json.dump({"urls": new_site.input_urls}, f, indent=2, ensure_ascii=False)
+        import src.artifacts as artifacts
+        artifacts.write_json(
+            artifacts.scrapers_key(slug, "input_urls.json"),
+            {"urls": new_site.input_urls},
+        )
 
     job = ScrapeJob.objects.create(
         url=new_site.url,
