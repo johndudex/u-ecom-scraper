@@ -557,22 +557,21 @@ def _attach_discovery_coverage(report: dict, slug: str) -> dict:
 
 
 def _preserve_test_report(slug: str) -> None:
-    """Copy test_report.json from workspace to scrapers analysis/ for safekeeping."""
+    """Copy test_report.json from LOCAL workspace to the File Master (scrapers analysis/)."""
     if not slug:
         return
     try:
-        import shutil
-        from pathlib import Path
+        import src.artifacts as artifacts
 
         root = _get_project_root()
-        src = Path(root) / "workspace" / slug / "test_report.json"
-        if not src.is_file():
+        src = os.path.join(root, "workspace", slug, "test_report.json")  # LOCAL
+        if not os.path.isfile(src):
             return
-        dst_dir = Path(root) / "scrapers" / slug / "analysis"
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        dst = dst_dir / "test_report.json"
-        shutil.copy2(src, dst)
-        logger.info("_preserve_test_report: copied to %s", dst)
+        with open(src, "rb") as _f:
+            _bytes = _f.read()
+        dst_key = artifacts.scrapers_key(slug, "analysis", "test_report.json")
+        artifacts.write(dst_key, _bytes)
+        logger.info("_preserve_test_report: copied to %s", dst_key)
     except Exception as exc:
         logger.warning("_preserve_test_report: failed: %s", exc)
 
@@ -877,75 +876,74 @@ def _get_project_root() -> str:
 def _archive_existing_scraper(slug: str) -> str | None:
     """Archive the current scraper.py before cleanup overwrites it.
 
-    Returns the archive path (or None if there was nothing to archive) so the
-    caller can restore the prior good scraper on a failed run.
+    Returns the archive KEY (or None if there was nothing to archive) so the
+    caller can restore the prior good scraper on a failed run. Artifacts live in
+    the File Master (cross-service); keys are logical ``scrapers/{slug}/...``.
     """
     if not slug:
         return None
     try:
-        import shutil
+        import src.artifacts as artifacts
         from datetime import datetime, timezone as dt_timezone
 
-        root = _get_project_root()
-        scraper_path = os.path.join(root, "scrapers", slug, "scraper.py")
-        if not os.path.isfile(scraper_path):
+        prod_key = artifacts.scrapers_key(slug, "scraper.py")
+        if not artifacts.exists(prod_key):
             return None
         ts = datetime.now(dt_timezone.utc).strftime("%Y-%m-%d_%H%M%S")
         archive_name = f"scraper-{slug}-{ts}.py"
-        archive_path = os.path.join(root, "scrapers", slug, archive_name)
-        shutil.copy2(scraper_path, archive_path)
+        archive_key = artifacts.scrapers_key(slug, archive_name)
+        artifacts.write(archive_key, artifacts.read(prod_key))
         logger.info("_archive_existing_scraper: archived → %s", archive_name)
-        return archive_path
+        return archive_key
     except Exception as exc:
         logger.warning("_archive_existing_scraper: failed: %s", exc)
         return None
 
 
 def _promote_scraper(
-    slug: str, job_id: int, execution_status: str, archive_path: str | None
+    slug: str, job_id: int, execution_status: str, archive_key: str | None
 ) -> str | None:
     """Deterministic, failure-safe scraper finalization (replaces the LLM cp).
 
-    1. Always copy this job's `workspace/{slug}/scraper_draft.py` to a per-job
-       file `scrapers/{slug}/jobs/scraper-{job_id}.py` (attributed, survives
-       later jobs) — so each job's download is stable.
-    2. Promote to the production `scrapers/{slug}/scraper.py` ONLY when the job
-       succeeded. On non-success, leave production untouched and restore the
-       prior good scraper from the archive (defends against any stray clobber).
+    1. Always copy this job's LOCAL ``workspace/{slug}/scraper_draft.py`` to a
+       per-job File Master key ``scrapers/{slug}/jobs/scraper-{job_id}.py``
+       (attributed, survives later jobs).
+    2. Promote to production ``scrapers/{slug}/scraper.py`` ONLY on SUCCESS. On
+       non-success, leave production untouched and restore the prior good scraper
+       from the archive key (defends against any stray clobber).
 
-    Returns the per-job scraper path (or None if no draft was produced).
+    Returns the per-job scraper KEY (or None if no draft was produced). The draft
+    read is local (workspace stays on the worker); all scrapers/ writes go to FM.
     """
     if not slug:
         return None
     try:
-        import shutil
+        import src.artifacts as artifacts
 
         root = _get_project_root()
-        draft = os.path.join(root, "workspace", slug, "scraper_draft.py")
-        site_dir = os.path.join(root, "scrapers", slug)
-        jobs_dir = os.path.join(site_dir, "jobs")
-        per_job = os.path.join(jobs_dir, f"scraper-{job_id}.py")
-        production = os.path.join(site_dir, "scraper.py")
+        draft = os.path.join(root, "workspace", slug, "scraper_draft.py")  # LOCAL
+        per_job_key = artifacts.scrapers_key(slug, "jobs", f"scraper-{job_id}.py")
+        prod_key = artifacts.scrapers_key(slug, "scraper.py")
 
+        promoted = None
         if os.path.isfile(draft):
-            os.makedirs(jobs_dir, exist_ok=True)
-            shutil.copy2(draft, per_job)
+            with open(draft, "rb") as _f:
+                _draft_bytes = _f.read()
+            artifacts.write(per_job_key, _draft_bytes)
+            promoted = per_job_key
             logger.info("_promote_scraper: per-job copy → jobs/scraper-%s.py", job_id)
-        else:
-            per_job = None
 
         if execution_status == "SUCCESS":
-            if per_job and os.path.isfile(per_job):
-                os.makedirs(site_dir, exist_ok=True)
-                shutil.copy2(per_job, production)
+            if promoted:
+                artifacts.write(prod_key, artifacts.read(per_job_key))
                 logger.info(
                     "_promote_scraper: SUCCESS → promoted to scraper.py (job %s)", job_id
                 )
         else:
             # Non-success: do NOT promote the (possibly broken) draft. Restore
             # the prior good production scraper if anything clobbered it.
-            if archive_path and os.path.isfile(archive_path) and os.path.isfile(production):
-                shutil.copy2(archive_path, production)
+            if archive_key and artifacts.exists(archive_key) and artifacts.exists(prod_key):
+                artifacts.write(prod_key, artifacts.read(archive_key))
                 logger.info(
                     "_promote_scraper: non-SUCCESS → restored scraper.py from archive (job %s)",
                     job_id,
@@ -955,7 +953,7 @@ def _promote_scraper(
                 "scraper.py left as-is (job %s)",
                 execution_status, job_id,
             )
-        return per_job
+        return promoted
     except Exception as exc:
         logger.warning("_promote_scraper: failed: %s", exc)
         return None
@@ -3160,34 +3158,22 @@ def _invoke_skill_learner(state: ScrapeState, config: RunnableConfig) -> dict[st
 
         if slug:
             try:
+                import src.artifacts as artifacts
                 from django.conf import settings
 
                 ws = os.path.join(settings.PROJECT_ROOT, "workspace", slug)
-                dest_dir = os.path.join(
-                    settings.PROJECT_ROOT, "scrapers", slug, "analysis"
-                )
-                os.makedirs(dest_dir, exist_ok=True)
-                import shutil
-
-                # Preserve learning_report.json
-                report_src = os.path.join(ws, "learning_report.json")
-                report_dst = os.path.join(dest_dir, "learning_report.json")
-                if os.path.isfile(report_src):
-                    shutil.copy2(report_src, report_dst)
-                    logger.info(
-                        "_invoke_skill_learner: copied learning_report.json → scrapers/%s/analysis/",
-                        slug,
-                    )
-
-                # Preserve nav_learning_report.json (from nav_skill_review)
-                nav_report_src = os.path.join(ws, "nav_learning_report.json")
-                nav_report_dst = os.path.join(dest_dir, "nav_learning_report.json")
-                if os.path.isfile(nav_report_src):
-                    shutil.copy2(nav_report_src, nav_report_dst)
-                    logger.info(
-                        "_invoke_skill_learner: copied nav_learning_report.json → scrapers/%s/analysis/",
-                        slug,
-                    )
+                # Preserve learning + nav_learning reports to the File Master.
+                for _name in ("learning_report.json", "nav_learning_report.json"):
+                    _src = os.path.join(ws, _name)
+                    if os.path.isfile(_src):
+                        with open(_src, "rb") as _f:
+                            _bytes = _f.read()
+                        _key = artifacts.scrapers_key(slug, "analysis", _name)
+                        artifacts.write(_key, _bytes)
+                        logger.info(
+                            "_invoke_skill_learner: copied %s → scrapers/%s/analysis/",
+                            _name, slug,
+                        )
             except Exception as exc:
                 logger.debug("skill_learner: failed to preserve reports: %s", exc)
 
@@ -3274,18 +3260,18 @@ def _invoke_dagster_converter(
                         slug, "; ".join(_unresolved[:3]),
                     )
                 else:
-                    # Per-job copy (attributed, survives later jobs) always;
-                    # promote to the production {slug}_dagster.py only on success
-                    # (mirrors _promote_scraper — don't clobber a good dagster
-                    # file with a failed job's output).
-                    import shutil
-                    jobs_dir = os.path.join(root, "scrapers", slug, "jobs")
-                    os.makedirs(jobs_dir, exist_ok=True)
-                    per_job_dagster = os.path.join(jobs_dir, f"dagster-{job_id}.py")
-                    shutil.copy2(ws_dagster, per_job_dagster)
+                    # Per-job copy to the File Master always; promote to production
+                    # {slug}_dagster.py only on success (mirrors _promote_scraper —
+                    # don't clobber a good dagster file with a failed job's output).
+                    import src.artifacts as artifacts
+
+                    with open(ws_dagster, "rb") as _f:
+                        _dagster_bytes = _f.read()
+                    per_job_key = artifacts.scrapers_key(slug, "jobs", f"dagster-{job_id}.py")
+                    artifacts.write(per_job_key, _dagster_bytes)
                     if state.get("execution_status") == "SUCCESS":
-                        os.makedirs(os.path.dirname(scrapers_dagster), exist_ok=True)
-                        shutil.copy2(per_job_dagster, scrapers_dagster)
+                        prod_key = artifacts.scrapers_key(slug, f"{slug}_dagster.py")
+                        artifacts.write(prod_key, artifacts.read(per_job_key))
                         logger.info(
                             "_invoke_dagster_converter: SUCCESS → promoted %s_dagster.py (job %s)",
                             slug, job_id,
@@ -3296,7 +3282,7 @@ def _invoke_dagster_converter(
                             "left as-is, per-job copy at jobs/dagster-%s.py",
                             slug, job_id,
                         )
-                    return {"messages": [], "dagster_path": per_job_dagster}
+                    return {"messages": [], "dagster_path": per_job_key}
             except SyntaxError as exc:
                 logger.warning(
                     "_invoke_dagster_converter: %s_dagster.py has syntax error: %s",
