@@ -1,343 +1,270 @@
 # Railway Migration Guide
 
-**Goal:** run the app on **Railway** for production using **only Railway-managed services** (no S3/R2 or other external stores), while keeping the **same architecture working on local docker-compose**.
-
-**Repo:** `github.com/al-johnf/ExtractorBuilderAi`
+**Repo:** `github.com/al-johnf/ExtractorBuilderAi` · **Branch:** `file-master-artifacts`
 **Railway docs:** <https://docs.railway.com/guides/docker-compose>
+**Status:** ✅ Fully implemented + e2e verified (adameve.com, 20 products, 12 FM PUTs)
 
 ---
 
-## TL;DR — read this first
+## TL;DR
 
-Railway does **not** run `docker-compose.yml`. Each compose service maps to a **Railway service** built from the same GitHub repo + Dockerfiles; managed **Postgres + Redis** replace the `postgres:`/`redis:` images. Each service keeps its own container — **celery-worker and browser_service stay separate**.
-
-Railway volumes mount to a **single service** (not shared), and there's no managed object store — so the existing "everyone bind-mounts `scrapers/` + `workspace/`" pattern can't work across separate containers. The fix, used identically in **compose and Railway**, is a **File Master** service: one small stateful service that owns all artifacts on a volume and serves them over HTTP to the others. No Postgres blobs, no S3, one code path everywhere.
-
-Everything else (Chrome flags, headless, managed DBs, env wiring) is config, not code.
+Railway doesn't run `docker-compose.yml` — each compose service becomes a Railway service. The codebase now uses a **File Master** (FastAPI artifact store on a volume) for cross-service artifact sharing, and **stateless `/scrape`** (scraper source in the POST body). Both work identically in compose and Railway. `workspace/` stays local on the worker.
 
 ---
 
-## 1. Target architecture (File Master in both environments)
+## What was built (13 commits on `file-master-artifacts`)
+
+| Commit | What |
+|--------|------|
+| `aaeb2b6` | `file_master/` (FastAPI: PUT/GET/HEAD/list/DELETE/stream/health) + `src/artifacts.py` (httpx client) |
+| `82f589a` | Stateless `/scrape`: `scraper_source` + `extra_files` in body, `output_content` in response |
+| `f0fba8f` `6c6f45e` `0034a7d` | Worker `scrapers/` writes → FM (graph.py, tasks.py, models.py, setup_workspace) |
+| `f44882f` | Django `scrapers/` reads → FM (views.py: 28 endpoints + proxy view) |
+| `e205d7e` `ee24e3d` | Compose wiring (file-master service, `FILE_MASTER_URL`, drop browser mounts) |
+| `04aa61b` | Pruning (keep newest 5 outputs per site) |
+| `9e4c473` | `extra_files` in `/scrape` (stage input_urls.json alongside scraper) |
+| `b7b20ac` | Railway-ready: whitenoise, REDIS_URL setting, headless Chrome toggle |
+
+### Key design decisions (different from earlier doc iterations)
+
+1. **`/scrape` takes `scraper_source` (bytes) + `extra_files`, NOT a `scraper_key`.** browser_service is **fully stateless** — no FM access, no DB, no volume. The worker reads the local `workspace/{slug}/scraper_draft.py`, POSTs the source + sibling files (input_urls.json, discovery_config.json), and receives the output content in the response.
+
+2. **`workspace/` stays LOCAL on the worker** (not in FM). Only `scrapers/` (published artifacts) goes through FM. This was the "minimal scope" decision — ~47 workspace call sites unchanged.
+
+3. **browser_service does NOT use FILE_MASTER_URL.** It never imports `src.artifacts`. The worker handles all FM interaction.
+
+4. **DB-stored paths are now FM keys.** `job.scraper_file`, `job.output_file`, `Site.default_scraper_path` store logical keys like `scrapers/{slug}/scraper.py` (resolved by django's `_fm_key_for` helper).
+
+---
+
+## Architecture
 
 ```
                     ┌──────────────────────────────┐
    public HTTPS ───▶│  django  (web + SSE + admin)  │  gunicorn :8000
-                    │  reads artifacts via File Master│
+                    │  reads artifacts via File Master│  whitenoise for static
                     └──────┬─────────────────────────┘
-                           │ private net (HTTP)
+                           │ private net
             ┌──────────────┼──────────────────────────────┐
             ▼              ▼                               ▼
    ┌────────────────┐    ┌──────────────────────┐   ┌─────────────────┐
    │ Postgres       │    │  celery-worker        │   │  redis          │
-   │ (metadata only)│    │  reads/writes via FM  │   │  (managed)      │
-   │ (managed)      │    └──────────┬───────────┘   └─────────────────┘
-   └────────────────┘               │
+   │ (metadata only)│    │  workspace/ LOCAL     │   │  (managed)      │
+   │ (managed)      │    │  scrapers/ → FM       │   │                 │
+   └────────────────┘    └──────────┬───────────┘   └─────────────────┘
                                      │
-              ┌──────────────────────┼────────────────────────────────┐
-              │                      │                                │
-              ▼                      ▼                                ▼
-   ┌─────────────────────┐  ┌──────────────────────────┐      ┌────────────────┐
-   │  ★ file-master ★    │  │  browser_service          │      │  celery-beat   │
-   │  FastAPI + VOLUME   │  │  reads scraper via FM,    │      │  (1 replica)   │
-   │  owns workspace/    │  │  writes outputs to FM     │      └────────────────┘
-   │  + scrapers/        │  │  uvicorn :8001 + MCP :8111│
-   │  HTTP :8002         │  │  + 2 headless Chromes     │
-   └─────────────────────┘  └──────────────────────────┘
-                                                                       
-                    ┌────────────────┐
-                    │  flower        │  optional, private-only
-                    └────────────────┘
+                    ┌────────────────┼────────────────────────────┐
+                    ▼                ▼                            ▼
+          ┌──────────────────┐  ┌──────────────────────┐  ┌──────────────┐
+          │  ★ file-master ★ │  │  browser_service      │  │  celery-beat │
+          │  FastAPI+VOLUME  │  │  STATELESS: source in │  │  (1 replica) │
+          │  scrapers/ tree  │  │  → output out (no FM) │  └──────────────┘
+          │  HTTP :8002      │  │  uvicorn :8001        │
+          └──────────────────┘  │  +2 headless Chromes  │
+                                │  MCP :8111            │
+                                └──────────────────────┘
+          ┌────────────┐
+          │  flower    │  optional, private-only
+          └────────────┘
 ```
 
-Same in compose (the File Master is a `docker-compose` service) and Railway (the File Master is a Railway service with a volume).
+---
+
+## Environment variables — COMPLETE reference
+
+### Per-service variable table
+
+Marked 🔒 = Railway Secret. Reference vars use `${{service.VAR}}` syntax.
+
+| Variable | django | celery-worker | browser_service | file-master | celery-beat | flower |
+|---|---|---|---|---|---|---|
+| **Database** | | | | | | |
+| `DB_HOST` | ✓ `${{postgres.RAILWAY_PRIVATE_DOMAIN}}` | ✓ | — | — | ✓ | ✓ |
+| `DB_PORT` | ✓ `5432` | ✓ | — | — | ✓ | ✓ |
+| `DB_NAME` | ✓ `${{postgres.PGDATABASE}}` | ✓ | — | — | ✓ | ✓ |
+| `DB_USER` | ✓ `${{postgres.PGUSER}}` | ✓ | — | — | ✓ | ✓ |
+| `DB_PASSWORD` | 🔒 `${{postgres.PGPASSWORD}}` | 🔒 | — | — | 🔒 | 🔒 |
+| **Redis** | | | | | | |
+| `REDIS_URL` | ✓ `${{redis.REDIS_PRIVATE_URL}}` | ✓ | — | — | ✓ | ✓ |
+| **Django** | | | | | | |
+| `SECRET_KEY` | 🔒 (same value all services) | 🔒 | — | — | 🔒 | 🔒 |
+| `DJANGO_SETTINGS_MODULE` | `config.settings` | `config.settings` | — | — | `config.settings` | `config.settings` |
+| `DEBUG` | `False` | — | — | — | — | — |
+| `ALLOWED_HOSTS` | your `*.railway.app` domain | — | — | — | — | — |
+| `DJANGO_SUPERUSER_PASSWORD` | 🔒 (for initial createsuperuser) | — | — | — | — | — |
+| **Python** | | | | | | |
+| `PYTHONPATH` | `/app` | `/app` | `/app` | — | `/app` | `/app` |
+| **File Master** | | | | | | |
+| `FILE_MASTER_URL` | ✓ `http://file-master.railway.internal:8002` | ✓ | — | — | — | — |
+| **Browser service** | | | | | | |
+| `BROWSER_SERVICE_URL` | ✓ `http://browser-service.railway.internal:8001` | ✓ | — | — | — | — |
+| `PLAYWRIGHT_MCP_URL` | ✓ `http://browser-service.railway.internal:8111/sse` | ✓ | — | — | — | — |
+| **LLM (Z.AI)** | | | | | | |
+| `ZAI_API_KEY` | 🔒 | 🔒 | — | — | — | — |
+| `ZAI_BASE_URL` | `https://api.z.ai/api/coding/paas/v4/` | ✓ | — | — | — | — |
+| `ZAI_MAIN_MODEL` | `glm-5-turbo` | ✓ | — | — | — | — |
+| `ZAI_SMALL_MODEL` | `glm-5-turbo` | ✓ | — | — | — | — |
+| `CODE_WRITER_MODEL` | — | `glm-5.2` | — | — | — | — |
+| **Celery** | | | | | | |
+| `CELERY_TASK_ACKS_LATE` | — | `true` | — | — | — | — |
+| `CELERY_WORKER_MAX_MEMORY_PER_CHILD` | — | `2621440` | — | — | — | — |
+| `CELERY_WORKER_MAX_TASKS_PER_CHILD` | — | `10` | — | — | — | — |
+| **Browser service internals** | | | | | | |
+| `DISPLAY` | — | — | `""` (empty → headless) | — | — | — |
+| `PROJECT_ROOT` | — | — | `/app` | — | — | — |
+| `NAVIGATE_MAX_CONCURRENT` | — | — | `2` | — | — | — |
+| `NAVIGATE_MAX_QUEUE` | — | — | `2` | — | — | — |
+| `PROXY_DATACENTER_HOST` | — | — | 🔒 | — | — | — |
+| `PROXY_DATACENTER_PORT` | — | — | `22225` | — | — | — |
+| `PROXY_DATACENTER_USER` | — | — | 🔒 | — | — | — |
+| `PROXY_DATACENTER_PASS` | — | — | 🔒 | — | — | — |
+| `PROXY_RESIDENTIAL_HOST` | — | — | 🔒 | — | — | — |
+| `PROXY_RESIDENTIAL_PORT` | — | — | `22225` | — | — | — |
+| `PROXY_RESIDENTIAL_USER` | — | — | 🔒 | — | — | — |
+| `PROXY_RESIDENTIAL_PASS` | — | — | 🔒 | — | — | — |
+
+### Variables NOT needed (common mistakes)
+- `FILE_MASTER_URL` on browser_service → ❌ browser_service is stateless, never imports artifacts
+- `ARTIFACT_STORAGE` → ❌ no dual-mode switch; FM is always HTTP
+- `S3_BUCKET` / `S3_ENDPOINT` → ❌ no external storage; FM uses a local volume
+
+> **Service-name gotcha:** Railway private DNS is **lowercase hyphenated** — `file-master.railway.internal`, `browser-service.railway.internal`. Underscored names (`browser_service`) won't resolve.
 
 ---
 
-## 2. The File Master service (the one piece of new code)
+## Per-service Railway config
 
-### Why
-Today, `django`, `celery-worker`, and `browser_service` share `workspace/` + `scrapers/` via bind mounts, and the worker hands the browser service a **file path** it then executes. Railway volumes are per-service, so that contract dies. Rather than scatter a dual-mode abstraction across ~30 call sites, we introduce one service that owns the artifacts and a clean HTTP API — used by every service, in both environments.
+### Postgres (managed plugin)
+- **Provision:** New → Database → PostgreSQL. Enable **PgBouncer** (django + worker + beat all connect).
+- **Wire:** consumers use `DB_HOST` etc. (settings.py reads individual components, NOT `DATABASE_URL`).
+- **No artifact blobs** — only job/site/approval/session rows.
 
-### The service — `file_master/`
-A minimal FastAPI app + a persistent volume. No DB, no business logic — just a typed key/value file store.
+### Redis (managed plugin / Upstash)
+- **Provision:** New → Database → Redis.
+- **Wire:** `REDIS_URL=${{redis.REDIS_PRIVATE_URL}}` (keep the `rediss://` scheme verbatim — Celery/redis-py handle TLS).
+- Pin to same region as the worker.
 
-```python
-# file_master/app.py
-from fastapi import FastAPI, Request, Response, HTTPException
-from pathlib import Path
-ROOT = Path("/data")                     # volume mount (compose: ./shared-data) or Railway volume
+### file-master (artifact store)
+- **Source:** `file_master/Dockerfile` (root dir = repo root via `build: ./file_master`).
+- **Start:** `uvicorn app:app --host 0.0.0.0 --port 8002 --workers 1`
+- **Volume:** mount at `/data` (persistent).
+- **Port:** `8002`, **private only** — no public domain.
+- **Healthcheck:** `GET /health` (boots in ~2s).
+- **Replicas:** 1 (singleton).
+- **No env vars needed** — `FILE_MASTER_ROOT` defaults to `/data`.
 
-app = FastAPI()
+### django (web)
+- **Source:** `./Dockerfile` (root dir = repo root).
+- **Start:** Dockerfile `CMD` (`gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 2`). Never `runserver` in prod.
+- **Pre-Deploy command:** `python manage.py migrate --noinput && python manage.py collectstatic --noinput` (wrap migrate in a retry — no `depends_on`).
+- **Port:** auto from `EXPOSE 8000`. Generate public domain.
+- **Static files:** ✅ `whitenoise` installed + `WhiteNoiseMiddleware` active (commit `b7b20ac`).
+- **Healthcheck:** `GET /health/`.
+- **Artifacts:** `FILE_MASTER_URL` set; django reads via `_fm_read_text` / `_fm_read_json` / `/fm/artifact/<key>` proxy view.
 
-@app.put("/artifacts/{key:path}")
-async def put(key: str, request: Request):
-    p = ROOT / key
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_bytes(await request.body())
-    return {"ok": True, "size": p.stat().st_size}
+### celery-worker
+- **Source:** `./Dockerfile`.
+- **Start:** `celery -A config worker -l INFO --concurrency=2 -Ofair` (from `/app/webapp`).
+- **`workspace/`** stays LOCAL — needs a Railway volume at `/app/workspace` (persistent for in-flight jobs across restarts).
+- **`scrapers/`** → File Master (no local volume needed for scrapers/).
+- **Replicas:** 1 (single shared browser_service Chrome).
+- **Healthcheck:** `celery -A config inspect ping -d celery@$(hostname) --timeout=10`, start_period 60s.
+- **Resources:** 8 GB / 4 vCPU (LLM agent contexts are RAM-heavy).
 
-@app.get("/artifacts/{key:path}")
-async def get(key: str):
-    p = ROOT / key
-    if not p.is_file(): raise HTTPException(404)
-    return Response(p.read_bytes(), media_type="application/octet-stream")
+### browser_service (stateless)
+- **Source:** `browser_service/Dockerfile` (root dir = repo root).
+- **Start:** Dockerfile `CMD` (uvicorn on :8001).
+- **NO `FILE_MASTER_URL`** — browser_service never touches FM. It receives `scraper_source` + `extra_files` in the POST body, stages to `/tmp`, runs, returns `output_content` in the response.
+- **`DISPLAY=""`** on Railway → headless mode (`--headless=new`, no Xvfb). ✅ Implemented (commit `b7b20ac`).
+- **Chrome `/dev/shm`:** already mitigated (`--disable-dev-shm-usage` on all Chrome launches).
+- **Ports:** `8001` private (django/worker reach it); `8111`/`9222`/`9223` **private only**.
+- **Healthcheck:** `GET /health` on :8001, grace ≥ 90s.
+- **Resources:** 8–16 GB / 4+ vCPU.
 
-@app.head("/artifacts/{key:path}")
-async def exists(key: str):
-    p = ROOT / key
-    if not p.is_file(): raise HTTPException(404)
-    return Response()
+### celery-beat
+- **Source:** `./Dockerfile`.
+- **Start:** `celery -A config beat -l INFO` (from `/app/webapp`). Drop `migrate` (django owns it).
+- **Replicas:** 1, disable autoscale + sleep. Two beats = duplicate tasks.
+- **No volume** — `DatabaseScheduler` stores schedule in Postgres.
 
-@app.get("/list")
-async def lst(prefix: str = ""):
-    return [str(p.relative_to(ROOT)) for p in (ROOT/prefix).rglob("*") if p.is_file()] if (ROOT/prefix).exists() else []
-
-@app.get("/health")
-async def health(): return {"ok": True}
-```
-
-### The client — `src/artifacts.py` (single mode, always HTTP)
-```python
-import os, httpx
-BASE = os.environ["FILE_MASTER_URL"].rstrip("/")          # e.g. http://file-master:8002
-
-def write(key: str, data: bytes):
-    httpx.put(f"{BASE}/artifacts/{key}", content=data, timeout=120)
-
-def read(key: str) -> bytes:
-    r = httpx.get(f"{BASE}/artifacts/{key}", timeout=120)
-    if r.status_code == 404: raise FileNotFoundError(key)
-    return r.content
-
-def exists(key: str) -> bool:
-    return httpx.head(f"{BASE}/artifacts/{key}", timeout=30).status_code == 200
-
-def list_keys(prefix: str = "") -> list[str]:
-    return httpx.get(f"{BASE}/list", params={"prefix": prefix}, timeout=30).json()
-
-def public_url(key: str) -> str:
-    # django proxies GET /api/artifact?key=... → File Master (so users never hit FM directly)
-    return f"/api/artifact?key={key}"
-```
-
-### How the app changes (mechanical)
-- **~30 call sites** in `webapp/agents/graph.py`, `run_execution.py`, `shell_tools.py`, and django views: replace `os.path.join(root, "workspace"|"scrapers", …)` with `artifacts.write/read(key, …)`.
-- **`run_scraper`**: POST `{"scraper_key": "workspace/{slug}/scraper_draft.py"}` to `browser_service /scrape`. `browser_service` does `src = artifacts.read(scraper_key)` → writes `/tmp/scraper_{uuid}.py` → runs it → `artifacts.write(output_key, output_bytes)`. (No shared disk between worker and browser_service.)
-- **Services that execute scrapers** (worker `code_tester`, browser_service): always `read()` to local `/tmp`, run, `write()` outputs back. Local tmp is per-container — fine.
-- **Django** serves outputs by proxying `GET` to the File Master (a thin view), so users stay on the django public domain.
-
-### Both environments, one codebase
-| | Local compose | Railway |
-|---|---|---|
-| File Master | `file-master` compose service, volume `./shared-data` | Railway service, Railway volume at `/data` |
-| `FILE_MASTER_URL` | `http://file-master:8002` | `http://file-master.railway.internal:8002` |
-| Code path | **identical** | **identical** |
-
-No `ARTIFACT_STORAGE` switch, no local-FS branch. Dev and prod are architecturally identical — what works locally works on Railway.
-
-### Operational notes
-- **Singleton + persistent volume.** 1 replica. If it's down, artifact reads/writes fail and the pipeline retries (browser_service/worker already retry on HTTP errors). Keep it dead-simple (the code above is the whole service).
-- **Pruning:** extend the `cleanup`/`skill_learner` nodes to `DELETE` (or overwrite) old artifacts; add a `DELETE /artifacts/<key>` endpoint. Keeps the volume from growing unbounded.
-- **No secrets in keys.** Keys are paths like `scrapers/{slug}/output_*.json` — never include credentials.
-- **Swap backend later (optional):** if you ever want S3, only the File Master's internals change — the 30 call sites keep calling `artifacts.*`. That's the value of centralizing.
+### flower (optional)
+- **Start:** `celery -A config flower --port=${PORT:-5555}`.
+- **No public domain without auth.** Keep private-only or add `--basic-auth`.
 
 ---
 
-## 3. Prerequisites
+## Deployment order
 
-```bash
-npm i -g @railway/cli && railway login
-railway init && railway link
-```
-Dashboard: **New → GitHub Repo → al-johnf/ExtractorBuilderAi → branch `lg-upgrade`**. Each service points at this repo with a **Root Directory** + **Dockerfile path** + **Start Command**.
-
----
-
-## 4. Per-service migration
-
-### 4.1 Postgres — Railway managed plugin (metadata only)
-- **Approach:** managed Postgres. **No artifact blobs** — only job/site/approval/session rows.
-- **Provision:** New → Database → PostgreSQL (rename `postgres`), or `railway add --plugin postgres`.
-- **Wire:** `webapp/config/settings.py` reads **`DB_HOST/DB_NAME/DB_USER/DB_PASSWORD/DB_PORT`**. On django / celery-worker / celery-beat set:
-  ```
-  DB_HOST=${{postgres.RAILWAY_PRIVATE_DOMAIN}}
-  DB_PORT=5432
-  DB_NAME=${{postgres.PGDATABASE}}
-  DB_USER=${{postgres.PGUSER}}
-  DB_PASSWORD=${{postgres.PGPASSWORD}}
-  ```
-- **Enable PgBouncer** (transaction pooling) — django + worker + beat all hold connections.
-- **Migrate data (one-time):**
-  ```bash
-  docker compose --profile full exec -T postgres pg_dump -U scraper -d scraper --no-owner --no-privileges -Fc > scraper.dump
-  pg_restore --no-owner --no-privileges --dbname="$DATABASE_PUBLIC_URL" --on-error-stop scraper.dump
-  ```
-
-### 4.2 Redis — Railway managed plugin (Upstash)
-- **Approach:** managed Redis. Codebase needs only `REDIS_URL` (broker + result backend + lock client in `services.py`).
-- **Provision:** New → Database → Redis. Set on consumers:
-  ```
-  REDIS_URL=${{redis.REDIS_PRIVATE_URL}}     # rediss:// — keep the scheme verbatim
-  ```
-  Upstash exposes only DB 0 (code uses `/0`). Pin Redis + worker to the same region.
-- **Persistence:** losing the volume is safe (broker/results/locks ephemeral). Drain workers before cutover.
-- **Follow-up bug:** `webapp/scraper/views.py` health view reads `getattr(settings,"REDIS_URL",…)` but settings only defines `CELERY_BROKER_URL` → falsely reports Redis down. Fix: add `REDIS_URL = config("REDIS_URL",…)` as a setting.
-
-### 4.3 ★ file-master ★ (the artifact store)
-- **Dockerfile:** `file_master/Dockerfile` (tiny — `python:3.12-slim`, `fastapi`, `uvicorn`, `httpx`).
-- **Start command:** `uvicorn file_master.app:app --host 0.0.0.0 --port 8002`.
-- **Volume:** Railway Settings → Volumes → mount at `/data`. (In compose, bind `./shared-data:/data`.)
-- **Port:** `8002`, **private only** (`file-master.railway.internal:8002`). No public domain.
-- **Healthcheck:** Path `/health`, short grace (~10s — it boots instantly).
-- **Resources:** smallest plan that fits the working set; size the **volume** for accumulated artifacts (a few GB + pruning).
-- **Replicas = 1.** Singleton file store.
-
-### 4.4 django (web)
-- **Dockerfile:** `./Dockerfile` · **Start command:** Dockerfile `CMD` (`gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 2`). **Never `runserver` in prod.**
-- **Pre-Deploy:** `python manage.py migrate --noinput && python manage.py collectstatic --noinput` (wrap migrate in a retry loop — no `depends_on`).
-- **Port:** auto from `EXPOSE 8000`. Public domain: Settings → Networking → Generate Domain.
-- **Static files (gotcha):** no `whitenoise` in requirements; under `DEBUG=False` admin/dashboard CSS 404. Add `whitenoise` + `WhiteNoiseMiddleware` after `SecurityMiddleware`.
-- **Healthcheck:** Path `/health/`.
-- **Artifacts:** `FILE_MASTER_URL=http://file-master.railway.internal:8002`. Add a django view `/api/artifact?key=…` that proxies `GET` to the File Master (stream the bytes) so dashboard links resolve on django's own domain.
-
-### 4.5 celery-worker
-- **Dockerfile:** `./Dockerfile` · **Start command:** `celery -A config worker -l INFO --concurrency=2 -Ofair` (from `/app/webapp`).
-- **Env:** `PYTHONPATH=/app`, `PROJECT_ROOT=/app`, DB+REDIS reference vars, `ZAI_*` secrets, `CODE_WRITER_MODEL=glm-5.2`, `BROWSER_SERVICE_URL=http://browser-service.railway.internal:8001`, `PLAYWRIGHT_MCP_URL=http://browser-service.railway.internal:8111/sse`, `FILE_MASTER_URL=http://file-master.railway.internal:8002`, `SECRET_KEY` (same as django), `CELERY_TASK_ACKS_LATE=true`.
-- **Artifacts:** reads/writes all workspace+scrapers artifacts via the File Master. `run_scraper` POSTs `scraper_key` (not a path). `code_tester` reads the draft to `/tmp`, runs, writes results back.
-- **No shared volume needed** — the worker uses the File Master + local `/tmp`. (An ephemeral `/tmp` is enough; nothing persistent required.)
-- **Resources:** **8 GB / 4 vCPU** (LLM agent contexts are RAM-heavy). Keep `CELERY_WORKER_MAX_MEMORY_PER_CHILD=2621440`, `CELERY_WORKER_MAX_TASKS_PER_CHILD=10`.
-- **Replicas = 1** initially. Healthcheck: command `celery -A config inspect ping -d celery@$(hostname) --timeout=10`, start_period 60s.
-
-### 4.6 browser_service
-- **Dockerfile:** `browser_service/Dockerfile` (root dir = repo root). Build is heavy (~8–12 min) — keep apt/pip/npm layers before `COPY` for cache.
-- **Start command:** the Dockerfile `CMD` (uvicorn `browser_service.server:app` on :8001).
-- **Artifacts via File Master:** `/scrape` takes `scraper_key`, does `artifacts.read(key)` → `/tmp/scraper_{uuid}.py` → runs → `artifacts.write(output_key, output_bytes)`. No shared disk with the worker.
-- **Chrome `/dev/shm` — already fixed.** `browser_pool.py` passes `--disable-dev-shm-usage --no-sandbox --disable-setuid-sandbox --disable-gpu` on both persistent Chromes; `/probe`+`/navigate` ephemeral launches pass `--no-sandbox --disable-dev-shm-usage`. **Don't add `--single-process`** (crashes). Give several GB ephemeral disk for `/tmp`.
-- **Drop Xvfb → headless.** Add `--headless=new` to the two persistent Chromes, gated on `DISPLAY` empty; set `DISPLAY=""` on Railway. CloakBrowser is already `headless=True`. Local compose keeps Xvfb.
-- **Ports:** `8001` private; `8111`/`9222`/`9223` **private only**.
-- **Resources:** **8–16 GB / 4+ vCPU**. Set `NAVIGATE_MAX_CONCURRENT=2`, `NAVIGATE_MAX_QUEUE=2` until sized.
-- **Healthcheck:** Path `/health`, port `8001`, **grace ≥ 90s**.
-- **Env:** `FILE_MASTER_URL=http://file-master.railway.internal:8002`, `PYTHONPATH=/app`, `PROJECT_ROOT=/app`.
-- **Proxy env (secrets):** `PROXY_DATACENTER_*`, `PROXY_RESIDENTIAL_*`.
-
-### 4.7 celery-beat (scheduler)
-- **Dockerfile:** `./Dockerfile` · **Start command:** `celery -A config beat -l INFO`. **Drop `migrate`** (django owns schema).
-- **Singleton:** replicas = 1, disable autoscale + sleep. Two beats = duplicate tasks.
-- **No volume** — `django_celery_beat.schedulers:DatabaseScheduler` stores schedule in Postgres.
-- Healthcheck: rely on exit→restart, or `pgrep -f "celery.*beat"`.
-
-### 4.8 flower (optional)
-- **Dockerfile:** `./Dockerfile` · **Start command:** `celery -A config flower --port=${PORT:-5555}`.
-- **No public domain without auth** (unauthenticated; task kwargs can contain secrets). Keep private-only or add `--basic-auth`.
-- Replicas = 1, smallest plan.
-
----
-
-## 5. Environment-variable reference map
-
-Reference vars auto-sync; mark keys/passwords as Railway **Secrets**.
-
-| Variable | django | celery-worker | browser_service | file-master | celery-beat | flower | Value |
-|---|---|---|---|---|---|---|---|
-| `DB_HOST/PORT/NAME/USER/PASSWORD` | ✓ | ✓ | — | — | ✓ | ✓ | `${{postgres.*}}` |
-| `REDIS_URL` | ✓ | ✓ | — | — | ✓ | ✓ | `${{redis.REDIS_PRIVATE_URL}}` |
-| `DJANGO_SETTINGS_MODULE` | `config.settings` | `config.settings` | — | — | `config.settings` | `config.settings` | |
-| `SECRET_KEY` | secret | secret | — | — | secret | secret | real random, **same across services** |
-| `PYTHONPATH` | `/app` | `/app` | `/app` | — | `/app` | `/app` | |
-| `PROJECT_ROOT` | `/app` | `/app` | `/app` | — | `/app` | `/app` | |
-| `FILE_MASTER_URL` | ✓ | ✓ | ✓ | — | — | — | `http://file-master.railway.internal:8002` |
-| `BROWSER_SERVICE_URL` | ✓ | ✓ | — | — | — | — | `http://browser-service.railway.internal:8001` |
-| `PLAYWRIGHT_MCP_URL` | ✓ | ✓ | — | — | — | — | `http://browser-service.railway.internal:8111/sse` |
-| `DEBUG` / `ALLOWED_HOSTS` | `False` / your domain | — | — | — | — | — | |
-| `ZAI_API_KEY` / `ZAI_BASE_URL` / `ZAI_MAIN_MODEL` / `ZAI_SMALL_MODEL` / `CODE_WRITER_MODEL` | ✓ | ✓ | — | — | — | — | |
-| `CELERY_TASK_ACKS_LATE` | — | `true` | — | — | — | — | |
-| `CELERY_WORKER_MAX_MEMORY_PER_CHILD` / `CELERY_WORKER_MAX_TASKS_PER_CHILD` | — | `2621440` / `10` | — | — | — | — | |
-| `DISPLAY` | — | — | `""` (→ headless) | — | — | — | |
-| `NAVIGATE_MAX_CONCURRENT` / `NAVIGATE_MAX_QUEUE` | — | — | `2` / `2` | — | — | — | |
-| `PROXY_DATACENTER_*` / `PROXY_RESIDENTIAL_*` | — | — | secrets | — | — | — | |
-
-> **Service-name gotcha:** Railway private DNS is **lowercase hyphenated** — `file-master.railway.internal`, `browser-service.railway.internal` (underscored names won't resolve).
-
----
-
-## 6. Deployment order
-
-No `depends_on`; deploy in this order (retries handle races):
-
-1. **Postgres** → healthy.
+1. **Postgres** → healthy (enable PgBouncer).
 2. **Redis** → healthy.
 3. **file-master** → healthy (`/health`).
 4. **django** (Pre-Deploy: migrate + collectstatic).
-5. **browser_service** (healthcheck ~90s grace).
-6. **celery-worker** (`CELERY_TASK_ACKS_LATE=true`).
+5. **browser_service** (DISPLAY="" for headless; healthcheck 90s grace).
+6. **celery-worker** (`CELERY_TASK_ACKS_LATE=true`; volume at `/app/workspace`).
 7. **celery-beat** (after django migrated).
-8. **flower** (optional, last).
+8. **flower** (optional).
 
-Smoke test: submit a job → worker writes scraper_draft to File Master → browser_service reads it, runs, writes output to File Master → django proxies the output to the dashboard.
-
----
-
-## 7. Gotchas checklist
-
-- [ ] **File Master first** — build `file_master/` + `src/artifacts.py`, refactor ~30 path call sites to `artifacts.*`. Verify on **local compose** (with the new `file-master` service) end-to-end before touching Railway.
-- [ ] **`/scrape` takes `scraper_key`** — browser_service resolves via `artifacts.read()`, writes output via `artifacts.write()`.
-- [ ] **Django proxy view** `/api/artifact?key=…` → File Master (users never hit FM directly).
-- [ ] **Artifact pruning** — add `DELETE` endpoint + schedule cleanup so the volume doesn't grow unbounded.
-- [ ] **Headless Chrome** (`--headless=new`, `DISPLAY=""`); `/dev/shm` already mitigated.
-- [ ] **Static files** — add `whitenoise` (`DEBUG=False`).
-- [ ] **`runserver` → `gunicorn`**; migrate via Pre-Deploy.
-- [ ] **beat = 1 replica**, no autoscale/sleep.
-- [ ] **flower auth** — no public domain without `--basic-auth`.
-- [ ] **Postgres** — enable PgBouncer; metadata only (no blobs).
-- [ ] **`CELERY_TASK_ACKS_LATE=true`**.
-- [ ] **Service names hyphenated** (`file-master`, `browser-service`).
-- [ ] **REDIS health-view bug** — add `REDIS_URL` setting.
-- [ ] **Secrets** → Railway Secrets.
-- [ ] **Region pin** — Redis + worker + browser_service + file-master same region.
+Smoke test: submit a job → worker writes scraper_draft to local workspace → `run_scraper` POSTs source + `extra_files` to browser_service → browser_service returns `output_content` → worker writes output to local workspace → `_finalize_job` publishes output + scraper to FM → django serves from FM.
 
 ---
 
-## 8. Local dev — add the File Master, drop the shared bind mounts
+## Gotchas checklist
 
-Local compose now mirrors Railway: add a `file-master` service and point all services at it. This is a **local change** (you accepted it) — but it makes dev and prod architecturally identical.
+- [x] **File Master built + verified** — `file_master/` + `src/artifacts.py`, e2e verified (12 FM PUTs, django serving)
+- [x] **Stateless `/scrape`** — `scraper_source` + `extra_files` in body, `output_content` in response
+- [x] **`extra_files` staging** — input_urls.json + discovery_config.json staged alongside scraper in `/tmp`
+- [x] **Django proxy view** `/fm/artifact/<key>` — streams from FM (users never hit FM directly)
+- [x] **Artifact pruning** — keep newest 5 outputs per site (Phase 6)
+- [x] **Headless Chrome** — `--headless=new` + skip Xvfb when `DISPLAY=""` (commit `b7b20ac`)
+- [x] **Static files** — whitenoise installed + middleware active (commit `b7b20ac`)
+- [x] **REDIS_URL setting** — explicit `REDIS_URL` in settings.py (fixes health-view bug)
+- [ ] **`runserver` → `gunicorn`** — Dockerfile CMD is already gunicorn; ensure Pre-Deploy runs migrate
+- [ ] **beat = 1 replica** — set in Railway UI
+- [ ] **flower auth** — no public domain without `--basic-auth`
+- [ ] **Postgres PgBouncer** — enable in managed plugin settings
+- [ ] **Service names hyphenated** — `file-master`, `browser-service`
+- [ ] **Region pin** — all services in same region
+- [ ] **Worker volume** — mount at `/app/workspace` (persistent for in-flight jobs)
 
-```yaml
-# add to docker-compose.yml services:
-file-master:
-  profiles: ["full"]
-  build: ./file_master
-  volumes:
-    - ./shared-data:/data          # local artifact store
-  environment:
-    BROWSER_SERVICE_PORT: "8002"
-  ports:
-    - "8002:8002"
-  healthcheck:
-    test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
-    interval: 10s
-    retries: 3
+---
+
+## E2E verification results (job 196, adameve.com, search_term=toys)
+
 ```
-And on `django` / `celery-worker` / `browser_service` set `FILE_MASTER_URL=http://file-master:8002` (instead of the `.:/app` bind mount for `scrapers/`+`workspace/`). The bind mounts for those two trees can be removed once all call sites use `artifacts.*`.
+status=completed, product_count=20, platform=custom .NET (aspx)
+```
+
+**12 FM PUTs fired during the full pipeline run:**
+```
+PUT scrapers/adameve-com/scraper.py                    ✅ _promote_scraper
+PUT scrapers/adameve-com/jobs/scraper-196.py           ✅ per-job attribution
+PUT scrapers/adameve-com/jobs/dagster-196.py           ✅ _invoke_dagster_converter
+PUT scrapers/adameve-com/adameve-com_dagster.py        ✅ dagster production
+PUT scrapers/adameve-com/output_2026-07-29_*.json ×3   ✅ _finalize_job
+PUT scrapers/adameve-com/analysis/*.json ×5            ✅ _finalize_job + _preserve + skill_learner
+PUT scrapers/adameve-com/analysis/learning_report.json ✅ skill_learner
+```
+
+**Django served from FM (3 GETs):**
+```
+GET scrapers/adameve-com/jobs/scraper-196.py    ✅ scraper served to dashboard
+GET scrapers/adameve-com/jobs/dagster-196.py    ✅ dagster served
+GET scrapers/adameve-com/output_2026-07-29_*.json ✅ output served to dashboard
+```
+
+**Stateless `/scrape` invocations:**
+- code_writer self-tests (2 invocations, exit code 0 on the second after edit)
+- code_tester self-tests (2 invocations)
+- probe (--discover-only, rc=0)
+
+**No LLM timeouts** (product_analyzer ~3 min, code_writer ~12 min — both under 900s).
+
+---
+
+## Local dev — unchanged
 
 ```bash
-docker compose --profile full up --build        # local dev, now with file-master
+docker compose --profile full up --build
 ```
 
-Repo-side additions:
-- `file_master/` (app.py + Dockerfile + requirements.txt).
-- `src/artifacts.py` (HTTP client).
-- The path→`artifacts.*` refactor across ~30 call sites.
-- A Railway-only headless toggle in `browser_pool.py` (gated on `DISPLAY`).
-- `docker-compose.yml`: add the `file-master` service + `FILE_MASTER_URL` env on consumers.
-- This doc.
-
----
-
-## 9. Suggested follow-up tickets (post-migration)
-
-1. **`dj_database_url`** so consumers need only `DATABASE_URL`.
-2. **Per-replica browser_service** sharded by `site_slug` (services already separate).
-3. **Artifact retention** (auto-prune old File Master keys; size the volume with monitoring).
-4. **File Master auth** (a shared token on the API) if the private network isn't trusted enough.
-5. **Fix the Redis health-view** (`views.py`).
-6. **Swap File Master backend to S3** (if ever desired) — only `file_master/app.py` changes; call sites untouched.
+`docker-compose.yml` includes the `file-master` service + `FILE_MASTER_URL` on django + celery-worker. `workspace/` stays bind-mounted on the worker. browser_service has no `scrapers/`/`workspace` mounts (stateless). The code path is identical to Railway.
