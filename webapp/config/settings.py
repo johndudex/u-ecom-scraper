@@ -10,6 +10,27 @@ DEBUG_AUTO_LOGIN = config("DEBUG_AUTO_LOGIN", default=False)
 
 ALLOWED_HOSTS = config("ALLOWED_HOSTS", default="*").split(",")
 
+# Railway / reverse-proxy TLS. Railway terminates TLS at the proxy; Django sees
+# HTTP. Without SECURE_PROXY_SSL_HEADER, request.is_secure() is always False →
+# CSRF origin checks fail on every POST (login, job submit, approval) → 403.
+# Gated on DEBUG so local dev (HTTP, no proxy) is unaffected.
+if not DEBUG:
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    SECURE_SSL_REDIRECT = config("SECURE_SSL_REDIRECT", default=True, cast=bool)
+
+# CSRF — REQUIRED on Railway. Without CSRF_TRUSTED_ORIGINS, every form POST
+# (which is ALL views — @login_required) returns 403 Forbidden because Django
+# 5.x compares the Origin header against this list and ALLOWED_HOSTS does NOT
+# auto-populate it (that mapping was removed in Django 4.0). Set to your Railway
+# domain(s): https://yourapp.up.railway.app,https://custom.com
+_csrf_origins = [o.strip() for o in config("CSRF_TRUSTED_ORIGINS", default="").split(",") if o.strip()]
+if _csrf_origins:
+    CSRF_TRUSTED_ORIGINS = _csrf_origins
+
+# Cookie safety on TLS (opt-in — local HTTP dev stays unsecured)
+SESSION_COOKIE_SECURE = config("SESSION_COOKIE_SECURE", default=not DEBUG, cast=bool)
+CSRF_COOKIE_SECURE = config("CSRF_COOKIE_SECURE", default=not DEBUG, cast=bool)
+
 LOGIN_URL = "/accounts/login/"
 LOGIN_REDIRECT_URL = "/"
 
@@ -69,6 +90,13 @@ DATABASES = {
     }
 }
 
+# PgBouncer transaction-pooling friendly settings (Django 5.1+). Opt-in via
+# DB_USE_PGBOUNCER=true on Railway (managed Postgres with PgBouncer enabled).
+if config("DB_USE_PGBOUNCER", default=False, cast=bool):
+    DATABASES["default"]["CONN_MAX_AGE"] = None  # persistent connections
+    DATABASES["default"]["CONN_HEALTH_CHECKS"] = True
+    DATABASES["default"]["DISABLE_SERVER_SIDE_CURSORS"] = True
+
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "Asia/Kolkata"
 USE_I18N = True
@@ -87,6 +115,9 @@ CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = "UTC"
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
+# Explicit (Celery 5.0+ defaults True; make it loud so a future version flip
+# doesn't break Railway's parallel-startup where the worker boots before Redis).
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 # Phase 3 (Per-Phase Execution Contract) — worker recycling. Reclaims leaked
 # memory (abandoned threads, large contexts, aya's 26K-record parse) by warm-
 # recycling the worker after a task if its RSS exceeds the ceiling, or after N

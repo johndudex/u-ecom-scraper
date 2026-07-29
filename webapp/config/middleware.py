@@ -19,11 +19,14 @@ class DebugAutoLoginMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        # Gate on DEBUG_AUTO_LOGIN alone (not DEBUG) — pytest-django forces
-        # DEBUG=False during tests, which would otherwise disable auto-login.
-        # DEBUG_AUTO_LOGIN is the explicit opt-in flag (set in test_settings/dev
-        # env); production leaves it unset → False → middleware is a no-op there.
-        if getattr(settings, "DEBUG_AUTO_LOGIN", False):
+        # Security hardening: auto-login is allowed ONLY when DEBUG=True (dev)
+        # OR running under pytest (tests force DEBUG=False). On Railway
+        # (DEBUG=False, no pytest), even if DEBUG_AUTO_LOGIN is accidentally
+        # set to true, this guard blocks the backdoor.
+        import sys
+        if getattr(settings, "DEBUG_AUTO_LOGIN", False) and (
+            getattr(settings, "DEBUG", False) or "pytest" in sys.modules
+        ):
             if not isinstance(request.user, AnonymousUser):
                 return self.get_response(request)
 
