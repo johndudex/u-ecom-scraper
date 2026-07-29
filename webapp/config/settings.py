@@ -175,6 +175,11 @@ RESPECT_LISTING_REACHED_FLAG = config("RESPECT_LISTING_REACHED_FLAG", default=Tr
 # its getattr default, masking the intent). Override via env if needed.
 LLM_REQUEST_TIMEOUT = config("LLM_REQUEST_TIMEOUT", default=300, cast=int)
 PLAYWRIGHT_MCP_URL = config("PLAYWRIGHT_MCP_URL", default="http://browser_service:8111/sse")
+# Explicit BROWSER_SERVICE_URL — views.py reads getattr(settings, ...) for the
+# health dashboard + site_rerun. Without this, it falls through to the
+# underscored default ("browser_service:8001") which doesn't resolve on Railway
+# (Railway private DNS is hyphenated: "browser-service.railway.internal").
+BROWSER_SERVICE_URL = config("BROWSER_SERVICE_URL", default="http://browser_service:8001")
 # Scraper execution routing (browser_service-rework Step 3). Controls how
 # run_execution + the run_scraper tool dispatch a generated scraper:
 #   "auto" (default) — _needs_browser decides per-scraper (sniff imports).
