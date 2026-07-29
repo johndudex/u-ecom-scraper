@@ -91,7 +91,14 @@ Marked 🔒 = Railway Secret. Reference vars use `${{service.VAR}}` syntax.
 | `DJANGO_SETTINGS_MODULE` | `config.settings` | `config.settings` | — | — | `config.settings` | `config.settings` |
 | `DEBUG` | `False` | — | — | — | — | — |
 | `ALLOWED_HOSTS` | your `*.railway.app` domain | — | — | — | — | — |
+| `CSRF_TRUSTED_ORIGINS` | `https://yourapp.up.railway.app` | — | — | — | — | — |
 | `DJANGO_SUPERUSER_PASSWORD` | 🔒 (for initial createsuperuser) | — | — | — | — | — |
+| **Proxy / TLS** (auto-when DEBUG=False) | | | | | | |
+| `SECURE_SSL_REDIRECT` | `True` | — | — | — | — | — |
+| `SESSION_COOKIE_SECURE` | `True` (default !DEBUG) | — | — | — | — | — |
+| `CSRF_COOKIE_SECURE` | `True` (default !DEBUG) | — | — | — | — | — |
+| **PgBouncer** | | | | | | |
+| `DB_USE_PGBOUNCER` | `True` (when PgBouncer enabled) | `True` | — | — | `True` | `True` |
 | **Python** | | | | | | |
 | `PYTHONPATH` | `/app` | `/app` | `/app` | — | `/app` | `/app` |
 | **File Master** | | | | | | |
@@ -122,13 +129,35 @@ Marked 🔒 = Railway Secret. Reference vars use `${{service.VAR}}` syntax.
 | `PROXY_RESIDENTIAL_PORT` | — | — | `22225` | — | — | — |
 | `PROXY_RESIDENTIAL_USER` | — | — | 🔒 | — | — | — |
 | `PROXY_RESIDENTIAL_PASS` | — | — | 🔒 | — | — | — |
+| **LLM (Z.AI) — optional tuning** | | | | | | |
+| `ZAI_FALLBACK_MODEL` | — | `glm-5-turbo` (set ≠ primary for breaker) | — | — | — | — |
+| `LLM_REQUEST_TIMEOUT` | — | `300` | — | — | — | — |
+| `LLM_CIRCUIT_BREAKER_ENABLED` | — | `True` | — | — | — | — |
+| `LLM_CIRCUIT_BREAKER_THRESHOLD` | — | `4` | — | — | — | — |
+| `LLM_CIRCUIT_BREAKER_COOLDOWN` | — | `60` | — | — | — | — |
+| `LLM_CLASSIFIED_RETRY` | — | `True` | — | — | — | — |
+| `LLM_MAX_RETRIES` | — | `5` (only when classified=off) | — | — | — | — |
+| `LLM_TRUNCATION_MAX_CHARS` | — | `180000` | — | — | — | — |
+| **Celery task limits (optional)** | | | | | | |
+| `CELERY_TASK_SOFT_TIME_LIMIT` | — | `7200` (2h) | — | — | — | — |
+| `CELERY_TASK_TIME_LIMIT` | — | `7560` (2h6m) | — | — | — | — |
+| `CELERY_TASK_REJECT_ON_WORKER_LOST` | — | `False` | — | — | — | — |
+| **Worker scrape runtime (optional)** | | | | | | |
+| `EXECUTION_TIMEOUT` | — | `3600` | — | — | — | — |
+| `EXECUTION_STALL_TIMEOUT` | — | `300` | — | — | — | — |
+| `SCRAPER_EXECUTION_MODE` | — | `auto` | — | — | — | — |
 
 ### Variables NOT needed (common mistakes)
 - `FILE_MASTER_URL` on browser_service → ❌ browser_service is stateless, never imports artifacts
 - `ARTIFACT_STORAGE` → ❌ no dual-mode switch; FM is always HTTP
 - `S3_BUCKET` / `S3_ENDPOINT` → ❌ no external storage; FM uses a local volume
+- `DEBUG_AUTO_LOGIN` → ❌ no-op on Railway (hardened: requires `DEBUG=True` or pytest context)
 
-> **Service-name gotcha:** Railway private DNS is **lowercase hyphenated** — `file-master.railway.internal`, `browser-service.railway.internal`. Underscored names (`browser_service`) won't resolve.
+> **Service-name gotcha:** Railway private DNS is **lowercase hyphenated** — `file-master.railway.internal`, `browser-service.railway.internal`. Underscored names (`browser_service`) won't resolve. The code defaults (`BROWSER_SERVICE_URL`, `PLAYWRIGHT_MCP_URL`) use underscored names — the Railway env overrides are **required**, not optional.
+
+> **CSRF is the #1 silent killer.** Without `CSRF_TRUSTED_ORIGINS=https://yourapp.up.railway.app`, every form POST (login, job submit, approval) returns 403. Django 5.x removed the `ALLOWED_HOSTS`→`CSRF_TRUSTED_ORIGINS` auto-mapping. Set it explicitly.
+
+> **Pre-Deploy is mandatory.** The Dockerfile CMD is `gunicorn` only — no migrate, no collectstatic, no createsuperuser. Set the django service's **Pre-Deploy command** to: `python manage.py migrate --noinput && python manage.py collectstatic --noinput && python manage.py createsuperuser --noinput --username admin --email admin@example.com`
 
 ---
 
