@@ -1485,9 +1485,16 @@ def site_rerun(request, site_id):
         # Anti-bot/Akamai sites: route the scraper through CloakBrowser stealth.
         # Stateless /scrape: POST the scraper SOURCE (read from FM) + persist the
         # returned output back to FM.
+        # Read sibling files (input_urls.json, discovery_config.json) from FM for staging
+        _rerun_extra = {}
+        for _sf in ("input_urls.json", "discovery_config.json"):
+            _txt = _fm_read_text(f"scrapers/{site.slug}/{_sf}")
+            if _txt is not None:
+                _rerun_extra[_sf] = _txt
         scrape_json = {
             "scraper_source": _source,
             "scraper_name": os.path.basename(scraper_key),
+            "extra_files": _rerun_extra,
             "args": [],
             "timeout": 3600,
         }

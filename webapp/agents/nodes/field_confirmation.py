@@ -428,6 +428,21 @@ def _run_sample_in_process(scraper_path: str, args: list[str], cwd: str) -> str:
         return f"[error] {exc}"
 
 
+def _read_sibling_files(scraper_path: str) -> dict[str, str]:
+    """Read input_urls.json + discovery_config.json from the scraper's dir (for stateless /scrape staging)."""
+    extra: dict[str, str] = {}
+    d = os.path.dirname(scraper_path)
+    for f in ("input_urls.json", "discovery_config.json"):
+        p = os.path.join(d, f)
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                    extra[f] = fh.read()
+            except OSError:
+                pass
+    return extra
+
+
 def _run_sample_via_queue(scraper_path: str, args: list[str]) -> str:
     try:
         import httpx
@@ -447,6 +462,7 @@ def _run_sample_via_queue(scraper_path: str, args: list[str]) -> str:
             json={
                 "scraper_source": _source,
                 "scraper_name": os.path.basename(scraper_path),
+                "extra_files": _read_sibling_files(scraper_path),
                 "args": args,
                 "timeout": 300,
             },

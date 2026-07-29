@@ -300,11 +300,23 @@ def get_shell_tools(
                         _source = _f.read()
                 except OSError as exc:
                     return f"Error: could not read scraper source {full_path}: {exc}"
+                # Read sibling files (input_urls.json, discovery_config.json) for staging
+                _extra = {}
+                _ws_dir = os.path.dirname(full_path)
+                for _sf in ("input_urls.json", "discovery_config.json"):
+                    _sp = os.path.join(_ws_dir, _sf)
+                    if os.path.isfile(_sp):
+                        try:
+                            with open(_sp, "r", encoding="utf-8", errors="replace") as _fh:
+                                _extra[_sf] = _fh.read()
+                        except OSError:
+                            pass
                 resp = httpx.post(
                     f"{service_url}/scrape",
                     json={
                         "scraper_source": _source,
                         "scraper_name": os.path.basename(full_path),
+                        "extra_files": _extra,
                         "args": cmd_args,
                         "timeout": timeout,
                         "env_overrides": env_overrides,

@@ -737,11 +737,22 @@ def _run_via_browser_service(
                 "execution_status": "FAILED",
                 "error_message": f"Could not read scraper source {scraper_path}: {exc}",
             }
+        # Read sibling files (input_urls.json, discovery_config.json) for staging
+        _extra = {}
+        for _sf in ("input_urls.json", "discovery_config.json"):
+            _sp = os.path.join(os.path.dirname(scraper_path), _sf)
+            if os.path.isfile(_sp):
+                try:
+                    with open(_sp, "r", encoding="utf-8", errors="replace") as _fh:
+                        _extra[_sf] = _fh.read()
+                except OSError:
+                    pass
         resp = httpx.post(
             f"{service_url}/scrape",
             json={
                 "scraper_source": _source,
                 "scraper_name": os.path.basename(scraper_path),
+                "extra_files": _extra,
                 "args": args,
                 "timeout": timeout,
                 "env_overrides": stealth_env,

@@ -343,6 +343,10 @@ class ScrapeRequest(BaseModel):
     # and no File Master access.
     scraper_source: str
     scraper_name: str = "scraper.py"   # filename to stage as (for SCRIPT_DIR output naming)
+    # Sibling files the scraper reads (input_urls.json, discovery_config.json,
+    # etc.) — staged alongside the scraper in the same /tmp dir. Without these,
+    # url_list scrapers fail ("No such file: input_urls.json").
+    extra_files: Optional[dict[str, str]] = Field(default_factory=dict)
     args: Optional[list[str]] = Field(default_factory=list)
     timeout: int = Field(default=3600, ge=30, le=7200)
     env_overrides: Optional[dict[str, str]] = Field(default_factory=dict)
@@ -921,6 +925,12 @@ async def scrape(request: ScrapeRequest):
         try:
             with open(scraper_path, "w", encoding="utf-8") as f:
                 f.write(request.scraper_source or "")
+            # Stage sibling files (input_urls.json, discovery_config.json, etc.)
+            for fname, content in (request.extra_files or {}).items():
+                safe = os.path.basename(fname)  # no path traversal
+                if safe and safe != request.scraper_name:
+                    with open(os.path.join(run_dir, safe), "w", encoding="utf-8") as ef:
+                        ef.write(content)
         except OSError as exc:
             return JSONResponse(
                 status_code=500,
