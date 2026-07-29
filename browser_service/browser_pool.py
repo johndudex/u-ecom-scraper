@@ -33,7 +33,10 @@ class BrowserPool:
     def startup(self) -> dict:
         errors = []
 
-        self._start_xvfb(errors)
+        if DISPLAY:  # local compose: Xvfb + headed Chrome
+            self._start_xvfb(errors)
+        else:
+            logger.info("DISPLAY empty — running headless (no Xvfb, Railway mode)")
         self._start_mcp_chrome(errors)
         self._start_scraper_chrome(errors)
 
@@ -233,6 +236,8 @@ class BrowserPool:
                 f"--user-data-dir={CHROME_USER_DATA_DIR}/mcp",
                 "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             ]
+            if not DISPLAY:
+                args.append("--headless=new")
             self._mcp_chrome_proc = subprocess.Popen(
                 args,
                 stdout=subprocess.PIPE,
@@ -292,6 +297,8 @@ class BrowserPool:
                 "--window-size=1920,1080",
                 f"--user-data-dir={CHROME_USER_DATA_DIR}/scraper",
             ]
+            if not DISPLAY:
+                args.append("--headless=new")
             self._scraper_chrome_proc = subprocess.Popen(
                 args,
                 stdout=subprocess.PIPE,
