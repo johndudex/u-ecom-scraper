@@ -29,3 +29,4 @@ scrapers/test-*/
 scrapers/*/analysis/
 scripts/test_nav_*.py
 .opencode/node_modules/
+config/proxy.json
