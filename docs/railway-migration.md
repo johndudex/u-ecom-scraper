@@ -197,7 +197,7 @@ Marked 🔒 = Railway Secret. Reference vars use `${{service.VAR}}` syntax.
 - **`workspace/`** stays LOCAL — needs a Railway volume at `/app/workspace` (persistent for in-flight jobs across restarts).
 - **`scrapers/`** → File Master (no local volume needed for scrapers/).
 - **Replicas:** 1 (single shared browser_service Chrome).
-- **Healthcheck:** `celery -A config inspect ping -d celery@$(hostname) --timeout=10`, start_period 60s.
+- **Healthcheck:** `celery -A config inspect ping --timeout=10` (drop `-d celery@$(hostname)` — Railway's container hostname doesn't reliably match Celery's nodename), start_period 60s.
 - **Resources:** 8 GB / 4 vCPU (LLM agent contexts are RAM-heavy).
 
 ### browser_service (stateless)
