@@ -108,3 +108,4 @@ scrapers/**/*_dagster.py
 
 # CloakBrowser runtime .pth patch
 cloak_stealth.pth
+shared-data/
