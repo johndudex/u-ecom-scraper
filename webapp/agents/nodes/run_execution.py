@@ -364,6 +364,7 @@ def run_execution(state: ScrapeState) -> dict:
     return _run_in_process(
         scraper_path, args, root, site_folder, workspace_folder, job_id=job_id,
         env_overrides=_stealth_env(state),
+        listing_url_env=_listing_url_env,
     )
 
 
@@ -545,6 +546,7 @@ def _run_in_process(
     scraper_path: str, args: list[str], cwd: str, site_folder: str,
     workspace_folder: str = "", job_id: int = 0,
     env_overrides: dict[str, str] | None = None,
+    listing_url_env: str = "",
 ) -> dict[str, Any]:
     cmd = ["python3", scraper_path] + args
     start = time.time()
@@ -587,7 +589,7 @@ def _run_in_process(
                  # regardless of CLI flags (which code_writer may not declare). This
                  # bypasses the argparse + _filter_supported_args chain that silently
                  # suppresses discovery → output == seed count (the 1-item root cause).
-                 **({"SCRAPER_LISTING_URL": _listing_url_env} if _listing_url_env else {})},
+                 **({"SCRAPER_LISTING_URL": listing_url_env} if listing_url_env else {})},
             # Make the scraper its own process-group leader so a timeout/stall
             # kill can reach its Chrome grandchildren too. Without this, killpg
             # can't target them and proc.kill() only reaps the python3 child,
