@@ -1926,6 +1926,11 @@ def _summarize_test_report(state: dict) -> str:
     # regenerating from scratch (which reintroduces variance).
     strategy_error = report.get("strategy_error") if isinstance(report, dict) else None
     crash_error = report.get("crash_error") if isinstance(report, dict) else None
+    # code_tester nests crash info at script_checks.crash_error (not top-level).
+    if not crash_error and isinstance(report, dict):
+        _sc = report.get("script_checks")
+        if isinstance(_sc, dict):
+            crash_error = _sc.get("crash_error") or _sc.get("error_message")
     if strategy_error:
         lines.append(
             f"\n**⚠️ STRATEGY MISMATCH — rewrite using the correct strategy:**\n"

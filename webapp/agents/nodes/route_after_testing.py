@@ -111,6 +111,13 @@ def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
     Deterministic — used as a guard that can override code_tester's LLM diagnosis.
     """
     crash = (report.get("crash_error") or "") if isinstance(report, dict) else ""
+    # code_tester nests crash info at script_checks.crash_error (not top-level).
+    # Without this fallback, AttributeError tracebacks are invisible to the
+    # classifier → misclassified as "low quality" instead of "code error".
+    if not crash and isinstance(report, dict):
+        _sc = report.get("script_checks")
+        if isinstance(_sc, dict):
+            crash = _sc.get("crash_error") or _sc.get("error_message") or ""
     items = _extracted_item_count(report or {})
     is_timeout = bool(_TIMEOUT_RE.search(crash))
     is_blocked = bool(_BLOCKED_RE.search(crash))
@@ -171,17 +178,19 @@ def _is_dead_product(p: dict) -> bool:
 
 
 def _scraper_produced_valid_output(state: ScrapeState) -> bool:
-    report = state.get("test_report") or {}
-    sample_products = report.get("sample_products") or []
-    if not sample_products:
-        return False
-    live_products = [p for p in sample_products if not _is_dead_product(p)]
-    try:
-        from src.content_types import has_substantive_field
-        valid = [p for p in live_products if has_substantive_field(p)]
-    except Exception:
-        valid = [p for p in live_products if p.get("title") and p.get("price")]
-    return len(valid) > 0
+    """Did the scraper produce at least 1 valid item? (output-file-aware)
+
+    Previously read only ``report.sample_products`` — a field code_tester NEVER
+    populates (not in its prompt schema). The function could essentially never
+    return True. Now delegates to ``_scraper_has_real_items`` which has the
+    3-tier fallback: report → sample_output → output JSON files on disk.
+    """
+    # Adaptive min_count: url_list/list_page jobs extract from specific URLs —
+    # 1 real item with rich data IS a success. Navigation/search_term jobs need
+    # 3+ to prove discovery worked.
+    _mode = (state.get("input_mode") or "").strip()
+    _min = 1 if _mode in ("url_list", "list_page") else 3
+    return _scraper_has_real_items(state, min_count=_min)
 
 
 def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
@@ -370,6 +379,16 @@ def route_after_testing(state: ScrapeState) -> str:
 
     if not report:
         if is_final_attempt:
+            # Output-file rescue: even with no test_report, the scraper may have
+            # produced real output during testing. Under skip_approvals,
+            # field_confirmation goes straight to run_execution.
+            _rescue_min = 1 if (state.get("input_mode") or "") in ("url_list", "list_page") else 3
+            if _scraper_has_real_items(state, min_count=_rescue_min):
+                logger.info(
+                    "route_after_testing: no test_report (final) but output has real "
+                    "items → field_confirmation (rescue)"
+                )
+                return "field_confirmation"
             logger.error(
                 "route_after_testing: FINAL attempt produced no test_report → cleanup"
             )
@@ -381,6 +400,14 @@ def route_after_testing(state: ScrapeState) -> str:
                 MAX_TEST_RETRIES + 1,
             )
             return "scraper_analyzer"
+        # Retries exhausted with no test_report — check output files before giving up.
+        _rescue_min = 1 if (state.get("input_mode") or "") in ("url_list", "list_page") else 3
+        if _scraper_has_real_items(state, min_count=_rescue_min):
+            logger.info(
+                "route_after_testing: no test_report after %d retries but output has "
+                "real items → field_confirmation (rescue)"
+            )
+            return "field_confirmation"
         logger.error(
             "route_after_testing: no test_report after %d retries → cleanup",
             retry_count,
@@ -527,8 +554,17 @@ def route_after_testing(state: ScrapeState) -> str:
             return "field_confirmation"
         # For skip_approvals jobs (intake), human_approval auto-approves and
         # loops back to scraper_analyzer — creating an infinite retry cycle.
-        # Fail the job instead so the user can investigate + re-run with fixes.
+        # BUT: if the output files contain real items, route to field_confirmation
+        # (which under skip_approvals goes straight to run_execution — NOT a loop).
         if state.get("skip_approvals", False):
+            _rescue_min = 1 if (state.get("input_mode") or "") in ("url_list", "list_page") else 3
+            if _scraper_has_real_items(state, min_count=_rescue_min):
+                logger.info(
+                    "route_after_testing: retries exhausted (count=%d, reason=%s) but "
+                    "output has real items → field_confirmation (rescue, skip_approvals → run_execution)",
+                    retry_count, _reason,
+                )
+                return "field_confirmation"
             logger.error(
                 "route_after_testing: retries exhausted in cascade (count=%d, "
                 "action=%s, reason=%s) → FAIL (skip_approvals job, no human to break the loop)",

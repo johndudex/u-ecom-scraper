@@ -2582,6 +2582,11 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
     # makes a targeted fix (the read-only analyzer that authored critical_fix is gone).
     _tr = state.get("test_report") or {}
     _crash = (_tr.get("crash_error") or "") if isinstance(_tr, dict) else ""
+    # code_tester nests crash info at script_checks.crash_error (not top-level).
+    if not _crash and isinstance(_tr, dict):
+        _sc = _tr.get("script_checks")
+        if isinstance(_sc, dict):
+            _crash = _sc.get("crash_error") or _sc.get("error_message") or ""
     if _crash:
         analysis["critical_fix"] = {
             "issue": f"Previous scraper crashed: {str(_crash)[:300]}",
