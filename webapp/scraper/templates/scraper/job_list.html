@@ -52,6 +52,10 @@
                         <span class="text-line-strong">·</span>
                         <span>{{ job.platform }}</span>
                         {% endif %}
+                        {% if show_owner and job.user %}
+                        <span class="text-line-strong">·</span>
+                        <span class="text-accent">Owner: {{ job.user.username }}</span>
+                        {% endif %}
                     </div>
                 </div>
                 <div class="flex items-center gap-2 flex-shrink-0">

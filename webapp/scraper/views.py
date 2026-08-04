@@ -29,6 +29,21 @@ from .models import Approval, JobListing, ProbeCache, ScrapeJob, SessionLog, Sit
 logger = logging.getLogger(__name__)
 
 
+def _get_job(request, job_id):
+    """Fetch a ScrapeJob. Superusers can access ANY job (regardless of owner);
+    regular users can only access their own. Returns the job or raises Http404."""
+    if request.user.is_superuser:
+        return get_object_or_404(ScrapeJob, pk=job_id)
+    return get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+
+
+def _user_jobs(request):
+    """Return the job queryset: ALL jobs for superusers, own jobs for regular users."""
+    if request.user.is_superuser:
+        return ScrapeJob.objects.all()
+    return ScrapeJob.objects.filter(user=request.user)
+
+
 # ── File Master helpers (cross-service artifact store) ──────────────────────
 # Published artifacts (scrapers/{slug}/...) live in the File Master, not on a
 # shared disk. These wrappers keep views terse and centralize the locator logic.
@@ -169,7 +184,7 @@ def home(request):
             "form_currency": currency,
             "form_page_type": page_type,
             "form_search_criteria": search_criteria,
-            "recent_jobs": ScrapeJob.objects.filter(user=request.user)[:10],
+            "recent_jobs": _user_jobs(request)[:10],
             "content_types": content_types,
         }
 
@@ -216,13 +231,13 @@ def home(request):
         job.save(update_fields=["celery_task_id"])
         return redirect("job_detail", job_id=job.id)
 
-    recent_jobs = ScrapeJob.objects.filter(user=request.user)[:10]
+    recent_jobs = _user_jobs(request)[:10]
     return render(request, "scraper/home.html", {"recent_jobs": recent_jobs, "content_types": content_types})
 
 
 @login_required
 def job_list(request):
-    jobs = ScrapeJob.objects.filter(user=request.user).prefetch_related("steps", "approvals")[:]
+    jobs = _user_jobs(request).prefetch_related("steps", "approvals")[:]
     active_statuses = {
         ScrapeJob.STATUS_RUNNING,
         ScrapeJob.STATUS_WAITING_APPROVAL,
@@ -242,13 +257,14 @@ def job_list(request):
             "jobs": jobs,
             "is_active_dict": is_active_dict,
             "is_terminal_dict": is_terminal_dict,
+            "show_owner": request.user.is_superuser,
         },
     )
 
 
 @login_required
 def job_detail(request, job_id):
-    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    job = _get_job(request, job_id)
     steps = _ordered_steps(job)
     for step in steps:
         if step.started_at and step.completed_at:
@@ -349,6 +365,15 @@ def job_detail(request, job_id):
 
     db_site = Site.objects.filter(url=job.url.rstrip("/")).first() if job.url else None
 
+    # Owner info: surfaced when an admin is viewing another user's job.
+    is_admin = request.user.is_superuser
+    show_owner = is_admin and job.user_id and job.user_id != request.user.id
+    owner_display = None
+    if show_owner and job.user_id:
+        owner_display = job.user.get_username()
+        if job.user.email:
+            owner_display = f"{owner_display} ({job.user.email})"
+
     return render(
         request,
         "scraper/job_detail.html",
@@ -369,13 +394,15 @@ def job_detail(request, job_id):
             "sample_output": sample_output,
             "tool_calls": tool_calls,
             "tool_call_agents": tool_call_agents,
+            "show_owner": show_owner,
+            "owner_display": owner_display,
         },
     )
 
 
 @login_required
 def job_cancel(request, job_id):
-    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    job = _get_job(request, job_id)
     if job.status in [
         ScrapeJob.STATUS_PENDING,
         ScrapeJob.STATUS_RUNNING,
@@ -420,7 +447,7 @@ def _slug_candidates(job) -> list[str]:
 
 @login_required
 def scraper_code(request, job_id):
-    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    job = _get_job(request, job_id)
 
     # Per-job attribution: this job's own scraper (if recorded) wins over the
     # shared scrapers/{slug}/scraper.py (which later jobs may overwrite).
@@ -447,7 +474,7 @@ def scraper_code(request, job_id):
 @login_required
 def dagster_code(request, job_id):
     """Download the Dagster-format scraper ({slug}_dagster.py)."""
-    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    job = _get_job(request, job_id)
     # Per-job attribution first (this job's own dagster file).
     own = _resolve_stored_path(job.dagster_file)
     if own:
@@ -483,7 +510,7 @@ def _resolve_job_slug(job):
 
 @login_required
 def job_output_view(request, job_id, filename):
-    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    job = _get_job(request, job_id)
     safe_name = os.path.basename(filename)
     if not safe_name.endswith(".json"):
         raise Http404("Only JSON files can be viewed")
@@ -528,7 +555,7 @@ def job_output_view(request, job_id, filename):
 
 @login_required
 def job_output_download(request, job_id, filename):
-    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    job = _get_job(request, job_id)
     safe_name = os.path.basename(filename)
     if not safe_name.endswith(".json"):
         raise Http404("Only JSON files can be downloaded")
@@ -550,7 +577,7 @@ def job_output_download(request, job_id, filename):
 
 @login_required
 def job_restart(request, job_id):
-    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    job = _get_job(request, job_id)
     is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
     if job.status in [
         ScrapeJob.STATUS_COMPLETED,
@@ -625,7 +652,7 @@ def job_update(request, job_id):
     """
     if request.method != "POST" or request.headers.get("x-requested-with") != "XMLHttpRequest":
         return JsonResponse({"error": "POST + AJAX required"}, status=400)
-    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    job = _get_job(request, job_id)
     update_fields = []
 
     if "title" in request.POST:
@@ -779,7 +806,7 @@ def approval_detail(request, approval_id):
 
 @login_required
 def scraper_code_json(request, job_id):
-    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    job = _get_job(request, job_id)
     # Per-job attribution first; then the shared production scraper.
     key = _resolve_stored_path(job.scraper_file)
     if not key and job.site_folder:
@@ -912,7 +939,7 @@ def _job_run_history(job, limit: int = 15) -> list:
 
 @login_required
 def job_api(request, job_id):
-    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    job = _get_job(request, job_id)
     since_seq = int(request.GET.get("since_seq", 0))
     return JsonResponse(
         {
@@ -926,6 +953,9 @@ def job_api(request, job_id):
             # Intake-revision: display title + saved bookmark.
             "title": job.title,
             "is_saved": job.is_saved,
+            # Owner info (only populated when an admin is viewing another user's job).
+            "owner_username": (job.user.username if (request.user.is_superuser and job.user_id) else None),
+            "owner_email": (job.user.email if (request.user.is_superuser and job.user_id) else None),
             # Intake config (drives the Current Configuration panel on deep-link)
             "target_fields": list(job.target_fields or []),
             "input_mode": job.input_mode,
@@ -983,8 +1013,7 @@ def job_api(request, job_id):
 
 @login_required
 def job_logs_api(request, job_id):
-    get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
-    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    job = _get_job(request, job_id)
     since_seq = int(request.GET.get("since_seq", 0))
     logs = [
         {
@@ -1001,7 +1030,8 @@ def job_logs_api(request, job_id):
 
 @login_required
 def job_events(request, job_id):
-    get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    # Authorize: admins see any job, regular users only their own.
+    _get_job(request, job_id)
     terminal_states = {
         ScrapeJob.STATUS_COMPLETED,
         ScrapeJob.STATUS_FAILED,
@@ -1095,7 +1125,7 @@ def job_events(request, job_id):
 
 @login_required
 def job_resume(request, job_id):
-    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    job = _get_job(request, job_id)
 
     if request.method == "POST":
         try:
@@ -1134,7 +1164,7 @@ def job_resume(request, job_id):
 
 @login_required
 def tool_calls_api(request, job_id):
-    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    job = _get_job(request, job_id)
     agent_filter = request.GET.get("agent", "")
     qs = job.tool_call_logs.order_by("call_seq")
     if agent_filter:
@@ -1156,7 +1186,7 @@ def tool_calls_api(request, job_id):
 
 @login_required
 def agent_summary(request, job_id: int):
-    job = get_object_or_404(ScrapeJob, pk=job_id, user=request.user)
+    job = _get_job(request, job_id)
     agent_filter = request.GET.get("agent", "")
     logs = SessionLog.objects.filter(job=job)
     if agent_filter:
@@ -1380,7 +1410,7 @@ def site_edit(request, site_id):
 @login_required
 def site_detail(request, site_id):
     site = get_object_or_404(Site, pk=site_id)
-    jobs = ScrapeJob.objects.filter(url__iexact=site.url, user=request.user)
+    jobs = _user_jobs(request).filter(url__iexact=site.url)
     scraper_code = ""
     if site.default_scraper_path:
         scraper_code = _fm_read_text(site.default_scraper_path) or ""
@@ -2339,12 +2369,12 @@ def intake_jobs(request):
     Returns a flat list (the client groups for the Saved tab by site and filters
     on is_saved). Saved jobs are always included even if older.
     """
-    recent = list(ScrapeJob.objects.filter(user=request.user).order_by("-created_at")[:100])
+    recent = list(_user_jobs(request).order_by("-created_at")[:100])
     saved_ids = set(
-        ScrapeJob.objects.filter(is_saved=True, user=request.user).values_list("id", flat=True)
+        _user_jobs(request).filter(is_saved=True).values_list("id", flat=True)
     )
     # merge any saved jobs that fell outside the recent-100 window
-    extra = [j for j in ScrapeJob.objects.filter(is_saved=True, user=request.user).order_by("-created_at")
+    extra = [j for j in _user_jobs(request).filter(is_saved=True).order_by("-created_at")
              if j.id not in {j.id for j in recent}]
     jobs = recent + extra[:50]
 
@@ -2353,6 +2383,7 @@ def intake_jobs(request):
             return (j.completed_at - j.started_at).total_seconds()
         return None
 
+    is_admin = request.user.is_superuser
     data = [
         {
             "id": j.id,
@@ -2366,6 +2397,9 @@ def intake_jobs(request):
             "target_fields": j.target_fields or [],
             "input_mode": j.input_mode,
             "site_name": j.site_name,
+            # Owner info: only meaningful when an admin is viewing everyone's jobs.
+            "owner_username": j.user.username if (is_admin and j.user_id) else None,
+            "owner_email": j.user.email if (is_admin and j.user_id) else None,
         }
         for j in jobs
     ]

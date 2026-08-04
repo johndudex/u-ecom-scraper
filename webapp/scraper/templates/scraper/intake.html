@@ -781,7 +781,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     <div class="tab-panel" id="libtab-jobs" style="padding:18px 0 0;">
       <p class="lib-tab-desc">All the recent builder jobs — every extraction that's been run in this system, with its status and result.</p>
       <div class="tablewrap">
-        <table class="runs-table"><thead><tr><th>Job</th><th>Name</th><th>Site</th><th>When</th><th>Status</th><th>Records</th><th>Duration</th><th>Action</th></tr></thead><tbody id="jobs-lib-body"></tbody></table>
+        <table class="runs-table"><thead><tr><th>Job</th><th>Name</th><th>Site</th><th>Owner</th><th>When</th><th>Status</th><th>Records</th><th>Duration</th><th>Action</th></tr></thead><tbody id="jobs-lib-body"></tbody></table>
       </div>
     </div>
     <div class="tab-panel hidden" id="libtab-saved" style="padding:18px 0 0;">
@@ -1661,6 +1661,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       var det = [];
       if(j.site_name) det.push(['Site', j.site_name]);
       if(j.platform) det.push(['Platform', j.platform]);
+      if(j.owner_username) det.push(['Owner', j.owner_username + (j.owner_email ? ' ('+j.owner_email+')' : '')]);
       det.push(['Status', (j.status||'').replace(/_/g,' ')]);
       det.push(['Records', intakeState.recordsStr]);
       if(j.full_extraction!=null) det.push(['Mode', j.full_extraction?'Full':'Sample']);
@@ -2041,7 +2042,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     var body = X('#jobs-lib-body');
     if(!body) return;
     if(!ALL_JOBS.length){
-      body.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--faint);padding:14px;font-family:var(--sans)">No jobs yet.</td></tr>';
+      body.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--faint);padding:14px;font-family:var(--sans)">No jobs yet.</td></tr>';
       return;
     }
     body.innerHTML = ALL_JOBS.map(function(j){
@@ -2051,10 +2052,11 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       var dur = (j.duration_seconds!=null) ? fmtDur(j.duration_seconds) : '—';
       var when = relativeWhen(j.created_at);
       var name = j.title || ('Job #'+j.id);
+      var owner = j.owner_username ? escHtml(j.owner_username) : '<span class="text-muted">—</span>';
       return '<tr><td class="rmono">#'+j.id+'</td>'
         + '<td><span class="rename-wrap"><span class="rename-text">'+escHtml(name)+'</span>'
         +   '<button class="rename-btn" type="button" data-id="'+j.id+'" title="Rename" aria-label="Rename job">'+icoEditSm()+'</button></span></td>'
-        + '<td class="rmono">'+escHtml(siteOf(j))+'</td><td>'+escHtml(when)+'</td>'
+        + '<td class="rmono">'+escHtml(siteOf(j))+'</td><td class="rmono">'+owner+'</td><td>'+escHtml(when)+'</td>'
         + '<td><span class="'+statusClass+'">'+escHtml(status)+'</span></td>'
         + '<td class="rmono">'+recs+'</td><td class="rmono">'+dur+'</td>'
         + '<td><button class="mini-btn" type="button" data-open-job="'+j.id+'">Open</button></td></tr>';

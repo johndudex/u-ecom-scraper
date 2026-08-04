@@ -26,6 +26,9 @@
             {% if job.product_url %}
             <p class="text-ink-muted text-xs mt-0.5 font-mono">Listing: {{ job.product_url|truncatechars:60 }}</p>
             {% endif %}
+            {% if show_owner %}
+            <p class="text-xs mt-0.5"><span class="inline-block px-2 py-0.5 rounded bg-accent/10 text-accent font-medium">Admin view</span> <span class="text-ink-muted">Created by {{ owner_display }}</span></p>
+            {% endif %}
         </div>
         <div class="flex items-center gap-2.5 flex-wrap">
             <span class="status-badge status-{{ job.status }}" id="hero-status">{{ job.get_status_display }}</span>

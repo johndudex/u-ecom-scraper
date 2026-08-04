@@ -1,8 +1,11 @@
 from model_bakery import baker
+from django.contrib.auth import get_user_model
 from django.test import TestCase, Client
 from django.urls import reverse
 
 from scraper.models import Approval, ScrapeJob
+
+User = get_user_model()
 
 
 class TestHomeView(TestCase):
@@ -166,3 +169,76 @@ class TestJobAPIView(TestCase):
         self.assertEqual(data["url"], "https://example.com")
         self.assertIn("steps", data)
         self.assertIn("approvals", data)
+
+
+class TestAdminJobVisibility(TestCase):
+    """Admins (superusers) can see EVERY job and who created it; regular users
+    only see their own. Covers the /intake/?job=N deep-link case where the admin
+    was previously 404-blocked from a job another user created."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(username="owner", password="pw", email="owner@example.com")
+        self.other = User.objects.create_user(username="other", password="pw")
+        self.admin = User.objects.create_superuser(username="admin", password="pw", email="admin@example.com")
+        # Job created by `owner` — the one an admin deep-links into.
+        self.job = baker.make(ScrapeJob, url="https://example.com", user=self.owner)
+        # A job belonging to `other`, to confirm cross-user isolation.
+        self.other_job = baker.make(ScrapeJob, url="https://other.com", user=self.other)
+
+    def test_regular_user_blocked_from_others_job(self):
+        c = Client()
+        c.force_login(self.other)
+        resp = c.get(reverse("job_detail", kwargs={"job_id": self.job.id}))
+        self.assertEqual(resp.status_code, 404)
+
+    def test_regular_user_sees_own_job(self):
+        c = Client()
+        c.force_login(self.owner)
+        resp = c.get(reverse("job_detail", kwargs={"job_id": self.job.id}))
+        self.assertEqual(resp.status_code, 200)
+
+    def test_admin_sees_others_job(self):
+        c = Client()
+        c.force_login(self.admin)
+        resp = c.get(reverse("job_detail", kwargs={"job_id": self.job.id}))
+        self.assertEqual(resp.status_code, 200)
+        # Owner info is surfaced to the admin viewer.
+        self.assertContains(resp, "Admin view")
+        self.assertContains(resp, "Created by owner")
+
+    def test_admin_api_returns_owner(self):
+        c = Client()
+        c.force_login(self.admin)
+        resp = c.get(reverse("job_api", kwargs={"job_id": self.job.id}))
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["owner_username"], "owner")
+        self.assertEqual(data["owner_email"], "owner@example.com")
+
+    def test_regular_api_hides_owner(self):
+        c = Client()
+        c.force_login(self.owner)
+        resp = c.get(reverse("job_api", kwargs={"job_id": self.job.id}))
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        # A regular user viewing their own job gets no owner fields.
+        self.assertIsNone(data["owner_username"])
+
+    def test_admin_intake_jobs_lists_all(self):
+        c = Client()
+        c.force_login(self.admin)
+        resp = c.get(reverse("intake_jobs"))
+        self.assertEqual(resp.status_code, 200)
+        ids = {j["id"] for j in resp.json()["jobs"]}
+        self.assertIn(self.job.id, ids)
+        self.assertIn(self.other_job.id, ids)
+
+    def test_regular_intake_jobs_lists_own_only(self):
+        c = Client()
+        c.force_login(self.owner)
+        resp = c.get(reverse("intake_jobs"))
+        self.assertEqual(resp.status_code, 200)
+        ids = {j["id"] for j in resp.json()["jobs"]}
+        self.assertIn(self.job.id, ids)
+        self.assertNotIn(self.other_job.id, ids)
+
