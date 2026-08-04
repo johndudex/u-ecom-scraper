@@ -881,6 +881,45 @@ def normalize_separators(text: str, sep="; ") -> str:
 awards) where `<br>` tags create multi-line content within single `<li>` elements. This is a
 general BeautifulSoup pattern, not site-specific.
 
+## Learned: Videowise Shopify app emits VideoObject JSON-LD blocks that dilute Product discovery
+**Source:** https://zquiet.com (2026-08-04)
+**Applicability:** any Shopify store using the Videowise (or similar video) app that injects per-video JSON-LD blocks.
+
+The Videowise Shopify app injects one `<script type="application/ld+json">` block per product video, each with `@type: "VideoObject"`. On a product page with 6 videos, this produces 6 VideoObject blocks before the actual Product block. Naive extraction that grabs the "first" JSON-LD block or iterates without type filtering will hit a VideoObject instead of Product, causing all field extraction to fail or return video data instead of product data.
+
+**Observed:** zquiet.com has 7 JSON-LD blocks — first 6 are VideoObject (videowise), last is Product.
+
+**Guard:** Always filter JSON-LD blocks by `@type === "Product"` rather than grabbing the first block or assuming only one block exists. This is already the recommended practice in the Disambiguation Strategy section above, but this example illustrates why it's critical:
+
+```python
+product_block = None
+for block in json_ld_blocks:
+    if block.get("@type") == "Product":
+        product_block = block
+        break  # or continue to find one with offers
+```
+
+**Detection heuristic:** If you see multiple JSON-LD blocks and the count seems high (5+), check if some have `@type: "VideoObject"`. The Product block is typically the last one.
+
+## Learned: aggregateRating may be an array instead of a single object
+**Source:** https://zquiet.com (2026-08-04)
+**Applicability:** any site where JSON-LD `aggregateRating` is emitted as an array `[{...}]` instead of the standard single object `{...}`.
+
+Per schema.org, `aggregateRating` should be a single `AggregateRating` object. Some Shopify themes emit it as an array with one element: `"aggregateRating": [{"ratingValue": "4.66", "reviewCount": "989"}]`. Code that accesses `block["aggregateRating"]["ratingValue"]` will raise `TypeError: list indices must be integers, not str`.
+
+**Guard:** Always check if `aggregateRating` is a list and unwrap it:
+
+```python
+ar = product_block.get("aggregateRating")
+if isinstance(ar, list):
+    ar = ar[0] if ar else None
+if ar and isinstance(ar, dict):
+    rating = ar.get("ratingValue", "")
+    review_count = ar.get("reviewCount", "")
+```
+
+**Note:** This pattern also applies to other JSON-LD fields that may be arrays with a single element (e.g., `offers` is already documented as potentially being an array).
+
 ## When NOT to Use
 
 - No `<script type="application/ld+json">` on the page
