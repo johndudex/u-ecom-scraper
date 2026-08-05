@@ -15,6 +15,35 @@ Job 250 succeeded (14 products) but took **~23 min** because `code_writer` ballo
 
 **The recommended fix is NOT summarization and NOT iteration caps.** It is **behavioral** (stop code_writer re-emitting the whole file every turn + detect convergence) plus **cheap deterministic state-shaping** (retain the seed message + a last-error stub). See §5–§7.
 
+## ⚠️ CRITICAL FINDING (2026-08-05 follow-up investigation) — the truncator is a runtime NO-OP
+
+An attempt to ship the "safe subset" (honest `_clen` + seed retention) on an `optimisation` branch, plus a 3-agent adversarial review, surfaced a load-bearing fact that **reframes this entire analysis**:
+
+**`_truncate_messages` does NOT actually shrink what the LLM sees.** It is wired as a langgraph `pre_model_hook` and returns `{"messages": kept}`. Per the langgraph contract (`langgraph/prebuilt/chat_agent_executor.py:396-421`, verified in the running container), a pre-model hook that returns `messages` is merged into state via the `add_messages` reducer — which **appends/updates-by-ID, never replaces** unless you return `[RemoveMessage(id=REMOVE_ALL_MESSAGES), *new]`. `_get_model_input_state` then reads `state["messages"]` (post-merge). Concretely:
+- Messages **dropped** by Step 2 are never removed from state → the LLM still sees them.
+- Step 1's `_trim` constructs **new no-ID message objects** → they get **appended** (the list *grows*).
+- The "Truncated messages: 68 → 7" log lines report what the function **computed**, not what the model **received**.
+
+**Evidence:** langgraph source (above) + an empirical `CapturingModel` test (a >200k input came back to the model at 208k = originals + appended trimmed copy) + the 2026-08-05 local e2e (adameve job 200): `code_writer` ballooned to **446k chars / 68 messages** with the new `seed_retained=True` log firing repeatedly — and each LLM call was slow (minutes), consistent with the model receiving the **full** 446k, not a bounded ~50k view.
+
+**Consequence — the "amnesia" framing (Gap 2) is wrong.** The LLM was never losing the seed or recent turns; it was receiving the **full ballooned context every call**. So the ballooning is a pure **latency/cost** problem (huge per-call input → slow, expensive LLM calls), **not** an amnesia/correctness problem. (Consistent with: job 250 succeeded with 14 products despite the ballooning.)
+
+**The "safe subset" (honest `_clen`, seed retention, headroom-skip) are therefore no-ops too** — they improve the *computed* list that the hook discards. They were implemented, unit-tested (8 tests), run through a real `code_writer` (job 200, no crash), and 3× adversarially reviewed (all clean for regressions) — then **reverted** on the `optimisation` branch because shipping no-ops as a fix is misleading. The work is in git history if needed for the real fix.
+
+### The real fix (and why it's NOT a quick change)
+
+Switch the hook's return to the langgraph-blessed mechanism:
+```python
+return {"llm_input_messages": kept}   # shapes the model input WITHOUT mutating state["messages"]
+```
+`_get_model_input_state` reads `llm_input_messages` first, so the model sees `kept` while the react loop's accumulation is untouched. **But naive application is dangerous**, so this was NOT shipped autonomously:
+1. **Step 1's 8k per-msg cap would go live** → it would cap the **25–35k `build_code_writer_message` seed to 8k** → catastrophic loss of the task/strategy/field-map. The seed MUST be exempted from the per-msg cap (or the cap raised) before this path is enabled.
+2. **Pairing**: once Step 2 actually drops messages, the fill loop can **orphan a `ToolMessage`** (keep it while dropping its `AIMessage`) → Z.AI/OpenAI HTTP 400 "an assistant message with 'tool_calls' must be found before a 'tool' message". `_validate_chat_history` only checks AI→Tool, not Tool→AI, so it won't catch it. The drop must be pair-aware (drop ToolMessages whose `tool_call_id` isn't backed by a kept AIMessage).
+3. **Broad blast radius**: making Step 1 live affects **every** agent that uses the hook (site_analyzer, product_analyzer, …) — any >8k message (e.g. product_analyzer page snapshots, site_analyzer probe HTML) would be capped for the model. Needs a per-agent audit of large-message needs.
+4. **Latency-vs-quality tradeoff**: bounding the view (fast/cheap) risks dropping context the agent needs (quality). The seed-exemption mitigates the biggest risk, but this is a real tradeoff that needs the user's call + staged rollout behind the `LLM_TRUNCATION_MODE='off'` kill-switch.
+
+**Recommended next step (for the user):** implement `llm_input_messages` + seed-exemption + pair-safe drop, default ON with the `LLM_TRUNCATION_MODE='off'` kill-switch as instant rollback, and validate on a ballooning site (zquiet/adameve) comparing both latency AND output quality (record count + field coverage) before/after. This is a real behavior change — do not ship without measuring quality, not just speed.
+
 ## Symptom (job 250 evidence)
 
 Celery logs (`ForkPoolWorker-2`), one `code_writer` invocation:
