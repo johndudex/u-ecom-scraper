@@ -665,6 +665,26 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
         <label class="field-label">Fields to extract</label>
         <div class="chips" id="cfg-chips" aria-label="fields to extract (current configuration)"></div>
         <input type="text" id="cfg-field-input" placeholder="Add a field, press Enter" aria-label="add a field (current configuration)">
+        <div class="schema-block cfg-schema-block" style="margin-top:11px;">
+          <div class="seg" id="cfg-schema-mode" role="group" aria-label="field input mode (current configuration)" style="margin-bottom:9px;">
+            <button class="on" data-mode="fields" type="button">Fields</button>
+            <button data-mode="schema" type="button">JSON schema</button>
+          </div>
+          <div class="hidden" id="cfg-schema-input-area">
+            <div class="add-input-box">
+              <textarea id="cfg-schema-json-input" placeholder='Paste a JSON schema, e.g.&#10;{ "type": "object", "properties": { "title": { "type": "string" }, "price": { "type": "number" } } }&#10;…or the internal { "fields": [ { "name": "title" } ] }' aria-label="paste JSON schema (current configuration)" rows="5"></textarea>
+              <div class="add-input-actions">
+                <label class="icon-btn" id="cfg-schema-file-label" title="Upload a .json schema file" aria-label="upload schema file">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+                  <input type="file" id="cfg-schema-file" hidden accept=".json,application/json">
+                </label>
+                <div class="file-status" id="cfg-schema-file-status"><span class="hint" style="margin:0">Upload a .json file, or paste it above</span></div>
+              </div>
+            </div>
+            <p class="url-error hidden" id="cfg-schema-error" role="alert"></p>
+            <p class="hint hidden" id="cfg-schema-ok"></p>
+          </div>
+        </div>
       </div>
 
       <div class="cfg-block cfg-nav-block">
@@ -884,43 +904,52 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
   // On a valid schema the server returns derived field names; we populate the
   // shared chips (fieldsArr), so every downstream gate/POST works unchanged.
   var schemaMode = 'fields';
-  var currentSchema = null;          // last validated raw text (advisory POST on create)
+  var currentSchema = null;          // last validated raw text (advisory; POSTed as schema_text)
   var schemaValidateTimer = null;
 
-  function setSchemaMode(mode){
+  // Schema input lives on TWO surfaces: screen-1 #fields-block (scope '') and the
+  // dashboard #cfg-panel (scope 'cfg-'). Both drive the SAME currentSchema + chips.
+  function _sid(scope){ return (scope ? '#'+scope : '#'); }  // '' -> '#', 'cfg-' -> '#cfg-'
+  function setSchemaMode(mode, scope){
+    scope = scope || '';
     schemaMode = mode;
-    var seg = X('#schema-mode');
+    var p = _sid(scope);
+    var seg = X(p+'schema-mode');
     if(seg) seg.querySelectorAll('button').forEach(function(b){
       b.classList.toggle('on', b.dataset.mode === mode);
     });
-    var area = X('#schema-input-area');
-    var fieldInput = X('#field-input');
+    var area = X(p+'schema-input-area');
+    var fieldInput = X(p+'field-input');
     if(area) area.classList.toggle('hidden', mode !== 'schema');
     if(fieldInput) fieldInput.classList.toggle('hidden', mode === 'schema');
-    if(mode !== 'schema') clearSchemaMsg();
+    if(mode !== 'schema') clearSchemaMsg(scope);
     if(typeof refreshRunSampleGate === 'function') refreshRunSampleGate();
   }
-  function clearSchemaMsg(){
-    var e = X('#schema-error'); if(e){ e.classList.add('hidden'); e.textContent=''; }
-    var o = X('#schema-ok'); if(o){ o.classList.add('hidden'); o.textContent=''; }
-    var ta = X('#schema-json-input'); if(ta) ta.classList.remove('input-invalid');
+  function clearSchemaMsg(scope){
+    var p = _sid(scope || '');
+    var e = X(p+'schema-error'); if(e){ e.classList.add('hidden'); e.textContent=''; }
+    var o = X(p+'schema-ok'); if(o){ o.classList.add('hidden'); o.textContent=''; }
+    var ta = X(p+'schema-json-input'); if(ta) ta.classList.remove('input-invalid');
   }
-  function showSchemaError(msg){
-    var e = X('#schema-error'); if(!e) return;
+  function showSchemaError(msg, scope){
+    var p = _sid(scope || '');
+    var e = X(p+'schema-error'); if(!e) return;
     e.textContent = msg; e.classList.remove('hidden');
-    var o = X('#schema-ok'); if(o) o.classList.add('hidden');
-    var ta = X('#schema-json-input'); if(ta) ta.classList.add('input-invalid');
+    var o = X(p+'schema-ok'); if(o) o.classList.add('hidden');
+    var ta = X(p+'schema-json-input'); if(ta) ta.classList.add('input-invalid');
     if(typeof refreshRunSampleGate === 'function') refreshRunSampleGate();
   }
-  function showSchemaOk(msg){
-    var o = X('#schema-ok'); if(!o) return;
+  function showSchemaOk(msg, scope){
+    var p = _sid(scope || '');
+    var o = X(p+'schema-ok'); if(!o) return;
     o.textContent = msg; o.classList.remove('hidden');
-    var e = X('#schema-error'); if(e) e.classList.add('hidden');
-    var ta = X('#schema-json-input'); if(ta) ta.classList.remove('input-invalid');
+    var e = X(p+'schema-error'); if(e) e.classList.add('hidden');
+    var ta = X(p+'schema-json-input'); if(ta) ta.classList.remove('input-invalid');
     if(typeof refreshRunSampleGate === 'function') refreshRunSampleGate();
   }
-  function validateSchemaText(text){
-    if(!text || !text.trim()){ clearSchemaMsg(); currentSchema=null; return; }
+  function validateSchemaText(text, scope){
+    scope = scope || '';
+    if(!text || !text.trim()){ clearSchemaMsg(scope); currentSchema=null; return; }
     var fd = new FormData();
     fd.append('schema_text', text);
     postJSON(INTAKE_CONFIG.validateSchemaUrl, fd).then(function(data){
@@ -930,45 +959,58 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
         currentSchema = text;
         var n = (data.derived_fields||[]).length;
         var extra = data.detected_content_type ? (' — looks like '+data.detected_content_type) : '';
-        showSchemaOk('Valid schema — '+n+' field'+(n===1?'':'s')+' added'+extra+'.');
+        showSchemaOk('Valid schema — '+n+' field'+(n===1?'':'s')+' added'+extra+'.', scope);
       } else {
         currentSchema = null;
         var errs = (data.issues||[]).filter(function(i){ return i.severity!=='warning'; });
         var warns = (data.issues||[]).filter(function(i){ return i.severity==='warning'; });
         var msg = errs.map(function(i){ return i.message; }).join(' ');
         if(warns.length) msg = (msg?msg+' ':'') + warns.map(function(i){ return i.message; }).join(' ');
-        showSchemaError(msg || 'Schema is invalid.');
+        showSchemaError(msg || 'Schema is invalid.', scope);
       }
-    }).catch(function(){ showSchemaError('Could not validate the schema (network error).'); });
+    }).catch(function(){ showSchemaError('Could not validate the schema (network error).', scope); });
   }
-  // mode toggle
-  var schemaSeg = X('#schema-mode');
-  if(schemaSeg) schemaSeg.addEventListener('click', function(e){
-    var b = e.target.closest('button[data-mode]'); if(!b) return;
-    setSchemaMode(b.dataset.mode);
-  });
-  // paste/typing → debounced validation
-  var schemaTa = X('#schema-json-input');
-  if(schemaTa) schemaTa.addEventListener('input', function(){
-    clearTimeout(schemaValidateTimer);
-    var v = this.value;
-    schemaValidateTimer = setTimeout(function(){ validateSchemaText(v); }, 250);
-  });
-  // file upload → read as text, drop into the textarea, run the same validation path
-  var schemaFile = X('#schema-file');
-  if(schemaFile) schemaFile.addEventListener('change', function(){
-    var f = this.files && this.files[0]; this.value = '';
-    if(!f) return;
-    var reader = new FileReader();
-    reader.onload = function(){
-      var text = String(reader.result||'');
-      var ta = X('#schema-json-input'); if(ta) ta.value = text;
-      var st = X('#schema-file-status');
-      if(st) st.innerHTML = '<span class="file-chip"><span class="fc-name" title="'+f.name+'">'+f.name+'</span></span>';
-      validateSchemaText(text);
-    };
-    reader.readAsText(f);
-  });
+  // Reset the schema UI for a scope (used by #restart + navigation).
+  function resetSchema(scope){
+    scope = scope || '';
+    var p = _sid(scope);
+    var ta = X(p+'schema-json-input'); if(ta) ta.value = '';
+    var st = X(p+'schema-file-status');
+    if(st) st.innerHTML = '<span class="hint" style="margin:0">Upload a .json file, or paste it above</span>';
+    clearSchemaMsg(scope);
+  }
+  // Wire one schema surface (scope '' = screen-1, 'cfg-' = dashboard panel).
+  function wireSchema(scope){
+    scope = scope || '';
+    var p = _sid(scope);
+    var seg = X(p+'schema-mode');
+    if(seg) seg.addEventListener('click', function(e){
+      var b = e.target.closest('button[data-mode]'); if(!b) return;
+      setSchemaMode(b.dataset.mode, scope);
+    });
+    var ta = X(p+'schema-json-input');
+    if(ta) ta.addEventListener('input', function(){
+      clearTimeout(schemaValidateTimer);
+      var v = this.value;
+      schemaValidateTimer = setTimeout(function(){ validateSchemaText(v, scope); }, 250);
+    });
+    var fi = X(p+'schema-file');
+    if(fi) fi.addEventListener('change', function(){
+      var f = this.files && this.files[0]; this.value = '';
+      if(!f) return;
+      var reader = new FileReader();
+      reader.onload = function(){
+        var text = String(reader.result||'');
+        var t = X(p+'schema-json-input'); if(t) t.value = text;
+        var st = X(p+'schema-file-status');
+        if(st) st.innerHTML = '<span class="file-chip"><span class="fc-name" title="'+f.name+'">'+f.name+'</span></span>';
+        validateSchemaText(text, scope);
+      };
+      reader.readAsText(f);
+    });
+  }
+  wireSchema('');       // screen-1 #fields-block
+  wireSchema('cfg-');   // dashboard #cfg-panel
 
   /* ---------- detect config changes since the job was last run ---------- */
   var configBaseline = null;
@@ -1170,6 +1212,10 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg> Done'
       : '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 013 3L12 15l-4 1 1-4z"/></svg> Edit';
     X('#cfg-field-input').disabled = !editable;
+    var cfgSchemaTa = X('#cfg-schema-json-input'); if(cfgSchemaTa) cfgSchemaTa.readOnly = !editable;
+    var cfgSchemaFile = X('#cfg-schema-file'); if(cfgSchemaFile) cfgSchemaFile.disabled = !editable;
+    var cfgSchemaSeg = X('#cfg-schema-mode');
+    if(cfgSchemaSeg) cfgSchemaSeg.querySelectorAll('button').forEach(function(b){ b.disabled = !editable; });
     document.querySelectorAll('input[name="cfg-nav"]').forEach(function(r){ r.disabled = !editable; });
     ['cfg-list-text','cfg-listing-text','cfg-search-url','cfg-search-kw'].forEach(function(id){
       var el = X('#'+id); if(el) el.readOnly = !editable;
@@ -1755,6 +1801,17 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
           clearChips();
           j.target_fields.forEach(function(f){ addChip(f); });
         }
+        // Re-hydrate the JSON schema (dashboard cfg-panel). Clear any stale schema
+        // from a previous job first, then restore this job's schema if it had one.
+        currentSchema = null;
+        resetSchema('cfg-'); resetSchema('');
+        if(j.schema_text){
+          var csta = X('#cfg-schema-json-input'); if(csta) csta.value = j.schema_text;
+          currentSchema = j.schema_text;
+          setSchemaMode('schema', 'cfg-');
+        } else {
+          setSchemaMode('fields', 'cfg-');
+        }
         var navmap={url_list:'list', list_page:'listing', navigation:'listing', search_term:'search'};
         var m=navmap[j.input_mode];
         if(m){ setNavMethod(m); }
@@ -1942,6 +1999,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     // picks up the user's field/nav edits (without this, the new job would
     // copy the OLD job's config and silently drop the edits).
     fd.append('target_fields', fieldsArr.join(','));
+    if(currentSchema) fd.append('schema_text', currentSchema);  // persist schema on the new (re-run) job
     var navMethod = (document.querySelector('input[name=cfg-nav]:checked')||{}).value || '';
     if(navMethod==='search'){
       fd.append('search_criteria', X('#cfg-search-kw').value);
@@ -2214,10 +2272,9 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     listFileState = null; renderListFileChip();
     listingFileState = null; renderListingFileChip();
     currentSchema = null;
-    setSchemaMode('fields');
-    var _ta = X('#schema-json-input'); if(_ta) _ta.value = '';
-    var _st = X('#schema-file-status'); if(_st) _st.innerHTML = '<span class="hint" style="margin:0">Upload a .json file, or paste it above</span>';
-    clearSchemaMsg();
+    setSchemaMode('fields');           // screen-1
+    setSchemaMode('fields', 'cfg-');   // dashboard panel
+    resetSchema(''); resetSchema('cfg-');
     X('#rerun-box').classList.add('hidden');
     X('#rerun-toggle').setAttribute('aria-expanded','false');
     X('#schedule-box').classList.add('hidden');

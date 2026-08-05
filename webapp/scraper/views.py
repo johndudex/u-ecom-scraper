@@ -613,6 +613,7 @@ def job_restart(request, job_id):
             target_fields=_tf,
             scope=_post_or_old("scope", job.scope),
             scope_value=_post_or_old("scope_value", job.scope_value),
+            schema_text=_post_or_old("schema_text", job.schema_text or ""),
             notes=(rerun_prompt or _post_or_old("notes", job.notes)),
             full_extraction=job.full_extraction,
             skip_approvals=job.skip_approvals,
@@ -966,6 +967,7 @@ def job_api(request, job_id):
             "scope": job.scope,
             "scope_value": job.scope_value,
             "notes": job.notes,
+            "schema_text": job.schema_text or "",
             "product_count": job.product_count,
             "output_file": job.output_file,
             "site_folder": job.site_folder,
@@ -2345,15 +2347,16 @@ def intake_create_job(request):
         else []
     )
 
-    # Defensive re-validation: if a raw schema was posted alongside the derived
-    # chips, gate on it so the endpoint can't be bypassed with an invalid schema.
-    # Normal flow posts only the derived target_fields (no schema_text), so this
-    # is a no-op for the happy path.
+    # Defensive re-validation + persistence: if a raw schema was posted, validate
+    # it (gate) AND keep it so the dashboard deep-link / re-run can re-display it.
+    # The derived field names (target_fields) are what the pipeline enforces; the
+    # raw schema_text is advisory (re-display only).
     schema_raw = request.POST.get("schema_text", "")
     schema_upload = request.FILES.get("schema_file")
+    schema_text = ""
     if schema_raw or schema_upload:
-        raw = schema_upload.read().decode("utf-8", errors="replace") if schema_upload else schema_raw
-        result = validate_user_schema(raw)
+        schema_text = schema_upload.read().decode("utf-8", errors="replace") if schema_upload else schema_raw
+        result = validate_user_schema(schema_text)
         if not result.valid:
             return JsonResponse(
                 {"error": "Schema invalid", "issues": [i.message for i in result.errors]},
@@ -2371,6 +2374,7 @@ def intake_create_job(request):
         scope=scope,
         scope_value=scope_value,
         notes=notes,
+        schema_text=schema_text,
         full_extraction=False,  # "sample" mode
         skip_approvals=True,  # intake jobs run unattended — skip approval gates
         user=request.user,

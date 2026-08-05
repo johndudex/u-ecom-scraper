@@ -165,6 +165,11 @@ class ScrapeJob(models.Model):
     scope = models.CharField(max_length=20, blank=True, default="")
     scope_value = models.CharField(max_length=200, blank=True, default="")
     notes = models.TextField(blank=True, default="")
+    # The raw JSON schema the user pasted/uploaded on /intake (byte-exact round-trip
+    # for re-display on the dashboard deep-link + re-run). Advisory to the pipeline —
+    # only the derived field names (target_fields) are enforced; types/nesting are
+    # flattened. [intake-ui]
+    schema_text = models.TextField(blank=True, default="")
     # search_term jobs: the search results page URL the user entered (distinct
     # from `search_criteria`, which holds the keywords). [intake-ui]
     search_url = models.URLField(max_length=1000, blank=True, default="")
