@@ -1263,6 +1263,42 @@ def _user_requirements_section(state: dict) -> str:
     )
 
 
+def _render_nested_node(name: str, node: dict, indent: str) -> list[str]:
+    """Render one nested-schema node as a shape line (+ recursive children)."""
+    t = node.get("type", "text")
+    children = node.get("children") or {}
+    if not children:
+        return [f"{indent}- {name} ({t})"]
+    kind = "array of objects" if t == "list" else "object"
+    lines = [f"{indent}- {name} ({kind}):"]
+    for ck, cn in children.items():
+        lines.extend(_render_nested_node(ck, cn, indent + "  "))
+    return lines
+
+
+def _nested_schema_section(state: dict) -> str:
+    """Surface the nested JSON-Schema SHAPE to code_writer so it emits nested
+    objects/arrays (variants:[{size,color}], address:{city,zip}) instead of
+    flattening. Only for nested-schema jobs; "" otherwise. Types are shape hints
+    only — NOT enforced."""
+    tree = state.get("nested_schema")
+    if not tree:
+        return ""
+    lines = ["### Nested Schema — PRESERVE STRUCTURE"]
+    lines.append("The user's schema contains nested fields. Emit each in the EXACT shape below:")
+    for name, node in tree.items():
+        lines.extend(_render_nested_node(name, node, ""))
+    lines.append(
+        "\n**Do NOT flatten nested children into top-level keys.** For an object field, "
+        "emit a dict with its sub-fields; for an array-of-objects field, emit a list of "
+        "dicts each with its sub-fields. If the page exposes the data nested (JSON-LD, "
+        "embedded JSON), preserve that structure. The output is pruned to this shape, so "
+        "flattened fields (e.g. `variants_size` instead of `variants:[{size}]`) WILL BE "
+        "DROPPED. Types are shape hints only — not validated.\n"
+    )
+    return "\n".join(lines) + "\n"
+
+
 def build_product_analyzer_message(state: dict) -> list:
     slug = state.get("site_slug", "unknown")
     url = state.get("url", "")
@@ -3081,6 +3117,9 @@ def build_code_writer_message(state: dict) -> list:
     _user_req = _user_requirements_section(state)
     if _user_req:
         content = _user_req + content
+    _nested = _nested_schema_section(state)
+    if _nested:
+        content = _nested + content
     # Reinforce template-fidelity for discovery/pagination (prevents execution-time
     # crashes that --sample testing can't see — e.g. session.url phantom attributes).
     content = (

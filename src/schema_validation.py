@@ -129,6 +129,94 @@ def validate_user_schema(raw: str | bytes | dict[str, Any]) -> SchemaValidationR
     return _finalize(shape, names, issues)
 
 
+def parse_nested_schema(raw: str | bytes | dict[str, Any]) -> dict[str, dict] | None:
+    """Parse a user schema into a NESTED tree ``{field: {type, children}}`` that
+    preserves object/array nesting (``validate_user_schema`` flattens by design).
+
+    Returns ``None`` unless the input is a *standard* JSON Schema whose
+    ``properties`` contain at least one nested field (object with ``properties``
+    or array-of-objects via ``items.properties``). Flat schemas, manual field
+    chips, internal/flat_map/array shapes, and anything malformed → ``None`` so
+    the pipeline stays on the byte-identical flat path. Never raises.
+
+    Node shape: ``{"type": str, "children": {subfield: node}}``; ``children``
+    is ``{}`` for leaves. Bounded by ``MAX_NESTING_DEPTH``; reuses the size /
+    remote-``$ref`` / depth guards.
+    """
+    if isinstance(raw, dict):
+        doc: Any = raw
+    else:
+        text = _to_text(raw)
+        if _parse_and_size(text, []):
+            return None
+        doc = _parse_json(text, [])
+        if doc is None:
+            return None
+    if not isinstance(doc, dict) or _detect_shape(doc) != "standard":
+        return None
+    props = doc.get("properties")
+    if not isinstance(props, dict) or not props:
+        return None
+    # Security/depth guards (validate_user_schema already enforced at intake;
+    # be defensive since this can run on re-parsed schema_text).
+    _issues: list[SchemaIssue] = []
+    _reject_remote_refs(doc, _issues)
+    if _object_depth(doc) > MAX_NESTING_DEPTH:
+        return None
+
+    tree = {name: _walk_node(sub, 1) for name, sub in props.items() if isinstance(name, str) and name}
+    # STRICT discriminator (the C2 BLOCKER): only return a tree when there is
+    # actual nesting to preserve. A purely flat schema → None → flat path.
+    if not any(_node_has_children(n) for n in tree.values()):
+        return None
+    return tree
+
+
+def _walk_node(sub: Any, depth: int) -> dict:
+    """Build one {type, children} node from a JSON-Schema sub-schema."""
+    node: dict[str, Any] = {"type": "text", "children": {}}
+    if not isinstance(sub, dict):
+        return node
+    t = sub.get("type")
+    recurse_ok = depth < MAX_NESTING_DEPTH
+
+    # object with properties → recurse
+    sub_props = sub.get("properties")
+    if (t == "object" or isinstance(sub_props, dict)) and isinstance(sub_props, dict) and sub_props and recurse_ok:
+        node["type"] = "object"
+        node["children"] = {k: _walk_node(v, depth + 1) for k, v in sub_props.items() if isinstance(k, str) and k}
+        return node
+
+    # array of objects → recurse into items.properties
+    if t == "array" and isinstance(sub.get("items"), dict):
+        items = sub["items"]
+        iprops = items.get("properties")
+        if (items.get("type") == "object" or isinstance(iprops, dict)) and isinstance(iprops, dict) and iprops and recurse_ok:
+            node["type"] = "list"
+            node["children"] = {k: _walk_node(v, depth + 1) for k, v in iprops.items() if isinstance(k, str) and k}
+            return node
+        node["type"] = "list"  # array of scalars (or items without properties)
+        return node
+
+    if t == "array":
+        node["type"] = "list"
+        return node
+
+    # scalar (handle ["string","null"]-style unions by taking the first non-null)
+    if isinstance(t, list):
+        t = next((x for x in t if x != "null"), "string")
+    node["type"] = _JS_TYPE_TO_INTERNAL.get(t if isinstance(t, str) else "string", "text")
+    return node
+
+
+def _node_has_children(node: dict) -> bool:
+    """True if this node or any descendant carries nested children."""
+    children = node.get("children") or {}
+    if children:
+        return True
+    return False
+
+
 # ── structural helpers ───────────────────────────────────────────────────────
 def _to_text(raw: str | bytes | dict[str, Any]) -> str:
     if isinstance(raw, bytes):

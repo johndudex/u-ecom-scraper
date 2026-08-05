@@ -45,6 +45,11 @@ class ScrapeState(TypedDict, total=False):
     content_type_config: dict[str, Any]
     search_criteria: str
     output_schema: dict[str, Any]
+    # Nested schema tree {field: {type, children}} from job.schema_text (only when
+    # the user supplied a nested JSON Schema). None/empty for manual field-chip /
+    # flat-schema / legacy jobs → flat pipeline path. Advisory to product_analyzer
+    # / code_writer; drives recursive output pruning. See src.schema_validation.
+    nested_schema: dict[str, Any]
 
     # ── Tracker ────────────────────────────────────────────────────────
     site_slug: str

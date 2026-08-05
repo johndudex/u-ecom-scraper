@@ -349,6 +349,50 @@ def resolve_allowed_fields(
     return set(names) | set(BOOKKEEPING_FIELDS)
 
 
+def _prune_value(value, node):
+    """Prune ``value`` to the shape described by a nested-schema ``node``.
+
+    ``node`` is ``{type, children}`` (from ``schema_validation.parse_nested_schema``).
+    - node with non-empty ``children``:
+        * dict value  → keep only keys in children, recurse each
+        * list value  → apply the SAME node to each element (array-of-objects)
+        * scalar/etc  → return unchanged (type mismatch: never crash, never null-fill)
+    - leaf/missing/malformed node → return value unchanged (opaque blob).
+    Builds fresh dicts/lists; never mutates input.
+    """
+    children = (node or {}).get("children") if isinstance(node, dict) else None
+    if not children:
+        return value  # leaf / unconstrained → opaque blob
+    if isinstance(value, dict):
+        return {k: _prune_value(v, children[k]) for k, v in value.items() if k in children}
+    if isinstance(value, list):
+        return [_prune_value(elem, node) for elem in value]  # array: each element gets the item shape
+    return value  # schema says nested but value is scalar → keep verbatim
+
+
+def prune_record_to_schema(record, allowed, schema_nested=None, bookkeeping=BOOKKEEPING_FIELDS):
+    """Prune one output record. ``allowed`` is the top-level authority (the flat
+    ``target_fields`` ∪ bookkeeping set from ``resolve_allowed_fields`` — this is
+    the C4 fix: target_fields drives top-level admission, so chip edits always
+    win over a stale schema_text). ``schema_nested`` (optional tree from
+    ``schema_validation.parse_nested_schema``) supplies the recursive shape —
+    inner-prune only for keys present in BOTH ``allowed`` and the tree.
+
+    ``allowed`` falsy/None → no prune (extract-everything / schema-less jobs).
+    Record is NEVER dropped — only keys/branches filtered. No null-fill.
+    """
+    if not isinstance(record, dict) or not allowed:
+        return record
+    keep_top = set(allowed) | set(bookkeeping)
+    out = {}
+    for k, v in record.items():
+        if k not in keep_top:
+            continue
+        node = schema_nested.get(k) if schema_nested else None
+        out[k] = _prune_value(v, node) if node is not None else v
+    return out
+
+
 def count_items_in_output(data: dict) -> int:
     """Count items in an output JSON, trying all known output keys.
 

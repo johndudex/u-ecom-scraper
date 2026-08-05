@@ -114,7 +114,9 @@ def _find_latest_output(slug: str, root: str) -> str | None:
     return candidates[-1] if candidates else None
 
 
-def _format_output_products(output_path: str, output_key: str = "products") -> str:
+def _format_output_products(output_path: str, output_key: str = "products",
+                            allowed: set[str] | None = None,
+                            schema_nested: dict | None = None) -> str:
     try:
         with open(output_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -130,6 +132,17 @@ def _format_output_products(output_path: str, output_key: str = "products") -> s
     if not items:
         return "(scraper produced 0 items)"
 
+    # DISPLAY-ONLY prune: work on shallow copies so the on-disk workspace file
+    # (read by route_after_testing as ground truth) is never mutated. When a
+    # schema is present the sample then shows the same field-set + nested shape
+    # the final output will have.
+    if allowed or schema_nested:
+        try:
+            from src.content_types import prune_record_to_schema
+            items = [prune_record_to_schema(dict(p), allowed, schema_nested) for p in items]
+        except Exception:
+            pass
+
     meta = data.get("metadata", {})
     label = output_key.rstrip("s")
     lines = [
@@ -139,23 +152,33 @@ def _format_output_products(output_path: str, output_key: str = "products") -> s
         "",
     ]
 
-    universal_fields = ["title", "url", "status_code", "remarks"]
-    product_fields = ["price", "original_price", "availability", "currency", "brand", "sku"]
-    all_display_fields = universal_fields + product_fields
-
-    for i, p in enumerate(items[:5], 1):
-        lines.append(f"--- {label.title()} {i} ---")
-        for field in all_display_fields:
-            val = p.get(field, "")
-            if val:
-                val_str = str(val)[:120]
-                lines.append(f"  {field}: {val_str}")
-        for field in ["author", "company", "location", "salary", "publish_date", "content", "rank", "snippet", "description"]:
-            val = p.get(field, "")
-            if val:
-                val_str = str(val)[:120]
-                lines.append(f"  {field}: {val_str[:80]}")
-        lines.append("")
+    # When a schema is present, render each item's ACTUAL surviving keys (so the
+    # preview matches the output, including nested fields). Otherwise keep the
+    # hardcoded field list (byte-identical to legacy behavior).
+    if allowed or schema_nested:
+        for i, p in enumerate(items[:5], 1):
+            lines.append(f"--- {label.title()} {i} ---")
+            for field, val in p.items():
+                if val:
+                    lines.append(f"  {field}: {str(val)[:120]}")
+            lines.append("")
+    else:
+        universal_fields = ["title", "url", "status_code", "remarks"]
+        product_fields = ["price", "original_price", "availability", "currency", "brand", "sku"]
+        all_display_fields = universal_fields + product_fields
+        for i, p in enumerate(items[:5], 1):
+            lines.append(f"--- {label.title()} {i} ---")
+            for field in all_display_fields:
+                val = p.get(field, "")
+                if val:
+                    val_str = str(val)[:120]
+                    lines.append(f"  {field}: {val_str}")
+            for field in ["author", "company", "location", "salary", "publish_date", "content", "rank", "snippet", "description"]:
+                val = p.get(field, "")
+                if val:
+                    val_str = str(val)[:120]
+                    lines.append(f"  {field}: {val_str[:80]}")
+            lines.append("")
 
     return "\n".join(lines)[:4000]
 
@@ -202,6 +225,16 @@ def field_confirmation(state: ScrapeState) -> Command:
 
     ct_config = state.get("content_type_config", {})
     output_key = ct_config.get("output_key", "products") if ct_config else "products"
+
+    # Schema conformance for the approval sample (display-only). When the user
+    # gave a schema, prune a COPY so the preview matches the final output's
+    # field-set + nested shape. allowed=None when no target_fields → show all.
+    try:
+        from src.content_types import resolve_allowed_fields
+        _fc_allowed = resolve_allowed_fields(state.get("target_fields") or [], state.get("output_schema") or {})
+    except Exception:
+        _fc_allowed = None
+    _fc_nested = state.get("nested_schema") or None
 
     if state.get("sample_only", False):
         job_id = state.get("job_id", 0)
@@ -256,7 +289,7 @@ def field_confirmation(state: ScrapeState) -> Command:
             output_file = _find_latest_output(slug, root)
             if output_file:
                 logger.info("field_confirmation: reading output file %s", output_file)
-                sample_text = _format_output_products(output_file, output_key)
+                sample_text = _format_output_products(output_file, output_key, allowed=_fc_allowed, schema_nested=_fc_nested)
     elif os.path.isfile(input_path):
         cmd_args = [
             "--input",
@@ -277,7 +310,7 @@ def field_confirmation(state: ScrapeState) -> Command:
             output_file = _find_latest_output(slug, root)
             if output_file:
                 logger.info("field_confirmation: reading output file %s", output_file)
-                sample_text = _format_output_products(output_file, output_key)
+                sample_text = _format_output_products(output_file, output_key, allowed=_fc_allowed, schema_nested=_fc_nested)
     else:
         logger.info(
             "field_confirmation: input_urls.json not found, reading latest output"
@@ -293,7 +326,7 @@ def field_confirmation(state: ScrapeState) -> Command:
             logger.info(
                 "field_confirmation: reading output file %s", output_file
             )
-            sample_text = _format_output_products(output_file, output_key)
+            sample_text = _format_output_products(output_file, output_key, allowed=_fc_allowed, schema_nested=_fc_nested)
         else:
             sample_text = ""
 

@@ -518,6 +518,18 @@ def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
             for f in _target_fields
         ]
 
+    # Nested schema tree (only when the user supplied a nested JSON Schema).
+    # Drives recursive output pruning + is surfaced to code_writer so it emits
+    # nested extraction. None for manual field-chip / flat-schema / legacy jobs.
+    _nested_schema = None
+    if job.schema_text:
+        try:
+            from src.schema_validation import parse_nested_schema
+            _nested_schema = parse_nested_schema(job.schema_text)
+        except Exception as exc:
+            logger.warning("Job %s: nested schema parse failed: %s", job.id, exc)
+            _nested_schema = None
+
     return {
         "job_id": job.id,
         "url": job.url,
@@ -533,6 +545,7 @@ def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
         "content_type_config": content_type_config,
         "search_criteria": search_criteria,
         "output_schema": output_schema,
+        "nested_schema": _nested_schema,
         # Intake-UI knobs (advisory; surfaced to product_analyzer / code_writer).
         "target_fields": list(job.target_fields or []),
         "scope": job.scope or "",
@@ -568,8 +581,10 @@ def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _prune_output_to_schema(output_file: str, allowed: set[str]) -> bool:
-    """Drop any per-record key not in ``allowed`` from the output JSON.
+def _prune_output_to_schema(output_file: str, allowed: set[str], schema_nested: dict | None = None) -> bool:
+    """Drop any per-record key not in ``allowed`` from the output JSON; when
+    ``schema_nested`` (a nested tree from ``parse_nested_schema``) is present,
+    also inner-prune nested objects/arrays to the schema's children.
 
     Operates on the first top-level key whose value is a list of dicts (the
     records — e.g. ``products``/``jobs``); top-level ``site``/``metadata`` are
@@ -580,6 +595,7 @@ def _prune_output_to_schema(output_file: str, allowed: set[str]) -> bool:
     local path for the workspace-phase case.
     """
     import src.artifacts as artifacts
+    from src.content_types import prune_record_to_schema
 
     data = None
     try:
@@ -595,11 +611,13 @@ def _prune_output_to_schema(output_file: str, allowed: set[str]) -> bool:
     pruned = False
     for key, val in list(data.items()):
         if isinstance(val, list) and val and isinstance(val[0], dict):
-            before = set(val[0].keys())
-            data[key] = [
-                {k: v for k, v in rec.items() if k in allowed} for rec in val
-            ]
-            if set(data[key][0].keys()) != before:
+            before = [set(rec.keys()) for rec in val]
+            if schema_nested:
+                data[key] = [prune_record_to_schema(rec, allowed, schema_nested) for rec in val]
+            else:
+                data[key] = [{k: v for k, v in rec.items() if k in allowed} for rec in val]
+            # C5 fix: detect change across ALL records, not just the first.
+            if any(set(rec.keys()) != pre for rec, pre in zip(data[key], before)):
                 pruned = True
             break  # only the records list
     if pruned:
@@ -862,10 +880,12 @@ def _finalize_job(job: ScrapeJob) -> None:
             logger.warning("Job %d: schema resolve failed: %s", job.id, exc)
 
     # Deterministic prune — the guarantee that the output matches the schema,
-    # regardless of what the agents extracted.
+    # regardless of what the agents extracted. Pass the nested tree (if any) for
+    # recursive inner-pruning of objects/arrays.
     if _allowed_fields and job.output_file:
         try:
-            _prune_output_to_schema(job.output_file, _allowed_fields)
+            _nested = final_state.get("nested_schema") or None
+            _prune_output_to_schema(job.output_file, _allowed_fields, _nested)
         except Exception as exc:
             logger.warning("Job %d: schema prune failed: %s", job.id, exc)
 
