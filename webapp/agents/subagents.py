@@ -530,24 +530,29 @@ def _trunc_settings():
 
 
 def _truncate_messages(input_dict: dict) -> dict:
-    """Pre-model hook: **deterministic** context truncation (no LLM calls).
+    """Pre-model hook: deterministic context truncation that the LLM ACTUALLY sees.
 
-    Phase 2 (Per-Phase Execution Contract): replaces the prior
-    ``headroom.compress``-based hook, which (a) made a SYNC z.ai call inside the
-    ONLY cancellation path — defeating ``asyncio.wait_for`` in Phase 4 (the P0
-    precondition) — and (b) added run-to-run non-determinism (LLM summarization
-    varies between runs, a contributor to codegen variance). This version is
-    purely deterministic:
+    Returns ``{"llm_input_messages": kept}`` (NOT ``{"messages": kept}``). Per the
+    langgraph ``pre_model_hook`` contract, returning ``messages`` is merged into
+    state via ``add_messages`` (append/update-by-ID) and never replaces — so the
+    model kept seeing the full ballooned history and this hook was a no-op for
+    shrinking. Returning ``llm_input_messages`` instead is read FIRST by
+    ``_get_model_input_state`` and used directly as the model input, WITHOUT
+    mutating ``state["messages"]`` (so the react loop's accumulation is untouched).
 
-    1. **Trim oversized messages in place** to a head+tail preview (per-msg cap,
-       default 8000). Prevents one huge tool/page dump from blowing the budget —
-       the old "drop oldest" step hit the "15→0 amnesia" bug (one message >
-       budget → the loop broke immediately → ALL conversation history lost).
-    2. **If still over budget**, drop OLDEST non-system messages while ALWAYS
-       retaining the most recent N, so the agent never loses its last few turns.
+    Behavior:
+    1. **Trim oversized NON-seed messages** to a head+tail preview (per-msg cap,
+       default 8000). The seed (first HumanMessage: task/strategy/field-map) is
+       NEVER trimmed — capping a 25–35k seed to 8k destroys the task spec.
+    2. **If still over budget**, keep system + seed + the most recent N messages,
+       dropping oldest. ``_clen`` counts ``tool_calls`` too, so write_file/edit_file
+       args (the ballooning driver) are measured honestly.
+    3. **Pair-safe drop**: a ``ToolMessage`` whose ``AIMessage`` was dropped is
+       removed, else the provider returns HTTP 400 ("assistant message with
+       tool_calls must be found before a tool message").
 
     No network, no LLM, no variance. Kill-switch ``LLM_TRUNCATION_MODE='off'`` →
-    no-op (emergency rollback to pre-truncation behavior).
+    no-op (returns the input verbatim = exact rollback to pre-fix behavior).
     """
     mode, max_chars, per_msg_cap = _trunc_settings()
     if mode == "off":
@@ -558,11 +563,21 @@ def _truncate_messages(input_dict: dict) -> dict:
         return input_dict
 
     _MIN_KEEP_RECENT = 6  # always retain the most recent N non-system messages
+    seed = next((m for m in messages if getattr(m, "type", "") == "human"), None)
 
     def _clen(m) -> int:
-        return len(str(m.content)) if hasattr(m, "content") else 0
+        # Count tool_calls too: an AIMessage whose .content is "" but which carries
+        # a large write_file/edit_file arg is otherwise invisible to the budget.
+        # READ-ONLY — we never mutate tool_calls.
+        n = len(str(m.content)) if hasattr(m, "content") else 0
+        tc = getattr(m, "tool_calls", None)
+        if tc:
+            n += len(str(tc))
+        return n
 
     def _trim(m):
+        if m is seed:
+            return m  # NEVER cap the seed (task/strategy/field-map)
         content = str(m.content) if hasattr(m, "content") else ""
         if len(content) <= per_msg_cap:
             return m
@@ -582,7 +597,7 @@ def _truncate_messages(input_dict: dict) -> dict:
 
     before_total = sum(_clen(m) for m in messages)
 
-    # Step 1: deterministically trim oversized messages in place.
+    # Step 1: deterministically trim oversized non-seed messages in place.
     trimmed = [_trim(m) for m in messages]
     total = sum(_clen(m) for m in trimmed)
     if total <= max_chars:
@@ -591,30 +606,52 @@ def _truncate_messages(input_dict: dict) -> dict:
                 "truncate: deterministically trimmed oversized messages (%d → %d chars)",
                 before_total, total,
             )
-        return {"messages": trimmed}
+        return {"llm_input_messages": trimmed}
 
-    # Step 2: still over budget — drop oldest non-system, keep system + recent N.
+    # Step 2: still over budget — keep system + seed + recent N.
     system_msgs = [m for m in trimmed if hasattr(m, "type") and m.type == "system"]
     other = [m for m in trimmed if not (hasattr(m, "type") and m.type == "system")]
     kept_recent = other[-_MIN_KEEP_RECENT:] if len(other) > _MIN_KEEP_RECENT else list(other)
 
     budget = max_chars - sum(_clen(m) for m in system_msgs)
+    if seed is not None:
+        budget -= _clen(seed)  # reserve room for the seed we'll prepend
+
     selected = []
     acc = 0
     for m in reversed(kept_recent):
+        if seed is not None and m is seed:
+            continue  # seed is prepended separately; don't double-count
         ml = _clen(m)
         if acc + ml > budget:
             break
         selected.append(m)
         acc += ml
     selected.reverse()  # back to chronological order
-    kept = system_msgs + selected
+    kept = system_msgs + ([seed] if seed is not None else []) + selected
+
+    # Pair-safe: drop any ToolMessage whose tool_call_id isn't backed by a kept
+    # AIMessage (otherwise the provider rejects the history with HTTP 400).
+    opened = set()
+    pair_safe = []
+    for m in kept:
+        tcid = getattr(m, "tool_call_id", None)
+        if tcid:
+            if tcid in opened:
+                pair_safe.append(m)
+            # else: orphaned ToolMessage — drop
+        else:
+            for tc in (getattr(m, "tool_calls", None) or []):
+                if isinstance(tc, dict) and tc.get("id"):
+                    opened.add(tc["id"])
+            pair_safe.append(m)
+    kept = pair_safe
 
     logger.info(
-        "Truncated messages: %d → %d (was %d chars, budget %d, deterministic)",
-        len(messages), len(kept), total, budget,
+        "Truncated messages: %d → %d (was %d chars, budget %d, seed_retained=%s)",
+        len(messages), len(kept), total, budget, seed is not None,
     )
-    return {"messages": kept}
+    return {"llm_input_messages": kept}
 
 
 def _build_agent(agent_name: str, site_slug: str = "", use_create_agent: bool = False, template_code: str = "") -> object:
