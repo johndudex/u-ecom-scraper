@@ -50,6 +50,13 @@ For each product in the output, check each field against `product_analysis.json 
 
 **You do NOT need to fetch any live pages.** The product-analyzer already verified what exists on the page. Your job is to check that the scraper correctly extracted it.
 
+**Nested-schema shape check:** If the user's schema contains nested fields (objects/arrays — check the message for a "Nested Schema" section), verify the output has the **nested structure**, not flattened keys. For example, if the schema says `variants: [{size, color}]`:
+- ✅ Correct: `"variants": [{"size": "M", "color": "red"}]` (nested list of objects)
+- ❌ Wrong: `"variants_size": "M", "variants_color": "red"` (flattened — these will be DROPPED by the output prune → data loss)
+- ❌ Wrong: `"variants": "M / red"` (string instead of list of objects)
+
+If you see flattened or wrong-shape output for a nested field, add a `high` severity issue: `"Nested field '{field}' is flattened/wrong shape — emit as {expected shape} per the Nested Schema section"` so code-writer fixes it on retry.
+
 ### Step 5: Write test_report.json (1 call)
 
 **This MUST be your last action.** Use `write_file` to save the report. See output format below.

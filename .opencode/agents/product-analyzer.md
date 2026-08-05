@@ -138,6 +138,15 @@ If variants exist (size, color, material):
 2. **Check data source**: Is variant data in DOM JSON or must you click each variant?
 3. **Check for variant-specific data**: Do price, images, availability change per variant?
 
+### 6b. Nested Field Analysis (when the schema has nested fields)
+
+If the user's schema contains nested objects or arrays (e.g. `address: {city, zip}`, `variants: [{size, color}]`, `specs: {key, value}`), the code-writer must emit them as **nested structures**, not flattened top-level keys. To enable that:
+1. **Identify the nested field's data source**: Is it a JSON-LD block, embedded `<script>` JSON, or rendered in the DOM?
+2. **Map per-child selectors** for each nested field's sub-fields (e.g. for `address`: the city selector, the zip selector; for `variants`: each variant's size/color). Record these in the field map under the parent field name with a `children` structure.
+3. **Note the shape**: object (single dict) vs array-of-objects (list of dicts). The code-writer will preserve whichever shape the page exposes.
+
+Without this step, code-writer has the nested *shape* (from the schema) but no per-child extraction detail → it emits empty or wrong nested fields.
+
 ### 7. Mechanism Reassessment
 
 After your deep analysis, reassess the scraping mechanism:
