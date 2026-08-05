@@ -26,6 +26,8 @@ from django.utils import timezone
 from .forms import SiteForm
 from .models import Approval, JobListing, ProbeCache, ScrapeJob, SessionLog, Site
 
+from src.schema_validation import validate_user_schema
+
 logger = logging.getLogger(__name__)
 
 
@@ -2250,6 +2252,46 @@ def _parse_url_lines(text: str) -> list[str]:
 
 
 @login_required
+def intake_validate_schema(request):
+    """AJAX: validate a user-pasted/uploaded JSON schema and return derived fields.
+
+    Accepts a pasted JSON string (POST ``schema_text``) or an uploaded file
+    (FILES ``schema_file``); file wins if both are present. Pure function of
+    its inputs (no DB writes) so the front-end can call it on every edit.
+
+    Returns 200 with ``{valid, issues, derived_fields, detected_content_type}``
+    even when the schema is invalid (mirrors ``intake_check_site``'s
+    200-with-``known_site:false`` convention) — only transport/auth failures 4xx.
+    """
+    if request.method != "POST" or request.headers.get("x-requested-with") != "XMLHttpRequest":
+        return JsonResponse({"error": "POST + AJAX required"}, status=400)
+
+    raw = ""
+    upload = request.FILES.get("schema_file")
+    if upload is not None:
+        # read() is bounded by Django's DATA_UPLOAD_MAX_MEMORY_SIZE (default 2.5MB)
+        raw = upload.read().decode("utf-8", errors="replace")
+    else:
+        raw = request.POST.get("schema_text", "")
+
+    result = validate_user_schema(raw)
+    logger.info(
+        "intake schema validation: valid=%s shape=%s fields=%d issues=%s",
+        result.valid, result.shape, len(result.derived_fields),
+        [i.code for i in result.issues],
+    )
+    return JsonResponse({
+        "valid": result.valid,
+        "issues": [
+            {"code": i.code, "message": i.message, "severity": i.severity, "path": i.path}
+            for i in result.issues
+        ],
+        "derived_fields": result.derived_fields,
+        "detected_content_type": result.detected_content_type,
+    })
+
+
+@login_required
 def intake_create_job(request):
     """AJAX: create a ScrapeJob + enqueue the full pipeline.
 
@@ -2302,6 +2344,21 @@ def intake_create_job(request):
         if target_fields
         else []
     )
+
+    # Defensive re-validation: if a raw schema was posted alongside the derived
+    # chips, gate on it so the endpoint can't be bypassed with an invalid schema.
+    # Normal flow posts only the derived target_fields (no schema_text), so this
+    # is a no-op for the happy path.
+    schema_raw = request.POST.get("schema_text", "")
+    schema_upload = request.FILES.get("schema_file")
+    if schema_raw or schema_upload:
+        raw = schema_upload.read().decode("utf-8", errors="replace") if schema_upload else schema_raw
+        result = validate_user_schema(raw)
+        if not result.valid:
+            return JsonResponse(
+                {"error": "Schema invalid", "issues": [i.message for i in result.errors]},
+                status=422,
+            )
 
     job = ScrapeJob.objects.create(
         url=url,

@@ -1,5 +1,6 @@
 from model_bakery import baker
 from django.contrib.auth import get_user_model
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, Client
 from django.urls import reverse
 
@@ -241,4 +242,96 @@ class TestAdminJobVisibility(TestCase):
         ids = {j["id"] for j in resp.json()["jobs"]}
         self.assertIn(self.job.id, ids)
         self.assertNotIn(self.other_job.id, ids)
+
+
+class TestIntakeValidateSchemaView(TestCase):
+    """POST /intake/validate-schema/ — validates a pasted/uploaded JSON schema.
+
+    Auth is covered by conftest's autouse superuser + DebugAutoLogin; the
+    POST+AJAX guard is the real gate, so every call passes
+    HTTP_X_REQUESTED_WITH="XMLHttpRequest".
+    """
+
+    URL = reverse("intake_validate_schema")
+
+    def setUp(self):
+        self.client = Client()
+
+    def _post_text(self, body, **extra):
+        return self.client.post(
+            self.URL, {"schema_text": body},
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest", **extra,
+        )
+
+    def _post_file(self, body, filename="schema.json"):
+        return self.client.post(
+            self.URL, {"schema_file": SimpleUploadedFile(filename, body, content_type="application/json")},
+            HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+        )
+
+    def test_valid_schema_returns_derived_fields(self):
+        resp = self._post_text('{"type":"object","properties":{"title":{"type":"string"},"price":{"type":"number"}}}')
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data["valid"])
+        self.assertEqual(data["derived_fields"], ["title", "price"])
+        self.assertEqual(data["detected_content_type"], "product")
+
+    def test_valid_schema_via_file_upload(self):
+        resp = self._post_file(b'{"fields":[{"name":"title"},{"name":"sku"}]}')
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data["valid"])
+        self.assertEqual(data["derived_fields"], ["title", "sku"])
+
+    def test_file_overrides_text(self):
+        # When both are present, the file wins.
+        resp = self.client.post(self.URL, {
+            "schema_text": "garbage",
+            "schema_file": SimpleUploadedFile("s.json", b'["title"]', content_type="application/json"),
+        }, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["valid"])
+
+    def test_invalid_json_returns_200_with_issue(self):
+        resp = self._post_text('{not valid')
+        self.assertEqual(resp.status_code, 200)  # content errors are 200+valid:false
+        data = resp.json()
+        self.assertFalse(data["valid"])
+        self.assertTrue(any(i["code"] == "INVALID_JSON" for i in data["issues"]))
+
+    def test_non_object_returns_invalid(self):
+        resp = self._post_text('"a string"')
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.json()["valid"])
+
+    def test_get_rejected(self):
+        resp = self.client.get(self.URL, HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_non_ajax_rejected(self):
+        resp = self.client.post(self.URL, {"schema_text": "[]"})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_oversize_rejected_by_validator(self):
+        # Over our 256 KiB cap but under Django's 2.5 MB transport cap → 200 + TOO_LARGE.
+        blob = "{" + ", ".join(f'"f{i}":"x"' for i in range(262144 // 6)) + "}"
+        self.assertGreater(len(blob), 262144)
+        resp = self._post_text(blob)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertFalse(data["valid"])
+        self.assertTrue(any(i["code"] == "TOO_LARGE" for i in data["issues"]))
+
+
+class TestIntakePageRendersSchemaUI(TestCase):
+    """The /intake page must render with the new JSON-schema input UI."""
+
+    def test_intake_page_has_schema_ui(self):
+        resp = Client().get(reverse("intake"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, 'id="schema-mode"')
+        self.assertContains(resp, 'id="schema-json-input"')
+        self.assertContains(resp, 'id="schema-file"')
+        self.assertContains(resp, "validateSchemaUrl")
 

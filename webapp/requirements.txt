@@ -21,3 +21,4 @@ mcp>=1.0,<2.0
 headroom-ai[langchain]>=0.30,<1.0
 onnxruntime>=1.16  # native lib for headroom/magika file-type detection (without this, context compression is a no-op → code_writer regenerates from scratch every iteration)
 whitenoise>=6.6,<7.0
+jsonschema>=4.20,<5.0  # meta-validate user-uploaded JSON Schemas on /intake (src/schema_validation.py)

@@ -364,6 +364,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     csrfToken: "{{ csrf_token }}",
     checkSiteUrl: "{% url 'intake_check_site' %}",
     createJobUrl: "{% url 'intake_create_job' %}",
+    validateSchemaUrl: "{% url 'intake_validate_schema' %}",
     jobsLibraryUrl: "{% url 'intake_jobs' %}",
   };
 </script>
@@ -415,6 +416,27 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
           <p class="fields-label" id="fields-label"></p>
           <div class="chips" id="chips" aria-label="fields to extract"></div>
           <input type="text" id="field-input" placeholder="Add a field, press Enter" aria-label="add a field">
+
+          <div class="schema-block" style="margin-top:11px;">
+            <div class="seg" id="schema-mode" role="group" aria-label="field input mode" style="margin-bottom:9px;">
+              <button class="on" data-mode="fields" type="button">Fields</button>
+              <button data-mode="schema" type="button">JSON schema</button>
+            </div>
+            <div class="hidden" id="schema-input-area">
+              <div class="add-input-box">
+                <textarea id="schema-json-input" placeholder='Paste a JSON schema, e.g.&#10;{ "type": "object", "properties": { "title": { "type": "string" }, "price": { "type": "number" } } }&#10;…or the internal { "fields": [ { "name": "title" } ] }' aria-label="paste JSON schema" rows="5"></textarea>
+                <div class="add-input-actions">
+                  <label class="icon-btn" id="schema-file-label" title="Upload a .json schema file" aria-label="upload schema file">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+                    <input type="file" id="schema-file" hidden accept=".json,application/json">
+                  </label>
+                  <div class="file-status" id="schema-file-status"><span class="hint" style="margin:0">Upload a .json file, or paste it above</span></div>
+                </div>
+              </div>
+              <p class="url-error hidden" id="schema-error" role="alert"></p>
+              <p class="hint hidden" id="schema-ok"></p>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -857,6 +879,96 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     renderFieldsAll();
   }
   function clearChips(){ fieldsArr = []; renderFieldsAll(); }
+
+  /* ---------- JSON schema input (alternative to typing field chips) ---------- */
+  // On a valid schema the server returns derived field names; we populate the
+  // shared chips (fieldsArr), so every downstream gate/POST works unchanged.
+  var schemaMode = 'fields';
+  var currentSchema = null;          // last validated raw text (advisory POST on create)
+  var schemaValidateTimer = null;
+
+  function setSchemaMode(mode){
+    schemaMode = mode;
+    var seg = X('#schema-mode');
+    if(seg) seg.querySelectorAll('button').forEach(function(b){
+      b.classList.toggle('on', b.dataset.mode === mode);
+    });
+    var area = X('#schema-input-area');
+    var fieldInput = X('#field-input');
+    if(area) area.classList.toggle('hidden', mode !== 'schema');
+    if(fieldInput) fieldInput.classList.toggle('hidden', mode === 'schema');
+    if(mode !== 'schema') clearSchemaMsg();
+    if(typeof refreshRunSampleGate === 'function') refreshRunSampleGate();
+  }
+  function clearSchemaMsg(){
+    var e = X('#schema-error'); if(e){ e.classList.add('hidden'); e.textContent=''; }
+    var o = X('#schema-ok'); if(o){ o.classList.add('hidden'); o.textContent=''; }
+    var ta = X('#schema-json-input'); if(ta) ta.classList.remove('input-invalid');
+  }
+  function showSchemaError(msg){
+    var e = X('#schema-error'); if(!e) return;
+    e.textContent = msg; e.classList.remove('hidden');
+    var o = X('#schema-ok'); if(o) o.classList.add('hidden');
+    var ta = X('#schema-json-input'); if(ta) ta.classList.add('input-invalid');
+    if(typeof refreshRunSampleGate === 'function') refreshRunSampleGate();
+  }
+  function showSchemaOk(msg){
+    var o = X('#schema-ok'); if(!o) return;
+    o.textContent = msg; o.classList.remove('hidden');
+    var e = X('#schema-error'); if(e) e.classList.add('hidden');
+    var ta = X('#schema-json-input'); if(ta) ta.classList.remove('input-invalid');
+    if(typeof refreshRunSampleGate === 'function') refreshRunSampleGate();
+  }
+  function validateSchemaText(text){
+    if(!text || !text.trim()){ clearSchemaMsg(); currentSchema=null; return; }
+    var fd = new FormData();
+    fd.append('schema_text', text);
+    postJSON(INTAKE_CONFIG.validateSchemaUrl, fd).then(function(data){
+      if(data.valid){
+        clearChips();
+        (data.derived_fields||[]).forEach(function(f){ addChip(f); });
+        currentSchema = text;
+        var n = (data.derived_fields||[]).length;
+        var extra = data.detected_content_type ? (' — looks like '+data.detected_content_type) : '';
+        showSchemaOk('Valid schema — '+n+' field'+(n===1?'':'s')+' added'+extra+'.');
+      } else {
+        currentSchema = null;
+        var errs = (data.issues||[]).filter(function(i){ return i.severity!=='warning'; });
+        var warns = (data.issues||[]).filter(function(i){ return i.severity==='warning'; });
+        var msg = errs.map(function(i){ return i.message; }).join(' ');
+        if(warns.length) msg = (msg?msg+' ':'') + warns.map(function(i){ return i.message; }).join(' ');
+        showSchemaError(msg || 'Schema is invalid.');
+      }
+    }).catch(function(){ showSchemaError('Could not validate the schema (network error).'); });
+  }
+  // mode toggle
+  var schemaSeg = X('#schema-mode');
+  if(schemaSeg) schemaSeg.addEventListener('click', function(e){
+    var b = e.target.closest('button[data-mode]'); if(!b) return;
+    setSchemaMode(b.dataset.mode);
+  });
+  // paste/typing → debounced validation
+  var schemaTa = X('#schema-json-input');
+  if(schemaTa) schemaTa.addEventListener('input', function(){
+    clearTimeout(schemaValidateTimer);
+    var v = this.value;
+    schemaValidateTimer = setTimeout(function(){ validateSchemaText(v); }, 250);
+  });
+  // file upload → read as text, drop into the textarea, run the same validation path
+  var schemaFile = X('#schema-file');
+  if(schemaFile) schemaFile.addEventListener('change', function(){
+    var f = this.files && this.files[0]; this.value = '';
+    if(!f) return;
+    var reader = new FileReader();
+    reader.onload = function(){
+      var text = String(reader.result||'');
+      var ta = X('#schema-json-input'); if(ta) ta.value = text;
+      var st = X('#schema-file-status');
+      if(st) st.innerHTML = '<span class="file-chip"><span class="fc-name" title="'+f.name+'">'+f.name+'</span></span>';
+      validateSchemaText(text);
+    };
+    reader.readAsText(f);
+  });
 
   /* ---------- detect config changes since the job was last run ---------- */
   var configBaseline = null;
@@ -1785,6 +1897,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     fd.append('nav_method', navMethod);
     fd.append('content_type', intakeState.contentType || '');
     fd.append('target_fields', fieldsArr.join(','));
+    if(currentSchema) fd.append('schema_text', currentSchema);  // re-validated server-side (defense against bypass)
     fd.append('scope', scope);
     fd.append('scope_value', X('#scope-input').value.trim());
     fd.append('notes', X('#notes').value.trim());
@@ -2100,6 +2213,11 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
   X('#restart').addEventListener('click', function(){
     listFileState = null; renderListFileChip();
     listingFileState = null; renderListingFileChip();
+    currentSchema = null;
+    setSchemaMode('fields');
+    var _ta = X('#schema-json-input'); if(_ta) _ta.value = '';
+    var _st = X('#schema-file-status'); if(_st) _st.innerHTML = '<span class="hint" style="margin:0">Upload a .json file, or paste it above</span>';
+    clearSchemaMsg();
     X('#rerun-box').classList.add('hidden');
     X('#rerun-toggle').setAttribute('aria-expanded','false');
     X('#schedule-box').classList.add('hidden');
