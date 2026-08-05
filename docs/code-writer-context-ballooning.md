@@ -44,6 +44,16 @@ return {"llm_input_messages": kept}   # shapes the model input WITHOUT mutating 
 
 **Recommended next step (for the user):** implement `llm_input_messages` + seed-exemption + pair-safe drop, default ON with the `LLM_TRUNCATION_MODE='off'` kill-switch as instant rollback, and validate on a ballooning site (zquiet/adameve) comparing both latency AND output quality (record count + field coverage) before/after. This is a real behavior change — do not ship without measuring quality, not just speed.
 
+### ✅ UPDATE (2026-08-05) — implemented on `optimisation` (commit `06883cc`) + validated
+
+The real fix above **was implemented and tested** (user: "implement and revert if it's an issue"). `_truncate_messages` now returns `{"llm_input_messages": kept}`, with the seed exempt from the 8k per-msg cap and always retained, honest `_clen` (counts `tool_calls`), and pair-safe `ToolMessage` drop. `LLM_TRUNCATION_MODE='off'` is the exact-rollback kill-switch.
+
+**Validation:**
+- **11 unit tests** (`webapp/tests/test_truncation.py`): returns `llm_input_messages` (not `messages`); tool_calls counted; seed retained AND never capped (20k seed passes full); non-seed messages capped; pair-safe (orphaned ToolMessage dropped, recent pair survives); kept total ≤ budget; kill-switch = exact rollback.
+- **E2E adameve job 201** (local): `code_writer` produced a **working scraper under the bounded view** — `route_after_testing: GROUND-TRUTH PASS — scraper produced ≥3 real items` (no quality regression from the bounded view). code_writer **did not balloon** (no Step-2 over-budget fired, vs the no-op version's 446k) and **converged**. **Zero pairing/400 errors** across all agents. The fix actively bounded `dagster_converter`'s view (313k state → ~123k model input). No crashes.
+
+**Caveat / watch-item:** making Step 1's 8k per-msg cap live affects every hooked agent. For `code_writer` (target) it's a clear win. `dagster_converter` was observed iterating with a large state (313k) — its view was bounded (~123k) and it continued, but the 8k cap on non-seed messages could in principle hurt agents that need full large messages (e.g. reading a big code file via a tool result rather than the seed). If any agent regresses on quality, raise `LLM_TRUNCATION_PER_MSG_CAP` or extend the seed-style exemption. The kill-switch (`LLM_TRUNCATION_MODE='off'`) restores prior behavior instantly.
+
 ## Symptom (job 250 evidence)
 
 Celery logs (`ForkPoolWorker-2`), one `code_writer` invocation:
