@@ -2335,6 +2335,12 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
   refreshRunSampleGate();
   updateScopeSampleNote();
   refreshLibrary();
+
+  // Expose for the Discover Fields modal (separate IIFE below).
+  window.addChip = addChip;
+  window.setSchemaMode = setSchemaMode;
+  window.validateSchemaText = validateSchemaText;
+  window.clearChips = clearChips;
 })();
 </script>
 
