@@ -217,7 +217,7 @@ def _fallback_jsonld(jsonld_blocks: list[dict]) -> dict:
 
 # ── public API ───────────────────────────────────────────────────────────────
 def discover_fields_from_html(*, url: str, html: str, title: str = "",
-                              llm_timeout: int = 60) -> dict:
+                              llm_timeout: int = 20) -> dict:
     """Discover extractable fields from a rendered page via LLM.
 
     Returns ``{fields: list[str], json_schema: dict|None, source: "llm"|"jsonld",

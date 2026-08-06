@@ -2388,10 +2388,10 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     var raw = X('#example-url').value.trim();
     if(!raw){ X('#example-url').focus(); return; }
     setDiscoverState('loading');
-    X('#discover-loading-text').textContent = 'Discovering fields… This takes ~15-20 seconds.';
+    X('#discover-loading-text').textContent = 'Discovering fields… This takes ~1-2 minutes.';
     X('#discover-modal').classList.remove('hidden');
     discoverController = new AbortController();
-    discoverTimer = setTimeout(function(){ try{discoverController.abort();}catch(_){} }, 60000);
+    discoverTimer = setTimeout(function(){ try{discoverController.abort();}catch(_){} }, 120000);
     var fd = new FormData(); fd.append('url', raw);
     fetch(INTAKE_CONFIG.discoverFieldsUrl, {
       method: 'POST',

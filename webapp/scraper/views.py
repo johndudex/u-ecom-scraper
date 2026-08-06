@@ -2367,7 +2367,7 @@ def intake_discover_fields(request):
     # Step 2 + 3: extract content + LLM discovery (with JSON-LD fallback).
     try:
         from src.field_discovery import discover_fields_from_html
-        result = discover_fields_from_html(url=url, html=html, title=title, llm_timeout=60)
+        result = discover_fields_from_html(url=url, html=html, title=title, llm_timeout=20)
     except Exception as exc:
         logger.warning("intake discover_fields failed for %s: %s", url[:120], exc)
         return JsonResponse({"fields": [], "json_schema": None, "source": "llm",
