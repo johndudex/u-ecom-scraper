@@ -109,6 +109,7 @@ urlpatterns = [
     path("intake/", views.intake, name="intake"),
     path("intake/check-site/", views.intake_check_site, name="intake_check_site"),
     path("intake/validate-schema/", views.intake_validate_schema, name="intake_validate_schema"),
+    path("intake/discover-fields/", views.intake_discover_fields, name="intake_discover_fields"),
     path("intake/create-job/", views.intake_create_job, name="intake_create_job"),
     path("intake/jobs/", views.intake_jobs, name="intake_jobs"),
 ]

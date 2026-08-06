@@ -180,14 +180,16 @@ def _classified_retry_enabled() -> bool:
         return True
 
 
-def get_llm(model: Optional[str] = None, temperature: float = 0.3) -> ChatOpenAI:
+def get_llm(model: Optional[str] = None, temperature: float = 0.3, timeout: Optional[int] = None) -> ChatOpenAI:
     """Create a ChatOpenAI instance configured for the Z.AI API.
 
     The per-model circuit breaker (llm_breaker) is consulted here: if the
     requested model is tripped (N consecutive failures), the fallback model is
     used instead. Phase 2 adds classified per-call retry (max_retries=0 on the
     SDK; ``ClassifiedRetryChatOpenAI`` adds the classified layer) unless the
-    ``LLM_CLASSIFIED_RETRY`` kill-switch is off.
+    ``LLM_CLASSIFIED_RETRY`` kill-switch is off. Pass ``timeout`` (seconds) to
+    override the default ``LLM_REQUEST_TIMEOUT`` for short-lived calls (e.g.
+    field discovery).
     """
     requested = model or getattr(settings, "ZAI_MAIN_MODEL", "glm-5-turbo")
     base_kwargs = dict(
@@ -197,7 +199,7 @@ def get_llm(model: Optional[str] = None, temperature: float = 0.3) -> ChatOpenAI
         temperature=temperature,
         # Per-call HTTP timeout — the primary hang guard (a stuck request dies
         # here rather than hanging indefinitely).
-        timeout=getattr(settings, "LLM_REQUEST_TIMEOUT", 600),
+        timeout=timeout if timeout is not None else getattr(settings, "LLM_REQUEST_TIMEOUT", 600),
     )
     if _classified_retry_enabled():
         # Phase 2: max_retries=0 (no blind SDK retry) + classified retry layer.
@@ -214,9 +216,10 @@ def get_main_llm(temperature: float = 0.3) -> ChatOpenAI:
     )
 
 
-def get_small_llm(temperature: float = 0.3) -> ChatOpenAI:
+def get_small_llm(temperature: float = 0.3, timeout: Optional[int] = None) -> ChatOpenAI:
     """Return the small / fast model (glm-5-turbo) for quick decisions."""
     return get_llm(
         model=getattr(settings, "ZAI_SMALL_MODEL", "glm-5-turbo"),
         temperature=temperature,
+        timeout=timeout,
     )

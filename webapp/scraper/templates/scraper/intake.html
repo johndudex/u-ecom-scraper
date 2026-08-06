@@ -357,6 +357,15 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
   .saved-item-meta{flex-wrap:wrap;}
   .saved-when{margin-left:0;}
 }
+/* Discover Fields modal */
+.discover-row{display:flex; align-items:center; gap:4px; margin:0 0 11px; flex-wrap:wrap;}
+.discover-row .btn-link{padding:4px 0; font-size:13px; display:inline-flex; align-items:center;}
+.discover-row .btn-link:disabled{opacity:.45; cursor:not-allowed; pointer-events:none;}
+.modal-overlay{position:fixed; inset:0; z-index:50; background:rgba(10,12,18,.55); display:flex; align-items:center; justify-content:center; padding:20px;}
+.modal-overlay.hidden{display:none;}
+.modal-panel{max-width:480px; width:100%; max-height:85vh; overflow:auto;}
+.modal-head{display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;}
+.modal-head h3{margin:0; font-size:15px; font-weight:600;}
 </style>
 <script>
   // Injected by Django (scraper/intake view). Drives the AJAX calls below.
@@ -365,6 +374,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     checkSiteUrl: "{% url 'intake_check_site' %}",
     createJobUrl: "{% url 'intake_create_job' %}",
     validateSchemaUrl: "{% url 'intake_validate_schema' %}",
+    discoverFieldsUrl: "{% url 'intake_discover_fields' %}",
     jobsLibraryUrl: "{% url 'intake_jobs' %}",
   };
 </script>
@@ -414,6 +424,13 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
 
         <div class="fields-block hidden" id="fields-block">
           <p class="fields-label" id="fields-label"></p>
+          <div class="discover-row">
+            <button class="btn-link" id="discover-fields-btn" type="button">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px; margin-right:5px;"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+              Discover fields from this page
+            </button>
+            <span class="hint" style="margin:0 0 0 4px; font-size:11px;">— takes ~15-20s</span>
+          </div>
           <div class="chips" id="chips" aria-label="fields to extract"></div>
           <input type="text" id="field-input" placeholder="Add a field, press Enter" aria-label="add a field">
 
@@ -2318,6 +2335,139 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
   refreshRunSampleGate();
   updateScopeSampleNote();
   refreshLibrary();
+})();
+</script>
+
+<!-- Discover Fields modal -->
+<div class="modal-overlay hidden" id="discover-modal" role="dialog" aria-modal="true">
+  <div class="panel modal-panel" id="discover-modal-card">
+    <div class="modal-head">
+      <h3>Discover fields</h3>
+      <button class="icon-btn" id="discover-close-btn" type="button" aria-label="Close" title="Close">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div id="discover-loading">
+      <div class="detect-status" style="margin:6px 0 14px;">
+        <span class="spinner-sm" aria-hidden="true"></span>
+        <span id="discover-loading-text">Discovering fields… This takes ~15-20 seconds.</span>
+      </div>
+      <p class="hint">We open the page in a real browser and analyze its structured data.</p>
+      <div class="rerun-actions" style="margin-top:14px;">
+        <button class="btn btn-ghost btn-sm" id="discover-cancel-btn" type="button">Cancel</button>
+      </div>
+    </div>
+    <div class="hidden" id="discover-success">
+      <p class="panel-sub">Found <b id="discover-count">0</b> fields — uncheck any you don't need.</p>
+      <div class="chip-select" id="discover-chips" style="margin:10px 0 14px;"></div>
+      <div class="rerun-actions" style="gap:9px;">
+        <button class="btn btn-primary btn-sm" id="discover-add-chips-btn" type="button">Add selected as chips</button>
+        <button class="btn btn-ghost btn-sm" id="discover-add-schema-btn" type="button">Insert as JSON schema</button>
+        <span class="hint" style="margin:0 0 0 auto; font-size:11px;" id="discover-source-badge"></span>
+      </div>
+    </div>
+    <div class="hidden" id="discover-error-box">
+      <p class="url-error" id="discover-error" role="alert"></p>
+      <p class="cfg-changed-note hidden" id="discover-message" role="status"></p>
+      <div class="rerun-actions" style="margin-top:14px;">
+        <button class="btn btn-ghost btn-sm" id="discover-retry-btn" type="button">Try again</button>
+        <button class="btn-link" id="discover-manual-btn" type="button">Add fields manually</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var X = function(s,r){return (r||document).querySelector(s);};
+  var discoverController = null;
+  var discoverTimer = null;
+  var discoverData = {fields: [], json_schema: null};
+
+  function openDiscoverModal(){
+    var raw = X('#example-url').value.trim();
+    if(!raw){ X('#example-url').focus(); return; }
+    setDiscoverState('loading');
+    X('#discover-loading-text').textContent = 'Discovering fields… This takes ~15-20 seconds.';
+    X('#discover-modal').classList.remove('hidden');
+    discoverController = new AbortController();
+    discoverTimer = setTimeout(function(){ try{discoverController.abort();}catch(_){} }, 60000);
+    var fd = new FormData(); fd.append('url', raw);
+    fetch(INTAKE_CONFIG.discoverFieldsUrl, {
+      method: 'POST',
+      headers: {'X-Requested-With':'XMLHttpRequest','X-CSRFToken':INTAKE_CONFIG.csrfToken},
+      body: fd,
+      signal: discoverController.signal,
+    }).then(function(r){ return r.json().then(function(d){ d._status=r.status; return d;}); }).then(function(data){
+      clearTimeout(discoverTimer);
+      if(data._status >= 400 || data.error){
+        renderDiscoverError(data.error || 'Something went wrong.', true);
+      } else if(!data.fields || !data.fields.length){
+        renderDiscoverError(data.message || 'No fields found. Add them manually.', false);
+      } else {
+        discoverData.fields = data.fields.slice();
+        discoverData.json_schema = data.json_schema || null;
+        renderDiscoverSuccess(data);
+      }
+    }).catch(function(err){
+      clearTimeout(discoverTimer);
+      if(err && err.name === 'AbortError') return;
+      renderDiscoverError('Could not reach the discovery service. Add fields manually.', true);
+    });
+  }
+  function closeDiscoverModal(){
+    if(discoverController){ try{discoverController.abort();}catch(_){} discoverController = null; }
+    clearTimeout(discoverTimer);
+    X('#discover-modal').classList.add('hidden');
+  }
+  function setDiscoverState(s){
+    X('#discover-loading').classList.toggle('hidden', s!=='loading');
+    X('#discover-success').classList.toggle('hidden', s!=='success');
+    X('#discover-error-box').classList.toggle('hidden', s!=='error');
+  }
+  function renderDiscoverSuccess(data){
+    setDiscoverState('success');
+    var box = X('#discover-chips'); box.innerHTML = '';
+    discoverData.fields.forEach(function(f){
+      var b = document.createElement('button');
+      b.type = 'button'; b.className = 'chip-select on'; b.textContent = f; b.dataset.field = f;
+      b.addEventListener('click', function(){ b.classList.toggle('on'); });
+      box.appendChild(b);
+    });
+    X('#discover-count').textContent = String(discoverData.fields.length);
+    X('#discover-source-badge').textContent = data.source ? ('source: '+data.source) : '';
+  }
+  function renderDiscoverError(msg, isHard){
+    setDiscoverState('error');
+    var hard = X('#discover-error'), soft = X('#discover-message');
+    hard.classList.add('hidden'); soft.classList.add('hidden');
+    if(isHard){ hard.textContent = msg; hard.classList.remove('hidden'); }
+    else { soft.textContent = msg; soft.classList.remove('hidden'); }
+  }
+  // wiring
+  X('#discover-fields-btn').addEventListener('click', openDiscoverModal);
+  X('#discover-close-btn').addEventListener('click', closeDiscoverModal);
+  X('#discover-cancel-btn').addEventListener('click', closeDiscoverModal);
+  X('#discover-manual-btn').addEventListener('click', closeDiscoverModal);
+  X('#discover-retry-btn').addEventListener('click', openDiscoverModal);
+  X('#discover-modal').addEventListener('click', function(e){ if(e.target === this) closeDiscoverModal(); });
+  document.addEventListener('keydown', function(e){
+    if(e.key === 'Escape' && !X('#discover-modal').classList.contains('hidden')) closeDiscoverModal();
+  });
+  X('#discover-add-chips-btn').addEventListener('click', function(){
+    X('#discover-chips').querySelectorAll('button.on').forEach(function(b){
+      if(window.addChip) addChip(b.dataset.field);
+    });
+    closeDiscoverModal();
+  });
+  X('#discover-add-schema-btn').addEventListener('click', function(){
+    if(!discoverData.json_schema){ closeDiscoverModal(); return; }
+    var text = JSON.stringify(discoverData.json_schema, null, 2);
+    if(window.setSchemaMode) setSchemaMode('schema', '');
+    var ta = X('#schema-json-input'); if(ta) ta.value = text;
+    if(window.validateSchemaText) validateSchemaText(text, '');
+    closeDiscoverModal();
+  });
 })();
 </script>
 </body>
