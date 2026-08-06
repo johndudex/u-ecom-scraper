@@ -129,11 +129,15 @@ def _build_prompt(url: str, title: str, jsonld: list, meta: dict, content: str) 
                    if k.startswith(("og:", "twitter:", "article:", "product:"))
                    or k in ("availability", "description", "keywords")}
     mb = json.dumps(interesting, ensure_ascii=False)[:3000] or "(none found)"
-    return _DISCOVERY_PROMPT.format(
-        url=url, title=title or "(unknown)",
-        jsonld_block=jl, meta_block=mb,
-        content_len=len(content), content_summary=content,
-    )
+    # Use .replace() not .format() — the prompt template contains literal JSON
+    # braces that .format() would misinterpret as format fields (KeyError).
+    return (_DISCOVERY_PROMPT
+            .replace("{url}", url)
+            .replace("{title}", title or "(unknown)")
+            .replace("{jsonld_block}", jl)
+            .replace("{meta_block}", mb)
+            .replace("{content_len}", str(len(content)))
+            .replace("{content_summary}", content))
 
 
 # ── response parsing ─────────────────────────────────────────────────────────
@@ -213,7 +217,7 @@ def _fallback_jsonld(jsonld_blocks: list[dict]) -> dict:
 
 # ── public API ───────────────────────────────────────────────────────────────
 def discover_fields_from_html(*, url: str, html: str, title: str = "",
-                              llm_timeout: int = 15) -> dict:
+                              llm_timeout: int = 60) -> dict:
     """Discover extractable fields from a rendered page via LLM.
 
     Returns ``{fields: list[str], json_schema: dict|None, source: "llm"|"jsonld",
