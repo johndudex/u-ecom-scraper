@@ -1216,6 +1216,13 @@ _PAGE_STATE_JS = r"""
     clickables: clickables.slice(0, 25),
     scroll_hint: document.body.scrollHeight > window.innerHeight * 1.5,
     has_load_more: !!document.querySelector('[class*="load-more" i],[class*="show-more" i],[class*="loadMore" i]'),
+    has_rel_next_page_param: (function() {
+      var el = document.querySelector('a[rel="next"]');
+      if (!el) return '';
+      var href = el.getAttribute('href') || '';
+      var m = href.match(/[?&](page|p|pg|pn|pagenum|start|offset)=(\d+)/i);
+      return m ? m[1] : '';
+    })(),
     signals: {results_items: ri, job_links: jl, reached: ri >= 5 || jl >= 5, div_listing: bestDiv}
   });
 }
@@ -1700,6 +1707,7 @@ def browser_traverse(
     mcp_tools: list | None = None,
     step_fn: Callable | None = None,
     max_actions: int = 12,
+    trust_start_as_listing: bool = False,
 ) -> TraversalResult:
     """Browser-driven navigation via MCP snapshot + LLM.
 
@@ -1788,7 +1796,9 @@ def browser_traverse(
         # site's own content grid — its counts would mislead the LLM into declaring
         # a premature listing. Suppress the counts on the start page so the LLM
         # judges by content + clickables and keeps navigating.
-        if _on_start:
+        # BUT for list_page/search_term, the start URL IS the listing — don't
+        # suppress (the signals are accurate and needed for listing detection).
+        if _on_start and not trust_start_as_listing:
             surface = {**surface, "signals": {"results_items": 0, "job_links": 0, "reached": False}}
             signals = surface["signals"]
 
@@ -1854,8 +1864,16 @@ def browser_traverse(
             # graph just never carried it forward.
             _has_lm = bool(surface.get("has_load_more"))
             _scroll_hint = bool(surface.get("scroll_hint"))
+            _rel_next_param = (surface.get("has_rel_next_page_param") or "").strip().lower()
             if _has_lm:
                 _pag_type = "load_more"
+            elif _rel_next_param:
+                # Positive URL-pagination signal: a[rel="next"] href contains
+                # ?page=N (or ?p=, ?pg=, etc.). This is stronger evidence than
+                # scroll_hint (which is just a tall-page heuristic). Catches
+                # desidime-class sites WITHOUT regressing lw.com/Coveo (which
+                # has no ?page=N in its rel-next href).
+                _pag_type = "page_param"
             elif _scroll_hint:
                 # scroll_hint is a tall-page heuristic, NOT a real IS detector —
                 # label it distinctly so the scraper doesn't blindly scroll tall
@@ -1863,13 +1881,16 @@ def browser_traverse(
                 _pag_type = "infinite_scroll_tall"
             else:
                 _pag_type = "page_param"
+            _pagination = {
+                "type": _pag_type,
+                "items_per_page": int((signals or {}).get("results_items", 0)),
+            }
+            if _rel_next_param:
+                _pagination["page_param_name"] = _rel_next_param
             _discovery = {
                 "listing_url": url,
                 "listing_reached": True,
-                "pagination": {
-                    "type": _pag_type,
-                    "items_per_page": int((signals or {}).get("results_items", 0)),
-                },
+                "pagination": _pagination,
             }
             return TraversalResult(
                 reached=True, goal_url=url, path=path,

@@ -1737,7 +1737,11 @@ def _invoke_navigation_traverse(
     try:
         from experimental.nav_traversal.traversal import browser_traverse, traverse
 
-        result = browser_traverse(url, content_type, query)
+        _input_mode = state.get("input_mode") or ""
+        result = browser_traverse(
+            url, content_type, query,
+            trust_start_as_listing=_input_mode in ("list_page", "search_term"),
+        )
 
         # MCP unavailable → fall back to the archived deterministic explorer +
         # synthesizer (imported lazily here so the fallback path is self-contained).
