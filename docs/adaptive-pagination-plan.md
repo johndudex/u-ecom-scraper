@@ -10,6 +10,36 @@ Commit `f3e20f2`: Added `has_rel_next_page_param` signal to `_PAGE_STATE_JS` (`t
 
 **Proven**: desidime.com went from 21 → **1,015 items** (job 209). The `discovery_config.json` correctly emitted `type: "page_param", page_param_name: "page"`.
 
+## Implementation status (2026-08-13) — Fixes 2 & 3 shipped; Fix 1 reverted
+
+Fixes 2 and 3 are implemented with unit tests (40 pass). Fix 1 was implemented, then **reverted** after a 3-agent deep critique (see below). E2E on desidime (live) + lw.com (DOM analysis):
+
+| Fix | Status | Evidence |
+|-----|--------|----------|
+| **1 rescrape routing** | **REVERTED** | Implemented as `skip_site = not nav_mode`, which forces the full normal flow (browser_traverse → … → code_writer) on every nav-mode rescrape. code_writer is brittle/stochastic → it ballooned on desidime job 210 (159k chars, 900s timeout). Rescrapes were completing fine before (cascade → `code_tester`, reused the archived scraper, code_writer never ran). The revert restores that. The empty-`navigation_analysis` bug Fix 1 targeted is **latent** again (only bites fields_changed/nav_changed rescrapes — pre-existing). |
+| **2 offset_param** | shipped | Unit: navigator-key shape (`page_param`/`page_size`) → `config_for_page_param`; `_apply` no longer `TypeError`s on navigator-only keys; offset math (`start` → `(page-1)*ipp`, e.g. page 3 × 24 = `?start=48`). Live SFCC e2e not run — calvinklein.us is anti-bot-blocked. |
+| **3 unify patterns** | shipped | desidime (live): `discovery_config.json type=page_param` — NOT false-flipped. lw.com (Coveo, DOM analysis): conservative presence set detects the real Coveo `coveo-pager-next` pager (→ correct `load_more`) while dropping 6 `button[aria-label*='more']` false positives (facet checkboxes for "More**head**"/"**Skidmore**"/"**Swarthmore**" — visible+enabled, so the gate can't filter them). |
+
+### Fix 1 deep critique (3 agents) → revert + staged hybrid
+
+The naive fix (force `browser_traverse` on every nav-mode rescrape) is wrong because the skip cascade at `graph.py:1110-1117` **conflates "which analysis to re-run" with "whether to regenerate code"** — once `skip_site=False`, code_writer runs unavoidably. Three solutions were critiqued:
+- **Revert** (chosen): minimal, restores fast rescrapes, HIGH confidence. Tolerates the pre-existing fields_changed/nav_changed gaps.
+- **Surgical gate** (deferred): correct but ~35-50 LOC + retry guard + a **mandatory `template_version` stamp** (without it, every future code_writer fix silently fails to reach completed sites). Too much surface for now.
+- **Re-hydration** (rejected): internally inconsistent — the cascade makes "skip code_writer AND reach scraper_analyzer" unreachable; doesn't fix desidime (archive already fresh; failure is retry-escalation).
+
+**Staged hybrid follow-up** (when rescrape-correctness is prioritized over minimalism):
+1. Narrow the gate from `nav_mode` → `nav_changed` (fresh `browser_traverse` only when nav *actually* changed — rare, user-initiated).
+2. Fix the dead re-hydration: load archived `navigation_analysis.json` into state in `setup_workspace` (load nav **only**, not `scraper_analysis`, to avoid the `graph.py:1114` route-to-code_writer hazard). Closes the fields_changed gap — `scraper_analyzer` reads correct archived nav.
+3. (Separate enhancement) `template_version`/prompt-hash stamp in archived `scraper_analysis.json` so deploy-time staleness is detectable.
+
+
+
+**Design change vs. the original plan (data-driven):** Fix 3 is now **two-facet**, not a flat unify. Layer A classification uses `load_more_presence_selectors` (6 unambiguous class-substring selectors: load-more/loadMore/show-more/showMore/pager-next/pagerNext); the broad `button[aria-label*='more' i]` / `a[aria-label*='next' i]` / `.coveo-magicbox-load-more` stay in `load_more_selectors` for Layer C **click fallback only**. Rationale: a false `has_load_more=true` MISROUTES the whole job to load_more; a wrong click in a click fallback only no-ops. The JS probe also gained a visibility/clickability gate (skip hidden/disabled/`aria-hidden`) so Layer A's presence-check matches Layer C's visible+enabled click contract.
+
+**Pre-existing blocker (NOT a regression from these fixes):** full end-to-end nav extraction is currently blocked by the code_writer 900s timeout + code_tester context ballooning (see [`code-writer-context-ballooning.md`](./code-writer-context-ballooning.md)). desidime 210 validated classification+routing (pre-timeout) but code_writer returned empty / code_tester ballooned (159k chars). All pagination-specific code paths are validated; the extraction stall is the separate, documented ballooning issue.
+
+
+
 ## Root problems found (beyond desidime)
 
 ### Problem 1: Stale `navigation_analysis` on rescrape (LATENT BUG)
@@ -38,9 +68,9 @@ The skills system (`.opencode/skills/`) feeds markdown to LLM agents via `load_s
 | # | Fix | Scope | Regression risk | Prerequisite |
 |---|-----|-------|----------------|--------------|
 | ✅ | **Layer 0** (desidime fix) | shipped | none | — |
-| **1** | **Fix rescrape routing** — force `browser_traverse` re-run on nav-mode rescrape (not just purge stale file) | `check_tracker.py:99` OR `graph.py:1110` + `setup_workspace.py` load-to-state | LOW (existing path already broken; fix makes it better) | Write rescrape tests first |
+| **1** | **Fix rescrape routing** — force `browser_traverse` re-run on nav-mode rescrape (not just purge stale file) | `check_tracker.py:99` OR `graph.py:1110` + `setup_workspace.py` load-to-state | **REVERTED** — see Implementation status. Naive `skip_site=False` forces code_writer → ballooning on every nav-mode rescrape. Staged as a narrower hybrid (gate on `nav_changed` + re-hydrate nav into state). | — |
 | **2** | **Fix `config_from_dict` + field-name pipeline** — map `offset_param` → `config_for_page_param`; fix `graph.py:2557` to read navigator's actual field names | `graph.py:2557` + `discovery.py:768` | ZERO existing jobs; HIGH future jobs if field-name fix skipped | Fix field names in same change |
-| **3** | **Unify pagination patterns** — `src/pagination_patterns.py` single source of truth for selectors + regexes (kills Layer A/C drift) | new file + imports in `traversal.py` + `discovery.py` | ZERO (additive, same data) | — |
+| **3** | **Unify pagination patterns** — `src/pagination_patterns.py` single source of truth for selectors + regexes (kills Layer A/C drift); **two-facet** (conservative `load_more_presence_selectors` for Layer A classification, full 9 for Layer C clicking) + visibility gate in the JS probe | new file + imports in `traversal.py` + `discovery.py` | LOW — NOT zero (see Implementation status); broad `aria-label*='more'` matches non-pagination buttons, so it's excluded from classification | — |
 
 ### Defer (needs more infrastructure)
 
