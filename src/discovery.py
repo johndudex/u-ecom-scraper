@@ -54,6 +54,12 @@ from enum import Enum
 from typing import Any, Callable, Optional, Protocol
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from src.pagination_patterns import (
+    DEFAULT_LOAD_MORE_SELECTORS,
+    DEFAULT_NEXT_BUTTON_SELECTORS,
+    _OFFSET_PARAMS,
+)
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -69,24 +75,10 @@ __all__ = [
     "DEFAULT_NEXT_BUTTON_SELECTORS",
 ]
 
-# ─── selector sets (ported verbatim from templates/playwright_scraper.py) ────
-
-DEFAULT_LOAD_MORE_SELECTORS: tuple[str, ...] = (
-    "[class*='load-more' i]", "[class*='loadMore' i]",
-    "[class*='show-more' i]", "[class*='showMore' i]",
-    "[class*='pager-next' i]", "[class*='pagerNext' i]",
-    "button[aria-label*='more' i]", "a[aria-label*='next' i]",
-    ".coveo-magicbox-load-more",
-)
-
-DEFAULT_NEXT_BUTTON_SELECTORS: tuple[str, ...] = (
-    'a[rel="next"]', "a.next", "li.next a",
-    '[aria-label*="next" i]',
-    'a:has-text("Next")', 'button:has-text("Next")',
-)
-
-# Offset-style query params: value = (page-1)*items_per_page, not the page no.
-_OFFSET_PARAMS = frozenset({"offset", "start", "skip", "begin", "from"})
+# Selector sets + _OFFSET_PARAMS now live in src/pagination_patterns.py so the
+# Layer A probe (traversal.py:_PAGE_STATE_JS) and this Layer C clicker share one
+# source of truth. Re-exported here for backward compatibility; __all__ below
+# still names them.
 
 
 class PageLike(Protocol):

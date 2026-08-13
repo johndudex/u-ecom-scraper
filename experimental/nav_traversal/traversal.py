@@ -35,6 +35,8 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 
+from src.pagination_patterns import PATTERNS
+
 logger = logging.getLogger(__name__)
 
 BROWSER_SERVICE_URL = os.environ.get("BROWSER_SERVICE_URL", "http://browser_service:8001")
@@ -1215,7 +1217,24 @@ _PAGE_STATE_JS = r"""
     url: location.href, title: (document.title || '').slice(0, 80),
     clickables: clickables.slice(0, 25),
     scroll_hint: document.body.scrollHeight > window.innerHeight * 1.5,
-    has_load_more: !!document.querySelector('[class*="load-more" i],[class*="show-more" i],[class*="loadMore" i]'),
+    has_load_more: (function() {
+      // Shared selector list with Layer C (src/discovery.py) via the sentinel
+      // below — see src/pagination_patterns.py. Visibility/clickability gate
+      // keeps this PRESENCE check honest with Layer C's visible+enabled CLICK
+      // contract: a hidden Coveo "magicbox" suggestion loader or an off-screen
+      // "More filters" facet button must NOT flip has_load_more (which would
+      // mis-classify the page as load_more and send Layer C clicking the wrong
+      // element). Mirrors click_load_more's visible+enabled semantics.
+      var matches = document.querySelectorAll(/*__LOAD_MORE_SELECTORS__*/);
+      for (var lmi = 0; lmi < matches.length; lmi++) {
+        var el = matches[lmi];
+        if (!el.offsetParent && el.getClientRects().length === 0) continue;  // hidden
+        if (el.disabled) continue;
+        if (el.getAttribute('aria-hidden') === 'true') continue;
+        return true;
+      }
+      return false;
+    })(),
     has_rel_next_page_param: (function() {
       var el = document.querySelector('a[rel="next"]');
       if (!el) return '';
@@ -1227,6 +1246,17 @@ _PAGE_STATE_JS = r"""
   });
 }
 """
+
+# Inject the shared Layer-A/C load-more selector list into the JS probe. Done at
+# module load (the JS runs verbatim in the page via ev.invoke and can't read
+# files). Sentinel-replace rather than f-string: the JS body has many { }.
+_PAGE_STATE_JS = _PAGE_STATE_JS.replace(
+    "/*__LOAD_MORE_SELECTORS__*/",
+    PATTERNS.load_more_presence_css_list,
+)
+assert "/*__LOAD_MORE_SELECTORS__*/" not in _PAGE_STATE_JS, (
+    "_PAGE_STATE_JS sentinel was not replaced — pagination_patterns load_more_css_list changed?"
+)
 
 
 def _parse_mcp_json(raw) -> dict:
