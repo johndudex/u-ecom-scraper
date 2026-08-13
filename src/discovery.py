@@ -763,6 +763,25 @@ def config_from_dict(d: dict) -> DiscoveryConfig:
             d.get("items_per_page"),
             **{k: v for k, v in overrides.items() if k not in ("page_param_name", "items_per_page")},
         )
+    if ptype in ("offset_param", "offset"):
+        # SFCC-style ?start=0&sz=24 (navigate_explore.py emits this shape). Reuses
+        # the page_param primitive — _OFFSET_PARAMS (pagination_patterns.py)
+        # makes build_page_param_url compute (page-1)*items_per_page for
+        # start/offset/skip/begin/from. The navigator emits page_param/page_size
+        # (NOT page_param_name/items_per_page), so accept BOTH. Strip navigator-
+        # only keys before passing extras to _apply, or it raises TypeError on
+        # unknown DiscoveryConfig fields.
+        _name = d.get("page_param_name") or d.get("page_param") or "start"
+        _size = d.get("items_per_page") or d.get("page_size")
+        _nav_only = (
+            "page_param_name", "items_per_page",
+            "page_param", "page_size_param", "page_size", "url_pattern",
+        )
+        return config_for_page_param(
+            _name,
+            _size,
+            **{k: v for k, v in overrides.items() if k not in _nav_only},
+        )
     if ptype in ("next_button", "nextbutton"):
         return config_for_next_button(
             d.get("next_button_selector"),
@@ -772,5 +791,9 @@ def config_from_dict(d: dict) -> DiscoveryConfig:
         from src.discovery import DiscoveryConfig as _DC
         cfg = _DC(strategies=("infinite_scroll", "load_more"))
         return _apply(cfg, overrides)
+    # page_numbers (numbered-button SPA pager) intentionally falls through — no
+    # primitive fits today (needs click_button_number(N)); load_more/infinite_scroll
+    # fallbacks occasionally rescue adjacent UI, which is strictly better than
+    # locking to next_button. Map it when a dedicated primitive exists.
     # Unknown/missing → try all strategies (self-discovery)
     return config_for_navigation_job(**overrides)

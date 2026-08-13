@@ -2554,10 +2554,15 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
         _disc_pag = _nav.get("pagination") if isinstance(_nav, dict) else None
     _discovery_config = None
     if isinstance(_disc_pag, dict) and _disc_pag.get("type"):
+        # The navigator (navigate_explore.py) emits `page_param`/`page_size` for
+        # offset_param (?start=0&sz=24); other paths emit canonical
+        # `page_param_name`/`items_per_page`. Accept BOTH so offset_param values
+        # reach config_for_page_param via discovery_config.json instead of being
+        # silently dropped (graph.py field-name pipeline bug).
         _discovery_config = {
             "type": _disc_pag.get("type"),
-            "page_param_name": _disc_pag.get("page_param_name"),
-            "items_per_page": _disc_pag.get("items_per_page"),
+            "page_param_name": _disc_pag.get("page_param_name") or _disc_pag.get("page_param"),
+            "items_per_page": _disc_pag.get("items_per_page") or _disc_pag.get("page_size"),
             "next_button_selector": _disc_pag.get("next_button_selector"),
             "max_pages": _disc_pag.get("max_pages"),
         }
