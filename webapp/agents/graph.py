@@ -719,11 +719,20 @@ class _HeartbeatHandle:
     concurrency=2 worker's two in-flight jobs don't clobber each other's timers.
     """
 
-    __slots__ = ("stop", "timers")
+    __slots__ = ("stop", "timers", "beats")
 
     def __init__(self) -> None:
         self.stop = threading.Event()
         self.timers: list = []
+        self.beats = 0
+
+
+# M4: hard cap on the self-rescheduling chain. Even with the F5 try/finally
+# at every call site, a future copy-pasted site (the pattern has already been
+# pasted five times) or a worker-level kill could leave the chain immortal —
+# job 333's leaked timer wrote DB rows every 5 minutes for days. 60 beats at
+# the default 300s interval ≈ 5h; at the execution interval (240s) ≈ 4h.
+_HEARTBEAT_MAX_BEATS = 60
 
 
 def _start_heartbeat(
@@ -741,25 +750,48 @@ def _start_heartbeat(
     when the agent finishes. The handle's stop flag is what actually ends the
     chain — ``_beat`` checks it before rescheduling, so cancellation is reliable
     even if a beat fires mid-cancel.
+
+    M4 belt-and-braces: the chain self-terminates after _HEARTBEAT_MAX_BEATS
+    beats OR when the job reaches a terminal status — so no leak path can
+    run forever even if _stop_heartbeat is never called.
     """
     handle = _HeartbeatHandle()
 
     def _beat() -> None:
         if handle.stop.is_set():
             return
-        try:
-            from scraper.models import SessionLog
-
-            seq = SessionLog.objects.filter(job_id=job_id).count()
-            SessionLog.objects.create(
-                job_id=job_id,
-                role=SessionLog.ROLE_SYSTEM,
-                agent=agent_name,
-                content=f"[HEARTBEAT] Agent {agent_name} still running...",
-                seq=seq,
+        # M4: self-cap — an immortal chain is worse than a missing heartbeat.
+        handle.beats += 1
+        if handle.beats > _HEARTBEAT_MAX_BEATS:
+            logger.warning(
+                "heartbeat for job %s (%s) exceeded %d beats — self-terminating",
+                job_id, agent_name, _HEARTBEAT_MAX_BEATS,
             )
+            return
+        _job_terminal = False
+        try:
+            from scraper.models import ScrapeJob, SessionLog
+
+            _job_terminal = job_id in () or ScrapeJob.objects.filter(
+                pk=job_id, status__in=(
+                    ScrapeJob.STATUS_COMPLETED, ScrapeJob.STATUS_FAILED,
+                    ScrapeJob.STATUS_CANCELLED, ScrapeJob.STATUS_CAPTCHA_BLOCKED,
+                    ScrapeJob.STATUS_AKAMAI_BLOCKED,
+                ),
+            ).exists()
+            if not _job_terminal:
+                seq = SessionLog.objects.filter(job_id=job_id).count()
+                SessionLog.objects.create(
+                    job_id=job_id,
+                    role=SessionLog.ROLE_SYSTEM,
+                    agent=agent_name,
+                    content=f"[HEARTBEAT] Agent {agent_name} still running...",
+                    seq=seq,
+                )
         except Exception:
             pass
+        if handle.stop.is_set() or _job_terminal:
+            return
         # Re-check before rescheduling — _stop_heartbeat may have fired while
         # the SessionLog write was in flight.
         if handle.stop.is_set():
@@ -1418,8 +1450,12 @@ def _run_budgeted_agent(
         agent = agent_factory(site_slug=slug)
         agent_cfg = _agent_config(config, phase)
         hb = _start_heartbeat(job_id, display_name)
-        result = _invoke_agent_with_timeout(agent, messages, agent_cfg, phase, job_id)
-        _stop_heartbeat(hb)
+        # F5: any raise between start and stop (DB outage, agent factory
+        # failure) previously leaked the self-rescheduling timer chain.
+        try:
+            result = _invoke_agent_with_timeout(agent, messages, agent_cfg, phase, job_id)
+        finally:
+            _stop_heartbeat(hb)
         _persist_agent_logs(state, result, display_name, config)
 
         if artifact_fix_fn is not None:
@@ -2879,9 +2915,12 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
 
         agent = create_code_writer(site_slug=slug, template_code=_template_code)
         hb = _start_heartbeat(job_id, "code-writer")
+        # F5: try/finally — an exception here previously leaked the timer chain.
         _cw_cfg = _agent_config(config, "code_writer")
-        result = _invoke_agent_with_timeout(agent, messages, _cw_cfg, "code_writer", job_id)
-        _stop_heartbeat(hb)
+        try:
+            result = _invoke_agent_with_timeout(agent, messages, _cw_cfg, "code_writer", job_id)
+        finally:
+            _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "code-writer", config)
         _notify_phase(job_id, "code_writer", "done")
         if _PATCHES_ENABLED:
@@ -3055,10 +3094,15 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         slug = state.get("site_slug", "")
         agent = create_code_tester(site_slug=slug)
         hb = _start_heartbeat(job_id, "code-tester")
-        result = agent.invoke(
-            {"messages": messages}, config=_agent_config(config, "code_tester")
-        )
-        _stop_heartbeat(hb)
+        # F5: try/finally — an exception here previously leaked the timer chain.
+        # (Note: this site uses raw agent.invoke with NO timeout wrapper —
+        # pre-existing; the finally at least guarantees heartbeat cleanup.)
+        try:
+            result = agent.invoke(
+                {"messages": messages}, config=_agent_config(config, "code_tester")
+            )
+        finally:
+            _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "code-tester", config)
         _notify_phase(job_id, "code_tester", "done")
         update = {"messages": []}
