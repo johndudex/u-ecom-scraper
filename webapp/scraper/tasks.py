@@ -633,6 +633,24 @@ def _prune_output_to_schema(output_file: str, allowed: set[str], schema_nested: 
     return pruned
 
 
+def _finalize_was_cancelled(final_state: dict[str, Any]) -> bool:
+    """F3: did the graph end because the user cancelled a human gate?
+
+    Mirrors decisions.is_cancel semantics (decision None, legacy Cancel/
+    Abort labels, or reject) against final_state['human_response'] — the
+    value every cancel path writes (route_from_human_approval's
+    cancel_values check, check_tracker's _handle_failed/_handle_complete).
+    """
+    try:
+        from agents.decisions import is_cancel
+    except Exception:
+        return False
+    response = final_state.get("human_response")
+    if not isinstance(response, dict):
+        return False
+    return is_cancel(response)
+
+
 def _finalize_job(job: ScrapeJob) -> None:
     """Read the final graph checkpoint and persist results to the job.
 
@@ -847,8 +865,15 @@ def _finalize_job(job: ScrapeJob) -> None:
     if job.status in (
         ScrapeJob.STATUS_CAPTCHA_BLOCKED,
         ScrapeJob.STATUS_AKAMAI_BLOCKED,
+        ScrapeJob.STATUS_CANCELLED,  # M3: a view-level cancel must not be resurrected
     ):
         pass
+    elif _finalize_was_cancelled(final_state):
+        # F3: a user Cancel ends the graph with no error_message and no FAILED
+        # execution_status — the old ladder blessed it COMPLETED and flipped
+        # the Site complete with 0 products (prod jobs 263/266/327).
+        job.status = ScrapeJob.STATUS_CANCELLED
+        logger.info("Job %d: finalised as CANCELLED (user cancelled)", job.id)
     elif job.error_message:
         job.status = ScrapeJob.STATUS_FAILED
     elif final_state.get("execution_status") == "FAILED":
@@ -899,9 +924,15 @@ def _finalize_job(job: ScrapeJob) -> None:
                 db_site.platform = job.platform or db_site.platform
                 db_site.scraping_method = job.scraping_method or db_site.scraping_method
                 db_site.product_count = job.product_count
-                db_site.status = (
-                    "complete" if job.status == ScrapeJob.STATUS_COMPLETED else "failed"
-                )
+                if job.status == ScrapeJob.STATUS_COMPLETED:
+                    db_site.status = "complete"
+                elif job.status == ScrapeJob.STATUS_CANCELLED:
+                    # F3: a cancel is a user decision, not a site failure —
+                    # leave in_progress so _do_schedule_next_site (which only
+                    # picks new/failed) can't auto-resurrect the cancellation.
+                    db_site.status = "in_progress"
+                else:
+                    db_site.status = "failed"
                 db_site.last_scraped_at = timezone.now()
                 if job.site_name:
                     db_site.name = job.site_name

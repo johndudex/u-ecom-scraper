@@ -724,7 +724,13 @@ def approval_inline(request, job_id, approval_id):
 
     human_response = _build_resume_value(approval, choice, feedback)
 
-    approval.status = Approval.STATUS_APPROVED
+    # N3: record the user's actual decision — a Cancel is a rejection, not an
+    # approval (prod approvals 398/399 permanently said 'approved' on cancels).
+    approval.status = (
+        Approval.STATUS_REJECTED
+        if human_response.get("decision") == "reject"
+        else Approval.STATUS_APPROVED
+    )
     approval.human_response = choice
     approval.resolved_at = timezone.now()
     approval.save(update_fields=["status", "resolved_at", "human_response"])
@@ -787,7 +793,12 @@ def approval_detail(request, approval_id):
 
         human_response = _build_resume_value(approval, choice, feedback)
 
-        approval.status = Approval.STATUS_APPROVED
+        # N3 (approval_detail): same rejection recording as approval_inline.
+        approval.status = (
+            Approval.STATUS_REJECTED
+            if human_response.get("decision") == "reject"
+            else Approval.STATUS_APPROVED
+        )
         approval.human_response = choice
         approval.resolved_at = timezone.now()
         approval.save(update_fields=["status", "resolved_at", "human_response"])
