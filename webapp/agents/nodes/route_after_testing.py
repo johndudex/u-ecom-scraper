@@ -264,7 +264,14 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
     except Exception:
         has_substantive_field = lambda p: bool(p.get("title"))  # type: ignore
     if fields:
-        good = [p for p in live if any(p.get(f) for f in fields) or has_substantive_field(p)]
+        # F15: when the content type defines filter fields, a "real" item must
+        # carry at least one of THEM — not just any substantive field. The old
+        # `or has_substantive_field(p)` escape let job 337 ship 36 rows whose
+        # only populated field was `brand` while price/availability sat at 0%
+        # (the ground-truth override then blessed a FAIL/0.35 test report).
+        # `any(filter_fields)` (not all-fields) so a product missing only
+        # availability/currency still counts — 320's 511 rows stay safe.
+        good = [p for p in live if any(p.get(f) for f in fields)]
     else:
         good = [p for p in live if has_substantive_field(p)]
     if len(good) >= min_count:
@@ -294,7 +301,13 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
                         _items = _out.get(_ck)
                         if isinstance(_items, list) and _items:
                             _live = [p for p in _items if not _is_dead_product(p)]
-                            _good = [p for p in _live if has_substantive_field(p)]
+                            # F15: same core-field requirement as the primary
+                            # predicate — a file full of brand-only rows must
+                            # not rescue a failing test (job 337 pattern).
+                            if fields:
+                                _good = [p for p in _live if any(p.get(f) for f in fields)]
+                            else:
+                                _good = [p for p in _live if has_substantive_field(p)]
                             if len(_good) >= min_count:
                                 logger.info(
                                     "route_after_testing: OUTPUT-AS-TRUTH rescue — found %d real "
@@ -485,7 +498,10 @@ def route_after_testing(state: ScrapeState) -> str:
     # code_tester's subjective high_severity flags. The output is the truth.
     # BUT: ≥3 real items does NOT mean full coverage (locumtenens had 38 real
     # jobs, 3733 missed) — so a coverage failure overrides ground-truth too.
-    if not _cov_reason and _scraper_has_real_items(state, min_count=3):
+    # F15: a core field at ~0% coverage ALSO overrides ground-truth (job 337:
+    # 36 rows with only `brand` populated, price/availability empty, FAIL/0.35
+    # report, shipped COMPLETED).
+    if not _cov_reason and not missing_core and _scraper_has_real_items(state, min_count=3):
         logger.info(
             "route_after_testing: GROUND-TRUTH PASS — scraper produced ≥3 real "
             "items (overriding code_tester's high_severity flags)"
