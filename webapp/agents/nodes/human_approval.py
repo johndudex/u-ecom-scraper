@@ -133,8 +133,23 @@ def human_approval(state: ScrapeState) -> dict:
         feedback[:200] if feedback else "(none)",
     )
 
-    return {
+    update = {
         "human_response": decision,
         "human_feedback": feedback,
         "interrupt_reason": reason,
     }
+
+    # F18: the final-retry sentinel + feedback must land in state HERE (the
+    # node), not in route_from_human_approval — a conditional-edge path fn may
+    # only return a plain node name on langgraph 1.2.10; returning
+    # Command(update=...) from it raises TypeError: unhashable type 'dict'
+    # during edge resolution, which kills the resume task.
+    _label = str(decision.get("label") or decision.get("decision") or "")
+    if (
+        reason == "testing_exhausted"
+        and _label == "Provide feedback for final retry"
+        and feedback
+    ):
+        update["test_retry_count"] = FINAL_RETRY_SENTINEL
+
+    return update

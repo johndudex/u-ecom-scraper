@@ -3741,13 +3741,10 @@ def route_from_human_approval(state: ScrapeState) -> str:
                 "(FINAL retry with user feedback: %s)",
                 feedback[:200],
             )
-            return Command(
-                update={
-                    "test_retry_count": FINAL_RETRY_SENTINEL,
-                    "human_feedback": feedback,
-                },
-                goto="scraper_analyzer",
-            )
+            # F18: the sentinel (test_retry_count=FINAL_RETRY_SENTINEL) is set
+            # by the human_approval node itself — a path fn may only return a
+            # plain node name (Command(update=...) here raised TypeError).
+            return "scraper_analyzer"
         logger.info(
             "route_from_human_approval: testing_exhausted -> field_confirmation"
         )
