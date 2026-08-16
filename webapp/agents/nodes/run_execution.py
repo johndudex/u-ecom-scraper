@@ -565,7 +565,7 @@ def _run_in_process(
         from webapp.agents.graph import _start_heartbeat
 
         if job_id:
-            hb = _start_heartbeat(job_id, "run_execution", interval=240)
+            hb = _start_heartbeat(job_id, "run_execution", interval=240, prefix="[EXEC-ALIVE]")
     except Exception as _hb_exc:
         logger.warning("run_execution: heartbeat start failed: %s", _hb_exc)
 
@@ -722,7 +722,7 @@ def _run_via_browser_service(
 
         _job_id = (state or {}).get("job_id", 0)
         if _job_id:
-            hb = _start_heartbeat(_job_id, "run_execution", interval=240)
+            hb = _start_heartbeat(_job_id, "run_execution", interval=240, prefix="[EXEC-ALIVE]")
     except Exception as _hb_exc:
         logger.warning("run_execution: heartbeat start failed: %s", _hb_exc)
 

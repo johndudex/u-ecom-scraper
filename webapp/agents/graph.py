@@ -736,7 +736,8 @@ _HEARTBEAT_MAX_BEATS = 60
 
 
 def _start_heartbeat(
-    job_id: int, agent_name: str, interval: int = 300
+    job_id: int, agent_name: str, interval: int = 300,
+    prefix: str = "[HEARTBEAT]",
 ) -> _HeartbeatHandle:
     """Start a background heartbeat that writes a SessionLog entry every
     ``interval`` seconds during long agent executions.
@@ -745,6 +746,16 @@ def _start_heartbeat(
     LLM agents (code_writer, site_analyzer, etc.) are blocking calls that
     can run 15+ minutes without producing SessionLog entries. This heartbeat
     keeps the watchdog informed.
+
+    ``prefix`` selects the watchdog treatment: ``[HEARTBEAT]`` rows are
+    EXCLUDED from the stuck-job activity check (a leaked timer chain must
+    not mask a dead agent — see cleanup_stuck_jobs), while run_execution
+    passes ``[EXEC-ALIVE]`` so its rows COUNT: execution liveness is
+    independently bounded (EXECUTION_STALL_TIMEOUT/EXECUTION_TIMEOUT and
+    the /scrape timeouts), so an [EXEC-ALIVE] row can only rescue a
+    genuinely-live 30+ min scrape — never mask a hang. Without this, a
+    healthy long scrape whose only signal is heartbeats gets SIGKILLed
+    as "crashed" the moment the watchdog is revived.
 
     Returns a ``_HeartbeatHandle`` that must be passed to ``_stop_heartbeat``
     when the agent finishes. The handle's stop flag is what actually ends the
@@ -785,7 +796,7 @@ def _start_heartbeat(
                     job_id=job_id,
                     role=SessionLog.ROLE_SYSTEM,
                     agent=agent_name,
-                    content=f"[HEARTBEAT] Agent {agent_name} still running...",
+                    content=f"{prefix} Agent {agent_name} still running...",
                     seq=seq,
                 )
         except Exception:
