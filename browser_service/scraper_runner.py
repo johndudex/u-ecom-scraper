@@ -52,13 +52,49 @@ def _is_chrome_death(stderr: str) -> bool:
     return any(marker in stderr for marker in _CHROME_CRASH_MARKERS)
 
 
+def _is_cdp_connect_failure(stderr: str) -> bool:
+    """F2: a connect_over_cdp failure naming the local CDP endpoint.
+
+    Prod jobs 325/328/334 died at browser connect (1-3s after an orphan-kill
+    cycle) with `pw.chromium.connect_over_cdp(http://127.0.0.1:9223)` →
+    ECONNREFUSED. Because a Python Traceback is always attached, the old
+    classifier called it a code bug and refused the available retry — even
+    though a Chrome restart is exactly the remedy. The CDP-endpoint naming is
+    unambiguous (never a site-outage string), so this relaxation cannot
+    misfire on genuine code bugs that merely raise ConnectionError.
+    """
+    if not stderr:
+        return False
+    if "connect_over_cdp" not in stderr:
+        return False
+    return any(
+        marker in stderr
+        for marker in ("ECONNREFUSED", "Target closed", "Connection refused", "9223")
+    )
+
+
 def _has_traceback(stderr: str) -> bool:
     """True if stderr contains a Python Traceback (code bug — don't retry)."""
     return bool(_PYTHON_TRACEBACK_RE.search(stderr or ""))
 
 
+# M2: restart cooldown — concurrent /scrapes share the one scraper Chrome with
+# no mutual exclusion; two failures in quick succession would restart it twice,
+# killing the other scrape's session mid-run. One restart per window is enough.
+_RESTART_COOLDOWN_S = 30.0
+_last_restart_ts: float = 0.0
+
+
 def _restart_scraper_chrome() -> None:
     """Restart the scraper Chrome instance to free resources for the script."""
+    global _last_restart_ts
+    now = time.monotonic()
+    if now - _last_restart_ts < _RESTART_COOLDOWN_S:
+        logger.info(
+            "Scraper Chrome restarted within %.0fs — skipping duplicate restart",
+            _RESTART_COOLDOWN_S,
+        )
+        return
     try:
         resp = httpx.post(
             f"{BROWSER_SERVICE_URL}/restart-cdp",
@@ -66,6 +102,7 @@ def _restart_scraper_chrome() -> None:
             timeout=30,
         )
         if resp.status_code == 200:
+            _last_restart_ts = now
             logger.info("Restarted scraper Chrome before scraper run")
             time.sleep(2)
         else:
@@ -216,7 +253,10 @@ def run_scraper_script(
 
             # Non-zero exit — classify: Chrome crash (retryable) vs code bug.
             stderr = result.stderr or ""
-            chrome_crash = _is_chrome_death(stderr) and not _has_traceback(stderr)
+            chrome_crash = (
+                (_is_chrome_death(stderr) and not _has_traceback(stderr))
+                or _is_cdp_connect_failure(stderr)  # F2: retry despite traceback
+            )
 
             if chrome_crash:
                 logger.warning(
