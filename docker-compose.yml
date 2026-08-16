@@ -13,7 +13,12 @@ services:
       interval: 5s
       retries: 5
       timeout: 5s
-    mem_limit: 256m
+    # O3: 256m was the direct cause of the OOM kills (2×/36h on prod —
+    # postgres 16 default shared_buffers alone is 128m; langgraph
+    # checkpoints write full state blobs + SessionLog-heavy workloads).
+    # restart: it previously had none, so an OOM left it dead for good.
+    mem_limit: 1g
+    restart: unless-stopped
 
   redis:
     profiles: ["full"]
@@ -120,11 +125,19 @@ services:
       REDIS_URL: redis://redis:6379/0
       DJANGO_SETTINGS_MODULE: config.settings
       SECRET_KEY: dev-secret-key-change-in-production
+      # O1: beat died for 10 days on prod with ModuleNotFoundError: No module
+      # named 'src' — the worker sets PYTHONPATH=/app (below); beat did not,
+      # so webapp/scraper/views.py's `from src...` failed at migrate time.
+      PYTHONPATH: /app
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # O1: no restart policy meant the Aug-6 crash stayed dead — the stuck-job
+    # and auto-approve watchdogs never ran, which is why 3 jobs sat RUNNING
+    # for days.
+    restart: unless-stopped
     mem_limit: 128m
 
   flower:
