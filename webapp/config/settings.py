@@ -87,6 +87,13 @@ DATABASES = {
         "PASSWORD": config("DB_PASSWORD", default="scraper"),
         "HOST": config("DB_HOST", default="localhost"),
         "PORT": config("DB_PORT", default="5432"),
+        # F4: long-lived celery workers kept using connections the postmaster
+        # had killed (postgres OOM restarts) — CONN_MAX_AGE keeps a connection
+        # reusable across tasks and CONN_HEALTH_CHECKS pings it before each
+        # checkout, replacing it when stale. (Celery skips the request-cycle
+        # close_old_connections, so the health check is the load-bearing half.)
+        "CONN_MAX_AGE": 60,
+        "CONN_HEALTH_CHECKS": True,
     }
 }
 

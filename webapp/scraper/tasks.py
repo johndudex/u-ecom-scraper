@@ -140,11 +140,36 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False) -> None:
         _run_graph_job(job, rescrape=rescrape)
     except Exception as exc:
         logger.exception("Scrape job %d failed: %s", job_id, exc)
+        # F4: the original failure is often a dead DB connection (postgres
+        # OOM restart). Saving on the same dead connection re-raises and the
+        # task dies with the job stranded RUNNING (prod 284/332/333). Recycle
+        # connections first, and guard every save so the row always finalizes.
+        try:
+            from django.db import close_old_connections
+
+            close_old_connections()
+        except Exception:
+            pass
         job.status = ScrapeJob.STATUS_FAILED
         job.error_message = str(exc)[:2000]
         job.completed_at = timezone.now()
-        job.save(update_fields=["status", "error_message", "completed_at"])
-        _publish_job_status(job_id, ScrapeJob.STATUS_FAILED)
+        try:
+            job.save(update_fields=["status", "error_message", "completed_at"])
+        except Exception:
+            try:
+                job = ScrapeJob.objects.get(pk=job_id)  # fresh instance+connection
+                job.status = ScrapeJob.STATUS_FAILED
+                job.error_message = str(exc)[:2000]
+                job.completed_at = timezone.now()
+                job.save(update_fields=["status", "error_message", "completed_at"])
+            except Exception:
+                logger.error(
+                    "Job %d: could not persist FAILED status (job stranded)", job_id
+                )
+        try:
+            _publish_job_status(job_id, ScrapeJob.STATUS_FAILED)
+        except Exception:
+            pass
 
         try:
             from scraper.models import Site
@@ -678,7 +703,34 @@ def _finalize_job(job: ScrapeJob) -> None:
         snapshot = graph.get_state(config)
         final_state = snapshot.values  # type: ignore[assignment]
     except Exception as exc:
-        logger.warning("Could not read final graph state for job %d: %s", job.id, exc)
+        # F4/M5: a dead connection here previously fell through with
+        # final_state={} → the status ladder landed on COMPLETED and the Site
+        # flipped complete (silent success on an unreadable checkpoint). The
+        # checkpointer owns a dedicated psycopg pool (min_size=0) — one retry
+        # after recycling the ORM connections genuinely heals it.
+        logger.warning("get_state failed for job %d (%s) — retrying once", job.id, exc)
+        try:
+            from django.db import close_old_connections
+
+            close_old_connections()
+        except Exception:
+            pass
+        try:
+            snapshot = graph.get_state(config)
+            final_state = snapshot.values  # type: ignore[assignment]
+        except Exception as exc2:
+            logger.error(
+                "get_state failed twice for job %d — marking FAILED: %s", job.id, exc2
+            )
+            job.status = ScrapeJob.STATUS_FAILED
+            job.error_message = f"finalizer could not read graph state: {exc2}"[:2000]
+            job.completed_at = timezone.now()
+            try:
+                job.save(update_fields=["status", "error_message", "completed_at"])
+                _publish_job_status(job.id, ScrapeJob.STATUS_FAILED)
+            except Exception:
+                pass
+            return
 
     # ── Pull fields from graph state ────────────────────────────────────
     site_slug = final_state.get("site_slug", "")
