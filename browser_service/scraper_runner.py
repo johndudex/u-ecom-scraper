@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -233,13 +234,42 @@ def run_scraper_script(
         logger.info("Scraper run attempt %d/%d: %s %s", attempt, max_retries,
                      os.path.basename(scraper_path), " ".join(args or []))
         try:
-            result = subprocess.run(
+            # M1: Popen + communicate (NOT subprocess.run) with
+            # start_new_session=True so a timeout can SIGKILL the whole
+            # process group. subprocess.run reaps the child inside its own
+            # TimeoutExpired handling, leaving grandchildren (node drivers,
+            # selenium browsers) running — the documented orphan/wedge hazard.
+            # pgid == pid for a session leader, and the pgid stays valid while
+            # any member lives, so killpg(proc.pid) is safe post-timeout.
+            # Note: Playwright-detached Chromium (cloak mode) escapes the
+            # group by design — F1's in-flight counter + the orphan killer
+            # cover that residual.
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
                 cwd=os.path.dirname(scraper_path) or PROJECT_ROOT,
                 env=env,
+                start_new_session=True,
+            )
+            try:
+                stdout_s, stderr_s = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                stdout_s, stderr_s = proc.communicate()  # reap
+                result = subprocess.CompletedProcess(
+                    cmd, proc.returncode, stdout_s, stderr_s
+                )
+                raise subprocess.TimeoutExpired(cmd, timeout, stderr=stderr_s)
+            result = subprocess.CompletedProcess(
+                cmd, proc.returncode, stdout_s, stderr_s
             )
             elapsed = round(time.time() - attempt_start, 2)
             logger.info(

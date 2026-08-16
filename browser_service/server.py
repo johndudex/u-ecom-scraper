@@ -58,6 +58,36 @@ NAVIGATE_ACTIVE_PIDS: set[int] = set()
 # killer safety gate).
 _navigate_in_flight = 0
 
+# ── /scrape in-flight registry (F1) ────────────────────────────────────────
+# A running scraper subprocess drives the SHARED scraper Chrome; the orphan
+# killer must not reap that Chrome's children mid-run (prod 325/328/334).
+# Keyed by request-id with a monotonic deadline: the endpoint wraps the run in
+# wait_for(timeout+120) so the executor thread can outlive the HTTP response —
+# the entry is released by the guarded runner only when the child is reaped,
+# and the deadline is a failsafe so a wedged holder can never permanently
+# disable the killer.
+SCRAPE_IN_FLIGHT: dict[str, float] = {}
+SCRAPE_PROTECTION_GRACE_S = 600.0
+
+
+def _scrape_protection_active() -> bool:
+    now = time.monotonic()
+    stale = [rid for rid, dl in SCRAPE_IN_FLIGHT.items() if now > dl]
+    for rid in stale:
+        SCRAPE_IN_FLIGHT.pop(rid, None)
+        logger.warning("scrape protection for %s expired (leaked holder?)", rid)
+    return bool(SCRAPE_IN_FLIGHT)
+
+
+def _run_scrape_guarded(rid: str, **kwargs):
+    """Executor wrapper: hold the kill-cycle protection until the child exits."""
+    try:
+        from .scraper_runner import run_scraper_script
+
+        return run_scraper_script(**kwargs)
+    finally:
+        SCRAPE_IN_FLIGHT.pop(rid, None)
+
 
 async def _start_mcp_process() -> bool:
     """Start (or restart) the Playwright MCP server process.
@@ -221,8 +251,19 @@ async def _periodic_cdp_liveness():
 
 
 async def _cleanup_chrome_artifacts():
-    _collect_persistent_pids()
-    killed = _kill_orphan_chrome()
+    # F1: snapshot + kill atomically under the restart lock so a Chrome that
+    # restarts mid-cycle can't have its fresh (un-allowlisted) PID killed.
+    # Non-blocking: a restart in progress means the tree is being torn down
+    # anyway — skip the cycle (orphans reaped next interval).
+    if not browser_pool._restart_lock.acquire(blocking=False):
+        logger.info("cleanup: skipping kill cycle (Chrome restart in progress)")
+        _clean_chrome_profile_cache()
+        return
+    try:
+        _collect_persistent_pids()
+        killed = _kill_orphan_chrome()
+    finally:
+        browser_pool._restart_lock.release()
     cleaned = _clean_chrome_profile_cache()
     if killed or cleaned:
         logger.info(
@@ -232,14 +273,53 @@ async def _cleanup_chrome_artifacts():
         )
 
 
+def _proc_children(pid: int) -> set[int]:
+    """Direct children of pid via /proc (Linux). Empty on any failure."""
+    kids: set[int] = set()
+    try:
+        for tid in os.listdir(f"/proc/{pid}/task"):
+            try:
+                with open(f"/proc/{pid}/task/{tid}/children") as fh:
+                    kids.update(int(x) for x in fh.read().split())
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return kids
+
+
 def _collect_persistent_pids():
+    """F1: protect the FULL process tree of both persistent Chromes.
+
+    The old version collected only the two top-level launcher PIDs — the
+    orphan killer then SIGKILLed ~20 renderer/GPU/utility children every
+    30-min cycle, CDP went DOWN, and both Chromes auto-restarted (prod's
+    permanent kill→restart loop that crashed jobs 325/328/334 and hung
+    272's product_analyzer mid-browse).
+    """
     PERSISTENT_CHROME_PIDS.clear()
     try:
         h = browser_pool.health()
-        for key in ("mcp_pid", "scraper_pid"):
-            pid = h.get(key)
-            if pid:
-                PERSISTENT_CHROME_PIDS.add(pid)
+        roots = [h.get(k) for k in ("mcp_pid", "scraper_pid")]
+        for root in roots:
+            if not root:
+                continue
+            # BFS the process tree (children lists change as Chrome spawns
+            # helpers; walk until fixpoint with a hard depth bound).
+            seen: set[int] = set()
+            frontier = [root]
+            for _ in range(32):
+                new = [p for p in frontier if p not in seen]
+                if not new:
+                    break
+                for p in new:
+                    seen.add(p)
+                nxt: set[int] = set()
+                for p in new:
+                    nxt |= _proc_children(p)
+                frontier = list(nxt - seen)
+            for p in seen:
+                PERSISTENT_CHROME_PIDS.add(p)
     except Exception:
         pass
 
@@ -258,6 +338,11 @@ def _kill_orphan_chrome() -> int:
                 "kill_orphan_chrome: skipping (%d navigate call(s) in flight)",
                 _navigate_in_flight,
             )
+            return 0
+        # F1: same gate for /scrape — a running scraper drives the shared
+        # Chrome; killing its children mid-run is the prod 325/328/334 crash.
+        if _scrape_protection_active():
+            logger.info("kill_orphan_chrome: skipping (scrape in flight)")
             return 0
         result = subprocess.run(
             ["pgrep", "-f", "chrome"],
@@ -946,16 +1031,30 @@ async def scrape(request: ScrapeRequest):
             )
         try:
             loop = asyncio.get_event_loop()
+            # F1: register kill-cycle protection keyed by the run dir's uuid,
+            # with a deadline failsafe (timeout × retries + grace) so a wedged
+            # executor thread can never permanently disable the orphan killer.
+            # Released by _run_scrape_guarded only when the child is reaped —
+            # NOT by this endpoint's finally (the executor thread outlives the
+            # HTTP response on wait_for timeout).
+            rid = os.path.basename(run_dir)
+            SCRAPE_IN_FLIGHT[rid] = (
+                time.monotonic()
+                + request.timeout * max(1, request.max_retries)
+                + SCRAPE_PROTECTION_GRACE_S
+            )
             result = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
-                    lambda: run_scraper_script(
-                        scraper_path=scraper_path,
-                        args=request.args,
-                        timeout=request.timeout,
-                        env_overrides=request.env_overrides,
-                        max_retries=request.max_retries,
-                    ),
+                    _run_scrape_guarded,
+                    **{
+                        "rid": rid,
+                        "scraper_path": scraper_path,
+                        "args": request.args,
+                        "timeout": request.timeout,
+                        "env_overrides": request.env_overrides,
+                        "max_retries": request.max_retries,
+                    },
                 ),
                 timeout=request.timeout + 120,
             )
