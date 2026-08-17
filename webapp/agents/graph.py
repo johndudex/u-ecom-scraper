@@ -1636,7 +1636,24 @@ def _invoke_site_analyzer(
                 "anti_bot_detected": analysis.get("anti_bot_detected", False),
             }
             update["probe_url"] = product_url
-        return update
+        # F13: fold the old conditional-edge routing (_route_after_site_analyzer)
+        # into the Command so budget/missing-artifact interrupts are NOT unioned
+        # with it (LangGraph executes both a Command goto AND any registered
+        # out-edges — the D6 shadow-branch bug: a paused job ran the ghost
+        # update_tracker_analysis → validate_analysis chain in parallel with
+        # the human_approval interrupt). This node must have NO out-edges.
+        input_mode = st.get("input_mode", "url_list")
+        if input_mode in ("navigation", "list_page", "search_term"):
+            logger.info(
+                "site_analyzer: input_mode=%s → browser_traverse (F13 Command route)",
+                input_mode,
+            )
+            return Command(goto="browser_traverse", update=update)
+        logger.info(
+            "site_analyzer: input_mode=%s → update_tracker_analysis (F13 Command route)",
+            input_mode,
+        )
+        return Command(goto="update_tracker_analysis", update=update)
 
     return _run_budgeted_agent(
         state,
@@ -1721,7 +1738,14 @@ def _invoke_product_analyzer(
                     "remap_count": remap_count,
                 },
             )
-        return {"messages": [], "product_analysis": analysis}
+        # F13: happy path routes via Command (the static product_analyzer →
+        # normalize_fields edge was deleted — it unioned with the budget/
+        # remap Commands; the D6 shadow branch). normalize_fields keeps its
+        # own static out-edge to validate_coverage.
+        return Command(
+            goto="normalize_fields",
+            update={"messages": [], "product_analysis": analysis},
+        )
 
     return _run_budgeted_agent(
         state,
@@ -4096,15 +4120,9 @@ def build_scrape_graph(
     # or probe result on first pass). goto may be: site_analyzer,
     # validate_analysis, scraper_analyzer, code_writer, code_tester, or END.
 
-    # site_analyzer → conditional (browser_traverse vs update_tracker_analysis)
-    workflow.add_conditional_edges(
-        "site_analyzer",
-        _route_after_site_analyzer,
-        {
-            "browser_traverse": "browser_traverse",
-            "update_tracker_analysis": "update_tracker_analysis",
-        },
-    )
+    # F13: site_analyzer routes via Command (folded into _on_success above) —
+    # NO registered out-edges. The old conditional edge unioned with the
+    # budget-exhaustion Command (both destinations ran — the D6 shadow branch).
 
     # browser_traverse → product_analyzer (replaces the 3-node navigation pipeline).
     workflow.add_edge("browser_traverse", "product_analyzer")
@@ -4132,8 +4150,13 @@ def build_scrape_graph(
     # From validate_analysis, Command goto may be: product_analyzer,
     # human_approval, code_writer
 
-    # product_analyzer → normalize_fields → validate_coverage
-    workflow.add_edge("product_analyzer", "normalize_fields")
+    # F13: product_analyzer routes via Command (happy path → normalize_fields
+    # via its _on_success; budget-exhaustion/missing-artifact/remap → their own
+    # gotos). The static edge unioned with those Commands (the D6 shadow
+    # branch: prod 272 needed TWO cancels and ended with a misleading error;
+    # the remap path's intended skip of normalize/validate never happened).
+    # normalize_fields keeps its own static edge (its source never returns
+    # a Command).
     workflow.add_edge("normalize_fields", "validate_coverage")
 
     # validate_coverage uses Command-based routing internally.

@@ -155,6 +155,17 @@ def _ordered_steps(job):
     return sorted(job.steps.all(), key=lambda s: order.get(s.phase, 999))
 
 
+def _url_slug(url: str) -> str:
+    """Hostname slug (mirrors tasks._generate_slug) — for the F10 existence check."""
+    try:
+        from urllib.parse import urlparse
+
+        host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+        return "".join(c if c.isalnum() else "-" for c in host) or "site"
+    except Exception:
+        return "site"
+
+
 @login_required
 def home(request):
     from .models import ContentType
@@ -193,6 +204,44 @@ def home(request):
         if not url:
             context["error"] = "URL is required"
             return render(request, "scraper/home.html", context)
+
+        # F10: guard the legacy form. url/product_url are URLFields (varchar
+        # 200) — a multi-URL paste into the single-URL field DataErrors into
+        # a 500 (prod 255+: four POST / → 500 tracebacks), and the surviving
+        # single-URL submissions created doomed url_list jobs that failed at
+        # setup_workspace's fail-fast. Reject at POST time with guidance
+        # instead of failing ~5 nodes into the graph.
+        if len(url) > 200 or len(product_url) > 200:
+            context["error"] = (
+                "That looks like multiple URLs pasted into a single-URL field. "
+                'Use the <a href="/intake/">intake form</a> and choose '
+                '"I have the exact list" to submit a URL list.'
+            )
+            return render(request, "scraper/home.html", context)
+        if input_mode == "url_list":
+            # This form has no URL-list input; a url_list-mode job from here
+            # has no URLs to extract. Point the user at the intake form.
+            from .models import Site
+
+            _slug_site = Site.objects.filter(url=url.rstrip("/")).first()
+            _has_urls = bool(
+                _slug_site and getattr(_slug_site, "input_urls", None)
+            ) or os.path.isfile(
+                os.path.join(
+                    str(getattr(settings, "PROJECT_ROOT", os.getcwd())),
+                    "scrapers",
+                    _url_slug(url),
+                    "input_urls.json",
+                )
+            )
+            if not _has_urls:
+                context["error"] = (
+                    "This quick form can't submit a product-URL list. Use the "
+                    '<a href="/intake/">intake form</a> with '
+                    '"I have the exact list", or pick a page type that '
+                    "navigates (e.g. Listing page)."
+                )
+                return render(request, "scraper/home.html", context)
 
         existing = ScrapeJob.objects.filter(
             url=url, status__in=[ScrapeJob.STATUS_PENDING, ScrapeJob.STATUS_RUNNING],
@@ -714,8 +763,33 @@ def _build_resume_value(approval: Approval, choice: str, feedback: str) -> dict:
 
 
 @login_required
+def _approval_scope(request):
+    """F11: the approval visibility scope. Superusers see ALL pending approvals;
+    regular users see their own PLUS ownerless ones (auto-queued jobs have
+    user=None and were invisible to everyone but Django admin — prod 257 sat
+    pending for days)."""
+    if request.user.is_superuser:
+        return None  # no filter
+    from django.db.models import Q
+
+    return Q(job__user=request.user) | Q(job__user__isnull=True)
+
+
+def _approval_visible(approval, request) -> bool:
+    """F11 companion: can this user act on this approval?"""
+    return (
+        request.user.is_superuser
+        or approval.job_id is None
+        or approval.job is None
+        or approval.job.user_id == request.user.id
+        or approval.job.user_id is None
+    )
+
+
 def approval_inline(request, job_id, approval_id):
-    approval = get_object_or_404(Approval, pk=approval_id, job_id=job_id, job__user=request.user)
+    approval = get_object_or_404(Approval, pk=approval_id, job_id=job_id)
+    if not _approval_visible(approval, request):
+        raise Http404("approval not found")
     choice = request.POST.get("choice", "")
     feedback = request.POST.get("feedback", "").strip()
 
@@ -768,7 +842,7 @@ def pending_approvals_fragment(request, job_id):
 @login_required
 def approval_list(request):
     approvals = (
-        Approval.objects.filter(status=Approval.STATUS_PENDING, job__user=request.user)
+        Approval.objects.filter(status=Approval.STATUS_PENDING).filter(_approval_scope(request))
         .select_related("job")
         .order_by("-created_at")
     )
@@ -777,13 +851,15 @@ def approval_list(request):
 
 @login_required
 def approval_count(request):
-    count = Approval.objects.filter(status=Approval.STATUS_PENDING, job__user=request.user).count()
+    count = Approval.objects.filter(status=Approval.STATUS_PENDING).filter(_approval_scope(request)).count()
     return JsonResponse({"count": count})
 
 
 @login_required
 def approval_detail(request, approval_id):
-    approval = get_object_or_404(Approval, pk=approval_id, job__user=request.user)
+    approval = get_object_or_404(Approval, pk=approval_id)
+    if not _approval_visible(approval, request):
+        raise Http404("approval not found")
     if request.method == "POST":
         choice = request.POST.get("choice", "")
         feedback = request.POST.get("feedback", "").strip()
