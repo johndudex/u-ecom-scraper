@@ -648,8 +648,25 @@ def _run_in_process(
             }
 
         _slug = os.path.basename(site_folder.rstrip("/")) if site_folder else None
-        output_file = _find_newest_output(workspace_folder, site_folder, slug=_slug)
-        product_count = _count_products(output_file) if output_file else 0
+        # F8: floor = subprocess start so only files THIS run wrote are eligible
+        # (prod 319 shipped code_tester's sample written 32s BEFORE execution).
+        # A floored call returns "" when nothing passed — the caller below fails
+        # the run instead of crediting a stale/absent file. No FM fallback here:
+        # an FM download lands in a fresh-mtime tmpfile that launders stale
+        # content through any floor.
+        output_file = _find_newest_output(
+            workspace_folder, site_folder, slug=None, mtime_floor=start
+        )
+        if not output_file:
+            return {
+                "execution_status": "FAILED",
+                "error_message": (
+                    "Execution produced no output file (rc=0 but no fresh "
+                    "output_*.json with mtime >= subprocess start; discovery "
+                    "likely found 0 items or the scraper wrote nothing)."
+                ),
+            }
+        product_count = _count_products(output_file)
         discovery_coverage = _read_discovery_coverage(output_file)
 
         # H3: in-process path owns its own checkpoint cleanup (no browser_service
@@ -824,23 +841,83 @@ def _run_via_browser_service(
                 pass
 
 
-def _find_newest_output(*directories: str, slug: str | None = None) -> str:
-    """Return the newest-mtime ``output_*.json`` across the given LOCAL directories.
+def _substantive_item_count(path: str) -> int:
+    """F8/F16/F9 helper: items with >=1 content-type core field (0 on any error).
+
+    Same predicate family as route_after_testing's F15 fix — an output whose
+    rows carry no core field (price/availability for products...) is not
+    'real' data (prod 337: 36 brand-only rows). Unparseable files count 0.
+    The output file does not record the job's content type, so when the
+    registry returns no fields we fall back to the union of common core
+    fields across types — deliberately EXCLUDING title, which brand-only
+    soft failures still carry (337's rows all had titles).
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return 0
+        fields: list[str] = []
+        try:
+            from src.content_types import output_filter_fields
+
+            fields = output_filter_fields("") or []
+        except Exception:
+            fields = []
+        if not fields:
+            fields = [
+                "price", "availability", "currency",
+                "author", "publish_date", "company", "location",
+                "content", "snippet", "rank", "posts",
+            ]
+        count = 0
+        for key in ("products", "jobs", "articles", "results", "items", "threads", "pages"):
+            val = data.get(key)
+            if isinstance(val, list) and val:
+                for item in val:
+                    if not isinstance(item, dict):
+                        continue
+                    if any(item.get(f) for f in fields):
+                        count += 1
+                break
+        return count
+    except Exception:
+        return 0
+
+
+def _find_newest_output(
+    *directories: str, slug: str | None = None, mtime_floor: float | None = None
+) -> str:
+    """Select the best ``output_*.json`` across the given LOCAL directories.
 
     The scraper writes its output next to itself (``SCRIPT_DIR`` = dirname of
     the scraper file), which during a run is ``workspace/{slug}/``. Selecting by
     name OR scanning ``scrapers/{slug}/`` first returns a *stale* output from a
-    prior job on a re-scrape, so picking the newest mtime reliably identifies the
-    file THIS run just wrote.
+    prior job on a re-scrape, so picking the newest mtime reliably identifies
+    the file THIS run just wrote.
 
-    If nothing is found locally and ``slug`` is given, fall back to the File
-    Master's latest published output for the site (downloaded to a tmp file so
-    downstream readers that open a path — ``_count_products``,
-    ``_read_discovery_coverage`` — keep working). This covers the resume case
-    where the workspace was rmtree'd.
+    F8 (``mtime_floor``): only accept files with mtime >= floor. Fresh-
+    execution callers pass the subprocess start so a stale file can never be
+    credited to this run (prod 319 shipped code_tester's sample written 32s
+    BEFORE execution started). With a floor set, an empty result returns ""
+    (FAILED by the caller) — the File-Master fallback is BYPASSED because an
+    FM download lands in a fresh-mtime tmpfile that launders stale content
+    through any floor.
+
+    F16: among floor-passing candidates, prefer the file with the MOST
+    substantive items; mtime is only the tiebreak (mirrors route_after_testing's
+    own best-of-N fix — the newest file is frequently a 0-item Phase-1 crash
+    while a full file sits minutes older). NOTE: this deliberately does NOT
+    rescue prod 324/336 — their 5-item files are testing-phase samples that
+    predate the execution subprocess (below the floor); widening the window
+    would ship tester samples as full scrapes. Those jobs fail honestly via
+    F9.
+
+    Without a floor (legacy callers: graph.py's tester context and
+    store_job_listings' resume path), behavior is the old newest-mtime pick
+    WITH the FM fallback preserved.
     """
-    best_mtime = -1.0
-    best_path = ""
+    candidates: list[tuple[float, str]] = []
     for directory in directories:
         if not directory or not os.path.isdir(directory):
             continue
@@ -856,24 +933,33 @@ def _find_newest_output(*directories: str, slug: str | None = None) -> str:
                 mtime = os.path.getmtime(path)
             except OSError:
                 continue
-            if mtime > best_mtime:
-                best_mtime, best_path = mtime, path
-    if not best_path and slug:
-        try:
-            import src.artifacts as artifacts
-            import tempfile
+            if mtime_floor is not None and mtime < mtime_floor:
+                continue
+            candidates.append((mtime, path))
+    if not candidates:
+        if mtime_floor is not None:
+            # F8: floored fresh-execution call — no FM fallback (laundering).
+            return ""
+        if slug:
+            try:
+                import src.artifacts as artifacts
+                import tempfile
 
-            fm_key = artifacts.latest_output_key(slug)
-            if fm_key:
-                _tmp = tempfile.NamedTemporaryFile(
-                    prefix="fm_output_", suffix=".json", delete=False
-                )
-                _tmp.write(artifacts.read(fm_key))
-                _tmp.close()
-                best_path = _tmp.name
-        except Exception as exc:
-            logger.debug("_find_newest_output: FM fallback failed: %s", exc)
-    return best_path
+                fm_key = artifacts.latest_output_key(slug)
+                if fm_key:
+                    _tmp = tempfile.NamedTemporaryFile(
+                        prefix="fm_output_", suffix=".json", delete=False
+                    )
+                    _tmp.write(artifacts.read(fm_key))
+                    _tmp.close()
+                    return _tmp.name
+            except Exception as exc:
+                logger.debug("_find_newest_output: FM fallback failed: %s", exc)
+        return ""
+    # F16: rank by substantive count DESC, then mtime DESC.
+    scored = [(mtime, _substantive_item_count(path), path) for mtime, path in candidates]
+    scored.sort(key=lambda t: (t[1], t[0]), reverse=True)
+    return scored[0][2]
 
 
 def _count_products(output_path: str) -> int:

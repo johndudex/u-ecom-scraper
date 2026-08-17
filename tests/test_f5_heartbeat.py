@@ -69,7 +69,7 @@ class TestM4SelfTermination:
         src = _graph_src()
         # the SessionLog write must be inside `if not _job_terminal:`
         i_check = src.index("if not _job_terminal:")
-        i_write = src.index('content=f"[HEARTBEAT] Agent {agent_name} still running...",')
+        i_write = src.index('content=f"{prefix} Agent {agent_name} still running...",')
         assert i_check < i_write
 
     def test_stop_before_reschedule(self):

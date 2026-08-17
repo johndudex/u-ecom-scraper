@@ -92,11 +92,20 @@ class TestScraperHasRealItems:
         assert self.fn(self._state(rows), min_count=3) is False
 
     def test_unknown_content_type_keeps_old_behavior(self):
-        # no filter fields → has_substantive_field fallback (title counts)
-        rows = [{"title": f"item {i}"} for i in range(5)]
+        # No filter fields → has_substantive_field fallback. NOTE: the REAL
+        # has_substantive_field deliberately excludes title from substantive
+        # fields (soft-404 pages still carry titles — see its docstring), so
+        # title-only rows do NOT count here either; a brand-only row does.
+        # (The earlier "title counts" expectation only held under the
+        # degraded-WSL runner where the src import fell back to a title lambda.)
+        rows = [{"title": f"item {i}", "brand": "Acme"} for i in range(5)]
         st = self._state(rows)
         st["content_type_config"] = {"content_type": ""}  # unknown → no fields
         assert self.fn(st, min_count=3) is True
+        title_only = [{"title": f"tee {i}"} for i in range(5)]
+        st2 = self._state(title_only)
+        st2["content_type_config"] = {"content_type": ""}
+        assert self.fn(st2, min_count=3) is False
 
 
 class TestOutputAsTruthFallback:
