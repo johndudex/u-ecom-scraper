@@ -375,3 +375,33 @@ Some sites silently reject non-authentic browsers (standard Playwright, direct H
 **Key distinction from Akamai/Cloudflare:** This pattern has `anti_bot.detected: false` because there's no visible protection system. The block happens at the TLS layer, not via a JavaScript challenge. This means the site_analyzer will NOT trigger anti-bot handling, but connectivity will indicate only UC Chrome works.
 
 **Sites observed:** bulgari.com (LVMH)
+
+## Learned: Force UTF-8 Response Encoding in Python requests to Prevent Mojibake
+**Source:** https://books.toscrape.com (2026-08-17)
+**Applicability:** Any Python scraper using the `requests` library when the server doesn't declare charset in Content-Type headers, or declares it incorrectly.
+
+Python's `requests` library defaults to ISO-8859-1 (Latin-1) encoding per HTTP/1.1 spec when the server doesn't declare `charset` in the `Content-Type` header. This causes multi-byte UTF-8 characters to render as mojibake:
+
+- `£` (U+00A3, UTF-8 bytes `C2 A3`) → `Â£`
+- `'` right single quote (U+2019, UTF-8 bytes `E2 80 99`) → `â\x80\x99`
+
+This affects price fields (currency symbols), titles (curly quotes, accented characters), and any text with non-ASCII content.
+
+**Fix — always force UTF-8 when decoding:**
+
+```python
+import requests
+
+response = requests.get(url)
+
+# Option 1 (recommended): Override detected encoding
+response.encoding = 'utf-8'
+html = response.text
+
+# Option 2: Decode bytes manually
+html = response.content.decode('utf-8')
+```
+
+**When to check:** If any extracted text contains `Â£`, `â€`, or similar mojibake artifacts, the response encoding is wrong. The numeric values in the data will be correct — only non-ASCII characters are corrupted.
+
+**Note:** This is NOT an anti-bot issue, but it commonly appears alongside anti-bot work because scraping libraries often need encoding fixes.

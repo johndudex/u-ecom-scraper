@@ -35,6 +35,7 @@ DENYLIST = {
     "skipverify-example",
     "books-toscrape-com",
     "desidime-com",
+    "quotes-toscrape-com",
 }
 
 
