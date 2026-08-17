@@ -389,8 +389,22 @@ def main():
     discovery_meta: dict = {"stop_reason": "skipped", "max_pages_hit": False}
 
     # Phase 1: URL discovery (or load from input).
-    if args.discover_only:
-        logger.info("--discover-only: running Phase 1 discovery, skipping Phase 2 extraction")
+    # F6 DETERMINISTIC DISCOVERY GATE (env-var): run_execution injects
+    # SCRAPER_LISTING_URL because the LLM-adapted argparse may drop
+    # --listing-url/--fresh-discovery (the CLI-contract guard then strips
+    # them). Without this gate the seed-file branch below ALWAYS wins (the
+    # seed file exists — run_execution stages input_urls.json) and discovery
+    # never runs (prod 285: 1 item from 4 seeds; pagination dead). In-place
+    # [:] mutation so LLM-copied drafts that alias the list stay coherent.
+    _env_listing = os.environ.get("SCRAPER_LISTING_URL", "").strip()
+    if _env_listing:
+        PRODUCT_LISTING_URLS[:] = [_env_listing]
+        logger.info("Env gate: SCRAPER_LISTING_URL set — forcing Phase 1 discovery on %s",
+                    _env_listing[:80])
+
+    if args.discover_only or _env_listing:
+        logger.info("Discovery mode (%s): running Phase 1, skipping Phase 2 extraction",
+                    "env-gate" if _env_listing else "--discover-only")
         product_urls, discovery_meta = discover_product_urls()
         discovered_urls_raw = len(product_urls)
         ran_phase1 = True

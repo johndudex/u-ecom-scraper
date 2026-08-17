@@ -1762,6 +1762,65 @@ def _invoke_product_analyzer(
     )
 
 
+def _sanitize_nav_domains(analysis: dict, job_url: str) -> dict:
+    """F17: blank cross-registrable-domain navigation artifacts (blank + warn).
+
+    Prod 331 (prettylittlething.us): browser_traverse followed a footer locale
+    link, so search.working_url / discovery.listing_url / every url_example
+    ended up prettylittlething.com.au under a .us job — 80/80 rows shipped
+    wrong-domain. No domain check existed anywhere in the chain. BLANKING
+    (not rejecting) is safe because the site-root fallback upstream re-fills
+    discovery.listing_url on the CORRECT domain when the artifact is empty;
+    if nothing valid is found, F9 fails the job loudly instead of shipping
+    contaminated data.
+    """
+    try:
+        from experimental.nav_traversal.traversal import _registrable
+
+        job_reg = _registrable(job_url)
+        if not job_reg:
+            return analysis
+        blanks: list[str] = []
+
+        def _check(value, field):
+            if isinstance(value, str) and value.startswith("http") and _registrable(value) not in ("", job_reg):
+                blanks.append(f"{field}={value[:60]}")
+                return True
+            return False
+
+        search = analysis.get("search") or {}
+        if isinstance(search, dict):
+            for k in ("working_url", "listing_url_used"):
+                if _check(search.get(k), f"search.{k}"):
+                    search[k] = ""
+        disc = analysis.get("discovery") or {}
+        if isinstance(disc, dict):
+            if _check(disc.get("listing_url"), "discovery.listing_url"):
+                disc["listing_url"] = ""
+        il = analysis.get("item_links") or {}
+        if isinstance(il, dict):
+            examples = il.get("url_examples")
+            if isinstance(examples, list):
+                kept = [
+                    u for u in examples
+                    if not (isinstance(u, str) and u.startswith("http")
+                            and _registrable(u) not in ("", job_reg))
+                ]
+                if len(kept) != len(examples):
+                    blanks.append(f"item_links.url_examples ({len(examples) - len(kept)} dropped)")
+                    il["url_examples"] = kept
+        if blanks:
+            logger.warning(
+                "browser_traverse: F17 domain guard blanked cross-domain nav "
+                "artifacts for job URL %s (registrable %s): %s",
+                job_url[:60], job_reg, "; ".join(blanks),
+            )
+        return analysis
+    except Exception as exc:
+        logger.warning("F17 domain guard error (passing through): %s", exc)
+        return analysis
+
+
 def _invoke_navigation_traverse(
     state: ScrapeState, config: RunnableConfig
 ) -> dict[str, Any] | Command:
@@ -1805,6 +1864,11 @@ def _invoke_navigation_traverse(
             if isinstance(explore_result, dict):
                 state.update(explore_result)
             synth_result = navigate_synthesize(dict(state), config)
+            # F17: apply the same domain guard on the fallback path's analysis
+            if isinstance(synth_result, dict):
+                _na = synth_result.get("navigation_analysis")
+                if isinstance(_na, dict):
+                    synth_result["navigation_analysis"] = _sanitize_nav_domains(_na, url)
             _notify_phase(job_id, "browser_traverse", "done")
             return synth_result if isinstance(synth_result, dict) else {"messages": []}
 
@@ -1946,6 +2010,9 @@ def _invoke_navigation_traverse(
             "discovery": _disc_fb,
             "pagination": _disc_fb.get("pagination") or {},
         }
+
+        # F17: blank cross-registrable-domain artifacts before persisting.
+        analysis = _sanitize_nav_domains(analysis, url)
 
         # Persist to workspace/{slug}/navigation_analysis.json
         root = _get_project_root()

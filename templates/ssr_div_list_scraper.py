@@ -218,6 +218,13 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="Max items (0=unlimited)")
     args = parser.parse_args()
 
+    # F6 DETERMINISTIC DISCOVERY GATE (env-var): env wins over --listing-url/
+    # seed-derived values (run_execution injects it for exactly this purpose).
+    _env_listing = os.environ.get("SCRAPER_LISTING_URL", "").strip()
+    if _env_listing:
+        logger.info("Env gate: SCRAPER_LISTING_URL → %s", _env_listing[:80])
+        args.listing_url = _env_listing
+
     # Determine the listing URL
     listing_url = args.listing_url
     if not listing_url and args.urls:

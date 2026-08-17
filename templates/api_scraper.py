@@ -251,6 +251,8 @@ def main():
     parser.add_argument("--limit", type=int, default=None, help="Max products to scrape")
     parser.add_argument("--input", type=str, default=None, help="Path to input URLs JSON file")
     parser.add_argument("--urls", nargs="+", default=None, help="Product URLs as arguments")
+    parser.add_argument("--fresh-discovery", action="store_true",
+                        help="Bypass input_urls.json and rediscover via API pagination")
     args = parser.parse_args()
 
     start_time = time.time()
@@ -266,14 +268,23 @@ def main():
     raw_products = []
     src_url = f"{API_BASE_URL}{API_PRODUCTS_ENDPOINT}"
 
-    if args.urls:
+    # F6: run_execution always passes --fresh-discovery for nav jobs; declaring
+    # it here means the CLI-contract guard passes it through (declared flags
+    # are never stripped) and the seed-file branch can't suppress API
+    # pagination. SCRAPER_LISTING_URL is semantically wrong for this template
+    # (no listing page — discovery IS the API), so the flag is the mechanism.
+    _force_fresh = args.fresh_discovery or bool(
+        os.environ.get("SCRAPER_FORCE_DISCOVERY", "").strip()
+    )
+    if args.urls and not _force_fresh:
         product_urls = args.urls
-    elif args.input:
+    elif args.input and not _force_fresh:
         product_urls = load_urls_from_file(args.input)
-    elif os.path.exists(INPUT_FILE):
+    elif os.path.exists(INPUT_FILE) and not _force_fresh:
         product_urls = load_urls_from_file(INPUT_FILE)
     else:
-        logger.info("No input_urls.json found. Discovering products via API...")
+        logger.info("Fresh discovery (%s): paginating API for product URLs",
+                    "flag" if args.fresh_discovery else "env")
         product_urls, raw_products = fetch_all_products_via_api()
         save_urls_to_file(INPUT_FILE, product_urls)
 

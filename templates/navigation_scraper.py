@@ -745,6 +745,14 @@ def main():
                         help="Ignore existing checkpoint; run Phase 1 from scratch")
     args = parser.parse_args()
 
+    # F6 DETERMINISTIC DISCOVERY GATE (env-var): see http_navigation_scraper.
+    _env_listing = os.environ.get("SCRAPER_LISTING_URL", "").strip()
+    if _env_listing:
+        args.listing_url = _env_listing
+        args.fresh_discovery = True
+        logger.info("Env gate: SCRAPER_LISTING_URL → --listing-url %s (fresh)",
+                    _env_listing[:80])
+
     limit = 5 if args.sample else args.limit
 
     proxy_url = None

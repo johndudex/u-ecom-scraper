@@ -1061,6 +1061,19 @@ def main():
     if args.no_proxy:
         PROXY_TIER = "none"
 
+    # F6 DETERMINISTIC DISCOVERY GATE (env-var): feeds the existing CLI
+    # contract rather than adding a parallel branch — run_execution injects
+    # SCRAPER_LISTING_URL because the LLM-adapted argparse may drop the flags.
+    # Deliberately does NOT override FORM_ACTION (form-search sites like
+    # locumtenens iterate a <select>'s options across the whole taxonomy;
+    # a listing URL would collapse that into one page — a 320-class regression).
+    _env_listing = os.environ.get("SCRAPER_LISTING_URL", "").strip()
+    if _env_listing:
+        args.listing_url = _env_listing
+        args.fresh_discovery = True  # the checkpoint gate below honors this
+        logger.info("Env gate: SCRAPER_LISTING_URL → --listing-url %s (fresh)",
+                    _env_listing[:80])
+
     limit = 5 if args.sample else args.limit
     start_time = time.time()
     discovered_urls: list[str] = []

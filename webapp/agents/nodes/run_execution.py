@@ -227,14 +227,35 @@ def run_execution(state: ScrapeState) -> dict:
             _respect_flag = True
 
         if _listing_reached or not _respect_flag:
-            # Nav reached the listing → working_url IS the listing URL → pass it.
-            # (Or kill-switch off → old behavior: always pass working_url.)
+            # Nav reached the listing → pass the best listing URL. F7 chain:
+            # discovery.listing_url (the navigator's authoritative contract)
+            # first, then search.working_url / listing_url_used (the
+            # traversal's actual landing page — blank for 8/9 sites' on-disk
+            # analyses if listing_url is absent, so the chain must fall
+            # through, never replace). F17: each candidate domain-guarded
+            # against the job URL's registrable domain (prod 331 shipped 80/80
+            # .com.au rows under a .us job).
             _search = _nav.get("search") or {}
-            _working_url = (
-                (_search.get("working_url") if isinstance(_search, dict) else "")
-                or (_search.get("listing_url_used") if isinstance(_search, dict) else "")
-                or ""
-            )
+            _disc = (_nav.get("discovery") if isinstance(_nav, dict) else None) or {}
+            _job_reg = _registrable_of(url)
+            _candidates = [
+                (_disc.get("listing_url") if isinstance(_disc, dict) else ""),
+                (_search.get("working_url") if isinstance(_search, dict) else ""),
+                (_search.get("listing_url_used") if isinstance(_search, dict) else ""),
+            ]
+            _working_url = ""
+            for _c in _candidates:
+                if not (isinstance(_c, str) and _c.strip()):
+                    continue
+                _c_reg = _registrable_of(_c)
+                if _job_reg and _c_reg and _c_reg != _job_reg:
+                    logger.warning(
+                        "run_execution: F17 dropped cross-domain --listing-url "
+                        "candidate %s (job domain %s)", _c[:70], _job_reg,
+                    )
+                    continue
+                _working_url = _c.strip()
+                break
             if _working_url:
                 args.extend(["--listing-url", _working_url])
                 logger.info(
@@ -268,17 +289,26 @@ def run_execution(state: ScrapeState) -> dict:
     # code_writer's per-run argparse may or may not declare --listing-url/
     # --fresh-discovery, but env vars always reach the scraper. The template's
     # main() checks SCRAPER_LISTING_URL before the seed-file gate.
+    # F7+M6: prefer discovery.listing_url (the navigator's authoritative
+    # contract; working_url may be a detail page — the uindex root cause),
+    # fall back to the CLI chain's value; F17 domain-guarded either way.
     _listing_url_env = ""
     if input_mode in ("navigation", "list_page", "search_term"):
         _nav_env = state.get("navigation_analysis") or {}
-        _disc = (_nav_env.get("discovery") if isinstance(_nav_env, dict) else None) or {}
-        # Use ONLY discovery.listing_url (the navigator's authoritative contract).
-        # Do NOT fall back to working_url (may be a detail page — the uindex
-        # root cause: discovery scraped a detail page's sidebar links instead of
-        # the listing) or search_criteria (may be a search query, not a URL).
-        # When null, the scraper's own PRODUCT_LISTING_URL / DEFAULT_LISTING_URL
-        # (which code_writer sets from the navigation findings) drives discovery.
-        _listing_url_env = (_disc.get("listing_url") if isinstance(_disc, dict) else "") or ""
+        _disc_env = (_nav_env.get("discovery") if isinstance(_nav_env, dict) else None) or {}
+        _env_candidate = (_disc_env.get("listing_url") if isinstance(_disc_env, dict) else "") or ""
+        if not _env_candidate:
+            _env_candidate = _working_url if (_listing_reached or not _respect_flag) else ""
+        _job_reg_env = _registrable_of(url)
+        if _env_candidate:
+            _cand_reg = _registrable_of(_env_candidate)
+            if _job_reg_env and _cand_reg and _cand_reg != _job_reg_env:
+                logger.warning(
+                    "run_execution: F17 dropped cross-domain SCRAPER_LISTING_URL "
+                    "%s (job domain %s)", _env_candidate[:70], _job_reg_env,
+                )
+                _env_candidate = ""
+        _listing_url_env = _env_candidate
         if _listing_url_env:
             logger.info("run_execution: setting SCRAPER_LISTING_URL=%s (env-var, deterministic discovery)", _listing_url_env[:80])
 
@@ -348,7 +378,11 @@ def run_execution(state: ScrapeState) -> dict:
 
     if needs_browser:
         logger.info("run_execution: browser-based scraper, dispatching to browser_service")
-        result = _run_via_browser_service(scraper_path, args, site_folder, state)
+        # M6: pass the computed listing env through state so the browser path
+        # uses the SAME value the in-process path would (single source of truth).
+        _state_bs = dict(state)
+        _state_bs["_listing_url_env"] = _listing_url_env
+        result = _run_via_browser_service(scraper_path, args, site_folder, _state_bs)
 
         # MULTI-SOURCE: for navigation jobs, also run the scraper against
         # watch-related category pages. A single search page often returns
@@ -356,7 +390,7 @@ def run_execution(state: ScrapeState) -> dict:
         # for each relevant category + merges the output. Generic.
         if input_mode in ("navigation", "list_page", "search_term") and search_criteria:
             result = _run_category_sources(
-                state, scraper_path, args, site_folder, result, search_criteria
+                _state_bs, scraper_path, args, site_folder, result, search_criteria
             )
 
         return result
@@ -716,14 +750,16 @@ def _run_via_browser_service(
     service_url = _get_browser_service_url()
     stealth_env = _stealth_env(state) if state else {}
     # DETERMINISTIC DISCOVERY: inject SCRAPER_LISTING_URL into the browser_service
-    # env_overrides so it reaches the scraper subprocess. Computed upstream in
-    # run_execution and stored on state by the caller — but _run_via_browser_service
-    # is called with `state`, so we re-derive from navigation_analysis here too.
-    _nav_bs = (state or {}).get("navigation_analysis") or {}
-    _disc_bs = (_nav_bs.get("discovery") if isinstance(_nav_bs, dict) else None) or {}
-    # Use ONLY discovery.listing_url (not working_url/search_criteria — see
-    # run_execution fix above for rationale).
-    _listing_env_bs = (_disc_bs.get("listing_url") if isinstance(_disc_bs, dict) else "") or ""
+    # env_overrides so it reaches the scraper subprocess. M6: single source of
+    # truth — the caller (run_execution) computes `_listing_url_env` once and
+    # stashes it on state; this path used to independently re-derive from
+    # navigation_analysis, so any change to the computation had to be made
+    # twice (and the two could silently diverge).
+    _listing_env_bs = (state or {}).get("_listing_url_env") or ""
+    if not _listing_env_bs:
+        _nav_bs = (state or {}).get("navigation_analysis") or {}
+        _disc_bs = (_nav_bs.get("discovery") if isinstance(_nav_bs, dict) else None) or {}
+        _listing_env_bs = (_disc_bs.get("listing_url") if isinstance(_disc_bs, dict) else "") or ""
     if _listing_env_bs and (state or {}).get("input_mode") in ("navigation", "list_page", "search_term"):
         stealth_env["SCRAPER_LISTING_URL"] = _listing_env_bs
     logger.info(
@@ -970,6 +1006,32 @@ def _extraction_quality_gate(
         # A gate that cannot read the output must never invent a failure —
         # F8 already handles the no-output case; unreadable output here is
         # the counting path's problem, not a quality verdict.
+        return ""
+
+
+def _registrable_of(url_val: str) -> str:
+    """F17 helper: best-effort registrable domain (lowercased, www-stripped).
+
+    Mirrors traversal._registrable; duplicated because browser_service's
+    run_execution copy must not import across package roots. '' on failure.
+    """
+    try:
+        from urllib.parse import urlparse
+
+        host = (urlparse(url_val).hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        two_part = (
+            ".co.uk", ".org.uk", ".com.au", ".co.nz", ".co.za", ".com.br",
+            ".co.jp", ".com.sg", ".com.mx",
+        )
+        for tld in two_part:
+            if host.endswith(tld):
+                pre = host[: -len(tld)].rstrip(".")
+                return f"{pre.split('.')[-1]}{tld}" if pre else host
+        parts = host.split(".")
+        return ".".join(parts[-2:]) if len(parts) >= 2 else host
+    except Exception:
         return ""
 
 
