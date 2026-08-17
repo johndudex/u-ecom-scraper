@@ -390,6 +390,9 @@ def route_after_testing(state: ScrapeState) -> str:
     retry_count = state.get("test_retry_count", 0)
     is_final_attempt = retry_count == FINAL_RETRY_SENTINEL
 
+    # Route functions return only a node name (no state update possible), so
+    # the exhausted-retries error is recorded by the CALLER (code_tester's
+    # exhausted-retry return) — see _invoke_code_tester. This fn only routes.
     if not report:
         if is_final_attempt:
             # Output-file rescue: even with no test_report, the scraper may have

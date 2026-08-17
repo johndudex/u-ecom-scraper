@@ -54,6 +54,7 @@ from langchain_core.runnables import RunnableConfig
 
 from .constants import (
     FINAL_RETRY_SENTINEL,
+    MAX_TEST_RETRIES,
 )
 from .decisions import options_to_decisions
 from .nodes import (
@@ -70,7 +71,11 @@ from .nodes import (
     validate_analysis,
     validate_coverage,
 )
-from .nodes.run_execution import _find_newest_output, _read_discovery_coverage
+from .nodes.run_execution import (
+    _find_newest_output,
+    _read_discovery_coverage,
+    _substantive_item_count,
+)
 from .state import ScrapeState
 from .subagents import (
     build_cleanup_message,
@@ -3223,6 +3228,41 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             logger.warning(
                 "_invoke_code_tester: no test_report found at workspace/%s/", slug
             )
+            # F19 (prod 352 pattern): retries exhausted (or final attempt) with
+            # no test_report — route_after_testing sends this to cleanup WITHOUT
+            # execution. Previously the finalize ladder saw no error_message and
+            # no execution_status → blessed the job COMPLETED with 0 items
+            # (D2-pattern in new clothes). Record the failure so it finalizes
+            # FAILED honestly. (Not a rescue case — the rescue path requires
+            # real output items, checked in route_after_testing.)
+            _is_last = is_final_attempt or retry_count >= MAX_TEST_RETRIES
+            _has_real_out = False
+            try:
+                _ws = os.path.join(_get_project_root(), "workspace", slug)
+                if os.path.isdir(_ws):
+                    import glob as _glob
+
+                    for _op in sorted(
+                        _glob.glob(os.path.join(_ws, "output_*.json")),
+                        key=os.path.getmtime,
+                        reverse=True,
+                    )[:3]:
+                        try:
+                            if _substantive_item_count(_op) > 0:
+                                _has_real_out = True
+                                break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            if _is_last and not _has_real_out:
+                update["error_message"] = (
+                    f"Testing exhausted {MAX_TEST_RETRIES} retries without a "
+                    "test_report — code_writer failed to produce a working "
+                    "scraper (repeated 900s timeouts). No output produced; "
+                    "not executed."
+                )
+                update["execution_status"] = "FAILED"
 
         # Deterministic Phase-1 discovery probe: catches discovery-path crashes
         # that --sample testing skips (e.g. session.url phantom attributes). On a
