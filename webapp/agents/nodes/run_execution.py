@@ -237,7 +237,7 @@ def run_execution(state: ScrapeState) -> dict:
             # .com.au rows under a .us job).
             _search = _nav.get("search") or {}
             _disc = (_nav.get("discovery") if isinstance(_nav, dict) else None) or {}
-            _job_reg = _registrable_of(url)
+            _job_reg = _registrable_of(state.get("url", ""))
             _candidates = [
                 (_disc.get("listing_url") if isinstance(_disc, dict) else ""),
                 (_search.get("working_url") if isinstance(_search, dict) else ""),
@@ -299,7 +299,7 @@ def run_execution(state: ScrapeState) -> dict:
         _env_candidate = (_disc_env.get("listing_url") if isinstance(_disc_env, dict) else "") or ""
         if not _env_candidate:
             _env_candidate = _working_url if (_listing_reached or not _respect_flag) else ""
-        _job_reg_env = _registrable_of(url)
+        _job_reg_env = _registrable_of(state.get("url", ""))
         if _env_candidate:
             _cand_reg = _registrable_of(_env_candidate)
             if _job_reg_env and _cand_reg and _cand_reg != _job_reg_env:
