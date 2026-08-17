@@ -28,7 +28,11 @@ def _import_graph_fn():
         sys.modules[name] = m
         return m
 
-    # stub the import surface graph.py needs before Django/etc.
+    # stub the import surface graph.py needs before Django/etc. Track what we
+    # created so it can be removed afterward — a leaked empty `bs4`/`httpx`
+    # stub in sys.modules breaks sibling tests that import the REAL modules
+    # (e.g. pagination tests importing traversal.py → from bs4 import ...).
+    _installed = []
     for name in [
         "django", "django.conf", "django.conf.settings",
         "langchain", "langchain_core", "celery", "celery.shared_task",
@@ -36,6 +40,7 @@ def _import_graph_fn():
     ]:
         if name not in sys.modules:
             _mk(name)
+            _installed.append(name)
 
     # If webapp.agents.graph is already importable (container env), use it directly.
     try:
@@ -70,6 +75,8 @@ def _import_graph_fn():
     }
     exec("import logging\nlogger = logging.getLogger('t.f18')\n" + fn_src, ns)
     _STUBS["route_fn"] = ns["route_from_human_approval"]
+    for _n in _installed:
+        sys.modules.pop(_n, None)
     return ns["route_from_human_approval"]
 
 

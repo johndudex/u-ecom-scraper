@@ -668,6 +668,16 @@ def _run_in_process(
             }
         product_count = _count_products(output_file)
         discovery_coverage = _read_discovery_coverage(output_file)
+        # F9 quality gate (nav modes): collapse-level failure rates -> FAILED
+        _q = _extraction_quality_gate(output_file, input_mode, product_count)
+        if _q:
+            return {
+                "execution_status": "FAILED",
+                "output_file": output_file,
+                "product_count": product_count,
+                "discovery_coverage": discovery_coverage,
+                "error_message": _q,
+            }
 
         # H3: in-process path owns its own checkpoint cleanup (no browser_service
         # to do it). Delete so a subsequent invocation starts fresh. Tried in both
@@ -808,6 +818,18 @@ def _run_via_browser_service(
             except OSError as exc:
                 logger.warning("run_execution: could not persist output locally: %s", exc)
         discovery_coverage = _read_discovery_coverage(output_file) if output_file else {}
+        # F9 quality gate (nav modes): collapse-level failure rates -> FAILED
+        _q = _extraction_quality_gate(
+            output_file, state.get("input_mode", ""), result.get("product_count", 0)
+        )
+        if _q:
+            return {
+                "execution_status": "FAILED",
+                "output_file": output_file,
+                "product_count": result.get("product_count", 0),
+                "discovery_coverage": discovery_coverage,
+                "error_message": _q,
+            }
 
         return {
             "execution_status": "SUCCESS",
@@ -883,6 +905,89 @@ def _substantive_item_count(path: str) -> int:
         return count
     except Exception:
         return 0
+
+
+def _extraction_quality_gate(
+    output_file: str, input_mode: str, product_count: int
+) -> str:
+    """F9: fail nav-mode executions whose output is overwhelmingly empty.
+
+    Prod shipped COMPLETED jobs whose extraction quietly collapsed: 330 kept
+    4 of 80 discovered (95% failed), 335 kept 5 of 39 (87%), 337 shipped 36
+    rows with zero core fields. url_list jobs are out of scope (their seeds
+    are user-provided; a wholesale seed failure is code_tester's signal).
+
+    good = items with >=1 core field (same predicate family as F15/F16).
+    bad  = failed_products + core-less items. Denominator is PROCESSED
+    (good+bad), never total_discovered — limit-truncated runs must not
+    false-positive (a --limit 5 run of a healthy site processes 5, fails 0).
+    Fires when processed >= 5 and fail-ratio >= 0.8 -> the caller turns the
+    SUCCESS into FAILED. Warn-only log at >= 0.5. Returns the error message
+    ('' when the gate passes).
+    """
+    if input_mode not in ("navigation", "list_page", "search_term"):
+        return ""
+    try:
+        good = _substantive_item_count(output_file) if output_file else 0
+        failed = 0
+        with open(output_file, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            meta = data.get("metadata") or {}
+            if isinstance(meta, dict):
+                try:
+                    failed = int(meta.get("failed_products") or 0)
+                except (TypeError, ValueError):
+                    failed = 0
+            # core-less items among the shipped rows
+            for key in ("products", "jobs", "articles", "results", "items",
+                        "threads", "pages"):
+                val = data.get(key)
+                if isinstance(val, list):
+                    coreless = sum(1 for it in val if isinstance(it, dict)
+                                   and not _item_has_core_field(it))
+                    bad = failed + coreless
+                    processed = good + bad
+                    if processed >= 5 and bad / processed >= 0.8:
+                        msg = (
+                            f"Extraction quality gate: {bad}/{processed} processed "
+                            f"items lacked core fields or failed "
+                            f"({good} good, {failed} failed_products, "
+                            f"{coreless} core-less) — failing rather than "
+                            f"shipping a collapsed extraction."
+                        )
+                        logger.error("run_execution: %s", msg)
+                        return msg
+                    if processed >= 5 and bad / processed >= 0.5:
+                        logger.warning(
+                            "run_execution: extraction quality warning — "
+                            "%d/%d processed items bad (failed/core-less)",
+                            bad, processed,
+                        )
+                    return ""
+        return ""
+    except Exception:
+        # A gate that cannot read the output must never invent a failure —
+        # F8 already handles the no-output case; unreadable output here is
+        # the counting path's problem, not a quality verdict.
+        return ""
+
+
+def _item_has_core_field(item: dict) -> bool:
+    """F9/F16 helper: does this item carry >=1 core field? (shared predicate)"""
+    try:
+        from src.content_types import output_filter_fields
+
+        fields = output_filter_fields("") or []
+    except Exception:
+        fields = []
+    if not fields:
+        fields = [
+            "price", "availability", "currency",
+            "author", "publish_date", "company", "location",
+            "content", "snippet", "rank", "posts",
+        ]
+    return any(item.get(f) for f in fields)
 
 
 def _find_newest_output(
