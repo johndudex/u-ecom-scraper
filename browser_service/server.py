@@ -8,6 +8,8 @@ import subprocess
 import sys
 import time
 from contextlib import asynccontextmanager
+import functools  # F1: run_in_executor takes no kwargs — bind via partial
+
 from typing import Optional
 
 from fastapi import FastAPI
@@ -1046,15 +1048,15 @@ async def scrape(request: ScrapeRequest):
             result = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
-                    _run_scrape_guarded,
-                    **{
-                        "rid": rid,
-                        "scraper_path": scraper_path,
-                        "args": request.args,
-                        "timeout": request.timeout,
-                        "env_overrides": request.env_overrides,
-                        "max_retries": request.max_retries,
-                    },
+                    functools.partial(
+                        _run_scrape_guarded,
+                        rid=rid,
+                        scraper_path=scraper_path,
+                        args=request.args,
+                        timeout=request.timeout,
+                        env_overrides=request.env_overrides,
+                        max_retries=request.max_retries,
+                    ),
                 ),
                 timeout=request.timeout + 120,
             )
