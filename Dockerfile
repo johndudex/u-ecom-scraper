@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt -r /tmp/scraper-requirem
 RUN adduser --disabled-password --gecos "Scraper" scraper
 # Create workspace + logs dirs owned by scraper so Railway volumes (mounted as
 # root) don't block the non-root worker's os.makedirs at setup_workspace.
-RUN mkdir -p /app/workspace /app/logs && chown -R scraper:scraper /app/workspace /app/logs
+RUN mkdir -p /app/workspace /app/logs /app/scrapers && chown -R scraper:scraper /app/workspace /app/logs /app/scrapers
 USER scraper
 
 COPY --chown=scraper:scraper webapp/ /app/webapp/
