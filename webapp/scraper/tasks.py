@@ -151,7 +151,7 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False) -> None:
         except Exception:
             pass
         job.status = ScrapeJob.STATUS_FAILED
-        job.error_message = str(exc)[:2000]
+        job.error_message = str(exc)[-4000:]  # tail: keep the exception, not the banner
         job.completed_at = timezone.now()
         try:
             job.save(update_fields=["status", "error_message", "completed_at"])
@@ -159,7 +159,7 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False) -> None:
             try:
                 job = ScrapeJob.objects.get(pk=job_id)  # fresh instance+connection
                 job.status = ScrapeJob.STATUS_FAILED
-                job.error_message = str(exc)[:2000]
+                job.error_message = str(exc)[-4000:]  # tail: keep the exception, not the banner
                 job.completed_at = timezone.now()
                 job.save(update_fields=["status", "error_message", "completed_at"])
             except Exception:
@@ -417,7 +417,7 @@ def resume_scrape_task(self, job_id: int, human_response: Any) -> None:
 
         logger.exception("Job %d resume failed: %s", job_id, exc)
         job.status = ScrapeJob.STATUS_FAILED
-        job.error_message = str(exc)[:2000]
+        job.error_message = str(exc)[-4000:]  # tail: keep the exception, not the banner
         job.completed_at = timezone.now()
         job.save(update_fields=["status", "error_message", "completed_at"])
         _publish_job_status(job.id, ScrapeJob.STATUS_FAILED)
@@ -1598,7 +1598,7 @@ def run_agent_task(self, playground_id: int) -> None:
     except Exception as exc:
         logger.exception("Agent Playground #%d failed: %s", pg.id, exc)
         pg.status = AgentPlayground.STATUS_FAILED
-        pg.error_message = str(exc)[:2000]
+        pg.error_message = str(exc)[-4000:]  # tail: keep the exception, not the banner
     finally:
         pg.completed_at = timezone.now()
         pg.save()

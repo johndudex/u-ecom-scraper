@@ -670,7 +670,7 @@ def _run_in_process(
             logger.error("run_execution: %s after %ds", stall_reason, elapsed)
             return {
                 "execution_status": "FAILED",
-                "error_message": f"{stall_reason}. Last output: {stderr[-1500:]}",
+                "error_message": f"{stall_reason}. Last output: {stderr[-4000:]}",
             }
 
         logger.info("run_execution: scraper exited with code %d in %ds", returncode, elapsed)
@@ -678,7 +678,7 @@ def _run_in_process(
         if returncode != 0:
             return {
                 "execution_status": "FAILED",
-                "error_message": f"Scraper exited with code {returncode}. {stderr[-2000:]}",
+                "error_message": f"Scraper exited with code {returncode}. {stderr[-4000:]}",
             }
 
         _slug = os.path.basename(site_folder.rstrip("/")) if site_folder else None
@@ -835,7 +835,11 @@ def _run_via_browser_service(
         result = resp.json()
 
         if result.get("returncode", 0) != 0:
-            stderr = result.get("stderr", "")[:2000]
+            # TAIL + 4000: the exception line lives at the END of a traceback;
+            # head-truncation kept the banner and cut the actual error (prod
+            # 351: "page.goto timeout" was invisible — 2000 chars of log start
+            # ate the whole budget). TextField on the model — no DB cap.
+            stderr = result.get("stderr", "")[-4000:]
             return {
                 "execution_status": "FAILED",
                 "error_message": f"Scraper exited with code {result['returncode']}. {stderr}",
