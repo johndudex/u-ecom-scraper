@@ -64,7 +64,7 @@ Railway's DNS has no port-mapping layer — the port in the URL is the port the 
 
 1. **⌘/Ctrl+K** → **Database** → **Redis**. Rename to `redis`.
 2. Same region as everything else (check the region tag on each service as you create them — mixed regions = latency).
-3. Done. The app wants the **private** URL (`REDIS_URL=${{redis.REDIS_PRIVATE_URL}}`), TLS scheme included — paste it verbatim, the code handles `rediss://`.
+3. Done. The app reads `REDIS_URL=${{redis.REDIS_URL}}` — Railway's Redis plugin exposes exactly `REDIS_URL` (internal, TLS) and `REDIS_PUBLIC_URL`. ⚠️ There is **no `REDIS_PRIVATE_URL`** on Railway's Redis (that naming is Postgres-only) — a wrong reference name resolves to an **empty string silently**, and the app logs `Could not initialize Redis client for SSE: Redis URL must specify one of the following schemes`. When in doubt, type `${{redis.` in the value field and let Railway's autocomplete list the real names (live-verified failure #3).
 
 ## Phase 3 — Shared Variables (define once, use everywhere)
 
@@ -114,7 +114,7 @@ DB_USER=${{postgres.PGUSER}}
 DB_PASSWORD=${{postgres.PGPASSWORD}}          # ⋮ → Seal after saving
 
 # ── celery/redis ──
-REDIS_URL=${{redis.REDIS_PRIVATE_URL}}
+REDIS_URL=${{redis.REDIS_URL}}
 
 # ── superuser for the Pre-Deploy below ──
 DJANGO_SUPERUSER_PASSWORD=<invent>            # ⋮ → Seal
@@ -210,7 +210,7 @@ DB_USER=${{postgres.PGUSER}}
 DB_PASSWORD=${{postgres.PGPASSWORD}}          # ⋮ → Seal
 
 # ── redis ──
-REDIS_URL=${{redis.REDIS_PRIVATE_URL}}
+REDIS_URL=${{redis.REDIS_URL}}
 
 # ── LLM ──
 ZAI_API_KEY=<your z.ai key>                   # ⋮ → Seal
