@@ -240,23 +240,75 @@ PLAYWRIGHT_MCP_URL=http://browser-service.railway.internal:8111/sse
 
 ## Phase 8 — celery-beat (scheduler)
 
-1. Same repo, Root Directory `/`.
-2. **Start Command:**
+1. **+ New** → GitHub Repo → same repo/branch. Root Directory `/` (repo root), Dockerfile auto-detected — same build config as django/worker.
+2. **Settings → Deploy → Start Command** (required — the image CMD is gunicorn, wrong for a scheduler):
 
 ```
 celery -A config beat -l INFO
 ```
 
-   ⚠️ **No `migrate` prefix** (compose has one; migrations are django's Pre-Deploy job). Beat crash-loops until django's first deploy has created the `django_celery_beat` tables — so do Phase 5 first.
-3. **FIRST — confirm the shared variables arrived** (same gate as Phase 5): the Variables tab must show `PYTHONPATH`, `DJANGO_SETTINGS_MODULE`, `SECRET_KEY`, `FILE_MASTER_URL`, `BROWSER_SERVICE_URL`. ⚠️ Without `PYTHONPATH` the worker dies at boot inside the celery CLI (`app.conf` load → `urls.py` → `ModuleNotFoundError: No module named 'src'` — live failure #8). Share them to this service or add `PYTHONPATH=/app` raw.
-4. **Variables** (plus shared): the same DB block + `REDIS_URL` as the worker. Nothing else — no LLM, no FM, no browser.
-4. **Replicas: 1**, autoscaling **off**, sleep **off**. Two beats = duplicate scheduled tasks.
-5. Heads-up: beat immediately runs the three watchdogs (`cleanup-stuck-jobs`, `schedule-next-site`, `stuck-approved-watchdog`, every 5 min). On a fresh DB there are no sites to auto-queue, so it's harmless — but if you migrate production data in, expect `schedule-next-site` to start auto-queuing jobs for any site with stored URL lists.
+   ⚠️ **No `migrate` prefix** — compose has one, but on Railway migrations are django's Pre-Deploy job (exactly once, from one service). Beat crash-loops with DB errors until django's first deploy has created the `django_celery_beat` tables — **so Phase 5 must be green before this service can stay up.** A crash-looping beat right after creation is expected in that case; it self-heals once the tables exist.
+3. **FIRST — confirm the shared variables arrived** (same gate as Phase 5): the Variables tab must show all five — `PYTHONPATH`, `DJANGO_SETTINGS_MODULE`, `SECRET_KEY`, `FILE_MASTER_URL`, `BROWSER_SERVICE_URL`. ⚠️ Without `PYTHONPATH`, beat dies at boot inside the celery CLI (`app.conf` load → `urls.py` → `ModuleNotFoundError: No module named 'src'` — the identical live failure the worker hit, #8). Missing? → Project Settings → Shared Variables → **Share** each to this service (or add `PYTHONPATH=/app` raw).
+4. **Variables tab → Raw Editor → paste** (on TOP of the five shared ones):
 
-## Phase 9 — flower (optional)
+```
+# ── database: WHY — beat's DatabaseScheduler reads/writes its schedule
+#    (django_celery_beat_* tables) in Postgres; same 5 components as django
+#    (settings.py never parses DATABASE_URL) ──
+DB_HOST=${{postgres.PGHOST}}
+DB_PORT=${{postgres.PGPORT}}
+DB_NAME=${{postgres.PGDATABASE}}
+DB_USER=${{postgres.PGUSER}}
+DB_PASSWORD=${{postgres.PGPASSWORD}}          # ⋮ → Seal after saving
 
-1. Start Command: `celery -A config flower --port=5555`. Variables: shared + `REDIS_URL` (+ the DB block for import safety).
-2. **Keep it private** (no public domain), or protect it: add `--basic-auth=user:pass` to the start command before ever generating a domain.
+# ── message broker: WHY — beat dispatches the scheduled tasks onto the same
+#    Redis queue the worker consumes; rediss:// TLS handled by celery ──
+REDIS_URL=${{redis.REDIS_URL}}
+```
+
+   **That is the complete list.** Deliberately NO `ZAI_*` (beat never calls an LLM), NO `FILE_MASTER_URL` usage (it never touches artifacts — it's shared but inert here), NO browser/proxy vars (it never scrapes). If you paste extra vars from the worker block, they're harmless but noise.
+5. **Settings:** Replicas **1** (two beats = every scheduled task fires twice — the watchdogs would auto-fail jobs in duplicate), autoscaling **off**, Serverless/sleep **off** (a sleeping scheduler silently stops all watchdogs).
+6. **Heads-up — what beat will start doing immediately:** it runs three schedules (every 5 min, from settings.py): `cleanup-stuck-jobs` (auto-FAILs jobs stuck >30 min — with `[EXEC-ALIVE]` rows counting as liveness, so long executions are safe), `stuck-approved-watchdog` (re-dispatches approved-but-stuck approvals), and `schedule-next-site` (auto-queues NEW jobs for any Site with stored URL lists — on a fresh Railway DB there are none, so it's dormant; if you later import production data, expect it to start queueing — that's intended behavior, not a bug).
+
+✅ **Checkpoint:** beat logs show `DatabaseScheduler: Schedule changed` then beat entries firing (`Scheduler: Sending due task cleanup-stuck-jobs ...`) every 5 minutes, with no `ModuleNotFoundError` and no DB connection errors after the first minute.
+
+## Phase 9 — flower (optional — the Celery task dashboard)
+
+Flower shows running/completed scrape tasks, retries, and per-task logs in a web UI. Skip it entirely if you don't need it — nothing else depends on it.
+
+1. **+ New** → GitHub Repo → same repo/branch. Root Directory `/`, Dockerfile auto-detected (same image as the other celery services).
+2. **Settings → Deploy → Start Command** (required — image CMD is gunicorn):
+
+```
+celery -A config flower --port=5555
+```
+
+   Flower binds :5555 (hardcoded in the command above).
+3. **FIRST — confirm the shared variables arrived** (same gate as every celery service): all five visible on the Variables tab. `PYTHONPATH` matters here for the same import-time reason.
+4. **Variables tab → Raw Editor → paste** (plus the five shared):
+
+```
+# ── broker + result backend: WHY — flower watches the Redis queue the
+#    worker consumes and reads task results from the same backend ──
+REDIS_URL=${{redis.REDIS_URL}}
+
+# ── database: WHY — importing the celery app pulls Django settings
+#    (config/celery.py → django.conf.settings), which touches the DB config
+#    at import time; without these the import can fail even though flower
+#    itself never queries Postgres ──
+DB_HOST=${{postgres.PGHOST}}
+DB_PORT=${{postgres.PGPORT}}
+DB_NAME=${{postgres.PGDATABASE}}
+DB_USER=${{postgres.PGUSER}}
+DB_PASSWORD=${{postgres.PGPASSWORD}}          # ⋮ → Seal after saving
+```
+
+5. **Networking — keep it PRIVATE (no public domain):** the flower UI has NO authentication — anyone with the URL sees your task names, job URLs, and can cancel tasks. Two safe options:
+   - **Private only (simplest):** generate no domain; reach it from your machine via `railway run` / an SSH tunnel when needed.
+   - **Public with a password:** change the Start Command to `celery -A config flower --port=5555 --basic-auth=<user>:<pass>` and ONLY THEN generate a public domain. Pick a real password — it's basic-auth over the wire.
+6. Serverless/sleep: **OFF** if you want it always watchable (it costs ~nothing idle). Replicas 1.
+
+✅ **Checkpoint:** logs show flower serving on :5555; opening it (privately) lists the `celery-worker` node and any tasks the moment a job runs.
 
 ---
 
