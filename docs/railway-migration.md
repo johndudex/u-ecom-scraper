@@ -345,6 +345,7 @@ curl -fsI https://<app>.up.railway.app/admin/login/      # → 200
 | django healthcheck fails but app serves fine | probe Host `healthcheck.railway.app` rejected by `ALLOWED_HOSTS` | append `,healthcheck.railway.app` to ALLOWED_HOSTS |
 | healthcheck fails + domain 404s "Application not found" | failed healthcheck blocks deployment activation | escape hatch: clear the healthcheck path, redeploy, verify via curl |
 | healthcheck "service unavailable", all config verified | quoted value (`PORT="8000"`) breaks probe URL | retype values unquoted in Raw Editor |
+| agent tools: `mkdir scrapers: Permission denied` / `sudo: not found` | image never created `/app/scrapers` (root-owned `/app` + uid-1000 worker) | fixed in Dockerfile `754bc6c` — dir pre-created + chowned; redeploy worker |
 | healthcheck 404 | trailing slash in the path field | use `/api/health/raw` exactly |
 
 ---
