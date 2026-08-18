@@ -13,6 +13,7 @@
 - Lines starting `#` inside blocks are comments — safe to paste, Railway ignores them.
 - `${{service.VAR}}` is **Railway reference syntax** — paste the braces exactly. These resolve to values from the Postgres/Redis services you create in Phases 1–2, which is why those come first.
 - **Secrets:** for any password/key, click the variable's ⋮ menu → **Seal** after pasting (values like `SECRET_KEY`, `ZAI_API_KEY`, `DB_PASSWORD`, `DJANGO_SUPERUSER_PASSWORD`, proxy creds).
+- **API tokens (for programmatic audits):** a PROJECT token must be sent with the **`Project-Access-Token:` header** — NOT `Authorization: Bearer` (which the CLI/`me` path uses for account tokens). A project token + Bearer returns plain `Not Authorized` on everything and looks like a dead token (live failure #9). Introspect scope with: `query { projectToken { projectId environmentId } }`. Sealed values can't be read back even with a valid token — presence-check only.
 
 ### The service names matter — do not rename
 
