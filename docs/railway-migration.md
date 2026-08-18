@@ -89,8 +89,7 @@ Why these five: identical on every Django-family service. Sharing them once is w
 2. **Service Settings → Build:**
    - **Root Directory:** `/file_master`  ← ⚠️ **critical**. The Dockerfile does `COPY app.py` from the build context; with root dir `/` the build fails immediately.
    - Dockerfile: default detection finds `Dockerfile` inside `/file_master`.
-3. **Variables:** just `PORT=8002` (step 3b). (`FILE_MASTER_ROOT` defaults to `/data` — already matches the volume; `FILE_MASTER_PORT` is a no-op — the CMD hardcodes 8002.)
-3b. **Variables:** add exactly one — `PORT=8002`. Railway's healthcheck probes the port in `PORT`; the Dockerfile hardcodes uvicorn on 8002. Without this, `/health` returns "service unavailable" for the full retry window and the deploy fails. (This bit us on the first real migration attempt.)
+3. **Variables:** add exactly one — `PORT=8002`. Railway's healthcheck probes the port named in `PORT`; the Dockerfile hardcodes uvicorn on 8002 and never reads `PORT`, so without this variable the check hits a dead port and fails the deploy with "service unavailable" for the full 5-minute retry window. ✅ **Live-verified on the first real migration attempt** (2026-08-18: fixed the failure, healthcheck green after adding it). (`FILE_MASTER_ROOT` defaults to `/data` — already matches the volume; `FILE_MASTER_PORT` is a no-op — the CMD hardcodes 8002.)
 4. **Volume:** right-click the service on the canvas (or ⌘/Ctrl+K → Volume) → attach to this service → **Mount Path `/data`**. This holds every published scraper + output JSON — size it ≥ 5 GB.
 5. **Settings:** replicas **1** (it's a singleton with a disk). **Deploy → Enable Serverless: OFF** (it must never sleep).
 6. Healthcheck (Settings → Healthcheck): path `/health`. It returns `{"ok": true}` in ~2s.
@@ -163,7 +162,7 @@ CSRF_TRUSTED_ORIGINS=https://<your-app>.up.railway.app
 
 ```
 # ⚠️ REQUIRED — see notes; getting these wrong is the #1 way this service dies
-PORT=8001
+PORT=8001                                     # same healthcheck-port rule as file-master (live-verified)
 DISPLAY=:98
 MCP_CDP_PORT=19222
 SCRAPER_CDP_PORT=19223
