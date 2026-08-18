@@ -234,7 +234,23 @@ PLAYWRIGHT_MCP_URL=http://browser-service.railway.internal:8111/sse
    - `FILE_MASTER_URL` (shared): the worker is the **only writer** to the artifact store.
    - `PLAYWRIGHT_MCP_URL`: the agents' browser client. Default is underscored → dead on Railway; this override is required.
    - Everything LLM-tuning (`LLM_CIRCUIT_BREAKER_*`, `EXECUTION_TIMEOUT`, …) has sane code defaults — leave unset until you need them. (Don't set `CELERY_TASK_ACKS_LATE=true`: the settings file explicitly marks it unsafe until regression-verified.)
-4. **Volume (optional — READ THE PERMISSION TRAP FIRST):** attaching at **`/app/workspace`** survives worker restarts mid-job (completed artifacts live in file-master, resume state in Postgres — so it's a nicety, not a requirement). ⚠️ **Railway mounts volumes as `root`, but this image runs as user `scraper`** — a naive volume mount makes every workspace write fail with `PermissionError`/`EACCES`. If you add the volume, ALSO set the service variable `RAILWAY_RUN_UID=0` (runs the container as root; Railway's documented escape hatch) — or keep no volume (current, working state). ≥ 5 GB if you add it.
+4. **Volume — full instructions (read the permission trap first):**
+   **Why:** `/app/workspace` is the pipeline's scratch space (`workspace/{site_slug}/` — drafts, analysis JSONs, discovery checkpoints). Without a volume it's **ephemeral**: a worker restart/redeploy mid-job wipes it, so an in-flight job loses its files (completed artifacts are safe in file-master; resume state is in Postgres). With a volume, in-flight jobs survive restarts.
+
+   **How to attach (Railway UI):**
+   1. Click the **celery-worker** service on the project canvas.
+   2. Open the **Settings** tab (or press ⌘/Ctrl+K → "Volume" — either path works).
+   3. Find **Volumes** → **Add Volume** (or right-click the service → Add Volume).
+   4. **Mount Path:** enter exactly `/app/workspace` — leading slash, lowercase, no trailing slash. This path must match where the code writes; a typo means the volume silently mounts where nothing reads it.
+   5. **Size:** ≥ **5 GB** (a big site's discovery checkpoint + drafts can run 1–2 GB per job; the volume also carries old job leftovers until pruned).
+   6. Save/deploy when prompted. NOTE: attaching a volume to a running service causes a brief restart (Railway must remount).
+
+   **⚠️ THE PERMISSION TRAP (this WILL bite if skipped):** Railway mounts volumes as **`root`**, but this image runs as user **`scraper`** (uid 1000). The moment the volume is attached, every write under `/app/workspace` fails with `PermissionError`/`EACCES` — the job dies in `setup_workspace`/`code_writer` with mkdir/open errors, and the cleanup agent burns tool calls trying `sudo` (not installed). **The fix — do BOTH of these together:**
+   - Add the service variable **`RAILWAY_RUN_UID=0`** (Variables tab → New Variable). This is Railway's documented escape hatch: it runs the container as root, so root-owned volume writes succeed. The app itself doesn't care about uid.
+   - Redeploy after adding it (variable changes stage a deploy — click through it).
+
+   Alternative if you dislike running as root: keep no volume (current working state — workspace is ephemeral), or chown the mount path in a custom start command (`sh -c "chown -R scraper:scraper /app/workspace && exec celery -A config worker ..."` — requires root anyway via RAILWAY_RUN_UID, so the simple form above is preferred).
+
 5. Serverless: **OFF** (a worker polling Redis never idles anyway, but be explicit). Resources: **4 GB RAM / 2 vCPU** (compose parity 3 GB; the worker self-recycles at 2.5 GB). Replicas: **1** — it shares one Chrome with the world.
 
 ✅ **Checkpoint:** logs show `celery@... ready`, no `ModuleNotFoundError` (that error = missing `PYTHONPATH` shared var).
