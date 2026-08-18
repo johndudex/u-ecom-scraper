@@ -126,3 +126,28 @@ class TestWiring:
             src = fh.read()
         assert src.count("_extraction_quality_gate(") >= 3  # def + 2 call sites
         assert "F9 quality gate (nav modes)" in src
+
+
+class TestInputModeScopeRegression:
+    """Railway job 1 (zquiet): the in-process F9 gate raised NameError
+    'input_mode' — _run_in_process used the caller's local without it being a
+    parameter, converting a SUCCESSFUL rc=0 execution (5 items) into
+    execution_status=FAILED. This locks the parameter threading in."""
+
+    def test_run_in_process_takes_input_mode(self):
+        import inspect
+
+        sig = inspect.signature(_shared["_run_in_process"]) if "_run_in_process" in _shared else None
+        src = open(_SRC, encoding="utf-8").read()
+        if sig is None:
+            import re as _re
+            m = _re.search(r"^def _run_in_process\(.*?\) ->", src, _re.S | _re.M)
+            assert m, "fn not found"
+            params = m.group(0)
+            assert "input_mode" in params
+        else:
+            assert "input_mode" in sig.parameters
+
+    def test_caller_passes_input_mode(self):
+        src = open(_SRC, encoding="utf-8").read()
+        assert "input_mode=input_mode," in src

@@ -399,6 +399,7 @@ def run_execution(state: ScrapeState) -> dict:
         scraper_path, args, root, site_folder, workspace_folder, job_id=job_id,
         env_overrides=_stealth_env(state),
         listing_url_env=_listing_url_env,
+        input_mode=input_mode,
     )
 
 
@@ -581,6 +582,7 @@ def _run_in_process(
     workspace_folder: str = "", job_id: int = 0,
     env_overrides: dict[str, str] | None = None,
     listing_url_env: str = "",
+    input_mode: str = "",
 ) -> dict[str, Any]:
     cmd = ["python3", scraper_path] + args
     start = time.time()
