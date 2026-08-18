@@ -22,6 +22,8 @@ COPY --chown=scraper:scraper scripts/ /app/scripts/
 COPY --chown=scraper:scraper data/ /app/data/
 COPY --chown=scraper:scraper templates/ /app/templates/
 COPY --chown=scraper:scraper .opencode/ /app/.opencode/
+COPY --chown=scraper:scraper experimental/nav_traversal/ /app/experimental/nav_traversal/
+COPY --chown=scraper:scraper experimental/__init__.py /app/experimental/__init__.py
 COPY --chown=scraper:scraper AGENTS.md /app/AGENTS.md
 
 WORKDIR /app/webapp
@@ -35,4 +37,4 @@ RUN PYTHONPATH=/app DJANGO_SETTINGS_MODULE=config.settings \
     python manage.py collectstatic --noinput
 
 EXPOSE 8000
-CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2"]
+CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "3600", "--graceful-timeout", "60", "--worker-tmp-dir", "/dev/shm"]
