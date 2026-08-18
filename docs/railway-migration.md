@@ -89,7 +89,8 @@ Why these five: identical on every Django-family service. Sharing them once is w
 2. **Service Settings → Build:**
    - **Root Directory:** `/file_master`  ← ⚠️ **critical**. The Dockerfile does `COPY app.py` from the build context; with root dir `/` the build fails immediately.
    - Dockerfile: default detection finds `Dockerfile` inside `/file_master`.
-3. **Variables:** none. (It reads only `FILE_MASTER_ROOT`, default `/data` — already matches the volume below.)
+3. **Variables:** just `PORT=8002` (step 3b). (`FILE_MASTER_ROOT` defaults to `/data` — already matches the volume; `FILE_MASTER_PORT` is a no-op — the CMD hardcodes 8002.)
+3b. **Variables:** add exactly one — `PORT=8002`. Railway's healthcheck probes the port in `PORT`; the Dockerfile hardcodes uvicorn on 8002. Without this, `/health` returns "service unavailable" for the full retry window and the deploy fails. (This bit us on the first real migration attempt.)
 4. **Volume:** right-click the service on the canvas (or ⌘/Ctrl+K → Volume) → attach to this service → **Mount Path `/data`**. This holds every published scraper + output JSON — size it ≥ 5 GB.
 5. **Settings:** replicas **1** (it's a singleton with a disk). **Deploy → Enable Serverless: OFF** (it must never sleep).
 6. Healthcheck (Settings → Healthcheck): path `/health`. It returns `{"ok": true}` in ~2s.
@@ -117,6 +118,9 @@ REDIS_URL=${{redis.REDIS_PRIVATE_URL}}
 
 # ── superuser for the Pre-Deploy below ──
 DJANGO_SUPERUSER_PASSWORD=<invent>            # ⋮ → Seal
+
+# ── healthcheck port (gunicorn binds 8000; see note) ──
+PORT=8000
 ```
 
    Why each (one-liners):
@@ -159,6 +163,7 @@ CSRF_TRUSTED_ORIGINS=https://<your-app>.up.railway.app
 
 ```
 # ⚠️ REQUIRED — see notes; getting these wrong is the #1 way this service dies
+PORT=8001
 DISPLAY=:98
 MCP_CDP_PORT=19222
 SCRAPER_CDP_PORT=19223
@@ -277,6 +282,7 @@ curl -fsI https://<app>.up.railway.app/admin/login/      # → 200
 | django deploy blocked after first success | Pre-Deploy `createsuperuser` failing | ensure `|| true` in the command |
 | intermittent 502s after idle | Serverless/sleep on | off on all services |
 | file-master build fails at `COPY app.py` | Root Directory not `/file_master` | Phase 4 step 2 |
+| healthcheck "service unavailable" full 5m | app port ≠ Railway's `PORT` | add `PORT=<app-port>` (8002 FM / 8001 browser / 8000 django) |
 
 ---
 
