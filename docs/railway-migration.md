@@ -203,7 +203,8 @@ SCRAPER_CDP_PORT=19223
 celery -A config worker -l INFO --concurrency=2 -Ofair
 ```
 
-3. **Variables → paste** (plus the 5 shared ones via Share):
+3. **FIRST — confirm the shared variables arrived** (same gate as Phase 5): the Variables tab must show `PYTHONPATH`, `DJANGO_SETTINGS_MODULE`, `SECRET_KEY`, `FILE_MASTER_URL`, `BROWSER_SERVICE_URL`. ⚠️ Without `PYTHONPATH` the worker dies at boot inside the celery CLI (`app.conf` load → `urls.py` → `ModuleNotFoundError: No module named 'src'` — live failure #8). Share them to this service or add `PYTHONPATH=/app` raw.
+4. **Variables → paste** (plus the 5 shared ones via Share):
 
 ```
 # ── database ──
@@ -247,7 +248,8 @@ celery -A config beat -l INFO
 ```
 
    ⚠️ **No `migrate` prefix** (compose has one; migrations are django's Pre-Deploy job). Beat crash-loops until django's first deploy has created the `django_celery_beat` tables — so do Phase 5 first.
-3. **Variables** (plus shared): the same DB block + `REDIS_URL` as the worker. Nothing else — no LLM, no FM, no browser.
+3. **FIRST — confirm the shared variables arrived** (same gate as Phase 5): the Variables tab must show `PYTHONPATH`, `DJANGO_SETTINGS_MODULE`, `SECRET_KEY`, `FILE_MASTER_URL`, `BROWSER_SERVICE_URL`. ⚠️ Without `PYTHONPATH` the worker dies at boot inside the celery CLI (`app.conf` load → `urls.py` → `ModuleNotFoundError: No module named 'src'` — live failure #8). Share them to this service or add `PYTHONPATH=/app` raw.
+4. **Variables** (plus shared): the same DB block + `REDIS_URL` as the worker. Nothing else — no LLM, no FM, no browser.
 4. **Replicas: 1**, autoscaling **off**, sleep **off**. Two beats = duplicate scheduled tasks.
 5. Heads-up: beat immediately runs the three watchdogs (`cleanup-stuck-jobs`, `schedule-next-site`, `stuck-approved-watchdog`, every 5 min). On a fresh DB there are no sites to auto-queue, so it's harmless — but if you migrate production data in, expect `schedule-next-site` to start auto-queuing jobs for any site with stored URL lists.
 
