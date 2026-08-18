@@ -143,14 +143,16 @@ python manage.py migrate --noinput && python manage.py collectstatic --noinput &
 8. **Now add the two domain vars** (new Variables):
 
 ```
-ALLOWED_HOSTS=<your-app>.up.railway.app
+ALLOWED_HOSTS=<your-app>.up.railway.app,healthcheck.railway.app
 CSRF_TRUSTED_ORIGINS=https://<your-app>.up.railway.app
 ```
 
    - `CSRF_TRUSTED_ORIGINS` is the **#1 silent killer**: without it every form POST (login, job submit, approvals) returns 403. Django 5 does not derive it from ALLOWED_HOSTS.
    - Redeploys after this are automatic.
 
-9. **Healthcheck:** path `/api/health/raw` ← ⚠️ not `/health/` (that one is login-protected → Railway would see a 302 and fail the deploy).
+9. **Healthcheck:** path `/api/health/raw` — **no trailing slash** (`/api/health/raw/` 404s). ⚠️ Not `/health/` (login-protected → 302 → failed deploy).
+   **Host-header trap (live failure #4):** Railway probes with the hostname `healthcheck.railway.app`. Once you set `ALLOWED_HOSTS=<your-domain>` (step 8), that probe Host is rejected → Django 400 → healthcheck "service unavailable" even though the app is fine. Fix: include the probe host —
+   `ALLOWED_HOSTS=<your-app>.up.railway.app,healthcheck.railway.app,healthcheck.railway.app`
 9. Serverless: **OFF**. Resources: 1 GB is fine.
 
 ✅ **Checkpoint:** open `https://<app>.up.railway.app/api/health/raw` → `ok`. `/accounts/login/` renders with CSS (proves whitenoise+collectstatic).
@@ -283,6 +285,8 @@ curl -fsI https://<app>.up.railway.app/admin/login/      # → 200
 | intermittent 502s after idle | Serverless/sleep on | off on all services |
 | file-master build fails at `COPY app.py` | Root Directory not `/file_master` | Phase 4 step 2 |
 | healthcheck "service unavailable" full 5m | app port ≠ Railway's `PORT` | add `PORT=<app-port>` (8002 FM / 8001 browser / 8000 django) |
+| django healthcheck fails but app serves fine | probe Host `healthcheck.railway.app` rejected by `ALLOWED_HOSTS` | append `,healthcheck.railway.app` to ALLOWED_HOSTS |
+| healthcheck 404 | trailing slash in the path field | use `/api/health/raw` exactly |
 
 ---
 
