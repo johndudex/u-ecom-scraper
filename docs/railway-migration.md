@@ -234,7 +234,7 @@ PLAYWRIGHT_MCP_URL=http://browser-service.railway.internal:8111/sse
    - `FILE_MASTER_URL` (shared): the worker is the **only writer** to the artifact store.
    - `PLAYWRIGHT_MCP_URL`: the agents' browser client. Default is underscored → dead on Railway; this override is required.
    - Everything LLM-tuning (`LLM_CIRCUIT_BREAKER_*`, `EXECUTION_TIMEOUT`, …) has sane code defaults — leave unset until you need them. (Don't set `CELERY_TASK_ACKS_LATE=true`: the settings file explicitly marks it unsafe until regression-verified.)
-4. **Volume (optional but recommended):** attach at **`/app/workspace`** — pipeline scratch space; survives worker restarts mid-job. Completed artifacts live in file-master and resume state in Postgres, so this is a nicety, not a requirement. ≥ 5 GB if you add it.
+4. **Volume (optional — READ THE PERMISSION TRAP FIRST):** attaching at **`/app/workspace`** survives worker restarts mid-job (completed artifacts live in file-master, resume state in Postgres — so it's a nicety, not a requirement). ⚠️ **Railway mounts volumes as `root`, but this image runs as user `scraper`** — a naive volume mount makes every workspace write fail with `PermissionError`/`EACCES`. If you add the volume, ALSO set the service variable `RAILWAY_RUN_UID=0` (runs the container as root; Railway's documented escape hatch) — or keep no volume (current, working state). ≥ 5 GB if you add it.
 5. Serverless: **OFF** (a worker polling Redis never idles anyway, but be explicit). Resources: **4 GB RAM / 2 vCPU** (compose parity 3 GB; the worker self-recycles at 2.5 GB). Replicas: **1** — it shares one Chrome with the world.
 
 ✅ **Checkpoint:** logs show `celery@... ready`, no `ModuleNotFoundError` (that error = missing `PYTHONPATH` shared var).
