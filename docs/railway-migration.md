@@ -132,11 +132,11 @@ PORT=8000
 5. **Settings → Deploy → Pre-Deploy Command** (runs between build and start, on every deploy):
 
 ```
-python manage.py migrate --noinput && python manage.py collectstatic --noinput && (python manage.py createsuperuser --noinput --username admin --email admin@example.com || true)
+python manage.py migrate --noinput && (python manage.py createsuperuser --noinput --username admin --email admin@example.com || true)
 ```
 
    ⚠️ The `|| true` is load-bearing: `createsuperuser --noinput` exits non-zero once `admin` exists, and a failing Pre-Deploy **blocks every future deploy**. (v1 of this doc omitted it — that's a redeploy brick.)
-   Note: Pre-Deploy runs in a separate container — it can reach Postgres but **cannot touch volumes**; that's fine, migrate only needs the DB.
+   Note: Pre-Deploy runs in a **separate container** — it can reach Postgres but its **filesystem is discarded**. That's fine for migrate (external DB) — but it means **collectstatic can NOT run here** (live failure #5: static files vanished → `No directory at: /app/webapp/staticfiles/` at boot → unstyled pages). Collectstatic runs at **build time inside the Dockerfile** now (verified: 127 files land in the image).
 
 6. **Deploy.** First boot: migrate + collectstatic + superuser run, then gunicorn on :8000.
 7. **Networking:** Settings → Networking → **Generate Domain**. If asked for a port, enter `8000` (gunicorn binds it, hard-coded).
@@ -276,7 +276,7 @@ curl -fsI https://<app>.up.railway.app/admin/login/      # → 200
 | Symptom | Cause | Fix |
 |---|---|---|
 | every POST 403s | missing `CSRF_TRUSTED_ORIGINS` | Phase 5 step 7 |
-| login page unstyled | collectstatic didn't run | Pre-Deploy command present? |
+| login page unstyled | static files missing | Dockerfile ≥ this branch's build-time collectstatic; redeploy |
 | any Django-family service (incl. django's Pre-Deploy) dies: `ModuleNotFoundError: No module named 'src'` | shared `PYTHONPATH` not *shared* to this service | Phase 5 step 3 gate; Share it or add raw |
 | browser-service `/health` 503 + log `Skipping MCP Chrome — Xvfb not running` | someone set `DISPLAY=""` | set `DISPLAY=:98` |
 | browser automation connects to nothing | missing `MCP_CDP_PORT`/`SCRAPER_CDP_PORT` | Phase 6 block |

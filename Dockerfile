@@ -26,5 +26,13 @@ COPY --chown=scraper:scraper AGENTS.md /app/AGENTS.md
 
 WORKDIR /app/webapp
 
+# Collect static at BUILD time. Railway's Pre-Deploy runs in a separate
+# container whose filesystem is discarded, so collectstatic there is a no-op
+# (live failure #5: "No directory at: /app/webapp/staticfiles/" at runtime).
+# Settings import needs zero env vars (every config() has a default) — only
+# PYTHONPATH=/app for the `from src...` imports.
+RUN PYTHONPATH=/app DJANGO_SETTINGS_MODULE=config.settings \
+    python manage.py collectstatic --noinput
+
 EXPOSE 8000
 CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2"]
