@@ -99,7 +99,8 @@ Why these five: identical on every Django-family service. Sharing them once is w
 
 1. **+ New** → GitHub Repo → same repo/branch.
 2. **Build:** Root Directory `/` (repo root), Dockerfile auto-detected. The image's CMD is already production-correct: `gunicorn ... :8000`. **Do not** copy compose's dev command (migrate/runserver).
-3. **Variables tab → Raw Editor → paste:**
+3. **FIRST — confirm the shared variables arrived.** Open the Variables tab: you must SEE all five (`PYTHONPATH`, `DJANGO_SETTINGS_MODULE`, `SECRET_KEY`, `FILE_MASTER_URL`, `BROWSER_SERVICE_URL`). Creating a shared variable is not enough — you must have pressed **Share** and checked this service. ⚠️ **If `PYTHONPATH` is missing, the Pre-Deploy below dies instantly with `ModuleNotFoundError: No module named 'src'`** (live-verified on the first real migration). Missing? → Project Settings → Shared Variables → Share to this service — or just add `PYTHONPATH=/app` as a raw variable here.
+4. **Variables tab → Raw Editor → paste:**
 
 ```
 # ── from Shared Variables (use the "Share" button instead of re-typing) ──
@@ -128,7 +129,7 @@ PORT=8000
    - `REDIS_URL` — Celery broker + the live-log SSE pubsub.
    - `FILE_MASTER_URL` / `BROWSER_SERVICE_URL` — the UI's artifact reads and health dashboard. Code defaults use underscored hostnames that don't resolve on Railway; these overrides are **required**.
 
-4. **Settings → Deploy → Pre-Deploy Command** (runs between build and start, on every deploy):
+5. **Settings → Deploy → Pre-Deploy Command** (runs between build and start, on every deploy):
 
 ```
 python manage.py migrate --noinput && python manage.py collectstatic --noinput && (python manage.py createsuperuser --noinput --username admin --email admin@example.com || true)
@@ -137,9 +138,9 @@ python manage.py migrate --noinput && python manage.py collectstatic --noinput &
    ⚠️ The `|| true` is load-bearing: `createsuperuser --noinput` exits non-zero once `admin` exists, and a failing Pre-Deploy **blocks every future deploy**. (v1 of this doc omitted it — that's a redeploy brick.)
    Note: Pre-Deploy runs in a separate container — it can reach Postgres but **cannot touch volumes**; that's fine, migrate only needs the DB.
 
-5. **Deploy.** First boot: migrate + collectstatic + superuser run, then gunicorn on :8000.
-6. **Networking:** Settings → Networking → **Generate Domain**. If asked for a port, enter `8000` (gunicorn binds it, hard-coded).
-7. **Now add the two domain vars** (new Variables):
+6. **Deploy.** First boot: migrate + collectstatic + superuser run, then gunicorn on :8000.
+7. **Networking:** Settings → Networking → **Generate Domain**. If asked for a port, enter `8000` (gunicorn binds it, hard-coded).
+8. **Now add the two domain vars** (new Variables):
 
 ```
 ALLOWED_HOSTS=<your-app>.up.railway.app
@@ -149,7 +150,7 @@ CSRF_TRUSTED_ORIGINS=https://<your-app>.up.railway.app
    - `CSRF_TRUSTED_ORIGINS` is the **#1 silent killer**: without it every form POST (login, job submit, approvals) returns 403. Django 5 does not derive it from ALLOWED_HOSTS.
    - Redeploys after this are automatic.
 
-8. **Healthcheck:** path `/api/health/raw` ← ⚠️ not `/health/` (that one is login-protected → Railway would see a 302 and fail the deploy).
+9. **Healthcheck:** path `/api/health/raw` ← ⚠️ not `/health/` (that one is login-protected → Railway would see a 302 and fail the deploy).
 9. Serverless: **OFF**. Resources: 1 GB is fine.
 
 ✅ **Checkpoint:** open `https://<app>.up.railway.app/api/health/raw` → `ok`. `/accounts/login/` renders with CSS (proves whitenoise+collectstatic).
@@ -274,7 +275,7 @@ curl -fsI https://<app>.up.railway.app/admin/login/      # → 200
 |---|---|---|
 | every POST 403s | missing `CSRF_TRUSTED_ORIGINS` | Phase 5 step 7 |
 | login page unstyled | collectstatic didn't run | Pre-Deploy command present? |
-| worker/beat dies: `ModuleNotFoundError: No module named 'src'` | missing `PYTHONPATH=/app` | Phase 3 shared var |
+| any Django-family service (incl. django's Pre-Deploy) dies: `ModuleNotFoundError: No module named 'src'` | shared `PYTHONPATH` not *shared* to this service | Phase 5 step 3 gate; Share it or add raw |
 | browser-service `/health` 503 + log `Skipping MCP Chrome — Xvfb not running` | someone set `DISPLAY=""` | set `DISPLAY=:98` |
 | browser automation connects to nothing | missing `MCP_CDP_PORT`/`SCRAPER_CDP_PORT` | Phase 6 block |
 | job pages error on artifacts | `FILE_MASTER_URL` unset/wrong on django or worker | Phase 3 |
