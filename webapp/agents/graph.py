@@ -2008,14 +2008,33 @@ def _invoke_navigation_traverse(
             and _root_method
             and not _disc_fb.get("listing_reached")
         ):
+            # list_page: the user EXPLICITLY provided the listing URL
+            # (search_criteria) — prefer it over the site root. The traverse
+            # probe failing to reach it (empty page-state / JS gate / anti-bot
+            # wall) says nothing about the EXECUTION browser (cloak=True full
+            # stealth via browser_service), which is far more capable than the
+            # probe. Substituting the site root silently redirects discovery to
+            # homepage featured links (rmwilliams job 227: 12 sweatshirts +
+            # belts/boot-polish/mug instead of the requested sweatshirts
+            # listing). navigation/search_term keep the root fallback — their
+            # "listing" is genuinely discovered, not user-specified.
+            _fallback_listing = _site_root
+            if _input_mode == "list_page":
+                _crit = (state.get("search_criteria") or "").strip()
+                try:
+                    _cp = _urlparse(_crit)
+                    if _cp.scheme in ("http", "https") and _cp.netloc == _p.netloc:
+                        _fallback_listing = _crit
+                except Exception:
+                    pass
             _disc_fb = {
-                "listing_url": _site_root,
+                "listing_url": _fallback_listing,
                 "listing_reached": True,
                 "pagination": _disc_fb.get("pagination") or {"type": "load_more"},
             }
             logger.warning(
-                "browser_traverse: listing not reached — falling back to reachable site origin %s (via %s, job %s)",
-                _site_root, _root_method, job_id,
+                "browser_traverse: listing not reached — falling back to %s (via %s, job %s)",
+                _fallback_listing, _root_method, job_id,
             )
 
         analysis = {
