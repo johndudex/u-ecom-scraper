@@ -172,6 +172,24 @@ ZAI_SMALL_MODEL = config("ZAI_SMALL_MODEL", default="glm-5-turbo")
 # of reading the full analysis JSONs. Set CODE_WRITER_MODEL=glm-4.7-flash to
 # A/B test the faster flash model on codegen.
 CODE_WRITER_MODEL = config("CODE_WRITER_MODEL", default="glm-5-turbo")
+# LiteLLM proxy provider routing (code_writer via llm.johnjf.xyz). A model name
+# prefixed with one of LITELLM_MODEL_PREFIXES (e.g. CODE_WRITER_MODEL=
+# litellm/standardcompute) routes to LITELLM_BASE_URL with the prefix stripped
+# client-side; the prefix IS the kill switch (unset it → back to Z.AI, no code
+# change). The breaker key stays the full configured string (see llm.py).
+LITELLM_ENABLED = config("LITELLM_ENABLED", default=True, cast=bool)
+LITELLM_BASE_URL = config("LITELLM_BASE_URL", default="https://llm.johnjf.xyz/v1")
+LITELLM_API_KEY = config("LITELLM_API_KEY", default="")
+LITELLM_MODEL_PREFIXES = config("LITELLM_MODEL_PREFIXES", default="litellm/")
+LITELLM_FALLBACK_MODEL = config("LITELLM_FALLBACK_MODEL", default="")
+# Empty = NO breaker fallback for litellm models (deliberate: the proxy exposes
+# exactly one model, so any non-empty litellm fallback 404s; a GLM-name fallback
+# would be sent to the wrong provider). Leave empty — not a knob.
+# Per-agent LLM call timeout overrides (subagents._build_agent). code_writer
+# needs a longer per-call budget than the 300s global default — reasoning
+# models generating ~500-line drafts can exceed 300s on a single call, and the
+# classified-retry layer would multiply that (3×300s) inside the 900s wall.
+CODE_WRITER_LLM_TIMEOUT = config("CODE_WRITER_LLM_TIMEOUT", default=600, cast=int)
 # Fallback model when the primary trips the per-model circuit breaker (Phase 1,
 # contract rollout). Defaults to the small model. The breaker bounds how long a
 # bad/stalling model receives traffic: after LLM_CIRCUIT_BREAKER_THRESHOLD

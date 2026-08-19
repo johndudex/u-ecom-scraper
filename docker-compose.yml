@@ -89,7 +89,13 @@ services:
       ZAI_BASE_URL: ${ZAI_BASE_URL:-https://api.z.ai/api/coding/paas/v4/}
       ZAI_MAIN_MODEL: ${ZAI_MAIN_MODEL:-glm-5-turbo}
       ZAI_SMALL_MODEL: ${ZAI_SMALL_MODEL:-glm-5-turbo}
-      CODE_WRITER_MODEL: glm-5.2
+      CODE_WRITER_MODEL: ${CODE_WRITER_MODEL:-glm-5.2}
+      # LiteLLM proxy routing (llm.py _provider_for): set CODE_WRITER_MODEL=
+      # litellm/standardcompute to route code_writer through the proxy. The
+      # prefix is the kill switch — unset it to return to Z.AI.
+      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-https://llm.johnjf.xyz/v1}
+      LITELLM_API_KEY: ${LITELLM_API_KEY:-}
+      LITELLM_ENABLED: ${LITELLM_ENABLED:-true}
       PLAYWRIGHT_MCP_URL: http://browser_service:8111/sse
       BROWSER_SERVICE_URL: http://browser_service:8001
       FILE_MASTER_URL: http://file-master:8002

@@ -14,6 +14,13 @@ In-process + thread-safe (one breaker state per celery worker process). Each
 worker tracks its own view — acceptable because a stalling model stalls for all
 workers, and the per-worker cooldown (default 60s) is short. A Redis-backed
 cross-worker breaker is a future refinement, not needed for correctness.
+
+Recording moved OUT of langchain callbacks into ``llm.ClassifiedRetryChatOpenAI``
+(the retry layer): on langchain-core 1.5.1+, ``on_llm_end``/``on_llm_error`` are
+never given the ``serialized`` payload, so ``CircuitBreakerCallback`` could not
+extract a model and never recorded anything. The retry layer intercepts every
+call and records under the configured model string (provider prefix intact).
+The callback class is kept only for backward compatibility of imports.
 """
 
 from __future__ import annotations
@@ -107,14 +114,29 @@ def is_tripped(model: Optional[str]) -> bool:
         return False
 
 
-def effective_model(primary: Optional[str]) -> Optional[str]:
+def effective_model(
+    primary: Optional[str], fallback: Optional[str] = None
+) -> Optional[str]:
     """Return the model to actually use: the fallback if ``primary`` is tripped,
     else ``primary`` itself. No-op (returns primary) when disabled or primary is
-    already the fallback."""
+    already the fallback.
+
+    ``fallback`` semantics (EXPLICIT — do not "simplify" to ``fallback or
+    default``; that ``or`` would turn an intentionally-empty string into the
+    ZAI default and silently cross providers):
+
+    - ``None`` (not specified) → use the configured ``ZAI_FALLBACK_MODEL``.
+    - ``""`` (empty string) → NO fallback: return ``primary`` even when tripped
+      (used for litellm models — the proxy has one model; a GLM-name fallback
+      would be sent to the wrong provider and 404).
+    - anything else → that model, verbatim.
+    """
     if not primary:
         return primary
-    enabled, _, _, fallback = _config()
-    if not enabled or primary == fallback:
+    enabled, _, _, default_fallback = _config()
+    if fallback is None:
+        fallback = default_fallback
+    if not enabled or not fallback or primary == fallback:
         return primary
     if is_tripped(primary):
         logger.info("llm_breaker: '%s' tripped → using fallback '%s'", primary, fallback)

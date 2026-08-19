@@ -80,6 +80,24 @@ AGENT_MODEL_SETTINGS: dict[str, str] = {
     "code-writer": "CODE_WRITER_MODEL",
 }
 
+
+def _agent_llm_timeouts() -> dict[str, int]:
+    """Per-agent per-call LLM timeout overrides (keyed by prompt stem, like
+    AGENT_MODEL_SETTINGS). Read lazily so tests can override settings without
+    import-order issues. code_writer gets a longer budget than the 300s global
+    default — reasoning models generating ~500-line drafts can exceed 300s on a
+    single call, and classified retry would multiply that inside the 900s wall."""
+    try:
+        from django.conf import settings as _s
+
+        return {"code-writer": int(getattr(_s, "CODE_WRITER_LLM_TIMEOUT", 600))}
+    except Exception:
+        return {}
+
+
+# Keyed by prompt stem (e.g. "code-writer" — NOT the node name "code_writer").
+_AGENT_LLM_TIMEOUTS: dict[str, int] = _agent_llm_timeouts()
+
 # ── Internal name mapping: agent node name → prompt file stem ─────────────
 
 AGENT_PROMPT_MAP: dict[str, str] = {
@@ -676,7 +694,11 @@ def _build_agent(agent_name: str, site_slug: str = "", use_create_agent: bool = 
         getattr(_settings, _model_setting, None) if _model_setting else None
     )
     if _model_override:
-        llm = get_llm(model=_model_override, temperature=temperature)
+        llm = get_llm(
+            model=_model_override,
+            temperature=temperature,
+            timeout=_AGENT_LLM_TIMEOUTS.get(prompt_stem),
+        )
     else:
         llm = get_main_llm(temperature)
 

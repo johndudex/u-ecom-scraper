@@ -10,7 +10,17 @@ classes (timeout/connection/5xx) retry a bounded number of times with
 exponential-jitter backoff; 429 honors Retry-After.
 
 Also consults the per-model circuit breaker (``llm_breaker``): a tripped model's
-traffic routes to ``ZAI_FALLBACK_MODEL``.
+traffic routes to its provider-local fallback (ZAI_FALLBACK_MODEL for Z.AI
+models; LITELLM_FALLBACK_MODEL — normally empty = no swap — for ``litellm/``
+models). Breaker state is recorded in ``ClassifiedRetryChatOpenAI`` (the retry
+layer intercepts every call and knows its model name); the old
+``CircuitBreakerCallback`` was dead code on langchain-core 1.5.1+ (callbacks
+never receive the ``serialized`` payload, so it could never extract a model).
+
+Provider routing: a model name prefixed ``litellm/`` (configurable via
+``LITELLM_MODEL_PREFIXES``) is sent to the LiteLLM proxy (``LITELLM_BASE_URL``)
+with the prefix stripped client-side — see ``_provider_for``. The prefix IS the
+kill switch: unsetting it routes the model back to Z.AI with no code change.
 
 Kill-switch ``LLM_CLASSIFIED_RETRY`` (settings, default on): off → revert to the
 pre-Phase-2 plain ChatOpenAI with the old ``max_retries``.
@@ -28,8 +38,9 @@ import openai
 from django.conf import settings
 from langchain_core.outputs import ChatResult
 from langchain_openai import ChatOpenAI
+from pydantic import PrivateAttr
 
-from .llm_breaker import effective_model
+from .llm_breaker import effective_model, record_failure, record_success
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +89,71 @@ def _backoff_delay(attempt: int, cfg: dict) -> float:
     """Full-jitter exponential backoff: uniform in [0, min(cap, base * 2**attempt)]."""
     import random as _r  # local alias to keep module surface clean
     return _r.uniform(0.0, min(cfg["backoff_cap"], cfg["backoff_base"] * (2 ** attempt)))
+
+
+# ── Provider routing (LiteLLM proxy) ─────────────────────────────────────────
+
+def _litellm_prefixes() -> tuple[str, ...]:
+    """Configured provider prefixes (``litellm/`` by default). Read lazily —
+    Django settings may not be ready at import."""
+    try:
+        raw = getattr(settings, "LITELLM_MODEL_PREFIXES", "litellm/")
+        if isinstance(raw, str):
+            raw = raw.split(",")
+        return tuple(p for p in (s.strip() for s in raw) if p)
+    except Exception:
+        return ("litellm/",)
+
+
+def _is_litellm_model(model: str) -> bool:
+    """True if ``model`` should route to the LiteLLM proxy. Requires the
+    feature flag AND a key — without a key the proxy would 401 every call."""
+    try:
+        if not getattr(settings, "LITELLM_ENABLED", True):
+            return False
+        if not getattr(settings, "LITELLM_API_KEY", ""):
+            return False
+    except Exception:
+        return False
+    return model.startswith(_litellm_prefixes())
+
+
+def _provider_for(model: str) -> tuple[str, str, str]:
+    """Resolve (base_url, api_key, model_name_to_send) for a model.
+
+    LiteLLM-prefixed models route to ``LITELLM_BASE_URL`` with the prefix
+    stripped client-side (the breaker key stays the FULL configured string —
+    see ``ClassifiedRetryChatOpenAI._breaker_key`` — so record and lookup can
+    never diverge). Everything else goes to Z.AI unchanged.
+    """
+    if _is_litellm_model(model):
+        for p in _litellm_prefixes():
+            if model.startswith(p):
+                return (
+                    getattr(settings, "LITELLM_BASE_URL", "https://llm.johnjf.xyz/v1"),
+                    getattr(settings, "LITELLM_API_KEY", ""),
+                    model[len(p):],
+                )
+    return (
+        getattr(settings, "ZAI_BASE_URL", "https://api.z.ai/api/coding/paas/v4/"),
+        getattr(settings, "ZAI_API_KEY", ""),
+        model,
+    )
+
+
+def _litellm_fallback(requested: str) -> Optional[str]:
+    """Provider-local breaker fallback for ``requested``.
+
+    litellm models → ``LITELLM_FALLBACK_MODEL`` (empty string = no swap; the
+    proxy exposes one model, so there is nothing to fall back TO — a
+    cross-provider GLM fallback would 404).
+    ZAI models → ``None`` = use the configured ``ZAI_FALLBACK_MODEL`` default
+    (effective_model treats None as "not specified", NOT as "no fallback" —
+    the distinction matters, see llm_breaker.effective_model).
+    """
+    if _is_litellm_model(requested):
+        return getattr(settings, "LITELLM_FALLBACK_MODEL", "")
+    return None
 
 
 def _retry_classified_sync(fn, cfg: dict):
@@ -142,6 +218,12 @@ def _handle_retry(kind: str, exc, attempt: int, cfg: dict, *, sleep, retry_after
 
 
 class ClassifiedRetryChatOpenAI(ChatOpenAI):
+    # Breaker key = the model string AS CONFIGURED (``litellm/standardcompute``,
+    # prefix intact) — NOT ``model_name``, which is the post-strip string sent
+    # to the server. ``effective_model`` looks up the configured string, so
+    # recording under anything else makes record/lookup diverge silently (the
+    # critique round's key-coherence finding). Set by ``get_llm``.
+    _breaker_name: Optional[str] = PrivateAttr(default=None)
     """``ChatOpenAI`` with classified, bounded, jittered per-call retry.
 
     Override of ``_generate``/``_agenerate`` (the methods langchain routes
@@ -150,6 +232,12 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
     so the retry applies to every LLM call the react loop makes. The base
     ``max_retries`` MUST be 0 — the SDK's own retry is blind + unbounded in
     effect, which is what this class replaces.
+
+    Also the breaker's observation point: ``_generate``/``_agenerate`` intercept
+    every outcome and record under ``self.model_name`` (the configured string,
+    prefix intact). The old CircuitBreakerCallback never worked on
+    langchain-core 1.5.1+ — callbacks don't receive the ``serialized`` payload —
+    so recording moved here (record/lookup keys identical by construction).
     """
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[override]
@@ -158,10 +246,16 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
         # lambda doesn't get the __class__ closure cell (RuntimeError: super(): no
         # arguments). Explicit super() + a local binding is robust.
         _super_generate = super(ClassifiedRetryChatOpenAI, self)._generate
-        return _retry_classified_sync(
-            lambda: _super_generate(messages, stop=stop, run_manager=run_manager, **kwargs),
-            cfg,
-        )
+        try:
+            result = _retry_classified_sync(
+                lambda: _super_generate(messages, stop=stop, run_manager=run_manager, **kwargs),
+                cfg,
+            )
+        except Exception as exc:
+            self._record_breaker(exc)
+            raise
+        record_success(self._breaker_key())
+        return result
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[override]
         cfg = _retry_settings()
@@ -170,7 +264,28 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
         async def _call():
             return await _super_agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
 
-        return await _retry_classified_async(_call, cfg)
+        try:
+            result = await _retry_classified_async(_call, cfg)
+        except Exception as exc:
+            self._record_breaker(exc)
+            raise
+        record_success(self._breaker_key())
+        return result
+
+    def _breaker_key(self) -> str:
+        """Configured model string (prefix intact); falls back to model_name
+        when get_llm didn't set the private attr (direct construction)."""
+        return self._breaker_name or self.model_name
+
+    def _record_breaker(self, exc: BaseException) -> None:
+        """record_failure for health-class errors only (timeout/connection/5xx).
+        Caller bugs (auth/bad-request) are config problems, not model health."""
+        if isinstance(exc, _CALLER_BUG_ERRORS):
+            return
+        try:
+            record_failure(self._breaker_key())
+        except Exception:
+            pass  # breaker bookkeeping must never mask the real exception
 
 
 def _classified_retry_enabled() -> bool:
@@ -192,10 +307,15 @@ def get_llm(model: Optional[str] = None, temperature: float = 0.3, timeout: Opti
     field discovery).
     """
     requested = model or getattr(settings, "ZAI_MAIN_MODEL", "glm-5-turbo")
+    # ORDER IS LOAD-BEARING: breaker swap first (provider-local fallback — a
+    # litellm model falls back only within litellm, or not at all), THEN resolve
+    # the provider from the swapped name, so base_url follows the actual model.
+    effective = effective_model(requested, fallback=_litellm_fallback(requested))
+    base_url, api_key, model_name = _provider_for(effective)
     base_kwargs = dict(
-        openai_api_base=getattr(settings, "ZAI_BASE_URL", "https://api.z.ai/api/coding/paas/v4/"),
-        openai_api_key=settings.ZAI_API_KEY,
-        model=effective_model(requested),
+        openai_api_base=base_url,
+        openai_api_key=api_key,
+        model=model_name,
         temperature=temperature,
         # Per-call HTTP timeout — the primary hang guard (a stuck request dies
         # here rather than hanging indefinitely).
@@ -203,8 +323,13 @@ def get_llm(model: Optional[str] = None, temperature: float = 0.3, timeout: Opti
     )
     if _classified_retry_enabled():
         # Phase 2: max_retries=0 (no blind SDK retry) + classified retry layer.
-        return ClassifiedRetryChatOpenAI(max_retries=0, **base_kwargs)
-    # Kill-switch off → pre-Phase-2 behavior (blind SDK retry).
+        llm = ClassifiedRetryChatOpenAI(max_retries=0, **base_kwargs)
+        # Breaker key = configured string (prefix intact), not the stripped name
+        # sent to the server — keeps record/lookup coherent across the swap.
+        llm._breaker_name = requested
+        return llm
+    # Kill-switch off → pre-Phase-2 behavior (blind SDK retry). Breaker not
+    # recorded on this path (no retry-layer interception).
     return ChatOpenAI(max_retries=getattr(settings, "LLM_MAX_RETRIES", 5), **base_kwargs)
 
 

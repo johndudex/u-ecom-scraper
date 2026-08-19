@@ -14,6 +14,11 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "webapp"))
 import src.skills_store as store
 
+# Reuse the store tests' dual patcher: sys.modules alone is insufficient once
+# the real src.artifacts has been imported (import a.b as c binds via getattr
+# on the package). Same-directory import — pytest puts tests/ on sys.path.
+from test_skills_store import _PkgAttrPatch
+
 
 class TestDenyList:
     """filesystem_tools must refuse writes under .opencode/skills (resolved path)."""
@@ -99,11 +104,11 @@ class TestSeedBranches:
             if k in fm_state:
                 return fm_state[k]
             raise FileNotFoundError(k)
-        art.read_text = mock.Mock(side_effect=_read)
-        art.write_text = mock.Mock(side_effect=lambda k, v: writes.__setitem__(k, v))
+        art.read_text = mock.Mock(side_effect=lambda k: fm_state[k] if k in fm_state else FileNotFoundError(k))
+        art.write_text = mock.Mock(side_effect=lambda k, v: fm_state.__setitem__(k, v))
         art.exists = mock.Mock(side_effect=lambda k: k in fm_state)
         art.list_keys = mock.Mock(return_value=[])
-        with mock.patch.dict(sys.modules, {"src.artifacts": art}), \
+        with _PkgAttrPatch(art), \
              mock.patch.object(store, "_image_skills_dir") as d:
             d.return_value = types.SimpleNamespace(
                 is_dir=lambda: True,
@@ -148,7 +153,7 @@ class TestReplaceLearnedSection:
         art.write_text = mock.Mock(side_effect=lambda k, v: state.__setitem__(k, v))
         art.exists = mock.Mock(return_value=True)
         art.list_keys = mock.Mock(return_value=["skills/nav/SKILL.md"])
-        with mock.patch.dict(sys.modules, {"src.artifacts": art}):
+        with _PkgAttrPatch(art):
             store._invalidate_snapshot()
             r = store.replace_learned_section("nav", "First", "## Learned: First\n**Source:** a\n\nEDITED\n")
         assert r["ok"]
@@ -167,7 +172,7 @@ class TestReplaceLearnedSection:
         art.write_text = mock.Mock(side_effect=lambda k, v: state.__setitem__(k, v))
         art.exists = mock.Mock(return_value=True)
         art.list_keys = mock.Mock(return_value=[])
-        with mock.patch.dict(sys.modules, {"src.artifacts": art}):
+        with _PkgAttrPatch(art):
             store._invalidate_snapshot()
             r = store.replace_learned_section("nav", "Nope", "x")
         assert not r["ok"]

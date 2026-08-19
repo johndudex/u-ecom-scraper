@@ -224,6 +224,13 @@ ZAI_BASE_URL=https://api.z.ai/api/coding/paas/v4/
 ZAI_MAIN_MODEL=glm-5-turbo
 ZAI_SMALL_MODEL=glm-5-turbo
 CODE_WRITER_MODEL=glm-5.2
+# LiteLLM proxy (optional — flip CODE_WRITER_MODEL to litellm/standardcompute
+# to route code_writer through the proxy; see docs/codewriter-litellm-plan.md).
+# Rotate the key BEFORE sealing it (rotation after sealing = two sealed-var
+# updates + a window where local and Railway use different keys).
+LITELLM_BASE_URL=https://llm.johnjf.xyz/v1
+LITELLM_API_KEY=<your litellm key>            # ⋮ → Seal
+# CODE_WRITER_MODEL=litellm/standardcompute
 
 # ── browser automation endpoint for the agents ──
 PLAYWRIGHT_MCP_URL=http://browser-service.railway.internal:8111/sse
