@@ -31,7 +31,7 @@ def get_skill_tools(skills_dir: Optional[str] = None) -> list:
         List of LangChain BaseTool instances: [load_skill, list_skills].
     """
     # skills_dir is accepted-and-ignored: pre-FM callers passed a path.
-    from src.skills_store import list_skills, read_skill
+    from src.skills_store import list_skills as _store_list_skills, read_skill as _store_read_skill
 
     @tool
     def load_skill(skill_name: str) -> str:
@@ -49,9 +49,9 @@ def get_skill_tools(skills_dir: Optional[str] = None) -> list:
             The full content of the skill's SKILL.md file, or an error
             message if the skill does not exist.
         """
-        content = read_skill(skill_name)
+        content = _store_read_skill(skill_name)
         if content is None:
-            available = list_skills()
+            available = _store_list_skills()
             hint = (
                 f"\nAvailable skills: {', '.join(available)}"
                 if available
@@ -90,7 +90,7 @@ def get_skill_tools(skills_dir: Optional[str] = None) -> list:
         Returns:
             A formatted list of skill names, or a message if none exist.
         """
-        names = list_skills()
+        names = _store_list_skills()
         if not names:
             return "No skills found."
         return "\n".join(f"- {name}" for name in names)

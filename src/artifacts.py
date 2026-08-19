@@ -55,9 +55,15 @@ def write_json(key: str, obj: object) -> int:
     return write_text(key, json.dumps(obj, indent=2, ensure_ascii=False, default=str))
 
 
-def read(key: str) -> bytes:
-    """Return the bytes at ``key``. Raises FileNotFoundError if missing."""
-    r = httpx.get(_key_url(key), timeout=_DEFAULT_TIMEOUT)
+def read(key: str, timeout: float | None = None) -> bytes:
+    """Return the bytes at ``key``. Raises FileNotFoundError if missing.
+
+    ``timeout`` overrides the 120s default — skills_store passes 5s because
+    its reads sit on the agent-build hot path (16 sequential calls per
+    first build; an FM that accepts TCP but stalls would otherwise block
+    the first agent boot for minutes).
+    """
+    r = httpx.get(_key_url(key), timeout=timeout if timeout is not None else _DEFAULT_TIMEOUT)
     if r.status_code == 404:
         raise FileNotFoundError(key)
     if r.status_code >= 400:
@@ -65,8 +71,8 @@ def read(key: str) -> bytes:
     return r.content
 
 
-def read_text(key: str) -> str:
-    return read(key).decode("utf-8")
+def read_text(key: str, timeout: float | None = None) -> str:
+    return read(key, timeout=timeout).decode("utf-8")
 
 
 def read_json(key: str):

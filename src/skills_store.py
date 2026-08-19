@@ -109,7 +109,7 @@ def read_skill(name: str) -> Optional[str]:
     try:
         import src.artifacts as artifacts
 
-        return artifacts.read_text(_FM_KEY.format(name=_name))
+        return artifacts.read_text(_FM_KEY.format(name=_name), timeout=_SKILLS_TIMEOUT_S)
     except FileNotFoundError:
         # 404: designed path for unseeded FM + image-only skills.
         return _read_image_skill(_name)
@@ -207,6 +207,11 @@ def _invalidate_snapshot() -> None:
 
 _LEARNED_HEADER_RE = re.compile(r"^## Learned:", re.MULTILINE)
 _LOCK_TIMEOUT_S = 15.0
+# Skills reads sit on the agent-build hot path (descriptions_snapshot does
+# 1 list + N sequential reads on the FIRST build per process). An FM that
+# accepts TCP but stalls would block boot for minutes at the 120s default —
+# 5s fails fast into the image fallback instead (critique gap (b)).
+_SKILLS_TIMEOUT_S = 5.0
 
 
 def append_learned(name: str, title: str, source: str, applicability: str, body: str,
@@ -263,7 +268,13 @@ def create_skill(name: str, description: str, body: str, *, actor: str = "") -> 
 
 
 def update_skill_text(name: str, new_text: str, *, actor: str = "") -> dict:
-    """Full-text replace (admin/UI path — NOT exposed to agents)."""
+    """Full-text replace (admin/UI path — NOT exposed to agents).
+
+    RISK NOTE: replaces the whole file, so a concurrent append between the
+    caller's read and this write is lost. UI callers should prefer
+    replace_learned_section (title-scoped, match-inside-lock, keeps any
+    concurrent appends to OTHER sections).
+    """
     _name = _validate_name(name)
     if _name is None:
         return {"ok": False, "error": f"invalid skill name: {name!r}"}
@@ -275,6 +286,36 @@ def update_skill_text(name: str, new_text: str, *, actor: str = "") -> dict:
         _audit("update", _name, f"{len(current)}→{len(new_text)} chars", actor)
         _invalidate_snapshot()
     return {"ok": True, "skill": _name}
+
+
+def replace_learned_section(name: str, title: str, new_section: str, *, actor: str = "") -> dict:
+    """Replace ONE ``## Learned:`` section by exact title, inside the lock.
+
+    The admin UI's safe edit path: reads the CURRENT text under the lock,
+    swaps only the matching section, writes back. A concurrent agent append
+    to any other section survives (unlike a full-text replace built from a
+    read taken before the edit form was even opened — the lost-update window
+    the critique flagged).
+    """
+    _name = _validate_name(name)
+    if _name is None:
+        return {"ok": False, "error": f"invalid skill name: {name!r}"}
+    with _skills_lock():
+        current = _fm_read_or_fail(_name)
+        if current is None:
+            return {"ok": False, "error": f"skill '{_name}' not found in FM"}
+        pattern = re.compile(
+            r"\n?## Learned: " + re.escape((title or "").strip()) + r"\n.*?(?=\n## Learned: |\Z)",
+            re.DOTALL,
+        )
+        m = pattern.search(current)
+        if not m:
+            return {"ok": False, "error": f"no learned section titled {title!r}"}
+        new_text = current[:m.start()] + "\n" + new_section.strip() + "\n" + current[m.end():]
+        _fm_write(_name, new_text)
+        _audit("replace_learned", _name, title, actor)
+        _invalidate_snapshot()
+    return {"ok": True, "skill": _name, "replaced": title}
 
 
 def delete_learned_section(name: str, title: str, *, actor: str = "") -> dict:

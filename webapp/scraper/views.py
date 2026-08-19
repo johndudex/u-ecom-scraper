@@ -2756,28 +2756,17 @@ def learnt_skill_update(request, skill_name):
     """Save an edited learned section (full-section replace, one section)."""
     if request.method != "POST":
         return redirect("learnt_skills")
-    from src.skills_store import delete_learned_section, read_skill, update_skill_text
+    from src.skills_store import replace_learned_section
     from django.contrib import messages
 
     title = request.POST.get("title", "").strip()
     body = (request.POST.get("body") or "").strip()
-    text = read_skill(skill_name) or ""
-    parts = [p for p in _LEARNED_SPLIT.split(text)]
-    replaced = False
-    out = []
-    for p in parts:
-        stripped = p.strip()
-        if stripped.startswith("## Learned:"):
-            first = stripped.splitlines()[0].lstrip("# ").strip()
-            if not replaced and first == f"Learned: {title}":
-                out.append("\n" + body + "\n")
-                replaced = True
-                continue
-        out.append(p)
-    if not replaced:
-        messages.error(request, f"Section '{title}' not found — nothing changed.")
-        return redirect("learnt_skills")
-    result = update_skill_text(skill_name, "".join(out), actor=f"ui:{request.user.username}")
+    # Lock-safe, title-scoped replace: reads CURRENT text under the flock and
+    # swaps only this section — a concurrent agent append to another section
+    # survives (the old full-text replace could silently erase it).
+    result = replace_learned_section(
+        skill_name, title, body, actor=f"ui:{request.user.username}"
+    )
     if result.get("ok"):
         messages.success(request, f"Updated '{title}' in {skill_name}.")
     else:
