@@ -819,6 +819,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
         <pre class="json-view" id="json-out"></pre>
       </div>
       <div class="tab-panel hidden" id="tab-tools"><div id="toolcalls"></div></div>
+      <style>#agent-log{scroll-behavior:auto;overflow-anchor:none;}</style>
       <div class="tab-panel hidden" id="tab-log"><div class="log" id="agent-log"></div></div>
     </div>
 
@@ -1546,6 +1547,29 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
      The pipeline / details / tools / log / runs / code panels are populated
      from the live job API by refreshJobData() once the build runs. (Do NOT
      seed mock data here — it would flash bogus content and fake run history.) */
+  // ── stick-to-bottom for #agent-log (replace-then-scroll variant). The pin
+  // decision must NOT depend on post-innerHTML measurement: innerHTML= resets
+  // scrollTop to 0, so we capture the flag BEFORE the replacement and the
+  // synchronous scroll below uses the pre-replacement value; the scroll event
+  // queued by the reset lands after and re-measures the final position.
+  var agentLogPinned = true;
+  (function(){
+    var el = X('#agent-log'); if(!el) return;
+    el.addEventListener('scroll', function(){
+      agentLogPinned = (el.scrollHeight - el.scrollTop - el.clientHeight) <= 40;
+    }, { passive: true });
+    // Hidden-tab degenerate case: while #tab-log is display:none the container
+    // measures 0/0 → the listener pins true and scrollTop assignment no-ops;
+    // opening the tab mid-run would show the TOP. Re-pin on tab show.
+    var tab = X('#tab-log');
+    var mo = new MutationObserver(function(){
+      if(!tab.classList.contains('hidden') && agentLogPinned){
+        el.scrollTop = el.scrollHeight;
+      }
+    });
+    if(tab) mo.observe(tab, { attributes: true, attributeFilter: ['class'] });
+  })();
+
   function renderResults(){
     var host = hostFromExample() || 'the site';
     var url = X('#example-url').value.trim() || host;
@@ -1558,6 +1582,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     X('#details-kv').innerHTML = '';
     X('#toolcalls').innerHTML = '';
     X('#agent-log').innerHTML = '';
+    agentLogPinned = true;   // cleared panel → follow again
     X('#runs-body').innerHTML = '';
     X('#extractor-code').textContent = '';
     X('#dagster-code').textContent = '';
@@ -1881,13 +1906,14 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
         }).join('');
       }
       if(j.logs && j.logs.length){
+        var _pinBefore = agentLogPinned;   // measure BEFORE innerHTML resets scrollTop
         X('#agent-log').innerHTML = j.logs.slice(-200).map(function(l){
           var lvl = (l.role==='assistant')?'ok':'info';
           var t = (l.created_at||'').slice(11,19);
           var who = l.agent?('['+l.agent+'] '):'';
           return '<div class="log-line"><span class="log-time">'+t+'</span><span class="log-lvl '+lvl+'">'+(l.role||'').toUpperCase().slice(0,5)+'</span><span class="log-msg">'+escHtml(who+(l.content||''))+'</span></div>';
         }).join('');
-        X('#agent-log').scrollTop = X('#agent-log').scrollHeight;
+        if (_pinBefore) X('#agent-log').scrollTop = X('#agent-log').scrollHeight;
       }
       // Real extracted output — show as soon as it exists (even mid-run, e.g.
       // right after testing/execution writes output_*.json), not only on terminal.

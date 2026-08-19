@@ -181,11 +181,19 @@
                 <div class="flex items-center gap-1.5">
                     <button id="refresh-logs-btn" class="text-xs text-ink-secondary hover:text-ink border border-line-strong px-2 py-1 rounded-md hover:bg-raised transition-colors cursor-pointer">Refresh</button>
                     <button class="text-xs text-ink-secondary hover:text-ink border border-line-strong px-2 py-1 rounded-md hover:bg-raised transition-colors cursor-pointer" onclick="var b=this;var cols=document.querySelectorAll('#log-container .log-agent-body:not(.open)');var exp=cols.length>0;document.querySelectorAll('#log-container .log-agent-body').forEach(function(el){var h=el.previousElementSibling;if(exp){el.classList.add('open');if(h){h.classList.add('open');h.classList.remove('collapsed');}}else{el.classList.remove('open');if(h){h.classList.remove('open');h.classList.add('collapsed');}}});b.textContent=exp?'Collapse All':'Expand All';">Expand All</button>
-                    <button class="text-ink-secondary hover:text-ink border border-line-strong px-2 py-1 rounded-md hover:bg-raised transition-colors cursor-pointer" onclick="document.getElementById('log-container').scrollTo({top:document.getElementById('log-container').scrollHeight,behavior:'smooth'})">
+                    <button class="text-ink-secondary hover:text-ink border border-line-strong px-2 py-1 rounded-md hover:bg-raised transition-colors cursor-pointer" onclick="logPinned=true;_pinSmooth(document.getElementById('log-container'))">
                         <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M19.347 14.07a.75.75 0 01.093 1.056l-4.25 5a.75.75 0 11-1.149-.972l3.75-4.406-3.75-4.406a.75.75 0 01.976-1.133l4.25 5a.75.75 0 01.05.912zM4.75 14.07a.75.75 0 01.05.912l-4.25 5a.75.75 0 01-1.149-.972L3.15 14.6.4 10.195a.75.75 0 01.976-1.133l4.25 5a.75.75 0 01-.05.912z" clip-rule="evenodd"/></svg>
                     </button>
                 </div>
             </div>
+            <!-- scroll-behavior:auto — the html-level smooth (base.html) doesn't
+                 inherit, but nothing protected that; one future selector would turn
+                 every pin-scroll animated and fight the suppress window.
+                 overflow-anchor:none — the prune compensates scrollTop manually;
+                 the browser's anchoring would double-compensate. -->
+            <style>
+              #log-container, #syslog-container { scroll-behavior: auto; overflow-anchor: none; }
+            </style>
             <div id="log-container" class="log-stream bg-void max-h-[60vh] min-h-[200px] overflow-y-auto scrollbar-thin font-mono text-xs leading-relaxed">
                 {% for log in recent_logs %}
                 <div class="log-entry log-{{ log.role }} px-3.5 py-1.5 border-b border-line-subtle/50 hover:bg-raised/30 transition-colors" data-seq="{{ log.seq }}" data-agent="{{ log.agent }}">
@@ -384,7 +392,7 @@
         syslogEntries++;
         while (syslogContainer.children.length > syslogMaxLines) syslogContainer.removeChild(syslogContainer.firstChild);
         syslogCountEl.textContent = syslogEntries + ' entries';
-        syslogContainer.scrollTop = syslogContainer.scrollHeight;
+        if (syslogPinned) _pinToBottom(syslogContainer);
     }
 
     function updateStatus(status) {
@@ -433,8 +441,38 @@
         if (!header) return;
         var body = header.nextElementSibling;
         if (body && !body.classList.contains('open')) { header.classList.add('open'); body.classList.add('open'); header.classList.add('active'); }
-        header.scrollIntoView({behavior:'smooth',block:'start'});
+        // Unpin BEFORE scrolling: the user navigated to a section; if the
+        // header is already fully visible scrollIntoView fires NO scroll event
+        // and the listener can't clear the flag itself. (Landing near the
+        // bottom, the listener legitimately re-pins — that's "follow the tail".)
+        logPinned = false;
+        _progScrollUntil = Date.now() + 600;   // smooth animation window
+        header.scrollIntoView({behavior:'smooth',block:'nearest'});
     }
+
+    // ── stick-to-bottom (plan v3 §scroll): pinned only while the user is at
+    // the bottom; scrolling up releases. A ~600ms suppress window around
+    // programmatic smooth scrolls keeps the jump button from unpinning itself
+    // mid-animation (its intermediate scroll events fire off-bottom).
+    var logPinned = true, syslogPinned = true;
+    var LOG_PIN_TOLERANCE = 40;            // px — subpixel/fractional safe
+    var _progScrollUntil = 0;              // ms timestamp
+    function _mkPinWatcher(container, setState) {
+        container.addEventListener('scroll', function() {
+            if (Date.now() < _progScrollUntil) return;   // programmatic smooth scroll
+            setState((container.scrollHeight - container.scrollTop
+                      - container.clientHeight) <= LOG_PIN_TOLERANCE);
+        }, { passive: true });
+    }
+    function _pinToBottom(container) {
+        container.scrollTop = container.scrollHeight;
+    }
+    function _pinSmooth(container) {
+        _progScrollUntil = Date.now() + 600;
+        container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
+    }
+    _mkPinWatcher(logContainer, function(v) { logPinned = v; });
+    _mkPinWatcher(syslogContainer, function(v) { syslogPinned = v; });
 
     function addLogs(logs, autoExpand) {
         var waiting = logContainer.querySelector('[style*="22D3EE"]');
@@ -469,7 +507,30 @@
             });
         });
         if (logCountEl) logCountEl.textContent = totalLogs + ' entries';
-        logContainer.scrollTop = logContainer.scrollHeight;
+        _pruneLogEntries();
+        if (logPinned) _pinToBottom(logContainer);          // instant, never smooth
+    }
+
+    // Pair-aware prune: children alternate .log-agent-header/.log-agent-body —
+    // removing a bare firstChild orphans bodies. Remove header+body PAIRS while
+    // entry count exceeds the cap. When unpinned, compensate scrollTop by the
+    // scrollHeight delta so content doesn't jump under the reader (#log-container
+    // has overflow-anchor:none so the browser doesn't double-compensate).
+    var LOG_MAX_ENTRIES = 1000;
+    function _countEntries() {
+        return logContainer.querySelectorAll('.log-entry').length;
+    }
+    function _pruneLogEntries() {
+        if (_countEntries() <= LOG_MAX_ENTRIES) return;
+        var sh0 = logContainer.scrollHeight;
+        while (_countEntries() > LOG_MAX_ENTRIES) {
+            var firstHeader = logContainer.querySelector(':scope > .log-agent-header');
+            if (!firstHeader) break;
+            var body = firstHeader.nextElementSibling;
+            if (body && body.classList.contains('log-agent-body')) body.remove();
+            firstHeader.remove();
+        }
+        if (!logPinned) logContainer.scrollTop -= (sh0 - logContainer.scrollHeight);
     }
 
     function fetchToolCalls() {

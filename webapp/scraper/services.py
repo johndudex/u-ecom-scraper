@@ -108,14 +108,23 @@ class _ScrapeCallbackHandler(BaseCallbackHandler):
             content=content[:3000],
             seq=seq,
         )
+        # Plural "logs" batch: both SSE consumers (job_detail + intake) handle
+        # ONLY the plural shape — the old singular "log" was silently dropped,
+        # so the Redis pub/sub path (Railway's live path) delivered ZERO live
+        # agent lines; logs only appeared on manual refresh/reload.
         LangGraphService._publish_redis(
             self.job.id,
             {
-                "type": "log",
-                "seq": seq,
-                "role": "assistant",
-                "agent": agent,
-                "content": content[:500],
+                "type": "logs",
+                "logs": [
+                    {
+                        "seq": seq,
+                        "role": "assistant",
+                        "agent": agent,
+                        "content": content[:500],
+                        "created_at": _iso_now(),
+                    }
+                ],
             },
         )
 
@@ -164,6 +173,12 @@ class _ScrapeCallbackHandler(BaseCallbackHandler):
 
     def on_chain_end(self, outputs: dict, *, run_id: str, parent_run_id: str | None = None, **kwargs: Any) -> None:
         pass
+
+
+def _iso_now() -> str:
+    from django.utils import timezone
+
+    return timezone.now().isoformat()
 
 
 class LangGraphService:
