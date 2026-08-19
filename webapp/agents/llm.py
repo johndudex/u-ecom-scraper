@@ -296,7 +296,8 @@ def _classified_retry_enabled() -> bool:
 
 
 def get_llm(model: Optional[str] = None, temperature: float = 0.3, timeout: Optional[int] = None) -> ChatOpenAI:
-    """Create a ChatOpenAI instance configured for the Z.AI API.
+    """Create a ChatOpenAI instance configured for the Z.AI API (or the LiteLLM
+    proxy for ``litellm/``-prefixed models — see ``_provider_for``).
 
     The per-model circuit breaker (llm_breaker) is consulted here: if the
     requested model is tripped (N consecutive failures), the fallback model is
@@ -305,6 +306,13 @@ def get_llm(model: Optional[str] = None, temperature: float = 0.3, timeout: Opti
     ``LLM_CLASSIFIED_RETRY`` kill-switch is off. Pass ``timeout`` (seconds) to
     override the default ``LLM_REQUEST_TIMEOUT`` for short-lived calls (e.g.
     field discovery).
+
+    LiteLLM-prefixed models get ``streaming=True``: the proxy's gateway 504s a
+    non-streaming request whose generation exceeds ~60s (measured), and the
+    reasoning model routinely exceeds that on codegen. Streaming keeps bytes
+    flowing — measured: non-stream 504 at 62s vs stream first-chunk 5.5s /
+    full 11K chars over 119s. langchain's react loop consumes streamed chunks
+    and assembles the final AIMessage identically, so behavior is unchanged.
     """
     requested = model or getattr(settings, "ZAI_MAIN_MODEL", "glm-5-turbo")
     # ORDER IS LOAD-BEARING: breaker swap first (provider-local fallback — a
@@ -320,6 +328,8 @@ def get_llm(model: Optional[str] = None, temperature: float = 0.3, timeout: Opti
         # Per-call HTTP timeout — the primary hang guard (a stuck request dies
         # here rather than hanging indefinitely).
         timeout=timeout if timeout is not None else getattr(settings, "LLM_REQUEST_TIMEOUT", 600),
+        # LiteLLM proxy: gateway 504s non-streaming gens > ~60s (measured).
+        streaming=_is_litellm_model(effective),
     )
     if _classified_retry_enabled():
         # Phase 2: max_retries=0 (no blind SDK retry) + classified retry layer.

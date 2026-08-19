@@ -1307,6 +1307,9 @@ def _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout):
     matching the sync path's contract.
     """
     import asyncio
+    import time as _time
+
+    t0 = _time.monotonic()
 
     async def _run():
         return await asyncio.wait_for(
@@ -1323,6 +1326,17 @@ def _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout):
         )
         return {"messages": []}
     except Exception as exc:
+        import traceback
+
+        logger.error(
+            "_invoke_agent_with_timeout[%s]: ainvoke raised after %.0fms: %s: %s (job %s)",
+            phase, (_time.monotonic() - t0) * 1000,
+            type(exc).__name__, str(exc)[:300], job_id,
+        )
+        logger.error(
+            "_invoke_agent_with_timeout[%s]: traceback:\n%s",
+            phase, traceback.format_exc(limit=8),
+        )
         return {"_error": str(exc)[:200]}
 
 
