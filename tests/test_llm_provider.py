@@ -222,6 +222,9 @@ class TestGetLlmWiring:
         assert llm.openai_api_base == "https://litellm.example/v1"  # type: ignore[attr-defined]
         assert llm.model_name == "standardcompute"                   # type: ignore[attr-defined]
         assert llm._breaker_name == "litellm/standardcompute"        # type: ignore[attr-defined]
+        # Streaming REQUIRED for litellm: proxy gateway 504s non-streaming
+        # generations > ~60s (measured; reasoning model thinks longer).
+        assert llm.streaming is True                                 # type: ignore[attr-defined]
 
     def test_zai_model_untouched(self):
         mod = _llm_mod()
@@ -232,6 +235,7 @@ class TestGetLlmWiring:
         assert llm.openai_api_base == "https://zai.example/v4"  # type: ignore[attr-defined]
         assert llm.model_name == "glm-5.2"                       # type: ignore[attr-defined]
         assert llm._breaker_name == "glm-5.2"                    # type: ignore[attr-defined]
+        assert llm.streaming is False                            # type: ignore[attr-defined]
 
     def test_code_writer_timeout_reaches_llm(self):
         """§D: AGENT_LLM_TIMEOUTS threads timeout= into get_llm."""
