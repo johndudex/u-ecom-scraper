@@ -2672,3 +2672,131 @@ def intake_jobs(request):
     ]
     return JsonResponse({"jobs": data})
 
+
+
+# ── Learnt Skills admin (/learnt-skills) ────────────────────────────────────
+# View/edit the File Master's live skills: delete or edit a learned section.
+# Baseline content (above the first `## Learned:`) is read-only here — it is
+# managed in git (the seed). All writes go through src.skills_store (flock'd).
+
+import re as _re_learned_split
+
+_LEARNED_SPLIT = _re_learned_split.compile(r"(?=^## Learned: )", _re_learned_split.MULTILINE)
+_LEARNED_META = _re_learned_split.compile(
+    r"^## Learned: (.+?)\n(.*?)(?:\n\n|\n)(.*)$", _re_learned_split.DOTALL
+)
+
+
+def _parse_skill_for_ui(name: str) -> dict:
+    """Split a skill into baseline + learned sections for the template."""
+    from src.skills_store import read_skill, read_skill_description
+
+    row = {
+        "name": name,
+        "description": "",
+        "learned": [],
+        "baseline": "",
+        "baseline_len": 0,
+        "learned_count": 0,
+        "error": "",
+    }
+    try:
+        text = read_skill(name) or ""
+    except Exception as exc:
+        row["error"] = f"read failed: {exc}"
+        return row
+    row["description"] = read_skill_description(name)
+    parts = [p for p in _LEARNED_SPLIT.split(text) if p.strip()]
+    baseline_parts = [p for p in parts if not p.startswith("## Learned:")]
+    learned_parts = [p for p in parts if p.startswith("## Learned:")]
+    row["baseline"] = baseline_parts[0].strip() if baseline_parts else ""
+    row["baseline_len"] = len(row["baseline"])
+    for lp in learned_parts:
+        m = _LEARNED_META.match(lp.strip())
+        if m:
+            title, meta, body = m.group(1).strip(), m.group(2).strip(), m.group(3)
+        else:
+            title, meta, body = lp.strip().splitlines()[0].lstrip("# ").strip(), "", lp
+        row["learned"].append({"title": title, "meta": meta, "body": body.strip()})
+    row["learned_count"] = len(row["learned"])
+    return row
+
+
+@login_required
+def learnt_skills(request):
+    """List skills with their learned sections (GET ?skill=&title= enters edit)."""
+    from src.skills_store import list_skills, read_skill
+
+    names = list_skills()
+    skills = [_parse_skill_for_ui(n) for n in names]
+    context = {
+        "skills": skills,
+        "selected": request.GET.get("skill", ""),
+        "editing": bool(request.GET.get("title")),
+        "edit_title": request.GET.get("title", ""),
+        "save_msg": "",
+    }
+    if context["editing"] and context["selected"]:
+        # Pre-fill the edit area with the section's raw text (title+meta+body).
+        text = read_skill(context["selected"]) or ""
+        parts = [p for p in _LEARNED_SPLIT.split(text) if p.startswith("## Learned:")]
+        want = context["edit_title"]
+        for p in parts:
+            first = p.strip().splitlines()[0]
+            if first.lstrip("# ").strip().lstrip("Learned: ").strip() == want:
+                context["edit_body"] = p.strip()
+                break
+        else:
+            context["edit_body"] = ""
+    return render(request, "scraper/learnt_skills.html", context)
+
+
+@login_required
+def learnt_skill_update(request, skill_name):
+    """Save an edited learned section (full-section replace, one section)."""
+    if request.method != "POST":
+        return redirect("learnt_skills")
+    from src.skills_store import delete_learned_section, read_skill, update_skill_text
+    from django.contrib import messages
+
+    title = request.POST.get("title", "").strip()
+    body = (request.POST.get("body") or "").strip()
+    text = read_skill(skill_name) or ""
+    parts = [p for p in _LEARNED_SPLIT.split(text)]
+    replaced = False
+    out = []
+    for p in parts:
+        stripped = p.strip()
+        if stripped.startswith("## Learned:"):
+            first = stripped.splitlines()[0].lstrip("# ").strip()
+            if not replaced and first == f"Learned: {title}":
+                out.append("\n" + body + "\n")
+                replaced = True
+                continue
+        out.append(p)
+    if not replaced:
+        messages.error(request, f"Section '{title}' not found — nothing changed.")
+        return redirect("learnt_skills")
+    result = update_skill_text(skill_name, "".join(out), actor=f"ui:{request.user.username}")
+    if result.get("ok"):
+        messages.success(request, f"Updated '{title}' in {skill_name}.")
+    else:
+        messages.error(request, result.get("error", "update failed"))
+    return redirect("learnt_skills")
+
+
+@login_required
+def learnt_skill_delete(request, skill_name):
+    """Delete ONE learned section by title."""
+    if request.method != "POST":
+        return redirect("learnt_skills")
+    from src.skills_store import delete_learned_section
+    from django.contrib import messages
+
+    title = request.POST.get("title", "").strip()
+    result = delete_learned_section(skill_name, title, actor=f"ui:{request.user.username}")
+    if result.get("ok"):
+        messages.success(request, f"Deleted '{title}' from {skill_name}.")
+    else:
+        messages.error(request, result.get("error", "delete failed"))
+    return redirect("learnt_skills")

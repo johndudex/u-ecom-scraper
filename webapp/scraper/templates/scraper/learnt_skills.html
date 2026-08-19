@@ -1,0 +1,124 @@
+{% extends "scraper/base.html" %}
+
+{% block title %}Learnt Skills{% endblock %}
+
+{% block content %}
+<style>
+.skills-wrap { max-width: 960px; margin: 0 auto; padding: 1.5rem; }
+.skills-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+.skills-head h1 { font-size: 1.25rem; font-weight: 700; color: #F1F5F9; }
+.skills-sub { color: #94A3B8; font-size: 0.8125rem; margin-bottom: 1.25rem; }
+.skill-card { background: var(--bg-panel, #111827); border: 1px solid var(--bg-line-subtle, #1E293B);
+    border-radius: 0.75rem; padding: 1rem 1.25rem; margin-bottom: 0.75rem; }
+.skill-card details > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 0.75rem; }
+.skill-card details > summary::-webkit-details-marker { display: none; }
+.skill-name { font-weight: 600; font-size: 0.9rem; color: #E2E8F0; }
+.skill-desc { color: #94A3B8; font-size: 0.8rem; flex: 1; }
+.skill-count { font-size: 0.7rem; color: #22D3EE; background: rgba(34,211,238,.08);
+    border: 1px solid rgba(34,211,238,.2); padding: 0.1rem 0.5rem; border-radius: 999px; }
+.learned-block { border-top: 1px dashed #1E293B; margin-top: 0.75rem; padding-top: 0.75rem; }
+.learned-title { font-weight: 600; font-size: 0.85rem; color: #F1F5F9; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; }
+.learned-meta { color: #64748B; font-size: 0.72rem; margin: 0.25rem 0 0.5rem; }
+.learned-body { color: #CBD5E1; font-size: 0.8rem; white-space: pre-wrap; word-break: break-word;
+    background: #0B1120; border: 1px solid #1E293B; border-radius: 0.5rem; padding: 0.75rem; max-height: 340px; overflow-y: auto; }
+.btn-mini { font-size: 0.72rem; padding: 0.25rem 0.6rem; border-radius: 0.4rem; border: 1px solid #334155;
+    background: transparent; color: #94A3B8; cursor: pointer; }
+.btn-mini:hover { color: #F87171; border-color: #F87171; }
+.btn-save { font-size: 0.78rem; padding: 0.35rem 0.9rem; border-radius: 0.45rem; border: 1px solid #22D3EE;
+    background: rgba(34,211,238,.1); color: #22D3EE; cursor: pointer; }
+.edit-area { width: 100%; min-height: 140px; background: #0B1120; color: #E2E8F0; border: 1px solid #1E293B;
+    border-radius: 0.5rem; padding: 0.75rem; font-family: var(--font-mono, monospace); font-size: 0.78rem; }
+.msg-ok { color: #34D399; font-size: 0.78rem; }
+.msg-err { color: #F87171; font-size: 0.78rem; }
+.baseline-note { color: #64748B; font-size: 0.7rem; margin-top: 0.4rem; }
+</style>
+
+<div class="skills-wrap">
+  <div class="skills-head">
+    <h1>Learnt Skills</h1>
+    <span style="color:#64748B;font-size:.75rem;">{{ skills|length }} skills · File Master</span>
+  </div>
+  <p class="skills-sub">
+    Agent-learned knowledge lives in the File Master and survives redeploys.
+    The <code>## Learned:</code> sections below were appended by
+    <code>nav_skill_review</code>. Baseline content (above the sections) is
+    managed in git; delete/edit only affects learned sections.
+  </p>
+
+  {% if messages %}
+    {% for m in messages %}<div class="{{ m.tags }}">{{ m }}</div>{% endfor %}
+  {% endif %}
+
+  {% if not skills %}
+    <div class="skill-card"><span class="skill-desc">No skills found (FM empty and no image fallback — is the File Master up?).</span></div>
+  {% endif %}
+
+  {% for sk in skills %}
+  <div class="skill-card">
+    <details {% if forloop.first and not selected %}open{% endif %}>
+      <summary>
+        <span class="skill-name">{{ sk.name }}</span>
+        <span class="skill-desc">{{ sk.description }}</span>
+        {% if sk.learned_count %}
+          <span class="skill-count">{{ sk.learned_count }} learned</span>
+        {% else %}
+          <span class="skill-count" style="color:#64748B;background:transparent;border-color:#334155;">baseline only</span>
+        {% endif %}
+      </summary>
+
+      {% if sk.error %}
+        <div class="baseline-note msg-err">{{ sk.error }}</div>
+      {% endif %}
+
+      {% if sk.baseline %}
+        <div class="baseline-note">Baseline ({{ sk.baseline_len }} chars) — read-only, managed in git.</div>
+      {% endif %}
+
+      {% for sec in sk.learned %}
+      <div class="learned-block">
+        <div class="learned-title">
+          <span>{{ sec.title }}</span>
+          <form method="post" action="{% url 'learnt_skill_delete' sk.name %}"
+                onsubmit="return confirm('Delete learned section \'{{ sec.title|escapejs }}\'?');">
+            {% csrf_token %}
+            <input type="hidden" name="title" value="{{ sec.title }}">
+            <button class="btn-mini" type="submit">delete</button>
+          </form>
+        </div>
+        <div class="learned-meta">{{ sec.meta }}</div>
+        <div class="learned-body">{{ sec.body }}</div>
+      </div>
+      {% empty %}
+        <div class="baseline-note" style="margin-top:.6rem;">No learned sections yet for this skill.</div>
+      {% endfor %}
+
+      {% if selected == sk.name and editing %}
+      <div class="learned-block">
+        <form method="post" action="{% url 'learnt_skill_update' sk.name %}">
+          {% csrf_token %}
+          <input type="hidden" name="title" value="{{ edit_title }}">
+          <div class="learned-title" style="margin-bottom:.4rem;">Editing: {{ edit_title }}</div>
+          <textarea class="edit-area" name="body">{{ edit_body }}</textarea>
+          <div style="display:flex;gap:.6rem;align-items:center;margin-top:.5rem;">
+            <button class="btn-save" type="submit">Save</button>
+            <a class="btn-mini" style="text-decoration:none;" href="{% url 'learnt_skills' %}">cancel</a>
+            {% if save_msg %}<span class="msg-ok">{{ save_msg }}</span>{% endif %}
+          </div>
+        </form>
+      </div>
+      {% else %}
+      <form method="get" action="{% url 'learnt_skills' %}" style="margin-top:.6rem;">
+        <input type="hidden" name="skill" value="{{ sk.name }}">
+        {% for sec in sk.learned %}
+          {% if forloop.first %}
+          <input type="hidden" name="title" value="{{ sec.title }}">
+          <button class="btn-mini" type="submit">edit newest section</button>
+          {% endif %}
+        {% endfor %}
+      </form>
+      {% endif %}
+    </details>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}
