@@ -1,6 +1,6 @@
 # Plan — Skills persistence via File Master + log-scroll UX (v2, post-critique round 1)
 
-> Status: **v2 — critique round 1 complete (2 agents). Round 2 pending.** v1's two false premises corrected: (1) nav_skill_review runs AFTER cleanup, not mid-pipeline (graph.py:4236-4239) — no same-job freshness requirement; (2) the worker is NOT the single FM writer (django writes FM at views.py:1558+; worker runs --concurrency=2) — read-modify-write needs a lock.
+> Status: **v3 (final) — both critique rounds complete (4 agents). Ready to implement.** v1's false premises corrected: (1) nav_skill_review runs AFTER cleanup, not mid-pipeline (graph.py:4236-4239) — no same-job freshness requirement; (2) the worker is NOT the single FM writer (django writes FM at views.py:1558+; worker runs --concurrency=2) — read-modify-write needs a lock.
 > Branch: `file-master-artifacts`. Both maps verified with file:line citations in the agent reports.
 
 ## Part 1 — Skills on the File Master
@@ -113,11 +113,19 @@ logContainer.addEventListener('scroll', function() {
 - **prompts.load_skill is dead code → delete** (don't consolidate). prompts._skills_dir dies with it.
 - **Dockerfile nuance**: under compose the "seed" is the repo checkout (bind mount); FM dev data lives in gitignored ./shared-data → dev redeploys keep skills; deleting the dir is the only dev data loss.
 
-## Scroll amendments
-- **Per-entry `scrollIntoView({block:'nearest'})` when pinned** — NOT container-bottom (accordions group by first appearance; a late system-line lands near the TOP while bottom shows the last agent's section). `nearest` also avoids yanking page ancestors. addLogs already holds the appended node.
-- **Prune is pair-aware + seen-seq**: container children alternate header/body divs — remove header+body PAIRS or whole groups; keep a JS seen-seq Set so Refresh-path re-feeds don't re-append pruned entries out of order.
-- scrollToAgent → logPinned=false; jump button → true (+ clear pill). Instant scroll (no smooth queueing under 2s batches).
-- Out-of-scope confirmed: the singular `{"type":"log"}` publisher mismatch (services.py:114) — separate fix.
+## Scroll amendments (v3 — round-2 verdict supersedes round-1's per-entry idea)
+- **Container-bottom assignment WINS** (round 2 reversed round 1's per-entry nearest on three grounds): (a) scrollIntoView scrolls ALL ancestors incl. the window — decisive; (b) per-entry calls = intra-batch scroll-event storm; (c) collapsed accordion bodies (max-height:0) give entries zero height → nothing to scroll to. Bottom = newest GROUP is the correct visual target. Round-1's concern (late system-line lands near top) is accepted as a minor artifact.
+- **MANDATORY: suppress window (~600ms) around programmatic SMOOTH scrolls** — the existing jump button is `behavior:'smooth'` (job_detail.html:184, verified); mid-animation scroll events fire at non-bottom → listener unpins → the plan's own re-pin affordance defeats itself if an SSE batch lands mid-animation. Alternative: make the button instant. Also add defensive `#log-container,#syslog-container,#agent-log { scroll-behavior: auto; overflow-anchor: none; }` (html-level smooth at base.html:77 doesn't inherit today, but nothing protects that; overflow-anchor:none prevents browser auto-compensation fighting manual prune compensation).
+- **scrollToAgent: set logPinned=false BEFORE scrollIntoView, same synchronous block** — load-bearing for the already-visible/no-scroll-event case; listener's later re-pin when landing near bottom is CORRECT (user navigated to tail = follow).
+- **Prune (replaces v1's naive 5-liner AND round-1's pair-only note)**: remove header+body PAIRS (children alternate; firstChild-removal orphans bodies or eats whole agents), count ENTRIES not children (cap ~1000 entries), **scrollTop compensation when unpinned**: `sh0=scrollHeight; prune(); scrollTop -= (sh0 - scrollHeight)` — syslog's 500-cap (:385) survives without this ONLY because it pins unconditionally; not evidence. scrollToAgent on a pruned agent → silent no-op (:433) — accepted + documented.
+- **INTAKE corrections (round 2)**: `#agent-log` is in a HIDDEN tab (#tab-log :822) — while display:none, clientHeight=scrollHeight=0 → listener measures 0 → pins true + scrollTop no-op; opening the tab mid-run shows the TOP. Add a tab-show re-pin hook. Pin decision must NOT depend on post-innerHTML measurement (innerHTML resets scrollTop→0; measure-before or rely on the synchronous-check-then-queued-event ordering — write the reasoning down). Reset point = `renderResults` (:1560) ONLY — subscribeToJob (:1942) does NOT clear the log (v1 was wrong).
+- **The singular {"type":"log"} mismatch is IN SCOPE (round-2 promotion)**: redis IS present on Railway → job_events takes the pub/sub branch (views.py:1133-1165) which has NO log polling — job_detail currently receives ZERO live agent lines (status/step/approval/syslog only); logs appear only on manual Refresh/reload (both unconditional-pin paths — likely the actual complaint surface, esp. intake's 4s replace-then-scroll at :1890/:1959). Fix = publish plural `{"type":"logs","logs":[{...}]}` at services.py:114 (~3 lines; fixes intake's SSE too; better than relay-rewriting at views.py:1153). OPTIONAL +10 lines: on_tool_start/end (:122-156) persist but publish nothing — publish there too for live tool lines. Cadence note: post-fix event rate ×10 — exactly the regime the suppress window exists for; ship both together.
+- **Pre-existing leak noted (fix while in file, non-blocking)**: setupStepClicks (:516-520) re-binds click listeners on every SSE batch (:541,:545) — N-deep accumulation; idempotent handlers mask it.
+
+## Round-2 final verdicts (both parts)
+- Part 1 (skills): GO with v2 amendments — flock RMW, worker_ready seed + version stamp, per-key fallback (404≠outage), playground gate, health_api FM check, 7-step order.
+- Part 2 (scroll): NO-GO as v1 → GO with the four mandatory adjustments above (suppress window + scroll-behavior:auto; scrollToAgent flag ordering; pair-aware entry-counted prune w/ compensation + overflow-anchor:none; singular→plural log fix in scope).
+- Implementation order stands (skills steps 1-6; scroll = step 7, now includes the publisher fix as 7a).
 
 ## Implementation order (reranked)
 1. Read path only (skills_store read-only; point skill_tools + _get_skill_descriptions at it; delete prompts dead code; UI-skill scan exclusion; per-key fallback). Zero write risk, deployable alone.
