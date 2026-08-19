@@ -7,10 +7,12 @@ import sys
 import types
 import unittest.mock as mock
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import src.skills_store as store
-
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+# These tests import agents.* (webapp) — ensure /app/webapp is importable
+# regardless of the runner's cwd (pure-src runs start at /app).
+sys.path.insert(0, os.path.join(ROOT, "webapp"))
+import src.skills_store as store
 
 
 class TestDenyList:
