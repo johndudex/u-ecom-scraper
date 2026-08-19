@@ -1,5 +1,5 @@
 ---
-description: Reviews navigation findings against existing skills and auto-applies reusable learnings. Runs after navigation_synthesize to capture new patterns immediately. Only appends "Learned:" sections to existing skills or creates new skills — never removes content.
+description: Reviews navigation findings against existing skills and auto-applies reusable learnings. Runs after cleanup (post-execution) to capture new patterns. Only appends "Learned:" sections to existing skills or creates new skills — never removes content.
 mode: subagent
 temperature: 0.2
 ---
@@ -107,15 +107,19 @@ Compare the navigation findings against existing skills. Identify patterns that 
 5. **Optionally LOAD** platform-specific skills if the site matches (0-2 calls)
 6. **COMPARE** findings against skills — identify 1-3 genuinely new patterns
 7. **APPLY** learnings:
-   - For each new pattern, use `edit_file` to append a `## Learned:` section
-   - Use `write_file` only to create a new skill file (rare)
+   - For each new pattern, use `learn_skill` (ONE call per pattern) — it
+     appends a `## Learned:` section for you, enforces the format, persists
+     to the File Master (survives redeploys), and refuses duplicates.
+     Direct `write_file`/`edit_file` on skill files are DISABLED.
+   - Use `create_new_skill` only for a genuinely NEW skill (rare)
 8. **WRITE** `workspace/{site_slug}/nav_learning_report.json` (1 call) — your LAST action
 
 ## BUDGET: 15 tool calls maximum.
 
-## Applying Learnings — Exact Format
+## Applying Learnings — learn_skill arguments
 
-When appending to an existing skill, use `edit_file` with this format:
+`learn_skill(skill_name, title, source, applicability, body)` builds this
+section for you (append-only; you never touch existing content):
 
 ```markdown
 
@@ -130,22 +134,16 @@ When appending to an existing skill, use `edit_file` with this format:
 ```
 ```
 
-**Example edit for navigation-patterns skill:**
+**Example learn_skill call:**
 
-oldString (find the last line of the file to append after):
 ```
-- **Rate Limiting**: Always use 2+ second delays between page loads.
-```
-
-newString:
-```
-- **Rate Limiting**: Always use 2+ second delays between page loads.
-
-## Learned: NewSite Pagination Detection
-**Source:** https://example.com (2026-06-19)
-**Applicability:** Sites using NewSite platform
-
-NewSite renders pagination as buttons with `data-page` attributes...
+learn_skill(
+  skill_name="navigation-patterns",
+  title="NewSite Pagination Detection",
+  source="https://example.com (2026-06-19)",
+  applicability="Sites using NewSite platform",
+  body="NewSite renders pagination as buttons with `data-page` attributes..."
+)
 ```
 
 ## Evaluation: When NOT to Apply

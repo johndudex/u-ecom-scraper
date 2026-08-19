@@ -117,8 +117,9 @@ For each candidate learning, run this 3-check gate IN ORDER. The first check tha
 determines the `status` — and you **do not write** anything for that learning. Only if all
 three pass do you apply it (Section 5).
 
-1. **Duplicate check (mandatory).** Use `load_skill` / `read_file` / `search_content` on the
-   relevant existing skill(s) and grep for the pattern/keywords/selector. If the learning is
+1. **Duplicate check (mandatory).** Use `load_skill` (and `read_file` on a
+   skill you've loaded) for the relevant existing skill(s) and check the
+   pattern/keywords/selector. If the learning is
    already documented anywhere in `.opencode/skills/` (even partially, or under a different
    heading) → `status: "skipped_duplicate"`, do NOT write.
 2. **Genericness check.** Is this reusable across a category of sites (or as a general
@@ -132,23 +133,23 @@ three pass do you apply it (Section 5).
 Be conservative: 1–2 quality applications beat 10 marginal ones. Record every candidate in
 `learning_report.json` with its `status` + reason regardless of outcome (so it's traceable).
 
-### 5. Apply Immediately
+### 5. Report Only — nav_skill_review Applies
 
-When a learning passes the Section 4 gate, apply it right away — you have `write_file` /
-`edit_file`; use them (do NOT wait for any approval). Then record it in `learning_report.json`
+You do NOT write skill files. Direct writes to `.opencode/skills` are disabled
+(the File Master owns live skills; `nav_skill_review` applies learnings with
+the `learn_skill` tool). Your job ends at the report: record each gated
+candidate in `learning_report.json`
 with `status: "applied"` and append to `skills_modified` (update) or `skills_created` (new).
 
-**For new skills:**
-```bash
-mkdir -p .opencode/skills/{skill-name}
-```
-Create `.opencode/skills/{skill-name}/SKILL.md` following the standard format:
+**For proposed NEW skills**, include in the report entry:
+`proposed_new_skill: {name, description, body}` — nav_skill_review (or a human
+via /learnt-skills) will create it with `create_new_skill`. The standard
+frontmatter it should carry:
+
 ```yaml
 ---
 name: {skill-name}
 description: {description}
-license: MIT
-compatibility: opencode
 metadata:
   audience: site-analyzer
   workflow: scraping
@@ -157,9 +158,11 @@ metadata:
 ---
 ```
 
-**For existing skill updates:**
-Read the existing SKILL.md and append a new section:
-```markdown
+**For proposed updates to existing skills**, include in the report entry:
+`proposed_append: {skill_name, title, source, applicability, body}` matching
+the `## Learned:` section format — nav_skill_review applies it verbatim via
+`learn_skill`.
+
 ## Learned: {title}
 **Source:** {site_url} ({date})
 **Applicability:** {when this applies}

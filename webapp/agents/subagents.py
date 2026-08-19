@@ -396,29 +396,26 @@ def _embedded_json_code_writer_section(
 
 
 def _get_skill_descriptions() -> str:
-    """Scan the .opencode/skills/ tree and return a bullet list of skill names
-    and their descriptions (first line of the SKILL.md after the frontmatter).
+    """Bullet list of skill names + descriptions for the system prompt.
 
     This is the *progressive disclosure* layer: agents see lightweight
-    descriptions in their system prompt and can call ``load_skill`` to get
-    the full content on demand.
+    descriptions and call ``load_skill`` for full content on demand.
+
+    Skills resolve via ``src.skills_store`` (File Master first, image seed
+    fallback; the 2 image-only UI-authoring skills are excluded from the
+    scan — they were 2.7MB of per-build full-file reads and are irrelevant
+    to scraping agents). The snapshot is cached in-process and invalidated
+    on any skills_store write; descriptions only change on
+    create_new_skill (learn_skill appends below the frontmatter).
     """
-    skills_dir = _resolve_skills_dir()
-    if not os.path.isdir(skills_dir):
+    try:
+        from src.skills_store import descriptions_snapshot
+
+        snap = descriptions_snapshot()
+    except Exception:
         return ""
 
-    lines: list[str] = []
-    for name in sorted(os.listdir(skills_dir)):
-        sk_md = os.path.join(skills_dir, name, "SKILL.md")
-        if not os.path.isfile(sk_md):
-            continue
-        try:
-            text = open(sk_md, encoding="utf-8").read()
-        except Exception:
-            continue
-        description = _extract_frontmatter_field(text, "description") or name
-        lines.append(f"- **{name}**: {description}")
-
+    lines = [f"- **{name}**: {desc}" for name, desc in sorted(snap.items())]
     if not lines:
         return ""
 
@@ -431,34 +428,6 @@ def _get_skill_descriptions() -> str:
         "(e.g. Shopify, SFCC, Algolia, Amazon, Kibo, Localised), load it "
         "with `load_skill` for proven detection and extraction methods.\n"
     )
-
-
-def _resolve_skills_dir() -> str:
-    """Return the absolute path to .opencode/skills/."""
-    try:
-        from django.conf import settings
-
-        root = getattr(settings, "PROJECT_ROOT", None)
-        if root:
-            return os.path.join(str(root), ".opencode", "skills")
-    except Exception:
-        pass
-    return os.path.join(os.getcwd(), ".opencode", "skills")
-
-
-def _extract_frontmatter_field(text: str, field: str) -> str | None:
-    """Extract a field value from YAML frontmatter (``---`` delimited block)."""
-    if not text.startswith("---"):
-        return None
-    end = text.find("---", 3)
-    if end == -1:
-        return None
-    block = text[3:end]
-    for line in block.splitlines():
-        stripped = line.strip()
-        if stripped.startswith(f"{field}:"):
-            return stripped[len(field) + 1 :].strip().strip("\"'")
-    return None
 
 
 def _append_skill_descriptions(system_prompt: str) -> str:
@@ -1899,9 +1868,11 @@ def build_nav_skill_review_message(state: dict) -> list:
         f"5. Optionally LOAD platform-specific skills if the site matches "
         f"(shopify-detection, sfcc-detection, etc.) — 0-2 calls\n"
         f"6. COMPARE findings against skills — identify 0-3 genuinely new patterns\n"
-        f"7. APPLY learnings: for each new pattern, use edit_file to APPEND a "
-        f"'## Learned:' section to the relevant skill. Use write_file ONLY to "
-        f"create a new skill file (rare).\n"
+        f"7. APPLY learnings: for each new pattern, call learn_skill (ONE call "
+        f"per pattern) — it appends the '## Learned:' section to the File "
+        f"Master for you (format enforced, duplicate-safe). Use "
+        f"create_new_skill ONLY for a genuinely new skill (rare). Direct "
+        f"write_file/edit_file on skill files are DISABLED.\n"
         f"8. WRITE your report to workspace/{slug}/nav_learning_report.json "
         f"(1 call — your LAST action)\n\n"
         f"## BUDGET: 15 tool calls maximum.\n\n"

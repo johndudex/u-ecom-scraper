@@ -56,6 +56,25 @@ def _enforce_root(path: str, root: str) -> str:
     return resolved
 
 
+def _enforce_not_skills(path: str, root: str) -> str:
+    """Write-guard: .opencode/skills is File-Master territory.
+
+    Skills live in the FM (skills/ namespace, typed learn_skill tool); a
+    local write here would (a) land in the ephemeral container and be lost,
+    or (b) dirty the git seed copy. Checked on the RESOLVED path so tricks
+    like ``.//opencode/skills`` or ``subdir/../.opencode`` can't slip through.
+    Reads remain allowed (load_skill itself reads the image fallback).
+    """
+    resolved = _enforce_root(path, root)
+    skills_dir = os.path.join(os.path.abspath(root), ".opencode", "skills")
+    if resolved == skills_dir or resolved.startswith(skills_dir + os.sep):
+        raise ValueError(
+            "Direct writes to .opencode/skills are disabled — skills persist in "
+            "the File Master. Use the learn_skill / create_new_skill tools."
+        )
+    return resolved
+
+
 def get_filesystem_tools(
     project_root: Optional[str] = None,
     workspace_scope: Optional[str] = None,
@@ -132,7 +151,7 @@ def get_filesystem_tools(
             Success message with the resolved path, or an error message.
         """
         try:
-            safe = _enforce_root(path, root)
+            safe = _enforce_not_skills(path, root)
         except ValueError as e:
             return str(e)
         try:
@@ -160,7 +179,7 @@ def get_filesystem_tools(
             Success or failure message with details.
         """
         try:
-            safe = _enforce_root(path, root)
+            safe = _enforce_not_skills(path, root)
         except ValueError as e:
             return str(e)
         try:

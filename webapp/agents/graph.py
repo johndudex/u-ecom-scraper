@@ -1078,6 +1078,10 @@ def _summarize_tool_args(tool_name: str, args: dict) -> str:
         return f"Type into {str(args.get('element', ''))[:60]}"
     if "wait_for" in tool_name:
         return f"Wait for {str(args.get('selector', args.get('time', '')))[:60]}"
+    if tool_name == "learn_skill":
+        return f"Learn skill {args.get('skill_name', '')}: {str(args.get('title', ''))[:60]}"
+    if tool_name == "create_new_skill":
+        return f"Create skill {args.get('name', '')}: {str(args.get('description', ''))[:60]}"
     if tool_name == "write_file":
         path = str(args.get("path", ""))
         content = str(args.get("content", ""))

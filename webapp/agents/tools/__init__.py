@@ -34,6 +34,10 @@ AGENT_TOOL_MAP: dict[str, list[str]] = {
         "edit_file",
         "load_skill",
         "list_skills",
+        # Write path via the typed tools ONLY (generic write_file/edit_file
+        # are deny-listed on .opencode/skills — see filesystem_tools).
+        "learn_skill",
+        "create_new_skill",
     ],
     "code_writer": [
         "read_file",
@@ -147,6 +151,7 @@ async def get_tools_for_agent(
     needs_fs = bool(fs_tool_names & set(requested))
     needs_bash = "run_bash" in requested
     needs_skill = "load_skill" in requested or "list_skills" in requested
+    needs_skill_write = "learn_skill" in requested or "create_new_skill" in requested
 
     if needs_playwright:
         pw_tools = await get_playwright_tools()
@@ -183,6 +188,12 @@ async def get_tools_for_agent(
 
     if needs_skill:
         tools.extend(_get_skill_tools())
+
+    if needs_skill_write:
+        # Typed write path — nav_skill_review only (see AGENT_TOOL_MAP).
+        from .skill_tools import get_skill_write_tools
+
+        tools.extend(get_skill_write_tools())
 
     logger.info(
         "Tools for agent '%s': %s",

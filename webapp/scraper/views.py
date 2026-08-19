@@ -2096,6 +2096,25 @@ def _check_browser_service():
         return {"status": "down", "latency_ms": ms, "detail": str(exc)[:200]}
 
 
+
+def _check_file_master():
+    """FM health — critical since skills + artifacts live there (plan §observability)."""
+    t0 = time.monotonic()
+    try:
+        import src.artifacts as artifacts
+
+        base = artifacts._base().rstrip("/")
+        resp = httpx.get(f"{base}/health", timeout=5)
+        ms = int((time.monotonic() - t0) * 1000)
+        if resp.status_code == 200:
+            return {"status": "up", "latency_ms": ms, "detail": "Ready"}
+        return {"status": "degraded", "latency_ms": ms,
+                "detail": f"HTTP {resp.status_code}"}
+    except Exception as exc:
+        ms = int((time.monotonic() - t0) * 1000)
+        return {"status": "down", "latency_ms": ms, "detail": str(exc)[:80]}
+
+
 @login_required
 def health_api(request):
     checks = {
@@ -2105,6 +2124,7 @@ def health_api(request):
         "celery_worker": _check_celery_worker,
         "celery_beat": _check_celery_beat,
         "browser_service": _check_browser_service,
+        "file_master": _check_file_master,
     }
     labels = {
         "django": "Django",
@@ -2113,6 +2133,7 @@ def health_api(request):
         "celery_worker": "Celery Worker",
         "celery_beat": "Celery Beat",
         "browser_service": "Browser Service",
+        "file_master": "File Master",
     }
     services = {}
     for name, check_fn in checks.items():
