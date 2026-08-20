@@ -249,3 +249,37 @@ if __name__ == "__main__":
     import pytest
 
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class TestMisconfigGuard:
+    """Prefix set but routing unavailable → LOUD failure, never silent Z.AI 400."""
+
+    def test_litellm_prefix_without_key_raises(self):
+        mod = _llm_mod()
+        fake = _FakeSettings(LITELLM_API_KEY="", CODE_WRITER_MODEL="litellm/standardcompute")
+        with mock.patch.object(mod, "settings", fake), \
+             mock.patch.object(mod, "effective_model", side_effect=lambda p, fallback=None: p):
+            try:
+                mod.get_llm(model="litellm/standardcompute")
+                raise AssertionError("expected RuntimeError")
+            except RuntimeError as e:
+                assert "LITELLM_API_KEY" in str(e)
+
+    def test_litellm_prefix_disabled_raises(self):
+        mod = _llm_mod()
+        fake = _FakeSettings(LITELLM_ENABLED=False, LITELLM_API_KEY="k")
+        with mock.patch.object(mod, "settings", fake), \
+             mock.patch.object(mod, "effective_model", side_effect=lambda p, fallback=None: p):
+            try:
+                mod.get_llm(model="litellm/standardcompute")
+                raise AssertionError("expected RuntimeError")
+            except RuntimeError as e:
+                assert "LITELLM_ENABLED" in str(e)
+
+    def test_bare_zai_model_unaffected_by_guard(self):
+        mod = _llm_mod()
+        fake = _FakeSettings(LITELLM_API_KEY="")  # no key, but no prefix either
+        with mock.patch.object(mod, "settings", fake), \
+             mock.patch.object(mod, "effective_model", side_effect=lambda p, fallback=None: p):
+            llm = mod.get_llm(model="glm-5-turbo")  # must NOT raise
+            assert llm.openai_api_base == "https://zai.example/v4"

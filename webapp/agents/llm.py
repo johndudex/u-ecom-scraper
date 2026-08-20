@@ -315,6 +315,19 @@ def get_llm(model: Optional[str] = None, temperature: float = 0.3, timeout: Opti
     and assembles the final AIMessage identically, so behavior is unchanged.
     """
     requested = model or getattr(settings, "ZAI_MAIN_MODEL", "glm-5-turbo")
+    # Config-error guard: a litellm/-prefixed model with routing unavailable
+    # (disabled flag or missing key) must NOT silently fall through to Z.AI with
+    # the UNSTRIPPED name — Z.AI 400s it ("modelCode: does not exist", caller-bug
+    # class, no retry) and every LLM call dies instantly with zero diagnostics
+    # (Railway job 6: 3 code_writer cycles, no tool calls, no draft). The prefix
+    # is an explicit routing instruction; if it can't be honored, say so loudly.
+    if requested.startswith(_litellm_prefixes()) and not _is_litellm_model(requested):
+        raise RuntimeError(
+            f"model '{requested}' requests the LiteLLM proxy but routing is "
+            "unavailable (LITELLM_ENABLED=false or LITELLM_API_KEY missing/empty). "
+            "Set LITELLM_API_KEY on the worker, or unset the prefix in "
+            "CODE_WRITER_MODEL to return to Z.AI."
+        )
     # ORDER IS LOAD-BEARING: breaker swap first (provider-local fallback — a
     # litellm model falls back only within litellm, or not at all), THEN resolve
     # the provider from the swapped name, so base_url follows the actual model.
