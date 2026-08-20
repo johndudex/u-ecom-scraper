@@ -1,206 +1,265 @@
-# Plan — Scraper CLI-contract enforcement (guard + prompt), v1 pre-critique
+# Plan — Scraper CLI-contract enforcement (guard + prompt), v2 post-critique
 
-> Status: **v1 — two deep planners (guard, prompt) folded in. Critique round pending.**
+> Status: **v2 — critique round 1 folded in. Every CONFIRMED flaw re-verified by the
+> critique agent against source + repo artifacts before acceptance.**
 > Trigger: Railway job 7 (2026-08-20, rmwilliams chelsea-boots, litellm code_writer) —
 > generated scraper renamed the discovery CLI (`--query`) and dropped `--listing-url` /
-> `--fresh-discovery` / the `SCRAPER_LISTING_URL` env read. run_execution's guard
-> stripped the undeclared flags, scraper fell back to `input_urls.json` (1 seed URL),
-> job "completed" with **1 product** instead of the full listing.
+> `--fresh-discovery` / the `SCRAPER_LISTING_URL` env read → flags stripped →
+> seed-only execution → job "completed" with **1 product**.
+> v1 verdict: NO-GO (3 HIGH flaws, 6 inter-planner contradictions, 1 pre-existing
+> template bug two edits were unknowingly built on). All fixed below.
 
-## Root cause (verified from source, both agents agree)
+## Root cause (verified)
 
-Three-way hand-maintained inconsistency + no hard gate:
+1. **The prompt contradicts the template.** `build_code_writer_message`'s "Required
+   CLI Arguments" (subagents.py:3070-3076) enumerates only
+   `--input/--urls/--sample/--limit` — every discovery flag omitted. The enumerated
+   list reads as authoritative → the model prunes the template's "extra" flags.
+   Same incomplete list in `.opencode/agents/code-writer.md:128-129`.
+2. **The tester is structurally blind**: forbidden from reading the draft
+   (subagents.py:3308-3310), told to mark `phase1_discovery: true` even when
+   unvalidated (:3305-3307), tests in seed mode.
+3. **The only deterministic guard logs and proceeds** (run_execution.py:328-361).
+4. `_enforce_env_discovery_gate` (graph.py:369-421) no-ops when the whole consumer
+   was dropped — job 7's exact shape.
+5. `_probe_phase1_discovery`'s check (`rc != 0 and "Traceback" in stderr`,
+   graph.py:3197) misses argparse exit(2) — and see pre-existing bug P0 below.
 
-1. **The prompt contradicts itself.** `build_code_writer_message`'s "Required CLI
-   Arguments" (subagents.py:3070-3076) enumerates ONLY `--input/--urls/--sample/--limit`
-   — every discovery flag omitted. The template (which declares them) says one thing,
-   the task message's authoritative-looking list says another → a reasoning model
-   satisfies the enumeration and prunes the "extra" flags. Same incomplete list in
-   `.opencode/agents/code-writer.md:128-129`.
-2. **The tester cannot catch it.** It's forbidden from reading the draft
-   (subagents.py:3308-3310), the prompt tells it to mark
-   `phase1_discovery: true` even when unvalidated (subagents.py:3305-3307), and its
-   test invocation uses `--sample` seed mode — never the flags execution passes.
-3. **The only deterministic guard logs and proceeds**
-   (run_execution.py:328-361 `DISCOVERY-CRITICAL flags stripped` → warning only).
-4. `_enforce_env_discovery_gate` (graph.py:369-421) no-ops when the whole env-gate
-   consumer was dropped — exactly job 7's shape.
-5. `_probe_phase1_discovery`'s failure check (`rc != 0 and "Traceback" in stderr`,
-   graph.py:3197) misses argparse exit(2) — no Traceback in that stderr.
+## Pre-existing bugs to fix FIRST (found by critique, proven from artifacts)
 
-## Shared foundation — `webapp/agents/constants.py` (leaf module, no imports)
+- **P0 — `playwright_scraper.py --discover-only` is broken by construction.** The
+  main() gate closes the browser at :334; the discover-only block (:362-403) then
+  calls `discover_item_urls(page, ...)` on the CLOSED page at :383 →
+  `_discovery_goto` swallows "target closed" (src/discovery.py:337-342) → exits 0
+  with `found=0, stop_reason=navigate_error`, no Traceback. **Proof:**
+  `scrapers/rmwilliams-com-au/output_2026-08-19_204624.json` and `..._184904.json`
+  are both exactly `{"products": [], "total_discovered": 0, "stop_reason":
+  "navigate_error"}`. Fix: hoist the discover-only check inside the live `with`
+  block (or re-open a page). Without this, Edit 6 fails every playwright-family
+  draft and the exit-2 hook targets a probe that never fails loudly.
+- **P1 — probe-crash bounce is already half-dead (live bug).** graph.py:3320-3322
+  inserts `{"severity": "high", "message": ...}` but `_summarize_test_report` reads
+  `i.get("field"/"description")` (subagents.py:1978-1990) → today's probe-crash
+  feedback renders as `` `?`: `` + empty body. Fix together with Edit 7 (one issue
+  vocabulary).
+- **P2 — `run_execution.py:301` UnboundLocalError**: `_working_url`/`_listing_reached`/
+  `_respect_flag` are bound only inside the `elif input_mode in ("navigation",
+  "list_page")` branch (:219-276) but read at :301 (env block, runs for search_term
+  too). A search_term job with empty `discovery.listing_url` crashes the node.
+  Fix while editing that function for L3.
 
-Both fixes consume ONE vocabulary so they can never drift apart:
+## Shared foundation — `webapp/agents/constants.py` (verified true leaf, zero imports)
 
 ```python
-SCRAPER_ENV_LISTING = "SCRAPER_LISTING_URL"
-SCRAPER_ENV_FORCE = "SCRAPER_FORCE_DISCOVERY"
 CONTRACT_VIOLATION_MARKER = "CLI CONTRACT VIOLATION"
+SCRAPER_ENV_LISTING = "SCRAPER_LISTING_URL"
 NAV_INPUT_MODES = frozenset({"navigation", "list_page", "search_term"})
-API_STRATEGIES = frozenset({"api", "internal_api"})
+API_STRATEGIES = frozenset({"api", "internal_api"})   # + "shopify_api"? cosmetic, decide at impl
 
 def required_cli_flags(input_mode, strategy="") -> tuple[str, ...]:
-    """PROMPT-side enumeration (strict): every flag the dispatcher passes that
-    the selected template family declares. url_list → base 4; nav modes →
-    + --fresh-discovery --discover-only (+ --listing-url | --query);
-    api strategy → + --fresh-discovery ONLY (no listing page — aya class)."""
-
-CONTRACT_VIOLATION_FEEDBACK = "...(see §L1 message; single source)..."
+    """PROMPT-side enumeration — STRATEGY-AWARE (v2): must be ⊆ what the selected
+    template family actually declares, or the anti-drift test fails day one.
+    url_list → base 4 (--input/--urls/--sample/--limit);
+    nav + playwright/http_navigation/navigation family → base + --fresh-discovery
+      --discover-only --listing-url (search_term: --query instead);
+    nav + api family → base + --fresh-discovery ONLY (api has no listing page);
+    nav + ssr_div_list → base + --listing-url ONLY (template declares neither
+      --fresh-discovery nor --discover-only — do NOT advertise them);
+    UC/shopify → base 4 only (no discovery flags — header says so)."""
 ```
 
-An anti-drift test parses each template with `_accepted_cli_flags`'s own AST walk
-and asserts `required_cli_flags(mode, strategy) ⊆ declared` — renaming a flag in a
-template without updating the constant fails CI, and vice versa.
+Anti-drift test parses each template with `_accepted_cli_flags`'s AST walk and
+asserts `required_cli_flags(mode, strategy) ⊆ declared` **per template family**
+(v1's blanket assertion failed day one against ssr_div_list — contradiction #1).
 
-## FIX 1 — deterministic guard (3 layers, no new topology)
+## FIX 1 — deterministic guard
 
-### The checker: `cli_contract_violation(path, input_mode) -> str | None`
+### The checker: `cli_contract_violation(path, input_mode, strategy) -> str | None`
 
-In `run_execution.py` beside `_accepted_cli_flags` (pure AST, reuses it on the DRAFT
-— already proven pre-execution at graph.py:3140). **Wiring-based, mode-gated — NOT a
-hardcoded flag list** (validated against ALL 8 templates: api_scraper legitimately
-reads `SCRAPER_FORCE_DISCOVERY` not the listing env; UC/shopify templates have no
-discovery flags at all and a UC-based nav draft IS broken today — true positive).
+Beside `_accepted_cli_flags` (run_execution.py). Comment-stripped AST check,
+mode-gated, satisfied by ANY of:
 
-Comment-stripped source check; satisfied by ANY of:
+- **M0 (redefined v2)** "cannot silently degrade to seed-only": no `input_urls.json`/
+  `INPUT_FILE` seed branch (unconditional discovery) — OR an honest-crash main()
+  (UC: exits 1 with no URLs, never silent). UC passes M0 **for the right reason**.
+- **M1** reads `SCRAPER_LISTING_URL` env — satisfying ONLY for non-api strategies.
+- **M2 — DEMOTED (v2, critique vector 1A):** reading `SCRAPER_FORCE_DISCOVERY` is a
+  *signal*, never satisfying. That env var is set NOWHERE in the repo (grep: only
+  readers api_scraper.py:277, playwright_scraper.py:320, the patcher graph.py:414).
+  api family's real execution trigger is the `--fresh-discovery` flag
+  (api_scraper.py:276-289), always appended by run_execution.py:285. So:
+- **M3** declares `--listing-url` AND consumes `args.listing_url` — or, **for api
+  strategies: declares `--fresh-discovery` AND consumes `args.fresh_discovery`** (v2).
+- **M4** (search_term only) declares `--query` AND consumes `args.query`.
 
-- **M0** no seed-file branch (`input_urls.json`/`INPUT_FILE` absent) — unconditional discovery
-- **M1** reads `SCRAPER_LISTING_URL` env
-- **M2** reads `SCRAPER_FORCE_DISCOVERY` env (api/internal_api family)
-- **M3** declares `--listing-url` AND consumes `args.listing_url`
-- **M4** (search_term only) declares `--query` AND consumes `args.query`
+`url_list` exempt; unparseable → None (syntax fixer owns it).
 
-`url_list` exempt; unparseable draft → None (syntax fixer owns it); comments don't
-satisfy (stripped first).
+> M1-only drafts are execution-safe on playwright/http_navigation/navigation/
+> requests/ssr (critique verified: the env gates at http_navigation:1070-1075,
+> navigation:749-753, requests:399-403, ssr:223-225 set `args.fresh_discovery = True`
+> themselves, replicating the checkpoint skip; requests declares it a no-op;
+> playwright has no checkpoint). The guard asymmetry stands — corrected only for api.
 
-> **Tension flagged for critique:** the guard is *wiring-loose* (any trigger satisfies)
-> while the prompt is *enumeration-strict* (all dispatcher-passed flags declared).
-> Rationale: a draft reading only the env var works at execution (env carries the
-> listing; the stripped `--listing-url` is then harmless) — bouncing it would be a
-> false positive; but the prompt should still teach the full surface to minimize
-> strip-noise. Critique should attack this asymmetry.
+### L1 — self-heal in `_invoke_code_writer` (PRIMARY, after `_fix_scraper_syntax` :3097)
 
-### L1 — self-heal in `_invoke_code_writer` (PRIMARY, graph.py after :3097)
+`_enforce_cli_contract`: the `_fix_scraper_syntax` pattern (:2827-2882) — same agent
+object, ONE HumanMessage, fresh invoke, max 2 attempts, re-AST-check each time.
+**v2: the message renders the env-gate snippet FROM THE SELECTED TEMPLATE**
+(`_select_template_file` state, graph.py:2889-2929 — playwright shape
+`global PRODUCT_LISTING_URL` vs http_navigation family shape
+`args.listing_url = _env_listing; args.fresh_discovery = True` are both live; a
+playwright-shaped instruction on an http_navigation draft produces a Frankenstein
+gate). Instruction: "re-add the gate **in the shape YOUR template's main() uses**
+(your system prompt contains the full file); do NOT introduce a foreign shape;
+edit_file only; do NOT regenerate." The full `CONTRACT_VIOLATION_FEEDBACK` text is
+published in this plan's implementation notes, not deferred.
 
-`_enforce_cli_contract(...)`: the `_fix_scraper_syntax` pattern (:2827-2882) — same
-agent object, ONE targeted HumanMessage, fresh invoke (no context accumulation —
-this is the blessed bounded-fix pattern, NOT the reverted rescrape-routing), max 2
-attempts, re-AST-check each time. Message = CONTRACT_VIOLATION_FEEDBACK: names the
-exact violation, cites the template in the system prompt, instructs edit_file-only
-add of the argparse lines + env gate, "do NOT regenerate".
+### L2 — hard gate: tester force-FAIL is the LOAD-BEARING closure (v2 correction)
 
-Placement beats alternatives: (b) tester/route alone wastes a 5-10min tester LLM run
-on a statically-predictable failure; (c) run_execution is post-approval, static edge
-`run_execution → cleanup` — no loop back. Command(goto) from code_writer rejected —
-D6 shadow-branch hazard (graph.py:4206-4208). Deterministic flag *injection* rejected
-— it would silence the existing DISCOVERY-CRITICAL tripwire while discovery stays
-dead (declaration ≠ wiring).
+- Tester (graph.py, beside `_probe_phase1_discovery`): after the LLM runs, re-check
+  the draft; on violation force `overall_assessment="FAIL"`,
+  `ready_for_execution=False`, prepend `{"severity": "high", "message": ...}` with
+  the marker, set `feedback_for_writer` (**string** — v2 decision; update
+  code-tester.md:144-153 which documents an object schema). A forced FAIL skips the
+  PASS exit at route_after_testing.py:**496** — which is where job 7 actually
+  escaped (v1 said :507; wrong: PASS reports with confidence ≥0.85 and no high
+  severity return at :496 before :507 is ever reached, and the :468-481 phase gate
+  is neutralized by the phase1-lie instruction).
+- `route_after_testing.py`: add `not _contract_bad` to BOTH the :496 PASS condition
+  AND the :507 ground-truth override (belt and braces); new branch after the
+  `is_final_attempt` block (:514-521) with its OWN exhaustion check (the existing
+  exhausted block at :566 is below): violation + retries left → `code_writer`;
+  exhausted → `human_approval` (skip_approvals → `cleanup`, mirroring :587-592).
+- **Boundedness verified (critique vector 3c):** route returns strings only; the
+  bump at graph.py:2942-2959 fires whenever `state["test_report"]` is truthy — the
+  forced FAIL guarantees it. Exactly 2 bounces, 3 code_writer runs, then exhausted.
+- Accepted shadow (conscious): a contract-violating draft with a *genuine* strategy
+  failure goes to code_writer before scraper_analyzer (contract beats
+  classify_test_failure at :531) — burns ≤2 retries on contract fixes first.
 
-### L2 — hard gate: `_invoke_code_tester` + `route_after_testing`
+### L3 — `run_execution` honesty floor (:335-361) + residual documentation
 
-- Tester (graph.py:3310-3334, beside `_probe_phase1_discovery`): re-check the draft
-  AFTER the LLM runs; on violation force `overall_assessment=FAIL`,
-  `ready_for_execution=False`, prepend a high issue with the marker, set
-  `feedback_for_writer` = CONTRACT_VIOLATION_FEEDBACK; F19-pattern honest error at
-  retry exhaustion.
-- `route_after_testing.py`: compute `_contract_bad` near :455; **plug the ground-truth
-  laundering hole** at :507 (`not _contract_bad` joins the override condition — job 7
-  escaped exactly this way: PASS report + ≥3 real sample items); new branch after the
-  `is_final_attempt → human_approval` block: violation + retries left → `code_writer`;
-  exhausted → `human_approval` (or `cleanup` under skip_approvals, mirroring :587-592).
-  Rides the existing `test_retry_count`/MAX_TEST_RETRIES=2 budget — no new counters.
+Discovery-critical flags stripped AND draft violates → `execution_status=FAILED` +
+actionable error. Behind `DISCOVERY_CONTRACT_STRICT` (default True). Compliant
+draft + stripped flags → today's behavior.
 
-### L3 — `run_execution` honesty floor (:335-361)
-
-Discovery-critical flags stripped AND draft violates the contract → return
-`execution_status=FAILED` + actionable `error_message` (never a silent seed-only
-"completed"). Behind `DISCOVERY_CONTRACT_STRICT` kill-switch (default True, mirrors
-`RESPECT_LISTING_REACHED_FLAG`). Compliant draft + stripped flags → today's behavior.
+**Documented out-of-scope residual (critique vector 9):** navigation job where the
+browser_traverse fallback's preconditions fail (no `method_that_worked`) →
+`discovery.listing_url` empty → only `--fresh-discovery` passed, nothing stripped,
+L3's precondition false → a declaring draft runs seed-only silently. The guard
+calls it compliant (M1/M3), F9 won't fire (few high-quality items), no exit-2.
+Mitigation option (deferred, note only): nav-mode + no `ran_phase1` signal +
+item_count ≤ seed_count → FAILED.
 
 ## FIX 2 — prompt/message reinforcement (7 edits, ≈+2,150 chars steady-state)
 
-All static seed text — does not participate in the loop-growth mechanism
-(docs/code-writer-context-ballooning.md).
+1. **REQUIRED** "Required CLI Arguments" → complete, mode- AND strategy-conditional
+   HARD CONTRACT rendered from `required_cli_flags()`; "ADD to the template's
+   add_argument block, never replace it".
+2. **REQUIRED** "Template fidelity" +1 sentence: argparse block + env read are CONTRACT.
+3. **REQUIRED** code-writer.md:128-129 → the conditional set.
+4. **REQUIRED** code-writer.md rule 4 rewrite — covers BOTH gate shapes; states the
+   flag declarations are protected by nothing but the writer.
+5. **REQUIRED** `# CLI CONTRACT` header above `def main():` — **5 templates**
+   (playwright, http_navigation, navigation, requests, api [own variant]);
+   ssr_div_list gets its own true set (no --fresh-discovery/--discover-only);
+   UC/shopify get an honest note (flags stripped on nav jobs; UC exits 1 — no
+   silent seed-only). No braces in header text.
+6. **REQUIRED (v2-restricted)** code_tester Phase-1 step → run discovery as
+   execution does, **but pass only flags THIS draft declares** (reuse
+   `_accepted_cli_flags` in the instruction's construction or pre-compute the
+   arg list deterministically in the message builder — do NOT have the LLM guess;
+   run_scraper does NOT strip, so a passed-but-undeclared flag manufactures an
+   exit-2 execution would never see — critique vector 5). Keep `--limit` (a small
+   N, e.g. 50) in the probe invocation — http_navigation's `--discover-only` runs
+   Phase 1 to exhaustion against `DISCOVERY_DEADLINE_SECONDS=300`
+   (http_navigation_scraper.py:138) and run_scraper's timeout is 300s
+   (shell_tools.py:164); uncapped = killed-at-deadline = false crash. argparse
+   exit 2 → HIGH issue, marker-prefixed, target "scraper". Remove the
+   phase1-lie instruction (:3305-3307). **Depends on P0 fix.**
+7. **REQUIRED** `_summarize_test_report` — normalize the issue relay: read
+   `message` OR `description` OR `problem` (three vocabularies are live today);
+   relay marked issues verbatim into the retry seed. Fixes P1 in the same change.
 
-1. **REQUIRED** `build_code_writer_message` "Required CLI Arguments" → complete,
-   mode-conditional HARD CONTRACT rendered from `required_cli_flags()`;
-   "ADD to the template's add_argument block, never replace it".
-2. **REQUIRED** "Template fidelity" block (+1 sentence): the argparse block + env
-   read are CONTRACT, not boilerplate.
-3. **REQUIRED** `.opencode/agents/code-writer.md:128-129` → the conditional set.
-4. **REQUIRED** `code-writer.md` rule 4 rewrite — current text shows only the
-   playwright gate shape and over-promises the patcher ("backstops this" — it
-   no-ops on the job-7 shape). New text covers both template shapes and states
-   the flag declarations are protected by nothing but the writer.
-5. **REQUIRED** `# CLI CONTRACT` header above `def main():` in the 6 discovery
-   templates (template source is injected whole into the system prompt —
-   subagents.py:664-675 — so this is read with certainty). Per-template truth
-   (api_scraper gets its own "no listing page" variant).
-6. **REQUIRED** `build_code_tester_message` Phase-1 step → run discovery EXACTLY as
-   execution does (`--listing-url/--fresh-discovery/--discover-only`; `--query` for
-   search_term; api → `--fresh-discovery` only); argparse exit 2 → HIGH issue whose
-   problem starts with `CLI CONTRACT VIOLATION:`, target "scraper". Replacement not
-   addition (preserves the 2-run / 10-call budgets). Remove the "mark
-   phase1_discovery true even if unvalidated" instruction (:3305-3307).
-7. **REQUIRED** `_summarize_test_report`: relay marked issues verbatim into the
-   retry seed (the only path test_report issues reach the next code_writer message).
-
-OPTIONAL: tester crash_capture treats exit-2 as a crash; code-tester.md sentence;
-`_probe_phase1_discovery` exit-2 hook (see hand-offs).
-
-## Hand-offs discovered during planning (each is a 1-3 line bonus fix)
+## Hand-offs (1-3 line bonus fixes)
 
 - `_probe_phase1_discovery` (graph.py:3197): treat `rc == 2 and "unrecognized
-  arguments" in stderr` as a contract violation → second free deterministic detector.
-- `shell_tools.py:282-286`: env injection only fires when
-  `navigation_analysis.discovery.listing_url` populated — fine, but note it.
-- `.opencode/agents/code-writer-v1.md` is DEAD (prompt map → "code-writer" only) — do
-  not edit it; delete eventually.
-- Deploy note: `prompts.py:16 _PROMPT_CACHE` — .md edits need a worker restart on
-  Railway or they're judged against a stale prompt.
-
-## Interaction analysis (both agents, reconciled)
-
-- **Reverted-Fix-1 history (context ballooning):** L1 = fresh single-message invoke
-  (syntax-fixer pattern, shipped safe); L2 rides the EXISTING retry loop; nothing
-  routes code_writer from analysis-phase nodes. Nav rescrapes already wipe workspace
-  (check_tracker.py:314-326); list_page/search_term rescrapes of legacy scrapers pay
-  one bounded regen — the intended trade, kill-switch de-risks.
-- **skip_code_generation rescrapes:** L2 fires on the restored old draft → regen via
-  the normal loop (correct: can't demand flags without regen).
-- **F18/F19/sentinel:** L2's exhausted path mirrors F19 exactly; sentinel untouched.
-- **RESPECT_LISTING_REACHED_FLAG / F17 / _run_category_sources:** orthogonal (static
-  check; F17 only prunes URLs; category-url self-guards at :473-478).
-- **`feedback_for_writer` is write-only dead code** today (no reader) — L2 gives it a
-  reader via `_summarize_test_report` (Edit 7). Do not build anything else on it.
+  arguments" in stderr` as a contract violation (second free detector). **Depends
+  on P0** — the probe currently exits 0 with garbage on playwright drafts.
+- `_attach_discovery_coverage` (graph.py:540) reads the NEWEST output, not the
+  best — after P0 it can pick up a navigate_error discover-only file and downgrade
+  a healthy job via `_COVERAGE_FAIL_STOP_REASONS` (route_after_testing.py:76).
+  Guard it to skip discover-only artifacts.
+- Delete dead `.opencode/agents/code-writer-v1.md` eventually; do not edit.
+- Deploy note: `prompts.py:16 _PROMPT_CACHE` — .md edits need a worker restart.
 
 ## Tests
 
-`tests/test_cli_contract.py` (guard, 11 cases): url_list exempt; job-7 shape
-(query-only nav) violates; ALL 8 templates compliant (false-positive suite: aya/
-locumtenens/lw.com classes); search_term query satisfies / navigation doesn't;
-comment-mention doesn't satisfy; unparseable → None; no-seed-branch satisfies;
-route blocks ground-truth laundering; exhausted → human_approval / skip_approvals →
-cleanup; L3 fails honestly; L1 bounded (exactly max_tries).
+`tests/test_cli_contract.py` (guard): url_list exempt; job-7 shape (query-only nav)
+violates; **api draft with env-read-only violates (M2 demotion regression)**; api
+draft with --fresh-discovery declared+consumed passes; **UC draft passes M0 via
+honest-crash wording**; all template families compliant per their OWN declaration
+sets (ssr_div_list asserts its reduced set); comment-mention doesn't satisfy;
+unparseable → None; route blocks PASS exit (:496) and ground-truth (:507);
+exhausted → human_approval / skip_approvals → cleanup; L3 fails honestly; L1
+bounded (exactly max_tries) + message contains the SELECTED template's gate shape.
 
-`tests/test_cli_contract_prompt.py` (prompt, 9 cases): constants ↔ templates
-anti-drift tripwire (the load-bearing test); writer message carries contract;
-url_list message has NO discovery flags; api strategy omits --listing-url; .md
-staleness tripwire; template headers present; tester message uses execution-parity
-args; feedback constants render; "Template fidelity" retained.
+`tests/test_cli_contract_prompt.py` (prompt): constants ↔ templates anti-drift
+**per family**; writer message carries contract; url_list message has no discovery
+flags; api strategy omits --listing-url; ssr strategy omits --fresh-discovery;
+.md staleness tripwire; template headers present + accurate per family; tester
+message's pre-computed args ⊆ draft-declared flags; issue-relay normalizes all
+three keys; "Template fidelity" retained.
 
-## E2E validation
+Plus: P0 regression test (playwright --discover-only on a live page stub yields
+found>0 or an honest error — not silent navigate_error/0).
 
-Re-run rmwilliams chelsea-boots (job 7's config). Expect: no `DISCOVERY-CRITICAL
-flags stripped` in worker logs; `--listing-url` passed + `SCRAPER_LISTING_URL` set;
-`metadata.discovery_coverage.stop_reason ∈ {no_next_link, max_pages_hit}` (not
-navigate_error); product_count = listing size (tens, NOT 1). Regression: one url_list
-job (adameve-class) unchanged; one search_term API job (aya-class) still passes (M2).
+## E2E validation (v2 — falsifiable)
 
-## Files touched
+Re-run rmwilliams chelsea-boots (job 7's config). Accept:
+1. `product_count >= 5` (hard floor; NOT "tens" — cross-sell contamination makes
+   exact counts non-falsifiable).
+2. **Every** output row's `src_url` == the discovery listing URL actually used
+   (`.../footwear/men/chelsea-boots...`) — this is the real signal; job 7's
+   failure had src_url = the seed detail page.
+3. Worker logs: no `DISCOVERY-CRITICAL flags stripped`; `--listing-url` passed +
+   `SCRAPER_LISTING_URL` set.
+4. ~~stop_reason assertion~~ — dropped: playwright full runs don't emit
+   `discovery_coverage` at all (proven: the compliant 20-product
+   output_204813.json metadata has none). OPTIONAL follow-up: teach
+   playwright_scraper.py:463-476 to emit it (5 lines, makes _read_discovery_coverage
+   useful for this family).
 
-`webapp/agents/constants.py`, `webapp/agents/nodes/run_execution.py`,
-`webapp/agents/graph.py`, `webapp/agents/nodes/route_after_testing.py`,
-`webapp/agents/subagents.py`, `.opencode/agents/code-writer.md`,
-`.opencode/agents/code-tester.md`, `templates/{6 discovery templates}`,
-`webapp/config/settings.py`, 2 new test files.
+Regression: one url_list job (adameve-class) unchanged; one search_term API job
+(aya-class) still passes.
+
+## Files touched (implementation order)
+
+1. `templates/playwright_scraper.py` (P0) + regression test
+2. `webapp/agents/nodes/run_execution.py` (P2 fix, checker, L3)
+3. `webapp/agents/constants.py` (shared vocabulary)
+4. `webapp/agents/graph.py` (L1 `_enforce_cli_contract`, L2 tester block,
+   probe exit-2 hook, `_attach_discovery_coverage` guard)
+5. `webapp/agents/nodes/route_after_testing.py` (L2 routing, :496 + :507)
+6. `webapp/agents/subagents.py` (Edits 1, 2, 6, 7)
+7. `.opencode/agents/code-writer.md` (Edits 3, 4), `.opencode/agents/code-tester.md`
+8. `templates/{5 headers + 2 notes}`
+9. `webapp/config/settings.py` (`DISCOVERY_CONTRACT_STRICT`)
+10. `tests/test_cli_contract.py`, `tests/test_cli_contract_prompt.py`
+
+## Critique-round log
+
+- **Round 1 (2026-08-20):** NO-GO. 10 vectors: 5 CONFIRMED (api M2 false-pass —
+  SCRAPER_FORCE_DISCOVERY never set anywhere; L1 gate-shape gap; issue-shape
+  mismatch already live in the probe-crash path; Edit 6 manufactures exit-2 +
+  rides the broken playwright --discover-only, proven by two repo artifacts;
+  e2e criterion unevaluable — playwright emits no discovery_coverage), 3 REFUTED
+  (constants leaf sound; template-header edits safe; M1-only drafts genuinely
+  execution-safe outside api), 1 partial (loop boundedness confirmed — but job 7
+  escaped at :496 not :507; the tester force-FAIL is the load-bearing closure).
+  6 inter-planner contradictions resolved (ssr_div_list broke the blanket
+  anti-drift test day one; three issue-key vocabularies; feedback_for_writer
+  string-vs-object; escape-route narrative; "8 templates" was 9; UC true/false
+  positive wording). 3 pre-existing bugs surfaced (P0 playwright discover-only
+  closed-page; P1 probe-crash bounce renders empty; P2 search_term
+  UnboundLocalError at run_execution.py:301). v2 folds all of it.
