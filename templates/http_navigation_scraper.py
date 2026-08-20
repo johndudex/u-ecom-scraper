@@ -1026,6 +1026,16 @@ def _extract_item_safe(item_url: str, src_url: str) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+# ── CLI CONTRACT — keep every line below when adapting ───────────────────────
+# The pipeline launches this scraper with EXACTLY these names. A flag missing
+# from the argparse below is STRIPPED at launch and discovery silently falls
+# back to the seed file (input_urls.json). Same for the SCRAPER_LISTING_URL
+# env read in main(). ADD flags if you need them; NEVER remove or rename:
+#   --fresh-discovery  always (execution)     --listing-url  navigation/list_page
+#   --query            search_term            --input/--sample/--limit  testing
+#   --discover-only    Phase-1 probe          (+ SCRAPER_LISTING_URL env read)
+# Source of truth: webapp/agents/constants.py
+# ──────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description=f"{SITE_NAME} HTTP Navigation Scraper")
     parser.add_argument("--query", type=str, help="Search query for navigation mode")

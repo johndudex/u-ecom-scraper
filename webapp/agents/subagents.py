@@ -1971,13 +1971,28 @@ def _summarize_test_report(state: dict) -> str:
         f"- **Confidence:** {confidence:.0%}",
     ]
     if issues:
+        # Issue-shape normalization (P1): three vocabularies are live in the
+        # repo — graph.py inserts write `message`, code-tester.md documents
+        # `problem`, this summarizer reads `description`/`field` (which made the
+        # probe-crash bounce render as "`?`: <empty>" until now). Read all
+        # three keys; deterministic inserts carry message+description both.
+        def _issue_text(i: dict) -> str:
+            return (
+                i.get("description")
+                or i.get("message")
+                or i.get("problem")
+                or ""
+            )
+
         high = [i for i in issues if i.get("severity") == "high"]
         medium = [i for i in issues if i.get("severity") == "medium"]
         if high:
             lines.append(f"\n**HIGH severity ({len(high)}):**")
             for i in high[:5]:
-                field = i.get("field", i.get("description", "?"))
-                desc = i.get("description", "")
+                field = i.get("field") or (
+                    _issue_text(i)[:60] if _issue_text(i) else "?"
+                )
+                desc = _issue_text(i)
                 expected = i.get("expected", "")
                 actual = i.get("actual", "")
                 lines.append(f"  - `{field}`: {desc}")
@@ -1986,8 +2001,24 @@ def _summarize_test_report(state: dict) -> str:
         if medium:
             lines.append(f"\n**MEDIUM severity ({len(medium)}):**")
             for i in medium[:3]:
-                field = i.get("field", i.get("description", "?"))
-                lines.append(f"  - `{field}`: {i.get('description', '')}")
+                field = i.get("field") or (
+                    _issue_text(i)[:60] if _issue_text(i) else "?"
+                )
+                desc = _issue_text(i)
+                lines.append(f"  - `{field}`: {desc}")
+        # Relay CLI-contract issues verbatim (Edit 7): the marker-prefixed
+        # bounce must reach the next code_writer message intact so the fix
+        # instruction's vocabulary matches the guard's.
+        _marked = [
+            i
+            for i in issues
+            if "CLI CONTRACT VIOLATION" in _issue_text(i)
+        ]
+        if _marked:
+            lines.append(
+                "\n**⚠️ CLI CONTRACT VIOLATION — targeted argparse fix, do NOT "
+                "regenerate the scraper:**\n" + _issue_text(_marked[0])
+            )
     # Fix A: surface the RAW error so code_writer makes a targeted fix instead of
     # regenerating from scratch (which reintroduces variance).
     strategy_error = report.get("strategy_error") if isinstance(report, dict) else None
@@ -2955,6 +2986,36 @@ def build_code_writer_message(state: dict) -> list:
     # the skills would say (field mappings, extraction methods, navigation patterns).
     skills_section = ""
 
+    # CLI contract tail — rendered from the SAME constants the deterministic
+    # guard consumes (agents.constants.required_cli_flags), so the prompt and
+    # the guard can never drift apart. Strategy-aware (api family has no
+    # listing page; ssr_div_list declares a reduced set).
+    from .constants import required_cli_flags
+
+    _cw_input_mode = (state.get("input_mode") or "").strip().lower()
+    _cw_strategy = ""
+    _cw_sa = state.get("scraper_analysis")
+    if isinstance(_cw_sa, dict):
+        _cw_strategy = (_cw_sa.get("strategy") or "").strip().lower()
+    _cw_flags = required_cli_flags(_cw_input_mode, _cw_strategy)
+    _discovery_flags = [
+        f for f in _cw_flags
+        if f not in ("--input", "--urls", "--sample", "--limit")
+    ]
+    _cli_contract_tail = ""
+    if _discovery_flags:
+        _flag_list = ", ".join(f"`{f}`" for f in _discovery_flags)
+        _cli_contract_tail = (
+            f"- **Discovery flags for this {_cw_input_mode} job (HARD "
+            f"CONTRACT):** {_flag_list} — copy the add_argument lines verbatim "
+            "from the template's main()\n"
+            "- `main()` MUST contain "
+            '`_env_listing = os.environ.get("SCRAPER_LISTING_URL", "").strip()` '
+            "BEFORE the seed-file/checkpoint gate, wired into the discovery "
+            "branch exactly as the template does — execution sets this env var, "
+            "not a CLI flag\n"
+        )
+
     content = (
         "## OBJECTIVE\n"
         f"Build a **scraper** for {url}. "
@@ -3067,13 +3128,22 @@ def build_code_writer_message(state: dict) -> list:
         "/flags/, /icon/, or /navigation/\n"
         "- Skip images where the src URL path has no product identifier\n"
         "- A typical product page should have 3-15 images, NOT 100+\n\n"
-        "### Required CLI Arguments\n"
-        "The scraper MUST support these argparse arguments:\n"
+        "### Required CLI Arguments (HARD CONTRACT — machine-checked)\n"
+        "The scraper's argparse MUST declare every flag below with these EXACT "
+        "spellings. Execution passes them verbatim; a flag your argparse does not "
+        "declare is STRIPPED at launch and discovery silently falls back to "
+        "input_urls.json (the seed file) — output collapses to the seed count.\n"
         "- `--input FILE` — Path to input URLs JSON file\n"
-        "  **CRITICAL: `--input` MUST take precedence over any checkpoint file.** When `--input` is passed, the scraper MUST ignore `discovered_urls_checkpoint.json` and process the input URLs directly — the checkpoint is for resume only, NOT for shadowing an explicit test input. Check `args.input` BEFORE loading any checkpoint; if `--input` is set, skip the checkpoint load entirely.\n"
+        "  **CRITICAL: `--input` MUST take precedence over any checkpoint file.** "
+        "Check `args.input` BEFORE `_load_checkpoint()`; if `--input` is set, skip "
+        "the checkpoint load entirely.\n"
         "- `--urls URL [URL ...]` — Product URLs as CLI arguments\n"
         "- `--sample` — Scrape only 5 products (action='store_true')\n"
-        "- `--limit N` — Max products to scrape (type=int)\n\n"
+        "- `--limit N` — Max products to scrape (type=int)\n"
+        f"{_cli_contract_tail}"
+        "- Do NOT rename, merge, or delete any flag the template's main() declares "
+        "(`--query`→`--search`, `--listing-url`→`--start-url` both break execution). "
+        "Keep the template's add_argument block; ADD to it, never replace it.\n\n"
         f"**CRITICAL: You MUST call write_file to save the scraper to "
         f"workspace/{slug}/scraper_draft.py"
         f"{' AND call write_file to save input URLs to workspace/' + slug + '/input_urls.json' if not site_input_urls and not navigation_section else ''}. "
@@ -3119,7 +3189,11 @@ def build_code_writer_message(state: dict) -> list:
         "\n### Template fidelity — discovery & pagination\n"
         "Do NOT re-signature or redefine the template's discovery/pagination helpers "
         "(`_get_next_page_url`, `_discover_urls_via_*`, `_fetch_html`, checkpoint "
-        "load/save). Call them exactly as the template does. NEVER reference attributes "
+        "load/save). Call them exactly as the template does. The template's main() "
+        "argparse block and its "
+        '`_env_listing = os.environ.get("SCRAPER_LISTING_URL", "")` read are '
+        "CONTRACT, not boilerplate — copy both verbatim; a renamed or deleted flag "
+        "passes `--sample` testing and silently zeroes the real run. NEVER reference attributes "
         "that don't exist on an object — `requests.Session`/`httpx.Client` have NO `.url`; "
         "capture the current URL from the response (`final_url = str(resp.url)`) and pass "
         "the string. A scratch run exercises Phase 1 discovery end-to-end; a wrong call "
@@ -3163,6 +3237,60 @@ def build_code_tester_message(state: dict) -> list:
 
     input_mode = state.get("input_mode", "url_list")
     search_criteria = state.get("search_criteria", "")
+    # Phase-1 test invocation, PRE-COMPUTED from the draft's own declared flags
+    # (critique v1 vector 5): run_scraper does NOT strip undeclared flags, so a
+    # hardcoded arg list would manufacture argparse exit-2 failures execution
+    # never sees (execution filters first). Only flags the draft declares are
+    # passed; --limit stays (http_navigation's --discover-only runs Phase 1 to
+    # exhaustion vs a 300s deadline — the cap keeps the probe bounded).
+    _tester_phase1_instruction = " `run_scraper(args=['--discover-only','--limit','50'])`."
+    try:
+        import os as _os
+
+        _draft_p = _os.path.join(
+            _os.environ.get("PROJECT_ROOT", "/app"),
+            "workspace", slug, "scraper_draft.py",
+        )
+        if _os.path.isfile(_draft_p):
+            from .nodes.run_execution import _accepted_cli_flags
+
+            _accepted = _accepted_cli_flags(_draft_p) or set()
+            _p1_flags = []
+            if input_mode == "search_term" and "query" in _accepted and search_criteria:
+                _p1_flags = ["--query", search_criteria]
+            elif "listing-url" in _accepted:
+                _listing = (
+                    ((state.get("navigation_analysis") or {}).get("discovery") or {})
+                    .get("listing_url")
+                    or ""
+                )
+                _p1_flags = ["--listing-url", _listing] if _listing else []
+            if "fresh-discovery" in _accepted:
+                _p1_flags.append("--fresh-discovery")
+            if "discover-only" in _accepted:
+                _p1_flags.append("--discover-only")
+            _has_discovery_flag = bool(
+                {"fresh-discovery", "discover-only", "listing-url", "query"}
+                & _accepted
+            )
+            if "limit" in _accepted:
+                _p1_flags += ["--limit", "50"]
+            if _has_discovery_flag and _p1_flags:
+                _args_rendered = ",".join(
+                    repr(f) for f in _p1_flags
+                )
+                _tester_phase1_instruction = (
+                    f" `run_scraper(args=[{_args_rendered}])`."
+                )
+            else:
+                _tester_phase1_instruction = (
+                    " the draft declares NO discovery flags (no --listing-url/"
+                    "--query/--fresh-discovery/--discover-only) — report that "
+                    "as a HIGH issue prefixed `CLI CONTRACT VIOLATION:` "
+                    "(discovery cannot run at execution either)."
+                )
+    except Exception:
+        pass  # fall back to the generic instruction above
     nav_validation = ""
     if input_mode in ("navigation", "list_page", "search_term"):
         nav_analysis = state.get("navigation_analysis") or {}
@@ -3294,17 +3422,19 @@ def build_code_tester_message(state: dict) -> list:
         f"   - **Phase 2 (field extraction):** `run_scraper(args=['--sample','--input','input_urls.json'])` "
         f"— fast field check against known URLs.\n"
         f"   - **Phase 1 (discovery) — for navigation/list_page/search_term jobs ONLY:** "
-        f"`run_scraper(args=['--sample','--limit','50'])` (or `--query '<search_criteria>' --limit 50` "
-        f"for search_term) so the discovery loop ACTUALLY runs. Assert the output's "
-        f"`metadata.discovered_urls` > 1 page worth (e.g. > items_per_page) — if it returns only "
-        f"~1 page, pagination/discovery is broken (HIGH severity). For url_list jobs, skip this "
-        f"(no Phase 1).\n"
+        f"run discovery EXACTLY as execution does, so a dropped CLI flag fails HERE instead "
+        f"of in production:{_tester_phase1_instruction} "
+        f"Assert `metadata.discovered_urls` > 1 page worth (e.g. > items_per_page) — if it "
+        f"returns only ~1 page, pagination/discovery is broken (HIGH severity). If argparse "
+        f"rejects a flag (exit 2, `unrecognized arguments: ...`), that is a HIGH severity "
+        f"issue whose problem text MUST start with `CLI CONTRACT VIOLATION:` and name the "
+        f"missing flags — set `target: \"scraper\"`. For url_list jobs, skip this (no Phase 1).\n"
         f"2. Read `workspace/{slug}/product_analysis.json` for field expectations (1 call)\n"
         f"3. Read the output JSON file(s) that run_scraper produced (1 call)\n"
         f"4. Write test_report.json — include `phases_tested: {{phase1_discovery: <bool>, "
         f"phase2_extraction: <bool>}}` so routing knows whether discovery was validated. "
-        f"If you could NOT validate Phase 1 (e.g. site genuinely returns 1 page), set "
-        f"`phases_tested.phase1_discovery: true` with a `single_page: true` note, NOT false.\n\n"
+        f"Set each phase TRUE only if you actually ran it; a false phase1 with real "
+        f"findings is better than a defaulted true.\n\n"
         f"**IMPORTANT: Do NOT read scraper_draft.py.** Assess the scraper ONLY by its output. "
         f"The code contains post-generation patches (robust overrides, output filters) that are correct by design. "
         f"Judge solely by whether the output JSON has correctly-populated product fields.\n\n"

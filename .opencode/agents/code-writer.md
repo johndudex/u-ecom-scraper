@@ -85,21 +85,22 @@ from src.discovery import discover_item_urls, config_for_load_more
 3. **NEVER define `_click_load_more`, `_safe_eval`, `_get_next_page_url`, or
    any pagination loop inline.** If the template doesn't have the import,
    something is wrong — use the template as-is.
-4. **KEEP the `main()` discovery gate initializers verbatim, in place.** The
-   template's `main()` has, immediately before the discovery `if/elif`:
+4. **KEEP the `main()` discovery gate verbatim, in place.** Every nav
+   template's `main()` reads, BEFORE the checkpoint/seed-file gate:
    ```python
    _env_listing = os.environ.get("SCRAPER_LISTING_URL", "").strip()
-   _env_force = os.environ.get("SCRAPER_FORCE_DISCOVERY", "").strip().lower() in ("1","true","yes")
-   if _env_listing or _env_force or args.fresh_discovery or args.listing_url:
-       global PRODUCT_LISTING_URL
-       ...
    ```
-   Do NOT drop these two `_env_*` assignments, and do NOT merge the `if` into
-   an `elif` of an `if args.sample:` chain. The consumer (`... _env_listing or
-   _env_force ...`) is kept verbatim, so dropping the initializers raises
-   `NameError` on every `--listing-url`/`--fresh-discovery`/`SCRAPER_LISTING_URL`
-   invocation — crashing run_execution. `--sample` testing will NOT catch it
-   (different branch). A post-gen patcher backstops this, but keep it intact.
+   and routes discovery from it — either by feeding `args.listing_url` /
+   `args.fresh_discovery` (http_navigation, navigation, ssr_div_list) or via
+   an `_env_force` / `PRODUCT_LISTING_URL` consumer (playwright, requests).
+   Copy whichever shape YOUR template has exactly; do not drop the
+   `os.environ.get` line, do not merge the discovery `if` into an `elif` of
+   an `if args.sample:` chain, and do not delete the flag declarations it
+   feeds. `--sample` testing cannot catch a broken gate (different branch) —
+   the real run, launched with `--listing-url`/`--fresh-discovery`/
+   `SCRAPER_LISTING_URL`, is the first thing that hits it. A post-gen patcher
+   backstops the env *read* only; the flag *declarations* are protected by
+   nothing but you.
 
 ### Other discovery helpers — DO NOT re-signature
 
@@ -125,8 +126,13 @@ checkpoint load/save, etc.) are **correct as written**. Three hard rules:
 - **Save to:** `workspace/{slug}/scraper_draft.py`
 - **Output JSON key:** `{output_key}` — drop items missing `title` + at least one
   core field. Output structure: `{"site": ..., "{output_key}": [...], "metadata": ...}`.
-- **Required argparse:** `--input` (input_urls.json path), `--urls` (inline URLs),
-  `--sample` (5-item test mode), `--limit` (max items). The template already has these.
+- **Required argparse:** `--input`, `--urls`, `--sample`, `--limit` — plus, for
+  navigation/list_page/search_term jobs, EVERY discovery flag the template
+  declares (`--query`, `--category-url`, `--listing-url`, `--fresh-discovery`,
+  `--discover-only`). Your task message lists the exact set for this job. Never
+  remove or rename a flag the template declares: the executor passes those
+  names verbatim and strips any the argparse no longer declares, which
+  silently disables discovery.
 - `--sample` MUST use URLs already in `input_urls.json` (skip Phase 1 discovery).
 
 ## What NOT to Do

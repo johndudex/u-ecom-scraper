@@ -545,6 +545,28 @@ def _attach_discovery_coverage(report: dict, slug: str) -> dict:
         return report
     try:
         cov = _read_discovery_coverage(output_file)
+        # Guard: the newest output may be a --discover-only PROBE artifact, not
+        # the real run's output. Pre-P0 (playwright closed-page bug) those
+        # probes always wrote {found: 0, stop_reason: navigate_error}; picking
+        # that up here downgraded healthy jobs via _COVERAGE_FAIL_STOP_REASONS.
+        # A probe artifact is identifiable by empty products + a coverage block.
+        if (
+            isinstance(cov, dict)
+            and int(cov.get("found") or 0) == 0
+            and str(cov.get("stop_reason") or "") == "navigate_error"
+        ):
+            try:
+                with open(output_file, "r", errors="ignore") as _pf:
+                    _pdata = json.load(_pf)
+                if not (_pdata.get("products") or []):
+                    logger.info(
+                        "_attach_discovery_coverage: skipping empty discover-only "
+                        "probe artifact %s (navigate_error/0 — pre-P0 probe shape)",
+                        os.path.basename(output_file),
+                    )
+                    cov = None
+            except Exception:
+                pass
         if isinstance(cov, dict):
             report["discovery_coverage"] = cov
             logger.info(
@@ -2882,6 +2904,128 @@ def _fix_scraper_syntax(
     )
 
 
+def _contract_fix_message(
+    slug: str, input_mode: str, violation: str, template_path: str
+) -> str:
+    """L1 fix instruction. Renders the env-gate snippet FROM THE SELECTED
+    TEMPLATE (two canonical gate shapes are live — playwright's
+    `global PRODUCT_LISTING_URL` vs the http_navigation family's
+    `args.listing_url = _env_listing; args.fresh_discovery = True` — and a
+    wrong-shape instruction produces a Frankenstein gate; critique v1 vector 2).
+    """
+    gate_hint = (
+        "re-add the env-var gate in the shape YOUR template's main() uses "
+        "(the full template is in your system prompt) — do NOT invent a "
+        "different shape"
+    )
+    if template_path and os.path.isfile(template_path):
+        try:
+            with open(template_path, "r", errors="ignore") as _tf:
+                _tsrc = _tf.read()
+            if "global PRODUCT_LISTING_URL" in _tsrc:
+                gate_hint = (
+                    "re-add the gate exactly as your template (playwright "
+                    "family) does: `_env_listing = os.environ.get("
+                    '"SCRAPER_LISTING_URL", "").strip()` then '
+                    "`if _env_listing or args.fresh_discovery or "
+                    "args.listing_url:` with the `global PRODUCT_LISTING_URL` "
+                    "assignment inside"
+                )
+            elif "_env_listing" in _tsrc:
+                gate_hint = (
+                    "re-add the gate exactly as your template (http_navigation "
+                    "family) does: `_env_listing = os.environ.get("
+                    '"SCRAPER_LISTING_URL", "").strip()` then '
+                    "`if _env_listing: args.listing_url = _env_listing; "
+                    "args.fresh_discovery = True`"
+                )
+        except OSError:
+            pass
+    return (
+        f"Your `workspace/{slug}/scraper_draft.py` VIOLATES the execution CLI "
+        f"contract for this {input_mode} job.\n\n"
+        f"{violation}\n\n"
+        "How to fix — a SMALL targeted edit with `edit_file` (do NOT rewrite "
+        "the scraper):\n"
+        "1. In main()'s argparse, add the missing flag declarations VERBATIM "
+        "from the template in your system prompt (e.g. "
+        '`parser.add_argument("--listing-url", type=str, default=None, ...)` '
+        'and `parser.add_argument("--fresh-discovery", action="store_true", '
+        "...)`).\n"
+        "2. Wire discovery: " + gate_hint + ".\n"
+        "3. The flags must be CONSUMED (feed the discovery branch), not just "
+        "declared.\n"
+        "Change nothing else. Keep the file syntactically valid."
+    )
+
+
+def _enforce_cli_contract(
+    agent, state: ScrapeState, config: RunnableConfig, job_id: int, slug: str,
+    max_tries: int = 2,
+) -> None:
+    """L1: bounce CLI-contract violations back into this agent loop.
+
+    Same bounded single-HumanMessage pattern as _fix_scraper_syntax (fresh
+    invoke — no context accumulation; NOT the reverted rescrape-routing class).
+    On persistent violation, fall through — L2 (code_tester force-FAIL) is the
+    load-bearing gate and will catch it deterministically.
+    """
+    from langchain_core.messages import HumanMessage
+
+    try:
+        from .nodes.run_execution import cli_contract_violation
+    except Exception as exc:
+        logger.warning("_enforce_cli_contract: import failed: %s", exc)
+        return
+
+    input_mode = (state.get("input_mode") or "").strip()
+    if input_mode not in ("navigation", "list_page", "search_term"):
+        return  # url_list: no discovery contract
+    strategy = ""
+    _sa = state.get("scraper_analysis")
+    if isinstance(_sa, dict):
+        strategy = (_sa.get("strategy") or "").strip()
+
+    scraper_path = os.path.join(
+        _get_project_root(), "workspace", slug, "scraper_draft.py"
+    )
+    for attempt in range(max_tries):
+        violation = cli_contract_violation(scraper_path, input_mode, strategy)
+        if violation is None:
+            if attempt > 0:
+                logger.info(
+                    "_invoke_code_writer: CLI contract fixed after %d attempt(s) (job %s)",
+                    attempt, job_id,
+                )
+            return
+        logger.warning(
+            "_invoke_code_writer: CLI contract violation (attempt %d/%d, job %s): %s",
+            attempt + 1, max_tries, job_id, violation[:300],
+        )
+        template_path = os.path.join(
+            _get_project_root(), _select_template_file(state)
+        )
+        fix_msg = [HumanMessage(content=_contract_fix_message(
+            slug, input_mode, violation, template_path
+        ))]
+        hb = _start_heartbeat(job_id, "code-writer")
+        try:
+            result = _invoke_agent_with_timeout(
+                agent, fix_msg, _agent_config(config, "code_writer"),
+                "code_writer", job_id,
+            )
+            _persist_agent_logs(state, result, "code-writer", config)
+        finally:
+            _stop_heartbeat(hb)
+        # re-check at loop top; a syntax break from the edit is handled by the
+        # NEXT cycle's _fix_scraper_syntax (checker returns None on unparseable).
+    logger.error(
+        "_invoke_code_writer: CLI contract still violated after %d attempts "
+        "(job %s) — code_tester L2 gate will force-FAIL",
+        max_tries, job_id,
+    )
+
+
 
 
 def _select_template_file(state: ScrapeState) -> str:
@@ -3096,6 +3240,12 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         # immediate fix (keeps syntax errors out of code_tester's path).
         _fix_scraper_syntax(agent, state, config, job_id, slug)
 
+        # CLI-contract guard L1 (docs/cli-contract-plan.md): a draft with no
+        # wired discovery trigger would pass --sample testing (seed mode) and
+        # ship 1 seed item at execution. Bounce back into THIS agent loop with
+        # a targeted fix instruction before code_tester burns its budget.
+        _enforce_cli_contract(agent, state, config, job_id, slug)
+
         update["messages"] = []
         scraper_analysis = state.get("scraper_analysis") or {}
         strategy = scraper_analysis.get("strategy", "")
@@ -3200,6 +3350,18 @@ def _probe_phase1_discovery(slug: str, state: dict, job_id: int) -> tuple[bool, 
             logger.warning(
                 "_probe_phase1_discovery: CRASHED (job %s, rc=%s):\n%s",
                 job_id, rc, tail,
+            )
+            return True, tail
+        # argparse exit(2) carries NO Traceback — without this hook the probe
+        # silently passed a draft whose CLI rejects the execution flags
+        # (CLI-contract plan v2 hand-off). Treat it as a crash with the
+        # unrecognized-argument list in the tail.
+        if rc == 2 and "unrecognized arguments" in stderr:
+            tail = stderr.strip()[-800:]
+            logger.warning(
+                "_probe_phase1_discovery: ARGPARSE REJECTED execution flags "
+                "(job %s): %s",
+                job_id, tail,
             )
             return True, tail
         logger.info(
@@ -3318,7 +3480,15 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             report["confidence_score"] = 0.0
             report["ready_for_execution"] = False
             report.setdefault("issues", []).insert(
-                0, {"severity": "high", "message": "Phase-1 discovery crashed: " + (tb or "")}
+                0,
+                # Issue-shape fix (P1): carry BOTH keys — _summarize_test_report
+                # reads description/field, code-tester.md documents problem, the
+                # marker relay reads message. One vocabulary going forward.
+                {
+                    "severity": "high",
+                    "message": "Phase-1 discovery crashed: " + (tb or ""),
+                    "description": "Phase-1 discovery crashed: " + (tb or ""),
+                },
             )
             report["feedback_for_writer"] = (
                 "PHASE-1 DISCOVERY CRASH — caught by the deterministic discovery "
@@ -3331,6 +3501,68 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             update["test_report"] = report
             logger.warning(
                 "_invoke_code_tester: discovery probe FAILED the test (job %s) → retry", job_id
+            )
+
+        # L2 CLI-contract hard gate (docs/cli-contract-plan.md): the LOAD-BEARING
+        # closure. A draft with no wired discovery trigger passes --sample
+        # testing (seed mode) and would ship seed-only at execution. Force the
+        # report FAIL so route_after_testing skips the PASS exit entirely (the
+        # job-7 escape) and bounces to code_writer with the violation.
+        _cli_violation = None
+        try:
+            from .nodes.run_execution import cli_contract_violation
+
+            _draft = os.path.join(
+                _get_project_root(), "workspace", slug, "scraper_draft.py"
+            )
+            _sa_t = state.get("scraper_analysis")
+            _strategy_t = (
+                (_sa_t.get("strategy") or "") if isinstance(_sa_t, dict) else ""
+            )
+            _cli_violation = cli_contract_violation(
+                _draft, state.get("input_mode", ""), _strategy_t
+            )
+        except Exception as _exc:
+            logger.warning(
+                "_invoke_code_tester: CLI-contract check errored (job %s): %s",
+                job_id, _exc,
+            )
+        if _cli_violation:
+            report = report or {}
+            report["overall_assessment"] = "FAIL"
+            report["confidence_score"] = 0.0
+            report["ready_for_execution"] = False
+            report.setdefault("issues", []).insert(
+                0,
+                {
+                    "severity": "high",
+                    "message": _cli_violation,
+                    "description": _cli_violation,
+                },
+            )
+            report["feedback_for_writer"] = (
+                "CLI CONTRACT VIOLATION (deterministic — testing cannot pass "
+                "while discovery is unwired):\n" + _cli_violation + "\n"
+                "Add the missing argparse declarations AND the "
+                "SCRAPER_LISTING_URL env gate in main(), exactly as your "
+                "template does. Use edit_file; do NOT rewrite the scraper."
+            )
+            update["test_report"] = report
+            # F19-pattern honest failure when the retry budget is spent.
+            _retry_now = state.get("test_retry_count", 0)
+            _is_last_now = (
+                _retry_now == FINAL_RETRY_SENTINEL
+                or _retry_now >= MAX_TEST_RETRIES
+            )
+            if _is_last_now:
+                update["error_message"] = (
+                    _cli_violation
+                    + " — retries exhausted; refusing seed-only execution."
+                )
+                update["execution_status"] = "FAILED"
+            logger.warning(
+                "_invoke_code_tester: CLI contract violation → test FAIL "
+                "(job %s, retry_count=%s)", job_id, _retry_now,
             )
         return update
     except Exception:

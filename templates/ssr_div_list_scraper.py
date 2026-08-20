@@ -209,6 +209,16 @@ def scrape_listing(listing_url, limit=0):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+# ── CLI CONTRACT — keep every line below when adapting ───────────────────────
+# The pipeline launches this scraper with EXACTLY these names. A flag missing
+# from the argparse below is STRIPPED at launch and discovery silently falls
+# back to the seed file (input_urls.json). ADD flags if you need them; NEVER
+# remove or rename:
+#   --listing-url      navigation/list_page (this template's discovery trigger;
+#                      it does NOT use --fresh-discovery/--discover-only)
+#   --input/--sample/--limit  testing      (+ SCRAPER_LISTING_URL env read)
+# Source of truth: webapp/agents/constants.py
+# ──────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="SSR Div-List Scraper")
     parser.add_argument("--listing-url", default=LISTING_URL, help="Listing page URL")

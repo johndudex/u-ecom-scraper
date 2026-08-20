@@ -125,6 +125,104 @@ def _filter_supported_args(
     return filtered
 
 
+# ── Deterministic discovery CLI-contract check (FIX 1, plan v2) ──────────────
+
+_ENV_LISTING_READS = (
+    'os.environ.get("SCRAPER_LISTING_URL"',
+    "os.environ.get('SCRAPER_LISTING_URL'",
+    'os.getenv("SCRAPER_LISTING_URL"',
+    "os.getenv('SCRAPER_LISTING_URL'",
+)
+# Signal only — NEVER satisfying (SCRAPER_FORCE_DISCOVERY is set nowhere in the
+# repo; the api family's real execution trigger is the --fresh-discovery flag,
+# which run_execution always appends). Critique round 1, vector 1A.
+_ENV_FORCE_READS = (
+    'os.environ.get("SCRAPER_FORCE_DISCOVERY"',
+    "os.environ.get('SCRAPER_FORCE_DISCOVERY'",
+    'os.getenv("SCRAPER_FORCE_DISCOVERY"',
+)
+
+# Seed-file markers: a main() with NONE of these cannot silently degrade to
+# seed-only output (it either discovers unconditionally or crashes honestly,
+# e.g. UC exits 1 with no URLs).
+_SEED_FILE_MARKERS = ("input_urls.json", "INPUT_FILE")
+
+
+def _strip_comments(src: str) -> str:
+    return "\n".join(
+        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+def cli_contract_violation(
+    scraper_path: str, input_mode: str, strategy: str = ""
+) -> str | None:
+    """Static discovery CLI-contract check on a generated scraper draft.
+
+    Returns a violation description (consumable by the L1 fix instruction and
+    the L2 tester force-FAIL) or None when compliant / out of scope /
+    indeterminate (NEVER blocks an opaque draft — the syntax fixer owns those).
+
+    Contract per input_mode × strategy (the dispatcher side is
+    run_execution.py's arg/env computation, lines ~205-313):
+
+    - url_list / unknown: exempt (no Phase 1).
+    - navigation / list_page: satisfied by ANY of
+        M0  no seed-file branch (cannot silently degrade to seed-only)
+        M1  reads the SCRAPER_LISTING_URL env (non-api strategies)
+        M3  declares --listing-url AND consumes args.listing_url
+            — OR, api family: declares --fresh-discovery AND consumes
+            args.fresh_discovery (the flag run_execution always passes)
+    - search_term: any of the above, or
+        M4  declares --query AND consumes args.query
+    """
+    from ..constants import API_STRATEGIES, NAV_INPUT_MODES, SCRAPER_ENV_LISTING
+
+    im = (input_mode or "").strip().lower()
+    if im not in NAV_INPUT_MODES:
+        return None
+    if not scraper_path or not os.path.isfile(scraper_path):
+        return None
+    accepted = _accepted_cli_flags(scraper_path)
+    if accepted is None:
+        return None  # unparseable → don't block; the syntax fixer owns it
+    try:
+        with open(scraper_path, "r", errors="ignore") as fh:
+            src = _strip_comments(fh.read())
+    except OSError:
+        return None
+
+    is_api = (strategy or "").strip().lower() in API_STRATEGIES
+    m0 = not any(marker in src for marker in _SEED_FILE_MARKERS)
+    m1 = (not is_api) and any(f in src for f in _ENV_LISTING_READS)
+    if is_api:
+        m3 = "fresh-discovery" in accepted and "args.fresh_discovery" in src
+    else:
+        m3 = "listing-url" in accepted and "args.listing_url" in src
+    m4 = im == "search_term" and "query" in accepted and "args.query" in src
+
+    if m0 or m1 or m3 or m4:
+        return None
+
+    # Reach here = no wired discovery trigger. Name the remedy precisely.
+    if is_api:
+        need = 'declare --fresh-discovery and consume args.fresh_discovery (the dispatcher always passes this flag — it is the api family\'s execution trigger)'
+    else:
+        need = (
+            f'read the {SCRAPER_ENV_LISTING} env var (the deterministic-discovery gate), '
+            'or declare --listing-url and consume args.listing_url'
+        )
+        if im == "search_term":
+            need += ', or declare --query and consume args.query'
+    return (
+        f"CLI CONTRACT VIOLATION (input_mode={im}, strategy={strategy or 'unknown'}): "
+        f"the draft has no wired discovery trigger. Need: {need}. Declared flags: "
+        f"{sorted(accepted)}. run_execution strips undeclared discovery flags "
+        f"(_filter_supported_args) — execution would silently fall back to "
+        f"input_urls.json (the seed file) and return only the seed count."
+    )
+
+
 def _needs_browser(state: ScrapeState, scraper_path: str = "") -> bool:
     """True if this scraper must run in browser_service (Chrome/Playwright).
 
@@ -213,6 +311,14 @@ def run_execution(state: ScrapeState) -> dict:
     # `--query` here collapses full taxonomy iteration into a single keyword
     # search (e.g. locumtenens: 1000+ → 25). Route navigation/list_page to
     # full discovery via the proven `--listing-url` (working results page).
+    # Pre-bind for all modes (P2 fix): the env-injection block below reads
+    # _working_url/_listing_reached/_respect_flag for search_term jobs too,
+    # but they were previously bound only inside the navigation/list_page
+    # elif → UnboundLocalError on a search_term job with empty
+    # discovery.listing_url.
+    _working_url = ""
+    _listing_reached = False
+    _respect_flag = True
     if input_mode == "search_term" and search_criteria:
         args.extend(["--query", search_criteria])
         logger.info("run_execution: search_term job, passing --query '%s'", search_criteria)
@@ -345,8 +451,13 @@ def run_execution(state: ScrapeState) -> dict:
                 filtered,
             )
             # Flag discovery-critical flag stripping (the root cause of 1-item
-            # outputs). This doesn't FAIL the job (the scraper still runs with
-            # the seed file) but makes the suppression LOUD.
+            # outputs). L3 honesty floor (CLI-contract plan v2): when critical
+            # flags are stripped AND the draft has no wired discovery trigger
+            # (no env gate, no consuming flag), execution would be a silent
+            # seed-only run — refuse it and fail honestly instead. A COMPLIANT
+            # draft (e.g. reads SCRAPER_LISTING_URL) is safe: the env carries
+            # the listing and the stripped flags are behaviorally inert, so it
+            # proceeds (today's behavior). Kill-switch: DISCOVERY_CONTRACT_STRICT.
             _discovery_critical = {"listing-url", "fresh-discovery", "query"}
             _stripped_critical = [f for f in _stripped if f[2:] in _discovery_critical]
             if _stripped_critical:
@@ -358,6 +469,34 @@ def run_execution(state: ScrapeState) -> dict:
                     "declare these flags for discovery to work.",
                     _stripped_critical,
                 )
+                _contract = None
+                try:
+                    _contract = cli_contract_violation(
+                        scraper_path,
+                        input_mode,
+                        (state.get("scraper_analysis") or {}).get("strategy", "")
+                        if isinstance(state.get("scraper_analysis"), dict)
+                        else "",
+                    )
+                except Exception as _exc:
+                    logger.warning(
+                        "run_execution: cli_contract_violation check errored: %s", _exc
+                    )
+                try:
+                    from django.conf import settings as _st
+
+                    _strict = bool(getattr(_st, "DISCOVERY_CONTRACT_STRICT", True))
+                except Exception:
+                    _strict = True
+                if _contract and _strict:
+                    return {
+                        "execution_status": "FAILED",
+                        "error_message": (
+                            f"{_contract} Refusing silent seed-only execution. "
+                            "Remedy: regenerate the scraper (delete the cached "
+                            "draft to force code_writer) or re-submit the job."
+                        ),
+                    }
         args = filtered
 
     # Execution-mode feature flag (settings.SCRAPER_EXECUTION_MODE):

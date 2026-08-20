@@ -283,6 +283,16 @@ def save_urls_to_file(filepath: str, urls: list[str]) -> None:
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── CLI CONTRACT — keep every line below when adapting ───────────────────────
+# The pipeline launches this scraper with EXACTLY these names. A flag missing
+# from the argparse below is STRIPPED at launch and discovery silently falls
+# back to the seed file (input_urls.json). Same for the SCRAPER_LISTING_URL
+# env read in main(). ADD flags if you need them; NEVER remove or rename:
+#   --fresh-discovery  always (execution)     --listing-url  navigation/list_page
+#   --query            search_term            --input/--sample/--limit  testing
+#   --discover-only    Phase-1 probe          (+ SCRAPER_LISTING_URL env read)
+# Source of truth: webapp/agents/constants.py
+# ──────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description=f"Playwright scraper for {SITE_NAME}")
     parser.add_argument("--sample", action="store_true", help="Scrape only 5 products")
@@ -359,6 +369,12 @@ def main():
     # discovery actually works (finds >0 URLs, paginates past page 1) without
     # needing the full ~800s for 200 pages. The probe has a 180s budget — plenty
     # for 5 pages × ~4s = ~20s.
+    # NOTE: opens its OWN browser page — the discovery gate above may have
+    # already closed its browser (browser.close() at the end of the gate's
+    # with-block), and a `page` handle from a closed browser makes every
+    # navigation fail silently ("target closed" is swallowed by
+    # _discovery_goto) → always found=0 / stop_reason=navigate_error with
+    # exit 0 (the pre-fix bug: two rmwilliams probe artifacts proved it).
     if args.discover_only:
         _dcfg = None
         try:
@@ -380,7 +396,15 @@ def main():
             except Exception:
                 return []
 
-        _probe_result = discover_item_urls(page, PRODUCT_LISTING_URL, _extract_probe, _dcfg)
+        with sync_playwright() as p:
+            browser = get_browser(p)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                viewport={"width": 1920, "height": 1080},
+            )
+            probe_page = context.new_page()
+            _probe_result = discover_item_urls(probe_page, PRODUCT_LISTING_URL, _extract_probe, _dcfg)
+            browser.close()
         logger.info(
             "discover-only: stop_reason=%s pages=%d urls=%d",
             _probe_result.stop_reason, _probe_result.pages_visited, len(_probe_result.urls),

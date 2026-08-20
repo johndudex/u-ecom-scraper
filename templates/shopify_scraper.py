@@ -218,6 +218,9 @@ def save_urls_to_file(filepath: str, urls: list[str]) -> None:
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# NOTE: run_execution passes --fresh-discovery/--listing-url on nav jobs; this
+# template does not declare them (they are stripped). Verify discovery wiring
+# before shipping it on a navigation/list_page job.
 def main():
     parser = argparse.ArgumentParser(description=f"Shopify scraper for {SITE_NAME}")
     parser.add_argument("--sample", action="store_true", help="Scrape only 5 products")

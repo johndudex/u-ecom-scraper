@@ -348,6 +348,16 @@ def save_urls_to_file(filepath: str, urls: list[str]) -> None:
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── CLI CONTRACT — keep every line below when adapting ───────────────────────
+# The pipeline launches this scraper with EXACTLY these names. A flag missing
+# from the argparse below is STRIPPED at launch and discovery silently falls
+# back to the seed file (input_urls.json). Same for the SCRAPER_LISTING_URL
+# env read in main(). ADD flags if you need them; NEVER remove or rename:
+#   --fresh-discovery  always (execution)     --listing-url  navigation/list_page
+#   --query            search_term            --input/--sample/--limit  testing
+#   --discover-only    Phase-1 probe          (+ SCRAPER_LISTING_URL env read)
+# Source of truth: webapp/agents/constants.py
+# ──────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description=f"HTTP scraper for {SITE_NAME}")
     parser.add_argument("--sample", action="store_true", help="Scrape only 5 products")

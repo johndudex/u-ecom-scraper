@@ -475,6 +475,9 @@ def save_urls_to_file(filepath: str, urls: list[str]) -> None:
     logger.info(f"Saved {len(urls)} URLs to {filepath}")
 
 
+# NOTE: run_execution passes --fresh-discovery/--listing-url on nav jobs; this
+# template does not declare them (they are stripped). Its main() exits 1 with
+# no URLs — an honest crash, never a silent seed-only run.
 def main():
     parser = argparse.ArgumentParser(description=f"Scraper for {SITE_NAME} (SeleniumBase UC Mode)")
     parser.add_argument("--sample", action="store_true", help="Scrape only 5 products")

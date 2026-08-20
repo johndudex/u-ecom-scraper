@@ -225,6 +225,11 @@ LLM_CODEGEN_DETERMINISTIC = config("LLM_CODEGEN_DETERMINISTIC", default=False, c
 # listing (listing_reached=False), OMIT --listing-url so the scraper's
 # DEFAULT_LISTING_URL drives discovery (not the sample detail URL). Default True.
 RESPECT_LISTING_REACHED_FLAG = config("RESPECT_LISTING_REACHED_FLAG", default=True, cast=bool)
+# CLI-contract L3 honesty floor (docs/cli-contract-plan.md): when discovery-
+# critical flags are stripped AND the draft has no wired discovery trigger,
+# run_execution refuses the silent seed-only run and fails honestly. A draft
+# that reads SCRAPER_LISTING_URL (compliant) proceeds even with stripped flags.
+DISCOVERY_CONTRACT_STRICT = config("DISCOVERY_CONTRACT_STRICT", default=True, cast=bool)
 # Per-call HTTP timeout for every LLM call (llm.py ChatOpenAI). The PRIMARY hang
 # guard — a stuck request dies here at 600s rather than hanging indefinitely.
 # Explicitly defined (previously only referenced in comments; llm.py fell back to

@@ -245,6 +245,17 @@ def scrape_product(url: str, src_url: str) -> Optional[dict]:
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── CLI CONTRACT — keep every line below when adapting ───────────────────────
+# The pipeline launches this scraper with EXACTLY these names. A flag missing
+# from the argparse below is STRIPPED at launch and discovery silently falls
+# back to the seed file (input_urls.json). ADD flags if you need them; NEVER
+# remove or rename:
+#   --fresh-discovery  the ONLY discovery trigger for the api family (execution
+#                      always passes it) — there is NO listing page; discovery
+#                      IS the API. SCRAPER_FORCE_DISCOVERY is the env gate.
+#   --input/--sample/--limit  testing
+# Source of truth: webapp/agents/constants.py
+# ──────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description=f"API scraper for {SITE_NAME}")
     parser.add_argument("--sample", action="store_true", help="Scrape only 5 products")

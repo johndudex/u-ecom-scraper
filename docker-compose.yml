@@ -96,6 +96,10 @@ services:
       LITELLM_BASE_URL: ${LITELLM_BASE_URL:-https://llm.johnjf.xyz/v1}
       LITELLM_API_KEY: ${LITELLM_API_KEY:-}
       LITELLM_ENABLED: ${LITELLM_ENABLED:-true}
+      # Phase 4 async cancellation — see settings.py note. Set true in .env for
+      # the litellm A/B arm (reasoning models + sync thread-join = abandoned
+      # threads holding 36K-token contexts at concurrency=2).
+      LLM_ASYNC_EXECUTION: ${LLM_ASYNC_EXECUTION:-false}
       PLAYWRIGHT_MCP_URL: http://browser_service:8111/sse
       BROWSER_SERVICE_URL: http://browser_service:8001
       FILE_MASTER_URL: http://file-master:8002

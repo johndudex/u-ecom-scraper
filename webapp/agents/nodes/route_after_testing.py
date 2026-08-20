@@ -454,7 +454,42 @@ def route_after_testing(state: ScrapeState) -> str:
     # from the anti-bot downgrade. None ⇒ no coverage problem (gate is a no-op).
     _cov_reason = _discovery_coverage_failure(report)
 
-    if assessment == "PASS" and confidence >= MIN_CONFIDENCE_PASS and not high_severity:
+    # L2 CLI-contract signal (docs/cli-contract-plan.md): static re-check of the
+    # DRAFT — a violation means execution would be seed-only. Belt-and-braces
+    # alongside the tester-side force-FAIL (the load-bearing closure lives in
+    # _invoke_code_tester; this re-derivation makes routing LLM-proof).
+    _contract_bad = False
+    try:
+        _slug_cb = (state.get("site_slug") or "").strip()
+        _im_cb = (state.get("input_mode") or "").strip()
+        if _slug_cb and _im_cb in ("navigation", "list_page", "search_term"):
+            import os as _os
+
+            _root_cb = _os.environ.get("PROJECT_ROOT", "/app")
+            _draft_cb = _os.path.join(
+                _root_cb, "workspace", _slug_cb, "scraper_draft.py"
+            )
+            if _os.path.isfile(_draft_cb):
+                from ..nodes.run_execution import cli_contract_violation
+
+                _sa_cb = state.get("scraper_analysis")
+                _st_cb = (
+                    (_sa_cb.get("strategy") or "")
+                    if isinstance(_sa_cb, dict)
+                    else ""
+                )
+                _contract_bad = (
+                    cli_contract_violation(_draft_cb, _im_cb, _st_cb) is not None
+                )
+    except Exception as _exc_cb:
+        logger.debug("route_after_testing: contract re-check errored: %s", _exc_cb)
+
+    if (
+        assessment == "PASS"
+        and confidence >= MIN_CONFIDENCE_PASS
+        and not high_severity
+        and not _contract_bad
+    ):
         # Phase-coverage gate (deterministic backstop): for two-phase
         # navigation scrapers, a PASS is only valid if Phase 1 discovery was
         # actually exercised. code_tester historically ran `--input
@@ -504,12 +539,43 @@ def route_after_testing(state: ScrapeState) -> str:
     # F15: a core field at ~0% coverage ALSO overrides ground-truth (job 337:
     # 36 rows with only `brand` populated, price/availability empty, FAIL/0.35
     # report, shipped COMPLETED).
-    if not _cov_reason and not missing_core and _scraper_has_real_items(state, min_count=3):
+    if (
+        not _cov_reason
+        and not missing_core
+        and not _contract_bad
+        and _scraper_has_real_items(state, min_count=3)
+    ):
         logger.info(
             "route_after_testing: GROUND-TRUTH PASS — scraper produced ≥3 real "
             "items (overriding code_tester's high_severity flags)"
         )
         return "field_confirmation"
+
+    # L2 CLI-contract bounce (before the strategy cascade — a contract violation
+    # is a precisely-known fix, not a strategy question; classify_test_failure
+    # would guess). Bounded: the test_retry_count bump in _invoke_code_writer
+    # fires on every re-entry with a truthy test_report, so this loops at most
+    # MAX_TEST_RETRIES times before the exhausted arms below take over.
+    if _contract_bad:
+        _retry_now = int(state.get("test_retry_count", 0) or 0)
+        if _retry_now >= MAX_TEST_RETRIES or is_final_attempt:
+            if state.get("skip_approvals", False):
+                logger.error(
+                    "route_after_testing: CLI contract violation + retries "
+                    "exhausted + skip_approvals → cleanup (honest failure)"
+                )
+                return "cleanup"
+            logger.error(
+                "route_after_testing: CLI contract violation + retries "
+                "exhausted → human_approval"
+            )
+            return "human_approval"
+        logger.info(
+            "route_after_testing: CLI contract violation → code_writer "
+            "(targeted fix, retry %d/%d)",
+            _retry_now + 1, MAX_TEST_RETRIES,
+        )
+        return "code_writer"
 
     if is_final_attempt:
         logger.error(

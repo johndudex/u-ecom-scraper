@@ -141,16 +141,7 @@ Save to: `workspace/{site_slug}/test_report.json`
   "overall_assessment": "PASS|NEEDS_FIXES|FAIL",
   "confidence_score": 0.0-1.0,
   "ready_for_execution": true|false,
-  "feedback_for_writer": {
-    "summary": "Brief summary of issues",
-    "field_fixes": {
-      "field_name": {
-        "issue": "what's wrong",
-        "fix": "how to fix it",
-        "priority": "high|medium|low"
-      }
-    }
-  }
+  "feedback_for_writer": "Plain-text remediation instructions for code_writer (a STRING — the deterministic pipeline also writes here on contract violations; start with 'CLI CONTRACT VIOLATION:' when the scraper's argparse rejects an execution flag)"
 }
 ```
 
