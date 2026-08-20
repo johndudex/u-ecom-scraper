@@ -1,0 +1,1139 @@
+asyncapi: 3.0.0
+
+# ═══════════════════════════════════════════════════════════════════════════
+# REALTIME / EVENT LAYER — PARTNER-FACING API (DRAFT)
+#
+# Sibling of sync_api.draft.yaml (sync REST). Vocabulary is LOCKED to the sync
+# spec: job_id, user_id, states inprogress|sample_ready|scraper_ready|failed,
+# X-API-Key auth, base path /api/v1/jobs. Do not rename unilaterally.
+#
+# HONESTY FLAGS — read before implementing:
+#   x-status: live      — mechanism exists in the repo today (cited).
+#   x-status: planned   — designed here, NOT built. Do not code against it
+#                         assuming it exists.
+# No websocket server exists in this stack today. See servers.production-wss
+# and the transport phasing note in info.description.
+# ═══════════════════════════════════════════════════════════════════════════
+
+info:
+  title: Universal Ecommerce Scraper — Partner Event API
+  version: 0.1.0-draft
+  description: |
+    Events for asynchronous scrape jobs. Jobs run 10–60 minutes; partners can
+    either (a) give us a callback endpoint at submit time and we push events to
+    them, or (b) hold an inbound subscription and receive the same events.
+
+    ## Transport phasing (IMPORTANT — read before building a client)
+
+    **Phase 1 (what the spec promises for first release):**
+      1. **Outbound callbacks** over HTTPS. We POST each event, signed with
+         HMAC-SHA256. At-least-once delivery, dedupe by `event_id`.
+      2. **Inbound subscription over SSE**, not WSS. The Redis pub/sub → SSE
+         bridge is the ONLY live realtime mechanism in the codebase today
+         (`webapp/scraper/views.py:1123` `job_events`, fed by
+         `webapp/scraper/services.py:460` `_publish_redis`). It carries the
+         same event payloads defined here, but framed as SSE, not WS frames.
+
+    **Phase 2 (declared here, not yet built):** a WSS gateway so partners
+    subscribe over `wss://` as originally requested. The `production-wss`
+    server, the `jobs` WS channel, and its control messages below are the
+    contract for that gateway. The server stack has NO websocket support
+    today — no `channels`/`daphne` in `webapp/requirements.txt`, no Channels
+    in `INSTALLED_APPS` (`webapp/config/settings.py:37`), stock
+    `get_asgi_application()` with no ProtocolTypeRouter
+    (`webapp/config/asgi.py:13`), and the web tier is gunicorn/WSGI
+    (`Dockerfile:40`). Phase 2 adds one small ASGI gateway service (the
+    FastAPI+uvicorn pattern already proven by browser_service and
+    file-master); it does NOT convert the Django service to ASGI.
+
+    ## WS auth token exchange (because browsers cannot set headers)
+
+    The browser `WebSocket` API cannot send `X-API-Key`. Non-browser clients
+    MAY authenticate the handshake with `X-API-Key` directly. Browser clients
+    MUST first call the sync endpoint:
+
+        POST /api/v1/ws-token        (header: X-API-Key)
+        -> 201 { "token": "...", "expires_in": 300,
+                 "connect_url": "/ws/v1/jobs?token=..." }
+
+    The token is short-lived (300 s) and single-use; it is passed as the
+    `token` query parameter on connect. Query-param tokens can leak into
+    access logs — the 5-minute TTL and single-use nonce bound that exposure.
+    This exchange endpoint belongs to the sibling OpenAPI spec; it is
+    documented here because it is load-bearing for the WS server.
+
+    ## State model (shared with the sync spec — do not fork)
+
+    Partners observe exactly four states:
+
+        inprogress -> sample_ready -> scraper_ready
+             \____________> failed (from any state)
+
+    They are a PROJECTION of the eight internal `ScrapeJob` statuses
+    (`webapp/scraper/models.py:99-113`):
+
+    | internal                              | partner state  |
+    |---------------------------------------|----------------|
+    | pending, running                      | inprogress     |
+    | waiting_approval                      | inprogress (1) |
+    | (new) code_tester sample validated    | sample_ready   |
+    | (new) scraper promoted by cleanup     | scraper_ready  |
+    | failed, cancelled, captcha_blocked,   | failed         |
+    | akamai_blocked                        |                |
+
+    (1) Partner-submitted jobs run with approvals skipped (the `skip_approvals`
+    flag already exists, `webapp/scraper/models.py:151-153`), so
+    `waiting_approval` should never appear; if it does (budget escalation),
+    the job stays `inprogress` and a supplementary
+    `job.approval.required` event is emitted.
+
+    `sample_ready` and `scraper_ready` are NEW milestones — no such states
+    exist internally today. They are derived from phase events that DO exist:
+    the testing phase completing (`_notify_phase`, `webapp/agents/graph.py:888`)
+    and cleanup promoting the scraper (`webapp/agents/graph.py:3597-3603`).
+    Note the pipeline produces the FULL output (run_execution) BEFORE cleanup
+    promotes the scraper, so the `output` artifact event fires between
+    `sample_ready` and `scraper_ready`. `scraper_ready` is the terminal
+    success state.
+
+    ## Ownership
+
+    Every event envelope carries `user_id` (the API key's user). Subscriptions
+    and callbacks are rejected unless `job.user_id == key.user_id` — the same
+    owner check the internal UI enforces (`webapp/scraper/views.py:34-39`).
+    Internally `ScrapeJob.user` is nullable (`webapp/scraper/models.py:154`);
+    partner-facing endpoints MUST always set it — a null-owner job is
+    invisible to partner flows.
+
+defaultContentType: application/json
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SERVERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+servers:
+  production-wss:
+    host: api.example-scraper.internal
+    pathname: /ws/v1
+    protocol: wss
+    title: Partner WSS gateway
+    description: |
+      WebSocket subscription endpoint (Phase 2). Not live — no websocket
+      server exists in the stack today (see info.description). The URL,
+      channel addresses, control messages, and event payloads below are the
+      frozen contract for that gateway.
+    security:
+      - $ref: '#/components/securitySchemes/apiKeyHeader'
+      - $ref: '#/components/securitySchemes/wsTokenQuery'
+    x-status: planned
+    x-token-exchange:
+      method: POST
+      path: /api/v1/ws-token
+      auth: X-API-Key
+      token_ttl_seconds: 300
+      single_use: true
+
+  production-sse:
+    host: api.example-scraper.internal
+    pathname: /api/v1
+    protocol: https
+    title: SSE bridge (live today for the internal UI; partner exposure Phase 1)
+    description: |
+      Server-Sent Events fallback carrying the SAME envelope payloads over
+      `GET /api/v1/jobs/{job_id}/events`. Internally this view exists and is
+      live (`webapp/scraper/views.py:1123`, routed at
+      `webapp/scraper/urls.py:66`) but is session-authenticated for the web
+      UI; the partner variant adds X-API-Key auth and the envelope framing
+      defined here. Use it until the WSS gateway ships; the event JSON is
+      byte-identical, so client deserialization code does not change.
+    security:
+      - $ref: '#/components/securitySchemes/apiKeyHeader'
+    x-status: live-internal
+    x-bridge-notes: |
+      SSE framing today: named `event: status` / `event: done` frames plus
+      unnamed `data:` frames that are raw Redis pub/sub passthrough. The
+      partner variant wraps every payload in the EventEnvelope of this spec.
+      No `id:` / `Last-Event-ID` support exists — SSE here is LIVE-ONLY with
+      no replay (verified: no id/retry fields emitted). Reconnect strategy:
+      re-GET the stream, then reconcile via the sync job endpoint.
+
+  partner-callback:
+    host: '{callback_host}'
+    protocol: '{callback_scheme}'
+    title: Partner callback endpoint (we are the CLIENT)
+    description: |
+      Informational pseudo-server: the URL the partner supplied at submit
+      time. We connect OUT to it and POST (https, Phase 1) or open an
+      outbound WebSocket (wss, Phase 2) and push events. Variables are bound
+      per-job from the `callback` object on POST /api/v1/jobs.
+      wss:// callbacks require an always-on outbound WS client, which does
+      not fit the Celery worker model well — Phase 1 supports https
+      callbacks only; wss callbacks arrive with the Phase 2 gateway.
+    variables:
+      callback_host:
+        description: Host of the partner-supplied callback URL.
+      callback_scheme:
+        description: "https (Phase 1) or wss (Phase 2)."
+        enum: ['https', 'wss']
+        default: 'https'
+    x-status: live-planned-https
+    x-security: |
+      We authenticate TO the partner with an HMAC-SHA256 signature header.
+      Partners cannot IP-allowlist us (Railway egress IPs are not static), so
+      the signature is the primary proof of authenticity. See the
+      deliverCallback operation.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CHANNELS
+# ═══════════════════════════════════════════════════════════════════════════
+
+channels:
+  jobs:
+    address: /ws/v1/jobs
+    title: Job event subscription
+    summary: One multiplexed WS connection; subscribe/unsubscribe by job_id.
+    description: |
+      A single connection per client. The client subscribes to jobs with
+      `subscribe` control messages; the server confirms with
+      `subscribe.ack` (which carries a state snapshot for late joiners) and
+      then streams `job.*` events and `heartbeat.ping` frames.
+
+      Why one multiplexed endpoint rather than per-job URLs
+      (`/ws/v1/jobs/{job_id}`): partners fan out many jobs per API key; N
+      per-job connections cost N handshakes, N proxy slots, and N auth
+      token exchanges. A single authenticated connection with cheap
+      subscribe messages scales to a partner's whole job history, and the
+      same `job_id` scoping rule applies per subscription.
+    servers:
+      - $ref: '#/servers/production-wss'
+    messages:
+      Subscribe:
+        $ref: '#/components/messages/Subscribe'
+      Unsubscribe:
+        $ref: '#/components/messages/Unsubscribe'
+      SubscribeAck:
+        $ref: '#/components/messages/SubscribeAck'
+      SubscribeNack:
+        $ref: '#/components/messages/SubscribeNack'
+      UnsubscribeAck:
+        $ref: '#/components/messages/UnsubscribeAck'
+      HeartbeatPing:
+        $ref: '#/components/messages/HeartbeatPing'
+      HeartbeatPong:
+        $ref: '#/components/messages/HeartbeatPong'
+      JobCreated:
+        $ref: '#/components/messages/JobCreated'
+      JobInprogress:
+        $ref: '#/components/messages/JobInprogress'
+      JobSampleReady:
+        $ref: '#/components/messages/JobSampleReady'
+      JobScraperReady:
+        $ref: '#/components/messages/JobScraperReady'
+      JobFailed:
+        $ref: '#/components/messages/JobFailed'
+      JobPhaseUpdated:
+        $ref: '#/components/messages/JobPhaseUpdated'
+      JobArtifactAvailable:
+        $ref: '#/components/messages/JobArtifactAvailable'
+      JobApprovalRequired:
+        $ref: '#/components/messages/JobApprovalRequired'
+      JobLogAppended:
+        $ref: '#/components/messages/JobLogAppended'
+      ProtocolError:
+        $ref: '#/components/messages/ProtocolError'
+    x-status: planned
+
+  jobEventsSse:
+    address: /api/v1/jobs/{job_id}/events
+    title: Per-job SSE feed (Phase 1 bridge)
+    description: |
+      Server-Sent Events variant of the same feed, one stream per job, no
+      subscribe messages (the job is in the URL). Emits the identical
+      EventEnvelope JSON as the `data:` payload of each SSE frame. This is
+      the transport that exists today internally; exposing it to partners
+      (X-API-Key + owner check + envelope framing) is a small change to the
+      existing view, not new infrastructure.
+      KEEPALIVE (critique fix): intermediary proxies idle-kill silent
+      streams — a documented gunicorn WORKER-TIMEOUT storm already hit
+      /jobs/1/events/. The partner-facing view MUST emit a
+      `: ping` comment frame (or an heartbeat.ping envelope) at least every
+      30 s of silence, and SHOULD set SSE `retry:` on connect. Clients
+      should auto-reconnect with backoff; SSE here is live-only (no
+      Last-Event-ID replay) until Phase 2.5.
+    servers:
+      - $ref: '#/servers/production-sse'
+    parameters:
+      job_id:
+        description: Numeric ScrapeJob id (same identifier as the sync API).
+        location: $message.payload#/job_id
+        schema:
+          type: integer
+    messages:
+      JobCreated:
+        $ref: '#/components/messages/JobCreated'
+      JobInprogress:
+        $ref: '#/components/messages/JobInprogress'
+      JobSampleReady:
+        $ref: '#/components/messages/JobSampleReady'
+      JobScraperReady:
+        $ref: '#/components/messages/JobScraperReady'
+      JobFailed:
+        $ref: '#/components/messages/JobFailed'
+      JobPhaseUpdated:
+        $ref: '#/components/messages/JobPhaseUpdated'
+      JobArtifactAvailable:
+        $ref: '#/components/messages/JobArtifactAvailable'
+      JobApprovalRequired:
+        $ref: '#/components/messages/JobApprovalRequired'
+    x-status: live-internal
+
+  partnerCallback:
+    address: '#/callback'
+    title: Outbound event delivery to the partner
+    description: |
+      We are the APPLICATION (the sender); the partner's endpoint is the
+      server. Modeled as a channel we `send` on — the AsyncAPI 3 way to
+      describe a webhook-style outbound integration. Delivery is HTTPS POST
+      of one EventEnvelope per request (Phase 1). The partner replies 2xx to
+      accept; anything else (or a timeout) schedules a retry.
+    servers:
+      - $ref: '#/servers/partner-callback'
+    messages:
+      JobCreated:
+        $ref: '#/components/messages/JobCreated'
+      JobInprogress:
+        $ref: '#/components/messages/JobInprogress'
+      JobSampleReady:
+        $ref: '#/components/messages/JobSampleReady'
+      JobScraperReady:
+        $ref: '#/components/messages/JobScraperReady'
+      JobFailed:
+        $ref: '#/components/messages/JobFailed'
+      JobArtifactAvailable:
+        $ref: '#/components/messages/JobArtifactAvailable'
+    x-status: planned
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OPERATIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
+operations:
+  # ── Inbound WS: client → server control messages ──────────────────────
+  receiveSubscriptions:
+    action: receive
+    channel:
+      $ref: '#/channels/jobs'
+    title: Receive subscribe/unsubscribe/pong from the client
+    summary: The application consumes control messages.
+    security:
+      - $ref: '#/components/securitySchemes/apiKeyHeader'
+      - $ref: '#/components/securitySchemes/wsTokenQuery'
+    messages:
+      - $ref: '#/channels/jobs/messages/Subscribe'
+      - $ref: '#/channels/jobs/messages/Unsubscribe'
+      - $ref: '#/channels/jobs/messages/HeartbeatPong'
+    x-status: planned
+
+  # ── Inbound WS: server → client events ────────────────────────────────
+  sendJobEvents:
+    action: send
+    channel:
+      $ref: '#/channels/jobs'
+    title: Push job events to subscribed clients
+    summary: |
+      Fires for every subscribed job. Ordering per job_id is guaranteed by
+      `event_id` monotonicity (ULID); ordering ACROSS jobs is not. Delivery
+      is live-only in the first release — there is no replay buffer. A
+      client that reconnects re-subscribes and reconciles from the
+      `subscribe.ack` state snapshot plus the sync job endpoint. A Redis
+      Streams replay buffer (`since_event_id`) is the designated Phase 2.5
+      upgrade and is already accepted by the `subscribe` message shape.
+    security:
+      - $ref: '#/components/securitySchemes/apiKeyHeader'
+      - $ref: '#/components/securitySchemes/wsTokenQuery'
+    messages:
+      - $ref: '#/channels/jobs/messages/SubscribeAck'
+      - $ref: '#/channels/jobs/messages/SubscribeNack'
+      - $ref: '#/channels/jobs/messages/UnsubscribeAck'
+      - $ref: '#/channels/jobs/messages/HeartbeatPing'
+      - $ref: '#/channels/jobs/messages/JobCreated'
+      - $ref: '#/channels/jobs/messages/JobInprogress'
+      - $ref: '#/channels/jobs/messages/JobSampleReady'
+      - $ref: '#/channels/jobs/messages/JobScraperReady'
+      - $ref: '#/channels/jobs/messages/JobFailed'
+      - $ref: '#/channels/jobs/messages/JobPhaseUpdated'
+      - $ref: '#/channels/jobs/messages/JobArtifactAvailable'
+      - $ref: '#/channels/jobs/messages/JobApprovalRequired'
+      - $ref: '#/channels/jobs/messages/JobLogAppended'
+      - $ref: '#/channels/jobs/messages/ProtocolError'
+    x-status: planned
+    x-heartbeat: |
+      Server sends heartbeat.ping every 25 s of silence. Rationale: the
+      existing SSE feed has NO keepalive at all (verified — the internal
+      heartbeat mechanism at webapp/agents/graph.py:762 writes SessionLog
+      DB rows for the stuck-job watchdog, it does not emit transport
+      frames), so idle SSE connections are already exposed to proxy idle
+      timeouts during long quiet LLM phases. The WS gateway must not
+      repeat that mistake.
+
+  # ── SSE bridge ─────────────────────────────────────────────────────────
+  streamJobEventsSse:
+    action: send
+    channel:
+      $ref: '#/channels/jobEventsSse'
+    title: Stream per-job events over SSE
+    summary: |
+      The stream opens with the current state (the internal view already
+      emits an initial `status` frame, webapp/scraper/views.py:1141) and
+      closes after the terminal event (the internal view synthesizes
+      `done`, webapp/scraper/views.py:1145). Live-only, no replay.
+    security:
+      - $ref: '#/components/securitySchemes/apiKeyHeader'
+    messages:
+      - $ref: '#/channels/jobEventsSse/messages/JobCreated'
+      - $ref: '#/channels/jobEventsSse/messages/JobInprogress'
+      - $ref: '#/channels/jobEventsSse/messages/JobSampleReady'
+      - $ref: '#/channels/jobEventsSse/messages/JobScraperReady'
+      - $ref: '#/channels/jobEventsSse/messages/JobFailed'
+      - $ref: '#/channels/jobEventsSse/messages/JobPhaseUpdated'
+      - $ref: '#/channels/jobEventsSse/messages/JobArtifactAvailable'
+      - $ref: '#/channels/jobEventsSse/messages/JobApprovalRequired'
+    x-status: live-internal
+
+  # ── Outbound callback: WE send, partner receives ──────────────────────
+  deliverCallback:
+    action: send
+    channel:
+      $ref: '#/channels/partnerCallback'
+    title: Deliver events to the partner callback endpoint
+    summary: |
+      One EventEnvelope per POST request (https, Phase 1). The partner
+      responds 2xx to accept. Non-2xx or timeout (10 s connect / 10 s read)
+      schedules a retry.
+    description: |
+      ## Delivery semantics — at-least-once
+
+      Retries: 5 attempts, exponential backoff 10 s, 1 m, 10 m, 1 h, 6 h.
+      `event_id` is stable across retries; partners MUST dedupe on it.
+      Events are delivered in order per job while healthy, but retries can
+      reorder across jobs and (rarely) within a job during failover —
+      partners should treat `event_id` ordering, not arrival order, as
+      authoritative.
+
+      ## Disabled-callback policy
+
+      After the final failed attempt the callback is marked disabled
+      (`status: "disabled"`, `disabled_reason`, `last_failure` — visible on
+      the job in the sync API as `callback`), event delivery for that job
+      stops, and the data remains fetchable via the sync endpoints forever.
+      Re-enabling is an explicit partner action (PATCH the job's callback).
+
+      ## Security — how we authenticate TO the partner
+
+      Partners cannot IP-allowlist us, so every request is signed:
+
+          X-Scraper-Signature: t=<unix_ts>,v1=<hex hmac_sha256("<t>." + raw_body, callback_secret)>
+          X-Scraper-Event-Id:  <event_id>
+          X-Scraper-Job-Id:    <job_id>
+
+      The partner verifies by recomputing the HMAC over
+      `"<t>." + request_body` with the secret they registered, then
+      rejecting stale timestamps (recommend ±300 s) to defeat replay. The
+      secret is supplied once at callback registration, stored hashed at
+      rest, and never appears in events or logs.
+
+      ## Dispatcher implementation note
+
+      Follows the pattern the beat scheduler already runs
+      (CELERY_BEAT_SCHEDULE, webapp/config/settings.py:150 — three periodic
+      watchdogs at 300 s): a `dispatch_pending_callbacks` beat task drains
+      an outbox table (NEW MODEL + migration — nothing comparable exists in scraper/models.py today; must be built with Phase 1), and a `deliver_callback` task with
+      `autoretry_for`/`retry_backoff` performs each POST. Events enter the
+      outbox at publish time alongside the existing Redis publish hook
+      (`LangGraphService._publish_redis`, webapp/scraper/services.py:460),
+      which gives at-least-once semantics for free (outbox row survives
+      worker death; Redis fan-out does not).
+    messages:
+      - $ref: '#/channels/partnerCallback/messages/JobCreated'
+      - $ref: '#/channels/partnerCallback/messages/JobInprogress'
+      - $ref: '#/channels/partnerCallback/messages/JobSampleReady'
+      - $ref: '#/channels/partnerCallback/messages/JobScraperReady'
+      - $ref: '#/channels/partnerCallback/messages/JobFailed'
+      - $ref: '#/channels/partnerCallback/messages/JobArtifactAvailable'
+    x-status: planned
+    x-signature-header: X-Scraper-Signature
+    x-retry:
+      attempts: 5
+      backoff: [10s, 1m, 10m, 1h, 6h]
+      timeout: {connect: 10s, read: 10s}
+      on_exhaustion: disable_callback
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMPONENTS
+# ═══════════════════════════════════════════════════════════════════════════
+
+components:
+  securitySchemes:
+    apiKeyHeader:
+      type: httpApiKey
+      name: X-API-Key
+      in: header
+      description: |
+        Same key + same header as the sibling OpenAPI spec. Identifies the
+        partner user; `user_id` in every event envelope is derived from
+        this key.
+    wsTokenQuery:
+      type: httpApiKey
+      name: token
+      in: query
+      description: |
+        Short-lived (300 s), single-use token from POST /api/v1/ws-token —
+        the browser-compatible path, since the browser WebSocket API
+        cannot set headers. Non-browser clients should prefer
+        X-API-Key on the handshake.
+
+  schemas:
+    # ── Core shared vocabulary ────────────────────────────────────────────
+    JobState:
+      type: string
+      description: Partner-visible lifecycle state. Locked vocabulary,
+        shared with the sibling OpenAPI spec.
+      enum: [inprogress, sample_ready, scraper_ready, failed]
+
+    EventEnvelope:
+      type: object
+      description: |
+        Every event on every transport (WS frame, SSE data frame, callback
+        POST body) is this envelope. Transport framing differs; the JSON is
+        identical.
+      required: [event_id, type, occurred_at, job_id, user_id, data]
+      additionalProperties: false
+      properties:
+        event_id:
+          type: string
+          description: |
+            ULID. Monotonic per producer — lexicographic sort equals
+            causal order. Use for dedup (callbacks are at-least-once) and,
+            later, for `since_event_id` replay cursors.
+          examples: ['01JZQ3V8W2C4B6D8F0H2J4L6N8P']
+        type:
+          type: string
+          description: |
+            Event type. The four state events (`job.inprogress`,
+            `job.sample_ready`, `job.scraper_ready`, `job.failed`) map 1:1
+            to the JobState enum and are the only events a minimal partner
+            integration needs.
+          enum:
+            - job.created
+            - job.inprogress
+            - job.sample_ready
+            - job.scraper_ready
+            - job.failed
+            - job.phase.updated
+            - job.artifact.available
+            - job.approval.required
+            - job.log.appended
+        occurred_at:
+          type: string
+          format: date-time
+          description: When the transition happened server-side (ISO 8601, UTC).
+        job_id:
+          type: integer
+          description: Same identifier as the sync API (ScrapeJob pk).
+        user_id:
+          type: integer
+          description: |
+            The API key's user id. Customer-facing by requirement — present
+            in both the sync and the event flows. Events for a job whose
+            owner is not the subscriber are never delivered.
+        data:
+          type: object
+          description: Type-specific payload; one of the *Data schemas.
+
+    # ── Event payloads ────────────────────────────────────────────────────
+    JobCreatedData:
+      type: object
+      description: Emitted once, when POST /api/v1/jobs returns 202.
+      required: [state, url, content_type, input_mode]
+      properties:
+        state: { $ref: '#/components/schemas/JobState' }
+        previous_state: { type: 'null' }
+        url: { type: string, format: uri, description: Target site URL. }
+        content_type:
+          type: string
+          description: One of the 11 content page types (product, article,
+            job_posting, ...).
+          examples: [product, job_posting, article]
+        input_mode:
+          type: string
+          enum: [url_list, navigation, list_page, search_term]
+        search_criteria: { type: string, description: Query, for search modes. }
+        callback:
+          $ref: '#/components/schemas/CallbackStatus'
+      examples:
+        - state: inprogress
+          url: 'https://example-store.com/products/widget'
+          content_type: product
+          input_mode: url_list
+          callback:
+            url: 'https://partner.example/hooks/scraper'
+            status: active
+
+    StateChangeData:
+      type: object
+      description: |
+        Shared shape of the four state events. `sample_url` /
+        `scraper_code_url` echo the artifact URLs of the sync API (endpoints
+        3/4/5) so a partner can act on the state event alone.
+      required: [state, previous_state]
+      properties:
+        state: { $ref: '#/components/schemas/JobState' }
+        previous_state:
+          oneOf:
+            - $ref: '#/components/schemas/JobState'
+            - type: 'null'
+        reason:
+          type: string
+          description: |
+            Human-readable cause. On `job.failed` this is the job's
+            error_message (e.g. anti-bot block, timeout, no items found).
+        item_count:
+          type: integer
+          description: |
+            Substantive items extracted so far (internal product_count).
+            Present on sample_ready / scraper_ready.
+        sample_url: { type: string, description: Sync API sample endpoint (3). }
+        output_url: { type: string, description: Sync API full-output endpoint (4). }
+        scraper_code_url: { type: string, description: Sync API scraper-code endpoint (5). }
+
+    ArtifactDescriptor:
+      type: object
+      description: |
+        Big artifacts (full output, scraper code) are delivered BY
+        REFERENCE — url + integrity metadata. Full outputs reach tens of
+        thousands of records (a 26,742-item job exists in production
+        history) and have already caused OOM/hang incidents when moved as
+        blobs; pushing them through pub/sub + WS frames would repeat that.
+        Small artifacts (sample) are inlined.
+      required: [kind, url]
+      properties:
+        kind:
+          type: string
+          enum: [sample, output, scraper_code, dagster_code]
+        url:
+          type: string
+          description: |
+            RELATIVE path on the API host (e.g. /api/v1/jobs/{job_id}/output)
+            — fetch with the same X-API-Key header used everywhere else. No
+            pre-signed URLs, no token query params: the sync spec's endpoints
+            are the only artifact surface, so both specs share one auth model.
+            Backed by the File Master, surfaced through the Django proxy so
+            partners never touch internal services.
+        size_bytes: { type: integer }
+        sha256: { type: string, description: Hex digest for integrity checks. }
+        item_count:
+          type: integer
+          description: For sample/output — number of records inside.
+
+    ArtifactAvailableData:
+      type: object
+      description: |
+        Emitted for each of the three sync-API artifacts (3 sample, 4 full
+        output, 5 scraper code) plus dagster code when generated.
+        Ordering (corrected per critique — matches the real pipeline):
+        sample (at sample_ready) → scraper_code (promoted in-graph at
+        cleanup) → output (published by the finalizer AFTER the graph
+        ends; arrives with, never before, the terminal status event).
+        event_id order (ULID), not arrival order, is authoritative.
+      required: [artifact]
+      properties:
+        artifact: { $ref: '#/components/schemas/ArtifactDescriptor' }
+        records:
+          type: array
+          description: |
+            INLINE records — present ONLY when kind=sample. Samples are
+            single-URL extractions (a few KB); the internal UI already
+            NOTE (same backend addition the sync spec flags): structured
+            sample records do not exist today — persisting
+            scrapers/{slug}/samples/sample-{job_id}.json at
+            field_confirmation time is REQUIRED before this event can carry
+            records (field_confirmation.py:288-313 already holds them).
+            caps its preview the same way (webapp/scraper/views.py:972
+            _job_output_preview, first 3 records). Absent for output /
+            scraper_code — fetch via `artifact.url`.
+          items: { type: object, additionalProperties: true }
+
+    PhaseUpdatedData:
+      type: object
+      description: |
+        Fine-grained pipeline progress. Maps 1:1 to the internal `step`
+        pub/sub event (webapp/agents/graph.py:888) and the Step model. A
+        minimal partner ignores these and listens only to the four state
+        events.
+      required: [phase, phase_status]
+      properties:
+        phase:
+          type: string
+          description: Internal pipeline phase (site_analysis, testing,
+            cleanup, ...).
+        phase_status: { type: string, enum: [running, done, failed] }
+
+    ApprovalRequiredData:
+      type: object
+      description: |
+        The job paused for a human decision. Should NOT occur for partner
+        jobs (they run with skip_approvals, webapp/scraper/models.py:151);
+        surfaces only on budget escalation. Maps to the internal
+        `approval` event (webapp/scraper/services.py:365). Partner state
+        remains `inprogress`.
+      required: [approval_id, approval_type, question]
+      properties:
+        approval_id: { type: integer }
+        approval_type: { type: string }
+        question: { type: string }
+        options: { type: array, items: { type: string } }
+      examples:
+        - approval_id: 88
+          approval_type: budget_escalation
+          question: 'code_writer exhausted its budget — escalate?'
+          options: [escalate, cancel]
+
+    LogAppendedData:
+      type: object
+      description: |
+        Opt-in agent log tail (same batch shape as the internal `logs`
+        event, webapp/scraper/services.py:115 — seq-monotonic, ordered,
+        resumable via the sync logs endpoint with since_seq). Delivered
+        only to subscribers that requested it in `subscribe.events`.
+      required: [logs]
+      properties:
+        logs:
+          type: array
+          items:
+            type: object
+            required: [seq, role, content, created_at]
+            properties:
+              seq: { type: integer }
+              role: { type: string, enum: [user, assistant, tool, system] }
+              agent: { type: string }
+              content: { type: string }
+              created_at: { type: string, format: date-time }
+
+    CallbackStatus:
+      type: object
+      description: |
+        State of the submit-time callback, echoed in job.created and
+        readable via the sync API. `disabled` means delivery stopped after
+        retries were exhausted — data is still fetchable synchronously.
+      required: [url, status]
+      properties:
+        url: { type: string, format: uri }
+        status: { type: string, enum: [active, disabled] }
+        disabled_reason: { type: string }
+        last_failure: { type: string, format: date-time }
+
+    # ── WS control payloads ───────────────────────────────────────────────
+    SubscribeData:
+      type: object
+      description: |
+        Client → server. Also acts as the replay cursor request for the
+        Phase 2.5 buffer: if `since_event_id` is honored the server replays
+        buffered events after the ack; today (Phase 2.0) it is accepted
+        and answered from the state snapshot only.
+      required: [job_id]
+      additionalProperties: false
+      properties:
+        job_id: { type: integer }
+        events:
+          type: array
+          description: |
+            Filter. Default is the four state events plus
+            job.artifact.available. Add 'job.log.appended' for the agent
+            tail; add 'job.phase.updated' for per-phase progress.
+          items:
+            type: string
+            enum:
+              - job.inprogress
+              - job.sample_ready
+              - job.scraper_ready
+              - job.failed
+              - job.artifact.available
+              - job.phase.updated
+              - job.approval.required
+              - job.log.appended
+        since_event_id:
+          type: string
+          description: Optional replay cursor (Phase 2.5; ignored in 2.0).
+      examples:
+        - job_id: 345
+          events: [job.sample_ready, job.scraper_ready, job.failed,
+                   job.artifact.available]
+
+    SubscribeAckData:
+      type: object
+      description: |
+        Server → client. The snapshot is the late-joiner recovery
+        mechanism and the ONLY reconnect guarantee in the first releases
+        (no replay buffer): if the snapshot shows a terminal or advanced
+        state, skip waiting for events you already missed and fetch
+        artifacts via the sync API.
+      required: [job_id, state, snapshot]
+      properties:
+        job_id: { type: integer }
+        state: { $ref: '#/components/schemas/JobState' }
+        snapshot:
+          type: object
+          properties:
+            last_event_id: { type: string }
+            item_count: { type: integer }
+            sample_url: { type: string }
+            output_url: { type: string }
+            scraper_code_url: { type: string }
+      examples:
+        - job_id: 345
+          state: sample_ready
+          snapshot:
+            last_event_id: '01JZQ3V8W2C4B6D8F0H2J4L6N8P'
+            item_count: 5
+            sample_url: '/api/v1/jobs/345/sample'
+
+    NackData:
+      type: object
+      description: |
+        Rejected subscribe. `job_not_found` covers both missing jobs and
+        jobs owned by another user — the owner check mirrors the internal
+        `_get_job` rule (webapp/scraper/views.py:34-39).
+      required: [job_id, error_code, message]
+      properties:
+        job_id: { type: integer }
+        error_code:
+          type: string
+          enum: [job_not_found, token_expired, invalid_message]
+        message: { type: string }
+      examples:
+        - job_id: 345
+          error_code: job_not_found
+          message: 'job 345 belongs to another user'
+
+    HeartbeatData:
+      type: object
+      description: |
+        Server → client ping every 25 s of silence; client SHOULD pong.
+        App-level rather than WS protocol-level pings because intermediary
+        proxies terminate on their own idle timers regardless of protocol
+        ping visibility.
+      properties:
+        server_time: { type: string, format: date-time }
+      examples:
+        - server_time: '2026-08-20T09:15:00Z'
+
+    UnsubscribeData:
+      type: object
+      required: [job_id]
+      properties:
+        job_id: { type: integer }
+
+    ProtocolErrorData:
+      type: object
+      description: Malformed control message; the connection stays open.
+      required: [error_code, message]
+      properties:
+        error_code: { type: string }
+        message: { type: string }
+      examples:
+        - error_code: invalid_message
+          message: 'expected {job_id: integer}'
+
+  messages:
+    # ── Control ───────────────────────────────────────────────────────────
+    Subscribe:
+      name: subscribe
+      title: Subscribe to a job's events
+      payload:
+        type: object
+        required: [op, data]
+        properties:
+          op: { type: string, const: subscribe }
+          data: { $ref: '#/components/schemas/SubscribeData' }
+      examples:
+        - payload:
+            op: subscribe
+            data: { job_id: 345, events: [job.scraper_ready, job.failed] }
+
+    Unsubscribe:
+      name: unsubscribe
+      title: Stop receiving a job's events
+      payload:
+        type: object
+        required: [op, data]
+        properties:
+          op: { type: string, const: unsubscribe }
+          data: { $ref: '#/components/schemas/UnsubscribeData' }
+
+    SubscribeAck:
+      name: subscribe.ack
+      title: Subscription confirmed
+      payload:
+        type: object
+        required: [op, data]
+        properties:
+          op: { type: string, const: subscribe.ack }
+          data: { $ref: '#/components/schemas/SubscribeAckData' }
+
+    SubscribeNack:
+      name: subscribe.nack
+      title: Subscription rejected
+      payload:
+        type: object
+        required: [op, data]
+        properties:
+          op: { type: string, const: subscribe.nack }
+          data: { $ref: '#/components/schemas/NackData' }
+
+    UnsubscribeAck:
+      name: unsubscribe.ack
+      title: Unsubscription confirmed
+      payload:
+        type: object
+        properties:
+          op: { type: string, const: unsubscribe.ack }
+          data: { $ref: '#/components/schemas/UnsubscribeData' }
+
+    HeartbeatPing:
+      name: heartbeat.ping
+      title: Server keepalive
+      payload:
+        type: object
+        properties:
+          op: { type: string, const: heartbeat.ping }
+          data: { $ref: '#/components/schemas/HeartbeatData' }
+
+    HeartbeatPong:
+      name: heartbeat.pong
+      title: Client keepalive response
+      payload:
+        type: object
+        properties:
+          op: { type: string, const: heartbeat.pong }
+          data: { $ref: '#/components/schemas/HeartbeatData' }
+
+    ProtocolError:
+      name: error
+      title: Control-plane error
+      payload:
+        type: object
+        properties:
+          op: { type: string, const: error }
+          data: { $ref: '#/components/schemas/ProtocolErrorData' }
+
+    # ── The four state events (core contract, shared by ALL transports) ──
+    JobCreated:
+      name: job.created
+      title: Job accepted
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type: { const: job.created }
+              data: { $ref: '#/components/schemas/JobCreatedData' }
+      examples:
+        - payload:
+            event_id: '01JZQ3V8W2C4B6D8F0H2J4L6N8P'
+            type: job.created
+            occurred_at: '2026-08-20T09:00:00Z'
+            job_id: 345
+            user_id: 12
+            data:
+              state: inprogress
+              url: 'https://example-store.com/products/widget'
+              content_type: product
+              input_mode: url_list
+              callback:
+                url: 'https://partner.example/hooks/scraper'
+                status: active
+
+    JobInprogress:
+      name: job.inprogress
+      title: Job entered inprogress
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type: { const: job.inprogress }
+              data: { $ref: '#/components/schemas/StateChangeData' }
+      examples:
+        - payload:
+            event_id: '01JZQ3W0K2M4N6P8R0T2V4X6Z8A'
+            type: job.inprogress
+            occurred_at: '2026-08-20T09:00:41Z'
+            job_id: 345
+            user_id: 12
+            data: { state: inprogress, previous_state: null }
+
+    JobSampleReady:
+      name: job.sample_ready
+      title: Sample extraction validated
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type: { const: job.sample_ready }
+              data: { $ref: '#/components/schemas/StateChangeData' }
+      examples:
+        - payload:
+            event_id: '01JZQ3Y4C6E8G0I2K4M6O8Q0S2U'
+            type: job.sample_ready
+            occurred_at: '2026-08-20T09:14:02Z'
+            job_id: 345
+            user_id: 12
+            data:
+              state: sample_ready
+              previous_state: inprogress
+              item_count: 5
+              sample_url: '/api/v1/jobs/345/sample'
+
+    JobScraperReady:
+      name: job.scraper_ready
+      title: Scraper promoted + full output available (terminal success)
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type: { const: job.scraper_ready }
+              data: { $ref: '#/components/schemas/StateChangeData' }
+      examples:
+        - payload:
+            event_id: '01JZQ428M6O8Q0S2U4W6Y8A0C2E'
+            type: job.scraper_ready
+            occurred_at: '2026-08-20T09:47:19Z'
+            job_id: 345
+            user_id: 12
+            data:
+              state: scraper_ready
+              previous_state: sample_ready
+              item_count: 1284
+              output_url: '/api/v1/jobs/345/output'
+              scraper_code_url: '/api/v1/jobs/345/scraper-code'
+
+    JobFailed:
+      name: job.failed
+      title: Job failed (terminal)
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type: { const: job.failed }
+              data: { $ref: '#/components/schemas/StateChangeData' }
+      examples:
+        - payload:
+            event_id: '01JZQ430A2C4E6G8I0K2M4O6Q8S'
+            type: job.failed
+            occurred_at: '2026-08-20T09:31:55Z'
+            job_id: 346
+            user_id: 12
+            data:
+              state: failed
+              previous_state: inprogress
+              reason: 'code generation failed after 3 attempts'
+
+    # ── Supplementary events ──────────────────────────────────────────────
+    JobPhaseUpdated:
+      name: job.phase.updated
+      title: Pipeline phase transitioned
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type: { const: job.phase.updated }
+              data: { $ref: '#/components/schemas/PhaseUpdatedData' }
+      examples:
+        - payload:
+            event_id: '01JZQ3X6S8U0W2Y4A6C8E0G2I4K'
+            type: job.phase.updated
+            occurred_at: '2026-08-20T09:08:11Z'
+            job_id: 345
+            user_id: 12
+            data: { phase: code_generation, phase_status: running }
+
+    JobArtifactAvailable:
+      name: job.artifact.available
+      title: Artifact ready to fetch (or inlined, for samples)
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type: { const: job.artifact.available }
+              data: { $ref: '#/components/schemas/ArtifactAvailableData' }
+      examples:
+        - payload:
+            event_id: '01JZQ3Y6G8I0K2M4O6Q8S0U2W4Y'
+            type: job.artifact.available
+            occurred_at: '2026-08-20T09:14:05Z'
+            job_id: 345
+            user_id: 12
+            data:
+              artifact:
+                kind: sample
+                url: '/api/v1/jobs/345/sample'
+                item_count: 5
+              records:
+                - title: 'Widget Pro'
+                  price: '29.99'
+                  currency: 'USD'
+                  availability: 'InStock'
+        - payload:
+            event_id: '01JZQ426O0Q2S4U6W8Y0A2C4E6'
+            type: job.artifact.available
+            occurred_at: '2026-08-20T09:41:03Z'
+            job_id: 345
+            user_id: 12
+            data:
+              artifact:
+                kind: output
+                url: '/api/v1/jobs/345/output'
+                size_bytes: 4821933
+                sha256: '9f2c...e1'
+                item_count: 1284
+
+    JobApprovalRequired:
+      name: job.approval.required
+      title: Human decision needed (should not occur for partner jobs)
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type: { const: job.approval.required }
+              data: { $ref: '#/components/schemas/ApprovalRequiredData' }
+
+    JobLogAppended:
+      name: job.log.appended
+      title: Agent log batch (opt-in)
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type: { const: job.log.appended }
+              data: { $ref: '#/components/schemas/LogAppendedData' }
+      examples:
+        - payload:
+            event_id: '01JZQ3V9A0B2C4D6E8F0G2H4I6K'
+            type: job.log.appended
+            occurred_at: '2026-08-20T09:00:12Z'
+            job_id: 345
+            user_id: 12
+            data:
+              logs:
+                - seq: 14
+                  role: assistant
+                  agent: site-analyzer
+                  content: 'Platform detected: Shopify. Method: api.'
+                  created_at: '2026-08-20T09:00:12Z'

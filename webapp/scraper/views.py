@@ -2789,3 +2789,74 @@ def learnt_skill_delete(request, skill_name):
     else:
         messages.error(request, result.get("error", "delete failed"))
     return redirect("learnt_skills")
+
+
+# ── Partner API specification documents (login-gated) ────────────────────────
+
+_SPECS_DIR = os.path.join(settings.PROJECT_ROOT, "docs", "specs")
+_SPEC_FILES = {"sync": "sync_api.yaml", "async": "async_api.yaml"}
+
+
+def _serve_spec(request, which: str):
+    """Serve an API spec YAML. Login required (enforced by the callers) — these
+    documents are for the internal team + partners under NDA, not public.
+
+    ?format=json renders a simple HTML preview with syntax-highlighted YAML;
+    the default returns the raw file (downloadable, tool-ingestible).
+    """
+    fname = _SPEC_FILES.get(which)
+    if not fname:
+        raise Http404("unknown spec")
+    path = os.path.join(_SPECS_DIR, fname)
+    if not os.path.isfile(path):
+        raise Http404(f"spec file missing: {fname}")
+    with open(path, "r", encoding="utf-8") as fh:
+        content = fh.read()
+    if request.GET.get("format") == "html":
+        from django.utils.html import escape
+
+        sibling = "async" if which == "sync" else "sync"
+        ctx = {
+            "spec_name": "Sync API (OpenAPI 3.1)" if which == "sync" else "Event API (AsyncAPI 3.0)",
+            "spec_yaml": content,
+            "raw_url": f"/docs/{which}_api/",
+            "sibling_url": f"/docs/{sibling}_api/",
+            "line_count": content.count("\n") + 1,
+        }
+        # Render via a minimal inline template (no new template file needed).
+        html = (
+            "{% extends 'scraper/base.html' %}{% block title %}{{ spec_name }}{% endblock %}"
+            "{% block content %}"
+            "<div style='max-width:1100px;margin:0 auto;padding:1.5rem;'>"
+            "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;'>"
+            "<h1 style='color:#F1F5F9;font-size:1.25rem;'>{{ spec_name }}</h1>"
+            "<div><a href='{{ raw_url }}' style='color:#22D3EE;font-size:.8rem;'>raw YAML</a> "
+            "&nbsp;|&nbsp; <a href='{{ sibling_url }}?format=html' style='color:#22D3EE;font-size:.8rem;'>sibling spec</a></div>"
+            "</div>"
+            "<p style='color:#94A3B8;font-size:.8rem;margin-bottom:1rem;'>{{ line_count }} lines · login-gated ·"
+            " paste into <a href='https://editor.swagger.io/' style='color:#22D3EE;'>swagger editor</a> or"
+            " <a href='https://studio.asyncapi.com/' style='color:#22D3EE;'>asyncapi studio</a> for full rendering</p>"
+            "<pre style='background:#0B1120;color:#CBD5E1;border:1px solid #1E293B;border-radius:.75rem;"
+            "padding:1rem;font-size:.72rem;line-height:1.5;max-height:75vh;overflow:auto;"
+            "white-space:pre-wrap;word-break:break-word;'>{{ spec_yaml }}</pre></div>"
+            "{% endblock %}"
+        )
+        from django.template import engines
+
+        template = engines["django"].from_string(html)
+        return HttpResponse(template.render(ctx, request))
+    resp = HttpResponse(content, content_type="application/yaml; charset=utf-8")
+    resp["Content-Disposition"] = f'inline; filename="{fname}"'
+    return resp
+
+
+@login_required
+def docs_sync_api(request):
+    """Partner sync API spec (OpenAPI 3.1). Logged-in users only."""
+    return _serve_spec(request, "sync")
+
+
+@login_required
+def docs_async_api(request):
+    """Partner event/callback spec (AsyncAPI 3.0). Logged-in users only."""
+    return _serve_spec(request, "async")

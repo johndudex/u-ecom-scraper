@@ -1,0 +1,1897 @@
+openapi: 3.1.0
+jsonSchemaDialect: "https://json-schema.org/draft/2020-12/schema"
+
+# =============================================================================
+# Universal Ecommerce Scraper — Partner-Facing SYNC API (DRAFT v0.1)
+# =============================================================================
+# Status: DRAFT for critique round. Not yet implemented. Derived from the live
+# codebase on branch file-master-artifacts (evidence cited per-field below as
+# file:line). This is a SPEC, not a description of existing endpoints: every
+# path here is NEW and lives under /api/v1/*, backed by thin wrappers around
+# existing internal logic.
+#
+# Design notes (full rationale in the accompanying design message):
+#
+# 1. SYNC-STYLED OVER AN ASYNC CORE. Jobs run 10-60 min. This API exposes the
+#    async pipeline as a synchronous-looking resource: create -> poll a 4-state
+#    status -> fetch artifacts. No websockets, no SSE here (the AsyncAPI
+#    sibling spec owns push/callback delivery; `callback_url` on create is
+#    ACCEPTED here but its delivery contract is defined there).
+#
+# 2. THE 4 STATES AND WHAT ACTUALLY PRODUCES THEM (see JobState description
+#    for the full derivation table):
+#      inprogress    — ScrapeJob.status in {pending, running, waiting_approval}
+#                      and no sample artifact yet.
+#      sample_ready  — testing phase done, a sample artifact is resolvable.
+#                      *** LOUD CAVEAT ***: today the pipeline does NOT persist
+#                      structured sample records anywhere a partner API can
+#                      read them. What exists at that point in the run:
+#                        - Step(phase="testing", status="done")
+#                          (webapp/agents/graph.py:870 _notify_phase)
+#                        - test_report.json published to the File Master at
+#                          scrapers/{slug}/analysis/test_report.json
+#                          (webapp/agents/graph.py:586-603 _preserve_test_report)
+#                          — structured field coverage, but NO sample records
+#                          (code_tester never populates sample_products /
+#                          sample_output; see route_after_testing.py:181-186).
+#                        - a SessionLog row (agent="field_confirmation",
+#                          content="Sample output presented for review:...")
+#                          with up to 5 items as a TRUNCATED TEXT blob
+#                          (webapp/agents/nodes/field_confirmation.py:510-527).
+#                      SERVING THIS ENDPOINT WITH STRUCTURED RECORDS REQUIRES A
+#                      SMALL BACKEND ADDITION: persist the testing-phase output
+#                      records (or field_confirmation's items) as JSON to the
+#                      File Master at a deterministic per-job key, e.g.
+#                      scrapers/{slug}/samples/sample-{job_id}.json. The spec
+#                      below assumes that addition; until it lands, GET /sample
+#                      would have to serve the text blob or 409.
+#      scraper_ready — ScrapeJob.status == completed (terminal success). The
+#                      scraper is promoted by cleanup
+#                      (webapp/agents/graph.py:973-1018 _promote_scraper; per-job
+#                      copy at scrapers/{slug}/jobs/scraper-{job_id}.py +
+#                      production scrapers/{slug}/scraper.py on SUCCESS) and the
+#                      full output is published by the finalizer
+#                      (webapp/scraper/tasks.py:798-819).
+#      failed        — ScrapeJob.status in {failed, cancelled, captcha_blocked,
+#                      akamai_blocked}. Cancelled/blocked are folded into failed
+#                      with a machine-readable `failure.code` (see open
+#                      questions if a 5th state is preferred).
+#
+# 3. MULTI-TENANCY. Every job is scoped to the API key's owning user
+#    (ScrapeJob.user, webapp/scraper/models.py:156-159). Cross-tenant reads are
+#    404 (not 403) so job ids cannot be enumerated across tenants.
+#
+# 4. ERROR MODEL. The existing internal convention is JsonResponse with an
+#    {"error": "<string>"} body (21 occurrences in webapp/scraper/views.py) and
+#    only sometimes a real status code. This API keeps the familiar key names
+#    but upgrades to a single structured error object + real HTTP status codes
+#    everywhere (401/403/404/409/422/500). See the Error schema.
+#
+# 5. BIG OUTPUTS. Full outputs reach 26,742 items / 101 MB (ayahealthcare run,
+#    scrapers/ayahealthcare-com/output_2026-07-19_201912.json). Endpoint 4 is
+#    window-paginated over the item array; a separate /download path streams
+#    the raw file. The sample endpoint is never paginated (samples are <= 5
+#    records; field_confirmation.py:23 FIELD_CONFIRMATION_SAMPLE_COUNT = 5).
+# =============================================================================
+
+info:
+  title: Universal Ecommerce Scraper — Partner API
+  version: 0.1.0-draft
+  summary: Synchronous partner API to create scrape jobs and retrieve samples, full outputs, and generated scraper code.
+  description: |
+    A partner-facing, sync-styled HTTP JSON API over the scraper pipeline.
+
+    **Model of use**
+
+    1. `POST /api/v1/jobs` with everything the /intake UI takes. You get a
+       `job_id` back immediately (HTTP 202).
+    2. Poll `GET /api/v1/jobs/{job_id}` until `state` is terminal
+       (`scraper_ready` or `failed`). Typical wall-clock: 10-60 minutes.
+       While the extractor is being built and validated, `state` flips to
+       `sample_ready` — at that point `GET .../sample` returns a small set of
+       extracted records you can show a user before the full run completes.
+    3. On `scraper_ready`: `GET .../output` (paginated) or
+       `GET .../output/download` (raw file) for the full dataset, and
+       `GET .../scraper-code` for the generated Python scraper.
+
+    **Guarantees**
+
+    - `scraper_ready` implies the full output and the scraper code are both
+      resolvable (with the degenerate exception documented on the state —
+      a completed 0-item run still reports `scraper_ready` with
+      `item_count: 0`; check `output_available` / `scraper_available` flags).
+    - `failed` does NOT imply no data. A run can fail at the full-execution
+      stage after the testing stage produced good records; `GET .../sample`
+      and `GET .../output` still return whatever exists (else 404).
+    - Jobs are private to the API key that created them. Reading another
+      tenant's job id returns 404.
+
+    **Callbacks / streaming — out of scope here**
+
+    An optional `callback_url` may be supplied at create time; its delivery
+    semantics (retries, signing, payload shape, SSE/WebSocket channels) are
+    specified in the companion AsyncAPI document, NOT in this file. This API
+    only stores the URL.
+  contact:
+    name: Scraper Platform Team
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Internal
+
+# Paths are relative to the deployment root. The Django app mounts the scraper
+# app at "/" (webapp/config/urls.py), so /api/v1/* is a fresh namespace that
+# does not collide with the existing UI routes (webapp/scraper/urls.py).
+servers:
+  - url: /
+    description: Same-origin (Django web app + API). Railway deployment serves this at https://<app>.up.railway.app/.
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: jobs
+    description: Create, list, inspect, and cancel scrape jobs.
+  - name: artifacts
+    description: Retrieve job artifacts — sample records, the full scraped output, and the generated scraper code.
+  - name: intake-helpers
+    description: Optional pure helpers mirroring the /intake UI's pre-submit checks. Recommended ONLY for validate-schema (see GET/POST notes); check-site is deliberately NOT exposed (cross-tenant data leak — see design rationale).
+
+paths:
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1. CREATE JOB
+  # ─────────────────────────────────────────────────────────────────────────
+  /api/v1/check-site:
+    post:
+      tags: [jobs]
+      operationId: checkSite
+      summary: Scope-limited site pre-check
+      description: |
+        Answers "has this site been scraped before" WITHOUT the cross-tenant
+        leak that excluded the internal `intake_check_site` (which reads
+        every user's target_fields for the host — views.py:2331-2337).
+        Returns Site-level metadata only — no field names, no other
+        tenants' data. Pure read; no side effects.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  format: uri
+                  example: "https://www.rmwilliams.com.au/"
+      responses:
+        "200":
+          description: Site knowledge summary (scope-limited).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [known_site]
+                properties:
+                  known_site:
+                    type: boolean
+                    description: A Site record exists for this host.
+                  platform:
+                    type: [string, "null"]
+                    description: Detected platform (e.g. "Salesforce Commerce Cloud (Demandware)"), null when unknown.
+                    example: "Salesforce Commerce Cloud (Demandware)"
+                  content_type:
+                    type: [string, "null"]
+                    description: Last-scraped content type on record, null when unknown.
+                    example: "product"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+  /api/v1/jobs:
+    post:
+      tags: [jobs]
+      operationId: createJob
+      summary: Create a scrape job (everything /intake takes)
+      description: |
+        JSON-body equivalent of the /intake form's create-job endpoint
+        (`intake_create_job`, webapp/scraper/views.py:2503-2629). Creates a
+        `ScrapeJob` row and dispatches the full LangGraph pipeline via
+        Celery (`run_scrape_task`); returns immediately.
+
+        **Field mapping from the /intake multipart form**
+
+        | Form field (multipart string)         | API field (JSON)      | Notes |
+        |----------------------------------------|-----------------------|-------|
+        | `url`                                  | `url`                 | Same. Required. A sample ITEM page, not a homepage. |
+        | `nav_method` = `list`/`listing`/`search` | `input_mode` = `url_list`/`list_page`/`search_term` | The API takes the CANONICAL `input_mode` value stored on ScrapeJob (webapp/scraper/views.py:2223-2227 `_INTAKE_NAV_TO_INPUT_MODE`) instead of the UI radio shorthand. |
+        | `content_type`                         | `content_type`        | Content-type registry key (`src/content_types.py:153`), stored as `page_type`. |
+        | `target_fields` (comma string)         | `target_fields` (array of strings) | No more comma-splitting. |
+        | `schema_text` / `schema_file`          | `schema_text`         | Raw JSON Schema as a string (no multipart file upload in JSON APIs). Re-validated server-side; invalid -> 422. |
+        | `scope`                                | `scope`               | `all` / `firstn` / `filter`. |
+        | `scope_value`                          | `scope_value`         | String; a number for `firstn`, a filter expression for `filter`. Kept a string to match the CharField (webapp/scraper/models.py:166). |
+        | `notes`                                | `notes`               | Free text; surfaced to the analysis agents as advisory hints. |
+        | `list_urls` (newline text / file)      | `item_urls` (array)   | Item URLs for `input_mode=url_list`. Persisted to the File Master as `scrapers/{slug}/input_urls.json`. |
+        | `listing_urls` (newline text / file)   | `listing_urls` (array)| Listing/category page URLs for `input_mode=list_page`. NOTE: the current backend joins these with newlines into `search_criteria` (views.py:2531-2532); this API accepts an array and performs that join server-side. |
+        | `search_keywords`                      | `search_keywords`     | Stored as `search_criteria`. |
+        | `search_url`                           | `search_url`          | Search results page URL, distinct from keywords. |
+        | (none)                                 | `callback_url`        | NEW, optional. Stored only; delivery is specified in the AsyncAPI sibling document. |
+        | (none)                                 | `title`               | NEW, optional display name (ScrapeJob.title exists, webapp/scraper/models.py:153; the UI sets it post-hoc — here it can be set at creation). |
+
+        Behavioral parity with `intake_create_job`: the created job always runs
+        with `skip_approvals=true` (unattended — views.py:2585) and
+        `full_extraction=false` (sample-first mode — views.py:2584; the full
+        scope of the run is governed by `scope`/`scope_value` and the input
+        mode). A duplicate submission while a job for the same URL is pending
+        or running returns 409 with the existing job's id (views.py:2537-2548).
+
+        Differences from the UI endpoint, on purpose: no
+        `X-Requested-With: XMLHttpRequest` requirement and no CSRF token —
+        auth is the `X-API-Key` header, and this namespace is CSRF-exempt.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateJobRequest"
+            examples:
+              urlListProduct:
+                summary: Exact URL list — product fields (rmwilliams-style)
+                value:
+                  url: "https://www.rmwilliams.com.au/comfort-craftsman-boot-chestnut-yearling-leather.html?lang=en_AU"
+                  input_mode: "url_list"
+                  content_type: "product"
+                  item_urls:
+                    - "https://www.rmwilliams.com.au/comfort-craftsman-boot-chestnut-yearling-leather.html?lang=en_AU"
+                    - "https://www.rmwilliams.com.au/mulyungarie-quarter-zip-sweatshirt-brushed-back-sweat-pine.html?lang=en_AU"
+                  target_fields: ["title", "price", "availability", "currency"]
+                  scope: "firstn"
+                  scope_value: "10"
+                  notes: "Australian retail site; AUD pricing expected."
+                  title: "RM Williams — boots + sweatshirts"
+              listingPage:
+                summary: Listing page discovery
+                value:
+                  url: "https://www.rmwilliams.com.au/comfort-craftsman-boot-chestnut-yearling-leather.html?lang=en_AU"
+                  input_mode: "list_page"
+                  content_type: "product"
+                  listing_urls:
+                    - "https://www.rmwilliams.com.au/footwear/men/chelsea-boots?lang=en_AU"
+                    - "https://www.rmwilliams.com.au/clothing/men/sweatshirts?lang=en_AU"
+                  target_fields: ["title", "price", "availability", "currency"]
+                  scope: "all"
+                  title: "RM Williams — chelsea boots + sweatshirts"
+              searchWithSchema:
+                summary: Search term + JSON Schema + callback
+                value:
+                  url: "https://www.ayahealthcare.com/travel-nursing/jobs/oral-surgeon-dentist-wisconsin/"
+                  input_mode: "search_term"
+                  content_type: "job_posting"
+                  search_keywords: "oral surgeon"
+                  search_url: "https://www.ayahealthcare.com/jobs/search?q=oral+surgeon"
+                  target_fields: ["title", "company", "location", "salary", "description"]
+                  schema_text: |
+                    {
+                      "$schema": "https://json-schema.org/draft/2020-12/schema",
+                      "type": "object",
+                      "properties": {
+                        "title": {"type": "string"},
+                        "company": {"type": "string"},
+                        "location": {"type": "string"},
+                        "salary": {"type": "string"},
+                        "description": {"type": "string"}
+                      },
+                      "required": ["title", "location"]
+                    }
+                  scope: "all"
+                  callback_url: "https://partner.example.com/hooks/scraper"
+      responses:
+        "202":
+          description: Job accepted and dispatched. Poll the returned `status_url`.
+          headers:
+            Location:
+              description: Canonical status resource for the created job.
+              schema:
+                type: string
+                format: uri-reference
+                example: "/api/v1/jobs/481"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobCreated"
+              example:
+                job_id: 481
+                state: "inprogress"
+                created_at: "2026-08-20T19:10:45Z"
+                status_url: "/api/v1/jobs/481"
+                sample_url: "/api/v1/jobs/481/sample"
+                output_url: "/api/v1/jobs/481/output"
+                output_download_url: "/api/v1/jobs/481/output/download"
+                scraper_code_url: "/api/v1/jobs/481/scraper-code"
+        "400":
+          description: Malformed JSON body, or a required field is missing/invalid (`url` missing, non-http(s) URL, `item_urls` entries not absolute http(s) URLs, `input_mode` incompatible with the provided navigation fields).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: "validation_failed"
+                message: "url is required and must be an absolute http(s) URL of a sample item page"
+                details:
+                  fields: ["url"]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: A job for this URL is already pending or running under this API key. The existing job's id is returned so the client can resume polling it.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - type: object
+                    properties:
+                      details:
+                        type: object
+                        properties:
+                          existing_job_id:
+                            type: integer
+                            description: The id of the already-running job (mirrors intake_create_job's 409 payload, views.py:2541-2548).
+              example:
+                code: "duplicate_running_job"
+                message: "A job for this URL is already running"
+                details:
+                  existing_job_id: 479
+        "422":
+          description: "`schema_text` failed validation (gate re-run server-side exactly as in views.py:2560-2570). The per-issue list uses the same shape as /validate-schema."
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - type: object
+                    properties:
+                      details:
+                        type: object
+                        properties:
+                          issues:
+                            type: array
+                            items:
+                              $ref: "#/components/schemas/SchemaIssue"
+              example:
+                code: "schema_invalid"
+                message: "Schema invalid"
+                details:
+                  issues:
+                    - code: "type_unsupported"
+                      message: "Property 'price' declares type 'decimal'; supported types are string|number|integer|boolean"
+                      severity: "error"
+                      path: "$.properties.price.type"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+    get:
+      tags: [jobs]
+      operationId: listJobs
+      summary: List jobs owned by this API key
+      description: |
+        Recommended addition beyond the 5 required endpoints: partners need to
+        enumerate their jobs to re-attach after a crash, reconcile state, or
+        build a dashboard. Mirrors `intake_jobs` (views.py:2632-2673) but
+        strictly scoped to the key's user (no superuser see-all bypass in the
+        API namespace — see security rationale) and returns the derived
+        partner `state` on every row.
+      parameters:
+        - $ref: "#/components/parameters/page"
+        - $ref: "#/components/parameters/pageSize"
+        - name: state
+          in: query
+          description: Filter by the derived partner state.
+          schema:
+            $ref: "#/components/schemas/JobState"
+        - name: input_mode
+          in: query
+          schema:
+            $ref: "#/components/schemas/InputMode"
+        - name: created_since
+          in: query
+          description: Only jobs created at or after this ISO-8601 timestamp.
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: Paginated job summaries, newest first (ScrapeJob.Meta.ordering, models.py:182-183).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobList"
+              example:
+                jobs:
+                  - job_id: 481
+                    title: "RM Williams — boots + sweatshirts"
+                    state: "scraper_ready"
+                    url: "https://www.rmwilliams.com.au/comfort-craftsman-boot-chestnut-yearling-leather.html?lang=en_AU"
+                    input_mode: "url_list"
+                    content_type: "product"
+                    site_name: "R.M.Williams"
+                    item_count: 20
+                    created_at: "2026-08-20T19:10:45Z"
+                    completed_at: "2026-08-20T19:24:49Z"
+                  - job_id: 480
+                    title: null
+                    state: "sample_ready"
+                    url: "https://www.ayahealthcare.com/travel-nursing/jobs/oral-surgeon-dentist-wisconsin/"
+                    input_mode: "search_term"
+                    content_type: "job_posting"
+                    site_name: "Aya Healthcare"
+                    item_count: null
+                    created_at: "2026-08-20T18:02:11Z"
+                    completed_at: null
+                  - job_id: 479
+                    title: null
+                    state: "failed"
+                    failure:
+                      code: "captcha_blocked"
+                      message: "Captcha detected: hCaptcha. All 7 probe methods returned captcha pages."
+                    url: "https://www.example-boutique.com/products/wool-scarf"
+                    input_mode: "url_list"
+                    content_type: "product"
+                    item_count: 0
+                    created_at: "2026-08-20T17:40:03Z"
+                    completed_at: "2026-08-20T17:41:20Z"
+                page: 1
+                page_size: 20
+                total_items: 3
+                total_pages: 1
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 2. STATUS
+  # ─────────────────────────────────────────────────────────────────────────
+  /api/v1/jobs/{job_id}:
+    parameters:
+      - $ref: "#/components/parameters/jobId"
+    get:
+      tags: [jobs]
+      operationId: getJobStatus
+      summary: Get job status (the 4-state view)
+      description: |
+        A thin, derived view over `ScrapeJob` + its `Step` rows + artifact
+        resolvability. Poll this; everything else keys off `state`.
+
+        **Derivation (authoritative)** — implemented as a pure function of
+        `(job.status, steps, artifact resolvability)`:
+
+        | ScrapeJob.status (models.py:99-117)        | Steps / artifacts                                        | Partner `state`  |
+        |---------------------------------------------|----------------------------------------------------------|------------------|
+        | `pending`                                   | —                                                        | `inprogress`     |
+        | `running`                                   | testing step not done, no sample artifact                | `inprogress`     |
+        | `running`                                   | sample artifact resolvable (see below)                   | `sample_ready`   |
+        | `waiting_approval`                          | — rare but REACHABLE for API jobs: budget-escalation pauses set this status WITHOUT checking `skip_approvals` (services.py:413-451, called unconditionally); the job resumes on its own — mapped to `inprogress` | `inprogress` |
+        | `completed`                                 | —                                                        | `scraper_ready`  |
+        | `failed`                                    | —                                                        | `failed`         |
+        | `cancelled`                                 | —                                                        | `failed` (`failure.code="cancelled"`) |
+        | `captcha_blocked`                           | —                                                        | `failed` (`failure.code="captcha_blocked"`) |
+        | `akamai_blocked`                            | —                                                        | `failed` (`failure.code="akamai_blocked"`) |
+
+        **"Sample artifact resolvable"** — in implementation order:
+        1. A persisted per-job sample file exists in the File Master at
+           `scrapers/{slug}/samples/sample-{job_id}.json` (**requires the small
+           backend addition described in the header comments** — this is the
+           recommended primary signal), OR
+        2. `Step(phase="testing").status == "done"` AND
+           `scrapers/{slug}/analysis/test_report.json` exists in the File
+           Master (published by `_preserve_test_report`,
+           webapp/agents/graph.py:586-603). This signal exists TODAY but yields
+           coverage statistics only, not records.
+        The `testing`-done signal is deterministic: `_notify_phase`
+        (webapp/agents/graph.py:870-889) writes Step rows for every node.
+        MONOTONICITY (critique round, vector 2a): retry cycles re-fire
+        `testing → running → done` on every code_tester loop
+        (graph.py:3382/3413 + retry wiring at graph.py:4488-4500), so a
+        CURRENT-status check oscillates `sample_ready → inprogress →
+        sample_ready`. Derive instead from "a Step(testing) row has EVER
+        been completed (`completed_at IS NOT NULL`)" — state clamps at the
+        first done and never regresses until a terminal state.
+
+        **`scraper_ready` invariants** — `status=completed` is set only by the
+        finalizer ladder (webapp/scraper/tasks.py:916-934), after outputs are
+        published to the File Master (tasks.py:798-819) and cleanup has
+        promoted the scraper (`_promote_scraper`, graph.py:973-1018 — a
+        per-job copy at `scrapers/{slug}/jobs/scraper-{job_id}.py` is ALWAYS
+        written when a draft exists; the production
+        `scrapers/{slug}/scraper.py` is only promoted on
+        `execution_status == "SUCCESS"`). Resolvability for the partner
+        endpoints follows the existing `scraper_code` view's precedence:
+        per-job `job.scraper_file` first, then the site's production scraper
+        (views.py:499-522). A completed run that somehow produced neither
+        still reports `scraper_ready` but with `scraper_available: false` —
+        check the flags rather than assuming.
+
+        **Cross-tenant**: a job id owned by another key returns 404.
+      responses:
+        "200":
+          description: Current job status. `state` is the partner-facing enum; `internal_status` is exposed read-only for support/debugging.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobStatus"
+              examples:
+                inprogress:
+                  summary: Early — site analysis underway
+                  value:
+                    job_id: 481
+                    state: "inprogress"
+                    internal_status: "running"
+                    url: "https://www.rmwilliams.com.au/comfort-craftsman-boot-chestnut-yearling-leather.html?lang=en_AU"
+                    input_mode: "url_list"
+                    content_type: "product"
+                    title: "RM Williams — boots + sweatshirts"
+                    current_phase: "site_analysis"
+                    phases:
+                      - {phase: "accessibility_check", status: "done"}
+                      - {phase: "site_analysis", status: "running"}
+                      - {phase: "code_generation", status: "pending"}
+                      - {phase: "testing", status: "pending"}
+                      - {phase: "execution", status: "pending"}
+                      - {phase: "cleanup", status: "pending"}
+                    sample_available: false
+                    output_available: false
+                    scraper_available: false
+                    item_count: null
+                    created_at: "2026-08-20T19:10:45Z"
+                    started_at: "2026-08-20T19:10:47Z"
+                    completed_at: null
+                sample_ready:
+                  summary: Extractor validated; sample records ready
+                  value:
+                    job_id: 481
+                    state: "sample_ready"
+                    internal_status: "running"
+                    url: "https://www.rmwilliams.com.au/comfort-craftsman-boot-chestnut-yearling-leather.html?lang=en_AU"
+                    input_mode: "url_list"
+                    content_type: "product"
+                    title: "RM Williams — boots + sweatshirts"
+                    site_name: "R.M.Williams"
+                    platform: "Demandware/SFCC"
+                    scraping_method: "playwright"
+                    current_phase: "execution"
+                    phases:
+                      - {phase: "accessibility_check", status: "done"}
+                      - {phase: "site_analysis", status: "done"}
+                      - {phase: "product_analysis", status: "done"}
+                      - {phase: "code_generation", status: "done"}
+                      - {phase: "testing", status: "done"}
+                      - {phase: "execution", status: "running"}
+                      - {phase: "cleanup", status: "pending"}
+                    sample_available: true
+                    output_available: false
+                    scraper_available: false
+                    item_count: null
+                    created_at: "2026-08-20T19:10:45Z"
+                    started_at: "2026-08-20T19:10:47Z"
+                    completed_at: null
+                scraper_ready:
+                  summary: Terminal success — everything downloadable
+                  value:
+                    job_id: 481
+                    state: "scraper_ready"
+                    internal_status: "completed"
+                    url: "https://www.rmwilliams.com.au/comfort-craftsman-boot-chestnut-yearling-leather.html?lang=en_AU"
+                    input_mode: "url_list"
+                    content_type: "product"
+                    title: "RM Williams — boots + sweatshirts"
+                    site_name: "R.M.Williams"
+                    platform: "Demandware/SFCC"
+                    scraping_method: "playwright"
+                    current_phase: null
+                    phases:
+                      - {phase: "accessibility_check", status: "done"}
+                      - {phase: "site_analysis", status: "done"}
+                      - {phase: "product_analysis", status: "done"}
+                      - {phase: "code_generation", status: "done"}
+                      - {phase: "testing", status: "done"}
+                      - {phase: "execution", status: "done"}
+                      - {phase: "cleanup", status: "done"}
+                    sample_available: true
+                    output_available: true
+                    scraper_available: true
+                    item_count: 20
+                    output_filename: "output_2026-08-20_192449.json"
+                    created_at: "2026-08-20T19:10:45Z"
+                    started_at: "2026-08-20T19:10:47Z"
+                    completed_at: "2026-08-20T19:24:49Z"
+                    duration_seconds: 842.0
+                    output_download_url: "/api/v1/jobs/481/output/download"
+                    scraper_code_url: "/api/v1/jobs/481/scraper-code"
+                failed:
+                  summary: Terminal failure — with a retrievable sample
+                  value:
+                    job_id: 479
+                    state: "failed"
+                    internal_status: "failed"
+                    url: "https://www.example-boutique.com/products/wool-scarf"
+                    input_mode: "url_list"
+                    content_type: "product"
+                    current_phase: "execution"
+                    failure:
+                      code: "execution_failed"
+                      message: "Scraper exceeded 900s wall-clock"
+                    phases:
+                      - {phase: "accessibility_check", status: "done"}
+                      - {phase: "site_analysis", status: "done"}
+                      - {phase: "code_generation", status: "done"}
+                      - {phase: "testing", status: "done"}
+                      - {phase: "execution", status: "failed"}
+                    sample_available: true
+                    output_available: false
+                    scraper_available: false
+                    item_count: 0
+                    created_at: "2026-08-20T17:40:03Z"
+                    started_at: "2026-08-20T17:40:05Z"
+                    completed_at: "2026-08-20T17:41:20Z"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 3. SAMPLE RESPONSE
+  # ─────────────────────────────────────────────────────────────────────────
+  /api/v1/jobs/{job_id}/sample:
+    parameters:
+      - $ref: "#/components/parameters/jobId"
+    get:
+      tags: [artifacts]
+      operationId: getJobSample
+      summary: Get the sample extraction (available before the run completes)
+      description: |
+        The small, early artifact: up to 5 extracted records produced while the
+        extractor was being built and validated (testing phase /
+        field_confirmation). Available in state `sample_ready`, and best-effort
+        in `failed` (a failed full run may still have a perfectly good sample —
+        see the guarantee in the info block).
+
+        **Never paginated.** Samples are capped at
+        `FIELD_CONFIRMATION_SAMPLE_COUNT = 5` records
+        (webapp/agents/nodes/field_confirmation.py:23) and pruned to the
+        requested schema for display (field_confirmation.py:229-237), so the
+        payload is a few KB at most.
+
+        **Implementation provenance (LOUD)**: as of this draft the pipeline
+        persists the sample as (a) coverage statistics in
+        `scrapers/{slug}/analysis/test_report.json` (graph.py:586-603) and (b)
+        a truncated text blob in a SessionLog row
+        (field_confirmation.py:510-527). Neither is structured records. Serving
+        this endpoint as specified requires persisting the sample records as
+        JSON in the File Master (recommended key:
+        `scrapers/{slug}/samples/sample-{job_id}.json`) when field_confirmation
+        runs — the records are already in hand at that point (they come from
+        the workspace `output_*.json` the tester wrote). `field_coverage`
+        in the response is sourced from the test report when present.
+      responses:
+        "200":
+          description: Sample records. `items` uses the job's output key (`products`, `jobs`, `articles`, `threads`, `results`, `pages` — src/content_types.py:294-306).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SampleResponse"
+              examples:
+                productSample:
+                  summary: Product sample (rmwilliams)
+                  value:
+                    job_id: 481
+                    state: "sample_ready"
+                    source: "testing"
+                    output_key: "products"
+                    item_count: 5
+                    items:
+                      - id: 1
+                        title: "Craftsman boot"
+                        price: "$699.00"
+                        availability: "In Stock"
+                        original_price: ""
+                        currency: "AUD"
+                        url: "https://www.rmwilliams.com.au/comfort-craftsman-boot-chestnut-yearling-leather.html?lang=en_AU"
+                        src_url: "https://www.rmwilliams.com.au/footwear/men/chelsea-boots?lang=en_AU"
+                        location: ""
+                        status_code: 200
+                        scraped_at: "2026-08-20T19:27:01.899259+00:00"
+                        remarks: ""
+                      - id: 2
+                        title: "Mulyungarie quarter-zip sweatshirt"
+                        price: "$149.00"
+                        availability: "In Stock"
+                        original_price: ""
+                        currency: "AUD"
+                        url: "https://www.rmwilliams.com.au/mulyungarie-quarter-zip-sweatshirt-brushed-back-sweat-pine.html?lang=en_AU"
+                        src_url: "https://www.rmwilliams.com.au/clothing/men/sweatshirts?lang=en_AU"
+                        location: ""
+                        status_code: 200
+                        scraped_at: "2026-08-20T19:27:04.113902+00:00"
+                        remarks: ""
+                    field_coverage:
+                      title: {count: 5, coverage: "100%", status: "CORRECT"}
+                      price: {count: 5, coverage: "100%", status: "CORRECT"}
+                      availability: {count: 5, coverage: "100%", status: "CORRECT"}
+                      currency: {count: 5, coverage: "100%", status: "CORRECT"}
+                    generated_at: "2026-08-20T19:22:10Z"
+                jobSample:
+                  summary: Job-posting sample (aya-style)
+                  value:
+                    job_id: 480
+                    state: "sample_ready"
+                    source: "testing"
+                    output_key: "jobs"
+                    item_count: 3
+                    items:
+                      - title: "Permanent, Oral Surgeon, Dentist"
+                        company: ""
+                        location: "Milwaukee, Wisconsin"
+                        salary: "$500000.00 to $1000000.00 per year"
+                        description: "<h2>Oral &amp; Maxillofacial Surgeon</h2><p>Wisconsin | Established Multi-Specialty Group Practice</p>..."
+                        url: "https://www.ayahealthcare.com/travel-nursing/jobs/oral-surgeon-dentist-wisconsin/"
+                        status_code: 200
+                        scraped_at: "2026-08-20T18:19:44.720815+00:00"
+                        remarks: ""
+                    field_coverage:
+                      title: {count: 3, coverage: "100%", status: "CORRECT"}
+                      location: {count: 3, coverage: "100%", status: "CORRECT"}
+                      salary: {count: 2, coverage: "67%", status: "PARTIAL"}
+                    generated_at: "2026-08-20T18:21:02Z"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: The job exists but no sample is available yet (state `inprogress` before testing completes). Retry after the suggested interval.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: "not_ready"
+                message: "Sample not available yet — the extractor is still being built (current phase: code_generation)"
+                details:
+                  state: "inprogress"
+                  current_phase: "code_generation"
+                  retry_after_seconds: 60  # CONSTANT HINT (not an estimate — no phase-duration telemetry exists; clients should treat it as a floor)
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 4. FULL OUTPUT (paginated)
+  # ─────────────────────────────────────────────────────────────────────────
+  /api/v1/jobs/{job_id}/output:
+    parameters:
+      - $ref: "#/components/parameters/jobId"
+      - $ref: "#/components/parameters/page"
+      - $ref: "#/components/parameters/pageSizeLarge"
+    get:
+      tags: [artifacts]
+      operationId: getJobOutput
+      summary: Get the full scraped output (window-paginated over the item array)
+      description: |
+        The complete dataset for the job, returned as fixed windows over the
+        output file's item array. The underlying file shape is
+        `{site, <output_key>: [...items], metadata}` — exactly what the scraper
+        writes (verified: scrapers/rmwilliams-com-au/output_2026-08-20_192449.json,
+        scrapers/ayahealthcare-com/output_2026-07-19_201912.json). `site` and
+        `metadata` are returned on every page (they are small); `items` is the
+        requested window.
+
+        **Why pagination is mandatory**: full outputs reach 26,742 items /
+        101 MB. A naive GET returning the raw JSON will blow both the HTTP
+        timeout and client memory. Defaults keep a page around a few hundred KB
+        even for record types with large text fields (e.g. job descriptions).
+
+        **Which file**: this job's own output, resolved with the existing
+        precedence — authoritative `job.output_file` (a File Master key) first,
+        else the newest `output_*.json` under `scrapers/{slug}/` whose
+        timestamp falls inside this job's run window
+        (`_resolve_job_output`, webapp/scraper/views.py:914-966). This
+        guarantees a partner never receives a previous run's output.
+
+        **NORMATIVE implementation requirement** (critique round — a full
+        parse per request has OOM'd 1 GB containers before): the view MUST
+        either stream-parse the item array or cache parsed pages keyed by
+        file key + mtime; `json.load` of the whole file per request is NOT
+        acceptable. A hard page cap (page_size ≤ 500) bounds worst-case
+        response size to ≲2 MB.
+
+        Prefer the whole file? Use `GET /api/v1/jobs/{job_id}/output/download`.
+      responses:
+        "200":
+          description: One window of the full output. `total_items` is the authoritative item count; `item_count` on the status resource equals it.
+          headers:
+            X-Total-Count:
+              description: Total items across all pages (convenience mirror of `total_items`).
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OutputPage"
+              example:
+                job_id: 481
+                state: "scraper_ready"
+                output_key: "products"
+                output_filename: "output_2026-08-20_192449.json"
+                total_items: 27
+                page: 1
+                page_size: 100
+                total_pages: 1
+                site:
+                  name: "R.M.Williams"
+                  url: "https://www.rmwilliams.com.au"
+                  platform: "Demandware/SFCC"
+                  scraping_method: "playwright"
+                  scraped_at: "2026-08-20T19:34:31.007229+00:00"
+                metadata:
+                  scraping_duration_seconds: 581.29
+                  failed_products: 0
+                  rate_limit_delay: 2
+                items:
+                  - id: 1
+                    title: "Craftsman boot"
+                    price: "$699.00"
+                    availability: "In Stock"
+                    original_price: ""
+                    currency: "AUD"
+                    url: "https://www.rmwilliams.com.au/comfort-craftsman-boot-chestnut-yearling-leather.html?lang=en_AU"
+                    src_url: "https://www.rmwilliams.com.au/footwear/men/chelsea-boots?lang=en_AU"
+                    location: ""
+                    status_code: 200
+                    scraped_at: "2026-08-20T19:27:01.899259+00:00"
+                    remarks: ""
+                  - id: 2
+                    title: "Mulyungarie quarter-zip sweatshirt"
+                    price: "$149.00"
+                    availability: "In Stock"
+                    original_price: ""
+                    currency: "AUD"
+                    url: "https://www.rmwilliams.com.au/mulyungarie-quarter-zip-sweatshirt-brushed-back-sweat-pine.html?lang=en_AU"
+                    src_url: "https://www.rmwilliams.com.au/clothing/men/sweatshirts?lang=en_AU"
+                    location: ""
+                    status_code: 200
+                    scraped_at: "2026-08-20T19:27:07.221054+00:00"
+                    remarks: ""
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: Job not found / not owned by this key, OR the job exists but no output file was produced (e.g. a failed run whose execution never wrote a file). The error `code` distinguishes the two.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                jobMissing:
+                  value:
+                    code: "not_found"
+                    message: "Job 999 does not exist"
+                outputMissing:
+                  value:
+                    code: "output_not_found"
+                    message: "Job 479 has no output file — the run failed before execution produced one"
+        "409":
+          description: The job is still running and no output exists yet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: "not_ready"
+                message: "Output not available yet — job is running (current phase: execution)"
+                details:
+                  state: "sample_ready"
+                  current_phase: "execution"
+                  retry_after_seconds: 120
+        "422":
+          description: Page parameters out of bounds (page > total_pages, page_size > max).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: "validation_failed"
+                message: "page 42 exceeds total_pages 1"
+                details:
+                  fields: ["page"]
+                  total_pages: 1
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/jobs/{job_id}/output/download:
+    parameters:
+      - $ref: "#/components/parameters/jobId"
+    get:
+      tags: [artifacts]
+      operationId: downloadJobOutput
+      summary: Download the raw output file
+      description: |
+        Serves the job's full output JSON with a
+        `Content-Disposition: attachment` header, proxying File Master bytes
+        so clients never talk to the artifact store directly. Use this (not
+        the paginated endpoint) when you want the whole file in one shot or
+        need a stable byte-identical artifact for checksumming; use the
+        paginated endpoint for interactive UIs.
+        NORMATIVE (critique round): the existing internal view
+        (`job_output_download`, views.py:607-626) BUFFERS the entire file
+        via `artifacts.read()` — unacceptable at 97 MB. This endpoint MUST
+        stream via `artifacts.stream_url()` / the File Master's
+        `/stream/{key}` (file_master/app.py:113) instead.
+      responses:
+        "200":
+          description: Raw output JSON file.
+          headers:
+            Content-Disposition:
+              description: 'attachment; filename="output_2026-08-20_192449.json"'
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                description: "The scraper's output document — {site, <output_key>: [...items], metadata}. May be tens of MB."
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/NotReady"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 5. SCRAPER CODE
+  # ─────────────────────────────────────────────────────────────────────────
+  /api/v1/jobs/{job_id}/scraper-code:
+    parameters:
+      - $ref: "#/components/parameters/jobId"
+      - name: format
+        in: query
+        description: "`json` (default) returns metadata + the code as a string; `raw` returns bare `text/x-python` with an attachment header for direct download."
+        schema:
+          type: string
+          enum: [json, raw]
+          default: json
+    get:
+      tags: [artifacts]
+      operationId: getJobScraperCode
+      summary: Get the generated scraper (Python source)
+      description: |
+        The Python scraper this job produced. Resolution order mirrors the
+        existing `scraper_code` view (webapp/scraper/views.py:499-522):
+        1. this job's own attributed copy
+           `scrapers/{slug}/jobs/scraper-{job_id}.py` (from `job.scraper_file`,
+           written by `_promote_scraper`, graph.py:973-1018), then
+        2. the site's production scraper `scrapers/{slug}/scraper.py`.
+        The per-job copy exists for ANY run that produced a draft (including
+        failed ones — per-job attribution is unconditional), so scraper code is
+        retrievable on `failed` jobs too; it is simply not promoted to
+        production unless execution succeeded.
+
+        Note: for navigation-style jobs the scraper is self-contained (two
+        phases: discovery + extraction) and runnable outside this platform
+        with plain Python + the declared strategy's driver.
+      responses:
+        "200":
+          description: Scraper source. With `format=json`, the code plus attribution metadata; with `format=raw`, the file itself.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScraperCode"
+              example:
+                job_id: 481
+                state: "scraper_ready"
+                filename: "rmwilliams-com-au_scraper.py"
+                language: "python"
+                strategy: "playwright"
+                source: "per_job"
+                code: |
+                  #!/usr/bin/env python3
+                  """R.M.Williams product scraper (playwright).
+
+                  Generated by the Universal Ecommerce Scraper.
+                  Usage: python scraper.py --input input_urls.json --output out.json
+                  """
+                  import argparse, json, time
+                  from datetime import datetime, timezone
+                  from playwright.sync_api import sync_playwright
+                  ...
+            text/x-python:
+              schema:
+                type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Job still running and no draft has been promoted yet (scraper code normally exists from the moment cleanup runs — including on later failure — so this is rare).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: "not_ready"
+                message: "Scraper code not available yet — the extractor is still being generated"
+                details:
+                  state: "inprogress"
+                  current_phase: "code_generation"
+                  retry_after_seconds: 120
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # RECOMMENDED EXTRAS
+  # ─────────────────────────────────────────────────────────────────────────
+  /api/v1/jobs/{job_id}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/jobId"
+    post:
+      tags: [jobs]
+      operationId: cancelJob
+      summary: Cancel a running job
+      description: |
+        Recommended extra: partners need a stop button. Mirrors `job_cancel`
+        (webapp/scraper/views.py:454-473) — sets `status=cancelled`, revokes
+        the Celery task, and (via the post_save hook,
+        webapp/scraper/models.py:539-558) supersedes any open approvals. After
+        cancellation the job reports `state: "failed"` with
+        `failure.code: "cancelled"`.
+      responses:
+        "200":
+          description: Job cancelled (or was already terminal — idempotent).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Job already terminal (completed/failed) and not cancellable. Returns the current status.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Error"
+                  - type: object
+                    properties:
+                      details:
+                        type: object
+                        properties:
+                          state:
+                            $ref: "#/components/schemas/JobState"
+              example:
+                code: "not_cancellable"
+                message: "Job 481 already completed"
+                details:
+                  state: "scraper_ready"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/v1/validate-schema:
+    post:
+      tags: [intake-helpers]
+      operationId: validateSchema
+      summary: Validate a JSON Schema and derive its field names
+      description: |
+        Pure function of its input (no DB writes, no site traffic) — the API
+        mirror of `intake_validate_schema` (webapp/scraper/views.py:2364-2401)
+        over `src/schema_validation.validate_user_schema`. INCLUDE this one:
+        partners building submission forms get server-grade validation and the
+        derived field list / detected content type for free, and re-submitting
+        the same schema to createJob cannot 422.
+
+        Convention (deliberately kept): returns 200 with `valid: false` when
+        the schema is invalid — only transport/auth failures are 4xx/5xx.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [schema_text]
+              properties:
+                schema_text:
+                  type: string
+                  description: "Raw JSON Schema (or the internal {fields: [...]} dialect) as a string."
+                  examples:
+                    - |
+                      {
+                        "type": "object",
+                        "properties": {
+                          "title": {"type": "string"},
+                          "price": {"type": "string"},
+                          "availability": {"type": "string"}
+                        },
+                        "required": ["title", "price"]
+                      }
+      responses:
+        "200":
+          description: Validation result (valid or not).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SchemaValidationResult"
+              examples:
+                valid:
+                  value:
+                    valid: true
+                    issues: []
+                    derived_fields: ["title", "price", "availability"]
+                    detected_content_type: "product"
+                invalid:
+                  value:
+                    valid: false
+                    issues:
+                      - code: "empty_schema"
+                        message: "Schema has no properties"
+                        severity: "error"
+                        path: "$"
+                    derived_fields: []
+                    detected_content_type: null
+        "400":
+          description: "`schema_text` missing or not valid UTF-8 JSON text."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+# ───────────────────────────────────────────────────────────────────────────
+# COMPONENTS
+# ───────────────────────────────────────────────────────────────────────────
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: |
+        Per-partner API key. Maps 1:1 to a non-superuser Django service-account
+        user; that user owns every job the key creates (`ScrapeJob.user`,
+        webapp/scraper/models.py:156-159) and is the sole tenancy boundary.
+        Keys are stored hashed and looked up by SHA-256; send the raw key in
+        this header on every request. No session, no CSRF token, no Bearer
+        scheme — a deliberate simplification (no OAuth infrastructure exists in
+        this deployment; see design rationale).
+
+        - Missing/unknown key -> 401
+        - Valid key, disabled/rotated -> 403
+        - CODE-LEVEL MANDATE (critique round): API-key authentication MUST
+          REJECT keys whose owner `is_superuser` at auth time with 403 —
+          prose alone is not a control (`_get_job`'s bypass,
+          views.py:34-39, would otherwise expose every tenant's jobs to an
+          admin-owned key). API views must scope by the key's user only
+          (`_get_job`, views.py:34-39).
+
+  parameters:
+    jobId:
+      name: job_id
+      in: path
+      required: true
+      description: Numeric ScrapeJob id (the `job_id` returned by createJob).
+      schema:
+        type: integer
+        minimum: 1
+    page:
+      name: page
+      in: query
+      description: 1-based page number.
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    pageSize:
+      name: page_size
+      in: query
+      description: Items per page (job summaries).
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    pageSizeLarge:
+      name: page_size
+      in: query
+      description: |
+        Records per page for the output window. Default 100 / max 500 — chosen
+        so a page stays under ~2 MB even for record types with large text
+        fields (aya-style job descriptions average ~4 KB/record).
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 500
+        default: 100
+
+  responses:
+    Unauthorized:
+      description: Missing or unknown `X-API-Key`.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            code: "unauthorized"
+            message: "A valid X-API-Key header is required"
+    Forbidden:
+      description: Key recognized but inactive/revoked, or the endpoint is not enabled for this key's plan.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            code: "forbidden"
+            message: "This API key has been revoked"
+    NotFound:
+      description: |
+        Resource does not exist — OR exists but belongs to a different tenant.
+        Deliberately indistinguishable so job ids cannot be enumerated across
+        tenants.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            code: "not_found"
+            message: "Job 481 does not exist"
+    ValidationError:
+      description: Request body or query parameters failed validation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            code: "schema_invalid"
+            message: "schema_text is not a valid JSON Schema"
+    NotReady:
+      description: Job exists but the artifact is not available yet.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            code: "not_ready"
+            message: "Output not available yet — job is running"
+            details:
+              state: "sample_ready"
+              retry_after_seconds: 120
+    InternalError:
+      description: Unexpected server error. `details.trace_id` correlates with server logs.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            code: "internal_error"
+            message: "Unexpected error while reading the output artifact"
+            details:
+              trace_id: "9f1c2a4e-7d3b-4f8e-b1a0-2c5d6e7f8a9b"
+
+  schemas:
+    # ── Enums ──────────────────────────────────────────────────────────────
+    JobState:
+      type: string
+      enum: [inprogress, sample_ready, scraper_ready, failed]
+      description: |
+        The four partner-facing states, derived (never stored) from
+        `ScrapeJob.status` + step/artifact resolvability:
+
+        - `inprogress` — accepted; the pipeline is analyzing the site, building
+          and validating the extractor. Nothing retrievable yet.
+        - `sample_ready` — the extractor passed testing; a small sample of
+          extracted records is available at `/sample`. The full run continues.
+        - `scraper_ready` — terminal success. Full output and scraper code are
+          available. (Invariant: `output_available` and `scraper_available`
+          flags are authoritative within this state; `item_count` may be 0.)
+        - `failed` — terminal failure. `failure` explains why. Samples (and
+          sometimes output) may still be retrievable — check the
+          `*_available` flags.
+
+        Internal statuses folded in: `cancelled`, `captcha_blocked`, and
+        `akamai_blocked` all map to `failed` with a distinct `failure.code`;
+        `waiting_approval` maps to `inprogress` (API jobs run unattended with
+        `skip_approvals=true`, so it should not occur — mapped defensively).
+    InputMode:
+      type: string
+      enum: [url_list, list_page, search_term]
+      description: |
+        How the target items are found. Canonical values as stored on
+        `ScrapeJob.input_mode` (webapp/scraper/models.py:123-127). The /intake
+        UI's radio shorthands map as `list`→`url_list`, `listing`→`list_page`,
+        `search`→`search_term` (`_INTAKE_NAV_TO_INPUT_MODE`,
+        webapp/scraper/views.py:2223-2227). `navigation` exists internally but
+        is not offered to partners in v1 (no intake form path produces it).
+    ContentType:
+      type: string
+      enum: [product, article, job_posting, forum_thread, serp, page_content]
+      description: |
+        Content-type registry key (`CONTENT_TYPES`, src/content_types.py:153).
+        Determines the output key (`products`, `articles`, `jobs`, `threads`,
+        `results`, `pages`) and the default core fields.
+    Scope:
+      type: string
+      enum: [all, firstn, filter]
+      description: |
+        How much to extract. `firstn` caps at the integer in `scope_value`
+        (passed to the scraper as `--limit`,
+        webapp/agents/nodes/run_execution.py:421-432); `filter` uses
+        `scope_value` as a match expression (advisory); `all` extracts
+        everything reachable.
+    FailureCode:
+      type: string
+      enum:
+        - cancelled
+        - captcha_blocked
+        - akamai_blocked
+        - validation_failed
+        - code_generation_failed
+        - execution_failed
+        - no_output_produced
+        - internal_error
+      description: Machine-readable failure classification. `cancelled`/`captcha_blocked`/`akamai_blocked` mirror the internal terminal statuses (models.py:104-106); the rest classify the pipeline stage that failed.
+
+    # ── Errors ─────────────────────────────────────────────────────────────
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable error code (`unauthorized`, `forbidden`, `not_found`, `not_ready`, `duplicate_running_job`, `validation_failed`, `schema_invalid`, `output_not_found`, `not_cancellable`, `internal_error`).
+          examples: ["not_found"]
+        message:
+          type: string
+          description: Human-readable explanation, safe to show in a partner UI.
+          examples: ["Job 481 does not exist"]
+        details:
+          type: object
+          additionalProperties: true
+          description: Optional structured context — field lists, issue arrays, current state, retry hints, trace ids.
+      description: |
+        Single error shape for every non-2xx response. This upgrades the
+        codebase's prevailing `JsonResponse({"error": "<string>"}, ...)`
+        convention (21 occurrences in webapp/scraper/views.py) with a stable
+        `code` for programmatic handling, keeps `message` human-readable, and
+        moves issue/field detail into `details` instead of ad-hoc sibling keys.
+
+    # ── Create ─────────────────────────────────────────────────────────────
+    CreateJobRequest:
+      type: object
+      required: [url, input_mode]
+      properties:
+        url:
+          type: string
+          format: uri
+          maxLength: 1000
+          description: A sample ITEM page on the target site (one product / job / article — not the homepage). Used to analyze field structure. Stored as both `url` and `product_url`.
+          examples: ["https://www.rmwilliams.com.au/comfort-craftsman-boot-chestnut-yearling-leather.html?lang=en_AU"]
+        input_mode:
+          $ref: "#/components/schemas/InputMode"
+        content_type:
+          $ref: "#/components/schemas/ContentType"
+          default: product
+        item_urls:
+          type: array
+          items:
+            type: string
+            format: uri
+          maxItems: 10000
+          description: "Required for `input_mode=url_list`: the exact item URLs to extract. Deduplicated server-side; persisted to `scrapers/{slug}/input_urls.json`."
+          examples:
+            - ["https://www.rmwilliams.com.au/comfort-craftsman-boot-chestnut-yearling-leather.html?lang=en_AU"]
+        listing_urls:
+          type: array
+          items:
+            type: string
+            format: uri
+          maxItems: 50
+          description: "Required for `input_mode=list_page`: listing / category page URLs to discover items from."
+        search_keywords:
+          type: string
+          maxLength: 500
+          description: "Required for `input_mode=search_term`: the query. Stored as `search_criteria` and passed to the scraper as `--query`."
+        search_url:
+          type: string
+          format: uri
+          maxLength: 1000
+          description: "Optional for `input_mode=search_term`: a known search-results page URL. Distinct from `search_keywords` (ScrapeJob.search_url, models.py:173-175)."
+        target_fields:
+          type: array
+          items:
+            type: string
+          maxItems: 100
+          description: Field names to extract. AUTHORITATIVE for the output schema — the finalizer deterministically prunes output records to these plus bookkeeping fields (`url`, `src_url`, `scraped_at`, `status_code`; src/content_types.py:311). Omit to extract everything the analyzer finds.
+          examples:
+            - ["title", "price", "availability", "currency"]
+        schema_text:
+          type: string
+          description: |
+            Optional raw JSON Schema (standard, or the internal
+            `{fields: [...]}` dialect). If present it is validated (invalid →
+            422) and the derived field names become the enforced
+            `target_fields`; the raw text is stored for re-display.
+            Use `/api/v1/validate-schema` first to avoid a 422.
+        scope:
+          $ref: "#/components/schemas/Scope"
+          default: all
+        scope_value:
+          type: string
+          maxLength: 200
+          description: "`scope=firstn` → an integer as a string (e.g. `\"500\"`); `scope=filter` → a match expression."
+          examples: ["500", "in stock only"]
+        notes:
+          type: string
+          maxLength: 4000
+          description: Free-text guidance for the analysis agents (advisory).
+        title:
+          type: string
+          maxLength: 200
+          description: Optional display name for the job (ScrapeJob.title).
+        callback_url:
+          type: string
+          format: uri
+          description: |
+            Optional HTTPS endpoint to notify on terminal state transitions.
+            Delivery semantics (event types, payload shape, retry policy,
+            signature header) are specified in the companion AsyncAPI
+            document. VALIDATION (enforced here, at create time): the URL
+            MUST be https, MUST NOT target private/loopback/link-local
+            ranges or internal service hostnames (browser_service,
+            file-master, postgres, redis, \*.railway.internal), and MUST use
+            a standard port (443/8443) — signed POSTs to arbitrary internal
+            targets would be an SSRF vector (critique round, vector 3d).
+        callback_secret:
+          type: string
+          minLength: 32
+          maxLength: 128
+          description: |
+            Shared secret for HMAC-SHA256 verification of callback
+            deliveries. Supplied ONCE at registration; stored hashed
+            (SHA-256) at rest and NEVER returned by any endpoint. Each
+            delivery is signed `X-Scraper-Signature:
+            t=<send_time_unix>,v1=<hex hmac_sha256("<t>." + raw_body,
+            callback_secret)>` — t is SEND time (re-signed on every retry),
+            verifiers should reject |now - t| > 300 s.
+
+    JobCreated:
+      type: object
+      required: [job_id, state, created_at, status_url]
+      properties:
+        job_id:
+          type: integer
+        state:
+          $ref: "#/components/schemas/JobState"
+        created_at:
+          type: string
+          format: date-time
+        status_url:
+          type: string
+          description: Relative path — GET this to poll.
+          examples: ["/api/v1/jobs/481"]
+        sample_url:
+          type: string
+        output_url:
+          type: string
+        output_download_url:
+          type: string
+        scraper_code_url:
+          type: string
+
+    # ── Status ─────────────────────────────────────────────────────────────
+    PhaseStatus:
+      type: string
+      enum: [pending, running, done, failed]
+      description: Step status (Step.STATUS_CHOICES, webapp/scraper/models.py:212-223).
+    Phase:
+      type: object
+      required: [phase, status]
+      properties:
+        phase:
+          type: string
+          enum:
+            - accessibility_check
+            - site_analysis
+            - browser_traverse
+            - navigation_skill_review
+            - navigation_analysis
+            - content_analysis
+            - product_analysis
+            - scraper_analysis
+            - code_generation
+            - code_review
+            - testing
+            - field_confirmation
+            - execution
+            - cleanup
+            - skill_learning
+            - dagster_converter
+            - store_job_listings
+          description: Canonical pipeline phases (Step.PHASE_CHOICES, models.py:225-243; seeded from PIPELINE_PHASES, tasks.py:193-208). code_review is seeded-but-inert (the reviewer node was removed; it stays pending forever — clients must not wait on it).
+        status:
+          $ref: "#/components/schemas/PhaseStatus"
+        started_at:
+          type: [string, "null"]
+          format: date-time
+        completed_at:
+          type: [string, "null"]
+          format: date-time
+
+    Failure:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          $ref: "#/components/schemas/FailureCode"
+        message:
+          type: string
+          description: Operator-grade detail (ScrapeJob.error_message, truncated tail of the exception — models.py:177).
+
+    JobStatus:
+      type: object
+      required: [job_id, state, url, input_mode, content_type, created_at]
+      properties:
+        job_id:
+          type: integer
+        state:
+          $ref: "#/components/schemas/JobState"
+        internal_status:
+          type: [string, "null"]
+          enum: [pending, running, waiting_approval, completed, failed, cancelled, captcha_blocked, akamai_blocked, null]
+          description: Read-only raw ScrapeJob.status for support/debugging. Clients should branch on `state`, not this.
+        url:
+          type: string
+          format: uri
+        input_mode:
+          $ref: "#/components/schemas/InputMode"
+        content_type:
+          $ref: "#/components/schemas/ContentType"
+        title:
+          type: [string, "null"]
+          description: Partner-supplied display name, if any.
+        site_name:
+          type: [string, "null"]
+          description: Resolved site display name (e.g. "R.M.Williams").
+        platform:
+          type: [string, "null"]
+          description: Detected platform (e.g. "Demandware/SFCC", "Shopify").
+        scraping_method:
+          type: [string, "null"]
+          description: Strategy used (e.g. "playwright", "http_navigation", "internal_api").
+        current_phase:
+          type: [string, "null"]
+          description: Phase currently `running` (or the failed one); null when terminal.
+        phases:
+          type: array
+          items:
+            $ref: "#/components/schemas/Phase"
+          description: Canonical-order pipeline steps (subset shown by default; every phase present in the live response).
+        sample_available:
+          type: boolean
+          description: GET /sample will return 200 right now.
+        output_available:
+          type: boolean
+          description: GET /output (and /output/download) will return 200 right now. True for terminal success; occasionally true for `failed` when execution wrote a file before failing the quality gate.
+        scraper_available:
+          type: boolean
+          description: GET /scraper-code will return 200 right now. True once cleanup promoted a draft — including on `failed` runs that produced a working draft.
+        item_count:
+          type: [integer, "null"]
+          description: Final count of successfully extracted records (ScrapeJob.product_count — counted from the output's ground truth, tasks.py:769-783). Null while running.
+        output_filename:
+          type: [string, "null"]
+          description: e.g. "output_2026-08-20_192449.json".
+        failure:
+          $ref: "#/components/schemas/Failure"
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: [string, "null"]
+          format: date-time
+        completed_at:
+          type: [string, "null"]
+          format: date-time
+        duration_seconds:
+          type: [number, "null"]
+          description: completed_at - started_at, when both exist.
+        output_download_url:
+          type: [string, "null"]
+        scraper_code_url:
+          type: [string, "null"]
+
+    JobSummary:
+      type: object
+      required: [job_id, state, url, input_mode, content_type, created_at]
+      properties:
+        job_id:
+          type: integer
+        title:
+          type: [string, "null"]
+        state:
+          $ref: "#/components/schemas/JobState"
+        failure:
+          $ref: "#/components/schemas/Failure"
+        url:
+          type: string
+          format: uri
+        input_mode:
+          $ref: "#/components/schemas/InputMode"
+        content_type:
+          $ref: "#/components/schemas/ContentType"
+        site_name:
+          type: [string, "null"]
+        item_count:
+          type: [integer, "null"]
+        created_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: [string, "null"]
+          format: date-time
+
+    JobList:
+      type: object
+      required: [jobs, page, page_size, total_items, total_pages]
+      properties:
+        jobs:
+          type: array
+          items:
+            $ref: "#/components/schemas/JobSummary"
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total_items:
+          type: integer
+        total_pages:
+          type: integer
+
+    # ── Artifacts ──────────────────────────────────────────────────────────
+    OutputKey:
+      type: string
+      enum: [products, jobs, articles, threads, results, pages]
+      description: The JSON key the output stores items under, derived from content type (get_output_key_label, src/content_types.py:294-306).
+
+    ScrapedRecord:
+      type: object
+      description: |
+        One extracted record. The four bookkeeping fields are always present
+        (BOOKKEEPING_FIELDS, src/content_types.py:311); every other key comes
+        from the requested `target_fields` (or everything found, when no
+        schema was requested). Values are strings unless the source provided
+        structured types — treat all values as display strings.
+      additionalProperties: true
+      properties:
+        url:
+          type: string
+          description: Canonical URL of the extracted item.
+        src_url:
+          type: string
+          description: Page the item was discovered on (listing/search page).
+        scraped_at:
+          type: string
+          description: ISO-8601 timestamp of this record's extraction.
+        status_code:
+          type: integer
+          description: HTTP status of the item page fetch (200 = live; 404/410 = dead).
+        remarks:
+          type: string
+          description: Empty on success; soft-404 / diagnostic notes otherwise.
+      examples:
+        - id: 1
+          title: "Craftsman boot"
+          price: "$699.00"
+          availability: "In Stock"
+          original_price: ""
+          currency: "AUD"
+          url: "https://www.rmwilliams.com.au/comfort-craftsman-boot-chestnut-yearling-leather.html?lang=en_AU"
+          src_url: "https://www.rmwilliams.com.au/footwear/men/chelsea-boots?lang=en_AU"
+          location: ""
+          status_code: 200
+          scraped_at: "2026-08-20T19:27:01.899259+00:00"
+          remarks: ""
+
+    SiteBlock:
+      type: object
+      additionalProperties: true
+      properties:
+        name:
+          type: string
+        url:
+          type: string
+        platform:
+          type: string
+        scraping_method:
+          type: string
+        scraped_at:
+          type: string
+      description: The output file's `site` block, passed through verbatim.
+
+    MetadataBlock:
+      type: object
+      additionalProperties: true
+      properties:
+        scraping_duration_seconds:
+          type: number
+        failed_products:
+          type: integer
+        rate_limit_delay:
+          type: number
+      description: The output file's `metadata` block, passed through verbatim.
+
+    SampleResponse:
+      type: object
+      required: [job_id, state, output_key, item_count, items]
+      properties:
+        job_id:
+          type: integer
+        state:
+          description: The state at fetch time — `sample_ready`, or `failed` when a failed run still yielded a sample.
+          type: string
+          enum: [sample_ready, failed, scraper_ready]
+        source:
+          type: string
+          enum: [testing, execution]
+          description: "`testing` = records from the extractor-validation run; `execution` = the sample was read back from the full run's output (terminal jobs)."
+        output_key:
+          $ref: "#/components/schemas/OutputKey"
+        item_count:
+          type: integer
+          minimum: 0
+          maximum: 5
+          description: Number of records in `items`.
+        items:
+          type: array
+          maxItems: 5
+          items:
+            $ref: "#/components/schemas/ScrapedRecord"
+        field_coverage:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              count:
+                type: integer
+              coverage:
+                type: string
+                description: "e.g. \"100%\", \"67%\""
+              status:
+                type: string
+                enum: [CORRECT, PARTIAL, MISSING, INCORRECT]
+          description: Per-field coverage from the test report (`results.field_coverage`, e.g. scrapers/vistaff placeholder — see scrapers/vistastaff-com/analysis/test_report.json). Absent when no test report was preserved.
+        generated_at:
+          type: [string, "null"]
+          format: date-time
+
+    OutputPage:
+      type: object
+      required: [job_id, state, output_key, output_filename, total_items, page, page_size, total_pages, items]
+      properties:
+        job_id:
+          type: integer
+        state:
+          type: string
+          enum: [scraper_ready, failed]
+          description: Terminal state at fetch time (`failed` appears when execution wrote output but the run failed a later gate — output is still served).
+        output_key:
+          $ref: "#/components/schemas/OutputKey"
+        output_filename:
+          type: string
+        total_items:
+          type: integer
+          description: Total records across all pages.
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total_pages:
+          type: integer
+        site:
+          $ref: "#/components/schemas/SiteBlock"
+        metadata:
+          $ref: "#/components/schemas/MetadataBlock"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScrapedRecord"
+
+    ScraperCode:
+      type: object
+      required: [job_id, filename, language, code]
+      properties:
+        job_id:
+          type: integer
+        state:
+          type: string
+          enum: [scraper_ready, failed, sample_ready]
+          description: State at fetch time — scraper code exists from cleanup onward, including on failed runs (per-job attribution is unconditional; only production promotion is success-gated).
+        filename:
+          type: string
+          examples: ["rmwilliams-com-au_scraper.py"]
+        language:
+          type: string
+          const: python
+        strategy:
+          type: [string, "null"]
+          description: Strategy the scraper implements (matches `scraping_method`).
+        source:
+          type: string
+          enum: [per_job, production]
+          description: Which copy was served — this job's own attributed copy, or the site's production scraper (only when the per-job copy is missing).
+        code:
+          type: string
+          description: Full Python source. Typically 200-600 lines.
+
+    # ── Schema validation ──────────────────────────────────────────────────
+    SchemaIssue:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        severity:
+          type: string
+          enum: [error, warning]
+        path:
+          type: string
+          description: JSON-pointer-ish location, e.g. "$.properties.price.type".
+
+    SchemaValidationResult:
+      type: object
+      required: [valid, issues, derived_fields]
+      properties:
+        valid:
+          type: boolean
+        issues:
+          type: array
+          items:
+            $ref: "#/components/schemas/SchemaIssue"
+        derived_fields:
+          type: array
+          items:
+            type: string
+          description: Flattened field names the schema requests (these become `target_fields` on create).
+        detected_content_type:
+          description: Content type inferred from the schema's field names; null when not recognizable.
+          oneOf:
+            - $ref: "#/components/schemas/ContentType"
+            - type: "null"
+
+# ───────────────────────────────────────────────────────────────────────────
+# CALLBACKS / WEBSOCKETS — NOT SPECIFIED HERE (by requirement).
+# The optional `callback_url` on POST /api/v1/jobs is stored by this API; its
+# delivery contract (event names, payloads, retries, signatures, SSE/WSS
+# channels) is owned by the sibling AsyncAPI document. This document defines
+# no webhooks object and no websocket/bindings on purpose.
+# ───────────────────────────────────────────────────────────────────────────

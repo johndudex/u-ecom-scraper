@@ -105,6 +105,8 @@ urlpatterns = [
     ),
     path("health/", views.health_dashboard, name="health"),
     path("learnt-skills/", views.learnt_skills, name="learnt_skills"),
+    path("docs/sync_api", views.docs_sync_api, name="docs_sync_api"),
+    path("docs/async_api", views.docs_async_api, name="docs_async_api"),
     path("learnt-skills/<slug:skill_name>/update/", views.learnt_skill_update, name="learnt_skill_update"),
     path("learnt-skills/<slug:skill_name>/delete/", views.learnt_skill_delete, name="learnt_skill_delete"),
     path("api/health/", views.health_api, name="health_api"),
