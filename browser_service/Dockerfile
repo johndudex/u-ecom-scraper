@@ -66,6 +66,8 @@ CMD ["sh", "-c", "\
     rm -rf /tmp/.X98-lock /tmp/.X11-unix/X98 && \
     rm -rf /tmp/chrome-profiles/mcp/SingletonLock /tmp/chrome-profiles/mcp/SingletonSocket /tmp/chrome-profiles/mcp/SingletonCookie && \
     rm -rf /tmp/chrome-profiles/scraper/SingletonLock /tmp/chrome-profiles/scraper/SingletonSocket /tmp/chrome-profiles/scraper/SingletonCookie && \
+    rm -f /app/core.* /core.* && \
+    ulimit -c 0 && \
     LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
     PYTHONPATH=/app exec uvicorn browser_service.server:app --host 0.0.0.0 --port 8001 --workers 1 --log-level info \
 "]

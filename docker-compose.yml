@@ -179,6 +179,14 @@ services:
       dockerfile: browser_service/Dockerfile
     init: true
     shm_size: 2g
+    # Chrome crash dumps: without this, every Chrome crash writes a 100-413MB
+    # core.* file to /app (707 of them = 61GB accumulated over 2 weeks; the
+    # host kernel's core_pattern + inherited 'unlimited' ulimit produce them).
+    # CDP auto-restart already recovers from crashes — the dumps are pure waste.
+    ulimits:
+      core:
+        soft: 0
+        hard: 0
     volumes:
       - ./browser_service:/app/browser_service
       - ./src:/app/src:ro
