@@ -3272,7 +3272,13 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             # (D2-pattern in new clothes). Record the failure so it finalizes
             # FAILED honestly. (Not a rescue case — the rescue path requires
             # real output items, checked in route_after_testing.)
-            _is_last = is_final_attempt or retry_count >= MAX_TEST_RETRIES
+            # NB: is_final_attempt is NOT in scope here (that's
+            # route_after_testing's local) — derive it the same way: the
+            # sentinel marks the final attempt (route_after_testing.py:391).
+            _is_last = (
+                retry_count == FINAL_RETRY_SENTINEL
+                or retry_count >= MAX_TEST_RETRIES
+            )
             _has_real_out = False
             try:
                 _ws = os.path.join(_get_project_root(), "workspace", slug)
