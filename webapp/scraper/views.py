@@ -2791,6 +2791,12 @@ def learnt_skill_delete(request, skill_name):
     return redirect("learnt_skills")
 
 
+def _yaml_safe_load(text: str):
+    import yaml
+
+    return yaml.safe_load(text)
+
+
 # ── Partner API specification documents (login-gated) ────────────────────────
 
 _SPECS_DIR = os.path.join(settings.PROJECT_ROOT, "docs", "specs")
@@ -2814,37 +2820,83 @@ def _serve_spec(request, which: str):
     with open(path, "r", encoding="utf-8") as fh:
         content = fh.read()
     if request.GET.get("format") != "yaml":
-        from django.utils.html import escape
+        import json as _json
 
         sibling = "async" if which == "sync" else "sync"
         ctx = {
             "spec_name": "Sync API (OpenAPI 3.1)" if which == "sync" else "Event API (AsyncAPI 3.0)",
             "spec_yaml": content,
+            "spec_json": _json.dumps(_yaml_safe_load(content)),
             "raw_url": f"/docs/{which}_api/?format=yaml",
             "sibling_url": f"/docs/{sibling}_api/",
             "line_count": content.count("\n") + 1,
         }
-        # Render via a minimal inline template (no new template file needed).
-        html = (
+        # Full renderer: Swagger UI (sync) / AsyncAPI web-component (async),
+        # both via CDN. Plain-YAML fallback stays available via ?view=raw for
+        # no-CDN environments (and renders automatically if CDN assets fail).
+        view = request.GET.get("view", "")
+        if view != "raw":
+            if which == "sync":
+                body = (
+                    "<link rel='stylesheet' href='https://unpkg.com/swagger-ui-dist@5/swagger-ui.css'>"
+                    "<div id='swagger-ui'></div>"
+                    "<script src='https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js'></script>"
+                    "<script>"
+                    "window.ui = SwaggerUIBundle({"
+                    "spec: " + ctx["spec_json"] + ","
+                    "dom_id: '#swagger-ui', deepLinking: true, docExpansion: 'none'"
+                    "});"
+                    "</script>"
+                    "<noscript><p style='color:#F87171;'>Swagger UI needs JavaScript —"
+                    " <a href='?view=raw'>plain YAML view</a></p></noscript>"
+                )
+            else:
+                body = (
+                    "<script src='https://unpkg.com/@asyncapi/web-component@1.4.10/lib/asyncapi-web-component.js' defer></script>"
+                    "<asyncapi-component"
+                    " schema='" + ctx["spec_json"].replace("'", "&#39;") + "'"
+                    " cssImport='https://unpkg.com/@asyncapi/react-component@1.4/styles/default.min.css'"
+                    " sidebar='true'></asyncapi-component>"
+                    "<noscript><p style='color:#F87171;'>The AsyncAPI component needs JavaScript —"
+                    " <a href='?view=raw'>plain YAML view</a></p></noscript>"
+                )
+            page = (
+                "{% extends 'scraper/base.html' %}{% block title %}{{ spec_name }}{% endblock %}"
+                "{% block content %}"
+                "<div style='max-width:1200px;margin:0 auto;padding:1.5rem;'>"
+                "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;'>"
+                "<h1 style='color:#F1F5F9;font-size:1.25rem;'>{{ spec_name }}</h1>"
+                "<div style='font-size:.8rem;'>"
+                "<a href='{{ raw_url }}' style='color:#22D3EE;'>raw YAML</a> &nbsp;|&nbsp; "
+                "<a href='?view=raw' style='color:#22D3EE;'>plain view</a> &nbsp;|&nbsp; "
+                "<a href='{{ sibling_url }}' style='color:#22D3EE;'>sibling spec</a></div></div>"
+                + body +
+                "</div>{% endblock %}"
+            )
+            from django.template import engines
+
+            template = engines["django"].from_string(page)
+            return HttpResponse(template.render(ctx, request))
+        # ?view=raw — plain readable YAML (no CDN dependency)
+        from django.template import engines
+
+        page = (
             "{% extends 'scraper/base.html' %}{% block title %}{{ spec_name }}{% endblock %}"
             "{% block content %}"
             "<div style='max-width:1100px;margin:0 auto;padding:1.5rem;'>"
             "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;'>"
             "<h1 style='color:#F1F5F9;font-size:1.25rem;'>{{ spec_name }}</h1>"
-            "<div><a href='{{ raw_url }}' style='color:#22D3EE;font-size:.8rem;'>raw YAML</a> "
-            "&nbsp;|&nbsp; <a href='{{ sibling_url }}?format=html' style='color:#22D3EE;font-size:.8rem;'>sibling spec</a></div>"
-            "</div>"
-            "<p style='color:#94A3B8;font-size:.8rem;margin-bottom:1rem;'>{{ line_count }} lines · login-gated ·"
-            " paste into <a href='https://editor.swagger.io/' style='color:#22D3EE;'>swagger editor</a> or"
-            " <a href='https://studio.asyncapi.com/' style='color:#22D3EE;'>asyncapi studio</a> for full rendering</p>"
+            "<div style='font-size:.8rem;'>"
+            "<a href='{{ raw_url }}' style='color:#22D3EE;'>raw YAML</a> &nbsp;|&nbsp; "
+            "<a href='.' style='color:#22D3EE;'>full renderer</a> &nbsp;|&nbsp; "
+            "<a href='{{ sibling_url }}' style='color:#22D3EE;'>sibling spec</a></div></div>"
+            "<p style='color:#94A3B8;font-size:.8rem;margin-bottom:1rem;'>{{ line_count }} lines · login-gated</p>"
             "<pre style='background:#0B1120;color:#CBD5E1;border:1px solid #1E293B;border-radius:.75rem;"
             "padding:1rem;font-size:.72rem;line-height:1.5;max-height:75vh;overflow:auto;"
             "white-space:pre-wrap;word-break:break-word;'>{{ spec_yaml }}</pre></div>"
             "{% endblock %}"
         )
-        from django.template import engines
-
-        template = engines["django"].from_string(html)
+        template = engines["django"].from_string(page)
         return HttpResponse(template.render(ctx, request))
     resp = HttpResponse(content, content_type="application/yaml; charset=utf-8")
     resp["Content-Disposition"] = f'attachment; filename="{fname}"'
