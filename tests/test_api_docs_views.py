@@ -137,8 +137,9 @@ class TestRendererPages:
             body = r.content.decode()
             # swagger bundle + url-fetch load (inline spec: constructor drops
             # operations in v5 builds; updateSpec races store init)
-            assert "swagger-ui-bundle.js" in body
+            assert "/docs/assets/swagger-ui-bundle.js" in body
             assert "url: '/docs/sync_api?format=json'" in body
+            assert "unpkg.com" not in body  # zero third-party loads
             assert "spec:" not in body.split("SwaggerUIBundle")[1].split("});")[0]
         finally:
             u.delete()
@@ -150,10 +151,39 @@ class TestRendererPages:
             r = views.docs_async_api(req)
             assert r.status_code == 200
             body = r.content.decode()
-            # v3 web component (1.4.x parser predates AsyncAPI 3.0 docs and
-            # renders a blank shadow root)
-            assert "web-component@3.1.6" in body
+            # v3 web component, vendored same-origin (1.4.x parser predates
+            # AsyncAPI 3.0 docs and renders a blank shadow root)
+            assert "/docs/assets/asyncapi-web-component.js" in body
             assert "asyncapi-component" in body
+            assert "unpkg.com" not in body  # zero third-party loads
+            # shadow-root @import 'assets/default.min.css' is page-relative
+            # -> must resolve against /docs/assets/
+            assert "cssImport=" not in body
+        finally:
+            u.delete()
+
+    def test_doc_assets_served_same_origin(self, db):
+        u = User(username="_t_spec9"); u.save()
+        try:
+            for name, ctype in (
+                ("default.min.css", "text/css"),
+                ("asyncapi-web-component.js", "javascript"),
+                ("swagger-ui.css", "text/css"),
+                ("swagger-ui-bundle.js", "javascript"),
+            ):
+                req = rf.get(f"/docs/assets/{name}"); req.user = u
+                r = views._serve_doc_asset(req, name)
+                assert r.status_code == 200, name
+                assert ctype in r["Content-Type"], name
+                assert len(r.content) > 10000, name  # real bundles, not stubs
+            # whitelist only — traversal/unknown names 404
+            from django.http import Http404
+            for bad in ("../settings.py", "evil.js", "settings.py"):
+                try:
+                    views._serve_doc_asset(rf.get(f"/docs/assets/{bad}"), bad)
+                    raise AssertionError(f"expected 404 for {bad}")
+                except Http404:
+                    pass
         finally:
             u.delete()
 

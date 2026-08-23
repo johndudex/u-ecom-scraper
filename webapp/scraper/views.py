@@ -2803,6 +2803,32 @@ _SPECS_DIR = os.path.join(settings.PROJECT_ROOT, "docs", "specs")
 _SPEC_FILES = {"sync": "sync_api.yaml", "async": "async_api.yaml"}
 
 
+# Vendored renderer assets (docs/assets/, see its README): whitelisted
+# name -> MIME. Served same-origin so the docs pages load no third-party
+# scripts, and the AsyncAPI component's shadow-root
+# @import 'assets/default.min.css' — relative to the PAGE, it ignores the
+# cssImport attribute — resolves here instead of to an HTML 404.
+_DOC_ASSETS = {
+    "swagger-ui.css": "text/css; charset=utf-8",
+    "swagger-ui-bundle.js": "application/javascript; charset=utf-8",
+    "asyncapi-web-component.js": "application/javascript; charset=utf-8",
+    "default.min.css": "text/css; charset=utf-8",
+}
+
+
+def _serve_doc_asset(request, filename: str):
+    """Static renderer asset, login-gated with the docs pages. 404 on any
+    name outside the whitelist (no directory traversal surface)."""
+    mime = _DOC_ASSETS.get(os.path.basename(filename))
+    if not mime:
+        raise Http404("unknown asset")
+    path = os.path.join(settings.PROJECT_ROOT, "docs", "assets", os.path.basename(filename))
+    if not os.path.isfile(path):
+        raise Http404(f"asset missing: {filename}")
+    with open(path, "r", encoding="utf-8") as fh:
+        return HttpResponse(fh.read(), content_type=mime)
+
+
 def _serve_spec(request, which: str):
     """Serve an API spec. Login required (enforced by the callers) — these
     documents are for the internal team + partners under NDA, not public.
@@ -2882,9 +2908,9 @@ def _serve_spec(request, which: str):
         # init ("No API definition provided") — both verified by bisection.
         # URL fetch is the path every real deployment uses.
         body = (
-            "<link rel='stylesheet' href='https://unpkg.com/swagger-ui-dist@5/swagger-ui.css'>"
+            "<link rel='stylesheet' href='/docs/assets/swagger-ui.css'>"
             "<div id='swagger-ui'></div>"
-            "<script src='https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js'></script>\n"
+            "<script src='/docs/assets/swagger-ui-bundle.js'></script>\n"
             "<script>\n"
             "window.ui = SwaggerUIBundle({\n"
             f"  url: '{ctx['json_url']}',\n"
@@ -2902,19 +2928,27 @@ def _serve_spec(request, which: str):
         # it pulls its stylesheet. Deliberately NO `configuration` attribute —
         # defaults render sidebar + content, and a malformed configuration
         # value silently blanked the component in earlier testing.
-        # v3.x of the web component (entry point moved to lib/index.js);
-        # the 1.4.x line bundles an AsyncAPI parser that predates 3.0
-        # documents — it registers the element, renders a bare shadow root
-        # with a style @import, and silently draws nothing else.
+        # v3.x of the web component — the 1.4.x line bundles an AsyncAPI
+        # parser that predates 3.0 documents (registers the element, renders
+        # a bare shadow root, draws nothing). Assets vendored under
+        # /docs/assets/ (same-origin): the shadow root hardcodes
+        # @import 'assets/default.min.css' relative to the page, so the CSS
+        # must be reachable at /docs/assets/default.min.css.
+        # font-family on the HOST element: inheritable properties cross
+        # the shadow boundary, but the stylesheet's own body/html font
+        # selectors cannot match inside it — without this, un-inherited
+        # elements fall back to the browser serif default.
         body = (
-            "<script src='https://unpkg.com/@asyncapi/web-component@3.1.6/lib/asyncapi-web-component.js'></script>\n"
-            "<asyncapi-component schema='" + schema_attr + "' "
-            "cssImport='https://unpkg.com/@asyncapi/react-component@3.1.6/styles/default.min.css'>"
+            "<style>asyncapi-component{font-family:system-ui,-apple-system,"
+            "'Segoe UI',Roboto,Helvetica,Arial,sans-serif;}</style>\n"
+            "<script src='/docs/assets/asyncapi-web-component.js'></script>\n"
+            "<asyncapi-component schema='" + schema_attr + "'>"
             "</asyncapi-component>"
         )
     page = (
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<title>" + ctx["spec_name"] + "</title>"
+        "<link rel='icon' href='data:,'>"  # suppress favicon 404 noise
         "<style>body{margin:0;background:#fff;}</style></head><body>"
         + nav + body + "</body></html>"
     )
