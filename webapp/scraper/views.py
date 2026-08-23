@@ -2798,11 +2798,12 @@ _SPEC_FILES = {"sync": "sync_api.yaml", "async": "async_api.yaml"}
 
 
 def _serve_spec(request, which: str):
-    """Serve an API spec YAML. Login required (enforced by the callers) — these
+    """Serve an API spec. Login required (enforced by the callers) — these
     documents are for the internal team + partners under NDA, not public.
 
-    ?format=json renders a simple HTML preview with syntax-highlighted YAML;
-    the default returns the raw file (downloadable, tool-ingestible).
+    DEFAULT renders a readable HTML page (browsers download application/yaml,
+    which made the default view useless); ?format=yaml returns the raw file
+    (for tooling / swagger+asyncapi studio import, served as an attachment).
     """
     fname = _SPEC_FILES.get(which)
     if not fname:
@@ -2812,14 +2813,14 @@ def _serve_spec(request, which: str):
         raise Http404(f"spec file missing: {fname}")
     with open(path, "r", encoding="utf-8") as fh:
         content = fh.read()
-    if request.GET.get("format") == "html":
+    if request.GET.get("format") != "yaml":
         from django.utils.html import escape
 
         sibling = "async" if which == "sync" else "sync"
         ctx = {
             "spec_name": "Sync API (OpenAPI 3.1)" if which == "sync" else "Event API (AsyncAPI 3.0)",
             "spec_yaml": content,
-            "raw_url": f"/docs/{which}_api/",
+            "raw_url": f"/docs/{which}_api/?format=yaml",
             "sibling_url": f"/docs/{sibling}_api/",
             "line_count": content.count("\n") + 1,
         }
@@ -2846,7 +2847,7 @@ def _serve_spec(request, which: str):
         template = engines["django"].from_string(html)
         return HttpResponse(template.render(ctx, request))
     resp = HttpResponse(content, content_type="application/yaml; charset=utf-8")
-    resp["Content-Disposition"] = f'inline; filename="{fname}"'
+    resp["Content-Disposition"] = f'attachment; filename="{fname}"'
     return resp
 
 

@@ -63,21 +63,32 @@ class TestSpecViewsAuth:
 
 
 class TestSpecViewsContent:
-    def test_sync_serves_openapi_yaml(self, db):
+    def test_sync_default_is_html(self, db):
         u = User(username="_t_spec2"); u.save()
         try:
             req = rf.get("/docs/sync_api"); req.user = u
             r = views.docs_sync_api(req)
             assert r.status_code == 200
-            assert "application/yaml" in r["Content-Type"]
-            assert b"openapi: 3.1" in r.content
+            assert b"Sync API (OpenAPI 3.1)" in r.content
         finally:
             u.delete()
 
-    def test_async_serves_asyncapi_yaml(self, db):
+    def test_sync_yaml_mode(self, db):
+        u = User(username="_t_spec5"); u.save()
+        try:
+            req = rf.get("/docs/sync_api?format=yaml"); req.user = u
+            r = views.docs_sync_api(req)
+            assert r.status_code == 200
+            assert "application/yaml" in r["Content-Type"]
+            assert b"openapi: 3.1" in r.content
+            assert "attachment" in r["Content-Disposition"]
+        finally:
+            u.delete()
+
+    def test_async_yaml_mode(self, db):
         u = User(username="_t_spec3"); u.save()
         try:
-            req = rf.get("/docs/async_api"); req.user = u
+            req = rf.get("/docs/async_api?format=yaml"); req.user = u
             r = views.docs_async_api(req)
             assert r.status_code == 200
             assert b"asyncapi:" in r.content[:200]
@@ -87,7 +98,7 @@ class TestSpecViewsContent:
     def test_html_preview_mode(self, db):
         u = User(username="_t_spec4"); u.save()
         try:
-            req = rf.get("/docs/sync_api?format=html"); req.user = u
+            req = rf.get("/docs/sync_api"); req.user = u  # html is the default now
             r = views.docs_sync_api(req)
             assert r.status_code == 200
             assert b"Sync API (OpenAPI 3.1)" in r.content

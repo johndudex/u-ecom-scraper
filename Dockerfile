@@ -21,6 +21,7 @@ COPY --chown=scraper:scraper config/ /app/config/
 COPY --chown=scraper:scraper scripts/ /app/scripts/
 COPY --chown=scraper:scraper data/ /app/data/
 COPY --chown=scraper:scraper templates/ /app/templates/
+COPY --chown=scraper:scraper docs/ /app/docs/
 COPY --chown=scraper:scraper .opencode/ /app/.opencode/
 COPY --chown=scraper:scraper experimental/nav_traversal/ /app/experimental/nav_traversal/
 COPY --chown=scraper:scraper experimental/__init__.py /app/experimental/__init__.py
