@@ -2807,9 +2807,11 @@ def _serve_spec(request, which: str):
     """Serve an API spec. Login required (enforced by the callers) — these
     documents are for the internal team + partners under NDA, not public.
 
-    DEFAULT renders a readable HTML page (browsers download application/yaml,
-    which made the default view useless); ?format=yaml returns the raw file
-    (for tooling / swagger+asyncapi studio import, served as an attachment).
+    Default renders the full interactive docs page (Swagger UI for the sync
+    spec, the AsyncAPI web component for the event spec) — standalone
+    documents with NO system styling. ?view=raw = plain-YAML fallback,
+    ?format=yaml = download for tooling, ?format=json = machine-readable
+    copy (what the on-page renderers fetch, same-origin with the session).
     """
     fname = _SPEC_FILES.get(which)
     if not fname:
@@ -2819,88 +2821,104 @@ def _serve_spec(request, which: str):
         raise Http404(f"spec file missing: {fname}")
     with open(path, "r", encoding="utf-8") as fh:
         content = fh.read()
-    if request.GET.get("format") != "yaml":
+
+    fmt = request.GET.get("format", "")
+
+    if fmt == "yaml":
+        resp = HttpResponse(content, content_type="application/yaml; charset=utf-8")
+        resp["Content-Disposition"] = f'attachment; filename="{fname}"'
+        return resp
+
+    spec_obj = _yaml_safe_load(content)
+    if which == "sync" and isinstance(spec_obj, dict):
+        # Swagger UI refuses to render endpoints when jsonSchemaDialect is
+        # set to a non-default value (verified: warning + 0 operation
+        # blocks). The field is optional in OpenAPI 3.1 — strip it from the
+        # RENDERED copies only; the raw YAML download keeps it.
+        spec_obj.pop("jsonSchemaDialect", None)
+
+    if fmt == "json":
+        return JsonResponse(spec_obj)
+
+    sibling = "async" if which == "sync" else "sync"
+    ctx = {
+        "spec_name": "Sync API (OpenAPI 3.1)" if which == "sync" else "Event API (AsyncAPI 3.0)",
+        "raw_url": f"/docs/{which}_api?format=yaml",
+        "json_url": f"/docs/{which}_api?format=json",
+        "sibling_url": f"/docs/{sibling}_api",
+        "line_count": content.count("\n") + 1,
+    }
+    nav = (
+        f"<div style='display:flex;gap:18px;align-items:center;padding:10px 18px;"
+        f"background:#0B1120;border-bottom:1px solid #1E293B;font-family:system-ui,sans-serif;'>"
+        f"<strong style='color:#F1F5F9;font-size:15px;'>{ctx['spec_name']}</strong>"
+        f"<span style='color:#64748B;font-size:12px;'>{ctx['line_count']} lines · login-gated</span>"
+        f"<span style='flex:1'></span>"
+        f"<a href='{ctx['raw_url']}' style='color:#22D3EE;font-size:13px;text-decoration:none;'>raw YAML</a>"
+        f"<a href='?view=raw' style='color:#22D3EE;font-size:13px;text-decoration:none;'>plain view</a>"
+        f"<a href='{ctx['sibling_url']}' style='color:#22D3EE;font-size:13px;text-decoration:none;'>sibling spec</a>"
+        f"</div>"
+    )
+    if request.GET.get("view") == "raw":
+        # ?view=raw — plain readable YAML (no CDN dependency), still standalone
+        page = (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<title>" + ctx["spec_name"] + "</title></head><body style='margin:0;background:#0B1120;'>"
+            + nav +
+            "<pre style='color:#CBD5E1;padding:18px;font-size:12.5px;line-height:1.55;"
+            "white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,monospace;'>"
+            + content.replace("&", "&amp;").replace("<", "&lt;") +
+            "</pre></body></html>"
+        )
+        return HttpResponse(page)
+
+    # Full renderer, via CDN. STANDALONE documents — no base.html, no Tailwind,
+    # no system styling (the system's CDN Tailwind preflight + dark CSS vars
+    # fought both renderers; these pages are deliberately independent).
+    if which == "sync":
+        # Load by URL (same-origin ?format=json). The inline `spec:`
+        # constructor option drops operations in swagger-ui-dist v5 builds,
+        # and calling updateSpec right after construction races the store
+        # init ("No API definition provided") — both verified by bisection.
+        # URL fetch is the path every real deployment uses.
+        body = (
+            "<link rel='stylesheet' href='https://unpkg.com/swagger-ui-dist@5/swagger-ui.css'>"
+            "<div id='swagger-ui'></div>"
+            "<script src='https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js'></script>\n"
+            "<script>\n"
+            "window.ui = SwaggerUIBundle({\n"
+            f"  url: '{ctx['json_url']}',\n"
+            "  dom_id: '#swagger-ui', deepLinking: true, docExpansion: 'list'\n"
+            "});\n"
+            "</script>"
+        )
+    else:
         import json as _json
 
-        sibling = "async" if which == "sync" else "sync"
-        ctx = {
-            "spec_name": "Sync API (OpenAPI 3.1)" if which == "sync" else "Event API (AsyncAPI 3.0)",
-            "spec_yaml": content,
-            "spec_json": _json.dumps(_yaml_safe_load(content)),
-            "raw_url": f"/docs/{which}_api/?format=yaml",
-            "sibling_url": f"/docs/{sibling}_api/",
-            "line_count": content.count("\n") + 1,
-        }
-        # Full renderer: Swagger UI (sync) / AsyncAPI web-component (async),
-        # both via CDN. Plain-YAML fallback stays available via ?view=raw for
-        # no-CDN environments (and renders automatically if CDN assets fail).
-        view = request.GET.get("view", "")
-        if view != "raw":
-            if which == "sync":
-                body = (
-                    "<link rel='stylesheet' href='https://unpkg.com/swagger-ui-dist@5/swagger-ui.css'>"
-                    "<div id='swagger-ui'></div>"
-                    "<script src='https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js'></script>"
-                    "<script>"
-                    "window.ui = SwaggerUIBundle({"
-                    "spec: " + ctx["spec_json"] + ","
-                    "dom_id: '#swagger-ui', deepLinking: true, docExpansion: 'none'"
-                    "});"
-                    "</script>"
-                    "<noscript><p style='color:#F87171;'>Swagger UI needs JavaScript —"
-                    " <a href='?view=raw'>plain YAML view</a></p></noscript>"
-                )
-            else:
-                body = (
-                    "<script src='https://unpkg.com/@asyncapi/web-component@1.4.10/lib/asyncapi-web-component.js' defer></script>"
-                    "<asyncapi-component"
-                    " schema='" + ctx["spec_json"].replace("'", "&#39;") + "'"
-                    " cssImport='https://unpkg.com/@asyncapi/react-component@1.4/styles/default.min.css'"
-                    " sidebar='true'></asyncapi-component>"
-                    "<noscript><p style='color:#F87171;'>The AsyncAPI component needs JavaScript —"
-                    " <a href='?view=raw'>plain YAML view</a></p></noscript>"
-                )
-            page = (
-                "{% extends 'scraper/base.html' %}{% block title %}{{ spec_name }}{% endblock %}"
-                "{% block content %}"
-                "<div style='max-width:1200px;margin:0 auto;padding:1.5rem;'>"
-                "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;'>"
-                "<h1 style='color:#F1F5F9;font-size:1.25rem;'>{{ spec_name }}</h1>"
-                "<div style='font-size:.8rem;'>"
-                "<a href='{{ raw_url }}' style='color:#22D3EE;'>raw YAML</a> &nbsp;|&nbsp; "
-                "<a href='?view=raw' style='color:#22D3EE;'>plain view</a> &nbsp;|&nbsp; "
-                "<a href='{{ sibling_url }}' style='color:#22D3EE;'>sibling spec</a></div></div>"
-                + body +
-                "</div>{% endblock %}"
-            )
-            from django.template import engines
-
-            template = engines["django"].from_string(page)
-            return HttpResponse(template.render(ctx, request))
-        # ?view=raw — plain readable YAML (no CDN dependency)
-        from django.template import engines
-
-        page = (
-            "{% extends 'scraper/base.html' %}{% block title %}{{ spec_name }}{% endblock %}"
-            "{% block content %}"
-            "<div style='max-width:1100px;margin:0 auto;padding:1.5rem;'>"
-            "<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;'>"
-            "<h1 style='color:#F1F5F9;font-size:1.25rem;'>{{ spec_name }}</h1>"
-            "<div style='font-size:.8rem;'>"
-            "<a href='{{ raw_url }}' style='color:#22D3EE;'>raw YAML</a> &nbsp;|&nbsp; "
-            "<a href='.' style='color:#22D3EE;'>full renderer</a> &nbsp;|&nbsp; "
-            "<a href='{{ sibling_url }}' style='color:#22D3EE;'>sibling spec</a></div></div>"
-            "<p style='color:#94A3B8;font-size:.8rem;margin-bottom:1rem;'>{{ line_count }} lines · login-gated</p>"
-            "<pre style='background:#0B1120;color:#CBD5E1;border:1px solid #1E293B;border-radius:.75rem;"
-            "padding:1rem;font-size:.72rem;line-height:1.5;max-height:75vh;overflow:auto;"
-            "white-space:pre-wrap;word-break:break-word;'>{{ spec_yaml }}</pre></div>"
-            "{% endblock %}"
+        schema_attr = (
+            _json.dumps(spec_obj).replace("&", "&amp;").replace("'", "&#39;")
         )
-        template = engines["django"].from_string(page)
-        return HttpResponse(template.render(ctx, request))
-    resp = HttpResponse(content, content_type="application/yaml; charset=utf-8")
-    resp["Content-Disposition"] = f'attachment; filename="{fname}"'
-    return resp
+        # The web component boots React inside a shadow root; cssImport is how
+        # it pulls its stylesheet. Deliberately NO `configuration` attribute —
+        # defaults render sidebar + content, and a malformed configuration
+        # value silently blanked the component in earlier testing.
+        # v3.x of the web component (entry point moved to lib/index.js);
+        # the 1.4.x line bundles an AsyncAPI parser that predates 3.0
+        # documents — it registers the element, renders a bare shadow root
+        # with a style @import, and silently draws nothing else.
+        body = (
+            "<script src='https://unpkg.com/@asyncapi/web-component@3.1.6/lib/asyncapi-web-component.js'></script>\n"
+            "<asyncapi-component schema='" + schema_attr + "' "
+            "cssImport='https://unpkg.com/@asyncapi/react-component@3.1.6/styles/default.min.css'>"
+            "</asyncapi-component>"
+        )
+    page = (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<title>" + ctx["spec_name"] + "</title>"
+        "<style>body{margin:0;background:#fff;}</style></head><body>"
+        + nav + body + "</body></html>"
+    )
+    return HttpResponse(page)
 
 
 @login_required

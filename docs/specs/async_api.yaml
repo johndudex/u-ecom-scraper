@@ -264,10 +264,11 @@ channels:
       - $ref: '#/servers/production-sse'
     parameters:
       job_id:
-        description: Numeric ScrapeJob id (same identifier as the sync API).
+        description: >-
+          Numeric ScrapeJob id (same identifier as the sync API) as a decimal
+          string in the topic address; the message payload carries it as a
+          JSON integer.
         location: $message.payload#/job_id
-        schema:
-          type: integer
     messages:
       JobCreated:
         $ref: '#/components/messages/JobCreated'

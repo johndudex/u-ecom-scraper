@@ -107,6 +107,57 @@ class TestSpecViewsContent:
             u.delete()
 
 
+class TestRendererPages:
+    """The full docs pages: spec JSON endpoint + renderer wiring (fixed
+    2026-08-23 after both renderers rendered blank — see view docstring)."""
+
+    def test_sync_json_endpoint(self, db):
+        u = User(username="_t_spec6"); u.save()
+        try:
+            req = rf.get("/docs/sync_api?format=json"); req.user = u
+            r = views.docs_sync_api(req)
+            assert r.status_code == 200
+            assert "json" in r["Content-Type"]
+            import json as _json
+            doc = _json.loads(r.content)
+            assert doc["openapi"].startswith("3.1")
+            assert len(doc["paths"]) >= 9
+            # jsonSchemaDialect is stripped from rendered copies (swagger-ui
+            # refuses endpoints when non-default) but NOT from raw yaml
+            assert "jsonSchemaDialect" not in doc
+        finally:
+            u.delete()
+
+    def test_sync_renderer_page_wiring(self, db):
+        u = User(username="_t_spec7"); u.save()
+        try:
+            req = rf.get("/docs/sync_api"); req.user = u
+            r = views.docs_sync_api(req)
+            assert r.status_code == 200
+            body = r.content.decode()
+            # swagger bundle + url-fetch load (inline spec: constructor drops
+            # operations in v5 builds; updateSpec races store init)
+            assert "swagger-ui-bundle.js" in body
+            assert "url: '/docs/sync_api?format=json'" in body
+            assert "spec:" not in body.split("SwaggerUIBundle")[1].split("});")[0]
+        finally:
+            u.delete()
+
+    def test_async_renderer_page_wiring(self, db):
+        u = User(username="_t_spec8"); u.save()
+        try:
+            req = rf.get("/docs/async_api"); req.user = u
+            r = views.docs_async_api(req)
+            assert r.status_code == 200
+            body = r.content.decode()
+            # v3 web component (1.4.x parser predates AsyncAPI 3.0 docs and
+            # renders a blank shadow root)
+            assert "web-component@3.1.6" in body
+            assert "asyncapi-component" in body
+        finally:
+            u.delete()
+
+
 class TestSpecFilesStructural:
     """The specs are contracts — keep them valid YAML with resolving refs."""
 
