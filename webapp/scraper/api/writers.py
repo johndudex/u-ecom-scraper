@@ -304,6 +304,12 @@ def get_job_sample(request, job_id: int):
 
 # ── output endpoints ────────────────────────────────────────────────────────
 
+def _fm_read_text(key: str) -> str:
+    import src.artifacts as artifacts
+
+    return artifacts.read_text(key)
+
+
 def _fm_read_bytes(key: str):
     try:
         import src.artifacts as artifacts
@@ -342,3 +348,32 @@ def download_job_output(request, job_id: int):
     resp = HttpResponse(data, content_type="application/json")
     resp["Content-Disposition"] = f'attachment; filename="{filename}"'
     return resp
+
+
+# ── scraper-code ────────────────────────────────────────────────────────────
+
+@api_view(["GET"])
+def get_job_scraper_code(request, job_id: int):
+    """GET /api/v1/jobs/{id}/scraper-code — the generated Python source.
+
+    ?format=json (default): {code, filename, size_bytes}; ?format=raw:
+    bare text/x-python with an attachment header.
+    """
+    job = _api_get_job(request, job_id)
+    if not job.scraper_file:
+        raise errors.ApiError(404, "not_found", "No scraper was produced for this job.")
+    try:
+        code = _fm_read_text(job.scraper_file)
+    except Exception:
+        raise errors.ApiError(404, "not_found", "No scraper was produced for this job.")
+    filename = job.scraper_file.rsplit("/", 1)[-1]
+    if request.GET.get("format") == "raw":
+        resp = HttpResponse(code, content_type="text/x-python")
+        resp["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return resp
+    return JsonResponse({
+        "code": code,
+        "filename": filename,
+        "size_bytes": len(code.encode("utf-8")),
+        "url": f"/api/v1/jobs/{job.id}/scraper-code",
+    })

@@ -895,6 +895,20 @@ def _notify_phase(job_id: int, node_name: str, status: str) -> None:
         )
     except Exception:
         pass
+    # Partner event (async_api.yaml JobPhaseUpdated) — the single phase
+    # choke point, so every phase transition fans out. Best-effort: emit's
+    # own gate skips non-partner jobs. (job is re-fetched: the Step block
+    # above may have failed before assigning it.)
+    try:
+        from scraper.events import emit as _emit
+        from scraper.models import ScrapeJob
+
+        pjob = ScrapeJob.objects.filter(pk=job_id).first()
+        if pjob is not None:
+            _emit(pjob, "job.phase.updated",
+                  {"phase": phase, "phase_status": status})
+    except Exception:
+        pass
 
 
 def _budget_setting(name: str, default: int) -> int:
@@ -1026,6 +1040,26 @@ def _promote_scraper(
                 "scraper.py left as-is (job %s)",
                 execution_status, job_id,
             )
+        # Partner events (async_api.yaml): scraper_ready fires IN-GRAPH at
+        # promotion on SUCCESS (not reconciler-late — the spec's artifact
+        # ordering places it between sample and output). Best-effort;
+        # emit's gate skips non-partner jobs; dedupe keeps retries once.
+        if promoted and execution_status == "SUCCESS":
+            try:
+                from scraper.events import emit as _emit
+                from scraper.models import ScrapeJob
+
+                pjob = ScrapeJob.objects.filter(pk=job_id).first()
+                if pjob is not None:
+                    _emit(pjob, "job.scraper_ready", {},
+                          dedupe_key="scraper_ready")
+                    _emit(pjob, "job.artifact.available",
+                          {"kind": "scraper_code",
+                           "url": f"/api/v1/jobs/{job_id}/scraper-code",
+                           "key": promoted},
+                          dedupe_key=f"artifact:scraper_code:{job_id}")
+            except Exception as exc:
+                logger.warning("_promote_scraper: emit: %s", exc)
         return promoted
     except Exception as exc:
         logger.warning("_promote_scraper: failed: %s", exc)

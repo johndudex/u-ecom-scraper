@@ -213,6 +213,18 @@ def _seed_pipeline_steps(job: ScrapeJob) -> None:
         Step.objects.get_or_create(job=job, phase=phase)
 
 
+def _emit_running_transition(job: ScrapeJob) -> None:
+    """Partner event for the RUNNING transition (async_api.yaml JobInprogress).
+    Best-effort inside the save transaction — emit's dedupe (inprogress)
+    keeps resume paths exactly-once."""
+    try:
+        from scraper.events import emit as _emit
+
+        _emit(job, "job.inprogress", {"internal_status": job.status}, dedupe_key="inprogress")
+    except Exception as exc:
+        logger.warning("job %s: inprogress emit: %s", job.id, exc)
+
+
 def _run_graph_job(job: ScrapeJob, rescrape: bool = False) -> None:
     """Build the graph, stream events, and handle interrupts."""
     _seed_pipeline_steps(job)
@@ -228,6 +240,7 @@ def _run_graph_job(job: ScrapeJob, rescrape: bool = False) -> None:
     job.graph_thread_id = thread_id
     job.save(update_fields=["status", "started_at", "graph_thread_id"])
     _publish_job_status(job.id, ScrapeJob.STATUS_RUNNING)
+    _emit_running_transition(job)
 
     config = service.get_config(job.id)
     initial_state = _build_initial_state(job)

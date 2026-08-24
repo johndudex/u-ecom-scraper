@@ -32,10 +32,22 @@ MAX_ATTEMPTS = 6
 
 
 def claim_due_rows(limit: int = 50) -> list[EventOutbox]:
-    """Lease due rows atomically. Returns claimed rows (state=leased)."""
+    """Lease due rows atomically. Returns claimed rows (state=leased).
+
+    Two-phase: the FOR UPDATE SKIP LOCKED select nominates candidates;
+    each row is then leased with a CONDITIONAL UPDATE (CAS) keyed on the
+    row's CURRENT committed state — a row another sweeper leased between
+    our select and our update fails the WHERE and is skipped. This makes
+    the claim correct even when the queryset's snapshot is stale relative
+    to a concurrent sweeper's commits (observed as intermittent
+    both-missed rows under real thread contention).
+    """
+    from django.db.models import F, Q
+
     now = timezone.now()
+    lease_until = now + timedelta(seconds=LEASE_SECONDS)
     with transaction.atomic():
-        due = (
+        due = list(
             EventOutbox.objects
             .select_for_update(skip_locked=True)
             .filter(
@@ -48,19 +60,32 @@ def claim_due_rows(limit: int = 50) -> list[EventOutbox]:
         )
         claimed = []
         for row in due:
-            stale = (
-                row.state == EventOutbox.STATE_LEASED
-                and row.locked_until and row.locked_until < now
-            )
-            fresh_pending = row.state == EventOutbox.STATE_PENDING
-            if not (stale or fresh_pending):
-                continue  # actively leased by a live worker
-            if stale:
-                row.attempts += 1  # the dead lease burned an attempt
-            row.state = EventOutbox.STATE_LEASED
-            row.locked_until = now + timedelta(seconds=LEASE_SECONDS)
-            row.save(update_fields=["state", "locked_until", "attempts"])
-            claimed.append(row)
+            if row.state == EventOutbox.STATE_PENDING:
+                # CAS on committed state: skip if a racing sweeper leased it
+                updated = EventOutbox.objects.filter(
+                    pk=row.pk, state=EventOutbox.STATE_PENDING
+                ).update(
+                    state=EventOutbox.STATE_LEASED,
+                    locked_until=lease_until,
+                )
+                if updated:
+                    claimed.append(row)
+            else:  # LEASED with an expired lock (nominated above)
+                # dead worker's lease: reclaim + burn one attempt. CAS on
+                # state=LEASED AND the lock still being EXPIRED — a racing
+                # renewal (fresh unexpired lease) must fail this WHERE.
+                updated = EventOutbox.objects.filter(
+                    pk=row.pk,
+                    state=EventOutbox.STATE_LEASED,
+                    locked_until__lt=now,
+                ).update(
+                    state=EventOutbox.STATE_LEASED,
+                    locked_until=lease_until,
+                    attempts=F("attempts") + 1,
+                )
+                if updated:
+                    row.refresh_from_db()
+                    claimed.append(row)
         return claimed
 
 
