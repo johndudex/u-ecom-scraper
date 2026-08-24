@@ -11,7 +11,7 @@ import logging
 import secrets
 
 from django.db import transaction
-from django.http import JsonResponse
+from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
 
 from .. import models
@@ -300,3 +300,45 @@ def get_job_sample(request, job_id: int):
         "records": data["records"],
         "record_count": len(data["records"]),
     })
+
+
+# ── output endpoints ────────────────────────────────────────────────────────
+
+def _fm_read_bytes(key: str):
+    try:
+        import src.artifacts as artifacts
+
+        return artifacts.read(key)  # artifacts API: read() → bytes
+    except Exception:
+        return None
+
+
+@api_view(["GET"])
+def get_job_output(request, job_id: int):
+    job = _api_get_job(request, job_id)
+    from .output_index import read_output_page
+
+    try:
+        page = int(request.GET.get("page", 1))
+        page_size = int(request.GET.get("page_size", 100))
+    except (TypeError, ValueError):
+        from . import errors as _e
+
+        raise _e.ApiError(422, "invalid_page", "page/page_size must be integers.")
+    payload = read_output_page(job, page=page, page_size=page_size)
+    return JsonResponse(payload)
+
+
+@api_view(["GET"])
+def download_job_output(request, job_id: int):
+    job = _api_get_job(request, job_id)
+    if not job.output_file:
+        raise errors.ApiError(404, "output_not_found", "No output for this job.")
+    data = _fm_read_bytes(job.output_file)
+    if data is None:
+        # M10: FM miss = fail-fast, never hang
+        raise errors.ApiError(404, "output_not_found", "No output for this job.")
+    filename = job.output_file.rsplit("/", 1)[-1]
+    resp = HttpResponse(data, content_type="application/json")
+    resp["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return resp

@@ -29,4 +29,6 @@ urlpatterns = [
     path("jobs/<int:job_id>/cancel", writers.cancel_job, name="api_cancel_job"),
     path("jobs/<int:job_id>/callback", _callback_dispatch, name="api_job_callback"),
     path("jobs/<int:job_id>/sample", writers.get_job_sample, name="api_job_sample"),
+    path("jobs/<int:job_id>/output", writers.get_job_output, name="api_job_output"),
+    path("jobs/<int:job_id>/output/download", writers.download_job_output, name="api_job_output_download"),
 ]

@@ -867,6 +867,15 @@ def _finalize_job(job: ScrapeJob) -> None:
                 k for k in artifacts.list_keys(f"scrapers/{site_slug}/")
                 if k.split("/")[-1].startswith("output_") and k.endswith(".json")
             ]
+            # M5/R2: partner-job outputs are exempt (spec: fetchable via the
+            # sync API forever). Unowned/legacy files keep pruning.
+            try:
+                from scraper.api.output_index import partner_owned_keys
+
+                _protected = partner_owned_keys(site_slug)
+            except Exception:
+                _protected = set()
+            _outs = [k for k in _outs if k not in _protected]
             if len(_outs) > 5:
                 for _old in sorted(_outs)[:-5]:
                     try:
@@ -965,6 +974,18 @@ def _finalize_job(job: ScrapeJob) -> None:
             _prune_output_to_schema(job.output_file, _allowed_fields, _nested)
         except Exception as exc:
             logger.warning("Job %d: schema prune failed: %s", job.id, exc)
+
+    # Partner API (fold M10): build the byte page-index AFTER the schema
+    # prune (which rewrites the FM artifact — the index must describe the
+    # FINAL bytes, or page reads slice stale offsets) and emit the output
+    # artifact event. Reads the FM copy; the workspace is already gone.
+    if job.created_via == "api" and job.output_file:
+        try:
+            from scraper.api.output_index import finalize_output_index
+
+            finalize_output_index(job)
+        except Exception as exc:
+            logger.warning("Job %d: output index hook: %s", job.id, exc)
 
     # ── Update Site model with ground truth ───────────────────────────
     if site_slug:
