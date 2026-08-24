@@ -448,6 +448,19 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "422":
+          description: |
+            page/page_size out of bounds (same bounds as /output pagination:
+            page >= 1, 1 <= page_size <= 100). created_since is ISO-8601;
+            unparseable → 422 with code=invalid_created_since. Matches the
+            /output endpoint's parameter contract for consistency.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: "invalid_page"
+                message: "page must be >= 1"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -661,6 +674,12 @@ paths:
         field_confirmation). Available in state `sample_ready`, and best-effort
         in `failed` (a failed full run may still have a perfectly good sample —
         see the guarantee in the info block).
+
+        MUTABILITY: the sample is written when testing first passes and
+        OVERWRITTEN on later retry cycles — availability is monotone (the
+        state never regresses from sample_ready) but the record contents
+        may change between fetches while a retry cycle is in flight. Once
+        the job is terminal, the sample is frozen.
 
         **Never paginated.** Samples are capped at
         `FIELD_CONFIRMATION_SAMPLE_COUNT = 5` records
@@ -1043,6 +1062,95 @@ paths:
   # ─────────────────────────────────────────────────────────────────────────
   # RECOMMENDED EXTRAS
   # ─────────────────────────────────────────────────────────────────────────
+  /api/v1/jobs/{job_id}/callback:
+    parameters:
+      - $ref: "#/components/parameters/jobId"
+    get:
+      tags: [jobs]
+      operationId: getJobCallback
+      summary: Read this job's callback registration and delivery health
+      description: |
+        The read surface for the event API's disable/re-enable policy
+        (async_api.yaml "on_exhaustion: disable_callback"): after delivery
+        retries are exhausted the callback is marked `disabled` and this
+        endpoint is how a partner learns that. Also exposes delivery
+        counters for observability. Absent registration → `callback: null`.
+      responses:
+        "200":
+          description: Current callback registration (or null).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CallbackStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    patch:
+      tags: [jobs]
+      operationId: updateJobCallback
+      summary: Update callback URL or re-enable a disabled callback
+      description: |
+        Re-enable path for the event API's disable-on-exhaustion policy:
+        `{"action": "reenable"}` resets the delivery attempt counter and
+        clears `disabled_reason` so the next dispatcher sweep resumes
+        delivery of PENDING outbox rows (events queue while disabled —
+        they are not dropped). Alternatively rotate the registration:
+        supply a new `callback_url` (SSRF-validated like create) and/or a
+        new `callback_secret` (returned once at registration only; this is
+        also the rotation flow). The action is audit-logged under the
+        partner's key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CallbackUpdate"
+            examples:
+              reenable:
+                value: {action: "reenable"}
+              rotate-url:
+                value: {action: "rotate", callback_url: "https://ops.partner.example/new-hook"}
+              rotate-secret:
+                value: {action: "rotate", callback_secret: "<new 32+ char secret>"}
+      responses:
+        "200":
+          description: Updated registration (secret never included).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CallbackStatus"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Callback already active (nothing to re-enable).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: "callback_already_active"
+                message: "Callback is active; use action=rotate to change it"
+        "422":
+          description: Validation failed (SSRF-blocked URL, weak secret).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: "invalid_callback_url"
+                message: "callback_url resolves to a private address"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /api/v1/jobs/{job_id}/cancel:
     parameters:
       - $ref: "#/components/parameters/jobId"
@@ -1312,6 +1420,12 @@ components:
         - `scraper_ready` — terminal success. Full output and scraper code are
           available. (Invariant: `output_available` and `scraper_available`
           flags are authoritative within this state; `item_count` may be 0.)
+          RARE EXCEPTION: the post-graph finalizer can fail a job after the
+          scraper was promoted (e.g. output persistence error) — in that case
+          the state moves to `failed` WITH `scraper_available`/`output_available`
+          still true where artifacts survived. Clients must treat `failed` as
+          the authoritative terminal state and not stop listening/polling at
+          `scraper_ready`.
         - `failed` — terminal failure. `failure` explains why. Samples (and
           sometimes output) may still be retrievable — check the
           `*_available` flags.
@@ -1404,6 +1518,7 @@ components:
           items:
             type: string
             format: uri
+            maxLength: 1000
           maxItems: 10000
           description: "Required for `input_mode=url_list`: the exact item URLs to extract. Deduplicated server-side; persisted to `scrapers/{slug}/input_urls.json`."
           examples:
@@ -1413,6 +1528,7 @@ components:
           items:
             type: string
             format: uri
+            maxLength: 1000
           maxItems: 50
           description: "Required for `input_mode=list_page`: listing / category page URLs to discover items from."
         search_keywords:
@@ -1555,6 +1671,54 @@ components:
           type: string
           description: Operator-grade detail (ScrapeJob.error_message, truncated tail of the exception — models.py:177).
 
+    CallbackStatus:
+      type: object
+      required: [status, url, created_at]
+      properties:
+        status:
+          type: string
+          enum: [active, disabled]
+        url:
+          type: string
+          format: uri
+        disabled_reason:
+          type: [string, "null"]
+          description: e.g. "delivery exhausted after 6 attempts over 7h 1m".
+        last_failure:
+          type: [string, "null"]
+          description: Most recent delivery error summary (truncated).
+        delivered_count:
+          type: integer
+          description: Lifetime count of successfully delivered events.
+        pending_count:
+          type: integer
+          description: Outbox rows waiting (including while disabled — they queue, not drop).
+        created_at:
+          type: string
+          format: date-time
+        last_delivered_at:
+          type: [string, "null"]
+          format: date-time
+
+    CallbackUpdate:
+      type: object
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum: [reenable, rotate]
+        callback_url:
+          type: string
+          format: uri
+          maxLength: 1000
+          description: Required with action=rotate to change the target URL (SSRF-validated as at create).
+        callback_secret:
+          type: string
+          minLength: 32
+          maxLength: 256
+          writeOnly: true
+          description: Required with action=rotate to change the signing secret. Stored raw at column level, never returned by any endpoint, log, or admin view.
+
     JobStatus:
       type: object
       required: [job_id, state, url, input_mode, content_type, created_at]
@@ -1611,6 +1775,22 @@ components:
           description: e.g. "output_2026-08-20_192449.json".
         failure:
           $ref: "#/components/schemas/Failure"
+        callback:
+          type: ["null", object]
+          description: |
+            Present when the job was created with a callback registration
+            (see the event API spec). Summary only — full delivery health
+            via GET /api/v1/jobs/{job_id}/callback. Partners polling the
+            sync API learn here whether pushes are flowing: `disabled`
+            means events are queueing in the outbox, not arriving.
+          properties:
+            status:
+              type: string
+              enum: [active, disabled]
+            disabled_reason:
+              type: [string, "null"]
+            last_failure:
+              type: [string, "null"]
         created_at:
           type: string
           format: date-time

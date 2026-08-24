@@ -226,8 +226,12 @@ class TestSpecFilesStructural:
         assert "job_not_owned" not in async_src
         # sibling filename correct
         assert "open_api.draft" not in async_src
-        # one artifact model: no pre-signed URLs / token query auth
-        assert "token=" not in async_src.replace("ws/v1/jobs?token=", "")
+        # one artifact model: no pre-signed artifact URLs. The two AUTH
+        # token= URLs are allowed (ws-token exchange for WSS + SSE browser
+        # clients — single-use 300s tokens, not pre-signed artifacts).
+        _auth_urls = async_src.replace("ws/v1/jobs?token=", "")
+        _auth_urls = _auth_urls.replace("events?token=", "")
+        assert "token=" not in _auth_urls
         # callback secret exists in sync (the HMAC path is implementable)
         assert "callback_secret" in sync_src
         # both carry the 4-state vocabulary

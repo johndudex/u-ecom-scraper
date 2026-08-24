@@ -146,8 +146,15 @@ servers:
       UI; the partner variant adds X-API-Key auth and the envelope framing
       defined here. Use it until the WSS gateway ships; the event JSON is
       byte-identical, so client deserialization code does not change.
+
+      BROWSER AUTH: the browser `EventSource` API cannot set X-API-Key
+      (same limitation as WebSocket). Browser clients authenticate with
+      `GET /api/v1/jobs/{job_id}/events?token=<single-use token>` using
+      the SAME ws-token exchange the WSS gateway uses (300 s TTL,
+      single-use). Non-browser clients SHOULD use the header.
     security:
       - $ref: '#/components/securitySchemes/apiKeyHeader'
+      - $ref: '#/components/securitySchemes/eventTokenQuery'
     x-status: live-internal
     x-bridge-notes: |
       SSE framing today: named `event: status` / `event: done` frames plus
@@ -440,8 +447,12 @@ operations:
       The partner verifies by recomputing the HMAC over
       `"<t>." + request_body` with the secret they registered, then
       rejecting stale timestamps (recommend ±300 s) to defeat replay. The
-      secret is supplied once at callback registration, stored hashed at
-      rest, and never appears in events or logs.
+      secret is supplied once at callback registration and never appears
+      in events or logs. HMAC-SHA256 signing requires the raw secret at
+      every delivery attempt, so the secret CANNOT be stored hashed — it
+      is stored encrypted-at-column-level as a raw value that no API
+      response, log line, or admin view ever serializes (test-locked).
+      This corrects an earlier draft that said "hashed at rest.
 
       ## Dispatcher implementation note
 
@@ -464,7 +475,13 @@ operations:
     x-status: planned
     x-signature-header: X-Scraper-Signature
     x-retry:
-      attempts: 5
+      # 6 attempts (5 backoff gaps between them). Backoff values are
+      # MINIMUM delays: delivery is driven by a 30 s dispatcher sweep, so
+      # the effective delay per leg is backoff + [0, 30] s; legs >= 1 m
+      # are additionally self-scheduled with an exact countdown and are
+      # honored exactly. On exhaustion the callback is disabled (see the
+      # PATCH re-enable endpoint in the sibling sync spec).
+      attempts: 6
       backoff: [10s, 1m, 10m, 1h, 6h]
       timeout: {connect: 10s, read: 10s}
       on_exhaustion: disable_callback
@@ -475,6 +492,11 @@ operations:
 
 components:
   securitySchemes:
+    eventTokenQuery:
+      type: httpApiKey
+      in: query
+      name: token
+      description: Single-use 300s token from POST /api/v1/ws-token (browser EventSource clients).
     apiKeyHeader:
       type: httpApiKey
       name: X-API-Key
