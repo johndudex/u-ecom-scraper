@@ -119,6 +119,9 @@ def build_page_index(src_path: str, items_key: str | None = None) -> dict:
     return {
         "items_key": key, "total_items": len(spans), "items": spans,
         "site": site, "metadata": metadata,
+        # the window cache keys on (key, size) — a prune rewrite changes
+        # size, which must invalidate rather than serve stale pages
+        "source_bytes": len(text.encode("utf-8")),
     }
 
 
@@ -143,7 +146,12 @@ def read_output_page(job, page: int, page_size: int) -> dict:
     start = (page - 1) * page_size
     window = index["items"][start: start + page_size]
     try:
-        text = _fm_read_text(job.output_file)
+        from .window_cache import _cache, window_fetch as _window_fetch
+
+        size = index.get("source_bytes") or 0
+        text = _cache.get(job.output_file, size, _window_fetch)
+    except errors.ApiError:
+        raise
     except Exception as exc:
         # M10: fail-fast, never hang a worker on FM
         raise errors.ApiError(503, "internal_error", "Output store unavailable.") from exc

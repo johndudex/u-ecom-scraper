@@ -379,3 +379,68 @@ curl -fsI https://<app>.up.railway.app/admin/login/      # → 200
 - **All env vars actually read by the code, with defaults:** the tunables not in the paste blocks (`LLM_*` retry/circuit/truncation knobs, `EXECUTION_TIMEOUT=3600`, `EXECUTION_STALL_TIMEOUT=300`, `SCRAPER_HTTP_TIMEOUT=7200`, `PROBE_TIMEOUT=180`, `NAVIGATE_MAX_CONCURRENT=3`, `NAVIGATE_MAX_QUEUE=4`, `XVFB_RESOLUTION=1920x1080x24`, `STARTUP_TIMEOUT=45`, proxy vars) all have working defaults — set only when tuning. (`CELERY_TASK_SOFT/TIME_LIMIT` are **not** env-readable — hardcoded 7200/7560; ignore v1's advice about them.)
 - **Postgres sizing:** ≥ 1 GB effective (compose pins `mem_limit: 1g` after production OOM incidents).
 - **Railway docs used:** guides/docker-compose, /variables, /variables/reference, /volumes, /deploy/healthchecks, /deployments/pre-deploy-command, /networking/private-networking, /networking/public-networking, /databases/postgresql, /databases/redis, /deployments/scaling + restart-policy + serverless.
+
+## Phase 11 — Partner API deploy (events worker + beat entry)
+
+The partner API (slices 1a + 1b, commits 80799db..948ccc7) adds one
+service and one beat entry. Deploy order matters — beat enqueues to the
+`events` queue every 30s; a missing worker means invisible Redis buildup
+(the same class of failure as a beat without tables).
+
+### 1. New service: `celery-events`
+
+Duplicate the `celery-worker` service in Railway, change ONLY:
+
+| Field | Value |
+|---|---|
+| Name | `celery-events` |
+| Start Command | `sh -c "python manage.py migrate --noinput && celery -A config worker -l INFO -Q events -Ofair --concurrency=4"` |
+| Memory | 512 MB (delivery is I/O, not LLM) |
+
+`migrate` first: Railway starts services in parallel; a worker without
+the 0033 tables (ApiKey/JobCallback/EventOutbox) crash-loops. Same env
+vars as celery-worker — no new secrets.
+
+### 2. Beat picks up the schedule automatically
+
+`CELERY_BEAT_SCHEDULE` (settings.py) now carries
+`dispatch-pending-callbacks` @30s. django_celery_beat's DatabaseScheduler
+reads it from code on beat restart — no DB rows to add. Restart
+`celery-beat` after this deploy.
+
+### 3. Routes are code-side
+
+`CELERY_TASK_ROUTES` sends `deliver_callback` +
+`dispatch_pending_callbacks` to `events`. The scrape worker does NOT
+listen on `events` and celery-events does NOT listen on `celery` (the
+default) — a hung partner endpoint can never touch scrape capacity.
+
+### 4. Post-deploy checks (2 minutes)
+
+```bash
+# a) events worker registered the tasks (KeyError here = app.conf.imports lost)
+railway ssh -s celery-events -- celery -A config inspect registered | grep deliver_callback
+
+# b) beat's entry is live
+railway ssh -s celery-beat -- celery -A config inspect scheduled | grep dispatch_pending
+
+# c) first sweep ran (no rows yet is FINE — created_via="api" gates emission)
+railway logs celery-events --tail 50 | grep "events sweep"
+```
+
+### 5. Rolling out partner traffic
+
+1. Create the partner's service account + key:
+   `python manage.py create_api_key --user <partner>` (management command
+   ships with the slice; prints the raw key ONCE).
+2. First partner job validates the whole chain end-to-end: create →
+   pipeline → outbox rows → sweep → HMAC POST → their 200.
+3. Watch `callback.delivered_count` on
+   `GET /api/v1/jobs/{id}/callback` — the partner-visible health signal.
+
+### Rollback
+
+The events worker is additive: stopping it freezes delivery (rows PENDING
+— they queue, never drop) while REST/SSE keep working. `git revert` the
+slice commits and redeploy; the 0033 migration is additive (new tables +
+nullable columns) and safe to leave in place.

@@ -70,11 +70,16 @@ def mark_delivered(row: EventOutbox) -> None:
         row.delivered_at = timezone.now()
         row.locked_until = None
         row.save(update_fields=["state", "delivered_at", "locked_until"])
+        from django.db.models import F
+
         cb = row.job.callback
-        cb.delivered_count += 1
-        cb.last_delivered_at = timezone.now()
-        cb.last_failure = ""
-        cb.save(update_fields=["delivered_count", "last_delivered_at", "last_failure"])
+        # F() increment: parallel deliveries on the same callback must not
+        # lose counts (read-modify-write races under contention)
+        JobCallback.objects.filter(pk=cb.pk).update(
+            delivered_count=F("delivered_count") + 1,
+            last_delivered_at=timezone.now(),
+            last_failure="",
+        )
 
 
 def mark_attempt_failed(row: EventOutbox, error: str) -> None:
