@@ -119,3 +119,8 @@ urlpatterns = [
     path("intake/create-job/", views.intake_create_job, name="intake_create_job"),
     path("intake/jobs/", views.intake_jobs, name="intake_jobs"),
 ]
+
+# Partner API v1 (docs/specs/sync_api.yaml) — own sub-app, X-API-Key auth
+from django.urls import include  # noqa: E402
+
+urlpatterns += [path("api/v1/", include("scraper.api.urls"))]

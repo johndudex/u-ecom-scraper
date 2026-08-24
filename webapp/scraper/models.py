@@ -116,7 +116,8 @@ class ScrapeJob(models.Model):
         (STATUS_AKAMAI_BLOCKED, "Akamai Blocked"),
     ]
 
-    url = models.URLField()
+    # 1000 per sync_api.yaml (was default 200) — catalog-only widen on Postgres
+    url = models.URLField(max_length=1000)
     product_url = models.URLField(max_length=1000, blank=True, default="")
     currency = models.CharField(max_length=10, blank=True, default="")
     page_type = models.CharField(max_length=30, default="product")
@@ -125,7 +126,8 @@ class ScrapeJob(models.Model):
         choices=_input_mode_choices(),
         default="url_list",
     )
-    search_criteria = models.CharField(max_length=500, blank=True, default="")
+    # TextField per sync_api.yaml C3: 50 listing URLs newline-joined overflow 500
+    search_criteria = models.TextField(blank=True, default="")
     status = models.CharField(
         max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING
     )
@@ -175,6 +177,14 @@ class ScrapeJob(models.Model):
     search_url = models.URLField(max_length=1000, blank=True, default="")
 
     error_message = models.TextField(blank=True, default="")
+    # Provenance for the event outbox: only created_via="api" (partner API)
+    # jobs emit events — internal intake traffic stays out of the outbox
+    # (critique M4: user_id is non-null for internal jobs too).
+    created_via = models.CharField(
+        max_length=10,
+        choices=[("intake", "Intake UI"), ("api", "Partner API")],
+        default="intake",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
@@ -420,6 +430,133 @@ class Site(models.Model):
         result = super().save(**kwargs)
         _sync_input_urls_file(self)
         return result
+
+
+# ── Partner API (docs/specs/sync_api.yaml + async_api.yaml) ─────────────────
+# The partner-facing surface: API-key auth, callback registration, and the
+# event outbox. See docs/plans/api-plans-fold.md + api-plans-fold-r2.md for
+# the decisions these encode.
+
+
+class ApiKey(models.Model):
+    """A partner's API key. Maps 1:1 to a non-superuser service-account user.
+
+    The key itself is stored as a SHA-256 hex digest; the raw key exists only
+    at creation (management command / admin) and is never recoverable. The
+    `prefix` (first 8 chars) is display-only — lookups go through the hash,
+    so authentication never depends on the prefix.
+    """
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="api_key",
+    )
+    prefix = models.CharField(max_length=8, db_index=True)
+    key_hash = models.CharField(max_length=64, unique=True)
+    label = models.CharField(max_length=100, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.prefix}… ({self.user.username})"
+
+    @staticmethod
+    def hash_key(raw: str) -> str:
+        import hashlib
+
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+class JobCallback(models.Model):
+    """Per-job callback registration for the event API (async_api.yaml).
+
+    The secret is stored RAW (fold decision 2): HMAC-SHA256 signing needs the
+    raw value at every delivery attempt, so hashed storage is impossible. The
+    column is never serialized by any endpoint, log line, or admin view —
+    test-locked. Rotation is PATCH action=rotate (sync spec).
+    """
+
+    STATUS_ACTIVE = "active"
+    STATUS_DISABLED = "disabled"
+    STATUS_CHOICES = [(STATUS_ACTIVE, "Active"), (STATUS_DISABLED, "Disabled")]
+
+    job = models.OneToOneField(
+        ScrapeJob, on_delete=models.CASCADE, related_name="callback"
+    )
+    url = models.URLField(max_length=1000)
+    secret = models.CharField(max_length=256)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
+    disabled_reason = models.TextField(blank=True, default="")
+    last_failure = models.TextField(blank=True, default="")
+    delivered_count = models.IntegerField(default=0)
+    last_delivered_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"job#{self.job_id} → {self.url} ({self.status})"
+
+
+class EventOutbox(models.Model):
+    """Outbox pattern for partner events (async_api.yaml, Planner B).
+
+    Events are written in the same transaction as the state change they
+    describe; a beat sweep + self-scheduled tasks deliver them as signed
+    HTTPS callbacks. Doubles as the Phase-2.5 replay log (ULID cursor).
+    Only jobs with created_via="api" produce rows (emit() gates).
+
+    Lifecycle: pending → leased (locked_until) → delivered
+                              ↘ pending (retry, next_attempt_at, attempts+1)
+                              ↘ permanently_failed (SSRF violation / exhausted)
+    """
+
+    STATE_PENDING = "pending"
+    STATE_LEASED = "leased"
+    STATE_DELIVERED = "delivered"
+    STATE_PERMANENTLY_FAILED = "permanently_failed"
+
+    STATE_CHOICES = [
+        (STATE_PENDING, "Pending"),
+        (STATE_LEASED, "Leased"),
+        (STATE_DELIVERED, "Delivered"),
+        (STATE_PERMANENTLY_FAILED, "Permanently failed"),
+    ]
+
+    # ULID — lexicographically sortable, the spec's event_id format
+    event_id = models.CharField(max_length=26, unique=True)
+    job = models.ForeignKey(
+        ScrapeJob, on_delete=models.CASCADE, related_name="outbox_events"
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL, related_name="outbox_events"
+    )
+    event_type = models.CharField(max_length=50)
+    dedupe_key = models.CharField(max_length=100, blank=True, default="")
+    payload = models.JSONField()
+    state = models.CharField(max_length=20, choices=STATE_CHOICES, default=STATE_PENDING)
+    attempts = models.IntegerField(default=0)
+    next_attempt_at = models.DateTimeField(null=True, blank=True)
+    locked_until = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            # dispatcher sweep: pending/retry rows due now
+            models.Index(fields=["state", "next_attempt_at"]),
+        ]
+        constraints = [
+            # idempotent emit: (job, type, dedupe_key) unique where non-empty
+            models.UniqueConstraint(
+                fields=["job", "event_type", "dedupe_key"],
+                name="uniq_outbox_dedupe",
+                condition=~models.Q(dedupe_key=""),
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.event_id} job#{self.job_id} {self.event_type} ({self.state})"
 
 
 class ProbeCache(models.Model):

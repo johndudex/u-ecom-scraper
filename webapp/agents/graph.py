@@ -721,7 +721,10 @@ PHASE_MAP: dict[str, str] = {
     # "navigation_agent": "navigation_agent",
     # "navigation_synthesize": "navigation_synthesize",
     # ═══ END ARCHIVED ═══
-    "browser_traverse": "Browser Navigation",
+    # Must stay the ENUM TOKEN (Step.phase choices + sync API Phase schema) —
+    # the display string "Browser Navigation" (pre-0035) wrote schema-invalid
+    # values to Step.phase and forked a duplicate row from the seeded one.
+    "browser_traverse": "browser_traverse",
     "nav_skill_review": "navigation_skill_review",
     "product_analyzer": "product_analysis",
     "scraper_analyzer": "scraper_analysis",
