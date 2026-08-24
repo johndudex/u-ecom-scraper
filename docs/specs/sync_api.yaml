@@ -121,6 +121,14 @@ info:
 # Paths are relative to the deployment root. The Django app mounts the scraper
 # app at "/" (webapp/config/urls.py), so /api/v1/* is a fresh namespace that
 # does not collide with the existing UI routes (webapp/scraper/urls.py).
+  x-rate-limits:
+    requests: {sustained_per_second: 10, burst: 30}
+    creates: {per_hour_per_key: 60}
+    event_streams: {concurrent_per_key: 1}
+    ws_token: {per_minute_per_key: 10}
+    response: {status: 429, retry_after_header: seconds}
+    scope: per API key (not per IP) — protects the 2-worker sync tier
+
 servers:
   - url: /
     description: Same-origin (Django web app + API). Railway deployment serves this at https://<app>.up.railway.app/.
@@ -146,6 +154,10 @@ paths:
       operationId: checkSite
       summary: Scope-limited site pre-check
       description: |
+        SECURITY NOTE: `known_site: true` is an accepted, bounded
+        cross-tenant signal — it discloses that *some* tenant scraped this
+        host (boolean + platform string only; never fields or outputs).
+
         Answers "has this site been scraped before" WITHOUT the cross-tenant
         leak that excluded the internal `intake_check_site` (which reads
         every user's target_fields for the host — views.py:2331-2337).
@@ -322,6 +334,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "409":
           description: A job for this URL is already pending or running under this API key. The existing job's id is returned so the client can resume polling it.
           content:
@@ -448,6 +462,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "422":
           description: |
             page/page_size out of bounds (same bounds as /output pagination:
@@ -1200,6 +1216,49 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /api/v1/ws-token:
+    post:
+      tags: [jobs]
+      operationId: createWsToken
+      summary: Mint a single-use short-lived token for browser event clients
+      description: |
+        Browser `EventSource` (SSE) and `WebSocket` cannot set the X-API-Key
+        header. A browser client calls this endpoint (server-side or from a
+        same-origin page) and receives a token valid for one use within
+        300 s, passed as `?token=` on the event stream URL. Tokens are
+        single-use (consumed atomically on first successful connect) and
+        short-lived; query-param exposure is bounded by the TTL. Rate-limited
+        with the global per-key limits (429 with Retry-After).
+      responses:
+        "201":
+          description: Token minted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, expires_in, connect_url]
+                properties:
+                  token:
+                    type: string
+                  expires_in:
+                    type: integer
+                    example: 300
+                  connect_url:
+                    type: string
+                    description: Ready-to-use stream URL with the token appended.
+              example:
+                token: "01J8ZQ9VK7M2X4A6B8C0D1E3F5"
+                expires_in: 300
+                connect_url: "/api/v1/jobs/481/events?token=01J8ZQ9VK7M2X4A6B8C0D1E3F5"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /api/v1/validate-schema:
     post:
       tags: [intake-helpers]
@@ -1341,6 +1400,24 @@ components:
         default: 100
 
   responses:
+    RateLimited:
+      description: Rate limit exceeded. Retry-After header present (seconds). Respect it; repeated immediate retries extend the window.
+      headers:
+        Retry-After:
+          description: Seconds until the next request will be accepted.
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            code: "rate_limited"
+            message: "Per-key rate limit exceeded"
+            details:
+              limit: "10 req/s (burst 30)"
+              stream_limit: 1
+
     Unauthorized:
       description: Missing or unknown `X-API-Key`.
       content:
@@ -1480,7 +1557,7 @@ components:
       properties:
         code:
           type: string
-          description: Stable machine-readable error code (`unauthorized`, `forbidden`, `not_found`, `not_ready`, `duplicate_running_job`, `validation_failed`, `schema_invalid`, `output_not_found`, `not_cancellable`, `internal_error`).
+          description: Stable machine-readable error code (`unauthorized`, `forbidden`, `not_found`, `not_ready`, `duplicate_running_job`, `validation_failed`, `schema_invalid`, `output_not_found`, `not_cancellable`, `invalid_page`, `invalid_page_size`, `invalid_created_since`, `invalid_callback_url`, `callback_already_active`, `rate_limited`, `internal_error`).
           examples: ["not_found"]
         message:
           type: string
@@ -1588,11 +1665,13 @@ components:
         callback_secret:
           type: string
           minLength: 32
-          maxLength: 128
+          maxLength: 256
           description: |
             Shared secret for HMAC-SHA256 verification of callback
-            deliveries. Supplied ONCE at registration; stored hashed
-            (SHA-256) at rest and NEVER returned by any endpoint. Each
+            deliveries. Supplied ONCE at registration; stored raw at rest
+            in a column no endpoint, log, or admin view ever serializes
+            (HMAC signing needs the raw value on every attempt — hashed
+            storage is impossible); NEVER returned by any endpoint. Each
             delivery is signed `X-Scraper-Signature:
             t=<send_time_unix>,v1=<hex hmac_sha256("<t>." + raw_body,
             callback_secret)>` — t is SEND time (re-signed on every retry),

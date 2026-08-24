@@ -94,7 +94,10 @@ info:
     Note the pipeline produces the FULL output (run_execution) BEFORE cleanup
     promotes the scraper, so the `output` artifact event fires between
     `sample_ready` and `scraper_ready`. `scraper_ready` is the terminal
-    success state.
+    success state UNLESS superseded by `failed` (rare post-promotion
+    finalizer failure — clients must treat `job.failed` as the
+    authoritative terminal event, matching the sync spec's JobState
+    caveat).
 
     ## Ownership
 
@@ -160,6 +163,11 @@ servers:
       SSE framing today: named `event: status` / `event: done` frames plus
       unnamed `data:` frames that are raw Redis pub/sub passthrough. The
       partner variant wraps every payload in the EventEnvelope of this spec.
+      AUTH FAILURES: missing/expired/consumed token or bad key returns
+      401 immediately (no stream). Tokens are SINGLE-USE, so the browser
+      EventSource auto-reconnect after a drop will 401 — clients must
+      catch `onerror`, mint a fresh token (POST /api/v1/ws-token), and
+      re-GET the stream; the old connect URL is NOT reusable.
       No `id:` / `Last-Event-ID` support exists — SSE here is LIVE-ONLY with
       no replay (verified: no id/retry fields emitted). Reconnect strategy:
       re-GET the stream, then reconcile via the sync job endpoint.
@@ -397,6 +405,7 @@ operations:
       `done`, webapp/scraper/views.py:1145). Live-only, no replay.
     security:
       - $ref: '#/components/securitySchemes/apiKeyHeader'
+      - $ref: '#/components/securitySchemes/eventTokenQuery'
     messages:
       - $ref: '#/channels/jobEventsSse/messages/JobCreated'
       - $ref: '#/channels/jobEventsSse/messages/JobInprogress'
@@ -421,7 +430,9 @@ operations:
     description: |
       ## Delivery semantics — at-least-once
 
-      Retries: 5 attempts, exponential backoff 10 s, 1 m, 10 m, 1 h, 6 h.
+      Retries: 6 attempts total (initial POST + 5 retries), backoff gaps
+      10 s, 1 m, 10 m, 1 h, 6 h (minimum delays — the 30 s dispatcher
+      sweep quantizes; legs >= 1 m are self-scheduled and exact).
       `event_id` is stable across retries; partners MUST dedupe on it.
       Events are delivered in order per job while healthy, but retries can
       reorder across jobs and (rarely) within a job during failover —
@@ -434,7 +445,15 @@ operations:
       (`status: "disabled"`, `disabled_reason`, `last_failure` — visible on
       the job in the sync API as `callback`), event delivery for that job
       stops, and the data remains fetchable via the sync endpoints forever.
-      Re-enabling is an explicit partner action (PATCH the job's callback).
+      Re-enabling is an explicit partner action: `PATCH
+      /api/v1/jobs/{job_id}/callback` with `{"action": "reenable"}` (see
+      the sibling sync spec). Re-enable has a 60 s cooldown per job and
+      resets the attempt counter; PENDING events that queued while
+      disabled are delivered after re-arm (re-armed rows stay subject to
+      the 30-day outbox prune). Rotation (`action=rotate`) swaps the
+      URL/secret atomically at the next dispatch — in-flight deliveries
+      during the swap complete under the OLD signature (verifiers should
+      accept either secret for a 30 s rotation window).
 
       ## Security — how we authenticate TO the partner
 
@@ -450,7 +469,7 @@ operations:
       secret is supplied once at callback registration and never appears
       in events or logs. HMAC-SHA256 signing requires the raw secret at
       every delivery attempt, so the secret CANNOT be stored hashed — it
-      is stored encrypted-at-column-level as a raw value that no API
+      is stored raw at rest in a column that no API
       response, log line, or admin view ever serializes (test-locked).
       This corrects an earlier draft that said "hashed at rest.
 
@@ -753,7 +772,11 @@ components:
         url: { type: string, format: uri }
         status: { type: string, enum: [active, disabled] }
         disabled_reason: { type: string }
-        last_failure: { type: string, format: date-time }
+        last_failure: { type: [string, 'null'], description: Most recent delivery error summary (truncated) — same field and type as the sync API's CallbackStatus.last_failure. }
+        last_delivered_at: { type: string, format: date-time }
+        delivered_count: { type: integer }
+        pending_count: { type: integer }
+        created_at: { type: string, format: date-time }
 
     # ── WS control payloads ───────────────────────────────────────────────
     SubscribeData:

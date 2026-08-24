@@ -50,7 +50,7 @@ Behaviour:
 1. Build `EventEnvelope` — `event_id` (ULID, D14), `type`, `occurred_at` (UTC ISO-8601), `job_id`, `user_id`, `data`. Fields exactly per `async_api.yaml:504-553`; `additionalProperties: false`.
 2. `get_or_create` on `(job, event_type, dedupe_key)` (§3) — idempotent across graph resume/finalize re-entry.
 3. Register `transaction.on_commit(lambda: _publish_redis(job_id, envelope, channel="job:{id}:envelope"))`. If no transaction is active, Django runs the callback immediately — so call sites need no branching.
-4. Return `None` without writing when `job.user_id` is null (D12).
+4. Return `None` without writing when `job.created_via != "api"` (D12 as revised by critique M4 — user_id is non-null for internal jobs too; the provenance column is the only clean gate).
 
 Transactional discipline: the four *state* emission sites (created / inprogress / terminal) are wrapped in `with transaction.atomic():` together with their `job.save()` — that is what makes the outbox row and the status change a single write. Artifacts/phase/log events are informational; standalone insert is fine.
 
@@ -124,7 +124,7 @@ Conventions:
 **Shared boundary with Planner A — `JobCallback` model** (his submit/PATCH surface, my dispatcher's read):
 
 ```
-JobCallback: job OneToOne, url URLField, secret_encrypted TextField,
+JobCallback: job OneToOne, url URLField, secret CharField(256) RAW (fold decision 2 — never serialized, test-locked; NO Fernet/CALLBACK_SECRET_KEY),
              status [active|disabled], disabled_reason TextField, last_failure DateTimeField
 ```
 
@@ -150,7 +150,15 @@ Spec-exact (`async_api.yaml:434-470`):
    - Selects `status='pending' AND next_attempt_at <= now() AND (locked_until IS NULL OR locked_until < now())` with `select_for_update(skip_locked=True)` (single beat container — compose `:121-152` — but this makes overlap harmless).
    - Sets `locked_until = now() + 5min`, enqueues `deliver_callback.s(event_id)`.
    - Runs the §2.4 reconciler.
-2. **`deliver_callback(event_id)`** — one POST. Records outcome + `next_attempt_at` from the table (explicit `countdown`-style scheduling; Celery's built-in `retry_backoff` is 2^n and its `retry_backoff_max` default of 600s would silently clamp the 1h/6h legs — do **not** use `autoretry_for`/`retry_backoff` despite the spec naming them; the beat sweeper is the retry driver). Never raises past exhausting the schedule.
+2. **`deliver_callback(event_id)`** — one POST. **B4/R2 HARD REQUIREMENT —
+   delivery-time SSRF re-validation:** re-resolve the callback host and
+   `ipaddress`-check it against the same blocklist as create-time
+   (private/loopback/link-local/reserved) BEFORE every attempt — DNS
+   rebinding between create and send is the threat; the 6 h retry ladder
+   is the amplifier. On violation: mark the row `permanently_failed`, set
+   `disabled_reason`, do NOT POST. `follow_redirects=False` ALWAYS (no
+   redirect policy = no redirect SSRF). Timeouts 10 s connect / 10 s read.
+   Records outcome + `next_attempt_at` from the table (explicit `countdown`-style scheduling; Celery's built-in `retry_backoff` is 2^n and its `retry_backoff_max` default of 600s would silently clamp the 1h/6h legs — do **not** use `autoretry_for`/`retry_backoff` despite the spec naming them. R2/M1 REVERSAL: legs >= 1 m are SELF-SCHEDULED via `apply_async(countdown=...)` from the delivery task itself; the 30 s beat sweeper is the safety net for short legs + lost tasks, not the primary driver). Never raises past exhausting the schedule.
 
 `acks_late` is default-False (`settings.py:141-146`); a killed `deliver_callback` loses only the lease, which expires in 5min and the sweeper re-enqueues — at-least-once holds without flipping the fleet-wide setting.
 
@@ -238,7 +246,17 @@ Existing harness: `webapp/tests/` (`test_views.py`, `test_tasks.py`, `test_model
 5. **Integration — reconciler**: terminal job with empty/partial outbox → synthetic terminal event emitted once, idempotent on re-run.
 6. **Integration — SSE view**: fakeredis pub/sub; initial state frame; keepalive `: ping` under an artificial 25s quiet (freeze-time); close rules D6 including the `captcha_blocked` case the legacy set misses; cap enforcement → 503.
 7. **Contract — callback receiver**: a pytest ASGI/httpx MockTransport partner that recomputes the HMAC, asserts `event_id` stability across simulated retries, and records duplicates for dedupe verification.
-8. **E2E (playground)**: seed a workspace per `docs/testing_guide.md`, drive `field_confirmation` → cleanup → finalizer; assert the full event sequence `job.created → inprogress → (phase…) → sample_ready → artifact(sample) → scraper_ready → artifact(scraper_code) → artifact(output) → terminal` in `event_id` order.
+8. **E2E (playground, PARTNER-SHAPED — R2/B1)**: the job MUST carry
+   `full_extraction=False` + `created_via="api"` (exactly what the partner
+   create endpoint produces) — driving `field_confirmation`'s sample block
+   directly would test a path partner jobs never execute (the B1 bug).
+   Seed a workspace per `docs/testing_guide.md`, drive the real graph from
+   a partner-shaped create through finalize; assert the sequence
+   `job.created → inprogress → (phase…) → sample_ready (emitted at
+   _invoke_code_tester, PASS-gated) → artifact(sample) → scraper_ready →
+   artifact(scraper_code) → artifact(output) → terminal` in `event_id`
+   order, AND assert a partner job that FAILS at testing emits NO
+   sample_ready (the pass-gate).
 
 ---
 

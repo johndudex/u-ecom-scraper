@@ -218,6 +218,50 @@ class TestSpecFilesStructural:
         doc = self._check("async_api.yaml")
         assert doc["asyncapi"].startswith("3.0")
 
+    def test_cross_spec_callbackstatus_parity(self):
+        """R2-B2: one CallbackStatus shape across both specs."""
+        import yaml as _y
+        sync = _y.safe_load(open(os.path.join(ROOT, "docs/specs/sync_api.yaml"), encoding="utf-8"))
+        asyncs = _y.safe_load(open(os.path.join(ROOT, "docs/specs/async_api.yaml"), encoding="utf-8"))
+        s_cb = sync["components"]["schemas"]["CallbackStatus"]["properties"]
+        a_cb = asyncs["components"]["schemas"]["CallbackStatus"]["properties"]
+        assert set(s_cb) == set(a_cb), f"field drift: {set(s_cb) ^ set(a_cb)}"
+        # last_failure: same shape in both, never a date-time (R2-B2 fix)
+        assert s_cb["last_failure"]["type"] == a_cb["last_failure"]["type"]
+        assert "string" in str(s_cb["last_failure"]["type"])
+
+    def test_ws_token_documented_in_sync(self):
+        """R2-B1: async depends on POST /api/v1/ws-token; it must live in sync."""
+        src = open(os.path.join(ROOT, "docs/specs/sync_api.yaml"), encoding="utf-8").read()
+        assert "/api/v1/ws-token:" in src
+        assert "createWsToken" in src
+
+    def test_secret_policy_unified(self):
+        """One policy, one maxLength for the CALLBACK secret (raw, HMAC-signable).
+
+        Scoped to the callback secret's schema descriptions — API keys are
+        a different mechanism and legitimately stored hashed.
+        """
+        import yaml as _y
+        sync = _y.safe_load(open(os.path.join(ROOT, "docs/specs/sync_api.yaml"), encoding="utf-8"))
+        asyncs = _y.safe_load(open(os.path.join(ROOT, "docs/specs/async_api.yaml"), encoding="utf-8"))
+        for sch in ("CreateJobRequest", "CallbackUpdate"):
+            props = sync["components"]["schemas"][sch]["properties"]
+            d = props["callback_secret"]["description"]
+            _clean = d.replace("— hashed\nstorage is impossible", "").replace("hashed storage is impossible", "")
+            assert "hashed" not in _clean, f"{sch} says hashed"
+            assert props["callback_secret"].get("maxLength") == 256, f"{sch} maxLength"
+        a_txt = str(asyncs["operations"]["deliverCallback"])
+        assert "CANNOT be stored hashed" in a_txt or "stored raw" in a_txt
+
+    def test_rate_limits_published(self):
+        """M11 (decision 4): limits + 429 are in the spec, not folklore."""
+        sync = open(os.path.join(ROOT, "docs/specs/sync_api.yaml"), encoding="utf-8").read()
+        assert "x-rate-limits:" in sync
+        assert "RateLimited:" in sync
+        assert sync.count("429") >= 3
+        assert "rate_limited" in sync
+
     def test_cross_spec_vocabulary_locked(self):
         """The critique round's divergence fixes must hold: no orphaned names."""
         sync_src = open(os.path.join(ROOT, "docs/specs/sync_api.yaml"), encoding="utf-8").read()

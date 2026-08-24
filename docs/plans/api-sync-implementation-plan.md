@@ -1,5 +1,15 @@
 # Partner Sync API (`/api/v1/*`) — Implementation Plan
 
+> **POST-CRITIQUE REVISIONS (2026-08-23, rounds 1+2):** per
+> `api-plans-fold.md` and `api-plans-fold-r2.md`. Callback registration
+> is the `JobCallback` model (NOT ScrapeJob columns — §2.2, §4.1, §8 step
+> 1 updated); create uses atomic + on_commit dispatch + events.emit
+> (M12/R2); rate limits ARE in v1 (decision 4 — 429 + Retry-After, spec
+> x-rate-limits); recursion-approval jobs FAIL-FAST (M7/R2 — no
+> self-resume); the sample hook carries a pass-gate; Phase-enum lock
+> requires a data migration. Where this file and the folds disagree,
+> THE FOLDS WIN.
+
 Planner A (sync half). Contract: `docs/specs/sync_api.yaml` (OpenAPI 3.1, DRAFT v0.1) —
 **the spec wins for behavior**; every spec-vs-code disagreement is flagged in §1.3 and
 resolved in §8 (Open questions). All file:line citations verified on branch
@@ -297,8 +307,14 @@ intake-form equivalent cites views.py):
 | `scope_value` (≤200) | `scope_value` | views.py:2519 | Kept string (spec:1449; models.py:166). If `scope=firstn`, must parse as positive int → else 400. |
 | `notes` (≤4000) | `notes` | views.py:2520 | — |
 | `title` (≤200) | `title` | set post-hoc in UI | Set at creation (models.py:153 exists). |
-| `callback_url` | `callback_url` | none | SSRF gate §5. |
-| `callback_secret` (32-128) | `callback_secret` | none | Stored per C2; never returned by any endpoint. |
+| `callback_url` | `JobCallback.url` (created with the job) | none | SSRF gate §5. |
+| `callback_secret` (32-256) | `JobCallback.secret` | none | RAW, never serialized (fold decision 2); rotation via PATCH /callback. |
+
+**M12/R2 emit contract (build AFTER B's emitter exists — see fold-r2
+sequence):** `with transaction.atomic(): job = create(...); JobCallback.create(...); events.emit(job, "job.created", ...)` then
+`transaction.on_commit(lambda: run_scrape_task.delay(job.id))` — dispatch
+OUTSIDE the transaction body (on_commit) so the worker never reads an
+uncommitted row (Critic-2's M3-recurrence).
 
 Fixed creation flags (spec: "Behavioral parity", sync_api.yaml:220-225):
 `full_extraction=False` (views.py:2584), `skip_approvals=True` (views.py:2585),
@@ -350,7 +366,7 @@ Table (spec `sync_api.yaml:471-481`, statuses from models.py:99-117):
 |---|---|---|
 | `pending` | — | `inprogress` |
 | `running` | `sample_ready(...)` | `sample_ready` else `inprogress` |
-| `waiting_approval` | — | `inprogress` (budget-escalation pauses set this unconditionally, services.py:413-451 — reachable even for skip-approvals jobs; job self-resumes) |
+| `waiting_approval` | — | `inprogress` (budget-escalation pauses set this unconditionally, services.py:413-451 — reachable even for skip-approvals jobs; R2/M7: recursion-error jobs FAIL-FAST instead of waiting — no auto-resume exists) |
 | `completed` | — | `scraper_ready` |
 | `failed` | — | `failed` |
 | `cancelled` | — | `failed` (`failure.code="cancelled"`) |
@@ -706,8 +722,12 @@ Run command (mirror the header comment in test_api_docs_views.py):
 
 Each step lands green before the next; steps 1-3 are dependency-free foundations.
 
-1. **Migrations** — `ApiKey` + `ScrapeJob` changes (url 1000, search_criteria
-   TextField, callback_url/callback_secret). Migration `0033_apikey_and_job_fields`.
+1. **Migrations** — `ApiKey` + `JobCallback` + `ScrapeJob` changes (url 1000,
+   search_criteria TextField, created_via; R2: plus Step phase data-migration
+   merging "Browser Navigation" rows into `browser_traverse`, and
+   `completed_at` backfill for cancelled/failed jobs with NULL — reconciler
+   keys on it). Migration `0033_apikey_jobcallback_job_fields`. Events
+   schema (B's EventOutbox) may share this migration or follow as 0034.
 2. **API skeleton** — `scraper/api/` package: `errors.py`, `auth.py`,
    `urls.py`, mount in `scraper/urls.py`; `api_view` wrapper (csrf + auth + error
    envelope). Ship with a trivial 404-proof (no endpoints yet).
@@ -774,5 +794,8 @@ Each step lands green before the next; steps 1-3 are dependency-free foundations
 - **`test_report.json` is per-site, latest-job-wins** (graph.py:586-603) — used
   only as the *state* fallback, never for record contents; the sample endpoint's
   coverage comes from the per-job sample file, so cross-job bleed is impossible.
-- **No rate limiting in v1** — spec defines none; gunicorn's 2 sync workers are
-  the natural backstop. Revisit with Planner B's threat model.
+- **Rate limits ARE in v1** (human decision 4, 2026-08-23): Redis
+  fixed-window per key — 10 req/s burst 30, 60 creates/h, 1 concurrent
+  stream/key, ws-token 10/min; 429 + Retry-After. Published in the spec
+  (`x-rate-limits` + the RateLimited response). Enforced in `api_view`
+  before any handler logic.
