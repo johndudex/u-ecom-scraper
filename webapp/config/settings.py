@@ -160,6 +160,20 @@ CELERY_BEAT_SCHEDULE = {
         "task": "scraper.tasks.redispatch_stuck_approved_interrupts",
         "schedule": 300.0,
     },
+    # Partner event delivery (async_api.yaml): 30s sweep drives the < 1m
+    # backoff legs + lost-task recovery; >= 1m legs self-schedule exact.
+    "dispatch-pending-callbacks": {
+        "task": "scraper.events.reconciler.dispatch_pending_callbacks",
+        "schedule": 30.0,
+    },
+}
+
+# Fold B5: delivery HTTP must never share the scrape workers' 2-slot pool —
+# one hung partner endpoint ≈ 10 min of zero scrape capacity otherwise.
+CELERY_TASK_ROUTES = {
+    "scraper.events.dispatcher.deliver_callback": "events",
+    "scraper.events.dispatcher.dispatch_pending_callbacks": "events",
+    "scraper.events.reconciler.dispatch_pending_callbacks": "events",
 }
 
 ZAI_API_KEY = config("ZAI_API_KEY", default="")

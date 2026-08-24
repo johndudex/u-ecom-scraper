@@ -3,6 +3,7 @@ from django.urls import path
 from django.views.decorators.csrf import csrf_exempt
 
 from . import readers
+from . import sse as sse_views
 from . import writers
 
 
@@ -31,4 +32,6 @@ urlpatterns = [
     path("jobs/<int:job_id>/sample", writers.get_job_sample, name="api_job_sample"),
     path("jobs/<int:job_id>/output", writers.get_job_output, name="api_job_output"),
     path("jobs/<int:job_id>/output/download", writers.download_job_output, name="api_job_output_download"),
+    path("jobs/<int:job_id>/events", sse_views.job_events_sse, name="api_job_events"),
+    path("ws-token", sse_views.ws_token, name="api_ws_token"),
 ]

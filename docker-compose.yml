@@ -118,6 +118,38 @@ services:
     mem_limit: 3g
     memswap_limit: 4g
 
+  celery-events:
+    # Fold B5: partner-event delivery must never share the scrape pool —
+    # one hung partner endpoint ≈ 10 min of zero scrape capacity otherwise.
+    # Runs migrate first (beat may enqueue before worker start on Railway's
+    # parallel startup — a worker without tables crash-loops into invisible
+    # Redis buildup).
+    profiles: ["full"]
+    build: .
+    init: true
+    command: >
+      sh -c "python manage.py migrate --noinput &&
+             celery -A config worker -l INFO -Q events -Ofair --concurrency=4"
+    volumes:
+      - .:/app
+    environment:
+      DB_HOST: postgres
+      DB_NAME: scraper
+      DB_USER: scraper
+      DB_PASSWORD: scraper-password
+      DB_PORT: "5432"
+      REDIS_URL: redis://redis:6379/0
+      DJANGO_SETTINGS_MODULE: config.settings
+      SECRET_KEY: dev-secret-key-change-in-production
+      PYTHONPATH: /app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    mem_limit: 512m
+    restart: unless-stopped
+
   celery-beat:
     profiles: ["full"]
     build: .

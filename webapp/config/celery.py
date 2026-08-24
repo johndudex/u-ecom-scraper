@@ -11,6 +11,10 @@ app = Celery("scraper")
 
 app.config_from_object("django.conf.settings", namespace="CELERY")
 app.autodiscover_tasks()
+# Events dispatcher lives outside tasks.py (scraper/events/) — autodiscover
+# only finds <app>.tasks. Explicit import so every worker (scrape + events
+# queue) registers deliver_callback/dispatch_pending_callbacks.
+app.conf.imports = ("scraper.events.dispatcher", "scraper.events.reconciler")
 
 
 @worker_ready.connect
