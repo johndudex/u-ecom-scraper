@@ -3426,6 +3426,21 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 "_invoke_code_tester: loaded test_report from workspace/%s/", slug
             )
             _preserve_test_report(slug)
+            # Partner sample (fold B1): persist the first PASS's records +
+            # emit job.sample_ready — NOT at field_confirmation (dead code for
+            # partner jobs; sample_only bounces before its sample block).
+            # Idempotent across retry cycles (dedupe sample:{job_id}).
+            try:
+                if job_id:
+                    from scraper.models import ScrapeJob as _SJ
+
+                    _job = _SJ.objects.filter(pk=job_id).first()
+                    if _job is not None:
+                        from scraper.api.sample_persist import persist_partner_sample
+
+                        persist_partner_sample(_job, slug=slug, report=report)
+            except Exception as exc:  # never break the graph for the sample
+                logger.warning("_invoke_code_tester: partner sample hook: %s", exc)
         else:
             logger.warning(
                 "_invoke_code_tester: no test_report found at workspace/%s/", slug
