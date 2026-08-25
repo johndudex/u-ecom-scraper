@@ -264,3 +264,61 @@ class EventOutboxAdmin(admin.ModelAdmin):
     raw_id_fields = ("job", "user")
     date_hierarchy = "created_at"
     readonly_fields = ("payload",)
+
+
+# ── Date-reliability recompute (a66e33f data repair) ────────────────────────
+from django.contrib import admin as _admin  # noqa: E402
+from django.http import HttpResponseRedirect  # noqa: E402
+from django.urls import path, reverse as _reverse  # noqa: E402
+
+
+@_admin.site.admin_view
+def joblisting_recompute(request):
+    """Phase 11 §5, as a button: preview (no param) or apply (?write=1).
+
+    Replaces the start-command-flip procedure — the stack runs web-UI-only.
+    Superuser-only via admin_view + the staff required check.
+    """
+    from io import StringIO
+
+    from django.contrib import messages
+    from django.core.management import call_command
+
+    if not request.user.is_superuser:
+        from django.http import HttpResponseForbidden
+
+        return HttpResponseForbidden("superuser only")
+    write = request.GET.get("write") == "1"
+    out = StringIO()
+    call_command("recompute_date_reliability", *(["--write"] if write else []), stdout=out)
+    messages.success(request, out.getvalue().strip().replace("\n", " | "))
+    return HttpResponseRedirect(_reverse("admin:scraper_joblisting_changelist"))
+
+
+from .models import JobListing  # noqa: E402
+
+
+@admin.register(JobListing)
+class JobListingAdmin(admin.ModelAdmin):
+    list_display = ("title", "site_slug", "posted_date", "date_posted_reliable", "scraped_at")
+    list_filter = ("date_posted_reliable", "site_slug")
+    search_fields = ("title", "url")
+    date_hierarchy = "scraped_at"
+
+    def get_urls(self):
+        from django.urls import path
+
+        urls = super().get_urls()
+        custom = [
+            path(
+                "recompute-dates/",
+                self.admin_site.admin_view(joblisting_recompute),
+                name="admin_joblisting_recompute",
+            ),
+        ]
+        return custom + urls
+
+    def changelist_view(self, request, extra_context=None):
+        extra_context = extra_context or {}
+        extra_context["recompute_url"] = "recompute-dates/"
+        return super().changelist_view(request, extra_context)

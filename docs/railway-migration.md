@@ -456,25 +456,27 @@ railway logs celery-events --tail 50 | grep "events sweep"
 ### 5. The production data repair (recompute date reliability)
 
 The a66e33f parse bug corrupted JobListing dates on Railway's DB too
-(every row since 2026-07-22 marked unreliable). The fix + repair command
-ship in this deploy. Without the CLI, run it via a one-deploy start
-command flip:
+(every row since 2026-07-22 marked unreliable). The repair ships as an
+**admin button** — no shell, no start-command edits:
 
-1. `django` service → **Settings** → note the current Start Command.
-2. Set Start Command to the normal command **prefixed** with the dry run:
-   `sh -c "python manage.py recompute_date_reliability && <normal command>"`
-   — the dry-run counts print in the deploy logs (expect ~6k scanned).
-3. Happy with the counts? Flip `--write` in, deploy once more, watch the
-   logs for `would fix / fixed: N`, then **revert the Start Command**.
+1. Log into Django admin (`/admin/`) as the superuser.
+2. Go to **Job Listings** (`/admin/scraper/joblisting/`).
+3. Click **"Preview date-reliability recompute"** (top toolbar) — a green
+   message shows DRY RUN counts (expect ~6k scanned, ~1.3k would-fix on
+   data shaped like the local DB; your numbers will differ).
+4. Happy with the counts? Click **"APPLY recompute (--write)"** — the
+   same message now reports the applied counts. Done. (Idempotent; the
+   preview button is always safe to click.)
 
 ### 6. Rolling out partner traffic
 
 1. Create the partner's service account + key:
-   `python manage.py create_api_key --user <partner>` (management command
-   ships with the slice; prints the raw key ONCE). Same start-command
-   trick as §5 runs it without a shell — OR use the Django admin
-   (`/admin/scraper/apikey/` → cannot mint, but shows the created key's
-   prefix/status; minting needs the command).
+   `python manage.py create_api_key --user <partner>` (prints the raw key
+   ONCE). Needs a shell — if you're web-UI-only, the same admin-button
+   pattern can be added on request; until then, ask whoever has CLI
+   access, or run it once via a temporary start-command prefix.
+   `/admin/scraper/apikey/` shows existing keys (prefix, active, last
+   used) but cannot mint.
 2. First partner job validates the whole chain end-to-end: create →
    pipeline → outbox rows → sweep → HMAC POST → their 200.
 3. Watch `callback.delivered_count` on
