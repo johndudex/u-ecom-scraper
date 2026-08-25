@@ -22,7 +22,6 @@ import hashlib
 import json
 import logging
 import os
-import time
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
 
@@ -31,8 +30,6 @@ import django  # noqa: E402
 django.setup()
 
 from django.conf import settings as dj_settings  # noqa: E402
-from django.db import close_old_connections  # noqa: E402
-
 logger = logging.getLogger("event_gateway")
 
 HEARTBEAT_SECONDS = 25  # spec x-heartbeat: <=25s of silence

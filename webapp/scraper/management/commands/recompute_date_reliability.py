@@ -16,7 +16,6 @@ Dry-run by default (reports counts); --write applies.
 from __future__ import annotations
 
 import datetime as _dt
-import os
 
 from django.core.management.base import BaseCommand
 from django.utils import timezone
