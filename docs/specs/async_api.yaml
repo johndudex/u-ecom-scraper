@@ -11,7 +11,7 @@ asyncapi: 3.0.0
 #   x-status: live      — mechanism exists in the repo today (cited).
 #   x-status: planned   — designed here, NOT built. Do not code against it
 #                         assuming it exists.
-# No websocket server exists in this stack today. See servers.production-wss
+# The WSS gateway is LIVE (event-gateway service — deploy runbook Phase 12)
 # and the transport phasing note in info.description.
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -258,7 +258,7 @@ channels:
         $ref: '#/components/messages/JobLogAppended'
       ProtocolError:
         $ref: '#/components/messages/ProtocolError'
-    x-status: planned
+    x-status: live
 
   jobEventsSse:
     address: /api/v1/jobs/{job_id}/events
@@ -329,7 +329,7 @@ channels:
         $ref: '#/components/messages/JobFailed'
       JobArtifactAvailable:
         $ref: '#/components/messages/JobArtifactAvailable'
-    x-status: planned
+    x-status: live
 
 # ═══════════════════════════════════════════════════════════════════════════
 # OPERATIONS
@@ -493,7 +493,7 @@ operations:
       - $ref: '#/channels/partnerCallback/messages/JobScraperReady'
       - $ref: '#/channels/partnerCallback/messages/JobFailed'
       - $ref: '#/channels/partnerCallback/messages/JobArtifactAvailable'
-    x-status: planned
+    x-status: live
     x-signature-header: X-Scraper-Signature
     x-retry:
       # 6 attempts (5 backoff gaps between them). Backoff values are
@@ -550,6 +550,15 @@ components:
         Every event on every transport (WS frame, SSE data frame, callback
         POST body) is this envelope. Transport framing differs; the JSON is
         identical.
+
+        v1 PAYLOAD SCOPE (deliberate): state events carry a minimal `data`
+        (e.g. `{}` for scraper_ready) — the authoritative rich state lives in
+        the WSS subscribe.ack snapshot and the REST job resource; partners
+        reconcile via those. `job.approval.required` and `job.log.appended`
+        are NOT emitted in v1 (partner jobs run with approvals skipped and
+        log streaming is internal-only); they remain reserved enum values
+        for a future release. `job.artifact.available` data is flat
+        {kind, url, ...} — size_bytes/sha256 are future additions.
       required: [event_id, type, occurred_at, job_id, user_id, data]
       additionalProperties: false
       properties:
@@ -577,6 +586,7 @@ components:
             - job.artifact.available
             - job.approval.required
             - job.log.appended
+            - callback.reenabled
         occurred_at:
           type: string
           format: date-time

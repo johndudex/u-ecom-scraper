@@ -395,17 +395,46 @@ def get_job_output(request, job_id: int):
     return JsonResponse(payload)
 
 
+def _stream_fm_file(key: str):
+    """A7-1 (spec NORMATIVE): stream FM bytes, never buffer the whole file —
+    a full read OOM'd 1 GB containers on aya-class outputs. httpx's
+    stream() gives us chunked pass-through via the generator below."""
+    import httpx
+
+    import src.artifacts as artifacts
+
+    url = artifacts.stream_url(key)
+    return httpx.stream("GET", url, timeout=30.0)
+
+
 @api_view(["GET"])
 def download_job_output(request, job_id: int):
     job = _api_get_job(request, job_id)
     if not job.output_file:
         raise errors.ApiError(404, "output_not_found", "No output for this job.")
-    data = _fm_read_bytes(job.output_file)
-    if data is None:
-        # M10: FM miss = fail-fast, never hang
-        raise errors.ApiError(404, "output_not_found", "No output for this job.")
     filename = job.output_file.rsplit("/", 1)[-1]
-    resp = HttpResponse(data, content_type="application/json")
+
+    try:
+        resp_stream = _stream_fm_file(job.output_file)
+    except errors.ApiError:
+        raise
+    except Exception as exc:  # FM down/miss = fail-fast, never hang
+        raise errors.ApiError(
+            404, "output_not_found", "No output for this job."
+        ) from exc
+
+    def _chunks():
+        with resp_stream as r:
+            if r.status_code != 200:
+                raise errors.ApiError(
+                    404, "output_not_found", "No output for this job."
+                )
+            for chunk in r.iter_bytes():
+                yield chunk
+
+    from django.http import StreamingHttpResponse
+
+    resp = StreamingHttpResponse(_chunks(), content_type="application/json")
     resp["Content-Disposition"] = f'attachment; filename="{filename}"'
     return resp
 

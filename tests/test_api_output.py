@@ -253,3 +253,47 @@ class TestFinalizeIntegration:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class TestDownloadStreams:
+    def test_download_uses_fm_stream_not_buffered_read(self, partner, db):
+        """A7-1 (spec NORMATIVE): /output/download MUST stream from FM, not
+        buffer the whole file via artifacts.read (OOM'd 1 GB containers)."""
+        import json as _json
+
+        from scraper.api.writers import download_job_output
+
+        u, raw = partner
+        job = _job(u)
+        chunks = []
+        import httpx as _httpx
+
+        class _FakeCM:
+            def __init__(self, url):
+                self.url = url
+
+            def __enter__(self):
+                assert "/stream/" in self.url, f"not the streaming endpoint: {self.url}"
+                return _httpx.Response(
+                    200, content=iter([b'{"site": ', b'"x"}']),
+                    request=_httpx.Request("GET", self.url),
+                )
+
+            def __exit__(self, *a):
+                return False
+
+        import unittest.mock as _mock
+
+        def fake_stream(key):
+            return _FakeCM("http://fm/stream/" + key)
+
+        with _mock.patch("scraper.api.writers._stream_fm_file", side_effect=fake_stream) as st, \
+             _mock.patch("scraper.api.writers._fm_read_bytes") as br:
+            r = download_job_output(
+                rf.get(f"/api/v1/jobs/{job.id}/output/download", HTTP_X_API_KEY=raw), job.id
+            )
+        assert r.status_code == 200
+        assert st.called
+        assert not br.called, "buffered read must not be used"
+        body = b"".join(r.streaming_content)
+        assert body == b'{"site": "x"}'

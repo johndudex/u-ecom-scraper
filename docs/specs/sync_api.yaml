@@ -122,12 +122,14 @@ info:
 # app at "/" (webapp/config/urls.py), so /api/v1/* is a fresh namespace that
 # does not collide with the existing UI routes (webapp/scraper/urls.py).
   x-rate-limits:
-    requests: {sustained_per_second: 10, burst: 30}
-    creates: {per_hour_per_key: 60}
-    event_streams: {concurrent_per_key: 1}
-    ws_token: {per_minute_per_key: 10}
+    requests: {sustained_per_second: 10, burst: 30, scope: per key, enforced: true}
+    event_streams: {concurrent_total: 1, scope: global (all partners share the sync tier's worker budget), enforced: true, over_limit_status: 503, note: raise PARTNER_STREAM_BUDGET or deploy the Phase-12 gateway when a partner needs concurrent streams}
     response: {status: 429, retry_after_header: seconds}
-    scope: per API key (not per IP) — protects the 2-worker sync tier
+    not_yet_enforced: |
+      creates-per-hour and ws-token-per-minute are DESIGN CEILINGS
+      recorded for capacity planning, not enforced in v1 — the global
+      request limiter (10 rps/key) bounds them indirectly. Enforce
+      per-limit if abuse appears.
 
 servers:
   - url: /
@@ -790,8 +792,14 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
-        "409":
-          description: The job exists but no sample is available yet (state `inprogress` before testing completes). Retry after the suggested interval.
+        "404":
+          description: |
+            No sample yet (state `inprogress` before testing passes) or the
+            job is terminal without a sample. Same `not_ready` code, 404
+            status — fetch-when-available semantics: poll status and retry
+            when `sample_available` flips true. (404 not 409: nothing is
+            wrong with the request and there is no conflict to resolve —
+            the resource simply does not exist yet.)
           content:
             application/json:
               schema:
@@ -800,8 +808,6 @@ paths:
                 code: "not_ready"
                 message: "Sample not available yet — the extractor is still being built (current phase: code_generation)"
                 details:
-                  state: "inprogress"
-                  current_phase: "code_generation"
                   retry_after_seconds: 60  # CONSTANT HINT (not an estimate — no phase-duration telemetry exists; clients should treat it as a floor)
         "500":
           $ref: "#/components/responses/InternalError"
@@ -922,8 +928,8 @@ paths:
                   value:
                     code: "output_not_found"
                     message: "Job 479 has no output file — the run failed before execution produced one"
-        "409":
-          description: The job is still running and no output exists yet.
+        "404":
+          description: The job is still running and no output exists yet (same `not_ready` code, 404 fetch-when-available semantics).
           content:
             application/json:
               schema:
@@ -1059,8 +1065,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
-        "409":
-          description: Job still running and no draft has been promoted yet (scraper code normally exists from the moment cleanup runs — including on later failure — so this is rare).
+        "404":
+          description: Job still running and no draft has been promoted yet (scraper code normally exists from the moment cleanup runs — including on later failure — so this is rare). Same `not_ready` code, 404 semantics.
           content:
             application/json:
               schema:
@@ -1494,6 +1500,12 @@ components:
           and validating the extractor. Nothing retrievable yet.
         - `sample_ready` — the extractor passed testing; a small sample of
           extracted records is available at `/sample`. The full run continues.
+          (TRANSPORT NOTE: the EVENT stream reports this state as a
+          `job.sample_ready` event the moment testing passes; the REST
+          `state` field reports it only opportunistically — polling
+          clients should treat `sample_available: true` on an
+          `inprogress` job as the equivalent signal, which is exactly how
+          the event and REST surfaces agree.)
         - `scraper_ready` — terminal success. Full output and scraper code are
           available. (Invariant: `output_available` and `scraper_available`
           flags are authoritative within this state; `item_count` may be 0.)
@@ -1543,12 +1555,9 @@ components:
         - cancelled
         - captcha_blocked
         - akamai_blocked
-        - validation_failed
-        - code_generation_failed
-        - execution_failed
-        - no_output_produced
+        - pipeline_failed
         - internal_error
-      description: Machine-readable failure classification. `cancelled`/`captcha_blocked`/`akamai_blocked` mirror the internal terminal statuses (models.py:104-106); the rest classify the pipeline stage that failed.
+      description: Machine-readable failure classification. `cancelled`/`captcha_blocked`/`akamai_blocked` mirror the internal terminal statuses (models.py:104-106); `pipeline_failed` covers every other pipeline failure (the human-readable stage detail lives in `message`); `internal_error` for unexpected server faults.
 
     # ── Errors ─────────────────────────────────────────────────────────────
     Error:
