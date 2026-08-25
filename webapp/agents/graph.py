@@ -3726,6 +3726,15 @@ def _invoke_dagster_converter(
     the job status."""
     job_id = state.get("job_id", 0)
     slug = state.get("site_slug", "")
+    # P2 (Railway job-1 forensics): skip on non-SUCCESS — converting a
+    # scraper for a failed job burned 6 minutes on prod. Same guard pattern
+    # as skill_learner/store_job_listings.
+    if state.get("execution_status", "FAILED") != "SUCCESS":
+        logger.info(
+            "_invoke_dagster_converter: skipping (execution_status=%s, job %s)",
+            state.get("execution_status"), job_id,
+        )
+        return {"messages": []}
     _notify_phase(job_id, "dagster_converter", "running")
 
     # Only run if the scraper exists + job succeeded

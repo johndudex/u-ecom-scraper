@@ -212,3 +212,24 @@ class TestPromotionEmissions:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class TestDagsterSkipGuard:
+    def test_skips_on_failed_execution(self, partner, db):
+        """P2 from the Railway job-1 forensics: dagster_converter burned 6
+        minutes converting a scraper for a FAILED job. Same guard pattern
+        as skill_learner/store_job_listings."""
+        import agents.graph as graph_mod
+
+        u, raw = partner
+        job = _job(u, status="failed")
+        from scraper.models import Step
+
+        before = Step.objects.filter(job=job, phase="dagster_converter").count()
+        out = graph_mod._invoke_dagster_converter(
+            {"job_id": job.id, "site_slug": "gap", "execution_status": "FAILED"}, None
+        )
+        # no Step row was created (the running notify never fired)
+        after = Step.objects.filter(job=job, phase="dagster_converter").count()
+        assert before == after
+        assert out == {"messages": []}

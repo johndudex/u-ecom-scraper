@@ -25,6 +25,46 @@ def _build_conn_string() -> str:
     return f"postgresql://{user}:{password}@{host}:{port}/{name}"
 
 
+def _ensure_thread_id_indexes(saver) -> None:
+    """The MIGRATIONS create thread_id indexes with CONCURRENTLY, which
+    fails inside PostgresSaver.setup()'s transaction — the tables exist but
+    the indexes silently don't (Railway prod carried this: every checkpoint
+    read scanned without thread_id index). Autocommit, one statement per
+    cursor: CONCURRENTLY cannot run in a transaction block."""
+    import re
+
+    names = []
+    for m in saver.MIGRATIONS:
+        names.extend(
+            re.findall(r"CREATE (?:UNIQUE )?INDEX (?:CONCURRENTLY )?(?:IF NOT EXISTS )?(\w+)", m)
+        )
+    wanted = [n for n in names if "thread_id" in n]
+    with saver._cursor() as cur:
+        cur.execute(
+            "SELECT indexname FROM pg_indexes WHERE schemaname='public'"
+        )
+        existing = {r[0] for r in cur.fetchall()}
+    missing = [n for n in wanted if n not in existing]
+    if not missing:
+        return
+    for name in missing:
+        for m in saver.MIGRATIONS:
+            if name in m:
+                try:
+                    conn = saver.conn
+                    old_autocommit = getattr(conn, "autocommit", None)
+                    if old_autocommit is not None:
+                        conn.autocommit = True
+                    with conn.cursor() as cur:
+                        cur.execute(m)
+                    if old_autocommit is not None:
+                        conn.autocommit = old_autocommit
+                    logger.info("created checkpoint index %s", name)
+                except Exception as exc:
+                    logger.warning("index %s creation failed: %s", name, exc)
+                break
+
+
 def _ensure_tables(saver) -> None:
     """Ensure checkpoint tables exist, handling CONCURRENTLY index limitations."""
     try:
@@ -44,6 +84,7 @@ def _ensure_tables(saver) -> None:
 
     if count > 0:
         logger.info("PostgresSaver checkpointer tables verified")
+        _ensure_thread_id_indexes(saver)
         return
 
     logger.warning("Checkpoint tables missing after setup(), creating manually")

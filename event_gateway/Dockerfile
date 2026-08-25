@@ -28,4 +28,4 @@ COPY webapp/scraper/management/ /app/webapp/scraper/management/
 WORKDIR /app/event_gateway
 EXPOSE 8100
 ENV PYTHONPATH=/app:/app/webapp
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8100"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8100", "--no-access-log"]
