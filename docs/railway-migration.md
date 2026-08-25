@@ -493,26 +493,109 @@ nullable columns) and safe to leave in place.
 
 ## Phase 12 — Event gateway (WSS, optional)
 
-The Phase-2 WSS gateway (`event_gateway/`, port 8100) ships as a compose
-service and runs live locally. It is OPTIONAL on Railway: callbacks + SSE
-already cover partner push. Add it when a partner wants websockets.
+The Phase-2 WSS gateway (`event_gateway/`) gives partners one multiplexed
+websocket per client (subscribe/unsubscribe by job_id, state snapshots,
+live event fan-out, ≤25s heartbeats) instead of per-job SSE streams.
+**Skip this phase unless a partner asks for websockets** — callbacks
+(Phase 11) + SSE (on django) already cover partner push; this adds a 10th
+service to monitor for a transport nobody is using yet.
 
-| Field | Value |
-|---|---|
-| Service name | `event-gateway` |
-| Source | repo root (Dockerfile at `event_gateway/Dockerfile`) |
-| Start Command | (image default) `uvicorn app:app --host 0.0.0.0 --port 8100` |
-| Env | same DB/Redis vars as django + `PYTHONPATH=/app:/app/webapp` |
-| Memory | 256 MB |
+Built and verified locally: 17 unit tests + 14 consecutive full e2e runs
+(9 protocol behaviors each) against the compose service.
 
-**PYTHONPATH must include `/app/webapp`** (compose env overrides the
-image's) — the gateway imports `config.settings` for the shared DB config.
+### 1. Create the service (same pattern as every phase)
 
-Post-deploy check (web UI): `event-gateway` → **Settings → Networking** →
-copy the public URL, open `<url>/health` in a browser → `{"status":"ok",
-"service":"event-gateway"}`. Client URL: `wss://<gateway-host>/ws/v1/jobs`.
-Auth: single-use token (POST /api/v1/ws-token with X-API-Key) or
-`?apikey=<key>` for non-browser clients. All 9 protocol behaviors
-(ack+snapshot, live fan-out, terminal retirement, idempotent unsubscribe,
-error-keeps-connection, token auth, consumed-token rejection, cross-tenant
-nack, unauth refusal) verified live locally in 14 consecutive e2e runs.
+1. **+ New** → GitHub Repo → same repo/branch. Root Directory `/`
+   (repo root) — Railway auto-detects `event_gateway/Dockerfile` ONLY if
+   you set **Settings → Build → Dockerfile Path** to
+   `event_gateway/Dockerfile` (the repo root also has the main Dockerfile;
+   Railway picks the root one by default — this is the one setting people
+   miss).
+2. **Settings → Deploy → Start Command**: leave EMPTY — the image CMD is
+   already `uvicorn app:app --host 0.0.0.0 --port 8100`.
+3. **Variables** (paste block — same DB/Redis as django, plus the two
+   gateway-specific ones):
+
+```
+# ── from Shared Variables (use the "Share" button — same set as django) ──
+# DJANGO_SETTINGS_MODULE, SECRET_KEY
+
+# ── database (references resolve because 'postgres' exists) ──
+DB_HOST=${{postgres.PGHOST}}
+DB_PORT=${{postgres.PGPORT}}
+DB_NAME=${{postgres.PGDATABASE}}
+DB_USER=${{postgres.PGUSER}}
+DB_PASSWORD=${{postgres.PGPASSWORD}}          # ⋮ → Seal after saving
+
+# ── redis ──
+REDIS_URL=${{redis.REDIS_URL}}
+
+# ── the two gateway-specific ones ──
+PYTHONPATH=/app:/app/webapp
+PORT=8100
+```
+
+Two traps, both bit during local bring-up:
+- **`PYTHONPATH` must be `/app:/app/webapp`** — the gateway imports
+  `config.settings` and `scraper.*`; without the second entry it dies at
+  boot with `ModuleNotFoundError: No module named 'config.settings'`.
+  Railway's variables OVERRIDE the Dockerfile's ENV — setting just
+  `/app` breaks it.
+- **`PORT=8100`** — same trap as file-master's Phase 4: Railway probes
+  the port named in `PORT`; the image hardcodes 8100. Without the
+  variable the healthcheck hits a dead port and the deploy fails after
+  the full retry window.
+
+4. **Settings → Resources**: 256 MB (delivery is I/O, not LLM).
+5. **Settings → Healthcheck**: path `/health`, leave the timeout default
+   (the endpoint is a static JSON blob — fast).
+
+### 2. Networking
+
+**Settings → Networking → Generate Domain** only if a partner needs a
+PUBLIC websocket endpoint — then note two things:
+- Railway terminates TLS at its edge; the client URL becomes
+  `wss://<your-gateway-domain>/ws/v1/jobs`.
+- A public gateway is an internet-reachable auth surface. The auth is
+  sound (single-use tokens / full key state machine), but if you'd
+  rather not expose it, leave the domain off and use Railway's private
+  networking from a partner-facing proxy later — the service works
+  either way; nothing about the app requires a public URL.
+
+### 3. Post-deploy check (web UI, 1 minute)
+
+1. `event-gateway` → **Logs**: you want `Uvicorn running on
+   http://0.0.0.0:8100` and NO `ModuleNotFoundError` (that's the
+   PYTHONPATH trap). Healthcheck flips green within a minute.
+2. If you generated a domain: open `https://<domain>/health` in your
+   browser → `{"status":"ok","service":"event-gateway",...}`.
+3. End-to-end (needs one valid API key): in any browser console on your
+   django domain, mint a token and connect —
+
+```js
+const r = await fetch('/api/v1/ws-token', {method:'POST',
+  headers:{'X-API-Key':'<pk_...>'}});
+const {token} = await r.json();
+const ws = new WebSocket(
+  `wss://<gateway-domain>/ws/v1/jobs?token=${token}`);
+ws.onopen = () => ws.send(JSON.stringify(
+  {op:'subscribe', data:{job_id:<a real job id>}}));
+ws.onmessage = e => console.log(JSON.parse(e.data));
+// expect: subscribe.ack with a state snapshot, then job.* events
+```
+
+### 4. What partners should know (already in /docs/async_api)
+
+- One connection per client; subscribe/unsubscribe by `job_id`; the ack
+  carries a state snapshot (the ONLY reconnect guarantee — no replay).
+- Terminal events retire a subscription but the connection stays open
+  for their other jobs.
+- `heartbeat.ping` every ≤25s of silence; clients SHOULD pong.
+- Browser clients authenticate with the single-use token exchange
+  (`POST /api/v1/ws-token`); non-browser clients may pass `?apikey=`.
+
+### Rollback
+
+The gateway is stateless (no DB writes, no queue consumption) — deleting
+the service or setting it to sleep loses nothing. Partners fall back to
+SSE + callbacks transparently; they were never asked to choose.
