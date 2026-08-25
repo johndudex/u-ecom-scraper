@@ -1,10 +1,14 @@
 {% extends "admin/change_list.html" %}
-{% block object-tools-items %}
-  <li>
-    <a href="{{ recompute_url }}" style="color:#0a7ea4;">Preview date-reliability recompute</a>
-  </li>
-  <li>
-    <a href="{{ recompute_url }}?write=1" style="color:#ba2121;">APPLY recompute (--write)</a>
-  </li>
+{# Date-repair buttons for the a66e33f window. Rendered at the TOP of the
+   content block: inside block content but BEFORE content-main (the div the
+   admin's filter/search XHR swaps) — context (recompute_url) survives every
+   re-render because changelist_view always provides it. #}
+{% block content %}
+  <div style="margin: 0 0 12px 0; padding: 10px 12px; background: #f8f8f8; border: 1px solid #ddd; border-radius: 4px;">
+    <strong>Date-reliability repair (a66e33f window):</strong>&nbsp;
+    <a href="{{ recompute_url }}" style="color:#0a7ea4; padding:4px 10px; border:1px solid #0a7ea4; border-radius:3px; text-decoration:none;">1&nbsp;·&nbsp;Preview recompute (dry run)</a>&nbsp;
+    <a href="{{ recompute_url }}?write=1" style="color:#ba2121; padding:4px 10px; border:1px solid #ba2121; border-radius:3px; text-decoration:none;">2&nbsp;·&nbsp;APPLY recompute (--write)</a>
+    <span style="color:#666; font-size:12px;">&nbsp;— click Preview first; counts appear as a green message at the top. Superuser only.</span>
+  </div>
   {{ block.super }}
 {% endblock %}
