@@ -23,17 +23,20 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect  # noqa: E402
 from gateway import (  # noqa: E402
     HEARTBEAT_SECONDS,
     check_ws_token,
+    event_allowed,
     handle_control_sync,
+    heartbeat_ping_frame,
+    retire_subscription,
     verify_api_key,
 )
 
 logger = logging.getLogger("event_gateway")
 
 
-def _run_control_sync(user_id: int, raw: str, subs: set) -> str | None:
+def _run_control_sync(user_id: int, raw: str, subs: set, filters: dict) -> str | None:
     """Sync control-frame handler (psycopg inside) — run in the executor so
     DB dials never block the event loop."""
-    return handle_control_sync(user_id, raw, subs)
+    return handle_control_sync(user_id, raw, subs, filters)
 app = FastAPI(title="Partner Event Gateway", version="1")
 
 _TERMINAL_OPS = ("job.scraper_ready", "job.failed")
@@ -63,13 +66,14 @@ async def ws_jobs(ws: WebSocket, token: str = ""):
     await ws.accept()
 
     subs: set[int] = set()
+    filters: dict[int, set[str] | None] = {}  # job_id → event filter (None = default)
     state = {"last_send": time.monotonic()}
 
     async def reader():
         while True:
             raw = await ws.receive_text()
             out = await _aio.get_running_loop().run_in_executor(
-                None, _run_control_sync, user_id, raw, subs
+                None, _run_control_sync, user_id, raw, subs, filters
             )
             if out is not None:
                 await ws.send_text(out)
@@ -103,14 +107,20 @@ async def ws_jobs(ws: WebSocket, token: str = ""):
                 payload = msg["data"]
                 if isinstance(payload, bytes):
                     payload = payload.decode("utf-8", "replace")
-                await ws.send_text(payload)
-                state["last_send"] = time.monotonic()
                 try:
                     env = json.loads(payload)
-                    if env.get("type") in _TERMINAL_OPS:
-                        subs.discard(jid)  # retire; connection stays for other jobs
                 except json.JSONDecodeError:
-                    pass
+                    env = None
+                # subscribe.events filter (B6-2): silently drop non-listed
+                # types. Unparseable payloads have no type to test — forward
+                # them rather than swallow (matches pre-filter behavior).
+                if env is not None and not event_allowed(filters, jid, env.get("type", "")):
+                    continue
+                await ws.send_text(payload)
+                state["last_send"] = time.monotonic()
+                if env is not None and env.get("type") in _TERMINAL_OPS:
+                    # retire; connection stays for other jobs
+                    retire_subscription(jid, subs, filters)
         finally:
             try:
                 await pubsub.close()
@@ -122,9 +132,7 @@ async def ws_jobs(ws: WebSocket, token: str = ""):
         while True:
             await asyncio.sleep(5)
             if time.monotonic() - state["last_send"] >= HEARTBEAT_SECONDS:
-                await ws.send_text(
-                    json.dumps({"op": "heartbeat.ping", "data": {"ts": time.time()}})
-                )
+                await ws.send_text(heartbeat_ping_frame())
                 state["last_send"] = time.monotonic()
 
     tasks = [

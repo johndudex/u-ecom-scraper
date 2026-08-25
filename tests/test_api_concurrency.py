@@ -168,6 +168,63 @@ class DispatchConcurrencyTests(TransactionTestCase):
         self.job.callback.refresh_from_db()
         assert self.job.callback.delivered_count == 20
 
+    def test_racing_duplicate_dispatches_post_exactly_once(self):
+        """Sweep→task double-dispatch guard under REAL parallelism (B3-2
+        follow-on): every row dispatched TWICE (same lease token, as a
+        duplicate enqueue or celery redelivery would), both tasks firing
+        simultaneously — the task-side CAS claim must let exactly one POST.
+
+        httpx.post is patched process-wide from the main thread (mock.patch
+        replaces the module attribute; both worker threads see it)."""
+        import httpx
+        from unittest.mock import patch
+
+        from scraper.events.dispatcher import _lease_token, deliver_callback
+
+        rows = claim_due_rows(limit=50)
+        assert len(rows) == 20
+        tokens = {r.pk: _lease_token(r) for r in rows}
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def run_dispatches():
+            from django.db import connections
+
+            try:
+                connections.close_all()
+                barrier.wait(timeout=30)  # maximize same-row contention
+                for r in rows:
+                    deliver_callback(r.pk, tokens[r.pk])
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+            finally:
+                connections.close_all()
+
+        def ok_post(url, content=None, headers=None, timeout=None, follow_redirects=None):
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+        from scraper.api import ssrf as ssrf_mod
+
+        with patch("httpx.post", side_effect=ok_post), \
+             patch.object(ssrf_mod, "_resolve", lambda h: ["93.184.216.34"]):
+            t1 = threading.Thread(target=run_dispatches)
+            t2 = threading.Thread(target=run_dispatches)
+            t1.start(); t2.start()
+            t1.join(timeout=60); t2.join(timeout=60)
+        assert not errors, errors
+
+        self.job.callback.refresh_from_db()
+        assert self.job.callback.delivered_count == 20, (
+            f"double-POSTed: {self.job.callback.delivered_count} deliveries "
+            f"for 20 rows"
+        )
+        states = list(
+            models.EventOutbox.objects.filter(job=self.job)
+            .values_list("state", flat=True)
+            .distinct()
+        )
+        assert states == [models.EventOutbox.STATE_DELIVERED], states
+
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

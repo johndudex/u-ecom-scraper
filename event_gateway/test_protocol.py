@@ -16,10 +16,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 os.environ.setdefault("EVENT_GATEWAY_TEST", "1")
 from gateway import (  # noqa: E402
+    DEFAULT_EVENT_FILTER,
     HEARTBEAT_SECONDS,
     build_snapshot,
     check_ws_token,
+    event_allowed,
     handle_control,
+    heartbeat_ping_frame,
+    retire_subscription,
     verify_api_key,
 )
 
@@ -168,6 +172,98 @@ class TestControlProtocol:
         assert job.id in subs
 
 
+class TestEventFilter:
+    """B6-2: subscribe.events must actually filter the pump's fan-out."""
+
+    pytestmark = pytest.mark.django_db(transaction=True)
+
+    async def _job_async(self, u, **kw):
+        return await sync_to_async(_job)(u, **kw)
+
+    async def _subscribe(self, u, job, subs, filters, events=None):
+        frame = {"op": "subscribe", "data": {"job_id": job.id}}
+        if events is not None:
+            frame["data"]["events"] = events
+        return await handle_control(u.id, json.dumps(frame), subs=subs, filters=filters)
+
+    async def test_filtered_subscribe_stores_filter(self, partner):
+        u, raw = partner
+        job = await self._job_async(u)
+        subs, filters = set(), {}
+        out = await self._subscribe(u, job, subs, filters, ["job.scraper_ready"])
+        assert json.loads(out)["op"] == "subscribe.ack"
+        assert filters[job.id] == {"job.scraper_ready"}
+
+    async def test_plain_subscribe_stores_default_filter(self, partner):
+        u, raw = partner
+        job = await self._job_async(u)
+        subs, filters = set(), {}
+        await self._subscribe(u, job, subs, filters)
+        assert filters[job.id] is None  # None = the spec's default set
+
+    async def test_unknown_event_name_is_invalid_message(self, partner):
+        u, raw = partner
+        job = await self._job_async(u)
+        subs, filters = set(), {}
+        out = await self._subscribe(u, job, subs, filters, ["job.scraper_ready", "job.nonsense"])
+        payload = json.loads(out)
+        assert payload["op"] == "error"
+        assert payload["data"]["error_code"] == "invalid_message"
+        assert job.id not in subs and job.id not in filters  # not half-subscribed
+
+    async def test_events_not_a_list_is_invalid_message(self, partner):
+        u, raw = partner
+        job = await self._job_async(u)
+        subs, filters = set(), {}
+        out = await self._subscribe(u, job, subs, filters, "job.scraper_ready")
+        assert json.loads(out)["data"]["error_code"] == "invalid_message"
+
+    async def test_filter_scopes_fanout(self, partner):
+        """The TDD core: phase.updated filtered out, scraper_ready let through."""
+        u, raw = partner
+        job = await self._job_async(u)
+        subs, filters = set(), {}
+        await self._subscribe(u, job, subs, filters, ["job.scraper_ready"])
+        assert not event_allowed(filters, job.id, "job.phase.updated")
+        assert event_allowed(filters, job.id, "job.scraper_ready")
+
+    async def test_default_filter_lets_state_events_through(self, partner):
+        u, raw = partner
+        job = await self._job_async(u)
+        subs, filters = set(), {}
+        await self._subscribe(u, job, subs, filters)
+        for et in DEFAULT_EVENT_FILTER:
+            assert event_allowed(filters, job.id, et)
+        # the two opt-in types are excluded by default
+        assert not event_allowed(filters, job.id, "job.log.appended")
+        assert not event_allowed(filters, job.id, "job.phase.updated")
+
+    async def test_unsubscribe_clears_filter(self, partner):
+        u, raw = partner
+        job = await self._job_async(u)
+        subs, filters = set(), {}
+        await self._subscribe(u, job, subs, filters, ["job.scraper_ready"])
+        await handle_control(u.id, json.dumps({"op": "unsubscribe", "data": {"job_id": job.id}}),
+                             subs=subs, filters=filters)
+        assert job.id not in filters  # H3: no leak
+
+    async def test_resubscribe_replaces_filter(self, partner):
+        u, raw = partner
+        job = await self._job_async(u)
+        subs, filters = set(), {}
+        await self._subscribe(u, job, subs, filters, ["job.scraper_ready"])
+        await self._subscribe(u, job, subs, filters, ["job.failed"])
+        assert filters[job.id] == {"job.failed"}
+
+    async def test_terminal_retire_clears_filter(self, partner):
+        """Pump-side subscription retirement must not leak the filter either."""
+        u, raw = partner
+        job = await self._job_async(u)
+        subs, filters = {job.id}, {job.id: {"job.scraper_ready"}}
+        retire_subscription(job.id, subs, filters)
+        assert job.id not in subs and job.id not in filters
+
+
 class TestSnapshot:
     def test_terminal_completed(self, partner, transactional_db):
         u, raw = partner
@@ -194,3 +290,20 @@ class TestSnapshot:
 class TestTimers:
     def test_heartbeat_interval_under_30(self):
         assert HEARTBEAT_SECONDS <= 25  # spec: ping every 25s of silence
+
+
+class TestHeartbeatFrame:
+    """B6-3/H2: HeartbeatData.server_time (ISO 8601 date-time), not `ts`."""
+
+    def test_ping_frame_shape_matches_spec(self):
+        frame = json.loads(heartbeat_ping_frame())
+        assert frame["op"] == "heartbeat.ping"
+        assert set(frame["data"]) == {"server_time"}
+        assert "ts" not in frame["data"]
+        # format: date-time → parseable by fromisoformat after the Z fixup
+        import datetime as dt
+
+        raw = frame["data"]["server_time"]
+        assert raw.endswith("Z")
+        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        assert parsed.tzinfo is not None

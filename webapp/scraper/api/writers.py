@@ -41,9 +41,28 @@ def create_job(request):
     content_type = str(body.get("content_type", "product")).strip() or "product"
     item_urls = body.get("item_urls") or []
     listing_urls = body.get("listing_urls") or []
-    search_criteria = str(body.get("search_criteria", "")).strip()
+    # The spec's field name is `search_keywords` (sync_api.yaml
+    # CreateJobRequest: "Stored as search_criteria"); `search_criteria` is
+    # kept as a legacy alias. The spec name wins when both are sent.
+    search_criteria = str(body.get("search_keywords", "")).strip()
+    if not search_criteria:
+        search_criteria = str(body.get("search_criteria", "")).strip()
     callback_url = str(body.get("callback_url", "")).strip()
     callback_secret = str(body.get("callback_secret", "")).strip()
+
+    # Deduped, order-preserving copies for persistence (spec: "Deduplicated
+    # server-side"). list_page listings are newline-joined into
+    # search_criteria — the field the browser path actually reads (the
+    # CharField→TextField widening was done for exactly this; intake does
+    # the same join server-side for its textarea form field).
+    item_urls_deduped = list(dict.fromkeys(
+        u.strip() for u in item_urls if isinstance(u, str) and u.strip()
+    ))
+    listing_urls_deduped = list(dict.fromkeys(
+        u.strip() for u in listing_urls if isinstance(u, str) and u.strip()
+    ))
+    if input_mode == "list_page" and listing_urls_deduped:
+        search_criteria = "\n".join(listing_urls_deduped)
 
     if not url or input_mode not in INPUT_MODES:
         raise errors.ApiError(
@@ -140,10 +159,52 @@ def create_job(request):
         task = run_scrape_task.delay(job.id, rescrape=False)
         models.ScrapeJob.objects.filter(pk=job.pk).update(celery_task_id=task.id)
 
+    def _persist_item_urls():
+        """F1: url_list's input contract is scrapers/{slug}/input_urls.json —
+        the pipeline falls back to it when Site.input_urls is empty
+        (tasks.py _build_initial_state). Without this the created job runs
+        with 0 URLs. Mirrors intake_create_job (views.py:2593-2607): best
+        effort, an FM outage logs and never breaks create."""
+        try:
+            from ..tasks import _generate_slug
+
+            import src.artifacts as artifacts
+
+            slug = _generate_slug(url)
+            artifacts.write_json(
+                artifacts.scrapers_key(slug, "input_urls.json"),
+                {"urls": item_urls_deduped},
+            )
+        except Exception as exc:
+            logger.warning(
+                "api create: could not persist item_urls for %s: %s", url[:80], exc
+            )
+
+    # Both side effects are post-commit: _dispatch must not observe an
+    # uncommitted row, and an FM write must never leak out of a rolled-back
+    # transaction. url_list jobs only — input_urls.json is not part of the
+    # navigation/list_page/search_term contract.
+    if input_mode == "url_list" and item_urls_deduped:
+        transaction.on_commit(_persist_item_urls)
     transaction.on_commit(_dispatch)
 
+    # 202 = the spec's JobCreated schema (sync_api.yaml): required
+    # [job_id, state, created_at, status_url] + the derived artifact URLs,
+    # and a Location header pointing at the status resource.
+    jid = job.id
     return JsonResponse(
-        {"job_id": job.id, "status_url": f"/api/v1/jobs/{job.id}"}, status=202
+        {
+            "job_id": jid,
+            "state": "inprogress",
+            "created_at": job.created_at.isoformat().replace("+00:00", "Z"),
+            "status_url": f"/api/v1/jobs/{jid}",
+            "sample_url": f"/api/v1/jobs/{jid}/sample",
+            "output_url": f"/api/v1/jobs/{jid}/output",
+            "output_download_url": f"/api/v1/jobs/{jid}/output/download",
+            "scraper_code_url": f"/api/v1/jobs/{jid}/scraper-code",
+        },
+        status=202,
+        headers={"Location": f"/api/v1/jobs/{jid}"},
     )
 
 

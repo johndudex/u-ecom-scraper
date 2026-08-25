@@ -170,24 +170,90 @@ def build_snapshot(job_id: int, user_id: int) -> dict | None:
 
 # ── control protocol ────────────────────────────────────────────────────────
 
-def handle_control_sync(user_id: int, raw: str, subs: set) -> str | None:
+# Delivery filter (async_api.yaml SubscribeData.events). `None` in the
+# per-connection filters dict means "no explicit filter" → this default set:
+# the four state events plus job.artifact.available (and job.created, which
+# the default-set callers in the task brief include).
+DEFAULT_EVENT_FILTER = frozenset({
+    "job.created",
+    "job.inprogress",
+    "job.sample_ready",
+    "job.scraper_ready",
+    "job.failed",
+    "job.artifact.available",
+})
+
+# Names a client may list in subscribe.events — the spec's enum exactly.
+# (job.created is delivered by default but is NOT requestable per the enum.)
+SUBSCRIBABLE_EVENTS = frozenset({
+    "job.inprogress",
+    "job.sample_ready",
+    "job.scraper_ready",
+    "job.failed",
+    "job.artifact.available",
+    "job.phase.updated",
+    "job.approval.required",
+    "job.log.appended",
+})
+
+
+def event_allowed(filters: dict, job_id: int, event_type: str) -> bool:
+    """Pure fan-out decision — unit-testable without a socket.
+
+    `filters` maps job_id → set[str] | None (None/absent = default set).
+    """
+    allowed = filters.get(job_id)
+    return event_type in (allowed if allowed is not None else DEFAULT_EVENT_FILTER)
+
+
+def retire_subscription(job_id: int, subs: set, filters: dict) -> None:
+    """Drop a job's subscription AND its filter (a filter without a
+    subscription is a leak). Used by unsubscribe and terminal events."""
+    subs.discard(job_id)
+    filters.pop(job_id, None)
+
+
+def parse_event_filter(data: dict) -> set[str] | None:
+    """subscribe.data.events → the stored filter.
+
+    Returns None when absent (caller stores None = default set). Raises
+    ValueError on anything the spec's enum rejects — strict, per the
+    additionalProperties:false spirit: garbage in = invalid_message out,
+    and the subscription must NOT be half-applied.
+    """
+    events = data.get("events")
+    if events is None:
+        return None
+    if not isinstance(events, list) or not all(
+        isinstance(e, str) for e in events
+    ):
+        raise ValueError("events must be an array of event names")
+    unknown = sorted(set(events) - SUBSCRIBABLE_EVENTS)
+    if unknown:
+        raise ValueError(f"unknown event type(s): {', '.join(unknown)}")
+    return set(events)
+
+
+def handle_control_sync(user_id: int, raw: str, subs: set, filters: dict | None = None) -> str | None:
     """Sync core — see handle_control (the async wrapper) for the contract.
     Runs psycopg; call from a worker thread in async contexts."""
-    return _handle_control_body(user_id, raw, subs)
+    return _handle_control_body(user_id, raw, subs, filters)
 
 
-async def handle_control(user_id: int, raw: str, subs: set) -> str | None:
+async def handle_control(user_id: int, raw: str, subs: set, filters: dict | None = None) -> str | None:
     """Async wrapper (tests + any loop-context caller): delegates to the
     sync core. The app's WS handler runs the core in an executor instead."""
-    return _handle_control_body(user_id, raw, subs)
+    return _handle_control_body(user_id, raw, subs, filters)
 
 
-def _handle_control_body(user_id: int, raw: str, subs: set) -> str | None:
+def _handle_control_body(user_id: int, raw: str, subs: set, filters: dict | None = None) -> str | None:
     """One inbound frame → zero or one outbound control frame.
 
     Returns None for frames that produce no reply (heartbeat.pong).
-    Mutates `subs` for subscribe/unsubscribe.
+    Mutates `subs` (and `filters`, the per-job event filters) for
+    subscribe/unsubscribe — never partially: validation precedes mutation.
     """
+    filters = filters if filters is not None else {}
     try:
         msg = json.loads(raw)
         if not isinstance(msg, dict):
@@ -205,12 +271,18 @@ def _handle_control_body(user_id: int, raw: str, subs: set) -> str | None:
         if not isinstance(jid, int):
             return json.dumps({"op": "error", "data": {
                 "error_code": "invalid_message", "message": "job_id must be an integer"}})
+        try:
+            event_filter = parse_event_filter(data)
+        except ValueError as exc:
+            return json.dumps({"op": "error", "data": {
+                "error_code": "invalid_message", "message": str(exc)}})
         snap = build_snapshot(jid, user_id)
         if snap is None:
             return json.dumps({"op": "subscribe.nack", "data": {
                 "job_id": jid, "error_code": "job_not_found",
                 "message": f"Job {jid} does not exist."}})
         subs.add(jid)
+        filters[jid] = event_filter
         return json.dumps({"op": "subscribe.ack", "data": snap})
 
     if op == "unsubscribe":
@@ -218,7 +290,7 @@ def _handle_control_body(user_id: int, raw: str, subs: set) -> str | None:
         if not isinstance(jid, int):
             return json.dumps({"op": "error", "data": {
                 "error_code": "invalid_message", "message": "job_id must be an integer"}})
-        subs.discard(jid)  # idempotent per spec
+        retire_subscription(jid, subs, filters)  # idempotent per spec
         return json.dumps({"op": "unsubscribe.ack", "data": {"job_id": jid}})
 
     if op == "heartbeat.pong":
@@ -230,3 +302,14 @@ def _handle_control_body(user_id: int, raw: str, subs: set) -> str | None:
 
 def _error_frame(error_code: str, message: str) -> dict:
     return {"op": "error", "data": {"error_code": error_code, "message": message}}
+
+
+def heartbeat_ping_frame() -> str:
+    """heartbeat.ping per HeartbeatData: `server_time` (date-time, UTC),
+    NOT the epoch `ts` this used to send. Lives here (not app.py) so the
+    frame shape is unit-testable wherever the suite runs."""
+    import datetime as dt
+
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    return json.dumps({"op": "heartbeat.ping",
+                       "data": {"server_time": now.replace("+00:00", "Z")}})

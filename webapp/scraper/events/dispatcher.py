@@ -10,13 +10,20 @@ legs >= 1m are self-scheduled with exact countdowns by the delivering
 task. Celery's retry_backoff is deliberately unused (2^n, 600s default
 clamp would silently break the 1h/6h legs).
 
+deliver_callback claims its own row (audit B3-2): sweep dispatches carry
+the sweep's lease stamp as an ownership token; self-scheduled legs claim
+the due PENDING row directly, so exact countdowns are actually honored.
+The claim is a CAS — a second in-flight task for the same row (duplicate
+enqueue, redelivery, late leg) fails it and returns without POSTing.
+
 The dispatcher lives on the dedicated `events` queue (fold B5): delivery
 HTTP never shares the scrape workers' 2-slot pool.
 """
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
+from datetime import timezone as _tz
 
 from django.db import transaction
 from django.utils import timezone
@@ -69,6 +76,9 @@ def claim_due_rows(limit: int = 50) -> list[EventOutbox]:
                     locked_until=lease_until,
                 )
                 if updated:
+                    # refresh: the returned object must carry the committed
+                    # lease stamp (sweep forwards it as the dispatch token)
+                    row.refresh_from_db()
                     claimed.append(row)
             else:  # LEASED with an expired lock (nominated above)
                 # dead worker's lease: reclaim + burn one attempt. CAS on
@@ -152,8 +162,14 @@ def sweep() -> int:
     for row in rows:
         try:
             # < 1m legs ride the next 30s sweep; >= 1m legs self-schedule
-            # from the delivering task (exact countdown, M1)
-            deliver_callback.apply_async(args=[row.pk], queue="events")
+            # from the delivering task (exact countdown, M1). The lease
+            # stamp travels with the dispatch as an ownership token — the
+            # task's claim matches on it, so a duplicate/late task can't
+            # piggyback on a lease that belongs to another dispatch.
+            deliver_callback.apply_async(
+                args=[row.pk, _lease_token(row)],
+                queue="events",
+            )
             n += 1
         except Exception as exc:
             logger.exception("sweep: enqueue failed for %s: %s", row.event_id, exc)
@@ -164,22 +180,104 @@ def sweep() -> int:
     return n
 
 
+def _lease_token(row: EventOutbox) -> int | None:
+    """The sweep's lease stamp as a pass-through ownership token.
+
+    Integer microseconds — Postgres stores timestamptz at exactly µs
+    resolution, so the roundtrip is lossless (a float epoch would be
+    fine until 2038 and silently lossy after). None when the row carries
+    no lease (never expected for a sweep claim) — the task then falls
+    back to the PENDING-claim path only.
+    """
+    if row.locked_until is None:
+        return None
+    return int(row.locked_until.timestamp() * 1_000_000)
+
+
+def _token_to_dt(token: int) -> datetime:
+    """Token (epoch µs int) → tz-aware UTC datetime for the CAS WHERE."""
+    return datetime.fromtimestamp(token / 1_000_000, tz=_tz.utc)
+
+
+def _claim_for_delivery(row_id: int, token: int | None) -> EventOutbox | None:
+    """CAS-claim the row this task was dispatched for (audit B3-2).
+
+    Two dispatch provenances, one conditional UPDATE:
+
+    1. sweep dispatch (token present): the row is LEASED under the sweep's
+       claim, with next_attempt_at already in the past (that is WHY the
+       sweep nominated it). Match on state=LEASED AND the exact lease
+       stamp — someone else's lease (stale token after a dead-worker
+       reclaim, or a duplicate task that re-leased) never matches.
+    2. self-scheduled / retry leg (no token): the row is PENDING and due.
+       Match on state=PENDING AND next_attempt_at <= now.
+
+    The WHERE is deliberately FLAT — local columns only. A join condition
+    (e.g. job__callback__status) makes Django render `UPDATE ... WHERE id
+    IN (SELECT ... WHERE <conditions>)`, and PostgreSQL evaluates an
+    uncorrelated IN-subquery once at statement start: after a blocked
+    UPDATE waits out a concurrent one, its READ-COMMITTED recheck
+    (EvalPlanQual) re-evaluates only the OUTER quals, the CAS terms are
+    never rechecked, and two overlapping dispatches BOTH succeed (real
+    double-POST, reproduced under thread contention). Flat terms sit in
+    the outer WHERE, so the loser's recheck fails and it returns None.
+
+    The claim never touches attempts — this is the same logical attempt
+    the dispatcher already scheduled; attempts counts completed failures
+    only (mark_attempt_failed owns that increment).
+    """
+    now = timezone.now()
+    lease_until = now + timedelta(seconds=LEASE_SECONDS)
+    qs = EventOutbox.objects.filter(pk=row_id)
+    if token is not None:
+        qs = qs.filter(
+            state=EventOutbox.STATE_LEASED,
+            locked_until=_token_to_dt(token),
+        )
+    else:
+        qs = qs.filter(
+            state=EventOutbox.STATE_PENDING,
+            next_attempt_at__lte=now,
+        )
+    updated = qs.update(
+        state=EventOutbox.STATE_LEASED,
+        locked_until=lease_until,
+    )
+    if not updated:
+        return None  # someone else owns it, or it's delivered/exhausted/not due
+    row = (
+        EventOutbox.objects.select_related("job", "job__callback")
+        .filter(pk=row_id)
+        .first()
+    )
+    if row is None:  # pragma: no cover — deleted between claim and read
+        return None
+    if row.job.callback.status != JobCallback.STATUS_ACTIVE:
+        # Callback disabled between dispatch and claim (rotation/disable
+        # endpoint): hand the row back — PENDING with a due
+        # next_attempt_at parks behind the sweep's disabled-callback gate
+        # and is delivered if/when the partner re-enables.
+        EventOutbox.objects.filter(pk=row.pk).update(
+            state=EventOutbox.STATE_PENDING,
+            locked_until=None,
+        )
+        return None
+    return row
+
+
 from ..tasks import shared_task  # noqa: E402  (register on the celery app)
 
 
 @shared_task(queue="events", max_retries=0)
-def deliver_callback(row_id: int) -> None:
+def deliver_callback(row_id: int, token: int | None = None) -> None:
     """Deliver one event: SSRF re-validate → HMAC-sign → POST → record."""
     from django.db import close_old_connections
 
     close_old_connections()
-    row = (
-        EventOutbox.objects.select_related("job", "job__callback")
-        .filter(pk=row_id, state=EventOutbox.STATE_LEASED)
-        .first()
-    )
+    row = _claim_for_delivery(row_id, token)
     if row is None:
-        return  # lease expired + reclaimed, or already delivered
+        return  # not ours: delivered, exhausted, not yet due, or another
+                # dispatch owns the lease — never a second POST
     ok, error = _deliver(row)
     if ok:
         mark_delivered(row)

@@ -314,3 +314,230 @@ class TestDeliverHmac:
         assert not ok and "transport" in err
         row.refresh_from_db()
         assert row.state == models.EventOutbox.STATE_PENDING  # scheduled retry
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task-side claim (audit B3-2 + sweep→task double-dispatch guard)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from scraper.events.dispatcher import (  # noqa: E402
+    LEASE_SECONDS,
+    MAX_ATTEMPTS,
+    _lease_token,
+    deliver_callback as deliver_task,
+)
+
+
+class TestTaskClaim:
+    """deliver_callback must CAS-claim the row itself (B3-2).
+
+    Two dispatch provenances, one claim:
+    - sweep dispatch — claim_due_rows already leased the row and the task
+      arrives holding that lease's stamp as an ownership token;
+    - self-scheduled / retry leg — the row is PENDING and due; the task
+      flips it PENDING→LEASED itself (previously it required an existing
+      LEASE, found PENDING, and no-opped — every leg sweep-quantized).
+
+    The claim never bumps attempts: attempts counts completed failures
+    (mark_attempt_failed owns the increment); the claim is the same
+    logical attempt the dispatcher already scheduled.
+    """
+
+    @pytest.fixture(autouse=True)
+    def no_conn_recycle(self, monkeypatch):
+        """The celery wrapper recycles worker connections; inside pytest's
+        transaction-wrapped TestCase that closes the wrapper's own
+        connection — neutralize it for direct task invocation."""
+        import django.db
+
+        monkeypatch.setattr(django.db, "close_old_connections", lambda: None)
+
+    def test_claims_due_pending_row_and_delivers_without_bumping_attempts(self, partner, db):
+        u, raw = partner
+        job = _job(u)
+        row = _row(job, attempts=2)
+        with patch("scraper.events.dispatcher._deliver", return_value=(True, "")) as d:
+            deliver_task(row.pk)
+        assert d.call_count == 1
+        row.refresh_from_db()
+        assert row.state == models.EventOutbox.STATE_DELIVERED
+        assert row.attempts == 2  # claim + success never touch attempts
+        assert row.locked_until is None
+        job.callback.refresh_from_db()
+        assert job.callback.delivered_count == 1
+
+    def test_failed_attempt_bumps_and_reschedules(self, partner, db):
+        u, raw = partner
+        job = _job(u)
+        row = _row(job, attempts=2)
+        with patch("scraper.events.dispatcher._deliver", return_value=(False, "http 500")):
+            deliver_task(row.pk)
+        row.refresh_from_db()
+        assert row.attempts == 3  # one completed failure
+        assert row.state == models.EventOutbox.STATE_PENDING
+        gap = BACKOFFS[2]  # attempts=3 → 10m leg
+        delta = (row.next_attempt_at - timezone.now()).total_seconds()
+        assert abs(delta - gap) < 30
+
+    def test_self_scheduled_leg_claims_and_delivers(self, partner, db):
+        """The B3-2 repro: fail a delivery, let the exact-countdown task fire
+        at its due time — it MUST deliver (was: no-op on the PENDING row)."""
+        u, raw = partner
+        job = _job(u)
+        row = _row(job, attempts=1)
+        claimed = {r.pk: r for r in claim_due_rows(limit=10)}
+        assert row.pk in claimed
+        token = _lease_token(claimed[row.pk])
+        with patch("scraper.events.dispatcher._deliver", return_value=(False, "http 503")):
+            deliver_task(row.pk, token)  # the sweep's dispatch
+        row.refresh_from_db()
+        assert row.state == models.EventOutbox.STATE_PENDING
+        assert row.attempts == 2  # gap=BACKOFFS[1]=60s → self-scheduled
+        # countdown=gap fires: the leg is now due
+        models.EventOutbox.objects.filter(pk=row.pk).update(
+            next_attempt_at=timezone.now() - timedelta(seconds=1)
+        )
+        with patch("scraper.events.dispatcher._deliver", return_value=(True, "")) as d:
+            deliver_task(row.pk)  # NO token — the self-scheduled path
+        assert d.call_count == 1  # ← inert before the fix
+        row.refresh_from_db()
+        assert row.state == models.EventOutbox.STATE_DELIVERED
+        assert row.attempts == 2  # success still doesn't bump
+
+    def test_sweep_dispatch_token_delivers_leased_row(self, partner, db):
+        """claim_due_rows pre-leases for the sweep; its dispatch carries the
+        lease stamp and must go through (the main first-delivery path)."""
+        u, raw = partner
+        job = _job(u)
+        row = _row(job)
+        claimed = {r.pk: r for r in claim_due_rows(limit=10)}
+        assert row.pk in claimed
+        assert claimed[row.pk].locked_until is not None  # committed lease surfaced
+        token = _lease_token(claimed[row.pk])
+        with patch("scraper.events.dispatcher._deliver", return_value=(True, "")) as d:
+            deliver_task(row.pk, token)
+        assert d.call_count == 1
+        row.refresh_from_db()
+        assert row.state == models.EventOutbox.STATE_DELIVERED
+
+    def test_leased_row_without_token_not_delivered(self, partner, db):
+        """A sweep-leased row belongs to THAT dispatch; a token-less caller
+        must not piggyback on someone else's lease."""
+        u, raw = partner
+        job = _job(u)
+        row = _row(job)
+        claim_due_rows(limit=10)
+        with patch("scraper.events.dispatcher._deliver", return_value=(True, "")) as d:
+            deliver_task(row.pk)  # no token
+        assert d.call_count == 0
+        row.refresh_from_db()
+        assert row.state == models.EventOutbox.STATE_LEASED
+
+    def test_stale_lease_token_rejected(self, partner, db):
+        """Dead-worker reclaim re-leases under a NEW stamp and dispatches its
+        own task; the late first dispatch's token must no longer match."""
+        u, raw = partner
+        job = _job(u)
+        row = _row(job)
+        claimed = {r.pk: r for r in claim_due_rows(limit=10)}
+        stale_token = _lease_token(claimed[row.pk])
+        # simulate the reclaim's fresh lease (+ the renewal the new task does)
+        models.EventOutbox.objects.filter(pk=row.pk).update(
+            locked_until=timezone.now() + timedelta(seconds=LEASE_SECONDS)
+        )
+        with patch("scraper.events.dispatcher._deliver", return_value=(True, "")) as d:
+            deliver_task(row.pk, stale_token)
+        assert d.call_count == 0
+        row.refresh_from_db()
+        assert row.state == models.EventOutbox.STATE_LEASED  # not stolen
+
+    def test_second_dispatch_returns_without_delivering(self, partner, db):
+        """Sweep→task double-dispatch guard: once one dispatch has claimed,
+        a second in-flight task for the same row must no-op (one POST)."""
+        u, raw = partner
+        job = _job(u)
+        row = _row(job, attempts=3)
+        with patch("scraper.events.dispatcher._deliver", return_value=(True, "")) as d:
+            deliver_task(row.pk)
+            deliver_task(row.pk)  # duplicate enqueue
+        assert d.call_count == 1
+        row.refresh_from_db()
+        assert row.state == models.EventOutbox.STATE_DELIVERED
+        job.callback.refresh_from_db()
+        assert job.callback.delivered_count == 1
+
+    def test_second_token_dispatch_after_delivery_noops(self, partner, db):
+        """Same guard on the sweep path: a redelivered sweep message (same
+        token) after the row reached DELIVERED must not re-POST."""
+        u, raw = partner
+        job = _job(u)
+        row = _row(job)
+        claimed = {r.pk: r for r in claim_due_rows(limit=10)}
+        token = _lease_token(claimed[row.pk])
+        with patch("scraper.events.dispatcher._deliver", return_value=(True, "")) as d:
+            deliver_task(row.pk, token)
+            deliver_task(row.pk, token)  # celery redelivery
+        assert d.call_count == 1
+        job.callback.refresh_from_db()
+        assert job.callback.delivered_count == 1
+
+    def test_not_yet_due_row_not_claimed(self, partner, db):
+        """A leg firing early (worker clock skew) must not deliver before
+        its scheduled time — the next sweep picks it up when genuinely due."""
+        u, raw = partner
+        job = _job(u)
+        row = _row(job, next_attempt_at=timezone.now() + timedelta(seconds=30))
+        with patch("scraper.events.dispatcher._deliver", return_value=(True, "")) as d:
+            deliver_task(row.pk)
+        assert d.call_count == 0
+        row.refresh_from_db()
+        assert row.state == models.EventOutbox.STATE_PENDING
+
+    def test_disabled_callback_not_claimed_by_task(self, partner, db):
+        """Disabled callbacks park rows (delivered after re-enable) — the
+        task-side claim enforces the same gate the sweep does."""
+        u, raw = partner
+        job = _job(u)
+        job.callback.status = "disabled"
+        job.callback.save()
+        row = _row(job)
+        with patch("scraper.events.dispatcher._deliver", return_value=(True, "")) as d:
+            deliver_task(row.pk)
+        assert d.call_count == 0
+        row.refresh_from_db()
+        assert row.state == models.EventOutbox.STATE_PENDING
+
+    def test_long_leg_self_schedules_exact_countdown(self, partner, db):
+        u, raw = partner
+        job = _job(u)
+        row = _row(job, attempts=1)  # failure → attempts=2 → gap=60s ≥ 1m
+        with patch("scraper.events.dispatcher.deliver_callback") as task, \
+             patch("scraper.events.dispatcher._deliver", return_value=(False, "http 500")):
+            deliver_task(row.pk)
+        assert task.apply_async.call_count == 1
+        call = task.apply_async.call_args
+        assert call.kwargs.get("countdown") == BACKOFFS[1]
+        assert call.kwargs.get("args") == [row.pk]
+        assert call.kwargs.get("queue") == "events"
+
+    def test_short_leg_rides_the_sweep(self, partner, db):
+        u, raw = partner
+        job = _job(u)
+        row = _row(job, attempts=0)  # failure → attempts=1 → gap=10s < 1m
+        with patch("scraper.events.dispatcher.deliver_callback") as task, \
+             patch("scraper.events.dispatcher._deliver", return_value=(False, "http 500")):
+            deliver_task(row.pk)
+        assert task.apply_async.call_count == 0
+
+    def test_exhaustion_via_task_disables_callback(self, partner, db):
+        u, raw = partner
+        job = _job(u)
+        row = _row(job, attempts=MAX_ATTEMPTS - 1)  # 6th failure exhausts
+        with patch("scraper.events.dispatcher.deliver_callback") as task, \
+             patch("scraper.events.dispatcher._deliver", return_value=(False, "dead endpoint")):
+            deliver_task(row.pk)
+        row.refresh_from_db()
+        assert row.state == models.EventOutbox.STATE_PERMANENTLY_FAILED
+        job.callback.refresh_from_db()
+        assert job.callback.status == "disabled"
+        assert task.apply_async.call_count == 0  # nothing left to schedule
