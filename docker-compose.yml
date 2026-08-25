@@ -258,6 +258,14 @@ services:
       REDIS_URL: redis://redis:6379/0
       DJANGO_SETTINGS_MODULE: config.settings
       SECRET_KEY: dev-secret-key-change-in-production
+      # O1 (same class as beat's): flower imports the Django app (config →
+      # scraper.views → from src...); without PYTHONPATH=/app it dies with
+      # ModuleNotFoundError: src. It ran before only via the stale image.
+      PYTHONPATH: /app
+      # flower >=2.0: the API (used by the healthcheck) 401s without this;
+      # the UI itself stays behind basic-auth creds when FLOWER_BASIC_AUTH
+      # is set (set it on Railway — the port must not be public otherwise).
+      FLOWER_UNAUTHENTICATED_API: "1"
     ports:
       - "5555:5555"
     depends_on:
