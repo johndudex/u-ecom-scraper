@@ -42,7 +42,7 @@ def claim_due_rows(limit: int = 50) -> list[EventOutbox]:
     to a concurrent sweeper's commits (observed as intermittent
     both-missed rows under real thread contention).
     """
-    from django.db.models import F, Q
+    from django.db.models import F
 
     now = timezone.now()
     lease_until = now + timedelta(seconds=LEASE_SECONDS)

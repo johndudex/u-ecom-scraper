@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 from django.core.paginator import Paginator
 from django.http import JsonResponse
 
-from ..models import ScrapeJob, Site, Step
+from ..models import ScrapeJob, Site
 from . import errors
 from .state import partner_state, sample_ready as sample_ready_fn
 from .views import _api_get_job, api_view

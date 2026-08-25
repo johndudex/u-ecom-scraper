@@ -21,7 +21,7 @@ import logging
 import secrets
 import time
 
-from django.http import HttpResponse, JsonResponse
+from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
 from .. import models

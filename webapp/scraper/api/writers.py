@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import secrets
 
 from django.db import transaction
 from django.http import HttpResponse, JsonResponse

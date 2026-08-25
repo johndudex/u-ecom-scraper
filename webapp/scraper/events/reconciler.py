@@ -18,7 +18,7 @@ from datetime import timedelta
 
 from django.utils import timezone
 
-from ..models import EventOutbox, ScrapeJob
+from ..models import ScrapeJob
 from .emitter import emit
 
 logger = logging.getLogger("scraper.events")

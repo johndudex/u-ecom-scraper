@@ -14,7 +14,6 @@ import logging
 import os
 
 from ..events import emit
-from .state import sample_ready as _sample_gate
 
 logger = logging.getLogger("scraper.api")
 

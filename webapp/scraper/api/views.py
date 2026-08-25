@@ -7,7 +7,6 @@ rate limit → handler → ApiError envelope conversion.
 from __future__ import annotations
 
 import functools
-import json
 import logging
 
 from django.http import JsonResponse
