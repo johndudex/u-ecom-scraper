@@ -26,7 +26,19 @@ class TestF19:
         assert 'update["execution_status"] = "FAILED"' in _src
 
     def test_gated_on_last_attempt(self):
-        assert "_is_last = is_final_attempt or retry_count >= MAX_TEST_RETRIES" in _src
+        # aab0f21: the original `_is_last = is_final_attempt or
+        # retry_count >= MAX_TEST_RETRIES` raised NameError — is_final_attempt
+        # is route_after_testing's local, never defined in _invoke_code_tester
+        # (Railway job 4 died mid-graph). The gate now derives is-final
+        # locally with the same truth table (route_after_testing.py defines
+        # is_final_attempt = retry_count == FINAL_RETRY_SENTINEL).
+        assert re.search(
+            r"_is_last = \(\s*"
+            r"retry_count == FINAL_RETRY_SENTINEL\s*"
+            r"or retry_count >= MAX_TEST_RETRIES\s*"
+            r"\)",
+            _src,
+        ), "exhausted-retry honesty gate must derive is-final attempt locally"
 
     def test_rescue_guard_present(self):
         # only fires when NO real output items exist (rescue path owns that case)

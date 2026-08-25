@@ -26,7 +26,10 @@ class TestF5CallSites:
         src = _graph_src()
         lines = src.split("\n")
         sites = [i for i, ln in enumerate(lines) if "hb = _start_heartbeat" in ln]
-        assert len(sites) == 4, f"expected 4 call sites, found {len(sites)}"
+        # Count is intentionally NOT pinned: new guarded call sites are added
+        # over time (5th arrived with the CLI-contract fix loop, aa74f02).
+        # The invariant under test is that EVERY site is finally-guarded.
+        assert len(sites) >= 4, f"expected >= 4 call sites, found {len(sites)}"
         for i in sites:
             window = "\n".join(lines[i:i + 10])
             assert "finally:" in window, f"line {i+1}: no finally within 10 lines"

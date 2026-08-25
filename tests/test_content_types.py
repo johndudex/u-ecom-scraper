@@ -204,42 +204,31 @@ class TestBuildInitialState:
 
 
 class TestNodeFunctions:
-    def test_build_mapping_prompt_product(self):
-        from agents.nodes.normalize_fields import _build_mapping_prompt
-        from src.content_types import get_content_type
+    # NOTE: the LLM field-mapper seam in normalize_fields
+    # (_build_mapping_prompt / _core_fields_present / _call_llm_for_mapping)
+    # was removed when normalize_fields went deterministic — job content types
+    # map via the src.job_fields resolver (see tests/test_job_fields.py for
+    # its coverage), other types keep the analyzer's own field map. The
+    # prompt-builder tests below were removed with it; registry-level prompt
+    # fields are still covered by TestContentTypeRegistry.test_mapping_prompt_fields.
+    # The surviving "are the core fields present" check is validate_coverage's
+    # _extract_covered_fields, tested here in its place.
 
-        config = get_content_type("product")
-        prompt = _build_mapping_prompt(config.output_schema)
-        assert "price" in prompt.lower()
-        assert "title" in prompt.lower()
-
-    def test_build_mapping_prompt_article(self):
-        from agents.nodes.normalize_fields import _build_mapping_prompt
-        from src.content_types import get_content_type
-
-        config = get_content_type("article")
-        prompt = _build_mapping_prompt(config.output_schema)
-        assert "author" in prompt.lower()
-        assert "publish_date" in prompt.lower()
-
-    def test_build_mapping_prompt_job(self):
-        from agents.nodes.normalize_fields import _build_mapping_prompt
-        from src.content_types import get_content_type
-
-        config = get_content_type("job_posting")
-        prompt = _build_mapping_prompt(config.output_schema)
-        assert "company" in prompt.lower()
-        assert "location" in prompt.lower()
-
-    def test_core_fields_present(self):
-        from agents.nodes.normalize_fields import _core_fields_present
+    def test_extract_covered_fields_core(self):
+        from agents.nodes.validate_coverage import _extract_covered_fields
         from src.content_types import get_content_type
 
         config = get_content_type("product")
         core = list(config.core_field_names)
-        fields = {f: f"val_{i}" for i, f in enumerate(core[:3])}
-        result = _core_fields_present(fields, core)
-        assert result is not None
+        fields = {
+            f: {"method": "resolver", "selector": f"json.{f}"} for f in core[:3]
+        }
+        covered = _extract_covered_fields({"fields": fields})
+        assert set(core[:3]) <= covered
+        # an entry with neither method nor selector is NOT covered
+        fields[core[0]] = {"method": "", "selector": ""}
+        covered = _extract_covered_fields({"fields": fields})
+        assert core[0] not in covered
 
     def test_format_output_products_all_keys(self):
         from agents.nodes.field_confirmation import _format_output_products
@@ -353,7 +342,11 @@ class TestNodeFunctions:
                 os.unlink(tmp_path)
 
     def test_item_label(self):
-        from agents.nodes.pre_execution_approval import _item_label
+        # _item_label moved from pre_execution_approval to field_confirmation
+        # (Wave 2 Cut 2 gate merge: pre_execution_approval is no longer a
+        # graph node; field_confirmation inherited the item-count estimate +
+        # label it used in its interrupt message).
+        from agents.nodes.field_confirmation import _item_label
         from src.content_types import get_content_type
 
         expected = {
@@ -473,9 +466,10 @@ class TestNavigationAgent:
     # node. The LLM-agent prompt/message-builder tests have been removed; the
     # integration test (webapp/tests/test_browser_traverse_integration.py)
     # covers the new node. Tests below exercise preserved surface area:
-    # _build_initial_state routing flags, code_writer/scraper_analyzer message
-    # builders (which still consume ``navigation_analysis`` state), and the
-    # runtime navigation scraper template.
+    # _build_initial_state routing flags, the code_writer message builder and
+    # the deterministic scraper_analyzer (_derive_strategy) — both of which
+    # still consume ``navigation_analysis`` state — and the runtime
+    # navigation scraper template.
 
     def test_route_after_site_analyzer_navigation(self):
         from agents.graph import _route_after_site_analyzer
@@ -488,7 +482,10 @@ class TestNavigationAgent:
         assert _route_after_site_analyzer(state_url_list) == "update_tracker_analysis"
         assert _route_after_site_analyzer(state_navigation) == "browser_traverse"
         assert _route_after_site_analyzer(state_list_page) == "browser_traverse"
-        assert _route_after_site_analyzer(state_search) == "update_tracker_analysis"
+        # search_term MUST route through navigation (the documented
+        # docs/scraper_agents.md bug: routing it to update_tracker_analysis
+        # bypassed navigation entirely for search jobs).
+        assert _route_after_site_analyzer(state_search) == "browser_traverse"
 
     def test_build_initial_state_navigation_mode(self):
         from scraper.tasks import _build_initial_state
@@ -502,11 +499,17 @@ class TestNavigationAgent:
         state = _build_initial_state(job)
         assert state["input_mode"] == "navigation"
         assert state["search_criteria"] == "sneakers"
-        assert state["skip_content_analysis"] is True
+        # skip_content_analysis was removed with the LLM-mapper cut: nav jobs
+        # no longer skip content analysis (browser_traverse feeds
+        # product_analyzer, which maps fields on discovered items). Fresh jobs
+        # start with every skip flag off; routing skips site_analyzer instead
+        # (set by _accessibility_goto at runtime, not here).
+        assert state["skip_site_analysis"] is False
+        assert state["skip_product_analysis"] is False
 
     def test_build_initial_state_navigation_mode_resolves_from_page_type(self):
         """Regression: jobs created without input_mode set (e.g. via legacy
-        views or scheduler) must still route through navigation_agent because
+        views or scheduler) must still route through navigation because
         page_type carries the canonical routing intent."""
         from scraper.tasks import _build_initial_state
 
@@ -522,7 +525,7 @@ class TestNavigationAgent:
         assert state["input_mode"] == "navigation", (
             "page_type=product_navigation must resolve to input_mode=navigation even when job.input_mode is empty"
         )
-        assert state["skip_content_analysis"] is True
+        assert state["skip_site_analysis"] is False
 
     def test_build_initial_state_list_page_mode_resolves_from_page_type(self):
         """Regression: same as above for list_page mode."""
@@ -535,7 +538,7 @@ class TestNavigationAgent:
         )
         state = _build_initial_state(job)
         assert state["input_mode"] == "list_page"
-        assert state["skip_content_analysis"] is True
+        assert state["skip_site_analysis"] is False
 
     def test_build_initial_state_list_page_mode(self):
         from scraper.tasks import _build_initial_state
@@ -547,7 +550,7 @@ class TestNavigationAgent:
         )
         state = _build_initial_state(job)
         assert state["input_mode"] == "list_page"
-        assert state["skip_content_analysis"] is True
+        assert state["skip_site_analysis"] is False
 
     def test_build_initial_state_url_list_no_skip(self):
         from scraper.tasks import _build_initial_state
@@ -558,7 +561,9 @@ class TestNavigationAgent:
             input_mode="url_list",
         )
         state = _build_initial_state(job)
-        assert state["skip_content_analysis"] is False
+        assert state["skip_site_analysis"] is False
+        assert state["skip_product_analysis"] is False
+        assert state["skip_code_generation"] is False
 
     def test_code_writer_message_with_navigation(self):
         from agents.subagents import build_code_writer_message
@@ -612,22 +617,44 @@ class TestNavigationAgent:
         assert "input_urls.json" in content
 
     def test_scraper_analyzer_message_with_navigation(self):
-        from agents.subagents import build_scraper_analyzer_message
+        # build_scraper_analyzer_message is gone: scraper_analyzer is the
+        # deterministic _decide_strategy/_derive_strategy pair (no LLM, no
+        # prompt). The navigation-awareness this test guarded — the analyzer
+        # must consume navigation_analysis — is exercised on _derive_strategy,
+        # which reads it to pick the strategy + carry the API/discovery
+        # signals code_writer needs for the two-phase scraper.
+        from agents.graph import _derive_strategy
 
         nav_analysis = {
-            "discovery_method": "category",
-            "pagination": {"type": "page_param"},
+            "discovery_method": "browser_traverse",
+            "rendering_verified": "csr",
+            "data_source": "api",
+            "api_endpoint": {
+                "url": "https://test.com/api/search",
+                "items_per_page": 20,
+                "count": 26955,
+            },
+            "pagination": {
+                "type": "page_param",
+                "page_param_name": "page",
+                "items_per_page": 20,
+            },
         }
         state = {
             "url": "https://test.com",
             "site_slug": "test-com",
+            "probe_result": {"connectivity": {"method_that_worked": "direct_http"}},
             "navigation_analysis": nav_analysis,
             "input_mode": "navigation",
         }
-        msg = build_scraper_analyzer_message(state)
-        content = msg[0].content
-        assert "navigation" in content.lower()
-        assert "two-phase" in content.lower()
+        analysis = _derive_strategy(state)
+        # captured API beats the probe method -> internal_api two-phase scraper
+        assert analysis["strategy"] == "internal_api"
+        assert analysis["api_endpoint"]["url"] == "https://test.com/api/search"
+        # navigator's pagination detection is propagated for the template
+        assert analysis["discovery_config"]["type"] == "page_param"
+        assert analysis["discovery_config"]["page_param_name"] == "page"
+        assert analysis["strategy_justification"].startswith("Deterministic:")
 
     def test_pipeline_phases_includes_navigation(self):
         from scraper.tasks import PIPELINE_PHASES

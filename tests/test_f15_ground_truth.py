@@ -156,5 +156,23 @@ class TestOverrideGateSite:
     """Static assertions on the route_after_testing override condition."""
 
     def test_override_condition_includes_missing_core(self):
+        # F15's original lock was the single-line form
+        #   if not _cov_reason and not missing_core and _scraper_has_real_items(...)
+        # aa74f02 added the CLI-contract conjunct (`not _contract_bad`) and
+        # reformatted the condition to parenthesized multi-line. The F15
+        # semantic is unchanged: the ground-truth override is blocked when a
+        # core field sits at ~0% coverage (job 337's brand-only rows).
         src = open(os.path.join(ROOT, "webapp/agents/nodes/route_after_testing.py")).read()
-        assert "if not _cov_reason and not missing_core and _scraper_has_real_items(state, min_count=3):" in src
+        assert re.search(
+            r"if \(\s*"
+            r"not _cov_reason\s*"
+            r"and not missing_core\s*"
+            r"and not _contract_bad\s*"
+            r"and _scraper_has_real_items\(state, min_count=3\)\s*"
+            r"\):",
+            src,
+        ), (
+            "ground-truth override must be gated on: no coverage failure, no "
+            "core field at ~0% coverage, no CLI-contract violation, and >=3 "
+            "real items"
+        )
