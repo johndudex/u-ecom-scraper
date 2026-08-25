@@ -150,6 +150,40 @@ services:
     mem_limit: 512m
     restart: unless-stopped
 
+  event-gateway:
+    # Phase 2 WSS gateway (async_api.yaml /ws/v1/jobs). Standalone FastAPI
+    # service — the Django tier stays WSGI. Owns the websocket surface only:
+    # auth parity via read-only SQL, control protocol, envelope fan-out,
+    # <=25s app heartbeats.
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: event_gateway/Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DB_HOST: postgres
+      DB_NAME: scraper
+      DB_USER: scraper
+      DB_PASSWORD: scraper-password
+      DB_PORT: "5432"
+      DJANGO_SETTINGS_MODULE: config.settings
+      SECRET_KEY: dev-secret-key-change-in-production
+      PYTHONPATH: /app:/app/webapp
+    ports:
+      - "8100:8100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8100/health"]
+      interval: 15s
+      retries: 3
+      timeout: 5s
+    restart: unless-stopped
+    mem_limit: 256m
+
   celery-beat:
     profiles: ["full"]
     build: .

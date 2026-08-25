@@ -121,14 +121,16 @@ servers:
     protocol: wss
     title: Partner WSS gateway
     description: |
-      WebSocket subscription endpoint (Phase 2). Not live — no websocket
-      server exists in the stack today (see info.description). The URL,
-      channel addresses, control messages, and event payloads below are the
-      frozen contract for that gateway.
+      WebSocket subscription endpoint — LIVE (event-gateway service, port
+      8100). One multiplexed connection per client; subscribe/unsubscribe
+      by job_id. Auth: single-use stream token query param (minted via
+      POST /api/v1/ws-token) for browser clients, or the apikey query
+      param carrying X-API-Key for non-browser clients (browsers cannot
+      set WS headers — hence the token path).
     security:
       - $ref: '#/components/securitySchemes/apiKeyHeader'
       - $ref: '#/components/securitySchemes/wsTokenQuery'
-    x-status: planned
+    x-status: live
     x-token-exchange:
       method: POST
       path: /api/v1/ws-token
@@ -348,7 +350,7 @@ operations:
       - $ref: '#/channels/jobs/messages/Subscribe'
       - $ref: '#/channels/jobs/messages/Unsubscribe'
       - $ref: '#/channels/jobs/messages/HeartbeatPong'
-    x-status: planned
+    x-status: live
 
   # ── Inbound WS: server → client events ────────────────────────────────
   sendJobEvents:
@@ -382,7 +384,7 @@ operations:
       - $ref: '#/channels/jobs/messages/JobApprovalRequired'
       - $ref: '#/channels/jobs/messages/JobLogAppended'
       - $ref: '#/channels/jobs/messages/ProtocolError'
-    x-status: planned
+    x-status: live
     x-heartbeat: |
       Server sends heartbeat.ping every 25 s of silence. Rationale: the
       existing SSE feed has NO keepalive at all (verified — the internal

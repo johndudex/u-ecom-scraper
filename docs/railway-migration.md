@@ -444,3 +444,22 @@ The events worker is additive: stopping it freezes delivery (rows PENDING
 — they queue, never drop) while REST/SSE keep working. `git revert` the
 slice commits and redeploy; the 0033 migration is additive (new tables +
 nullable columns) and safe to leave in place.
+
+## Phase 12 — Event gateway (WSS, optional)
+
+The Phase-2 WSS gateway (`event_gateway/`, port 8100) ships as a compose
+service and runs live locally. It is OPTIONAL on Railway: callbacks + SSE
+already cover partner push. Add it when a partner wants websockets.
+
+| Field | Value |
+|---|---|
+| Service name | `event-gateway` |
+| Source | repo root (Dockerfile at `event_gateway/Dockerfile`) |
+| Start Command | (image default) `uvicorn app:app --host 0.0.0.0 --port 8100` |
+| Env | same DB/Redis vars as django + `PYTHONPATH=/app:/app/webapp` |
+| Memory | 256 MB |
+
+**PYTHONPATH must include `/app/webapp`** (compose env overrides the
+image's) — the gateway imports `config.settings` for the shared DB config.
+Post-deploy check: `curl https://<gateway-host>/health` → `{"status":"ok",
+"service":"event-gateway"}`. Client URL: `wss://<gateway-host>/ws/v1/jobs`.
