@@ -6,6 +6,26 @@
 
 ---
 
+## Where do YOU start? (already-running stacks)
+
+**If your Railway project already runs the 8 services from the original
+migration (Phases 1–10, done ~2026-08-18) — start at Phase 11.** That's
+the only mandatory section; everything before it is the from-scratch
+history you already lived. Phase 12 (WSS gateway) is optional-by-demand.
+
+This deploy (branch `file-master-artifacts`, 18 commits ahead of origin)
+adds:
+- migration 0033 + the date-window data fixes — runs automatically on
+  `migrate` in the start commands
+- **Phase 11**: `celery-events` service (NEW — you create it) + a beat
+  schedule entry (automatic on beat restart)
+- **Phase 12**: `event-gateway` service (OPTIONAL — add when a partner
+  wants websockets)
+- the partner API itself (`/api/v1/*`), docs pages, admin surfaces —
+  all live on the existing `django` service, no new config
+
+One-time post-deploy task: the date recompute (Phase 11 §5).
+
 ## How to read this runbook
 
 - You will create **8 Railway services** in this exact order. Each phase = one service = one paste block.
@@ -417,26 +437,49 @@ default) — a hung partner endpoint can never touch scrape capacity.
 
 ### 4. Post-deploy checks (2 minutes)
 
+**Web UI (no CLI needed):**
+
+| Check | Where in the Railway dashboard | What you want to see |
+|---|---|---|
+| a) events worker registered the tasks | `celery-events` → **Logs** | celery banner on boot; no `KeyError: ...deliver_callback` anywhere. First delivery shows `Received task: scraper.events.dispatcher.deliver_callback` |
+| b) beat's entry is live | `celery-beat` → **Logs** | `Scheduler: Sending due task dispatch-pending-callbacks` every ~30s |
+| c) first sweep ran | `celery-events` → **Logs** | `events sweep: dispatched=... reconciled=...` lines. `dispatched=0` is FINE — `created_via="api"` gates emission, so zero rows exist until the first API job |
+
+**CLI alternative (if you have `railway` installed):**
+
 ```bash
-# a) events worker registered the tasks (KeyError here = app.conf.imports lost)
 railway ssh -s celery-events -- celery -A config inspect registered | grep deliver_callback
-
-# b) beat's entry is live
 railway ssh -s celery-beat -- celery -A config inspect scheduled | grep dispatch_pending
-
-# c) first sweep ran (no rows yet is FINE — created_via="api" gates emission)
 railway logs celery-events --tail 50 | grep "events sweep"
 ```
 
-### 5. Rolling out partner traffic
+### 5. The production data repair (recompute date reliability)
+
+The a66e33f parse bug corrupted JobListing dates on Railway's DB too
+(every row since 2026-07-22 marked unreliable). The fix + repair command
+ship in this deploy. Without the CLI, run it via a one-deploy start
+command flip:
+
+1. `django` service → **Settings** → note the current Start Command.
+2. Set Start Command to the normal command **prefixed** with the dry run:
+   `sh -c "python manage.py recompute_date_reliability && <normal command>"`
+   — the dry-run counts print in the deploy logs (expect ~6k scanned).
+3. Happy with the counts? Flip `--write` in, deploy once more, watch the
+   logs for `would fix / fixed: N`, then **revert the Start Command**.
+
+### 6. Rolling out partner traffic
 
 1. Create the partner's service account + key:
    `python manage.py create_api_key --user <partner>` (management command
-   ships with the slice; prints the raw key ONCE).
+   ships with the slice; prints the raw key ONCE). Same start-command
+   trick as §5 runs it without a shell — OR use the Django admin
+   (`/admin/scraper/apikey/` → cannot mint, but shows the created key's
+   prefix/status; minting needs the command).
 2. First partner job validates the whole chain end-to-end: create →
    pipeline → outbox rows → sweep → HMAC POST → their 200.
 3. Watch `callback.delivered_count` on
-   `GET /api/v1/jobs/{id}/callback` — the partner-visible health signal.
+   `GET /api/v1/jobs/{id}/callback` — the partner-visible health signal
+   (also visible in `/admin/scraper/jobcallback/`).
 
 ### Rollback
 
@@ -461,5 +504,12 @@ already cover partner push. Add it when a partner wants websockets.
 
 **PYTHONPATH must include `/app/webapp`** (compose env overrides the
 image's) — the gateway imports `config.settings` for the shared DB config.
-Post-deploy check: `curl https://<gateway-host>/health` → `{"status":"ok",
+
+Post-deploy check (web UI): `event-gateway` → **Settings → Networking** →
+copy the public URL, open `<url>/health` in a browser → `{"status":"ok",
 "service":"event-gateway"}`. Client URL: `wss://<gateway-host>/ws/v1/jobs`.
+Auth: single-use token (POST /api/v1/ws-token with X-API-Key) or
+`?apikey=<key>` for non-browser clients. All 9 protocol behaviors
+(ack+snapshot, live fan-out, terminal retirement, idempotent unsubscribe,
+error-keeps-connection, token auth, consumed-token rejection, cross-tenant
+nack, unauth refusal) verified live locally in 14 consecutive e2e runs.
