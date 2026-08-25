@@ -13,10 +13,9 @@ migration (Phases 1–10, done ~2026-08-18) — start at Phase 11.** That's
 the only mandatory section; everything before it is the from-scratch
 history you already lived. Phase 12 (WSS gateway) is optional-by-demand.
 
-This deploy (branch `file-master-artifacts`, 18 commits ahead of origin)
-adds:
-- migration 0033 + the date-window data fixes — runs automatically on
-  `migrate` in the start commands
+This deploy (branch `file-master-artifacts`) adds:
+- migration 0033 (schema only — new tables + widened columns) — runs
+  automatically on `migrate` in the start commands
 - **Phase 11**: `celery-events` service (NEW — you create it) + a beat
   schedule entry (automatic on beat restart)
 - **Phase 12**: `event-gateway` service (OPTIONAL — add when a partner
@@ -24,11 +23,13 @@ adds:
 - the partner API itself (`/api/v1/*`), docs pages, admin surfaces —
   all live on the existing `django` service, no new config
 
-One-time post-deploy task: the date recompute (Phase 11 §5).
+One-time post-deploy task: the date recompute (Phase 11 §5) — a MANUAL
+admin-button step; `migrate` does NOT repair the historical rows (0033
+is schema-only).
 
 ## How to read this runbook
 
-- You will create **8 Railway services** in this exact order. Each phase = one service = one paste block.
+- You will create **9 Railway services** (10 with the optional event-gateway) in this exact order. Each phase = one service = one paste block.
 - **Variables are pasted into each service's "Variables" tab.** Click the service → **Variables** tab → **Raw Editor** (or `+ New Variable`) → paste the whole block. Railway stages the change; click **Deploy** when prompted.
 - Lines starting `#` inside blocks are comments — safe to paste, Railway ignores them.
 - `${{service.VAR}}` is **Railway reference syntax** — paste the braces exactly. These resolve to values from the Postgres/Redis services you create in Phases 1–2, which is why those come first.
@@ -312,7 +313,7 @@ REDIS_URL=${{redis.REDIS_URL}}
 
    **That is the complete list.** Deliberately NO `ZAI_*` (beat never calls an LLM), NO `FILE_MASTER_URL` usage (it never touches artifacts — it's shared but inert here), NO browser/proxy vars (it never scrapes). If you paste extra vars from the worker block, they're harmless but noise.
 5. **Settings:** Replicas **1** (two beats = every scheduled task fires twice — the watchdogs would auto-fail jobs in duplicate), autoscaling **off**, Serverless/sleep **off** (a sleeping scheduler silently stops all watchdogs).
-6. **Heads-up — what beat will start doing immediately:** it runs three schedules (every 5 min, from settings.py): `cleanup-stuck-jobs` (auto-FAILs jobs stuck >30 min — with `[EXEC-ALIVE]` rows counting as liveness, so long executions are safe), `stuck-approved-watchdog` (re-dispatches approved-but-stuck approvals), and `schedule-next-site` (auto-queues NEW jobs for any Site with stored URL lists — on a fresh Railway DB there are none, so it's dormant; if you later import production data, expect it to start queueing — that's intended behavior, not a bug).
+6. **Heads-up — what beat will start doing immediately:** it runs FOUR schedules from settings.py: three every 5 min — `cleanup-stuck-jobs` (auto-FAILs jobs stuck >30 min — with `[EXEC-ALIVE]` rows counting as liveness, so long executions are safe), `stuck-approved-watchdog` (re-dispatches approved-but-stuck approvals), and `schedule-next-site` (auto-queues NEW jobs for any Site with stored URL lists — dormant on a fresh DB) — plus **`dispatch-pending-callbacks` every 30s** (partner-event delivery, Phase 11). **Ordering matters:** that 30s entry enqueues to the `events` queue, which only the `celery-events` service (Phase 11) consumes — deploy celery-events BEFORE or immediately after beat restarts, or tasks pile up unconsumed in Redis (harmless but invisible).
 
 ✅ **Checkpoint:** beat logs show `DatabaseScheduler: Schedule changed` then beat entries firing (`Scheduler: Sending due task cleanup-stuck-jobs ...`) every 5 minutes, with no `ModuleNotFoundError` and no DB connection errors after the first minute.
 
@@ -395,8 +396,8 @@ curl -fsI https://<app>.up.railway.app/admin/login/      # → 200
 
 ## Appendix — quick reference
 
-- **Deployment order if you ever rebuild from scratch:** postgres → redis → (shared vars) → file-master → django → browser-service → celery-worker → celery-beat → flower.
-- **All env vars actually read by the code, with defaults:** the tunables not in the paste blocks (`LLM_*` retry/circuit/truncation knobs, `EXECUTION_TIMEOUT=3600`, `EXECUTION_STALL_TIMEOUT=300`, `SCRAPER_HTTP_TIMEOUT=7200`, `PROBE_TIMEOUT=180`, `NAVIGATE_MAX_CONCURRENT=3`, `NAVIGATE_MAX_QUEUE=4`, `XVFB_RESOLUTION=1920x1080x24`, `STARTUP_TIMEOUT=45`, proxy vars) all have working defaults — set only when tuning. (`CELERY_TASK_SOFT/TIME_LIMIT` are **not** env-readable — hardcoded 7200/7560; ignore v1's advice about them.)
+- **Deployment order if you ever rebuild from scratch:** postgres → redis → (shared vars) → file-master → django → browser-service → celery-worker → **celery-events** (before beat — it consumes the 30s `events` queue) → celery-beat → flower. (`event-gateway` last, optional — Phase 12.)
+- **All env vars actually read by the code, with defaults:** the tunables not in the paste blocks (`LLM_*` retry/circuit/truncation knobs, `EXECUTION_TIMEOUT=3600`, `EXECUTION_STALL_TIMEOUT=300`, `SCRAPER_HTTP_TIMEOUT=7200`, `PROBE_TIMEOUT=180`, `NAVIGATE_MAX_CONCURRENT=3`, `NAVIGATE_MAX_QUEUE=4`, `XVFB_RESOLUTION=1920x1080x24`, `STARTUP_TIMEOUT=45`, proxy vars) all have working defaults — set only when tuning. (`CELERY_TASK_SOFT/TIME_LIMIT` are **not** env-readable — hardcoded 7200/7560; ignore v1's advice about them.) Partner-API additions, all defaulted: `PARTNER_STREAM_BUDGET=1` (concurrent SSE streams before 503), `PARTNER_STREAM_DEADLINE=3600` (max SSE stream seconds), `OUTPUT_CACHE_FILES=4` / `OUTPUT_CACHE_BYTES=134217728` (output page cache bounds on django).
 - **Postgres sizing:** ≥ 1 GB effective (compose pins `mem_limit: 1g` after production OOM incidents).
 - **Railway docs used:** guides/docker-compose, /variables, /variables/reference, /volumes, /deploy/healthchecks, /deployments/pre-deploy-command, /networking/private-networking, /networking/public-networking, /databases/postgresql, /databases/redis, /deployments/scaling + restart-policy + serverless.
 
@@ -443,7 +444,7 @@ default) — a hung partner endpoint can never touch scrape capacity.
 |---|---|---|
 | a) events worker registered the tasks | `celery-events` → **Logs** | celery banner on boot; no `KeyError: ...deliver_callback` anywhere. First delivery shows `Received task: scraper.events.dispatcher.deliver_callback` |
 | b) beat's entry is live | `celery-beat` → **Logs** | `Scheduler: Sending due task dispatch-pending-callbacks` every ~30s |
-| c) first sweep ran | `celery-events` → **Logs** | `events sweep: dispatched=... reconciled=...` lines. `dispatched=0` is FINE — `created_via="api"` gates emission, so zero rows exist until the first API job |
+| c) first sweep ran | `celery-events` → **Logs** | the worker booted with NO `KeyError` and NO crash-looping. (The `events sweep: dispatched=...` line only prints when something is due — on a fresh deploy there are zero partner jobs (`created_via="api"` gates emission), so silence + a healthy container IS the pass signal. After your first API job, the line appears every 30s.) |
 
 **CLI alternative (if you have `railway` installed):**
 
