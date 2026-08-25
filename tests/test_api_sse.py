@@ -125,3 +125,22 @@ def test_budget_exhausted_503(monkeypatch):
     )
     req = rf.get(f"/api/v1/jobs/{job.id}/events", HTTP_X_API_KEY=raw)
     assert job_events_sse(req, job.id).status_code == 503
+
+
+@pytest.mark.django_db
+def test_no_hop_by_hop_headers():
+    """Django forbids Connection on responses (hop-by-hop) — setting it 500s
+    the stream. Found in live smoke; unit tests never caught it because they
+    assert on content, not response headers."""
+    import secrets as _sec
+
+    u = User.objects.create_user("_hb_" + _sec.token_hex(3), password="x")
+    raw = "pk_" + _sec.token_hex(16)
+    models.ApiKey.objects.create(user=u, prefix=raw[:8], key_hash=models.ApiKey.hash_key(raw))
+    job = models.ScrapeJob.objects.create(
+        url="https://e.com/hb", user=u, created_via="api", status="completed",
+        input_mode="url_list", page_type="product",
+    )
+    req = rf.get(f"/api/v1/jobs/{job.id}/events", HTTP_X_API_KEY=raw)
+    resp = job_events_sse(req, job.id)
+    assert "Connection" not in resp.headers

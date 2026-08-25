@@ -225,3 +225,42 @@ class AgentPlaygroundAdmin(admin.ModelAdmin):
     search_fields = ("agent_name", "url", "prompt")
     readonly_fields = ("created_at", "started_at", "completed_at")
 
+
+
+# ── Partner API (docs/specs/*_api.yaml) ─────────────────────────────────────
+from .models import ApiKey, EventOutbox, JobCallback  # noqa: E402
+
+
+@admin.register(ApiKey)
+class ApiKeyAdmin(admin.ModelAdmin):
+    list_display = ("prefix", "user", "label", "created_at", "last_used_at", "revoked_at", "is_active")
+    search_fields = ("prefix", "user__username", "label")
+    list_filter = ("revoked_at",)
+    readonly_fields = ("key_hash", "created_at", "last_used_at")
+
+    @admin.display(boolean=True, description="Active")
+    def is_active(self, obj):
+        return obj.revoked_at is None and obj.user.is_active
+
+
+@admin.register(JobCallback)
+class JobCallbackAdmin(admin.ModelAdmin):
+    list_display = ("job", "status", "url", "delivered_count", "last_delivered_at", "disabled_reason")
+    list_filter = ("status",)
+    search_fields = ("url", "job__id")
+    raw_id_fields = ("job",)
+    # The secret is RAW at rest (HMAC signing requires it) — never render it.
+    exclude = ("secret",)
+
+
+@admin.register(EventOutbox)
+class EventOutboxAdmin(admin.ModelAdmin):
+    """The partner event timeline — the support surface for 'what did this
+    job's partner receive?' (fold m10)."""
+
+    list_display = ("event_id", "job", "event_type", "state", "attempts", "created_at", "next_attempt_at")
+    list_filter = ("state", "event_type")
+    search_fields = ("event_id", "job__id")
+    raw_id_fields = ("job", "user")
+    date_hierarchy = "created_at"
+    readonly_fields = ("payload",)

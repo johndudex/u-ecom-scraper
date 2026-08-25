@@ -230,7 +230,8 @@ def job_events_sse(request, job_id: int):
     resp = StreamingHttpResponse(event_stream(), content_type="text/event-stream")
     resp["Cache-Control"] = "no-cache"
     resp["X-Accel-Buffering"] = "no"
-    resp["Connection"] = "keep-alive"
+    # NOTE: no Connection header — hop-by-hop, Django asserts against it
+    # (a live-smoke catch: unit tests asserted content, not response headers)
     return resp
 
 
