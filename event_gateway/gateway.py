@@ -170,7 +170,19 @@ def build_snapshot(job_id: int, user_id: int) -> dict | None:
 
 # ── control protocol ────────────────────────────────────────────────────────
 
+def handle_control_sync(user_id: int, raw: str, subs: set) -> str | None:
+    """Sync core — see handle_control (the async wrapper) for the contract.
+    Runs psycopg; call from a worker thread in async contexts."""
+    return _handle_control_body(user_id, raw, subs)
+
+
 async def handle_control(user_id: int, raw: str, subs: set) -> str | None:
+    """Async wrapper (tests + any loop-context caller): delegates to the
+    sync core. The app's WS handler runs the core in an executor instead."""
+    return _handle_control_body(user_id, raw, subs)
+
+
+def _handle_control_body(user_id: int, raw: str, subs: set) -> str | None:
     """One inbound frame → zero or one outbound control frame.
 
     Returns None for frames that produce no reply (heartbeat.pong).

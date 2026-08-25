@@ -23,11 +23,17 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect  # noqa: E402
 from gateway import (  # noqa: E402
     HEARTBEAT_SECONDS,
     check_ws_token,
-    handle_control,
+    handle_control_sync,
     verify_api_key,
 )
 
 logger = logging.getLogger("event_gateway")
+
+
+def _run_control_sync(user_id: int, raw: str, subs: set) -> str | None:
+    """Sync control-frame handler (psycopg inside) — run in the executor so
+    DB dials never block the event loop."""
+    return handle_control_sync(user_id, raw, subs)
 app = FastAPI(title="Partner Event Gateway", version="1")
 
 _TERMINAL_OPS = ("job.scraper_ready", "job.failed")
@@ -42,11 +48,15 @@ async def health() -> dict:
 async def ws_jobs(ws: WebSocket, token: str = ""):
     """Auth order: subprotocol-carried API key, else single-use ?token=."""
     # X-API-Key via subprotocol (browsers can't set WS headers)
-    raw_key = ""
-    offered = ws.query_params.get("apikey") or ""
-    if offered:
-        raw_key = offered
-    user_id = verify_api_key(raw_key) if raw_key else check_ws_token(token)
+    import asyncio as _aio
+
+    raw_key = ws.query_params.get("apikey") or ""
+    loop = _aio.get_running_loop()
+    # psycopg is sync — never block the event loop with DB dials (a burst
+    # of handshakes + healthchecks once stalled the first ack >5s)
+    user_id = await loop.run_in_executor(
+        None, verify_api_key, raw_key
+    ) if raw_key else await loop.run_in_executor(None, check_ws_token, token)
     if user_id is None:
         await ws.close(code=4401, reason="unauthorized")
         return
@@ -58,7 +68,9 @@ async def ws_jobs(ws: WebSocket, token: str = ""):
     async def reader():
         while True:
             raw = await ws.receive_text()
-            out = await handle_control(user_id, raw, subs)
+            out = await _aio.get_running_loop().run_in_executor(
+                None, _run_control_sync, user_id, raw, subs
+            )
             if out is not None:
                 await ws.send_text(out)
                 state["last_send"] = time.monotonic()
