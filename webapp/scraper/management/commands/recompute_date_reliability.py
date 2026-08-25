@@ -1,0 +1,100 @@
+"""Repair JobListing date data corrupted by the a66e33f parse bug.
+
+From 2026-07-22 (a66e33f) until 2026-08-25 (31ae2f4), parse_posted_date
+was terminated early by a pasted-in function — every JobListing created
+in that window got posted_date=NULL + date_posted_reliable=False from
+assess_date_reliability's ("missing") arm, regardless of the real date.
+
+The raw date strings survive in extra_data.date_posted (the store node
+keeps unknown fields; date_posted is the most common site spelling that
+fell through to extra). This command re-derives posted_date + reliability
+for the suspect window using the FIXED parser + the original P0-13 rules
+(equals_scrape_date / future_dated stay unreliable-and-NULL).
+
+Dry-run by default (reports counts); --write applies.
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import os
+
+from django.core.management.base import BaseCommand
+from django.utils import timezone
+
+# a66e33f shipped 2026-07-22; 31ae2f4 (the fix) landed 2026-08-25.
+BROKEN_FROM = _dt.datetime(2026, 7, 22, tzinfo=_dt.timezone.utc)
+FIXED_AT = _dt.datetime(2026, 8, 26, tzinfo=_dt.timezone.utc)  # end of fix day, inclusive
+
+
+def _raw_dates(listing):
+    """Recover candidate raw date strings for a listing."""
+    extra = listing.extra_data or {}
+    cands = []
+    for key in ("date_posted", "posted_date", "postedDate", "datePosted"):
+        v = extra.get(key)
+        if isinstance(v, str) and v.strip():
+            cands.append(v.strip())
+    return cands
+
+
+class Command(BaseCommand):
+    help = "Recompute posted_date + date_posted_reliability for JobListings corrupted by the a66e33f parse bug."
+
+    def add_arguments(self, parser):
+        parser.add_argument("--write", action="store_true", help="apply (default: dry-run)")
+
+    def handle(self, *args, **options):
+        from scraper.models import JobListing
+        from src.job_fields import parse_posted_date
+
+        write = options["write"]
+        qs = JobListing.objects.filter(
+            scraped_at__gte=BROKEN_FROM,
+            scraped_at__lte=FIXED_AT,
+            date_posted_reliable=False,
+        )
+        would_fix = 0
+        unrecoverable = 0
+        still_unreliable = 0
+        batch = []
+        scanned = 0
+        for listing in qs.iterator(chunk_size=500):
+            scanned += 1
+            raws = _raw_dates(listing)
+            if not raws:
+                unrecoverable += 1
+                continue
+            parsed = None
+            for raw in raws:
+                parsed = parse_posted_date(raw)
+                if parsed is not None:
+                    break
+            if parsed is None:
+                # raw strings exist but none parse — leave as-is (missing)
+                unrecoverable += 1
+                continue
+            posted = parsed.date() if hasattr(parsed, "date") else parsed
+            # P0-13 rules, evaluated against the ORIGINAL scrape date (the
+            # day this row was first seen — scraped_at is first_seen_at)
+            scrape_day = (
+                listing.scraped_at.date()
+                if timezone.is_aware(listing.scraped_at)
+                else listing.scraped_at.date()
+            )
+            if posted == scrape_day:
+                still_unreliable += 1  # equals_scrape_date — rule, not bug
+                continue
+            if posted > scrape_day:
+                still_unreliable += 1  # future_dated — rule, not bug
+                continue
+            would_fix += 1
+            if write:
+                listing.posted_date = posted
+                listing.date_posted_reliable = True
+                listing.save(update_fields=["posted_date", "date_posted_reliable"])
+        mode = "APPLIED" if write else "DRY RUN (pass --write to apply)"
+        self.stdout.write(self.style.SUCCESS(f"recompute_date_reliability — {mode}"))
+        self.stdout.write(f"  scanned (broken window, reliable=False): {scanned}")
+        self.stdout.write(f"  would fix / fixed:                      {would_fix}")
+        self.stdout.write(f"  correctly-still-unreliable (P0-13):     {still_unreliable}")
+        self.stdout.write(f"  unrecoverable (no parsable raw date):   {unrecoverable}")
