@@ -1198,7 +1198,9 @@ def cleanup_stuck_jobs() -> None:
         if latest_activity_qs.exists():
             last_activity = latest_activity_qs.first().created_at
         else:
-            last_activity = job.started_at
+            # started_at can be None (shell-dispatched/test rows); created_at
+            # is always set — fall back rather than crash the watchdog
+            last_activity = job.started_at or job.created_at
 
         if last_activity >= threshold:
             continue

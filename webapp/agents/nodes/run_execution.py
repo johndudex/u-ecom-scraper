@@ -539,6 +539,7 @@ def run_execution(state: ScrapeState) -> dict:
         env_overrides=_stealth_env(state),
         listing_url_env=_listing_url_env,
         input_mode=input_mode,
+        target_fields=list(state.get("target_fields") or []),
     )
 
 
@@ -722,6 +723,7 @@ def _run_in_process(
     env_overrides: dict[str, str] | None = None,
     listing_url_env: str = "",
     input_mode: str = "",
+    target_fields: list[str] | None = None,
 ) -> dict[str, Any]:
     cmd = ["python3", scraper_path] + args
     start = time.time()
@@ -846,7 +848,7 @@ def _run_in_process(
         # F9 quality gate (nav modes): collapse-level failure rates -> FAILED
         _q = _extraction_quality_gate(
             output_file, input_mode, product_count,
-            target_fields=list(state.get("target_fields") or []),
+            target_fields=target_fields,
         )
         if _q:
             return {
