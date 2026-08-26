@@ -156,5 +156,20 @@ class TestConnectRecipe:
         assert rc["step2"].count("300") >= 1  # TTL stated
 
 
+class TestSuperuserMessage:
+    def test_refusal_explains_the_path(self, db):
+        from scraper.api import tokens
+
+        su = User.objects.create_user("_tm_su2", password="x", is_superuser=True)
+        req = _req(su)
+        req.user = su
+        r = tokens.token_list(req)
+        body = json.loads(r.content)
+        assert body.get("operator_hint") is True
+        assert "Add" in body["message"] and "non-admin" in body["message"] or "normal" in body["message"]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+

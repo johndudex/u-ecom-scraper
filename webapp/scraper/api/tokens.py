@@ -33,7 +33,15 @@ def _ajax(user_fn):
             return JsonResponse({"error": "login required"}, status=302)
         if request.user.is_superuser:
             return JsonResponse(
-                {"code": "forbidden", "message": "Superuser accounts may not hold API keys."},
+                {"code": "forbidden",
+                 "message": (
+                     "Admin accounts can't hold API keys — a superuser key "
+                     "would bypass every tenant boundary. Create a normal "
+                     "(non-admin) user for API access: Admin → Users → Add "
+                     "User (leave both staff and superuser unchecked), log "
+                     "in as that user, then generate keys here."
+                 ),
+                 "operator_hint": True},
                 status=403,
             )
         if request.headers.get("x-requested-with") != "XMLHttpRequest":

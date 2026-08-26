@@ -2381,7 +2381,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       <button class="btn btn-ghost btn-sm" id="tokens-close" type="button" aria-label="Close">✕</button>
     </div>
 
-    <div id="tokens-error" class="url-error hidden"></div>
+    <div id="tokens-error" class="url-error hidden" style="white-space:pre-wrap;"></div>
 
     <div id="tokens-list-block">
       <p style="margin:0 0 8px 0;font-size:13px;color:var(--muted,#8b93a7);">Your active API keys (max <span id="tokens-max">3</span>). The full key is only shown once, at creation.</p>
@@ -2560,6 +2560,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
   function open(){
     modal.classList.remove('hidden');
     X('#tokens-new-block').classList.add('hidden');
+    X('#tokens-list-block').classList.remove('hidden');
     refresh();
   }
   function close(){ modal.classList.add('hidden'); }
@@ -2574,7 +2575,11 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       headers: {'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': window.INTAKE_CONFIG.csrfToken}
     }).then(function(r){ return r.json().then(function(j){ return {s: r.status, j: j}; }); })
       .then(function(res){
-        if(res.s !== 200){ showErr((res.j && res.j.message) || 'Could not load keys.'); return; }
+        if(res.s !== 200){
+          showErr((res.j && res.j.message) || 'Could not load keys.');
+          if(res.j && res.j.operator_hint){ X('#tokens-list-block').classList.add('hidden'); }
+          return;
+        }
         render(res.j);
       }).catch(function(){ showErr('Network error loading keys.'); });
   }
