@@ -844,7 +844,10 @@ def _run_in_process(
         product_count = _count_products(output_file)
         discovery_coverage = _read_discovery_coverage(output_file)
         # F9 quality gate (nav modes): collapse-level failure rates -> FAILED
-        _q = _extraction_quality_gate(output_file, input_mode, product_count)
+        _q = _extraction_quality_gate(
+            output_file, input_mode, product_count,
+            target_fields=list(state.get("target_fields") or []),
+        )
         if _q:
             return {
                 "execution_status": "FAILED",
@@ -1001,7 +1004,8 @@ def _run_via_browser_service(
         discovery_coverage = _read_discovery_coverage(output_file) if output_file else {}
         # F9 quality gate (nav modes): collapse-level failure rates -> FAILED
         _q = _extraction_quality_gate(
-            output_file, state.get("input_mode", ""), result.get("product_count", 0)
+            output_file, state.get("input_mode", ""), result.get("product_count", 0),
+            target_fields=list(state.get("target_fields") or []),
         )
         if _q:
             return {
@@ -1044,7 +1048,7 @@ def _run_via_browser_service(
                 pass
 
 
-def _substantive_item_count(path: str) -> int:
+def _substantive_item_count(path: str, fields: list[str] | None = None) -> int:
     """F8/F16/F9 helper: items with >=1 content-type core field (0 on any error).
 
     Same predicate family as route_after_testing's F15 fix — an output whose
@@ -1060,19 +1064,23 @@ def _substantive_item_count(path: str) -> int:
             data = json.load(fh)
         if not isinstance(data, dict):
             return 0
-        fields: list[str] = []
-        try:
-            from src.content_types import output_filter_fields
+        if fields:
+            use_fields = list(fields)
+        else:
+            try:
+                from src.content_types import output_filter_fields
 
-            fields = output_filter_fields("") or []
-        except Exception:
-            fields = []
-        if not fields:
-            fields = [
-                "price", "availability", "currency",
-                "author", "publish_date", "company", "location",
-                "content", "snippet", "rank", "posts",
-            ]
+                use_fields = output_filter_fields("") or []
+            except Exception:
+                use_fields = []
+            if not use_fields:
+                use_fields = [
+                    "price", "availability", "currency",
+                    "author", "publish_date", "company", "location",
+                    "content", "snippet", "rank", "posts",
+                    "current_price", "previous_price", "list_price",
+                    "sale_price", "was_price", "regular_price",
+                ]
         count = 0
         for key in ("products", "jobs", "articles", "results", "items", "threads", "pages"):
             val = data.get(key)
@@ -1080,7 +1088,7 @@ def _substantive_item_count(path: str) -> int:
                 for item in val:
                     if not isinstance(item, dict):
                         continue
-                    if any(item.get(f) for f in fields):
+                    if any(item.get(f) for f in use_fields):
                         count += 1
                 break
         return count
@@ -1089,7 +1097,8 @@ def _substantive_item_count(path: str) -> int:
 
 
 def _extraction_quality_gate(
-    output_file: str, input_mode: str, product_count: int
+    output_file: str, input_mode: str, product_count: int,
+    target_fields: list[str] | None = None,
 ) -> str:
     """F9: fail nav-mode executions whose output is overwhelmingly empty.
 
@@ -1098,7 +1107,10 @@ def _extraction_quality_gate(
     rows with zero core fields. url_list jobs are out of scope (their seeds
     are user-provided; a wholesale seed failure is code_tester's signal).
 
-    good = items with >=1 core field (same predicate family as F15/F16).
+    good = items with >=1 core field — where "core" is the JOB'S REQUESTED
+    fields when the user asked for a custom set (a request for
+    {current_price, ratings} must be judged on those, not on the registry
+    default), falling back to the content-type/alias core list otherwise.
     bad  = failed_products + core-less items. Denominator is PROCESSED
     (good+bad), never total_discovered — limit-truncated runs must not
     false-positive (a --limit 5 run of a healthy site processes 5, fails 0).
@@ -1109,7 +1121,10 @@ def _extraction_quality_gate(
     if input_mode not in ("navigation", "list_page", "search_term"):
         return ""
     try:
-        good = _substantive_item_count(output_file) if output_file else 0
+        # The user's requested set IS the contract when present (job-9: a
+        # request for {current_price, ratings...} must be judged on those).
+        good_fields = list(target_fields) if target_fields else None
+        good = _substantive_item_count(output_file, good_fields) if output_file else 0
         failed = 0
         with open(output_file, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -1125,8 +1140,13 @@ def _extraction_quality_gate(
                         "threads", "pages"):
                 val = data.get(key)
                 if isinstance(val, list):
+                    def _good(it):
+                        if good_fields:
+                            return any(it.get(f) for f in good_fields)
+                        return _item_has_core_field(it)
+
                     coreless = sum(1 for it in val if isinstance(it, dict)
-                                   and not _item_has_core_field(it))
+                                   and not _good(it))
                     bad = failed + coreless
                     processed = good + bad
                     if processed >= 5 and bad / processed >= 0.8:
@@ -1189,12 +1209,29 @@ def _item_has_core_field(item: dict) -> bool:
     except Exception:
         fields = []
     if not fields:
+        # inlined (not the module global): these functions are exec-extracted
+        # into bare namespaces by test_f8_f16 — module globals aren't there
         fields = [
             "price", "availability", "currency",
             "author", "publish_date", "company", "location",
             "content", "snippet", "rank", "posts",
+            "current_price", "previous_price", "list_price",
+            "sale_price", "was_price", "regular_price",
         ]
     return any(item.get(f) for f in fields)
+
+
+# Price aliases generated scrapers legitimately emit (job-9 Priceline:
+# current_price was requested INSTEAD of price — a perfect extraction was
+# failed by the gate because 'current_price' didn't string-match 'price').
+_PRICE_ALIASES = ("price", "current_price", "previous_price", "list_price",
+                  "sale_price", "was_price", "regular_price")
+# The no-registry fallback list (was inline in _item_has_core_field).
+_FALLBACK_CORE_FIELDS = [
+    "price", "availability", "currency",
+    "author", "publish_date", "company", "location",
+    "content", "snippet", "rank", "posts",
+] + list(_PRICE_ALIASES[1:])
 
 
 def _find_newest_output(
