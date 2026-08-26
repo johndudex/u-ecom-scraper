@@ -447,10 +447,13 @@ class ApiKey(models.Model):
     so authentication never depends on the prefix.
     """
 
-    user = models.OneToOneField(
+    # FK (not OneToOne): users may hold multiple keys (max enforced at the
+    # API layer: MAX_ACTIVE_KEYS) — rotation overlaps + separate keys per
+    # integration. Reverse access is user.api_keys (plural).
+    user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
-        related_name="api_key",
+        related_name="api_keys",
     )
     prefix = models.CharField(max_length=8, db_index=True)
     key_hash = models.CharField(max_length=64, unique=True)

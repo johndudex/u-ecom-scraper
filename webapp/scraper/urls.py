@@ -1,6 +1,7 @@
 from django.urls import path
 
 from . import views
+from .api import tokens as api_tokens
 
 urlpatterns = [
     path("", views.home, name="home"),
@@ -118,6 +119,9 @@ urlpatterns = [
     path("intake/discover-fields/", views.intake_discover_fields, name="intake_discover_fields"),
     path("intake/create-job/", views.intake_create_job, name="intake_create_job"),
     path("intake/jobs/", views.intake_jobs, name="intake_jobs"),
+    path("intake/tokens/", api_tokens.token_list, name="intake_token_list"),
+    path("intake/tokens/create/", api_tokens.token_create, name="intake_token_create"),
+    path("intake/tokens/<int:key_id>/revoke/", api_tokens.token_revoke, name="intake_token_revoke"),
 ]
 
 # Partner API v1 (docs/specs/sync_api.yaml) — own sub-app, X-API-Key auth

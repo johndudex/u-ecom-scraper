@@ -376,6 +376,8 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     validateSchemaUrl: "{% url 'intake_validate_schema' %}",
     discoverFieldsUrl: "{% url 'intake_discover_fields' %}",
     jobsLibraryUrl: "{% url 'intake_jobs' %}",
+    tokenListUrl: "{% url 'intake_token_list' %}",
+    tokenCreateUrl: "{% url 'intake_token_create' %}",
   };
 </script>
 </head>
@@ -400,6 +402,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     </div>
     <div style="display:flex; gap:10px; align-items:center;">
       <button class="btn btn-ghost btn-sm" id="topbar-saved-link" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg> Jobs &amp; Saved</button>
+      <button class="btn btn-ghost btn-sm" id="api-tokens-btn" type="button" title="API keys &amp; streaming tokens"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px;"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>API</button>
       <button class="btn btn-primary btn-sm" id="restart" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg> New extraction</button>
     </div>
   </div>
@@ -2370,6 +2373,44 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
 })();
 </script>
 
+<!-- API Tokens modal -->
+<div class="modal-overlay hidden" id="tokens-modal" role="dialog" aria-modal="true">
+  <div class="panel modal-panel" id="tokens-modal-card" style="max-width:560px;">
+    <div class="modal-head">
+      <h3>API keys &amp; streaming tokens</h3>
+      <button class="btn btn-ghost btn-sm" id="tokens-close" type="button" aria-label="Close">✕</button>
+    </div>
+
+    <div id="tokens-error" class="url-error hidden"></div>
+
+    <div id="tokens-list-block">
+      <p style="margin:0 0 8px 0;font-size:13px;color:var(--muted,#8b93a7);">Your active API keys (max <span id="tokens-max">3</span>). The full key is only shown once, at creation.</p>
+      <div id="tokens-list"></div>
+      <button class="btn btn-primary btn-sm" id="tokens-generate" type="button" style="margin-top:10px;">Generate new key</button>
+    </div>
+
+    <div id="tokens-new-block" class="hidden" style="margin-top:12px;padding:12px;background:var(--panel-2,#111726);border:1px solid var(--line,#232b3f);border-radius:6px;">
+      <p style="margin:0 0 8px 0;font-size:13px;"><strong>Copy this key now</strong> — it is shown once and cannot be recovered:</p>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <code id="tokens-new-key" style="flex:1;padding:8px 10px;background:#0b0e17;border-radius:4px;font-size:12px;word-break:break-all;"></code>
+        <button class="btn btn-ghost btn-sm" id="tokens-copy" type="button">Copy</button>
+      </div>
+    </div>
+
+    <div style="margin-top:16px;border-top:1px solid var(--line,#232b3f);padding-top:12px;">
+      <p style="margin:0 0 6px 0;font-size:13px;font-weight:600;">Connecting (REST · WebSocket · SSE)</p>
+      <div style="font-size:12.5px;line-height:1.6;color:var(--muted,#8b93a7);">
+        <p style="margin:2px 0;"><strong>REST:</strong> send <code>X-API-Key: &lt;key&gt;</code> on every <code>/api/v1/*</code> request.</p>
+        <p style="margin:2px 0;"><strong>WebSocket (temp token):</strong> browsers cannot set WS headers, so mint a 5-minute single-use token first:</p>
+        <pre id="tokens-wss-step1" style="margin:4px 0;padding:8px;background:#0b0e17;border-radius:4px;font-size:11.5px;white-space:pre-wrap;"></pre>
+        <pre id="tokens-wss-step2" style="margin:4px 0;padding:8px;background:#0b0e17;border-radius:4px;font-size:11.5px;white-space:pre-wrap;"></pre>
+        <p style="margin:6px 0 2px 0;"><strong>SSE (temp token):</strong> same mint, then <code>GET /api/v1/jobs/{job_id}/events?token=…</code></p>
+      </div>
+      <p style="margin:8px 0 0 0;font-size:12px;color:var(--muted,#8b93a7);">Full reference: <a href="/docs/sync_api" style="color:var(--accent,#22d3ee);">REST spec</a> · <a href="/docs/async_api" style="color:var(--accent,#22d3ee);">events spec</a></p>
+    </div>
+  </div>
+</div>
+
 <!-- Discover Fields modal -->
 <div class="modal-overlay hidden" id="discover-modal" role="dialog" aria-modal="true">
   <div class="panel modal-panel" id="discover-modal-card">
@@ -2499,6 +2540,107 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     var ta = X('#schema-json-input'); if(ta) ta.value = text;
     if(window.validateSchemaText) validateSchemaText(text, '');
     closeDiscoverModal();
+  });
+})();
+</script>
+<script>
+/* ---------- API Tokens modal (intake header "API" button) ---------- */
+(function(){
+  var X = function(sel){ return document.querySelector(sel); };
+  var btn = X('#api-tokens-btn');
+  if(!btn) return;
+  var modal = X('#tokens-modal');
+  var listEl = X('#tokens-list');
+  var errEl = X('#tokens-error');
+
+  function showErr(msg){
+    errEl.textContent = msg || '';
+    errEl.classList.toggle('hidden', !msg);
+  }
+  function open(){
+    modal.classList.remove('hidden');
+    X('#tokens-new-block').classList.add('hidden');
+    refresh();
+  }
+  function close(){ modal.classList.add('hidden'); }
+  btn.addEventListener('click', open);
+  X('#tokens-close').addEventListener('click', close);
+  modal.addEventListener('click', function(e){ if(e.target === modal) close(); });
+  document.addEventListener('keydown', function(e){ if(e.key === 'Escape' && !modal.classList.contains('hidden')) close(); });
+
+  function refresh(){
+    showErr('');
+    fetch(window.INTAKE_CONFIG.tokenListUrl, {
+      headers: {'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': window.INTAKE_CONFIG.csrfToken}
+    }).then(function(r){ return r.json().then(function(j){ return {s: r.status, j: j}; }); })
+      .then(function(res){
+        if(res.s !== 200){ showErr((res.j && res.j.message) || 'Could not load keys.'); return; }
+        render(res.j);
+      }).catch(function(){ showErr('Network error loading keys.'); });
+  }
+
+  function render(data){
+    X('#tokens-max').textContent = data.max_active;
+    listEl.innerHTML = '';
+    (data.keys || []).forEach(function(k){
+      var row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line,#232b3f);border-radius:6px;margin-bottom:6px;';
+      var created = k.created_at ? new Date(k.created_at).toLocaleDateString() : '';
+      var used = k.last_used_at ? (' · last used ' + new Date(k.last_used_at).toLocaleDateString()) : ' · never used';
+      row.innerHTML = '<code style="flex:1;font-size:12.5px;">' + k.blurred + '</code>' +
+        '<span style="font-size:11.5px;color:var(--muted,#8b93a7);">created ' + created + used + '</span>' +
+        '<button class="btn btn-ghost btn-sm tokens-revoke" data-id="' + k.id + '" type="button" style="color:#f87171;">Revoke</button>';
+      listEl.appendChild(row);
+    });
+    if(!(data.keys || []).length){
+      listEl.innerHTML = '<p style="margin:4px 0;font-size:12.5px;color:var(--muted,#8b93a7);">No active keys.</p>';
+    }
+    var gen = X('#tokens-generate');
+    gen.disabled = (data.keys || []).length >= data.max_active;
+    gen.title = gen.disabled ? 'Maximum ' + data.max_active + ' active keys — revoke one first' : '';
+
+    var c = (data.connect || {});
+    X('#tokens-wss-step1').textContent = '1 · ' + ((c.wss || {}).step1 || '');
+    X('#tokens-wss-step2').textContent = '2 · ' + ((c.wss || {}).step2 || '');
+  }
+
+  listEl.addEventListener('click', function(e){
+    var b = e.target.closest('.tokens-revoke');
+    if(!b) return;
+    if(!window.confirm('Revoke this key? Clients using it will stop working immediately.')) return;
+    fetch(window.INTAKE_CONFIG.tokenListUrl.replace(/\/$/, '') + '/' + b.dataset.id + '/revoke/', {
+      method: 'POST',
+      headers: {'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': window.INTAKE_CONFIG.csrfToken}
+    }).then(function(r){ return r.json().then(function(j){ return {s: r.status, j: j}; }); })
+      .then(function(res){
+        if(res.s !== 200){ showErr((res.j && res.j.message) || 'Revoke failed.'); return; }
+        refresh();
+      }).catch(function(){ showErr('Network error revoking.'); });
+  });
+
+  X('#tokens-generate').addEventListener('click', function(){
+    showErr('');
+    fetch(window.INTAKE_CONFIG.tokenCreateUrl, {
+      method: 'POST',
+      headers: {'X-Requested-With': 'XMLHttpRequest', 'X-CSRFToken': window.INTAKE_CONFIG.csrfToken, 'Content-Type': 'application/json'},
+      body: '{}'
+    }).then(function(r){ return r.json().then(function(j){ return {s: r.status, j: j}; }); })
+      .then(function(res){
+        if(res.s !== 201){ showErr((res.j && res.j.message) || 'Could not create key.'); return; }
+        X('#tokens-new-key').textContent = res.j.raw_key;
+        X('#tokens-new-block').classList.remove('hidden');
+        refresh();
+      }).catch(function(){ showErr('Network error creating key.'); });
+  });
+
+  X('#tokens-copy').addEventListener('click', function(){
+    var t = X('#tokens-new-key').textContent;
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(t).then(function(){
+        X('#tokens-copy').textContent = 'Copied';
+        setTimeout(function(){ X('#tokens-copy').textContent = 'Copy'; }, 1500);
+      });
+    }
   });
 })();
 </script>

@@ -22,7 +22,11 @@ from django.utils import timezone
 
 # a66e33f shipped 2026-07-22; 31ae2f4 (the fix) landed 2026-08-25.
 BROKEN_FROM = _dt.datetime(2026, 7, 22, tzinfo=_dt.timezone.utc)
-FIXED_AT = _dt.datetime(2026, 8, 26, tzinfo=_dt.timezone.utc)  # end of fix day, inclusive
+# End of the broken window. The fix (31ae2f4) landed 2026-08-25; anything
+# still reliable=False AFTER this instant is post-fix data (or a genuinely
+# unreliable date per P0-13) and must not be touched. End-of-day inclusive
+# covers timezone skew; rows created after it are excluded.
+FIXED_AT = _dt.datetime(2026, 8, 27, tzinfo=_dt.timezone.utc)  # fix-day end, inclusive
 
 
 def _raw_dates(listing):
