@@ -2152,6 +2152,36 @@ def build_code_writer_message(state: dict) -> list:
     product_url = state.get("product_url") or state.get("sample_url") or ""
     site_analysis = state.get("site_analysis") or {}
     scraper_analysis = state.get("scraper_analysis") or {}
+
+    # Prior-art count (job-10 lesson, ~40 tokens — NOT the scraper file): a
+    # previous run on this site already established a discovery baseline. The
+    # writer gets the number as context; code_tester's count-regression check
+    # (below) enforces it as a band, scope-matched.
+    _prior_count_line = ""
+    try:
+        from scraper.models import ScrapeJob as _SJ
+
+        _prior = (
+            _SJ.objects.filter(
+                site_folder__contains=slug, status=_SJ.STATUS_COMPLETED,
+                product_count__gt=0,
+            )
+            .exclude(pk=state.get("job_id") or 0)
+            .order_by("-product_count")
+            .values_list("product_count", flat=True)
+            .first()
+        )
+        if _prior:
+            _prior_count_line = (
+                f"\n### Prior run on this site\nA previous completed run extracted "
+                f"**{_prior} items**. Your scraper should discover and extract a "
+                f"catalog of that order of magnitude (unless this run's scope "
+                f"deliberately narrows it — --limit/--sample). If your design "
+                f"naturally yields far fewer, you have missed pagination or "
+                f"categories.\n"
+            )
+    except Exception:
+        pass
     mechanism = scraper_analysis.get("strategy") or site_analysis.get(
         "scraping_mechanism", ""
     )
@@ -2746,6 +2776,23 @@ def build_code_writer_message(state: dict) -> list:
                     "`LocationDistance`).\n"
                 )
             api_section += (
+                "\n**CATALOG COVERAGE (HARD RULE — applies to API loops too):**\n"
+                "A single endpoint's first page is NOT the catalog. Enumerate EVERYTHING:\n"
+                "- If the API paginates (page/offset/cursor params in the captured URL or "
+                "response): LOOP until exhausted — keep fetching while the response returns "
+                "new items; stop only on an empty page or a repeated set. Record how many "
+                "pages you fetched and how many unique items total in the output metadata "
+                "(`metadata.pages_fetched`, `metadata.total_discovered`).\n"
+                "- If the API has category/search variants: enumerate the categories FIRST "
+                "(one request each) and aggregate — a single-category pull is an incomplete "
+                "run. Use the category taxonomy from navigation_analysis when present.\n"
+                "- If genuinely only ONE call exists (a config-like response with a fixed "
+                "array), say so in a code comment — but VERIFY by trying ?page=2 and a "
+                "category param before concluding that.\n"
+                "- **src_url discipline:** every record's `src_url` must be the LISTING or "
+                "SEARCH URL the item was discovered from (or the API query URL that returned "
+                "it) — NOT the record's own detail URL and NOT the API endpoint host root. "
+                "Partners use src_url to reconstruct discovery provenance.\n"
                 "\n**Output:** write the filtered list to `output_{datetime}.json`.\n"
             )
             # The API loop replaces the browser navigation template.
@@ -3165,9 +3212,10 @@ def build_code_writer_message(state: dict) -> list:
         )
     except Exception:
         _cw_allowed = None
-    pa_summary = _summarize_product_analysis(
-        state.get("product_analysis") or {}, allowed=_cw_allowed
-    )
+    _pa_raw = state.get("product_analysis") or {}
+    if _prior_count_line:
+        content = content + _prior_count_line
+    pa_summary = _summarize_product_analysis(_pa_raw, allowed=_cw_allowed)
     if pa_summary:
         pa_summary += (
             "\n### DO NOT read_file the analysis JSONs\n"
@@ -3177,6 +3225,21 @@ def build_code_writer_message(state: dict) -> list:
                 "down. The template (templates/*.py) is the only file you need to read.\n"
             )
         content = content + pa_summary
+    elif _pa_raw:
+        # Non-empty analysis the summarizer couldn't render (unknown shape or
+        # partially-salvaged after corruption — job 10 lesson): say so LOUDLY.
+        # Silent "" removed both the field map AND this verify instruction.
+        content += (
+            "\n### PRODUCT ANALYSIS PRESENT BUT UNREADABLE — VERIFY, DON'T GUESS\n"
+            "The product_analysis for this site could not be summarized (unknown or "
+            "damaged shape). You have NO reliable field-extraction map. Before writing "
+            "extraction code, run the page's real network/API behavior yourself "
+            "(run_scraper on a --sample, or inspect the page via the browser tool), "
+            "confirm each requested field's actual source, and prefer whatever the "
+            "site's live data shows over any single page's embedded markup. If the "
+            "site has a backend products API, FIND IT (check XHR/fetch in the browser) "
+            "— do not conclude 'there is no API' from one page's HTML alone.\n"
+        )
     _user_req = _user_requirements_section(state)
     if _user_req:
         content = _user_req + content

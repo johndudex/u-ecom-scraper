@@ -120,6 +120,11 @@ _PATCHES_ENABLED = True
 
 
 def _fix_json_artifact(slug: str, filename: str) -> None:
+    """Repair-on-write guard (job-10 lesson): a corrupt artifact silently
+    became {} downstream and the writer lost the field map AND the verify
+    note. Repair passes: bad-escape rewrite, then salvage of the largest
+    parseable object. Still-failing files are RENAMED *.corrupt so
+    downstream sees missing (-> rerun path), never silently-empty."""
     if not slug:
         return
     try:
@@ -133,20 +138,60 @@ def _fix_json_artifact(slug: str, filename: str) -> None:
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
         json.loads(content)
+        return  # valid as-is
     except json.JSONDecodeError:
-        try:
-            fixed = re.sub(r'(?<=[^\\])\\(?!["\\/bfnrtu])', r"\\\\", content)
+        pass
+    # pass 1: bad escapes
+    try:
+        fixed = re.sub(r'(?<=[^\\])\\(?!["\\/bfnrtu])', r"\\\\", content)
+        json.loads(fixed)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(fixed)
+        logger.info("_fix_json_artifact: fixed bad escapes in %s", path)
+        return
+    except Exception:
+        pass
+    # pass 2: salvage the largest parseable leading object (keys after the
+    # corruption are lost; everything before is real analysis data)
+    try:
+        dec = json.JSONDecoder()
+        obj, _end = dec.raw_decode(content)
+        if isinstance(obj, dict) and obj:
             with open(path, "w", encoding="utf-8") as f:
-                f.write(fixed)
-            json.loads(fixed)
-            logger.info("_fix_json_artifact: fixed bad escapes in %s", path)
-        except Exception as exc:
-            logger.warning("_fix_json_artifact: could not fix %s: %s", path, exc)
-
-
-
-
-
+                json.dump(obj, f, indent=1)
+            logger.warning(
+                "_fix_json_artifact: salvaged truncated object in %s (valid prefix kept)",
+                path,
+            )
+            return
+    except Exception:
+        pass
+    # pass 3: trim trailing partial content, re-close braces
+    try:
+        step = max(1, len(content) // 200)
+        for cut in range(len(content) - 1, 0, -step):
+            head = content[:cut].rstrip().rstrip(",")
+            for closer in ("}", "]}"):
+                try:
+                    obj = json.loads(head + closer)
+                    if isinstance(obj, dict) and obj:
+                        with open(path, "w", encoding="utf-8") as f:
+                            json.dump(obj, f, indent=1)
+                        logger.warning("_fix_json_artifact: salvaged %s by truncation", path)
+                        return
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    # unrepairable: rename so downstream treats as MISSING (rerun path)
+    try:
+        os.replace(path, path + ".corrupt")
+        logger.error(
+            "_fix_json_artifact: %s unrepairable — renamed .corrupt "
+            "(downstream treats as missing)", path,
+        )
+    except OSError:
+        pass
 
 
 def _enforce_anti_bot_strategy(analysis: dict, slug: str, filename: str) -> dict:
@@ -256,16 +301,26 @@ def _patch_scraper_output_filter(
             else:
                 cond = "p.get('title')"
                 label = "title"
+        # The injected block resolves the output key ITSELF: 5 of 9 template
+        # families never define OUTPUT_KEY, and the old injected reference
+        # NameError'd into the bare except → the filter silently no-oped
+        # (job 10's exact blank-row mechanism). Resolution order: the
+        # template's OUTPUT_KEY if defined, else the first list-of-dicts
+        # value in `output` (the actual item array, whatever it's called).
         filter_code = (
             "# _OUTPUT_FILTER_APPLIED — drop non-item pages (content-type aware)\n"
             f"_FILTER_FIELDS = {fields!r}\n"
             "try:\n"
-            "    _before = len(output.get(OUTPUT_KEY, []))\n"
-            f"    output[OUTPUT_KEY] = [p for p in output.get(OUTPUT_KEY, []) if {cond}]\n"
-            "    _after = len(output[OUTPUT_KEY])\n"
-            "    if _before != _after:\n"
-            f"        logger.info('output filter: %d → %d items (removed %d without {label})',\n"
-            "                     _before, _after, _before - _after)\n"
+            "    _OUTPUT_KEY = OUTPUT_KEY if 'OUTPUT_KEY' in dir() else next(\n"
+            "        (k for k, v in output.items() if isinstance(v, list)\n"
+            "         and v and isinstance(v[0], dict)), None)\n"
+            "    if _OUTPUT_KEY:\n"
+            "        _before = len(output[_OUTPUT_KEY])\n"
+            f"        output[_OUTPUT_KEY] = [p for p in output[_OUTPUT_KEY] if {cond}]\n"
+            "        _after = len(output[_OUTPUT_KEY])\n"
+            "        if _before != _after:\n"
+            f"            logger.info('output filter: %d → %d items (removed %d without {label})',\n"
+            "                         _before, _after, _before - _after)\n"
             "except Exception:\n"
             "    pass\n"
             "\n"
@@ -4073,6 +4128,31 @@ def _persist_agent_logs(
     messages = result.get("messages", [])
     if not messages:
         return
+
+    # Observability (job 9-vs-10 lesson): persist the RESOLVED model per invoke
+    # so "did two runs use the same model?" is answerable from the DB. One row.
+    try:
+        _model_used = getattr(result, "model_used", None) or ""
+        if not _model_used:
+            # langchain result metadata may carry it per-message
+            for _m in messages:
+                _meta = getattr(_m, "response_metadata", None) or {}
+                _model_used = _meta.get("model_name") or _model_used
+                if _model_used:
+                    break
+        if _model_used:
+            from scraper.models import SessionLog as _SL
+
+            _seq = _SL.objects.filter(job_id=job_id).count()
+            _SL.objects.create(
+                job_id=job_id,
+                role=_SL.ROLE_SYSTEM,
+                agent=agent_name,
+                content=f"[MODEL] {_model_used}",
+                seq=_seq,
+            )
+    except Exception:
+        pass
 
     try:
         from scraper.models import SessionLog, ToolCallLog

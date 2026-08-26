@@ -449,6 +449,49 @@ def route_after_testing(state: ScrapeState) -> str:
             missing_core,
         )
 
+    # Count-regression band (job-10 lesson: 3,616 → 68 undetected). Compare
+    # the tester's extracted count against the best prior COMPLETED run on
+    # this site — scope-matched (skipped when this run narrows: --limit/
+    # --sample/scope=firstn) and banded (never a bare percentage), because
+    # the tester's own --sample legitimately extracts 5 against a 3,616
+    # baseline. Only a full-scope test run extracting a tiny fraction of the
+    # prior catalog is a discovery-regression signal.
+    _count_regression = None
+    try:
+        _slug_cr = (state.get("site_slug") or "").strip()
+        _scope_cr = (state.get("scope") or "").strip().lower()
+        _narrowed = _scope_cr in ("firstn", "filter") or bool(
+            (state.get("scope_value") or "").strip()
+            and _scope_cr == "firstn"
+        )
+        if _slug_cr and not _narrowed:
+            from scraper.models import ScrapeJob as _SJ
+
+            _prior_n = (
+                _SJ.objects.filter(
+                    site_folder__contains=_slug_cr, status=_SJ.STATUS_COMPLETED,
+                    product_count__gt=0,
+                )
+                .exclude(pk=state.get("job_id") or 0)
+                .order_by("-product_count")
+                .values_list("product_count", flat=True)
+                .first()
+            )
+            if _prior_n and _prior_n >= 20:
+                _tested_n = int(
+                    (report.get("results") or {}).get("successful_extractions") or 0
+                )
+                # tester --sample caps at 5; only compare when the tester ran
+                # beyond sample size (a real mini-run) AND it's far below prior
+                if _tested_n > 5 and _tested_n < (_prior_n * 0.10):
+                    _count_regression = (
+                        f"discovery regression: extracted {_tested_n} vs prior "
+                        f"completed run's {_prior_n} on this site (<10%) — "
+                        "pagination or category enumeration is likely missing"
+                    )
+    except Exception:
+        pass
+
     # Discovery-coverage signal: computed once, used to (a) downgrade a
     # field-PASS, (b) bypass the ground-truth override, and (c) exempt the cascade
     # from the anti-bot downgrade. None ⇒ no coverage problem (gate is a no-op).
@@ -489,6 +532,7 @@ def route_after_testing(state: ScrapeState) -> str:
         and confidence >= MIN_CONFIDENCE_PASS
         and not high_severity
         and not _contract_bad
+        and not _count_regression
     ):
         # Phase-coverage gate (deterministic backstop): for two-phase
         # navigation scrapers, a PASS is only valid if Phase 1 discovery was
@@ -543,6 +587,7 @@ def route_after_testing(state: ScrapeState) -> str:
         not _cov_reason
         and not missing_core
         and not _contract_bad
+        and not _count_regression
         and _scraper_has_real_items(state, min_count=3)
     ):
         logger.info(
@@ -550,6 +595,19 @@ def route_after_testing(state: ScrapeState) -> str:
             "items (overriding code_tester's high_severity flags)"
         )
         return "field_confirmation"
+
+    # Count-regression bounce (bounded, same shape as the contract bounce):
+    # a big discovery drop vs the site's prior run is a precisely-known fix
+    # (pagination/categories), not a strategy question.
+    if _count_regression:
+        _retry_cr = int(state.get("test_retry_count", 0) or 0)
+        if _retry_cr >= MAX_TEST_RETRIES or is_final_attempt:
+            logger.error(
+                "route_after_testing: %s — retries exhausted, proceeding", _count_regression
+            )
+        else:
+            logger.warning("route_after_testing: %s — bouncing to code_writer", _count_regression)
+            return "scraper_analyzer"
 
     # L2 CLI-contract bounce (before the strategy cascade — a contract violation
     # is a precisely-known fix, not a strategy question; classify_test_failure

@@ -922,7 +922,51 @@ _TELEMETRY_RE = re.compile(
     re.I,
 )
 _API_HINT_TOKENS_NET = ("search", "product", "job", "listing", "feed", "graphql",
-                        "/api/", "catalog", "items", "results")
+                        "catalog", "items", "results")
+# NON-data paths that token-match by accident (job 10: 'product' substring-
+# matched 'production' in a ketchcdn CONSENT CONFIG url, which then asserted
+# data_source:api and deleted the pagination guidance). Word-boundary/path-
+# segment matching handles most; these shapes are rejected outright.
+_NON_DATA_PATH_RE = re.compile(
+    r"/config(\.|/|$)|/consent|\.config\.json|/settings|/preferences|"
+    r"/translations?/|/i18n|\.min\.json|/manifest",
+    re.I,
+)
+
+
+def url_looks_like_data_api(url: str) -> bool:
+    """Word-boundary / path-segment API test (generic).
+
+    Substring matching ('product' in 'production/config.json') let consent and
+    config URLs through (ketch, doubleclick conversion configs). This requires
+    tokens to appear as path SEGMENTS or query-ish whole words, always admits
+    explicit /api/ paths, and rejects config/consent/manifest shapes outright.
+    Cross-DOMAIN is deliberately NOT rejected — real catalog APIs legitimately
+    live on vendor domains (api.amnhealthcare.io, *.algolia.net).
+    """
+    if not url:
+        return False
+    base = url.split("?")[0]
+    if _NON_DATA_PATH_RE.search(base):
+        return False
+    lowered = base.lower()
+    if "/api/" in lowered or lowered.endswith("/api"):
+        return True
+    # tokenize path into segments; match tokens as whole segments or
+    # hyphen/underscore-delimited sub-words WITHIN a segment
+    from urllib.parse import urlparse
+
+    path = urlparse(base).path or "/"
+    segments = [seg for seg in re.split(r"[/_.-]+", path) if seg]
+    seg_set = set(segments)
+    for tok in _API_HINT_TOKENS_NET:
+        if tok in seg_set:
+            return True
+        # plural/compound segment forms: products, product-catalog, jobPosts
+        for seg in segments:
+            if re.fullmatch(rf"{tok}s?", seg) or re.search(rf"(?:^|[-_/.]){tok}s?(?:$|[-_/.])", seg):
+                return True
+    return False
 
 
 def _parse_resource_entries(raw: str) -> list[dict]:
@@ -1012,7 +1056,7 @@ def api_from_network(resources: list[dict]) -> list[str]:
         if _TELEMETRY_RE.search(url):
             continue
         is_xhr = init in ("fetch", "xmlhttprequest")
-        looks_data = any(tok in url.lower() for tok in _API_HINT_TOKENS_NET)
+        looks_data = url_looks_like_data_api(url)
         if is_xhr and looks_data:
             seen.add(url)
             out.append(url)

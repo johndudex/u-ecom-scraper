@@ -1004,6 +1004,14 @@ def _run_via_browser_service(
             except OSError as exc:
                 logger.warning("run_execution: could not persist output locally: %s", exc)
         discovery_coverage = _read_discovery_coverage(output_file) if output_file else {}
+        try:
+            _pruned = prune_empty_records(
+                output_file, list(state.get("target_fields") or []) or None
+            )
+            if _pruned:
+                logger.info("run_execution: pruned %d empty records", _pruned)
+        except Exception as exc:
+            logger.warning("run_execution: prune step: %s", exc)
         # F9 quality gate (nav modes): collapse-level failure rates -> FAILED
         _q = _extraction_quality_gate(
             output_file, state.get("input_mode", ""), result.get("product_count", 0),
@@ -1096,6 +1104,61 @@ def _substantive_item_count(path: str, fields: list[str] | None = None) -> int:
         return count
     except Exception:
         return 0
+
+
+def prune_empty_records(output_file: str, target_fields: list[str] | None = None) -> int:
+    """Row-level dilution guard (job-10 lesson): records carrying NONE of the
+    requested (or core) fields are discovery noise (delivery pseudo-SKUs, soft
+    404s) — PRUNE, not fail (sparse is honest for some content types: optional
+    salaries, OOS prices; those rows carry at least one field and survive).
+    Applied post-run, zero LLM cost. Returns rows removed."""
+    import json as _json
+    import os as _os
+    if not output_file or not _os.path.isfile(output_file):
+        return 0
+    try:
+        with open(output_file, "r", encoding="utf-8") as fh:
+            data = _json.load(fh)
+    except Exception:
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    fields = None
+    if target_fields:
+        fields = [f for f in target_fields if isinstance(f, str)]
+    if not fields:
+        try:
+            from src.content_types import output_filter_fields
+
+            fields = [f for f in (output_filter_fields("") or []) if isinstance(f, str)]
+        except Exception:
+            fields = []
+    if not fields:
+        fields = [
+            "price", "availability", "currency",
+            "author", "publish_date", "company", "location",
+            "content", "snippet", "rank", "posts",
+            "current_price", "previous_price", "list_price",
+            "sale_price", "was_price", "regular_price",
+        ]
+    for key in ("products", "jobs", "articles", "results", "items", "threads", "pages"):
+        val = data.get(key)
+        if isinstance(val, list) and val:
+            kept = [it for it in val if isinstance(it, dict) and any(it.get(f) for f in fields)]
+            removed = len(val) - len(kept)
+            if removed:
+                data[key] = kept
+                meta = data.get("metadata") or {}
+                meta["pruned_empty_records"] = removed
+                data["metadata"] = meta
+                try:
+                    with open(output_file, "w", encoding="utf-8") as fh:
+                        _json.dump(data, fh, indent=1)
+                except Exception:
+                    return 0
+                return removed
+            return 0
+    return 0
 
 
 def _extraction_quality_gate(
