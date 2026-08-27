@@ -284,12 +284,25 @@ def get_filesystem_tools(
             )
 
         updated = original.replace(old_string, new_string, 1)
+        note = ""
+        if safe.endswith(".json"):
+            # Same guard as write_file, applied at the edit's write point: an
+            # edit that leaves the file invalid JSON is canonicalized when
+            # possible, and flagged (result + log) when not.
+            updated, valid, err = sanitize_json_content(updated)
+            if not valid:
+                note = "\n" + _JSON_WARN_NOTE
+                logger.warning(
+                    "write guard: edit_file left %s as non-JSON (%s) — written "
+                    "raw; repair pass will attempt salvage on read",
+                    safe, err,
+                )
         try:
             with open(safe, "w", encoding="utf-8") as f:
                 f.write(updated)
             return (
                 f"Successfully replaced 1 occurrence in {safe} "
-                f"({len(original)} → {len(updated)} chars)"
+                f"({len(original)} → {len(updated)} chars){note}"
             )
         except Exception as e:
             return f"Error writing edited file '{path}': {e}"

@@ -131,3 +131,58 @@ class TestWriteFileJsonSanitize:
         p = tmp_path / "a.json"
         tools["write_file"].invoke({"path": str(p), "content": '{"a": {"b": 2}}'})
         assert p.read_text() == '{\n "a": {\n  "b": 2\n }\n}'
+
+
+# ─── edit_file: the same guard at its write point ────────────────────────────
+
+class TestEditFileJsonSanitize:
+    def test_edit_keeping_validity_canonicalized(self, tmp_path):
+        tools = _tools(tmp_path)
+        p = tmp_path / "a.json"
+        p.write_text(json.dumps({"a": 1, "b": 2}, indent=1), encoding="utf-8")
+        r = tools["edit_file"].invoke(
+            {"path": str(p), "old_string": '"b": 2', "new_string": '"b": 3'}
+        )
+        assert "Successfully replaced" in r
+        assert "not valid JSON" not in r
+        assert json.loads(p.read_text()) == {"a": 1, "b": 3}
+
+    def test_edit_breaking_json_warns(self, tmp_path, caplog):
+        """An edit that leaves invalid JSON hits the same sanitize/warn path."""
+        tools = _tools(tmp_path)
+        p = tmp_path / "a.json"
+        p.write_text(json.dumps({"offices": "x"}, indent=1), encoding="utf-8")
+        with caplog.at_level(logging.WARNING, logger="agents.tools.filesystem_tools"):
+            r = tools["edit_file"].invoke(
+                {
+                    "path": str(p),
+                    "old_string": '"offices": "x"',
+                    "new_string": '"offices": 25 offices with counts,',
+                }
+            )
+        assert "not valid JSON" in r
+        warned = [rec for rec in caplog.records if rec.levelno >= logging.WARNING]
+        assert warned
+
+    def test_edit_introducing_control_char_canonicalized(self, tmp_path):
+        """An edit that inserts a literal newline into a string value gets the
+        same lenient-parse repair as write_file."""
+        tools = _tools(tmp_path)
+        p = tmp_path / "a.json"
+        p.write_text(json.dumps({"note": "a"}, indent=1), encoding="utf-8")
+        r = tools["edit_file"].invoke(
+            {"path": str(p), "old_string": '"note": "a"', "new_string": '"note": "a' + chr(10) + 'b"'}
+        )
+        assert "not valid JSON" not in r
+        json.loads(p.read_text())  # strictly valid on disk
+        assert json.loads(p.read_text()) == {"note": "a\nb"}
+
+    def test_edit_non_json_untouched(self, tmp_path):
+        tools = _tools(tmp_path)
+        p = tmp_path / "s.py"
+        p.write_text("x = 1\n", encoding="utf-8")
+        r = tools["edit_file"].invoke(
+            {"path": str(p), "old_string": "x = 1", "new_string": "x = 2"}
+        )
+        assert "not valid JSON" not in r
+        assert p.read_text() == "x = 2\n"

@@ -120,6 +120,8 @@ Based on probe result:
 Save findings as JSON to the path provided by the orchestrator:
 `workspace/{site_slug}/site_analysis.json`
 
+When writing JSON artifacts, emit strictly valid JSON — quote all scalars, escape control characters in strings (\n not a literal newline).
+
 **Include a `connectivity` section** — downstream agents read this to know what works:
 
 ```json

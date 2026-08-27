@@ -1826,6 +1826,7 @@ def _invoke_site_analyzer(
             "Choose how to proceed."
         ),
         auto_extend_min_tool_calls=5,
+        artifact_fix_fn=lambda slug: _fix_json_artifact(slug, "site_analysis.json"),
         on_success=_on_success,
     )
 
@@ -3505,6 +3506,26 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         _notify_phase(job_id, "code_tester", "done")
         update = {"messages": []}
         report = _load_test_report(slug)
+        # only attempt the repair when the report FILE exists but would not
+        # parse (a genuinely-missing file is the F19 no-report path, not a
+        # corruption case — repairing it would be a no-op call).
+        _report_path = os.path.join(
+            _get_project_root(), "workspace", slug, "test_report.json"
+        ) if slug else ""
+        if not report and slug and os.path.isfile(_report_path):
+            # Artifact-corruption coverage: code_tester does NOT go through
+            # _run_budgeted_agent, so it never had an artifact_fix_fn. A corrupt
+            # test_report.json (the priceline instance: literal control chars)
+            # made _load_test_report return None and route_after_testing then
+            # burned the retry loop on a phantom "no report" failure. Repair
+            # once and reload BEFORE concluding the report is missing.
+            try:
+                _fix_json_artifact(slug, "test_report.json")
+                report = _load_test_report(slug)
+            except Exception as exc:
+                logger.warning(
+                    "_invoke_code_tester: test_report repair failed: %s", exc
+                )
         if report:
             # Phase 4a: deterministically attach the scraper's discovery_coverage
             # so the coverage-aware classifier sees it (the LLM-written report

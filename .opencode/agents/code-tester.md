@@ -61,6 +61,8 @@ If you see flattened or wrong-shape output for a nested field, add a `high` seve
 
 **This MUST be your last action.** Use `write_file` to save the report. See output format below.
 
+When writing JSON artifacts, emit strictly valid JSON — quote all scalars, escape control characters in strings (\n not a literal newline).
+
 ## Validation Against Dead URLs and Anti-Bot Pages
 
 When a product has `status_code` in [301, 302, 303, 307, 308, 404, 410, 451]:
