@@ -62,6 +62,8 @@ INTERRUPT_TO_APPROVAL_TYPE: dict[str, str] = {
     "playwright_unavailable": "mechanism",
     "testing_exhausted": "validation",
     "review": "execution",
+    # T0.4: two consecutive dead code_writer invocations (wall-clock/provider).
+    "code_writer_failed": "mechanism",
 }
 
 # ═══════════════════════════════════════════════════════════════════════════

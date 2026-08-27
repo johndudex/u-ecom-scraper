@@ -17,7 +17,9 @@ pagination, discovery, rate limiting, error handling, logging, and output format
 After you `write_file` the scraper, **immediately self-test**:
 call `run_scraper(args=["--sample", "--input", "input_urls.json"])` (runs ≤5 URLs).
 Read the output JSON or traceback. If it failed or returned 0 items, `edit_file`
-a *targeted* fix. Repeat at most 3 times (the tool is capped at 3 calls).
+a *targeted* fix. The cap is **per bucket**: 2 runs of scratch/probe-family
+targets (`probe*`, `test_*`, `debug*`) + 2 runs of `scraper_draft*`. Spend the
+draft bucket on the draft — do not burn it on scratch files.
 
 This catches selector / pagination / JSON-LD-path bugs NOW — before code_tester —
 so the first attempt you hand off actually works. **Do NOT hand off an untested scraper.**
@@ -29,7 +31,8 @@ so the first attempt you hand off actually works. **Do NOT hand off an untested 
    functions per the Field Map (in the message). Keep the template's structure, waits,
    pagination, discovery, and output code intact. Only substitute the extraction logic.
 3. `run_scraper --sample`. If output is empty or a traceback, `edit_file` a targeted
-   fix and re-run. Max 3 `run_scraper` calls.
+   fix and re-run. Max 2 `run_scraper` calls on `scraper_draft*` (+ 2 on
+   probe/scratch targets).
 4. Stop. Do not read analysis JSONs (the Field Map in the message is complete).
    Do not read reference scrapers.
 
@@ -134,6 +137,29 @@ checkpoint load/save, etc.) are **correct as written**. Three hard rules:
   names verbatim and strips any the argparse no longer declares, which
   silently disables discovery.
 - `--sample` MUST use URLs already in `input_urls.json` (skip Phase 1 discovery).
+
+## Field Mapping Rules (deterministic — the tester checks these)
+
+1. **Root-relative URL/link paths are JOINED, never concatenated.** API and
+   JSON-LD payloads frequently carry root-relative paths (`"/product/123/slug"`,
+   `"/media/catalog/x.jpg"`). Build them with
+   `urljoin(BASE_URL, raw_path)` (or `urljoin(final_response_url, raw_path)`
+   when the payload came from a redirect). NEVER do
+   `listing_url + raw_path` or `BASE_HOST + path_prefix + raw_path` —
+   concatenating onto an already-built path produces double-host URLs like
+   `https://site.comhttps://site.com/product/1` or
+   `https://site.com/product/https://site.com/product/1`, which fail every
+   downstream fetch. If the raw value is ALREADY absolute (`http(s)://…`),
+   leave it alone.
+2. **Coexisting price-like fields are oriented by VALUE, not by name.** When a
+   payload carries two price-shaped fields (a sale object beside a base
+   object, `price` beside `discountedPrice`, `was`/`now`), decide which is the
+   *current* price by comparing the numbers on each sampled item: **lower =
+   current_price, higher = previous_price.** Naming conventions are a TIEBREAK
+   only — sites disagree (`sale` can mean the base price, `discounted` can be
+   absent). Verify the orientation on your sample items before writing the
+   mapping, and leave `previous_price` empty when no second value exists
+   rather than duplicating the current price into it.
 
 ## What NOT to Do
 

@@ -885,6 +885,10 @@ AGENT_RECURSION_MAP: dict[str, int] = {
                          # at 900s) is the real backstop; this just prevents the react loop
                          # from iterating past GraphRecursionError.
     "code_tester": 120,
+    # T1.7: dagster_converter was absent → ran at the default AGENT_RECURSION_LIMIT
+    # (150) — which is how job 302 burned 34 LLM calls. Capped BELOW default like
+    # its peers; the T0.2 wall is the real backstop.
+    "dagster_converter": 120,
     "cleanup": 80,
     "skill_learner": 80,
 }
@@ -1595,9 +1599,20 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
     return _accessibility_goto(state, probe_state)
 
 
-_AGENT_INVOKE_TIMEOUT = 900  # seconds — hard wall-clock cap per agent.invoke().
-                            # glm-5-turbo needs ~700-900s for code_writer (read
-                            # template + generate ~500 lines + self-test + fix).
+def _env_int(name: str, default: int) -> int:
+    """Read an int from the environment, falling back on absence/garbage."""
+    try:
+        return int(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+
+
+# T0.2: the wall sat INSIDE the healthy range for the one agent that needs it
+# (glm-5-turbo code_writer ~700-900s) and was un-configurable; the value is now
+# env-tunable so a measured p95 per agent can drive it without a code change.
+_AGENT_INVOKE_TIMEOUT = _env_int("AGENT_INVOKE_TIMEOUT", 900)  # seconds — hard
+    # wall-clock cap per agent.invoke(). glm-5-turbo needs ~700-900s for
+    # code_writer (read template + generate ~500 lines + self-test + fix).
 
 
 def _async_execution_enabled() -> bool:
@@ -1654,7 +1669,12 @@ def _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout):
             "— cancelled (socket closed), returning empty (job %s)",
             phase, timeout, job_id,
         )
-        return {"messages": []}
+        # T0.3: the dead invocation must be DISTINGUISHABLE from a healthy
+        # budget-exhausted return — both paths used to be bare {"messages": []}
+        # and `_error` was read by nobody, so a wall-clock death was invisible
+        # downstream (25% of code_writer's wall was these silent deaths).
+        return {"messages": [], "_error": f"wall-clock timeout after {timeout}s",
+                "_error_class": "WallClockTimeout"}
     except Exception as exc:
         import traceback
 
@@ -1710,7 +1730,9 @@ def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, t
             "— abandoning thread, returning empty (job %s)",
             phase, timeout, job_id,
         )
-        return {"messages": []}
+        # T0.3 (sync twin of the async-path marker): surface the dead invocation.
+        return {"messages": [], "_error": f"wall-clock timeout after {timeout}s",
+                "_error_class": "WallClockTimeout"}
     return result_box[0] or {"messages": []}
 
 
@@ -3153,12 +3175,54 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
     # internal_api past the count gate (measured evidence outranks opinion,
     # and poison descriptors report opinions too).
     _rec_recommended = ""
+    _rec_key = ""
     for _pa_key in ("content_analysis", "product_analysis"):
         _pa = state.get(_pa_key)
         if isinstance(_pa, dict):
             _mr = _pa.get("mechanism_reassessment")
             if isinstance(_mr, dict):
-                _rec_recommended = (_mr.get("recommended") or "").strip()
+                # T1.5: the key-alias version read ONLY `.recommended` — the
+                # next synonym the analyzer model coins is silently dropped
+                # again (the exact drift class S3 was written to close). Two
+                # halves, in order:
+                #   1. verdict keys (known verdict-bearing names, fixed order);
+                #   2. a bounded VALUE scan over the remaining keys.
+                # The bare value-match a critic proposed is WORSE than either:
+                # origin-marking keys (original_recommendation,
+                # site_analyzer_said) carry the OLD verdict as their VALUE, so
+                # an unfiltered scan flips strategy to the very thing the
+                # reassessment argued against. Excluded here. Exact-token +
+                # enum-only stays (a contaminated artifact must not become
+                # self-confirming); ambiguous (≥2 distinct candidates) is
+                # ignored, not guessed.
+                _MR_VERDICT_KEYS = (
+                    "recommended", "reassessed_mechanism", "recommended_mechanism",
+                )
+                _MR_ORIGIN_TOKENS = ("original", "said", "previous", "prior", "old", "was")
+                _MR_ENUM = ("http_requests", "http_navigation", "playwright")
+                for _k in _MR_VERDICT_KEYS:
+                    _v = str(_mr.get(_k) or "").strip().lower()
+                    if _v in _MR_ENUM:
+                        _rec_recommended = _v
+                        _rec_key = _k
+                        break
+                if not _rec_recommended:
+                    _candidates: list[str] = []
+                    for _mk, _mv in _mr.items():
+                        if any(_tok in str(_mk).lower() for _tok in _MR_ORIGIN_TOKENS):
+                            continue
+                        _mv_s = str(_mv or "").strip().lower()
+                        if _mv_s in _MR_ENUM and _mv_s not in _candidates:
+                            _candidates.append(_mv_s)
+                    if len(_candidates) == 1:
+                        _rec_recommended = _candidates[0]
+                        _rec_key = "value-scan"
+                    elif len(_candidates) > 1:
+                        logger.warning(
+                            "_derive_strategy: ambiguous mechanism_reassessment "
+                            "values %s — ignored (job-level state key %s)",
+                            _candidates, _pa_key,
+                        )
                 if _rec_recommended:
                     break
     _strategy_source = ""
@@ -3173,7 +3237,7 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
     ):
         strategy = _rec_recommended
         _strategy_source = (
-            f"; mechanism_reassessment.recommended={_rec_recommended!r} "
+            f"; mechanism_reassessment[{_rec_key}]={_rec_recommended!r} "
             f"outranks count={_api_count!r} descriptor"
         )
 
@@ -3458,48 +3522,16 @@ def _enforce_cli_contract(
 
 
 def _select_template_file(state: ScrapeState) -> str:
-    """Return the template filename for this job's strategy/data_source.
+    """Thin alias → :mod:`agents.template_selector` (T3.2 single authority).
 
-    Simplified selection covering the 5 main templates. The message builder
-    (build_code_writer_message) has a more detailed selection (mechanism-based,
-    anti-bot notes, embedded_json variants) — that runs in parallel and its
-    template_hint still appears in the message. This function selects the
-    template for the SYSTEM PROMPT (where the full code is injected so it's
-    never summarized). For edge cases (undetected_chromedriver, navigation_scraper),
-    the LLM can still read_file the template — the system prompt's template is a
-    reference, not a replacement for the message's hint.
+    The mapping MOVED OUT of graph.py so ``build_code_writer_message``'s
+    template-hint can call the SAME function instead of its own
+    mechanism-first re-derivation (the two authorities used to disagree for
+    api/ssr_div_list/requests strategies).
     """
-    nav = state.get("navigation_analysis") or {}
-    sa = state.get("scraper_analysis") or {}
-    strategy = (sa.get("strategy") or "").lower()
-    data_source = nav.get("data_source", "")
-    api_ep = nav.get("api_endpoint") or {}
+    from .template_selector import select_template_file
 
-    if isinstance(api_ep, dict) and (api_ep.get("url") or api_ep.get("api_url")):
-        return "api_scraper.py"
-    if data_source == "ssr_div_list":
-        return "ssr_div_list_scraper.py"
-    if strategy in ("http_requests", "requests"):
-        # Form-POST sites (locumtenens: QuickSearch POST → SSR) need the
-        # navigation template (playwright form-POST replay + FORM_ACTION),
-        # not the plain requests template. Verified: locumtenens' working
-        # scraper imports playwright.sync_api + uses FORM_ACTION.
-        _nav_fm = state.get("navigation_analysis") or {}
-        _form_method = ((_nav_fm.get("search") or {}).get("form_method") or "").upper()
-        if _form_method == "POST":
-            return "navigation_scraper.py"
-        return "requests_scraper.py"
-    if strategy == "http_navigation":
-        return "http_navigation_scraper.py"
-    if strategy == "playwright":
-        # Playwright strategy → playwright_scraper.py (its discover step
-        # render-polls, which is what surfaces JS-rendered listings like Coveo
-        # that http_navigation's /navigate 2s wait cannot). Mapping playwright
-        # to http_navigation_scraper.py silently defeated the strategy.
-        return "playwright_scraper.py"
-    if strategy in ("internal_api", "api"):
-        return "api_scraper.py"
-    return "requests_scraper.py"
+    return select_template_file(state)
 
 
 def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
@@ -3639,6 +3671,58 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         finally:
             _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "code-writer", config)
+
+        # T0.3/T0.4: a dead invocation (wall-clock timeout, provider exception)
+        # used to be indistinguishable from a healthy return — the flow then
+        # paid code_tester's full (un-walled) invoke against a draft that was
+        # never written and the retry got relabelled "budget". Detect it, count
+        # it on a DEDICATED counter (test_retry_count carries
+        # FINAL_RETRY_SENTINEL semantics and must not be corrupted), and route
+        # past code_tester: one bounce to scraper_analyzer (re-derive strategy
+        # + regenerate), then honest escalation to a human.
+        _cw_result = result if isinstance(result, dict) else {}
+        _cw_err = str(_cw_result.get("_error") or "")
+        _cw_dead = bool(_cw_err) or not _cw_result.get("messages")
+        _draft_path = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
+        if _cw_dead and not os.path.isfile(_draft_path):
+            _err_note = _cw_err or "invocation returned no messages and wrote no draft"
+            _err_count = int(state.get("code_writer_error_count") or 0)
+            logger.error(
+                "_invoke_code_writer: dead invocation — %s (error_count=%d, job %s)",
+                _err_note, _err_count + 1, job_id,
+            )
+            _notify_phase(job_id, "code_writer", "failed")
+            update["code_writer_error"] = _err_note
+            update["code_writer_error_count"] = _err_count + 1
+            update["messages"] = []
+            if _err_count + 1 >= 2:
+                # Second consecutive death — stop burning wall-clock, escalate.
+                return Command(
+                    goto="human_approval",
+                    update={
+                        **update,
+                        "interrupt_reason": "code_writer_failed",
+                        "interrupt_message": (
+                            f"code_writer invocation failed twice without producing a draft "
+                            f"({_err_note}). Inspect the model/provider logs, then retry or cancel."
+                        ),
+                        "interrupt_options": ["Retry code generation", "Cancel"],
+                        "interrupt_decisions": [
+                            {"type": "approve", "label": "Retry code generation",
+                             "allow_feedback": True},
+                            {"type": "reject", "label": "Cancel", "allow_feedback": False},
+                        ],
+                    },
+                )
+            return Command(goto="scraper_analyzer", update=update)
+        if _cw_dead:
+            # Dead invocation but a draft WAS written (timeout hit after the
+            # write) — the draft is usable; log loudly and keep testing.
+            logger.warning(
+                "_invoke_code_writer: invocation died (%s) but draft exists — proceeding to test (job %s)",
+                _cw_err or "no messages", job_id,
+            )
+
         _notify_phase(job_id, "code_writer", "done")
         if _PATCHES_ENABLED:
             # Strategy-drift patches REMOVED (verify-then-delete via run_node --no-patches):
@@ -3759,6 +3843,8 @@ def _probe_phase1_discovery(slug: str, state: dict, job_id: int) -> tuple[bool, 
                 result = resp.json()
                 rc = result.get("returncode", 0)
                 stderr = result.get("stderr") or ""
+                # T2.1: stdout used to be discarded on both paths.
+                _stdout = result.get("stdout") or ""
             except Exception as exc:
                 logger.warning(
                     "_probe_phase1_discovery: browser_service dispatch failed (%s) — inconclusive",
@@ -3773,6 +3859,7 @@ def _probe_phase1_discovery(slug: str, state: dict, job_id: int) -> tuple[bool, 
             )
             rc = proc.returncode
             stderr = proc.stderr or ""
+            _stdout = proc.stdout or ""
         if rc != 0 and "Traceback" in stderr:
             lines = stderr.strip().splitlines()
             tail = "\n".join(lines[-12:]) if lines else stderr[:800]
@@ -3796,6 +3883,27 @@ def _probe_phase1_discovery(slug: str, state: dict, job_id: int) -> tuple[bool, 
         logger.info(
             "_probe_phase1_discovery: OK (job %s, rc=%s)", job_id, rc
         )
+        # T2.1: surface the probe's discovery yield — the discovered count from
+        # the OUTPUT FILE (the generic contract: every two-phase template emits
+        # metadata.discovery_coverage.discovered_urls) with stdout as fallback
+        # evidence. Deterministic; feeds the volume arbitration downstream.
+        try:
+            _probe_out = _find_newest_output(
+                os.path.join(root, "workspace", slug),
+                os.path.join(root, "scrapers", slug),
+                slug=slug,
+            )
+            if _probe_out:
+                _cov = _read_discovery_coverage(_probe_out)
+                _disc = (_cov or {}).get("found") or len(
+                    (_cov or {}).get("discovered_urls") or []
+                )
+                logger.info(
+                    "_probe_phase1_discovery: discovered=%s (coverage file %s, stdout tail: %r)",
+                    _disc, os.path.basename(_probe_out), _stdout.strip()[-200:],
+                )
+        except Exception as _pexc:
+            logger.debug("_probe_phase1_discovery: coverage read skipped: %s", _pexc)
     except subprocess.TimeoutExpired:
         logger.info(
             "_probe_phase1_discovery: timed out (job %s) — inconclusive", job_id
@@ -3829,12 +3937,11 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         slug = state.get("site_slug", "")
         agent = create_code_tester(site_slug=slug)
         hb = _start_heartbeat(job_id, "code-tester")
-        # F5: try/finally — an exception here previously leaked the timer chain.
-        # (Note: this site uses raw agent.invoke with NO timeout wrapper —
-        # pre-existing; the finally at least guarantees heartbeat cleanup.)
+        # F5 guard; T0.2: was a raw invoke with NO wall-clock cap.
+        _ct_cfg = _agent_config(config, "code_tester")
         try:
-            result = agent.invoke(
-                {"messages": messages}, config=_agent_config(config, "code_tester")
+            result = _invoke_agent_with_timeout(
+                agent, messages, _ct_cfg, "code_tester", job_id
             )
         finally:
             _stop_heartbeat(hb)
@@ -3867,6 +3974,31 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             # so the coverage-aware classifier sees it (the LLM-written report
             # doesn't reliably carry it).
             report = _attach_discovery_coverage(report, slug)
+            # T2.2/T2.3: deterministically check the OUTPUT rows (double-host
+            # URLs, inverted price pairs, mapped-but-empty fields) and merge
+            # the findings into report.issues — the tester's LLM misses these
+            # mechanical defects and routing arms on their suggested_fix shape.
+            try:
+                from .nodes.route_after_testing import deterministic_output_issues
+
+                _det = deterministic_output_issues(slug, state)
+                if _det:
+                    _known = {
+                        (str(i.get("field")), str(i.get("description")))
+                        for i in (report.get("issues") or [])
+                        if isinstance(i, dict)
+                    }
+                    _added = [i for i in _det if (str(i.get("field")), str(i.get("description"))) not in _known]
+                    if _added:
+                        report["issues"] = (report.get("issues") or []) + _added
+                        logger.warning(
+                            "_invoke_code_tester: %d deterministic output defect(s) "
+                            "appended to test_report: %s",
+                            len(_added),
+                            "; ".join(str(i.get("description", ""))[:90] for i in _added),
+                        )
+            except Exception as _dexc:
+                logger.debug("_invoke_code_tester: deterministic checks skipped: %s", _dexc)
             update["test_report"] = report
             logger.info(
                 "_invoke_code_tester: loaded test_report from workspace/%s/", slug
@@ -4183,17 +4315,79 @@ def _invoke_dagster_converter(
     set_tool_context(dict(state), agent_name="dagster_converter")
     try:
         logger.info("_invoke_dagster_converter: starting (job %s, slug %s)", job_id, slug)
-        messages = build_dagster_converter_message(state)
-        _log_agent_context(state, "dagster-converter", messages)
-        agent = create_dagster_converter(site_slug=slug)
-        result = agent.invoke(
-            {"messages": messages}, config=_agent_config(config, "dagster_converter")
-        )
-        _persist_agent_logs(state, result, "dagster-converter", config)
 
-        # Check if the dagster file was written
         ws_dagster = os.path.join(root, "workspace", slug, f"{slug}_dagster.py")
         scrapers_dagster = os.path.join(root, "scrapers", slug, f"{slug}_dagster.py")
+
+        # T3.1: deterministic renderer first — 0 LLM calls on the happy path.
+        # (job 302: the LLM converter burned 34 calls / 7m05s of wall hand-copying
+        # the draft's own parsing logic. The renderer does that mechanically off
+        # the draft's AST and its output must pass the SAME acceptance gate below.)
+        _rendered = ""
+        try:
+            from .dagster_renderer import describe_rejection, render_dagster_module
+
+            _draft_path = ""
+            for _cand in (
+                os.path.join(root, "workspace", slug, "scraper_draft.py"),
+                os.path.join(root, "scrapers", slug, "scraper.py"),
+            ):
+                if os.path.isfile(_cand):
+                    _draft_path = _cand
+                    break
+            if _draft_path:
+                _template = ""
+                _tpl_path = os.path.join(root, "templates", "dagster_template.py")
+                if os.path.isfile(_tpl_path):
+                    with open(_tpl_path, "r", encoding="utf-8", errors="replace") as _tf:
+                        _template = _tf.read()
+                _report: dict[str, Any] = {}
+                _rendered = render_dagster_module(
+                    _draft_path, _template,
+                    {
+                        "site_slug": slug,
+                        "site_url": state.get("url", ""),
+                        "site_name": state.get("site_name", ""),
+                        "input_mode": state.get("input_mode", ""),
+                        "job_id": job_id,
+                    },
+                    _report,
+                )
+                if _rendered:
+                    logger.info(
+                        "_invoke_dagster_converter: deterministic render OK "
+                        "(shape=%s) — LLM skipped (job %s)",
+                        _report.get("shape"), job_id,
+                    )
+                    os.makedirs(os.path.dirname(ws_dagster), exist_ok=True)
+                    with open(ws_dagster, "w", encoding="utf-8") as _f:
+                        _f.write(_rendered)
+                else:
+                    logger.info(
+                        "_invoke_dagster_converter: renderer declined (%s) — "
+                        "LLM fallback (job %s)",
+                        describe_rejection(_report), job_id,
+                    )
+        except Exception as _exc:
+            _rendered = ""
+            logger.warning(
+                "_invoke_dagster_converter: renderer attempt failed — LLM "
+                "fallback (job %s): %s", job_id, _exc,
+            )
+
+        if not _rendered:
+            messages = build_dagster_converter_message(state)
+            _log_agent_context(state, "dagster-converter", messages)
+            agent = create_dagster_converter(site_slug=slug)
+            # T0.2: wall-clock cap — this was the other raw unbounded invoke
+            # (job 302: 34 LLM calls, 7m05s of wall with no backstop).
+            result = _invoke_agent_with_timeout(
+                agent, messages, _agent_config(config, "dagster_converter"),
+                "dagster_converter", job_id,
+            )
+            _persist_agent_logs(state, result, "dagster-converter", config)
+
+        # Acceptance gate (runs for BOTH the rendered and the LLM-written file)
         if os.path.isfile(ws_dagster):
             # Syntax + import-binding check (P0-5: ast.parse alone misses
             # commented-out imports and undefined base classes — the file
@@ -4745,6 +4939,22 @@ def route_from_human_approval(state: ScrapeState) -> str:
             return "__end__"
         logger.info("route_from_human_approval: coverage_exhausted -> proceed to scraper_analyzer")
         return "scraper_analyzer"
+
+    # code_writer_failed (T0.4): two consecutive DEAD code_writer invocations.
+    # MUST be handled BEFORE the approve_values clobber below — the retry
+    # option is decision-type approve, so its label would be overwritten to
+    # "Continue anyway" and the retry would end the job instead.
+    # Retry -> scraper_analyzer (re-derive strategy + regenerate); anything
+    # non-retry ends the job (the default would have routed to cleanup and
+    # "finalized" a job with no draft at all).
+    if reason == "code_writer_failed":
+        if "retry" in (label or "").lower():
+            logger.info(
+                "route_from_human_approval: code_writer_failed -> retry scraper_analyzer"
+            )
+            return "scraper_analyzer"
+        logger.info("route_from_human_approval: code_writer_failed -> end (no draft)")
+        return "__end__"
 
     approve_values = {"approve", "yes", "ok", "continue", "continue anyway", "proceed"}
     if choice.lower() in approve_values:

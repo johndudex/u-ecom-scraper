@@ -169,11 +169,14 @@ class TestOverrideGateSite:
             r"and not missing_core\s*"
             r"and not _contract_bad\s*"
             r"and not _count_regression\s*"
+            r"and not _volume_reason\s*"
+            r"and not _det_blockers\s*"
             r"and _scraper_has_real_items\(state, min_count=3\)\s*"
             r"\):",
             src,
         ), (
             "ground-truth override must be gated on: no coverage failure, no "
             "core field at ~0% coverage, no CLI-contract violation, no "
-            "count regression vs prior runs, and >=3 real items"
+            "count regression vs prior runs, no volume gap, no deterministic "
+            "output defect, and >=3 real items"
         )

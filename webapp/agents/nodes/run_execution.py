@@ -659,6 +659,12 @@ def _run_category_sources(state, scraper_path, base_args, site_folder, primary_r
             timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
             merged_path = _os.path.join(site_folder, f"output_merged_{timestamp}.json")
             site_block = primary_data.get("site", {}) if primary_file else {}
+            # T0.5/H1: normalize the string-`site` template shape — a merged
+            # output re-deriving from a string would re-break every reader.
+            if not isinstance(site_block, dict):
+                from src.output_site import normalize_site_block
+
+                site_block = normalize_site_block(site_block) or {}
             # discovery_coverage: Phase 5 will fully aggregate across sources
             # (sum found, max dimensions_total, stop_reason precedence). For now
             # propagate the primary source's block as-is so the gate has something

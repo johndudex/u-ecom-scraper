@@ -43,6 +43,7 @@ AGENT_TOOL_MAP: dict[str, list[str]] = {
         "read_file",
         "write_file",
         "edit_file",
+        "check_syntax",
         "search_files",
         "search_content",
         "load_skill",
@@ -66,6 +67,7 @@ AGENT_TOOL_MAP: dict[str, list[str]] = {
     "dagster_converter": [
         "read_file",
         "write_file",
+        "check_syntax",
         "search_content",
         "search_files",
     ],
@@ -145,6 +147,7 @@ async def get_tools_for_agent(
         "read_file",
         "write_file",
         "edit_file",
+        "check_syntax",
         "search_files",
         "search_content",
     }

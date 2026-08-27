@@ -385,6 +385,232 @@ def _core_field_zero_coverage(report: dict, state: ScrapeState) -> str | None:
     return None
 
 
+# ── T2.1/T2.2/T2.3 deterministic output signals ──────────────────────────────
+# The tester's LLM misses mechanical defects (double-joined URLs, inverted
+# price pairs, mapped-but-empty fields); these checks read the OUTPUT rows
+# directly and never depend on the model noticing. Severity stays MEDIUM —
+# routing arms only on the WRONG_VALUE+anchored-fix shape (see
+# _det_blockers in route_after_testing), not on severity.
+
+_SAMPLE_CAP = 5  # code_tester's --sample run is 5-bounded
+_PRICE_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
+_EMPTY_STRINGS = ("", "none", "null", "[]", "n/a", "na")
+
+
+def _price_value(v) -> Optional[float]:
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    m = _PRICE_RE.search(str(v).replace(" ", " "))
+    if not m:
+        return None
+    try:
+        return float(m.group(0).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _is_double_host(url: str) -> bool:
+    """True for the double-join artifact: base_url + an already-absolute URL.
+
+    Catches both shapes seen in the wild — a duplicated scheme
+    (``https://hosthttps://host/path``) and a host repeated inside the path
+    (``https://host/https://host/path`` or ``https://host/host/path``).
+    """
+    u = str(url or "").strip()
+    if u.lower().count("://") > 1:
+        return True
+    m = re.match(r"^[a-z][a-z0-9+.\-]*://([^/?#]+)", u.lower())
+    if not m:
+        return False
+    host = m.group(1).split("@")[-1].split(":")[0]
+    rest = u.lower()[m.end():]
+    return (f"//{host}" in rest) or (f"/{host}/" in rest)
+
+
+def _items_from_output_file(slug: str) -> list[dict]:
+    """Read the newest scrape output's item rows (any content type).
+
+    Scans every top-level list-of-dicts (products/articles/jobs/…) — no
+    content-type coupling. Empty when nothing was written (the checks are
+    then silent — same no-op-on-missing-data philosophy as the coverage gate).
+    """
+    if not slug:
+        return []
+    import json
+    import os as _os
+
+    try:
+        from .run_execution import _find_newest_output
+    except Exception:
+        return []
+    try:
+        root = _os.environ.get("PROJECT_ROOT", "/app")
+        path = _find_newest_output(
+            _os.path.join(root, "workspace", slug),
+            _os.path.join(root, "scrapers", slug),
+            slug=slug,
+        )
+        if not path or not _os.path.isfile(path):
+            return []
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            data = json.load(f)
+    except Exception as exc:
+        logger.debug("_items_from_output_file: read failed for %s: %s", slug, exc)
+        return []
+    if not isinstance(data, dict):
+        return []
+    for v in data.values():
+        if isinstance(v, list) and v and all(isinstance(r, dict) for r in v):
+            return [r for r in v if isinstance(r, dict)]
+    return []
+
+
+def deterministic_output_issues(slug: str, state: ScrapeState) -> list[dict]:
+    """Deterministic checks over the newest OUTPUT file rows.
+
+    Three checks, each emitting a tester-shaped issue dict (so they land in
+    ``test_report.issues`` next to the LLM's own findings):
+
+    1. double-host URL — base+absolute double-join on >50% of rows;
+    2. inverted price pair — previous_price < current_price on >50% of rows
+       with both present (orient by VALUE: lower=current);
+    3. mapped-but-empty field (T2.3) — a field with a non-empty selector /
+       api_path in the analysis field map that is non-empty on <20% of rows.
+
+    Requires ≥3 rows (fewer is a different failure class, already routed).
+    """
+    rows = _items_from_output_file(slug)
+    if len(rows) < 3:
+        return []
+    issues: list[dict] = []
+    n = len(rows)
+
+    dbl = sum(
+        1 for r in rows
+        if _is_double_host(str(r.get("url") or r.get("src_url") or ""))
+    )
+    if dbl > n // 2:
+        issues.append({
+            "field": "url",
+            "issue_type": "WRONG_VALUE",
+            "severity": "medium",
+            "count": dbl,
+            "description": (
+                f"Deterministic check: {dbl}/{n} item URLs contain the host twice "
+                "(base_url + already-absolute URL double-join)"
+            ),
+            "suggested_fix": (
+                "Join with urllib.parse.urljoin(base_url, raw_url) — urljoin passes "
+                "absolute URLs through unchanged; never string-concatenate a base and "
+                "an absolute path."
+            ),
+        })
+
+    pairs = [
+        (_price_value(r.get("previous_price")), _price_value(r.get("price")))
+        for r in rows
+    ]
+    both = [(p, c) for p, c in pairs if p is not None and c is not None]
+    if both:
+        inv = sum(1 for p, c in both if p < c)
+        if inv > len(both) // 2:
+            issues.append({
+                "field": "price",
+                "issue_type": "WRONG_VALUE",
+                "severity": "medium",
+                "count": inv,
+                "description": (
+                    f"Deterministic check: {inv}/{len(both)} rows have previous_price "
+                    "< current_price (inverted price pair)"
+                ),
+                "suggested_fix": (
+                    "Orient price pairs by VALUE: the lower number is the CURRENT "
+                    "price, the higher is the previous/was price — regardless of the "
+                    "source field names; only fall back to naming when values tie."
+                ),
+            })
+
+    analysis = state.get("content_analysis") or state.get("product_analysis") or {}
+    fields = analysis.get("fields") if isinstance(analysis, dict) else None
+    if isinstance(fields, dict):
+        for fname, meta in fields.items():
+            if not isinstance(meta, dict) or not fname:
+                continue
+            anchor = (
+                meta.get("selector") or meta.get("api_path")
+                or meta.get("api_fallback_path") or meta.get("jsonld_key")
+                or meta.get("attribute") or ""
+            )
+            if not str(anchor).strip():
+                continue
+            filled = sum(
+                1 for r in rows
+                if str(r.get(fname) or "").strip().lower() not in _EMPTY_STRINGS
+            )
+            if filled / n < 0.2:
+                issues.append({
+                    "field": str(fname),
+                    "issue_type": "MISSING",
+                    "severity": "medium",
+                    "count": n - filled,
+                    "description": (
+                        f"Deterministic check: field '{fname}' is mapped ({anchor!r}) "
+                        f"but empty on {n - filled}/{n} rows"
+                    ),
+                    "suggested_fix": (
+                        f"The mapping for '{fname}' yields nothing on the live pages — "
+                        "re-anchor it to a populated source (verify the selector/api_path "
+                        "against the live DOM/API and prefer the structured JSON-LD/API "
+                        "value over a brittle CSS path) instead of shipping empty."
+                    ),
+                })
+    return issues
+
+
+def _volume_gap(report: dict, state: ScrapeState) -> Optional[str]:
+    """T2.1: discovered-vs-extracted gap, armed ONLY beyond sample scope.
+
+    The tester's --sample run is 5-bounded: judging volume on it fails the run
+    that SUCCEEDED (a job-302-shaped state — PASS / 5 extracted / 97 discovered
+    — must stay silent). Arms when the tester extracted beyond the sample cap,
+    the run is not scope-narrowed, discovery covered ≥2 pages' worth of URLs,
+    and extraction captured <50% of them. Returns a reason string or None.
+    """
+    if not isinstance(report, dict):
+        return None
+    cov = report.get("discovery_coverage")
+    if not isinstance(cov, dict) or not cov.get("ran_phase1", True):
+        return None
+    try:
+        discovered = int(cov.get("found") or len(cov.get("discovered_urls") or []) or 0)
+    except (TypeError, ValueError):
+        return None
+    if discovered <= 0:
+        return None
+    extracted = _extracted_item_count(report)
+    if extracted <= _SAMPLE_CAP:
+        return None  # sample-shaped run — volume is unknowable from it
+    scope = (state.get("scope") or "").strip().lower()
+    if scope in ("firstn", "filter") or (state.get("scope_value") or "").strip():
+        return None
+    nav = state.get("navigation_analysis")
+    ep = (nav.get("api_endpoint") or {}) if isinstance(nav, dict) else {}
+    ipp = ep.get("items_per_page")
+    if not isinstance(ipp, int) or isinstance(ipp, bool) or ipp <= 0:
+        ipp = cov.get("items_per_page")
+        if not isinstance(ipp, int) or isinstance(ipp, bool) or ipp <= 0:
+            return None  # no page-size denominator → gate stays silent
+    if discovered >= 2 * ipp and extracted < 0.5 * discovered:
+        return (
+            f"volume gap: discovery found {discovered} URLs (≥2 pages of {ipp}) but "
+            f"the run extracted only {extracted} (<50%) — pagination/discovery is "
+            "stopping early, not the strategy"
+        )
+    return None
+
+
 def route_after_testing(state: ScrapeState) -> str:
     report = state.get("test_report")
     retry_count = state.get("test_retry_count", 0)
@@ -497,6 +723,21 @@ def route_after_testing(state: ScrapeState) -> str:
     # from the anti-bot downgrade. None ⇒ no coverage problem (gate is a no-op).
     _cov_reason = _discovery_coverage_failure(report)
 
+    # T2.1 volume signal (sample-scope-guarded) + T2.2 deterministic output
+    # blockers. The blocker shape is narrow by design: a WRONG_VALUE on a
+    # value-shaped field WITH a non-empty suggested_fix (emitted only by the
+    # deterministic checks — the LLM's unanchored WRONG_VALUEs stay advisory).
+    # `src_url=listing` is BY DESIGN in two-phase scrapers and is never
+    # flaggable, so src_url is deliberately NOT in the blocker field set.
+    _volume_reason = _volume_gap(report, state)
+    _det_blockers = [
+        i for i in issues
+        if str(i.get("issue_type") or "").upper() == "WRONG_VALUE"
+        and (i.get("suggested_fix") or "").strip()
+        and str(i.get("field") or "").lower()
+        in ("url", "price", "previous_price", "original_price")
+    ]
+
     # L2 CLI-contract signal (docs/cli-contract-plan.md): static re-check of the
     # DRAFT — a violation means execution would be seed-only. Belt-and-braces
     # alongside the tester-side force-FAIL (the load-bearing closure lives in
@@ -533,6 +774,8 @@ def route_after_testing(state: ScrapeState) -> str:
         and not high_severity
         and not _contract_bad
         and not _count_regression
+        and not _volume_reason
+        and not _det_blockers
     ):
         # Phase-coverage gate (deterministic backstop): for two-phase
         # navigation scrapers, a PASS is only valid if Phase 1 discovery was
@@ -588,6 +831,8 @@ def route_after_testing(state: ScrapeState) -> str:
         and not missing_core
         and not _contract_bad
         and not _count_regression
+        and not _volume_reason
+        and not _det_blockers
         and _scraper_has_real_items(state, min_count=3)
     ):
         logger.info(
@@ -595,6 +840,40 @@ def route_after_testing(state: ScrapeState) -> str:
             "items (overriding code_tester's high_severity flags)"
         )
         return "field_confirmation"
+
+    # T2.1 volume-gap bounce (bounded, contract-bounce shape): a big
+    # discovered-vs-extracted gap on a beyond-sample run is a precisely-known
+    # fix (pagination), not a strategy question.
+    if _volume_reason:
+        _retry_vg = int(state.get("test_retry_count", 0) or 0)
+        if _retry_vg >= MAX_TEST_RETRIES or is_final_attempt:
+            logger.error(
+                "route_after_testing: %s — retries exhausted, proceeding", _volume_reason
+            )
+        else:
+            logger.warning(
+                "route_after_testing: %s — bouncing to code_writer", _volume_reason
+            )
+            return "scraper_analyzer"
+
+    # T2.2 deterministic-defect bounce (same shape): the WRONG_VALUE issues
+    # carry a mechanical suggested_fix, so a targeted fix beats shipping.
+    if _det_blockers:
+        _retry_db = int(state.get("test_retry_count", 0) or 0)
+        if _retry_db >= MAX_TEST_RETRIES or is_final_attempt:
+            logger.error(
+                "route_after_testing: %d deterministic output defects — retries "
+                "exhausted, proceeding",
+                len(_det_blockers),
+            )
+        else:
+            logger.warning(
+                "route_after_testing: %d deterministic output defects (e.g. %s) "
+                "— bouncing to code_writer",
+                len(_det_blockers),
+                _det_blockers[0].get("description", "")[:120],
+            )
+            return "scraper_analyzer"
 
     # Count-regression bounce (bounded, same shape as the contract bounce):
     # a big discovery drop vs the site's prior run is a precisely-known fix

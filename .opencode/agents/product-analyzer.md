@@ -105,6 +105,37 @@ From the probe result's selector tests and JSON-LD data, map each field:
 
 **The probe already tested common selectors.** Use those results. Only use `playwright_browser_evaluate` if you need to test selectors NOT in the common set.
 
+### API-fed fields: use `api_path` (+ `api_fallback_path`) and say when to use which
+
+When a field's value comes from a JSON API response body rather than the DOM,
+set `"method": "api"` and record the **dotted path into the response** as
+`api_path` (e.g. `"discountedPrice.formattedValue"`), with
+`api_fallback_path` for the alternate key when the primary is absent (e.g.
+`"price.formattedValue"`). Put the *rule for choosing between them* in
+`notes` — that note is relayed verbatim to code-writer, which renders
+`api_path`/`api_fallback_path` and your note as the field's read recipe.
+Top-level response shape goes in `api_extraction` (endpoint, `code_from_url`
+regex, `key_response_fields`) — see the output example below.
+
+### NOT-available claims need ≥3 samples
+
+Before you declare a field **NOT available** (or omit it from `fields` because
+"the page doesn't have it"), you must have **probed ≥ 3 distinct sample items**
+and confirmed the field is absent in all of them. One page is not evidence — a
+single product routinely omits an optional field (no discount → no
+`discountedPrice`; no reviews → no rating) and that is not the same as the
+field not existing on the site.
+
+- Name the probed items in the field's `notes` (e.g. `"checked codes 62311,
+  60142, 58890 — absent in all 3"`). An unsupported NOT-available claim is the
+  #1 cause of a core field shipping at 0%.
+- The 3 samples do NOT cost 3 extra page fetches: take them from the payload
+  you already have (a JSON-LD `ItemList`, a search/API response array, a
+  listing page's embedded JSON, sibling products from one category). Only
+  fetch more when one page genuinely exposes one item.
+- If you cannot get 3 samples (budget, dead page), write `tested: false` and
+  say so in `notes` — do NOT write "not available".
+
 ### 5. Field Extraction Plan
 
 > **If the message includes a "User Requirements (schema — ENFORCE)" block,
@@ -162,6 +193,28 @@ After your deep analysis, reassess the scraping mechanism:
   mode is more fragile and is not wired into the runtime stealth path.
 
 Document your reassessment in `mechanism_reassessment`. This overrides the site-analyzer's recommendation if different.
+
+**Schema (exact — the strategy gate reads this block):**
+
+```json
+"mechanism_reassessment": {
+  "recommended": "http_requests",
+  "site_analyzer_said": "playwright",
+  "reason": "The OCC REST API returns complete product JSON (price, description, stock) without auth or JS rendering."
+}
+```
+
+- **`recommended` is the verdict key.** The gate reads `recommended` (and
+  treats any other keys in the block as supporting evidence only — it does not
+  accept a verdict under an invented key name).
+- Its value MUST be **exactly one of**: `http_requests` | `http_navigation` |
+  `playwright` (exact spelling, no prose, no trailing text). Any other token —
+  `internal_api`, `api`, `stealth`, `seleniumbase_uc`, `undetected_chromedriver`,
+  `"use the OCC API directly"` — is NOT a verdict: it is discarded and the
+  strategy falls back to the measured cascade. If you believe a JSON API is the
+  right mechanism, say so in `reason` and recommend `http_requests`.
+- `site_analyzer_said` records what you are overriding, `reason` carries the
+  evidence (what you probed, not what you assume).
 
 ## Your Output
 
@@ -305,6 +358,19 @@ Save to: `workspace/{site_slug}/product_analysis.json`
   "jsonld_extraction": { ... },
   "variants": { ... },
   "page_structure": { ... },
+  "mechanism_reassessment": {
+    "recommended": "http_requests",
+    "site_analyzer_said": "playwright",
+    "reason": "OCC REST API returns complete product JSON without auth or JS rendering (see §7 — recommended must be exactly http_requests | http_navigation | playwright)"
+  },
+  "api_extraction": {
+    "endpoint": "https://api.example.com/occ/v2/products/{code}?fields=FULL",
+    "method": "GET",
+    "code_from_url": {"regex": "/product/([\\d]+)/"},
+    "key_response_fields": {
+      "price": {"path": "price", "type": "object", "fields": {"formattedValue": "string"}}
+    }
+  },
   "confidence_score": 0.9
 }
 ```

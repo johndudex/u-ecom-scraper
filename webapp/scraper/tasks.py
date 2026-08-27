@@ -828,7 +828,19 @@ def _finalize_job(job: ScrapeJob) -> None:
                 with open(p, "r", encoding="utf-8") as fh:
                     out_data = json.load(fh)
             if out_data:
-                site_block = out_data.get("site", {})
+                # T0.5/H1: two templates emitted `site` as a bare host string —
+                # `.get` on it AttributeError'd and the bare except below
+                # discarded EVERY ground-truth override (count/name/platform/
+                # method). Normalize any shape; platform falls back to the
+                # site_analysis verdict (never to product_analysis — no such key).
+                from src.output_site import ground_truth_platform, normalize_site_block
+
+                _fallback_platform = ground_truth_platform(
+                    final_state.get("site_analysis") or {}
+                )
+                site_block = normalize_site_block(
+                    out_data.get("site"), fallback_platform=_fallback_platform
+                )
                 if site_block.get("platform"):
                     job.platform = site_block["platform"]
                 if site_block.get("scraping_method") and not job.scraping_method:
@@ -1678,6 +1690,12 @@ def run_agent_task(self, playground_id: int) -> None:
         pg.save()
 
 
+# T1.7: PLAYGROUND-ONLY per-agent cap — counts LLM turns, NOT graph recursion
+# steps (graph.py's AGENT_RECURSION_MAP counts those; the two maps are
+# different units and deliberately NOT unified — the playground's smaller
+# budget is its only bound; inheriting graph values would make it unbounded).
+# dagster_converter is absent here on purpose: the playground doesn't exercise
+# it; the graph caps it in AGENT_RECURSION_MAP (120) + the 900s wall.
 AGENT_MAX_ITERATIONS_LOOKUP: dict[str, int] = {
         "site_analyzer": 25,
     "product_analyzer": 50,

@@ -96,7 +96,11 @@ services:
       ZAI_BASE_URL: ${ZAI_BASE_URL:-https://api.z.ai/api/coding/paas/v4/}
       ZAI_MAIN_MODEL: ${ZAI_MAIN_MODEL:-glm-5-turbo}
       ZAI_SMALL_MODEL: ${ZAI_SMALL_MODEL:-glm-5-turbo}
-      CODE_WRITER_MODEL: ${CODE_WRITER_MODEL:-glm-5.2}
+      # T0.1 model confound: code_writer is the ONLY per-agent model override.
+      # compose no longer forces a default (glm-5.2) — unset here means the
+      # settings.py default (glm-5-turbo, the 204-job corpus model) applies, so
+      # runs stay comparable. Set CODE_WRITER_MODEL explicitly in .env to deviate.
+      CODE_WRITER_MODEL: ${CODE_WRITER_MODEL:-}
       # LiteLLM proxy routing (llm.py _provider_for): set CODE_WRITER_MODEL=
       # litellm/standardcompute to route code_writer through the proxy. The
       # prefix is the kill switch — unset it to return to Z.AI.

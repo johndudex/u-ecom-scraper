@@ -185,7 +185,10 @@ ZAI_SMALL_MODEL = config("ZAI_SMALL_MODEL", default="glm-5-turbo")
 # from the stronger model now that it gets complete-but-lean summaries instead
 # of reading the full analysis JSONs. Set CODE_WRITER_MODEL=glm-4.7-flash to
 # A/B test the faster flash model on codegen.
-CODE_WRITER_MODEL = config("CODE_WRITER_MODEL", default="glm-5-turbo")
+# T0.1: an EMPTY env value must fall through to the corpus default — compose
+# exports CODE_WRITER_MODEL="" when .env doesn't set it (decouple returns ""
+# for present-but-empty, it does NOT substitute the default).
+CODE_WRITER_MODEL = config("CODE_WRITER_MODEL", default="glm-5-turbo") or "glm-5-turbo"
 # LiteLLM proxy provider routing (code_writer via llm.johnjf.xyz). A model name
 # prefixed with one of LITELLM_MODEL_PREFIXES (e.g. CODE_WRITER_MODEL=
 # litellm/standardcompute) routes to LITELLM_BASE_URL with the prefix stripped

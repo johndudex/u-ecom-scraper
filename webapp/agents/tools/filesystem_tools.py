@@ -454,4 +454,55 @@ def get_filesystem_tools(
             return f"No matches for pattern '{pattern}' in '{effective_path}'"
         return "\n".join(results)
 
-    return [read_file, write_file, edit_file, search_files, search_content]
+    @tool
+    def check_syntax(path: str) -> str:
+        """Parse a Python file for syntax errors WITHOUT running it.
+
+        Args:
+            path: Absolute or relative path to a .py file within the project.
+
+        Returns:
+            "OK: <path> parses cleanly (compiles)" on success, or a line-precise
+            error ("Line N: <message>" plus the offending source line) on
+            failure. Use this after EVERY write_file/edit_file to a .py file —
+            syntax errors must never reach testing.
+        """
+        import ast as _ast
+
+        try:
+            safe = _enforce_root(path, root)
+        except ValueError as e:
+            return str(e)
+        try:
+            with open(safe, "r", encoding="utf-8", errors="replace") as f:
+                src = f.read()
+        except FileNotFoundError:
+            return f"File not found: {path}"
+        except IsADirectoryError:
+            return f"Path is a directory, not a file: {path}"
+        except Exception as e:
+            return f"Error reading '{path}': {e}"
+
+        # ast.parse gives the line-precise error; compile() catches the rare
+        # invalid-syntax cases ast accepts (e.g. stray bytes issues) — cheap.
+        try:
+            _ast.parse(src, filename=safe)
+            compile(src, safe, "exec")
+        except SyntaxError as e:
+            lines = src.splitlines()
+            offending = ""
+            if e.lineno and 1 <= e.lineno <= len(lines):
+                offending = lines[e.lineno - 1][:200]
+            where = f"Line {e.lineno}" + (f", offset {e.offset}" if e.offset else "")
+            return (
+                f"SYNTAX ERROR in {os.path.relpath(safe, root)}: {where}: {e.msg}\n"
+                f"{offending}\n"
+                f"Fix THIS exact line and re-run check_syntax."
+            )
+        except ValueError as e:
+            return f"SYNTAX ERROR in {os.path.relpath(safe, root)}: {e}"
+        except Exception as e:
+            return f"Error checking '{path}': {e}"
+        return f"OK: {os.path.relpath(safe, root)} parses cleanly (compiles)"
+
+    return [read_file, write_file, edit_file, search_files, search_content, check_syntax]

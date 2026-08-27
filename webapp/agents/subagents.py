@@ -116,20 +116,14 @@ AGENT_PROMPT_MAP: dict[str, str] = {
 }
 
 
-AGENT_MAX_ITERATIONS: dict[str, int] = {
-    "site_analyzer": 30,
-    "product_analyzer": 30,
-    # ═══ ARCHIVED (replaced by browser_traverse) ═══
-    # "navigation_agent": 40,
-    # "navigation_explore": 20,
-    # ══════════════════════════════════════════════
-    "nav_skill_review": 15,
-    "code_writer": 20,
-    "code_tester": 20,
-    "cleanup": 15,
-    "skill_learner": 15,
-    "dagster_converter": 15,
-}
+# T1.7: the dead AGENT_MAX_ITERATIONS dict ({site_analyzer: 30, code_writer:
+# 20, ...}) was DELETED — zero importers (the graph caps react loops via
+# AGENT_RECURSION_MAP in graph.py + _AGENT_INVOKE_TIMEOUT; the playground has
+# its own AGENT_MAX_ITERATIONS_LOOKUP in scraper/tasks.py). Do NOT re-unify
+# them: they count DIFFERENT UNITS (recursion_limit = graph steps; the lookup =
+# playground LLM turns, ~2.5× apart) and the playground's smaller budget is
+# its only bound — inheriting graph values would make it unbounded, and
+# capping the graph at lookup values would GraphRecursionError at scale.
 
 BROWSER_UNAVAILABLE_WARNING = (
     "\n\n"
@@ -163,20 +157,216 @@ def _build_content_type_context(state: dict) -> str:
     return "\n".join(lines) + "\n\n"
 
 
-def _summarize_product_analysis(pa: dict, allowed: set[str] | None = None) -> str:
+# ── Field-map summarizer constants + helpers (T1.1 / T1.5) ─────────────────
+# The seed message is truncation-exempt (headroom only compresses tool output),
+# so every cap below is LOAD-BEARING — it is the only thing bounding these
+# blocks.
+
+# method values that mean "the value comes from a JSON API response body".
+# A field is also API-shaped when it carries an explicit api_path /
+# api_fallback_path regardless of the method label.
+_API_FIELD_METHODS = ("api", "internal_api")
+
+# Char caps.
+_FIELD_NOTE_CAP = 300
+_API_EXTRACTION_CAP = 600
+
+# T1.2 relays (code-tester artifacts). Bounded — the writer's seed message is
+# truncation-exempt, so an unbounded relay re-inflates the context the summary
+# exists to shrink.
+_ISSUE_FIX_CAP = 300
+_WRITER_FEEDBACK_CAP = 600
+
+# T1.5 (I7): exact strategy tokens a mechanism_reassessment verdict may carry.
+# Value-match, NOT a key-alias set, and NEVER ``scraping_mechanism`` (a key
+# ``_derive_strategy`` itself writes — a restated old verdict there would be
+# self-confirming).
+_MR_VERDICT_TOKENS = ("http_requests", "http_navigation", "playwright")
+
+# Marker ``_derive_strategy`` writes into strategy_justification when the
+# mechanism verdict was APPLIED (tests/test_job12_strategy_gate.py pins the
+# substring contract).
+_MR_APPLIED_MARKER = "mechanism_reassessment"
+
+# ── run_scraper cap buckets (T1.4 / I4 — code_writer ONLY) ─────────────────
+# A single flat cap let probe-family scratch runs (probe*.py / test_*.py /
+# debug*.py) consume the whole budget, so the writer handed off a draft it had
+# never executed. Buckets are counted INDEPENDENTLY: probe-family 2 + draft 2.
+# "other" keeps the pre-split flat cap of 3 so an unclassified target is no
+# looser than before the split. Scope guard (regression critic): this binds
+# ONLY code_writer — code_tester legitimately re-runs the draft across fix
+# cycles and stays UNCAPPED; do not move the guard into shell_tools.
+RUN_SCRAPER_PROBE_PREFIXES = ("probe", "test_", "debug")
+RUN_SCRAPER_DRAFT_PREFIX = "scraper_draft"
+RUN_SCRAPER_CAPS = {"probe_family": 2, "scraper_draft": 2, "other": 3}
+_RUN_SCRAPER_BUCKET_LABELS = {
+    "probe_family": "probe-family (probe*/test_*/debug* targets)",
+    "scraper_draft": "scraper_draft*",
+    "other": "other targets",
+}
+
+
+def _run_scraper_bucket(target: object) -> str:
+    """Classify a run_scraper target (path or bare stem) into its cap bucket."""
+    base = os.path.basename(str(target or "").replace("\\", "/").strip()).lower()
+    stem = base.removesuffix(".py")
+    if stem.startswith(RUN_SCRAPER_PROBE_PREFIXES):
+        return "probe_family"
+    if stem.startswith(RUN_SCRAPER_DRAFT_PREFIX):
+        return "scraper_draft"
+    return "other"
+
+
+def _run_scraper_target(args: tuple, kwargs: dict) -> str:
+    """Pull the run_scraper target out of a guard invocation."""
+    target = kwargs.get("scraper_path") or kwargs.get("scraper")
+    if not target:
+        for arg in args:
+            if isinstance(arg, str) and (
+                arg.endswith(".py") or "/" in arg or "\\" in arg
+            ):
+                target = arg
+                break
+    return str(target or "")
+
+
+def _is_api_field(info: object) -> bool:
+    """True when a field-map entry is fed by a JSON API response body."""
+    if not isinstance(info, dict):
+        return False
+    if str(info.get("method", "")).lower() in _API_FIELD_METHODS:
+        return True
+    return bool(info.get("api_path") or info.get("api_fallback_path"))
+
+
+def _mr_has_verdict(mr: object) -> bool:
+    """True when a mechanism_reassessment block carries a strategy verdict.
+
+    Recursive VALUE-match confined to the block itself (``recommended`` is the
+    canonical key but recorded artifacts also used ``reassessed_mechanism``) —
+    any string exactly equal to one of the enum tokens counts. It is NOT a
+    key-alias set: the ``scraping_mechanism`` key ``_derive_strategy`` itself
+    writes lives on scraper_analysis, OUTSIDE this block, and is never scanned
+    here — a restated old verdict there must not read as self-confirmation.
+    Non-string / non-exact-token values never match (poison descriptors report
+    opinions under invented tokens).
+    """
+    if not isinstance(mr, dict):
+        return False
+    stack: list = [mr]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+        elif isinstance(cur, str) and cur.strip() in _MR_VERDICT_TOKENS:
+            return True
+    return False
+
+
+def _suppress_mechanism_reassessment(
+    mr: object, scraper_analysis: object
+) -> bool:
+    """T1.5 (I7): decide whether the mechanism_reassessment block is injected.
+
+    DEFAULT is render — resumed jobs and any run where scraper_analysis is
+    absent/unreadable must keep the verdict evidence. SUPPRESS only when the
+    strategy gate ARMED and REJECTED the verdict: scraper_analysis exists, its
+    strategy_justification does not cite the applied-verdict marker, and the
+    block does carry a verdict. In that state the block argues against the
+    message's own strategy instruction.
+    """
+    if not isinstance(mr, dict) or not mr:
+        return False
+    sa = scraper_analysis if isinstance(scraper_analysis, dict) else {}
+    if not sa:
+        return False
+    justification = str(sa.get("strategy_justification") or "")
+    if _MR_APPLIED_MARKER in justification:
+        return False
+    return _mr_has_verdict(mr)
+
+
+def _render_api_extraction(ax: object, cap: int = _API_EXTRACTION_CAP) -> str:
+    """Bounded ``api_extraction`` render (T1.1) — the endpoint URL, the
+    code-extraction pattern, the response sample keys and ONE example entry.
+
+    priceline's raw block is 2.3K (headers, code_from_url, every
+    key_response_fields entry). The seed is truncation-exempt, so verbatim
+    injection would move all of it into untrimmable context; this keeps what
+    codegen needs and hard-caps the rest.
+    """
+    if not isinstance(ax, dict) or not ax:
+        return ""
+    import json as _json
+
+    parts: list[str] = []
+    url = ax.get("endpoint") or ax.get("url") or ax.get("api_url") or ""
+    if url:
+        parts.append(f"endpoint=`{ax.get('method') or 'GET'} {url}`")
+    cfu = ax.get("code_from_url")
+    if isinstance(cfu, dict) and cfu.get("regex"):
+        parts.append(f"code_from_url=`{cfu['regex']}`")
+    keys = ax.get("sample_keys") or ax.get("keys") or ax.get("response_keys") or []
+    if isinstance(keys, dict):
+        keys = list(keys)
+    if keys:
+        parts.append(f"sample_keys={list(keys)[:12]}")
+    out = "; ".join(parts)
+    example = _one_api_example(ax)
+    if example is not None:
+        prefix = ("; " if out else "") + "example="
+        room = cap - len(out) - len(prefix) - 1
+        if room >= 80:
+            blob = _json.dumps(example, ensure_ascii=False)
+            if len(blob) > room:
+                blob = blob[: room - 1].rstrip() + "…"
+            out += prefix + blob
+    if len(out) > cap:
+        out = out[: cap - 1] + "…"
+    return f"\n**API Extraction:** {out}" if out else ""
+
+
+def _one_api_example(ax: dict) -> object | None:
+    """ONE worked response-field example from an api_extraction block."""
+    krf = ax.get("key_response_fields")
+    if isinstance(krf, dict) and krf:
+        name = next(iter(krf))
+        return {name: krf[name]}
+    for key in ("sample_record", "example", "sample_response"):
+        val = ax.get(key)
+        if isinstance(val, dict) and val:
+            return val
+        if isinstance(val, list) and val:
+            return val[0]
+    return None
+
+
+def _summarize_product_analysis(
+    pa: dict,
+    allowed: set[str] | None = None,
+    scraper_analysis: dict | None = None,
+) -> str:
     """Complete-but-lean summary of product_analysis for code_writer.
 
     Replaces ``read_file`` of the full product_analysis.json (20K+). Includes
     EVERYTHING code_writer needs to write the scraper:
 
-    - the per-field extraction map (method + selector + JSON-LD/CSS fallback +
-      JS snippet) — compacted; ``examples``/``expectations``/``tested`` are
-      dropped (validation is code_tester's concern, not extraction).
+    - the per-field extraction map (method + selector/API path + fallback +
+      JS snippet + API notes) — compacted; ``examples``/``expectations``/
+      ``tested`` are dropped (validation is code_tester's concern, not
+      extraction). API-method fields are PINNED into the rendered set: the
+      core-first ``_MAX_FIELDS`` cap would otherwise drop the non-core API
+      field the map was extended to surface.
     - ``page_structure``, ``extraction_methods``, ``jsonld_extraction``,
-      ``mechanism_reassessment``, ``site_analysis_review``, ``variants`` —
-      included verbatim (each is small; these carry the page layout, the
-      primary extraction approach, JSON-LD details + field guidance like
-      "title truncated -> use CSS h1", and mechanism justification).
+      ``site_analysis_review``, ``variants`` — included verbatim (each is
+      small; these carry the page layout, the primary extraction approach,
+      JSON-LD details + field guidance like "title truncated -> use CSS h1").
+    - ``mechanism_reassessment`` — CONDITIONAL (see
+      ``_suppress_mechanism_reassessment``).
+    - ``api_extraction`` — bounded render (endpoint + sample keys + one
+      example entry), never the raw block.
     - ``content_type`` / ``output_key`` scalars.
 
     Only genuinely redundant/non-codegen keys are dropped: ``connectivity``
@@ -212,14 +402,24 @@ def _summarize_product_analysis(pa: dict, allowed: set[str] | None = None) -> st
     _MAX_FIELDS = 15
     lines.append("**Field Extraction Map:**")
     for name, info in _sorted_fields:
-        if _shown >= _MAX_FIELDS and name not in _CORE_FIELDS:
+        # T1.1 guard: API-method fields are PINNED — they are exactly the
+        # non-core entries (e.g. ratings on an API-fed site) the core-first
+        # cap would silently drop, and the api_path/notes this loop renders
+        # are the only place code_writer sees how to read them.
+        if _shown >= _MAX_FIELDS and name not in _CORE_FIELDS and not _is_api_field(info):
             continue
         _shown += 1
         if not isinstance(info, dict):
             lines.append(f"- **{name}**: {info}")
             continue
         method = info.get("method", "?")
-        sel = info.get("selector") or info.get("path") or ""
+        sel = (
+            info.get("selector")
+            or info.get("path")
+            or info.get("api_path")
+            or info.get("api_fallback_path")
+            or ""
+        )
         fb = (
             info.get("jsonld_fallback")
             or info.get("css_fallback")
@@ -234,19 +434,43 @@ def _summarize_product_analysis(pa: dict, allowed: set[str] | None = None) -> st
             line += f" fallback=`{fb}`"
         if js:
             line += f" js=`{js}`"
+        # API-fed fields carry their read recipe in `notes` (which path wins,
+        # when the fallback applies, what to strip). Without it the rendered
+        # api_path is an unlabelled key into an undocumented response.
+        if _is_api_field(info):
+            notes = re.sub(r"\s+", " ", str(info.get("notes") or "")).strip()
+            if notes:
+                if len(notes) > _FIELD_NOTE_CAP:
+                    notes = notes[: _FIELD_NOTE_CAP - 1] + "…"
+                line += f' notes="{notes}"'
         lines.append(line)
+    # T1.5 (I7): mechanism_reassessment is CONDITIONAL — render by default,
+    # suppress only when the strategy gate armed and rejected the verdict
+    # (injecting it then argues against the message's own strategy).
+    if not _suppress_mechanism_reassessment(
+        pa.get("mechanism_reassessment"), scraper_analysis
+    ):
+        _mr = pa.get("mechanism_reassessment")
+        if _mr:
+            lines.append(
+                f"**Mechanism Reassessment:** {_json.dumps(_mr, ensure_ascii=False)}"
+            )
     # The other extraction-relevant sections — verbatim (small + complete).
     for key, label in (
         ("page_structure", "Page Structure"),
         ("extraction_methods", "Extraction Methods"),
         ("jsonld_extraction", "JSON-LD Extraction"),
-        ("mechanism_reassessment", "Mechanism Reassessment"),
         ("site_analysis_review", "Site Analysis Review"),
         ("variants", "Variants"),
     ):
         val = pa.get(key)
         if val:
             lines.append(f"**{label}:** {_json.dumps(val, ensure_ascii=False)}")
+    # T1.1: api_extraction bounded to url + code pattern + sample keys + ONE
+    # example entry (never the raw block — the seed is truncation-exempt).
+    _api_section = _render_api_extraction(pa.get("api_extraction"))
+    if _api_section:
+        lines.append(_api_section)
     # Tiny scalars code_writer references.
     if pa.get("content_type"):
         lines.append(f"**content_type:** {pa['content_type']}")
@@ -922,16 +1146,27 @@ def _apply_guards(tools: list, agent_name: str) -> list:
     if agent_name == "code_writer":
         from .tools.guards import _make_guard
 
-        _rs_budget = {"n": 0}
+        # T1.4 (I4): the cap is PER BUCKET, not global — see the constants block.
+        _rs_budget: dict[str, int] = {k: 0 for k in RUN_SCRAPER_CAPS}
 
         def _cap_run_scraper(func, args, kwargs):
-            _rs_budget["n"] += 1
-            if _rs_budget["n"] > 3:
-                return (
-                    "run_scraper has been called 3 times (cap). You have tested the "
-                    "scraper enough — finalize it with write_file/edit_file and stop."
-                )
-            return None
+            bucket = _run_scraper_bucket(_run_scraper_target(args, kwargs))
+            _rs_budget[bucket] += 1
+            used = _rs_budget[bucket]
+            if used <= RUN_SCRAPER_CAPS[bucket]:
+                return None
+            remaining = ", ".join(
+                f"{_RUN_SCRAPER_BUCKET_LABELS[b]} "
+                f"{max(RUN_SCRAPER_CAPS[b] - _rs_budget[b], 0)}/{RUN_SCRAPER_CAPS[b]}"
+                for b in RUN_SCRAPER_CAPS
+            )
+            return (
+                f"run_scraper cap reached for the {_RUN_SCRAPER_BUCKET_LABELS[bucket]} "
+                f"bucket ({RUN_SCRAPER_CAPS[bucket]} allowed, {used} used). "
+                f"Remaining run_scraper budget: {remaining}. You have tested the "
+                "scraper enough — finalize it with write_file/edit_file and stop; "
+                "code_tester runs the full validation."
+            )
 
         for i, t in enumerate(tools):
             if getattr(t, "name", "") == "run_scraper":
@@ -1970,6 +2205,22 @@ def _summarize_test_report(state: dict) -> str:
         f"- **Assessment:** {assessment}",
         f"- **Confidence:** {confidence:.0%}",
     ]
+
+    def _issue_fix(i: dict) -> str:
+        """T1.2 (I8-narrow): relay the tester's mechanical fix instruction.
+
+        ``suggested_fix`` had ZERO readers in .py — the writer only ever saw
+        the complaint, so the retry applied a coin-flip rewrite instead of the
+        fix the tester already knew. Bounded (the seed is truncation-exempt).
+        """
+        fix = str(i.get("suggested_fix") or "").strip()
+        if not fix:
+            return ""
+        fix = re.sub(r"\s+", " ", fix)
+        if len(fix) > _ISSUE_FIX_CAP:
+            fix = fix[: _ISSUE_FIX_CAP - 1] + "…"
+        return f"    Fix: {fix}"
+
     if issues:
         # Issue-shape normalization (P1): three vocabularies are live in the
         # repo — graph.py inserts write `message`, code-tester.md documents
@@ -1998,6 +2249,9 @@ def _summarize_test_report(state: dict) -> str:
                 lines.append(f"  - `{field}`: {desc}")
                 if expected or actual:
                     lines.append(f"    Expected: {expected!r} | Actual: {actual!r}")
+                _fix = _issue_fix(i)
+                if _fix:
+                    lines.append(_fix)
         if medium:
             lines.append(f"\n**MEDIUM severity ({len(medium)}):**")
             for i in medium[:3]:
@@ -2006,6 +2260,9 @@ def _summarize_test_report(state: dict) -> str:
                 )
                 desc = _issue_text(i)
                 lines.append(f"  - `{field}`: {desc}")
+                _fix = _issue_fix(i)
+                if _fix:
+                    lines.append(_fix)
         # Relay CLI-contract issues verbatim (Edit 7): the marker-prefixed
         # bounce must reach the next code_writer message intact so the fix
         # instruction's vocabulary matches the guard's.
@@ -2019,6 +2276,19 @@ def _summarize_test_report(state: dict) -> str:
                 "\n**⚠️ CLI CONTRACT VIOLATION — targeted argparse fix, do NOT "
                 "regenerate the scraper:**\n" + _issue_text(_marked[0])
             )
+    # T1.2: report-level remediation instructions (code-tester.md:146 — also
+    # written deterministically on discovery-probe crashes and CLI contract
+    # violations). Unread until now; the issue relay above carried only the
+    # marker text, not the fix instruction. Outside the issues guard so a
+    # report with feedback and an empty issue list is not silently dropped.
+    _feedback = str(report.get("feedback_for_writer") or "").strip()
+    if _feedback:
+        if len(_feedback) > _WRITER_FEEDBACK_CAP:
+            _feedback = _feedback[: _WRITER_FEEDBACK_CAP - 1] + "…"
+        lines.append(
+            "\n**⚠️ REMEDIATION INSTRUCTION (apply this fix — do NOT rewrite "
+            "from scratch):**\n" + _feedback
+        )
     # Fix A: surface the RAW error so code_writer makes a targeted fix instead of
     # regenerating from scratch (which reintroduces variance).
     strategy_error = report.get("strategy_error") if isinstance(report, dict) else None
@@ -2643,23 +2913,21 @@ def build_code_writer_message(state: dict) -> list:
         )
 
         _template_family = "navigation"
-        # Strategy-aware template selection (Phase 2, JS-listing+pagination fix):
-        # align this hint with graph.py:_select_template_file (the authoritative
-        # source). The old code forced navigation_scraper.py for EVERY nav job
-        # regardless of strategy — so playwright-strategy jobs (lw.com/Coveo)
-        # got a template with no load-more clicker, while the verified
-        # _click_load_more lived in the playwright template they were prevented
-        # from using. Now: playwright strategy → playwright_scraper.py; http_navigation
-        # → http_navigation_scraper.py; else (http_requests form-POST etc.) → navigation_scraper.py.
-        _strategy = (
-            ((state.get("scraper_analysis") or {}).get("strategy") or "").lower()
-            if isinstance(state, dict) else ""
-        )
-        _nav_template_file = (
-            "http_navigation_scraper.py" if mechanism == "http_navigation"
-            else "playwright_scraper.py" if _strategy == "playwright"
-            else "navigation_scraper.py"
-        )
+        # T3.2 single authority: this hint now derives from the SAME selector
+        # graph.py uses for the system-prompt template injection
+        # (agents/template_selector.select_template_file). The old inline
+        # mechanism-first derivation never returned api/ssr_div_list/requests
+        # templates, so for those strategies the writer read one template's
+        # code (system prompt) while being pointed at another (this hint).
+        try:
+            from .template_selector import select_template_file
+
+            _nav_template_file = select_template_file(state)
+        except Exception:
+            _nav_template_file = (
+                "http_navigation_scraper.py" if mechanism == "http_navigation"
+                else "playwright_scraper.py"
+            )
         nav_template_hint = (
             f"\n### Template\nRead the template at: templates/{_nav_template_file} "
             "and use it as your base for the two-phase architecture. "
@@ -3215,7 +3483,9 @@ def build_code_writer_message(state: dict) -> list:
     _pa_raw = state.get("product_analysis") or {}
     if _prior_count_line:
         content = content + _prior_count_line
-    pa_summary = _summarize_product_analysis(_pa_raw, allowed=_cw_allowed)
+    pa_summary = _summarize_product_analysis(
+        _pa_raw, allowed=_cw_allowed, scraper_analysis=scraper_analysis
+    )
     if pa_summary:
         pa_summary += (
             "\n### DO NOT read_file the analysis JSONs\n"

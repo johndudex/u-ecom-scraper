@@ -68,6 +68,12 @@ class ScrapeState(TypedDict, total=False):
     coverage_retry_count: int
     test_retry_count: int
     reanalyze_count: int
+    # T0.3/T0.4: last dead code_writer invocation (wall-clock timeout /
+    # provider exception that produced no draft) and how many consecutive
+    # deaths this run has seen. Deliberately NOT test_retry_count — that
+    # carries FINAL_RETRY_SENTINEL semantics for the testing loop.
+    code_writer_error: str
+    code_writer_error_count: int
     # How many times product_analyzer has re-mapped failed fields in this run
     # (capped by MAX_REMAPS). Set when route_after_testing sends a mapping
     # failure back to product_analyzer.
