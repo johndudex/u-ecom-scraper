@@ -119,12 +119,183 @@ API_RETRY_DELAYS = [5, 15, 30]
 _PATCHES_ENABLED = True
 
 
+def _scan_json_prefix(content: str, upto: int) -> tuple[list[str], bool]:
+    """Track JSON structure over ``content[:upto]``.
+
+    Returns ``(closers, in_string)`` where ``closers`` is the stack of still
+    required closers (innermost first) and ``in_string`` says whether the scan
+    ended inside an unterminated string literal.
+    """
+    stack: list[str] = []
+    in_str = False
+    esc = False
+    for c in content[:upto]:
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c in "{[":
+                stack.append("}" if c == "{" else "]")
+            elif c in "}]":
+                if stack:
+                    stack.pop()
+    return stack, in_str
+
+
+def _trim_partial_json(head: str) -> str:
+    """Trim a raw JSON prefix back to the end of its last COMPLETE element.
+
+    Walks backward past any trailing whitespace/comma, then drops a dangling
+    fragment — ``"key"`` with no value, ``"key":`` with no value, or an
+    unterminated/invalid value (``"key": 25 offices``, ``"key": "unesc``) —
+    repeatedly, so what remains is either empty or ends on a complete value.
+    """
+    while True:
+        h = head.rstrip()
+        if not h:
+            return h
+        if h.endswith(","):
+            head = h[:-1]
+            continue
+        # find the character that ends the last syntactic unit
+        m = len(h) - 1
+        while m >= 0 and h[m] in " \t\r\n":
+            m -= 1
+        if m < 0:
+            return ""
+        # Case A: the last complete thing is a VALUE (ends with a non-separator)
+        if h[m] not in ",:":
+            return h
+        # Case B: "key": with nothing after it — drop the whole pair
+        if h[m] == ":":
+            # walk back over the key's closing quote
+            k = m - 1
+            while k >= 0 and h[k] in " \t\r\n":
+                k -= 1
+            if k < 0:
+                return ""
+            if h[k] != '"':
+                # not a simple string key (numeric/keyed var) — bail out safe
+                return h[: m].rstrip().rstrip(",")
+            # find the key's opening quote
+            j = k - 1
+            while j >= 0 and h[j] != '"':
+                j -= 1
+            head = h[:j]
+            continue
+        # h[m] == "," handled above; unreachable
+        return h
+
+
+def _balanced_close(content: str, err: json.JSONDecodeError) -> str:
+    """Repair by closing the unclosed structure at the strict-parse error.
+
+    Re-parse from the TOP, keeping the largest prefix that is structurally
+    coherent, then append exactly the closers the bracket/quote stack demands.
+    When the error lands inside a malformed string value (the sidley/job-10
+    class: an unquoted scalar or an unescaped quote), the cut is rewound past
+    the enclosing ``"key":`` pair so no half-written value survives.
+    """
+    cut = min(err.pos, len(content))
+    stack, in_str = _scan_json_prefix(content, cut)
+    if in_str:
+        # Rewind to the opening quote of the malformed string...
+        j = cut - 1
+        while j >= 0 and content[j] != '"':
+            j -= 1
+        # ...and if that string is a VALUE (preceded by ':'), drop its key too.
+        m = j - 1 if j > 0 else -1
+        while m >= 0 and content[m] in " \t\r\n":
+            m -= 1
+        if m >= 0 and content[m] == ":":
+            m2 = m - 1
+            while m2 >= 0 and content[m2] in " \t\r\n":
+                m2 -= 1
+            if m2 >= 0 and content[m2] == '"':
+                j = m2
+        cut = j
+        stack, _ = _scan_json_prefix(content, cut)
+    head = _trim_partial_json(content[:cut])
+    # re-derive the stack against the trimmed head (trimming may have removed
+    # structure tokens, e.g. an opening quote of a dropped key)
+    stack, _ = _scan_json_prefix(head, len(head))
+    candidate = head + "".join(reversed(stack))
+    # A trailing bare scalar (unquoted value — the sidley shape) parses but is
+    # NOT the data the model wrote. Drop that pair and retry once so only
+    # complete, correctly-quoted elements survive the salvage.
+    if len(stack) == 1 and stack[0] == "}":
+        # Does the final element end with a bare token that only parses
+        # accidentally (``"bad": 25 offices with counts`` → parses as 25)?
+        m = len(head) - 1
+        while m >= 0 and head[m] in " \t\r\n":
+            m -= 1
+        # find the last key colon at the ROOT depth (inside the outermost
+        # object only — deeper elements belong to their own closed objects)
+        depth = 0
+        in_s = False
+        esc2 = False
+        last_sep = -1
+        for i2, c2 in enumerate(head[: m + 1]):
+            if in_s:
+                if esc2:
+                    esc2 = False
+                elif c2 == "\\":
+                    esc2 = True
+                elif c2 == '"':
+                    in_s = False
+            else:
+                if c2 == '"':
+                    in_s = True
+                elif c2 in "{[":
+                    depth += 1
+                elif c2 in "}]":
+                    depth -= 1
+                elif c2 in ",:" and depth == 1:
+                    last_sep = i2
+        if last_sep >= 0 and head[last_sep] == ":":
+            k2 = last_sep - 1
+            while k2 >= 0 and head[k2] in " \t\r\n":
+                k2 -= 1
+            if k2 >= 0 and head[k2] == '"':
+                j = k2 - 1
+                while j >= 0 and head[j] != '"':
+                    j -= 1
+                head2 = _trim_partial_json(head[:j])
+                stack2, _ = _scan_json_prefix(head2, len(head2))
+                cand2 = head2 + "".join(reversed(stack2))
+                try:
+                    probe2 = json.loads(cand2)
+                    if isinstance(probe2, dict) and probe2:
+                        return cand2
+                except Exception:
+                    pass
+    return candidate
+
+
 def _fix_json_artifact(slug: str, filename: str) -> None:
     """Repair-on-write guard (job-10 lesson): a corrupt artifact silently
     became {} downstream and the writer lost the field map AND the verify
-    note. Repair passes: bad-escape rewrite, then salvage of the largest
-    parseable object. Still-failing files are RENAMED *.corrupt so
-    downstream sees missing (-> rerun path), never silently-empty."""
+    note. Still-failing files are RENAMED *.corrupt so downstream sees
+    missing (-> rerun path), never silently-empty.
+
+    Passes (each logs which pass succeeded):
+      0  valid as-is (strict)
+      0b strict=False — C1 literal control chars, repaired losslessly
+      1  bad-escape rewrite — C4
+      2  raw_decode salvage of a leading object — C3 prefix
+      2b balanced-closer bounded by the error position — C2 (sidley/job-10).
+          The old pass 3 stepped from the END by len//200 trying only two
+          hard-coded closers and recovered NOTHING on the real sidley file;
+          the balanced closer recovers 9/10 top-level keys + all 36 field
+          mappings there.
+      3  coarse truncation sweep — last resort, unchanged
+    """
     if not slug:
         return
     try:
@@ -137,17 +308,37 @@ def _fix_json_artifact(slug: str, filename: str) -> None:
     try:
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
+    except Exception:
+        return
+
+    def _write_repaired(text: str, note: str) -> None:
+        # validate BEFORE writing — never persist a guess that doesn't parse
+        json.loads(text)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        logger.warning("_fix_json_artifact: %s (%s)", note, path)
+
+    # pass 0 / 0b: is it valid as-is (strictly, then leniently)?
+    err: Optional[json.JSONDecodeError] = None
+    try:
         json.loads(content)
         return  # valid as-is
+    except json.JSONDecodeError as e:
+        err = e
+    try:
+        parsed = json.loads(content, strict=False)
+        _write_repaired(
+            json.dumps(parsed, indent=1, ensure_ascii=False),
+            "pass 0b: repaired control characters (strict=False)",
+        )
+        return
     except json.JSONDecodeError:
         pass
     # pass 1: bad escapes
     try:
         fixed = re.sub(r'(?<=[^\\])\\(?!["\\/bfnrtu])', r"\\\\", content)
         json.loads(fixed)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(fixed)
-        logger.info("_fix_json_artifact: fixed bad escapes in %s", path)
+        _write_repaired(fixed, "pass 1: fixed bad escapes")
         return
     except Exception:
         pass
@@ -157,15 +348,27 @@ def _fix_json_artifact(slug: str, filename: str) -> None:
         dec = json.JSONDecoder()
         obj, _end = dec.raw_decode(content)
         if isinstance(obj, dict) and obj:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(obj, f, indent=1)
-            logger.warning(
-                "_fix_json_artifact: salvaged truncated object in %s (valid prefix kept)",
-                path,
+            _write_repaired(
+                json.dumps(obj, indent=1, ensure_ascii=False),
+                "pass 2: salvaged truncated object (valid prefix kept)",
             )
             return
     except Exception:
         pass
+    # pass 2b: balanced-closer salvage bounded by the strict-parse error
+    if err is not None:
+        try:
+            candidate = _balanced_close(content, err)
+            obj = json.loads(candidate)
+            if isinstance(obj, dict) and obj:
+                _write_repaired(
+                    json.dumps(obj, indent=1, ensure_ascii=False),
+                    f"pass 2b: balanced-closer salvage (recovered {len(obj)} "
+                    f"top-level keys; dropped content after char {err.pos})",
+                )
+                return
+        except Exception:
+            pass
     # pass 3: trim trailing partial content, re-close braces
     try:
         step = max(1, len(content) // 200)
@@ -175,9 +378,10 @@ def _fix_json_artifact(slug: str, filename: str) -> None:
                 try:
                     obj = json.loads(head + closer)
                     if isinstance(obj, dict) and obj:
-                        with open(path, "w", encoding="utf-8") as f:
-                            json.dump(obj, f, indent=1)
-                        logger.warning("_fix_json_artifact: salvaged %s by truncation", path)
+                        _write_repaired(
+                            json.dumps(obj, indent=1, ensure_ascii=False),
+                            "pass 3: salvaged by truncation sweep",
+                        )
                         return
                 except Exception:
                     continue
