@@ -13,7 +13,12 @@ set of item URLs:
   * ``page_param``      — construct ``?{page_param}=N`` directly (deterministic,
                           DOM-independent) and navigate. Offset-style params
                           (``offset``/``start``/``skip``/…) compute
-                          ``(page-1) * items_per_page`` automatically.
+                          ``(page-1) * items_per_page`` automatically. If the
+                          configured param VERIFIES as stuck (navigated, 0 new
+                          items — the server is ignoring it), a 4-candidate
+                          alias ladder probes ``currentPage`` (0-indexed), ``p``,
+                          page-sized ``offset`` and ``skip``; the first one that
+                          also verifies is adopted for the rest of the run.
   * ``next_button``     — a declared selector OR the semantic fallbacks
                           (``a[rel="next"]``, ``li.next a``, ``Next``-text).
                           Reads the href when present (no JS nav) else clicks.
@@ -74,6 +79,46 @@ __all__ = [
     "DEFAULT_LOAD_MORE_SELECTORS",
     "DEFAULT_NEXT_BUTTON_SELECTORS",
 ]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE-PARAM ALIAS LADDER
+#
+# ``?page=N`` is a GUESS. Some servers ignore it silently and keep serving page 1
+# (priceline job 302: ``?page=2`` returned the first 36 items again — the real
+# param is ``currentPage``, 0-indexed; 36+36+25 = 97), so the page_param
+# primitive reports _STUCK and the run looks exhausted at 1 page. Rather than
+# relabel that as exhaustion, the ladder probes a SMALL ordered set of aliases
+# and adopts the first one that VERIFIES (≥1 genuinely new item — the same
+# standard the primary param is held to). Bounded to the 4 candidates below and
+# probed at most ONCE per discovery run (``state`` memoizes the exhaustion), so
+# a site that honors none of them pays 4 extra navigations, not 4 per page.
+#
+# Modes — how a page number becomes a param value:
+#   "page"   value = N              (1-indexed page number)
+#   "page0"  value = N - 1          (0-indexed page number — ASP.NET/Spring
+#                                    ``currentPage``/``pageindex`` convention)
+#   "offset" value = (N-1)*size     (item offset; ``offset``/``skip`` are already
+#                                    in ``_OFFSET_PARAMS``, so
+#                                    ``build_page_param_url`` does the math)
+_PAGE_PARAM_ALIASES: tuple[tuple[str, str], ...] = (
+    ("currentPage", "page0"),
+    ("p", "page"),
+    ("offset", "offset"),
+    ("skip", "offset"),
+)
+
+# state keys (local to one discover_item_urls run — never a cfg mutation, so a
+# caller that reuses its DiscoveryConfig keeps the param it asked for).
+_USED_PARAM_KEY = "page_param_used"        # reporting only: param behind the tail of `urls`
+_ADOPTED_ALIAS_KEY = "page_param_alias"    # control flow: set ONLY on a verified adoption
+_ADOPTED_MODE_KEY = "page_param_alias_mode"
+_ADOPTED_PAGE_SIZE_KEY = "page_param_alias_page_size"
+_LADDER_EXHAUSTED_KEY = "page_param_ladder_exhausted"
+
+# Fallback page size for the offset-style aliases when neither the config nor
+# the page we just fetched yields one. Matches build_page_param_url's own
+# ``or 25`` default so both code paths agree.
+_DEFAULT_PAGE_SIZE = 25
 
 # Selector sets + _OFFSET_PARAMS now live in src/pagination_patterns.py so the
 # Layer A probe (traversal.py:_PAGE_STATE_JS) and this Layer C clicker share one
@@ -172,12 +217,19 @@ class DiscoveryResult:
 
     ``urls`` is de-duplicated, order-preserving. The coverage fields feed the
     discovery-coverage gate (``stop_reason`` is the load-bearing signal).
+
+    ``param_used`` is the page param that actually produced the tail of
+    ``urls`` — the configured ``cfg.page_param_name``, or the alias the stuck
+    ladder adopted (see ``_PAGE_PARAM_ALIASES``). None when the page_param
+    primitive never ran. Additive + back-compatible: the gate reads only
+    ``stop_reason``/``pages_visited``.
     """
 
     urls: list[str]
     stop_reason: str = StopReason.NO_NEXT_LINK.value
     max_pages_hit: bool = False
     pages_visited: int = 0
+    param_used: Optional[str] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -476,6 +528,115 @@ def _try_infinite_scroll(page: Any, cfg: DiscoveryConfig,
     return _STUCK
 
 
+def _resolve_page_size(cfg: DiscoveryConfig, fetched: list[str]) -> int:
+    """Page size the offset-style alias probes are built from. Source of truth,
+    in order:
+
+    1. the page we JUST fetched — ``len(fetched)`` is a direct measurement of
+       this listing's real page size (the stuck page returned the same items as
+       its predecessor, so its raw count IS the page size);
+    2. ``cfg.items_per_page`` — what the analysis/navigation phase reported
+       (used when the stuck page rendered nothing to measure);
+    3. ``_DEFAULT_PAGE_SIZE`` — the same 25 ``build_page_param_url`` already
+       assumes. A wrong guess is harmless: the candidate still has to VERIFY
+       (≥1 new item) before it is adopted.
+    """
+    if fetched:
+        return len(fetched)
+    if cfg.items_per_page:
+        return int(cfg.items_per_page)
+    return _DEFAULT_PAGE_SIZE
+
+
+def _strip_url_param(url: str, param: str) -> str:
+    """Return ``url`` without ``param`` (no bare ``?`` left behind)."""
+    p = urlparse(url)
+    qs = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if k != param]
+    return urlunparse(p._replace(query=urlencode(qs)))
+
+
+def _alias_param_url(current_url: str, alias: str, mode: str, page_num: int,
+                     page_size: int, dead_param: Optional[str] = None) -> str:
+    """Probe URL for one alias candidate.
+
+    ``build_page_param_url`` owns the arithmetic — including the offset math for
+    ``offset``/``skip`` (both in ``_OFFSET_PARAMS``) — so the only value this
+    function transforms is the 0-indexed ``currentPage`` mode.
+
+    ``dead_param`` (the configured param that just proved dead) is stripped
+    first: sending ``?page=2&currentPage=1`` leaves the server free to honor
+    either, and the leftovers would accumulate on every subsequent page.
+    """
+    if dead_param and dead_param != alias:
+        current_url = _strip_url_param(current_url, dead_param)
+    if mode == "page0":
+        page_num = max(page_num - 1, 0)
+    return build_page_param_url(current_url, alias, page_num, page_size)
+
+
+def _try_page_param_alias_ladder(page: Any, cfg: DiscoveryConfig,
+                                 extract_urls: Callable[[Any], list[str]],
+                                 seen: set[str], accumulated: list[str],
+                                 next_page_num: int, page_size: int,
+                                 state: dict) -> str:
+    """Fallback ladder for a VERIFIED-stuck primary page param.
+
+    Tries ``_PAGE_PARAM_ALIASES`` in order against the CURRENT url; adopts the
+    first candidate that verifies exactly the way the primary param must
+    (navigate + extract + ≥1 genuinely new url — the ``seen``-set diff is the
+    identical-content detector). Returns ``_PROGRESSED`` on adoption (recording
+    the adopted alias in ``state`` so every later page uses it), else ``_STUCK``
+    — the caller's accounting is unchanged either way.
+
+    Bounded: ≤ ``len(_PAGE_PARAM_ALIASES)`` probes per discovery run. Once every
+    candidate has failed, ``state`` memoizes it and later stuck iterations skip
+    the ladder entirely instead of re-paying 4 navigations per page.
+    """
+    if state.get(_LADDER_EXHAUSTED_KEY):
+        return _STUCK
+    current_url = getattr(page, "url", "") or cfg.site_url or ""
+    if not current_url:
+        return _STUCK
+    for alias, mode in _PAGE_PARAM_ALIASES:
+        if alias == cfg.page_param_name:
+            continue  # already the param that just went stuck
+        probe_url = _alias_param_url(
+            current_url, alias, mode, next_page_num, page_size,
+            dead_param=cfg.page_param_name,
+        )
+        if probe_url == current_url:
+            continue
+        logger.info(
+            "discovery: page param %r stuck after page %d — probing alias %s",
+            cfg.page_param_name, next_page_num, probe_url[:100],
+        )
+        # ``_discovery_goto`` stamps NAVIGATE_ERROR (sticky, H4) on failure. A
+        # 404/timeout on ONE alias says nothing about the others, so roll the
+        # stop reason back — a working alias must not be shadowed by a bad probe.
+        prev_stop = state.get("stop_reason")
+        if not _discovery_goto(page, probe_url, cfg, state):
+            state["stop_reason"] = prev_stop
+            continue
+        fetched = _safe_extract(page, extract_urls, cfg.safe_eval_retries)
+        added = _merge_new(accumulated, seen, fetched)
+        if added:
+            state[_ADOPTED_ALIAS_KEY] = alias
+            state[_ADOPTED_MODE_KEY] = mode
+            state[_ADOPTED_PAGE_SIZE_KEY] = page_size
+            state[_USED_PARAM_KEY] = alias
+            logger.info(
+                "discovery: alias %r verified (+%d new urls) — adopted for the "
+                "rest of this run", alias, added,
+            )
+            return _PROGRESSED
+    state[_LADDER_EXHAUSTED_KEY] = True
+    logger.info(
+        "discovery: no page-param alias advanced (%d tried) — keeping %r",
+        len(_PAGE_PARAM_ALIASES), cfg.page_param_name,
+    )
+    return _STUCK
+
+
 def _try_page_param(page: Any, cfg: DiscoveryConfig,
                     extract_urls: Callable[[Any], list[str]],
                     seen: set[str], accumulated: list[str],
@@ -485,13 +646,48 @@ def _try_page_param(page: Any, cfg: DiscoveryConfig,
     current_url = getattr(page, "url", "") or cfg.site_url or ""
     if not current_url:
         return _NOT_APPLICABLE
+
+    # A previously adopted alias owns every subsequent page (the primary param
+    # was already proven dead).
+    alias = state.get(_ADOPTED_ALIAS_KEY)
+    if alias:
+        next_url = _alias_param_url(
+            current_url, alias, state.get(_ADOPTED_MODE_KEY, "page"),
+            next_page_num, state.get(_ADOPTED_PAGE_SIZE_KEY) or cfg.items_per_page or _DEFAULT_PAGE_SIZE,
+            dead_param=cfg.page_param_name,
+        )
+        if not _discovery_goto(page, next_url, cfg, state):
+            return _NAV_ERROR
+        added = _merge_new(accumulated, seen, _safe_extract(page, extract_urls, cfg.safe_eval_retries))
+        return _PROGRESSED if added else _STUCK
+
+    state.setdefault(_USED_PARAM_KEY, cfg.page_param_name)
+    # A failed ladder leaves the page sitting on an alias URL — don't let its
+    # params leak into this one.
+    for alias_name, _mode in _PAGE_PARAM_ALIASES:
+        if alias_name != cfg.page_param_name:
+            current_url = _strip_url_param(current_url, alias_name)
     next_url = build_page_param_url(
         current_url, cfg.page_param_name, next_page_num, cfg.items_per_page,
     )
     if not _discovery_goto(page, next_url, cfg, state):
         return _NAV_ERROR
-    added = _merge_new(accumulated, seen, _safe_extract(page, extract_urls, cfg.safe_eval_retries))
-    return _PROGRESSED if added else _STUCK
+    fetched = _safe_extract(page, extract_urls, cfg.safe_eval_retries)
+    added = _merge_new(accumulated, seen, fetched)
+    if added:
+        return _PROGRESSED
+    if not fetched:
+        # The page rendered NOTHING — the list genuinely ended (or a soft error).
+        # No alias can beat an empty page, so don't pay 4 probes on every
+        # healthy exhausted run.
+        return _STUCK
+    # Verified-stuck WITH content: the page held only items we already have, i.e.
+    # the server is probably ignoring the param (job 302). The only condition
+    # under which the alias ladder fires.
+    return _try_page_param_alias_ladder(
+        page, cfg, extract_urls, seen, accumulated, next_page_num,
+        _resolve_page_size(cfg, fetched), state,
+    )
 
 
 def _try_next_button(page: Any, cfg: DiscoveryConfig,
@@ -580,7 +776,9 @@ def discover_item_urls(
     DiscoveryResult
         ``urls`` (deduped, order-preserving) + ``stop_reason`` +
         ``max_pages_hit`` + ``pages_visited``. Feed ``stop_reason`` to the
-        discovery-coverage gate.
+        discovery-coverage gate. ``param_used`` names the page param that
+        produced the tail of ``urls`` (the configured one, or the alias adopted
+        after the configured one went stuck).
     """
     cfg = cfg or DiscoveryConfig()
     state = {"stop_reason": StopReason.NO_NEXT_LINK.value}
@@ -604,6 +802,7 @@ def discover_item_urls(
             return DiscoveryResult(
                 accumulated, stop_reason=state["stop_reason"],
                 max_pages_hit=True, pages_visited=pages_visited,
+                param_used=state.get(_USED_PARAM_KEY),
             )
 
         next_page_num = pages_visited + 1
@@ -635,6 +834,7 @@ def discover_item_urls(
                 return DiscoveryResult(
                     accumulated, stop_reason=state["stop_reason"],
                     pages_visited=pages_visited,
+                    param_used=state.get(_USED_PARAM_KEY),
                 )
             if outcome == _PROGRESSED:
                 iteration_outcome = _PROGRESSED
@@ -681,6 +881,7 @@ def discover_item_urls(
     return DiscoveryResult(
         accumulated, stop_reason=state["stop_reason"],
         max_pages_hit=False, pages_visited=pages_visited,
+        param_used=state.get(_USED_PARAM_KEY),
     )
 
 

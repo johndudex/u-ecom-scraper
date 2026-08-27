@@ -31,6 +31,14 @@ OUTPUT_KEY = "jobs"            # "products" for e-commerce, "jobs" for job board
 ITEM_SELECTOR = "[data-job-id]"  # CSS selector for item containers on the listing page
 LISTING_URL = ""               # Default listing URL (set by code_writer from nav analysis)
 
+# Output identity — the SAME keys the other templates emit. tasks.py reads
+# site["platform"] / site["scraping_method"] / site["name"] as job ground truth,
+# so "site" must be this dict, never a bare hostname string.
+SITE_NAME = "{SITE_NAME}"
+SITE_URL = "{SITE_URL}"
+PLATFORM = "{PLATFORM}"
+SCRAPING_METHOD = "ssr_div_list"
+
 # Rate limiting
 REQUEST_DELAY = 1.0            # seconds between requests
 MAX_RETRIES = 3
@@ -153,25 +161,39 @@ def scrape_listing(listing_url, limit=0):
     Args:
         listing_url: The URL of the listing page (page 1).
         limit: Max items to extract (0 = unlimited).
+
+    Returns:
+        (records, discovery_meta). ``discovery_meta`` feeds the output's
+        ``metadata.discovery_coverage`` block (discovery-coverage-gate contract
+        §1): stop_reason / raw items seen / pages visited / max_pages_hit.
     """
     all_records = []
     seen_ids = set()
+    raw_items_seen = 0      # item containers across ALL pages (pre-dedup, pre-filter)
+    pages_visited = 0
+    max_pages_hit = False
+    # Default = the loop ran to completion without an explicit break.
+    stop_reason = "no_next_link"
 
     for page in range(1, MAX_PAGES + 1):
         url = listing_url if page == 1 else _construct_page_url(listing_url, page)
         logger.info("Fetching page %d: %s", page, url)
+        pages_visited += 1
 
         html, status, final_url = _fetch(url)
         if not html or status >= 400:
             logger.warning("Page %d failed (status %d), stopping", page, status)
+            stop_reason = "navigate_error"
             break
 
         soup = BeautifulSoup(html, "html.parser")
         items = _find_items(soup)
+        raw_items_seen += len(items)
         logger.info("Page %d: found %d items", page, len(items))
 
         if not items:
             logger.info("No items on page %d, stopping", page)
+            stop_reason = "no_next_link"
             break
 
         page_records = 0
@@ -196,15 +218,34 @@ def scrape_listing(listing_url, limit=0):
 
             if limit and len(all_records) >= limit:
                 logger.info("Reached limit of %d items", limit)
-                return all_records
+                stop_reason = "limit_reached"  # truncated by --limit/--sample, NOT exhausted
+                break
+
+        if stop_reason == "limit_reached":
+            break
 
         logger.info("Page %d: extracted %d records (total: %d)", page, page_records, len(all_records))
 
         if page_records == 0:
+            # Every container on this page was a duplicate of a previous page —
+            # the server is ignoring PAGE_PARAM (identical content), or the list
+            # genuinely ended. `discovered_urls` vs `found` in the output tells
+            # those two apart downstream.
             logger.info("No records extracted on page %d, stopping", page)
+            stop_reason = "no_new_items"
             break
+    else:
+        # Ran all MAX_PAGES iterations without a break.
+        max_pages_hit = True
+        stop_reason = "max_pages_hit"
 
-    return all_records
+    discovery_meta = {
+        "stop_reason": stop_reason,
+        "discovered_urls": raw_items_seen,
+        "pages_visited": pages_visited,
+        "max_pages_hit": max_pages_hit,
+    }
+    return all_records, discovery_meta
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -255,16 +296,44 @@ def main():
     limit = args.limit or (5 if args.sample else 0)
     logger.info("Starting scrape: %s (limit=%d)", listing_url, limit)
 
-    records = scrape_listing(listing_url, limit=limit)
+    records, discovery_meta = scrape_listing(listing_url, limit=limit)
+
+    # discovery_coverage block — discovery-coverage-gate contract §1. Same 9 keys
+    # the two-phase templates emit, so `_read_discovery_coverage` and the Tier-1
+    # gate parse this single-phase family unchanged. This template's Phase 1 and
+    # Phase 2 are the SAME loop, so `found` (post-dedup, post-filter records) and
+    # `discovered_urls` (raw containers seen) diverge exactly when the list ended
+    # or the pagination param was ignored.
+    discovery_coverage = {
+        "stop_reason": discovery_meta.get("stop_reason", "no_next_link"),
+        "found": len(records),
+        "discovered_urls": discovery_meta.get("discovered_urls", 0),
+        "expected_total": None,      # no baked-in coverage target for this template
+        "dimensions_iterated": 0,    # single listing — no category/dimension loop
+        "dimensions_total": 0,
+        "max_pages_hit": discovery_meta.get("max_pages_hit", False),
+        "ran_phase1": True,          # the listing crawl IS this template's Phase 1
+        "skipped_reason": None,
+        # Extra diagnostic (not part of §1; no consumer reads it today).
+        "pages_visited": discovery_meta.get("pages_visited", 0),
+    }
 
     # Output
     output = {
-        "site": urlparse(listing_url).netloc,
+        "site": {
+            "name": SITE_NAME,
+            "url": SITE_URL,
+            "platform": PLATFORM,
+            "scraping_method": SCRAPING_METHOD,
+            "scraped_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        },
         OUTPUT_KEY: records,
         "metadata": {
             "listing_url": listing_url,
             "total_items": len(records),
             "scraped_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "discovered_urls": discovery_meta.get("discovered_urls", 0),
+            "discovery_coverage": discovery_coverage,
         },
     }
 

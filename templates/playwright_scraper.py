@@ -227,6 +227,20 @@ def scrape_product(page, url: str, src_url: str, index: int) -> dict:
 # site-specific and remains in this file for code_writer to adapt.
 MAX_DISCOVER_PAGES = 200
 
+# Last Phase-1 outcome, for the output's metadata.discovery_coverage block
+# (discovery-coverage-gate contract §1). Module-level so BOTH discovery call
+# sites in main() feed the same block without changing this function's
+# list[str] contract. Skipped-state defaults are what a run that never
+# discovered reports (url_list mode / checkpoint resume).
+LAST_DISCOVERY: dict = {
+    "ran_phase1": False,
+    "skipped_reason": None,
+    "stop_reason": "skipped",
+    "discovered_urls": 0,
+    "pages_visited": 0,
+    "max_pages_hit": False,
+}
+
 
 def discover_product_urls(page) -> list[str]:
     def _extract(p):
@@ -256,10 +270,18 @@ def discover_product_urls(page) -> list[str]:
 
     result = discover_item_urls(page, PRODUCT_LISTING_URL, _extract, _cfg)
     logger.info(
-        "discovery: stop_reason=%s pages=%d urls=%d strategies=%s",
+        "discovery: stop_reason=%s pages=%d urls=%d param=%s strategies=%s",
         result.stop_reason, result.pages_visited, len(result.urls),
-        _cfg.strategies,
+        result.param_used, _cfg.strategies,
     )
+    LAST_DISCOVERY.update({
+        "ran_phase1": True,
+        "skipped_reason": None,
+        "stop_reason": str(result.stop_reason),
+        "discovered_urls": len(result.urls),
+        "pages_visited": result.pages_visited,
+        "max_pages_hit": result.max_pages_hit,
+    })
     return result.urls
 
 
@@ -346,10 +368,15 @@ def main():
             save_urls_to_file(INPUT_FILE, product_urls)
     elif args.urls:
         product_urls = args.urls
+        LAST_DISCOVERY["skipped_reason"] = "url_list_mode"
     elif args.input:
         product_urls = load_urls_from_file(args.input)
+        LAST_DISCOVERY["skipped_reason"] = "url_list_mode"
     elif os.path.exists(INPUT_FILE):
         product_urls = load_urls_from_file(INPUT_FILE)
+        # input_urls.json is this template's persisted discovery output; reusing
+        # it means Phase 1 did not run this invocation.
+        LAST_DISCOVERY["skipped_reason"] = "checkpoint_loaded"
 
     if not product_urls:
         logger.info("No input URLs found. Discovering products via browser...")
@@ -409,16 +436,33 @@ def main():
             "discover-only: stop_reason=%s pages=%d urls=%d",
             _probe_result.stop_reason, _probe_result.pages_visited, len(_probe_result.urls),
         )
+        # discovery_coverage — contract §1, same 9 keys the full run emits below
+        # (plus the pages_visited diagnostic), so a probe output and an
+        # execution output are read by the same code path.
+        _probe_coverage = {
+            "ran_phase1": True,
+            "skipped_reason": None,
+            "stop_reason": str(_probe_result.stop_reason),
+            "found": 0,  # Phase 2 skipped by design
+            "discovered_urls": len(_probe_result.urls),
+            "expected_total": None,
+            "dimensions_iterated": 0,
+            "dimensions_total": 0,
+            "max_pages_hit": _probe_result.max_pages_hit,
+            "pages_visited": _probe_result.pages_visited,
+        }
         output = {
-            "site": SITE_NAME,
+            "site": {
+                "name": SITE_NAME,
+                "url": SITE_URL,
+                "platform": PLATFORM,
+                "scraping_method": SCRAPING_METHOD,
+                "scraped_at": datetime.now(timezone.utc).isoformat(),
+            },
             "products": [],
             "metadata": {
                 "total_discovered": len(_probe_result.urls),
-                "discovery_coverage": {
-                    "ran_phase1": True,
-                    "stop_reason": str(_probe_result.stop_reason),
-                    "found": len(_probe_result.urls),
-                },
+                "discovery_coverage": _probe_coverage,
             },
         }
         with open(OUTPUT_FILE, "w") as _of:
@@ -483,6 +527,26 @@ def main():
 
         browser.close()
 
+    # discovery_coverage — discovery-coverage-gate contract §1. Always emitted
+    # (even when Phase 1 was skipped) so the gate reads a uniform schema.
+    if LAST_DISCOVERY.get("ran_phase1"):
+        _stop_reason = LAST_DISCOVERY.get("stop_reason", "no_next_link")
+    else:
+        _stop_reason = "skipped"
+    discovery_coverage = {
+        "ran_phase1": LAST_DISCOVERY.get("ran_phase1", False),
+        "skipped_reason": LAST_DISCOVERY.get("skipped_reason"),
+        "stop_reason": _stop_reason,
+        "found": len(results),
+        "discovered_urls": LAST_DISCOVERY.get("discovered_urls", 0),
+        "expected_total": None,
+        "dimensions_iterated": 0,
+        "dimensions_total": 0,
+        "max_pages_hit": LAST_DISCOVERY.get("max_pages_hit", False),
+        # Extra diagnostic (not part of §1; no consumer reads it today).
+        "pages_visited": LAST_DISCOVERY.get("pages_visited", 0),
+    }
+
     output = {
         "site": {
             "name": SITE_NAME,
@@ -496,6 +560,8 @@ def main():
             "scraping_duration_seconds": round(time.time() - start_time, 2),
             "failed_products": failed,
             "rate_limit_delay": DELAY_BETWEEN_REQUESTS,
+            "discovered_urls": LAST_DISCOVERY.get("discovered_urls", 0),
+            "discovery_coverage": discovery_coverage,
         },
     }
 
