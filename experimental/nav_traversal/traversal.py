@@ -544,6 +544,15 @@ def _extract_items_count(data) -> tuple[list | None, int | None]:
     """Find the items list + a total count anywhere in a parsed JSON blob."""
     best_items = None
     total = None
+    # Total-like key names (lowercased). `jobcount`/`job_count` added after the
+    # live amn probe (2026-08-27): the ONEAmnJobSearch API reports a real
+    # `jobCount: 14627` beside the jobs array, which the old key set missed —
+    # the descriptor then carried count=null and the strategy gate (which
+    # requires POSITIVE count evidence) would honestly reject a true-positive
+    # API. bools are not totals (True would int()-coerce to 1).
+    total_like = ("count", "jobcount", "job_count", "total", "totalcount",
+                  "total_count", "totalresults", "resultcount")
+
     def walk(v):
         nonlocal best_items, total
         if isinstance(v, list) and v and all(isinstance(x, dict) for x in v[:5]):
@@ -551,8 +560,8 @@ def _extract_items_count(data) -> tuple[list | None, int | None]:
                 best_items = v
         elif isinstance(v, dict):
             for k, val in v.items():
-                if total is None and k.lower() in ("count", "total", "totalcount",
-                                                   "total_count", "totalresults", "resultcount"):
+                if (total is None and k.lower() in total_like
+                        and not isinstance(val, bool)):
                     try:
                         total = int(val)
                     except Exception:

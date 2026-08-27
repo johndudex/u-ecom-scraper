@@ -80,6 +80,7 @@ def _state_for(nav, *, rendering=None, recommended=None, rec_key="content_analys
         "ketchcdn-consent-config.json",
         "useinsider-personalization.json",
         "aya-jobs-api.json",
+        "amn-jobs-api.json",
         "coveo-explicit-zero.json",
         "zquiet-heatmap.json",
         "sidley-taxonomy.json",

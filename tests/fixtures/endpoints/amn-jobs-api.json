@@ -1,0 +1,16 @@
+{
+  "name": "amn-jobs-api",
+  "site": "amnhealthcare.com",
+  "expected_internal_api": true,
+  "note": "Live-probed 2026-08-27: ONEAmnJobSearch reports a real jobCount: 14627 beside the jobs array. The old _extract_items_count key set missed 'jobcount', leaving count=null in the descriptor — the positive-count gate would then honestly reject a true-positive API. Fixed capture-side (total_like += jobcount/job_count); the gate itself stays strict.",
+  "navigation_analysis": {
+    "data_source": "api",
+    "rendering_verified": "browser",
+    "api_endpoint": {
+      "url": "https://api.amnhealthcare.io/ONEAmnJobSearch/v1/JobSearch",
+      "count": 14627,
+      "items_per_page": 10,
+      "content_type": "application/json"
+    }
+  }
+}

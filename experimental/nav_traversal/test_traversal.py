@@ -398,6 +398,41 @@ def test_verify_api_descriptor_content_type_defaults_to_none():
     assert got["content_type"] is None
 
 
+# ─── _extract_items_count: total-like key coverage (live amn probe) ─────────
+
+# The real amn payload shape (api.amnhealthcare.io/ONEAmnJobSearch/v1/JobSearch,
+# probed live 2026-08-27): a top-level `jobCount` beside the jobs array.
+AMN_SEARCH = ('{"jobCount": 14627, "jobs": ['
+              '{"jobID": "a", "jobTitle": "RN 1"}, {"jobID": "b", "jobTitle": "RN 2"}]}')
+
+
+def test_extract_items_count_reads_jobcount():
+    from experimental.nav_traversal.traversal import _extract_items_count
+
+    items, total = _extract_items_count(json.loads(AMN_SEARCH))
+    assert total == 14627, (
+        "a real jobCount total must reach the descriptor — count=null makes the "
+        "strategy gate honestly reject a true-positive API"
+    )
+    assert items and items[0]["jobID"] == "a"
+
+
+def test_verify_api_descriptor_carries_jobcount_as_count():
+    got = verify_api("https://api.amnhealthcare.io/ONEAmnJobSearch/v1/JobSearch",
+                     _fetch_ok(AMN_SEARCH, content_type="application/json"))
+    assert got is not None
+    assert got["count"] == 14627
+    assert got["items_per_page"] == 2
+
+
+def test_extract_items_count_ignores_bool_totals():
+    """True would int()-coerce to 1 and masquerade as a positive total."""
+    from experimental.nav_traversal.traversal import _extract_items_count
+
+    _, total = _extract_items_count({"jobCount": True, "jobs": [{"jobID": "a"}]})
+    assert total is None
+
+
 if __name__ == "__main__":
     # ad-hoc runner: call each test, print pass/fail
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
