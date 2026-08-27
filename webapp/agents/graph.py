@@ -1667,7 +1667,7 @@ def _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout):
             "_invoke_agent_with_timeout[%s]: traceback:\n%s",
             phase, traceback.format_exc(limit=8),
         )
-        return {"_error": str(exc)[:200]}
+        return {"_error": str(exc)[:200], "_error_class": type(exc).__name__}
 
 
 def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, timeout: int = _AGENT_INVOKE_TIMEOUT):
@@ -1696,7 +1696,10 @@ def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, t
         try:
             result_box[0] = agent.invoke({"messages": messages}, agent_cfg)
         except Exception as exc:
-            result_box[0] = {"_error": str(exc)[:200]}
+            # Preserve the exception CLASS alongside the message: str(exc)
+            # alone laundered provider outages (429 code 1302) into
+            # "agent made no progress" (job-12).
+            result_box[0] = {"_error": str(exc)[:200], "_error_class": type(exc).__name__}
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
@@ -2199,6 +2202,26 @@ def _sanitize_nav_domains(analysis: dict, job_url: str) -> dict:
         return analysis
 
 
+def _project_api_endpoint(api: Any) -> dict:
+    """Project verify_api's descriptor for navigation_analysis.api_endpoint.
+
+    Uses the "url" key (what subagents.py:2208 checks), not "api_url", and
+    RETAINS the measured evidence the fetch already produced: count,
+    items_per_page, sample_keys, content_type. The old projection kept only
+    {url, count, items_per_page}, discarding sample_keys — which is what
+    left the strategy gate with nothing but a URL to judge (job-12).
+    """
+    if not api or not isinstance(api, dict) or not api.get("url"):
+        return api or {}
+    return {
+        "url": api["url"],
+        "count": api.get("count"),
+        "items_per_page": api.get("items_per_page"),
+        "sample_keys": api.get("sample_keys"),
+        "content_type": api.get("content_type"),
+    }
+
+
 def _invoke_navigation_traverse(
     state: ScrapeState, config: RunnableConfig
 ) -> dict[str, Any] | Command:
@@ -2390,13 +2413,7 @@ def _invoke_navigation_traverse(
             # (items_per_page>0) — a bare URL with 0 results (Coveo /coveo/rest/search
             # returns totalCount=0 without the browser's filter) must NOT trigger
             # internal_api, or the job diverts from playwright to a doomed strategy.
-            "api_endpoint": (
-                {"url": result.api["url"],
-                 "count": result.api.get("count"),
-                 "items_per_page": result.api.get("items_per_page")}
-                if result.api and isinstance(result.api, dict) and result.api.get("url")
-                else (result.api or {})
-            ),
+            "api_endpoint": _project_api_endpoint(result.api),
             "rendering_verified": "browser",
             # propagate the full path so downstream can see how we got here
             "traversal_path": result.path[:8] if hasattr(result, "path") else [],
@@ -2904,27 +2921,22 @@ def _decide_strategy(state: ScrapeState) -> dict[str, Any]:
         # without this it re-picks the SAME failing strategy every retry (the old
         # LLM analyzer read strategies_tried; the deterministic one must too). If
         # the chosen strategy was already tried+failed, escalate to a more capable
-        # one (http_requests -> http_navigation -> playwright -> internal_api).
+        # one (http_requests -> http_navigation -> playwright; internal_api only
+        # via the count gate, never via escalation). When the ladder is exhausted,
+        # route to the exhausted path instead of re-picking (job-12 cycle 3).
         _all_tried = {
             (_t.get("strategy") if isinstance(_t, dict) else _t)
             for _t in (tried + _new_tried)
         }
-        _ESCALATION = ["http_requests", "http_navigation", "playwright", "internal_api"]
-        _chosen = analysis.get("strategy")
-        if _chosen in _all_tried:
-            _idx = _ESCALATION.index(_chosen) if _chosen in _ESCALATION else -1
-            for _next in _ESCALATION[_idx + 1:]:
-                if _next not in _all_tried:
-                    for _k in ("strategy", "scraping_mechanism", "scraping_method", "recommended_strategy"):
-                        analysis[_k] = _next
-                    analysis["strategy_justification"] = (
-                        f"Deterministic escalation: {_chosen} tried+failed -> {_next}"
-                    )
-                    logger.info(
-                        "_decide_strategy: %s tried+failed -> escalating to %s (job %s)",
-                        _chosen, _next, job_id,
-                    )
-                    break
+        analysis, _exhausted_goto = _escalate_strategy(
+            analysis, _all_tried, skip_approvals=bool(state.get("skip_approvals"))
+        )
+        if _exhausted_goto:
+            logger.error(
+                "_decide_strategy: all strategies tried+failed — routing to %s "
+                "instead of re-picking the same one (job %s)",
+                _exhausted_goto, job_id,
+            )
         # Persist so downstream nodes/code_writer read the artifact from disk.
         try:
             root = _get_project_root()
@@ -2938,10 +2950,66 @@ def _decide_strategy(state: ScrapeState) -> dict[str, Any]:
         if _new_tried:
             update["strategies_tried"] = _new_tried  # append (Annotated[list, operator.add])
         _notify_phase(job_id, "scraper_analyzer", "done")
+        if _exhausted_goto:
+            # Command routing (bypasses conditional edges — the node decides):
+            # mirror route_after_testing's exhausted arms — skip_approvals
+            # intake jobs go to cleanup (honest failure, artifacts preserved);
+            # jobs with approvals get the human "final retry feedback" gate.
+            return Command(goto=_exhausted_goto, update=update)
         return update
     except Exception:
         _notify_phase(job_id, "scraper_analyzer", "failed")
         raise
+
+
+_STRATEGY_ESCALATION = ["http_requests", "http_navigation", "playwright", "internal_api"]
+
+
+def _escalate_strategy(
+    analysis: dict[str, Any],
+    all_tried: set,
+    *,
+    skip_approvals: bool = False,
+) -> tuple[dict[str, Any], str | None]:
+    """Escalate a tried+failed strategy, honestly.
+
+    Returns ``(analysis, goto)``. ``goto`` is None on the normal path, or the
+    node to route to when NO untried strategy remains: "cleanup" under
+    skip_approvals (intake jobs — human_approval would auto-approve and loop),
+    else "human_approval".
+
+    Two job-12 honesty rules on top of the old ladder:
+    - Never escalate INTO ``internal_api``. Evidence-backed internal_api is
+      CHOSEN directly by _derive_strategy's count gate; the old code let a
+      failed playwright escalate into it with no evidence check
+      (_ESCALATION[3:] hole) — manufacturing the doomed strategy the gate
+      just declined.
+    - Never re-pick the tried+failed strategy when the ladder is exhausted.
+      The old code fell through and returned the SAME strategy (job-12
+      cycle 3: 10 min / 49 tool calls / zero writes). Downward rungs are
+      also not manufactured: re-running internal_api as http_requests
+      against a CSR page is the exact "doomed strategy" failure.
+    """
+    chosen = analysis.get("strategy")
+    if chosen not in all_tried:
+        return analysis, None
+    idx = _STRATEGY_ESCALATION.index(chosen) if chosen in _STRATEGY_ESCALATION else -1
+    for nxt in _STRATEGY_ESCALATION[idx + 1:]:
+        if nxt == "internal_api":
+            continue
+        if nxt not in all_tried:
+            for k in ("strategy", "scraping_mechanism", "scraping_method", "recommended_strategy"):
+                analysis[k] = nxt
+            analysis["strategy_justification"] = (
+                f"Deterministic escalation: {chosen} tried+failed -> {nxt}"
+            )
+            return analysis, None
+    analysis["strategy_justification"] = (
+        f"Deterministic: strategy ladder exhausted — all strategies tried+failed "
+        f"(tried: {sorted(all_tried)}), no untried strategy remains; "
+        f"routing out instead of re-picking {chosen}"
+    )
+    return analysis, ("cleanup" if skip_approvals else "human_approval")
 
 
 def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
@@ -3035,27 +3103,79 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
     # that hangs on CSR pages with no paginated listing (aya).
     _nav_api = (_nav.get("api_endpoint") if isinstance(_nav, dict) else None) or {}
     _nav_api = _nav_api if isinstance(_nav_api, dict) else {}
-    # Gate on the API being a REAL data source for this query. Two signals, both
-    # required:
-    #   - items_per_page > 0  (verify_api's probe got actual records), AND
-    #   - count != 0          (the API's reported total isn't explicitly zero).
-    # The count!=0 check is load-bearing: Coveo /coveo/rest/search reports
-    # totalCount=0 for the generic query yet returns ~15 default-sample items to
-    # verify_api's limit/pageSize probe — items_per_page>0 ALONE wrongly picks
-    # internal_api, then the api_scraper (which can't reconstruct the browser's
-    # @filter) gets ~0-1 items (lw.com regression: 1 item vs playwright's 20).
-    # count>0 (aya: 26955) OR count is None (an API that doesn't report a total
-    # but returns real items) both pass; only an EXPLICIT zero total is rejected.
+    # Gate on the API being a REAL data source for this query — POSITIVE COUNT
+    # EVIDENCE required:
+    #   - items_per_page > 0, AND
+    #   - count is a positive int (> 0).
+    # items_per_page>0 is nearly vacuous as a signal: verify_api returns no
+    # descriptor at all unless it found a non-empty dict-array, then sets
+    # items_per_page = len(items) >= 1 — so every descriptor ever emitted
+    # satisfies it. The ketchcdn consent-config poison yielded
+    # items_per_page=5 from a 5-element array inside the CMP blob. count>0 is
+    # the gate's one real discriminator:
+    #   - count > 0   (aya: 26955)                              -> pass
+    #   - count null  (ketchcdn consent config, useinsider personalization,
+    #                  sidley taxonomy, zquiet heatmap)          -> rejected
+    #   - count == 0  (Coveo explicit zero, lw.com)              -> rejected
+    # The explicit-zero check predates this gate (lw.com regression:
+    # totalCount=0 yet ~15 sample items -> internal_api -> 1 item vs
+    # playwright's 20); the null rejection is the job-12 fix.
+    # Honest scope: this is a NO-COUNT filter, not a full poison filter — an
+    # endpoint reporting a real-looking total while returning non-item records
+    # (review widgets, totalResults:N) still passes; catching that class needs
+    # content-evidence verification (sample_keys/content_type, now retained by
+    # _project_api_endpoint), not a weaker count rule. Legit no-total APIs
+    # (Shopify /products.json feeds, cursor-paginated APIs) are downgraded to
+    # the next strategy BY DESIGN; code_writer's catalog guidance can still
+    # reach the feed directly.
     _api_items = _nav_api.get("items_per_page")
     _api_count = _nav_api.get("count")
     if (
         _data_source == "api"
         and (_nav_api.get("url") or _nav_api.get("api_url"))
         and isinstance(_api_items, int)
+        and not isinstance(_api_items, bool)
         and _api_items > 0
-        and _api_count != 0
+        and isinstance(_api_count, int)
+        and not isinstance(_api_count, bool)
+        and _api_count > 0
     ):
         strategy = "internal_api"
+
+    # Evidence precedence (job-12 fix S3): when the descriptor carries NO
+    # positive count evidence (the gate above declined internal_api), an
+    # explicit mechanism verdict produced by the content/product analysis
+    # outranks this function's heuristic cascade. Priceline shipped
+    # mechanism_reassessment.recommended="playwright" with OCC-interception
+    # instructions while the consent-config descriptor dragged the strategy
+    # elsewhere — the measured-page verdict was already on disk and must win.
+    # Browser/HTTP strategy names ONLY: a recommendation can never re-arm
+    # internal_api past the count gate (measured evidence outranks opinion,
+    # and poison descriptors report opinions too).
+    _rec_recommended = ""
+    for _pa_key in ("content_analysis", "product_analysis"):
+        _pa = state.get(_pa_key)
+        if isinstance(_pa, dict):
+            _mr = _pa.get("mechanism_reassessment")
+            if isinstance(_mr, dict):
+                _rec_recommended = (_mr.get("recommended") or "").strip()
+                if _rec_recommended:
+                    break
+    _strategy_source = ""
+    if (
+        _rec_recommended in ("http_requests", "http_navigation", "playwright")
+        and not (
+            isinstance(_api_count, int)
+            and not isinstance(_api_count, bool)
+            and _api_count > 0
+        )
+        and strategy != _rec_recommended
+    ):
+        strategy = _rec_recommended
+        _strategy_source = (
+            f"; mechanism_reassessment.recommended={_rec_recommended!r} "
+            f"outranks count={_api_count!r} descriptor"
+        )
 
     # Discovery config: propagate the navigator's pagination detection so the
     # template uses the RIGHT config_for_* preset (load_more vs page_param vs
@@ -3094,7 +3214,7 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
         "strategy_justification": (
             f"Deterministic: method_that_worked={method or 'unknown'} -> {strategy} "
             f"(proxy={proxy_tier}, anti_bot={anti_bot}, rendering={_rendering}, "
-            f"data_source={_data_source})"
+            f"data_source={_data_source}){_strategy_source}"
         ),
     }
 

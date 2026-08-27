@@ -1,0 +1,15 @@
+{
+  "name": "coveo-explicit-zero",
+  "site": "lw.com class",
+  "expected_internal_api": false,
+  "note": "Coveo /coveo/rest/search reports totalCount=0 for the generic query yet returns ~15 default-sample items to the probe — items_per_page>0 alone wrongly picked internal_api (lw.com regression: 1 item vs playwright's 20). The explicit-zero rejection predates the count clause; it must be preserved byte-identically.",
+  "navigation_analysis": {
+    "data_source": "api",
+    "rendering_verified": "browser",
+    "api_endpoint": {
+      "url": "https://lw.com/coveo/rest/search",
+      "count": 0,
+      "items_per_page": 15
+    }
+  }
+}

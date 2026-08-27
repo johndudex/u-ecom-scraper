@@ -1,0 +1,15 @@
+{
+  "name": "shopify-feed-legit-no-total",
+  "site": "Shopify /collections/all/products.json class",
+  "expected_internal_api": false,
+  "note": "HONEST DOWNGRADE entry — documents the filter's scope, not a poison. A legitimate product feed that reports NO total (count null) is downgraded to the next strategy by the positive-count rule. code_writer's catalog guidance can still reach the feed directly (zquiet's shipped scraper does exactly this). If this class is ever re-promoted, it needs content-evidence verification, not a weaker count rule.",
+  "navigation_analysis": {
+    "data_source": "api",
+    "rendering_verified": "browser",
+    "api_endpoint": {
+      "url": "https://www.example-shop.com/collections/all/products.json",
+      "count": null,
+      "items_per_page": 30
+    }
+  }
+}

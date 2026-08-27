@@ -1,0 +1,15 @@
+{
+  "name": "aya-jobs-api",
+  "site": "ayahealthcare.com",
+  "expected_internal_api": true,
+  "note": "The legitimate case the gate must keep passing: a real backend data API that reports its total. count is a positive int.",
+  "navigation_analysis": {
+    "data_source": "api",
+    "rendering_verified": "browser",
+    "api_endpoint": {
+      "url": "https://www.ayahealthcare.com/api/jobs/search",
+      "count": 26955,
+      "items_per_page": 5
+    }
+  }
+}

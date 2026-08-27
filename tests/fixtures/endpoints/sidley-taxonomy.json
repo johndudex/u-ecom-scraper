@@ -1,0 +1,16 @@
+{
+  "name": "sidley-taxonomy",
+  "site": "sidley.com (workspace artifact)",
+  "expected_internal_api": false,
+  "note": "Sitecore people-search taxonomy payload: uniform records but lookup data, not items. items_per_page=100 looks page-sized; sample_keys=[text,value,count] exposes it. Rejected on count (null) — also a live bug this gate fix closes.",
+  "navigation_analysis": {
+    "data_source": "api",
+    "rendering_verified": "browser",
+    "api_endpoint": {
+      "url": "https://www.sidley.com/sitecore/api/people/search",
+      "count": null,
+      "items_per_page": 100,
+      "sample_keys": ["text", "value", "count"]
+    }
+  }
+}

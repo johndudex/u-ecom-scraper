@@ -1,0 +1,15 @@
+{
+  "name": "useinsider-personalization",
+  "site": "priceline.com.au (fresh capture, job 12)",
+  "expected_internal_api": false,
+  "note": "Insider personalization widget endpoint; genuinely contains /api/ segments so URL heuristics accept it. Response is application/javascript with a large HTML string; count null, items_per_page=1.",
+  "navigation_analysis": {
+    "data_source": "api",
+    "rendering_verified": "browser",
+    "api_endpoint": {
+      "url": "https://pricelineau.api.useinsider.com/api/info/824.24",
+      "count": null,
+      "items_per_page": 1
+    }
+  }
+}

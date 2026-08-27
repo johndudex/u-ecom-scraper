@@ -1,0 +1,15 @@
+{
+  "name": "zquiet-heatmap",
+  "site": "zquiet.com (File Master artifact — constraint-1 site)",
+  "expected_internal_api": false,
+  "note": "Analytics/heatmap config whose URL mimics a Shopify collection feed (poison class C11: a URL rule actively ACCEPTS it). File Master shipped scraper actually uses /collections/all/products.json; flipping this descriptor off internal_api is a FIX, not a regression.",
+  "navigation_analysis": {
+    "data_source": "api",
+    "rendering_verified": "browser",
+    "api_endpoint": {
+      "url": "https://c.heatmap.com/2097/zquiet.com-collections-shop-all-products.json",
+      "count": null,
+      "items_per_page": 1
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "ketchcdn-consent-config",
+  "site": "priceline.com.au (rehydrated jobs 9/10 workspace artifact)",
+  "expected_internal_api": false,
+  "note": "Consent-management (Ketch CMP) config blob. _extract_items_count picked a 5-element array from inside it, producing items_per_page=5; count is null. Under the old count != 0 clause this descriptor selected internal_api.",
+  "navigation_analysis": {
+    "data_source": "api",
+    "rendering_verified": "browser",
+    "api_endpoint": {
+      "url": "https://global.ketchcdn.com/web/v3/config/wesfarmers_health/priceline/production/default/en/config.json",
+      "count": null,
+      "items_per_page": 5
+    }
+  }
+}
