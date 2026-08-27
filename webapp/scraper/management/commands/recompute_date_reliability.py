@@ -22,11 +22,12 @@ from django.utils import timezone
 
 # a66e33f shipped 2026-07-22; 31ae2f4 (the fix) landed 2026-08-25.
 BROKEN_FROM = _dt.datetime(2026, 7, 22, tzinfo=_dt.timezone.utc)
-# End of the broken window. The fix (31ae2f4) landed 2026-08-25; anything
-# still reliable=False AFTER this instant is post-fix data (or a genuinely
-# unreliable date per P0-13) and must not be touched. End-of-day inclusive
-# covers timezone skew; rows created after it are excluded.
-FIXED_AT = _dt.datetime(2026, 8, 27, tzinfo=_dt.timezone.utc)  # fix-day end, inclusive
+# No upper bound. scraped_at is auto_now_add, so a "fix-day end, inclusive"
+# ceiling excluded every row created on/after that midnight: the command
+# reported `scanned: 0` and exited 0 (two tests red) while claiming the
+# window was repaired. The lower bound is what selects corrupted rows; the
+# P0-13 rules below are what leave post-fix data alone (a surviving
+# reliable=False is a genuine "unreliable date" verdict, not the bug).
 
 
 def _raw_dates(listing):
@@ -53,7 +54,6 @@ class Command(BaseCommand):
         write = options["write"]
         qs = JobListing.objects.filter(
             scraped_at__gte=BROKEN_FROM,
-            scraped_at__lte=FIXED_AT,
             date_posted_reliable=False,
         )
         would_fix = 0
@@ -69,7 +69,10 @@ class Command(BaseCommand):
                 continue
             parsed = None
             for raw in raws:
-                parsed = parse_posted_date(raw)
+                # Anchor relative phrases ("3 days ago", "today") to the row's
+                # own scrape instant, not the run clock — the recovered date
+                # must not drift with how old the backlog is.
+                parsed = parse_posted_date(raw, now=listing.scraped_at)
                 if parsed is not None:
                     break
             if parsed is None:
@@ -101,3 +104,12 @@ class Command(BaseCommand):
         self.stdout.write(f"  would fix / fixed:                      {would_fix}")
         self.stdout.write(f"  correctly-still-unreliable (P0-13):     {still_unreliable}")
         self.stdout.write(f"  unrecoverable (no parsable raw date):   {unrecoverable}")
+        if scanned and would_fix == 0:
+            # The date-bomb's post-fix signature: it used to hide as
+            # `scanned: 0` (the upper bound ate everything); unbounded it
+            # hides as `scanned: N, would fix: 0`. Make both shapes loud.
+            self.stdout.write(self.style.WARNING(
+                f"  WARNING: {scanned} row(s) scanned but 0 would be fixed —"
+                f" every raw date was unrecoverable or genuinely unreliable."
+                f" If that is unexpected, the parser or the P0-13 rules changed."
+            ))

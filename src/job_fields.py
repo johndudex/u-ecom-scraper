@@ -69,11 +69,17 @@ _DATE_FORMATS = [
 ]
 
 
-def parse_posted_date(date_str: str) -> Optional[datetime]:
+def parse_posted_date(date_str: str, now: Optional[datetime] = None) -> Optional[datetime]:
     """Parse a posting date from many formats. Returns datetime or None.
 
     Handles ISO strings (with optional timezone offset), common US formats,
     and relative phrases ("2 days ago", "today", "yesterday", "just posted").
+
+    ``now`` is the reference instant for the relative phrases and defaults to
+    the current time (the historical behaviour, so existing callers are
+    unchanged). Repair/backfill paths pass the row's own scrape time instead —
+    "90 days ago" on a row scraped last month means a fixed date, not one that
+    moves every time the repair is re-run.
     """
     if not date_str:
         return None
@@ -95,24 +101,24 @@ def parse_posted_date(date_str: str) -> Optional[datetime]:
             continue
 
     low = s.lower()
-    now = datetime.now()
+    ref = now if now is not None else datetime.now()
     if "today" in low or "just posted" in low or low == "just":
-        return now
+        return ref
     if "yesterday" in low:
-        return now - timedelta(days=1)
+        return ref - timedelta(days=1)
 
     m = re.search(r"(\d+)\s*(day|hour|week|month)s?\s*ago", low)
     if m:
         n = int(m.group(1))
         unit = m.group(2)
         if unit == "hour":
-            return now - timedelta(hours=n)
+            return ref - timedelta(hours=n)
         if unit == "day":
-            return now - timedelta(days=n)
+            return ref - timedelta(days=n)
         if unit == "week":
-            return now - timedelta(weeks=n)
+            return ref - timedelta(weeks=n)
         if unit == "month":
-            return now - timedelta(days=n * 30)
+            return ref - timedelta(days=n * 30)
     return None
 
 
