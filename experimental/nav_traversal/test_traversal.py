@@ -262,6 +262,142 @@ def test_browser_budget_exhausted():
     assert res.reached is False
 
 
+# ─── verify_api: select-option guard (F17) + content-type capture (F7) ──────
+
+from types import SimpleNamespace  # noqa: E402
+
+import httpx as _httpx  # noqa: E402
+
+import experimental.nav_traversal.traversal as traversal_mod  # noqa: E402
+from experimental.nav_traversal.traversal import _httpx_fetch, verify_api  # noqa: E402
+
+# The real sidley payload (workspace/sidley-com/navigation_analysis.json):
+# a people-directory FACET response, records shaped {text, value, count}.
+SIDLEY_PEOPLE_SEARCH = json.dumps([
+    {"text": "Attorneys", "value": "attorneys", "count": 2145},
+    {"text": "Counsel", "value": "counsel", "count": 318},
+    {"text": "Partners", "value": "partners", "count": 96},
+])
+
+AYA_SEARCH = ('{"items": ['
+              '{"jobID": 1, "title": "RN 1"}, {"jobID": 2, "title": "RN 2"}, '
+              '{"jobID": 3, "title": "RN 3"}, {"jobID": 4, "title": "RN 4"}, '
+              '{"jobID": 5, "title": "RN 5"}], "count": 26889}')
+
+
+def _fetch_ok(body: str, content_type: str | None = None):
+    """Minimal fetch_fn: fixed body for every URL/params (no network)."""
+    def _fetch(url, method="GET", params=None, data=None, timeout=20.0):
+        r = {"ok": True, "status": 200, "final_url": url, "text": body}
+        if content_type is not None:
+            r["content_type"] = content_type
+        return r
+    return _fetch
+
+
+class _FakeClient:
+    """httpx.Client stand-in returning one canned response."""
+
+    def __init__(self, resp):
+        self._resp = resp
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, params=None):
+        return self._resp
+
+    def post(self, url, data=None):
+        return self._resp
+
+
+def _patch_httpx(monkeypatch, resp):
+    """Point traversal's httpx at a canned response (module-local, no global bleed)."""
+    monkeypatch.setattr(traversal_mod, "httpx",
+                        SimpleNamespace(Client=lambda **kw: _FakeClient(resp)))
+
+
+def test_select_option_guard_catches_count_bearing_facet_response():
+    """F17: sidley's ["text","value","count"] facet payload must be REJECTED.
+
+    The guard exists to reject select-option/taxonomy responses but omitted
+    "count" — so a payload that reports a count could never be a subset of the
+    key set and slipped through as a data API (sidley persisted
+    data_source=api with items_per_page=100 for a dropdown taxonomy).
+    """
+    got = verify_api("https://www.sidley.com/sitecore/api/people/search",
+                     _fetch_ok(SIDLEY_PEOPLE_SEARCH))
+    assert got is None, f"facet taxonomy must be rejected, got {got}"
+
+
+def test_guard_still_admits_real_records_that_carry_a_count_field():
+    """Adding "count" must not reject a real data API whose records happen to
+    carry a count-ish field alongside real entity fields."""
+    got = verify_api("https://api.ayahealthcare.com/AyaHealthcareWeb/job/search",
+                     _fetch_ok(AYA_SEARCH))
+    assert got is not None, "real record list must not be rejected"
+    assert got["count"] == 26889
+    assert "title" in got["sample_keys"]
+
+
+def test_httpx_fetch_returns_content_type(monkeypatch):
+    """F7 (capture only): the response content-type must survive the fetch.
+
+    Real httpx headers are case-insensitive — use httpx.Headers with the
+    capitalized spelling to pin that the impl reads it case-insensitively.
+    """
+    resp = SimpleNamespace(
+        status_code=200, text=AYA_SEARCH,
+        url="https://api.ayahealthcare.com/AyaHealthcareWeb/job/search",
+        headers=_httpx.Headers({"Content-Type": "application/json; charset=utf-8"}),
+    )
+    _patch_httpx(monkeypatch, resp)
+    r = _httpx_fetch("https://api.ayahealthcare.com/AyaHealthcareWeb/job/search")
+    assert r["ok"] is True
+    assert r["content_type"] == "application/json; charset=utf-8"
+
+
+def test_httpx_fetch_content_type_defaults_to_none_when_absent(monkeypatch):
+    resp = SimpleNamespace(status_code=200, text="<html></html>",
+                           url="https://example.com/", headers=_httpx.Headers({}))
+    _patch_httpx(monkeypatch, resp)
+    r = _httpx_fetch("https://example.com/")
+    assert r["ok"] is True
+    assert r["content_type"] is None
+
+
+def test_httpx_fetch_error_result_also_carries_content_type(monkeypatch):
+    """Both return paths carry the key, so downstream never sees a shape fork."""
+    def _boom(**kw):
+        raise RuntimeError("connect timeout")
+
+    monkeypatch.setattr(traversal_mod, "httpx", SimpleNamespace(Client=_boom))
+    r = _httpx_fetch("https://example.com/")
+    assert r["ok"] is False
+    assert r["content_type"] is None
+
+
+def test_verify_api_descriptor_includes_content_type():
+    """The descriptor persists the captured content-type (no enforcement here)."""
+    got = verify_api("https://api.ayahealthcare.com/AyaHealthcareWeb/job/search",
+                     _fetch_ok(AYA_SEARCH, content_type="application/json"))
+    assert got is not None
+    assert got["content_type"] == "application/json"
+    assert set(got) == {"url", "sample_params", "count", "items_per_page",
+                        "sample_keys", "content_type"}
+
+
+def test_verify_api_descriptor_content_type_defaults_to_none():
+    """A fetch_fn that predates the capture (no content_type key) yields None."""
+    got = verify_api("https://api.ayahealthcare.com/AyaHealthcareWeb/job/search",
+                     _fetch_ok(AYA_SEARCH))
+    assert got is not None
+    assert got["content_type"] is None
+
+
 if __name__ == "__main__":
     # ad-hoc runner: call each test, print pass/fail
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

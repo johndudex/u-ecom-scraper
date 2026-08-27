@@ -474,10 +474,17 @@ def verify_api(url: str, fetch_fn: Callable[..., dict], query: str = "") -> dict
 
     Fires a GET with a small limit/offset and checks the JSON has a list of dicts
     with a count. Returns a normalized descriptor or None. Rejects dropdown-taxonomy
-    responses (select-option dicts shaped {disabled, group, selected, text, value}).
+    responses (select-option dicts shaped {disabled, group, selected, text, value,
+    count}). The descriptor carries ``content_type`` as captured from the response
+    headers (None when the fetch_fn predates the capture) — evidence only.
     """
-    # Keys that identify a select-option/taxonomy response, NOT a data API
-    _SELECT_OPTION_KEYS = {"disabled", "group", "selected", "text", "value", "label", "key", "id"}
+    # Keys that identify a select-option/taxonomy response, NOT a data API.
+    # "count" belongs here: facet/taxonomy records carry a per-option hit count,
+    # and without it a payload like sidley's ["text","value","count"] could
+    # never be a subset of this set — the guard meant to reject it passed it
+    # straight through as a data API (items_per_page=100).
+    _SELECT_OPTION_KEYS = {"disabled", "group", "selected", "text", "value",
+                           "label", "key", "id", "count"}
 
     base = url.split("?")[0]
     for params in ({"limit": 5, "offset": 0}, {"pageSize": 5, "pageNumber": 1}, {}):
@@ -498,7 +505,11 @@ def verify_api(url: str, fetch_fn: Callable[..., dict], query: str = "") -> dict
             logger.info("verify_api: rejecting %s — keys look like dropdown options: %s", base[:60], sample_keys)
             continue
         return {"url": base, "sample_params": params, "count": total,
-                "items_per_page": len(items), "sample_keys": sample_keys}
+                "items_per_page": len(items), "sample_keys": sample_keys,
+                # CAPTURE ONLY (F7): headers used to be discarded at fetch time,
+                # so no content-evidence check was even expressible. Persisted
+                # verbatim; any veto built on it lives elsewhere.
+                "content_type": r.get("content_type")}
     return None
 
 
@@ -836,7 +847,13 @@ def _is_blocked(html: str, status: int) -> bool:
 
 def _httpx_fetch(url: str, method: str = "GET", params: dict | None = None,
                  data: dict | None = None, timeout: float = DEFAULT_TIMEOUT) -> dict:
-    """Plain httpx GET/POST (no browser fallback). Used for API verify + bundle fetch."""
+    """Plain httpx GET/POST (no browser fallback). Used for API verify + bundle fetch.
+
+    Returns {ok, status, final_url, text, content_type}. ``content_type`` is the
+    raw response Content-Type header (None when absent/unreachable) — captured
+    so a content-evidence check is possible downstream. CAPTURE ONLY: nothing
+    here rejects on it.
+    """
     try:
         with httpx.Client(headers=_HEADERS, timeout=timeout, follow_redirects=True) as client:
             if (method or "GET").upper() == "POST":
@@ -844,10 +861,12 @@ def _httpx_fetch(url: str, method: str = "GET", params: dict | None = None,
             else:
                 resp = client.get(url, params=params or {})
         return {"ok": resp.status_code < 400, "status": resp.status_code,
-                "final_url": str(resp.url), "text": resp.text}
+                "final_url": str(resp.url), "text": resp.text,
+                "content_type": resp.headers.get("content-type")}
     except Exception as exc:
         logger.warning("_httpx_fetch %s %s failed: %s", method, url[:80], exc)
-        return {"ok": False, "status": 0, "final_url": url, "text": ""}
+        return {"ok": False, "status": 0, "final_url": url, "text": "",
+                "content_type": None}
 
 
 def _render_via_browser(url: str, timeout: int = 120) -> dict:
