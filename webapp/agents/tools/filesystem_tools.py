@@ -10,6 +10,7 @@ schemas for the LLM.
 
 import fnmatch
 import glob
+import json
 import logging
 import os
 import re
@@ -18,6 +19,73 @@ from typing import Optional
 from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
+
+# F2 (artifact-corruption): what write_file/edit_file append to the tool result
+# when a .json target could not be parsed even leniently. The bytes are still
+# written — the phase-exit repair pass (graph._fix_json_artifact) owns salvage
+# — but the agent and the logs both see it. The WARNING log line is the
+# measurement signal for whether a corrective-refusal layer is ever needed.
+_JSON_WARN_NOTE = (
+    "NOTE: content written but is not valid JSON (strict or lenient parse "
+    "failed) — the repair pass will attempt salvage on read"
+)
+
+
+def _strip_json_fence(content: str) -> str:
+    """Strip a leading ```json fence (and trailing ```) if present.
+
+    C5 (fences/prose around JSON) — the model sometimes wraps the artifact in a
+    markdown fence, which makes the file unparseable on read. Stripping is only
+    attempted when the text starts with a fence opener, so ordinary JSON that
+    happens to contain backticks inside strings is never touched.
+    """
+    text = content.lstrip("﻿ \t\r\n")
+    m = re.match(r"^```(?:json|JSON)?\s*\n?", text)
+    if not m:
+        return content
+    text = text[m.end():]
+    # drop the closing fence if it is the last non-whitespace content
+    text = re.sub(r"\n?```\s*$", "", text)
+    return text
+
+
+def sanitize_json_content(content: str) -> tuple[str, bool, Optional[str]]:
+    """Validate/normalize *content* destined for a .json path.
+
+    Returns ``(canonical_content, is_valid, error)``:
+
+    * ``is_valid=True``  → ``canonical_content`` is a canonical re-dump
+      (``indent=1``) of the parsed value. A leading ```json fence is stripped
+      first, and a strict parse is tried before the lenient one, so the
+      canonical output is always STRICTLY valid JSON regardless of which parse
+      accepted the input.
+    * ``is_valid=False`` → ``canonical_content`` is the input unchanged and
+      ``error`` carries the strict-parse failure for logging. Callers write the
+      raw bytes anyway (the repair pass owns salvage) and surface the warning.
+    """
+    text = _strip_json_fence(content)
+    try:
+        parsed = json.loads(text)
+        return json.dumps(parsed, indent=1, ensure_ascii=False), True, None
+    except json.JSONDecodeError as strict_err:
+        error = f"{strict_err.msg} at line {strict_err.lineno} column {strict_err.colno} (char {strict_err.pos})"
+    try:
+        # strict=False legalizes literal control characters inside strings
+        # (the priceline class: real 0x0A bytes in a prose field). The re-dump
+        # escapes them, so the output is never looser than strict JSON.
+        parsed = json.loads(text, strict=False)
+        logger.info(
+            "write guard: canonicalized .json content (strict parse failed, "
+            "lenient parse succeeded — control characters escaped): %s",
+            error,
+        )
+        return json.dumps(parsed, indent=1, ensure_ascii=False), True, None
+    except json.JSONDecodeError as lenient_err:
+        error = (
+            f"{lenient_err.msg} at line {lenient_err.lineno} column "
+            f"{lenient_err.colno} (char {lenient_err.pos})"
+        )
+        return content, False, error
 
 
 def _resolve_project_root(project_root: Optional[str] = None) -> str:
@@ -154,11 +222,24 @@ def get_filesystem_tools(
             safe = _enforce_not_skills(path, root)
         except ValueError as e:
             return str(e)
+        note = ""
+        if safe.endswith(".json"):
+            # F2 sanitize-on-write: never let an unparseable artifact reach disk
+            # unflagged. Canonicalize on success; on failure write the raw bytes
+            # (the phase-exit repair pass owns salvage) but say so.
+            content, valid, err = sanitize_json_content(content)
+            if not valid:
+                note = "\n" + _JSON_WARN_NOTE
+                logger.warning(
+                    "write guard: %s is not valid JSON (%s) — written raw; "
+                    "repair pass will attempt salvage on read",
+                    safe, err,
+                )
         try:
             os.makedirs(os.path.dirname(safe) or ".", exist_ok=True)
             with open(safe, "w", encoding="utf-8") as f:
                 f.write(content)
-            return f"Successfully wrote {len(content)} characters to {safe}"
+            return f"Successfully wrote {len(content)} characters to {safe}{note}"
         except Exception as e:
             return f"Error writing '{path}': {e}"
 
