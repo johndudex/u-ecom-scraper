@@ -88,6 +88,67 @@ def sanitize_json_content(content: str) -> tuple[str, bool, Optional[str]]:
         return content, False, error
 
 
+def _repair_json_text_in_memory(text: str) -> tuple[Optional[str], str]:
+    """Run the deterministic artifact-repair ladder on *text* without touching
+    disk. Delegates to ``agents.graph.repair_json_text`` (imported lazily —
+    importing graph at module scope would be circular and drag Django in).
+    """
+    try:
+        from agents.graph import repair_json_text
+    except Exception as exc:  # pragma: no cover - import env problem
+        logger.warning("guard_json_bytes: repair ladder unavailable: %s", exc)
+        return None, ""
+    try:
+        return repair_json_text(text)
+    except Exception as exc:
+        logger.warning("guard_json_bytes: repair ladder errored: %s", exc)
+        return None, ""
+
+
+def guard_json_bytes(raw: bytes) -> tuple[Optional[bytes], str]:
+    """M4 copy-path guard: validate/repair .json bytes crossing a byte-copy
+    boundary (workspace → File Master, or FM → workspace on re-hydration).
+
+    Returns ``(bytes_to_store, note)``:
+
+    * valid strict JSON        → the ORIGINAL bytes, byte-identical (a valid
+      artifact must never be reformatted by a copy path — stable diffs).
+    * only control chars (C1)  → canonical redump built from the PARSED value.
+    * otherwise unparseable    → the deterministic repair runs in-memory and
+      the repaired bytes are returned.
+    * unrepairable             → ``(None, note)`` so the caller can SKIP the
+      copy instead of propagating corrupt bytes.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return None, f"not valid UTF-8 ({exc})"
+
+    # strict parse first: a strictly-valid artifact passes through UNTOUCHED.
+    try:
+        json.loads(text)
+        return raw, ""
+    except json.JSONDecodeError as strict_err:
+        err = strict_err
+
+    # C1: control chars only — lenient parse, redump canonically from the
+    # PARSED value (never a raw-byte copy of lenient-accepted bytes).
+    try:
+        parsed = json.loads(text, strict=False)
+        return (
+            json.dumps(parsed, indent=1, ensure_ascii=False).encode("utf-8"),
+            f"canonicalized on copy ({err.msg} at char {err.pos})",
+        )
+    except json.JSONDecodeError:
+        pass
+
+    # unparseable even leniently → run the deterministic repair in-memory
+    repaired, note = _repair_json_text_in_memory(text)
+    if repaired is not None:
+        return repaired.encode("utf-8"), note
+    return None, f"unrepairable ({err.msg} at char {err.pos})"
+
+
 def _resolve_project_root(project_root: Optional[str] = None) -> str:
     """Return the effective project root directory."""
     if project_root:

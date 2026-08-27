@@ -77,7 +77,12 @@ def _clean_stale_artifacts(workspace_dir: str, preserve: set[str] | None = None)
 def _restore_from_archive(slug: str, workspace_dir: str, filename: str) -> bool:
     """Re-hydrate an artifact from the File Master (scrapers/{slug}/analysis/)
     into the LOCAL workspace, if the workspace copy is missing (selective re-run
-    — the workspace was rmtree'd by _finalize_job)."""
+    — the workspace was rmtree'd by _finalize_job).
+
+    M4 copy-path guard: a corrupt FM copy is quarantined (``.corrupt``) rather
+    than faithfully restored — re-hydrating corrupt bytes is how corruption
+    became durable across jobs (job 10's author consumed a poisoned artifact
+    this way). Repairable bytes land repaired; unrepairable bytes never land."""
     import src.artifacts as artifacts
 
     dst = os.path.join(workspace_dir, filename)
@@ -86,9 +91,33 @@ def _restore_from_archive(slug: str, workspace_dir: str, filename: str) -> bool:
     key = artifacts.scrapers_key(slug, "analysis", filename)
     try:
         if artifacts.exists(key):
+            _bytes = artifacts.read(key)
+            if filename.endswith(".json"):
+                try:
+                    from ..tools.filesystem_tools import guard_json_bytes
+                except Exception as exc:  # pragma: no cover
+                    logger.warning(
+                        "setup_workspace: guard unavailable for %s: %s", filename, exc
+                    )
+                    guard_json_bytes = None
+                if guard_json_bytes is not None:
+                    guarded, note = guard_json_bytes(_bytes)
+                    if guarded is None:
+                        logger.error(
+                            "setup_workspace: FM copy of %s is corrupt and "
+                            "unrepairable (%s) — NOT re-hydrated; downstream "
+                            "will treat the artifact as missing", filename, note,
+                        )
+                        return False
+                    if note:
+                        logger.warning(
+                            "setup_workspace: FM copy of %s was corrupt — "
+                            "re-hydrating REPAIRED version (%s)", filename, note,
+                        )
+                    _bytes = guarded
             os.makedirs(workspace_dir, exist_ok=True)
             with open(dst, "wb") as _f:
-                _f.write(artifacts.read(key))
+                _f.write(_bytes)
             logger.info("setup_workspace: re-hydrated %s from FM analysis/", filename)
             return True
     except Exception as exc:

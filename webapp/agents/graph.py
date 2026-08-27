@@ -278,6 +278,80 @@ def _balanced_close(content: str, err: json.JSONDecodeError) -> str:
     return candidate
 
 
+def repair_json_text(content: str) -> tuple[Optional[str], str]:
+    """In-memory artifact repair (pure function — no filesystem access).
+
+    Runs the pass ladder described on ``_fix_json_artifact`` and returns
+    ``(repaired_text, note)``; ``(None, "")`` when nothing repairs. Used both
+    by the phase-exit repair and by the M4 copy-path guards, which must repair
+    bytes in memory rather than mutating a workspace file.
+    """
+    # pass 0: already valid?
+    try:
+        json.loads(content)
+        return content, ""
+    except json.JSONDecodeError as e:
+        err: Optional[json.JSONDecodeError] = e
+    # pass 0b: C1 — literal control chars, repaired losslessly
+    try:
+        parsed = json.loads(content, strict=False)
+        return (
+            json.dumps(parsed, indent=1, ensure_ascii=False),
+            "pass 0b: repaired control characters (strict=False)",
+        )
+    except json.JSONDecodeError:
+        pass
+    # pass 1: bad escapes (C4)
+    try:
+        fixed = re.sub(r'(?<=[^\\])\\(?!["\\/bfnrtu])', r"\\\\", content)
+        json.loads(fixed)
+        return fixed, "pass 1: fixed bad escapes"
+    except Exception:
+        pass
+    # pass 2: salvage the largest parseable leading object (C3 prefix)
+    try:
+        dec = json.JSONDecoder()
+        obj, _end = dec.raw_decode(content)
+        if isinstance(obj, dict) and obj:
+            return (
+                json.dumps(obj, indent=1, ensure_ascii=False),
+                "pass 2: salvaged truncated object (valid prefix kept)",
+            )
+    except Exception:
+        pass
+    # pass 2b: balanced-closer salvage bounded by the error position (C2)
+    if err is not None:
+        try:
+            candidate = _balanced_close(content, err)
+            obj = json.loads(candidate)
+            if isinstance(obj, dict) and obj:
+                return (
+                    json.dumps(obj, indent=1, ensure_ascii=False),
+                    f"pass 2b: balanced-closer salvage (recovered {len(obj)} "
+                    f"top-level keys; dropped content after char {err.pos})",
+                )
+        except Exception:
+            pass
+    # pass 3: coarse truncation sweep (last resort)
+    try:
+        step = max(1, len(content) // 200)
+        for cut in range(len(content) - 1, 0, -step):
+            head = content[:cut].rstrip().rstrip(",")
+            for closer in ("}", "]}"):
+                try:
+                    obj = json.loads(head + closer)
+                    if isinstance(obj, dict) and obj:
+                        return (
+                            json.dumps(obj, indent=1, ensure_ascii=False),
+                            "pass 3: salvaged by truncation sweep",
+                        )
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None, ""
+
+
 def _fix_json_artifact(slug: str, filename: str) -> None:
     """Repair-on-write guard (job-10 lesson): a corrupt artifact silently
     became {} downstream and the writer lost the field map AND the verify
@@ -311,82 +385,20 @@ def _fix_json_artifact(slug: str, filename: str) -> None:
     except Exception:
         return
 
-    def _write_repaired(text: str, note: str) -> None:
-        # validate BEFORE writing — never persist a guess that doesn't parse
-        json.loads(text)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(text)
-        logger.warning("_fix_json_artifact: %s (%s)", note, path)
-
-    # pass 0 / 0b: is it valid as-is (strictly, then leniently)?
-    err: Optional[json.JSONDecodeError] = None
     try:
         json.loads(content)
         return  # valid as-is
-    except json.JSONDecodeError as e:
-        err = e
-    try:
-        parsed = json.loads(content, strict=False)
-        _write_repaired(
-            json.dumps(parsed, indent=1, ensure_ascii=False),
-            "pass 0b: repaired control characters (strict=False)",
-        )
-        return
     except json.JSONDecodeError:
         pass
-    # pass 1: bad escapes
-    try:
-        fixed = re.sub(r'(?<=[^\\])\\(?!["\\/bfnrtu])', r"\\\\", content)
-        json.loads(fixed)
-        _write_repaired(fixed, "pass 1: fixed bad escapes")
+
+    repaired, note = repair_json_text(content)
+    if repaired is not None:
+        # validate BEFORE writing — never persist a guess that doesn't parse
+        json.loads(repaired)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(repaired)
+        logger.warning("_fix_json_artifact: %s (%s)", note, path)
         return
-    except Exception:
-        pass
-    # pass 2: salvage the largest parseable leading object (keys after the
-    # corruption are lost; everything before is real analysis data)
-    try:
-        dec = json.JSONDecoder()
-        obj, _end = dec.raw_decode(content)
-        if isinstance(obj, dict) and obj:
-            _write_repaired(
-                json.dumps(obj, indent=1, ensure_ascii=False),
-                "pass 2: salvaged truncated object (valid prefix kept)",
-            )
-            return
-    except Exception:
-        pass
-    # pass 2b: balanced-closer salvage bounded by the strict-parse error
-    if err is not None:
-        try:
-            candidate = _balanced_close(content, err)
-            obj = json.loads(candidate)
-            if isinstance(obj, dict) and obj:
-                _write_repaired(
-                    json.dumps(obj, indent=1, ensure_ascii=False),
-                    f"pass 2b: balanced-closer salvage (recovered {len(obj)} "
-                    f"top-level keys; dropped content after char {err.pos})",
-                )
-                return
-        except Exception:
-            pass
-    # pass 3: trim trailing partial content, re-close braces
-    try:
-        step = max(1, len(content) // 200)
-        for cut in range(len(content) - 1, 0, -step):
-            head = content[:cut].rstrip().rstrip(",")
-            for closer in ("}", "]}"):
-                try:
-                    obj = json.loads(head + closer)
-                    if isinstance(obj, dict) and obj:
-                        _write_repaired(
-                            json.dumps(obj, indent=1, ensure_ascii=False),
-                            "pass 3: salvaged by truncation sweep",
-                        )
-                        return
-                except Exception:
-                    continue
-    except Exception:
-        pass
     # unrepairable: rename so downstream treats as MISSING (rerun path)
     try:
         os.replace(path, path + ".corrupt")
@@ -3976,13 +3988,30 @@ def _invoke_skill_learner(state: ScrapeState, config: RunnableConfig) -> dict[st
 
                 ws = os.path.join(settings.PROJECT_ROOT, "workspace", slug)
                 # Preserve learning + nav_learning reports to the File Master.
+                # M4 copy-path guard: never publish corrupt bytes (they are
+                # re-hydrated into later jobs by setup_workspace).
+                from .tools.filesystem_tools import guard_json_bytes
+
                 for _name in ("learning_report.json", "nav_learning_report.json"):
                     _src = os.path.join(ws, _name)
                     if os.path.isfile(_src):
                         with open(_src, "rb") as _f:
                             _bytes = _f.read()
+                        _guarded, _note = guard_json_bytes(_bytes)
+                        if _guarded is None:
+                            logger.error(
+                                "_invoke_skill_learner: %s is corrupt and "
+                                "unrepairable (%s) — SKIPPED, not published to "
+                                "the File Master", _name, _note,
+                            )
+                            continue
+                        if _note:
+                            logger.warning(
+                                "_invoke_skill_learner: %s was corrupt — "
+                                "publishing REPAIRED version (%s)", _name, _note,
+                            )
                         _key = artifacts.scrapers_key(slug, "analysis", _name)
-                        artifacts.write(_key, _bytes)
+                        artifacts.write(_key, _guarded)
                         logger.info(
                             "_invoke_skill_learner: copied %s → scrapers/%s/analysis/",
                             _name, slug,

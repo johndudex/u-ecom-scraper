@@ -689,6 +689,60 @@ def _finalize_was_cancelled(final_state: dict[str, Any]) -> bool:
     return is_cancel(response)
 
 
+def _publish_analysis_artifacts(job_id: int, site_slug: str, ws) -> None:
+    """Copy the analysis artifacts from the LOCAL workspace to the File Master.
+
+    M4 copy-path guard (artifact-corruption plan): the finalize loop previously
+    copied raw bytes with no parse check, which is how the corrupt priceline
+    ``test_report.json`` reached the FM — and ``setup_workspace`` then faithfully
+    re-hydrates those bytes into the NEXT job's workspace, so corruption was
+    durable across jobs. Each .json is now validated first (strict, then
+    lenient → canonical redump from the PARSED value); unparseable bytes go
+    through the in-memory repair; if still bad the copy is SKIPPED with an
+    ERROR log rather than propagating corrupt bytes.
+    """
+    import src.artifacts as artifacts
+
+    try:
+        from agents.tools.filesystem_tools import guard_json_bytes
+    except Exception as exc:  # pragma: no cover - import env problem
+        logger.error("Job %s: guard_json_bytes unavailable: %s", job_id, exc)
+        return
+
+    for artifact in [
+        "site_analysis.json",
+        "navigation_analysis.json",
+        "product_analysis.json",
+        "scraper_analysis.json",
+        "test_report.json",
+    ]:
+        src = ws / artifact
+        if not src.is_file():
+            continue
+        try:
+            _bytes = src.read_bytes()
+            guarded, note = guard_json_bytes(_bytes)
+            if guarded is None:
+                logger.error(
+                    "Job %s: %s is corrupt and unrepairable (%s) — SKIPPED, not "
+                    "published to the File Master", job_id, artifact, note,
+                )
+                continue
+            if note:
+                logger.warning(
+                    "Job %s: %s was corrupt — publishing REPAIRED version (%s)",
+                    job_id, artifact, note,
+                )
+            artifacts.write(
+                artifacts.scrapers_key(site_slug, "analysis", artifact), guarded
+            )
+            logger.info("Job %s: preserved %s to analysis/", job_id, artifact)
+        except Exception as exc:
+            logger.warning(
+                "Job %s: preserve %s failed: %s", job_id, artifact, exc
+            )
+
+
 def _finalize_job(job: ScrapeJob) -> None:
     """Read the final graph checkpoint and persist results to the job.
 
@@ -830,24 +884,8 @@ def _finalize_job(job: ScrapeJob) -> None:
                         logger.warning("Job %d: preserve output %s failed: %s", job.id, f.name, exc)
                     if job.output_file and _P(job.output_file).name == f.name:
                         _matched_key = _key
-                # analysis → FM
-                for artifact in [
-                    "site_analysis.json",
-                    "navigation_analysis.json",
-                    "product_analysis.json",
-                    "scraper_analysis.json",
-                    "test_report.json",
-                ]:
-                    src = ws / artifact
-                    if src.is_file():
-                        try:
-                            artifacts.write(
-                                artifacts.scrapers_key(site_slug, "analysis", artifact),
-                                src.read_bytes(),
-                            )
-                            logger.info("Job %d: preserved %s to analysis/", job.id, artifact)
-                        except Exception:
-                            pass
+                # analysis → FM (M4: validated — corruption never reaches the FM)
+                _publish_analysis_artifacts(job.id, site_slug, ws)
                 # Defense-in-depth: don't rmtree if another job for this URL is
                 # mid-flight (the dispatch guard should prevent this, but a
                 # bypassed/played-with workspace would lose its artifacts).
