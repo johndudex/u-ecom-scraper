@@ -233,3 +233,26 @@ none requires new infrastructure, async, LLM cost, or env changes.
 - code_writer context ballooning (127 trims / 350k chars in job 12) is a separate documented
   root cause; this plan removes the amplification (cycle 3), not the pathology.
 - abercrombie artifacts were not found in either repo (constraint-1 list entry unverifiable).
+
+---
+
+## 7. Implementation record (2026-08-27, branch file-master-artifacts)
+
+| Step | Commit | Notes / deviations |
+|---|---|---|
+| S0 date-bomb + anchor | `1d335b3` | FIXED_AT deleted (the `scraped_at__lte` ceiling excluded every row from 2026-08-27 → scanned 0). `parse_posted_date(raw, now=listing.scraped_at)`; new warning when rows scanned but none fixable; idempotency test pins the anchor. 13/13 in the two affected suites. |
+| S1 classed ladder | `c363850` | Deviations (both necessary): (1) `settings.py` gained `LLM_RETRY_RATELIMIT_BASE=2.0` + `LLM_RETRY_BACKOFF_FLOOR=1.0` — decouple defaults always define the keys, so getattr fallbacks would be dead code; (2) exhaustion record is `logger.error("llm-retry-exhausted …")` with a stable test-locked prefix, NOT a SessionLog row — llm.py sits inside the react loop with no LangGraph state/job_id. Drive-by fix: the async classified-retry path never awaited its sleep (zero backoff). Worst case 6×30s=180s inside the 900s wall; measured mean ~62s. |
+| S2 gate + S3 precedence + S4 escalation | `eba9db6` | Also: `_invoke_agent_with_timeout` preserves `_error_class` at both sites (marker fix); `_project_api_endpoint` retains sample_keys/content_type (S6 retention half). S4 exhausted routing returns `Command(goto=…)` from `_decide_strategy`, mirroring route_after_testing's arms. 25 tests + golden replay over 7 fixtures; strategy-adjacent suites 90 passed/2 skipped. |
+| S6 capture prereqs | `d72d529` | F17 (`_SELECT_OPTION_KEYS` += "count"), F7 (`content_type` captured through `_httpx_fetch` → descriptor). 3 pre-existing traversal failures left as-is (stale `api_url` assertion ×1, environmental browser_traverse ×2). |
+| Pre-ship amn live check | `68bf8c1` | Live read-only probe: amn reports `jobCount: 14627`, but `_extract_items_count` missed the key → fresh descriptors would carry count=null and the strict gate would reject a true-positive class. Fixed capture-side (`total_like` += jobcount/job_count; bools never totals; list elements still never walked for totals). Fixture `amn-jobs-api.json` expected **true**. |
+| S5 salvage honesty + bypass tightening | `225fac0` | Lossy-salvage FM copies refused at rehydration; node returns cleared skip flags (plain bool fields — verified no reducers). Coverage bypass tightened to the loose rule exactly as planned; the one planned test flip was mechanical (fixture body lands in repair pass 2). |
+| S7 fixture corpus | `eba9db6` + `68bf8c1` | 8 fixtures + README verdict table (see tests/fixtures/endpoints/). |
+| S8 boxing | deferred | Per plan — requires an `_error` consumer design first. |
+
+Outstanding (zero-code / ops): set a distinct `ZAI_FALLBACK_MODEL` in Railway (circuit
+breaker is a no-op while all three model names are identical); decide priceline FM output
+poison cleanup; rotate the exposed prod admin + Railway Project-Access-Token.
+
+Process note: three implementation agents committed concurrently in this worktree and
+`git add`-all sweeps raced; one commit was rebuilt via `git commit-tree` by an agent.
+Final history verified file-by-file — every commit contains exactly its named files.
