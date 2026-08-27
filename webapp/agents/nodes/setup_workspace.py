@@ -74,7 +74,12 @@ def _clean_stale_artifacts(workspace_dir: str, preserve: set[str] | None = None)
     return removed
 
 
-def _restore_from_archive(slug: str, workspace_dir: str, filename: str) -> bool:
+def _restore_from_archive(
+    slug: str,
+    workspace_dir: str,
+    filename: str,
+    status: dict[str, str] | None = None,
+) -> bool:
     """Re-hydrate an artifact from the File Master (scrapers/{slug}/analysis/)
     into the LOCAL workspace, if the workspace copy is missing (selective re-run
     — the workspace was rmtree'd by _finalize_job).
@@ -82,7 +87,15 @@ def _restore_from_archive(slug: str, workspace_dir: str, filename: str) -> bool:
     M4 copy-path guard: a corrupt FM copy is quarantined (``.corrupt``) rather
     than faithfully restored — re-hydrating corrupt bytes is how corruption
     became durable across jobs (job 10's author consumed a poisoned artifact
-    this way). Repairable bytes land repaired; unrepairable bytes never land."""
+    this way). Repairable bytes land repaired; unrepairable bytes never land.
+
+    S5 salvage honesty: repair passes 2/2b/3 are LOSSY (content after the
+    parse-error position is dropped; every lossy note says "salvage"). A
+    lossy-salvaged FM copy is REFUSED and ``status[filename]`` is set to
+    ``"salvage-refused"`` so the caller can clear the skip flag — the phase
+    must re-run fresh rather than trust a 1-of-N artifact (job-12 round 2:
+    stale-artifact re-injection). Lossless repairs (0b control chars, 1 bad
+    escapes) still re-hydrate repaired."""
     import src.artifacts as artifacts
 
     dst = os.path.join(workspace_dir, filename)
@@ -107,6 +120,15 @@ def _restore_from_archive(slug: str, workspace_dir: str, filename: str) -> bool:
                             "setup_workspace: FM copy of %s is corrupt and "
                             "unrepairable (%s) — NOT re-hydrated; downstream "
                             "will treat the artifact as missing", filename, note,
+                        )
+                        return False
+                    if note and "salvage" in note:
+                        if status is not None:
+                            status[filename] = "salvage-refused"
+                        logger.error(
+                            "setup_workspace: FM copy of %s is a LOSSY salvage "
+                            "(%s) — NOT re-hydrated; clearing the skip flag so "
+                            "the phase re-runs fresh", filename, note,
                         )
                         return False
                     if note:
@@ -174,14 +196,25 @@ def setup_workspace(state: ScrapeState) -> dict[str, Any]:
 
     # Re-hydrate analysis artifacts from FM (scrapers/{slug}/analysis/) for the
     # selective re-run case (workspace was rmtree'd by _finalize_job last run).
+    # S5: when the only FM copy is a LOSSY salvage, the restore refuses — clear
+    # the governing skip flag so the producing phase re-runs instead of the job
+    # consuming a 1-of-N artifact under a "skip" it no longer earned.
+    update: dict[str, Any] = {}
+
+    def _restore(filename: str, flag: str) -> None:
+        _status: dict[str, str] = {}
+        _restore_from_archive(slug, workspace_dir, filename, _status)
+        if _status.get(filename) == "salvage-refused":
+            update[flag] = False
+
     if state.get("skip_site_analysis"):
-        _restore_from_archive(slug, workspace_dir, "site_analysis.json")
+        _restore("site_analysis.json", "skip_site_analysis")
     if state.get("skip_product_analysis"):
-        _restore_from_archive(slug, workspace_dir, "product_analysis.json")
-        _restore_from_archive(slug, workspace_dir, "navigation_analysis.json")
+        _restore("product_analysis.json", "skip_product_analysis")
+        _restore("navigation_analysis.json", "skip_product_analysis")
     if state.get("skip_code_generation"):
-        _restore_from_archive(slug, workspace_dir, "scraper_analysis.json")
-        _restore_from_archive(slug, workspace_dir, "test_report.json")
+        _restore("scraper_analysis.json", "skip_code_generation")
+        _restore("test_report.json", "skip_code_generation")
 
     input_urls = state.get("input_urls") or []
     if input_urls:
@@ -203,4 +236,4 @@ def setup_workspace(state: ScrapeState) -> dict[str, Any]:
 
     logger.info("setup_workspace: ensured directories for %s", slug)
 
-    return {}
+    return update

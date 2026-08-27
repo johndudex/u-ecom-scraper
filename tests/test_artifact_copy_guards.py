@@ -247,12 +247,46 @@ class TestRestoreFromArchiveGuard:
         assert ok is False
         assert any(r.levelno >= _l.ERROR for r in caplog.records)
 
-    def test_repairable_fm_copy_rehydrated_repaired(self, tmp_path, monkeypatch):
+    def test_lossy_salvage_fm_copy_refused(self, tmp_path, monkeypatch, caplog):
+        """S5 salvage honesty: the pass-2 body `{"a": "keep", ...truncated...}`
+        is a LOSSY salvage (content after the parse-error position is dropped).
+        Re-hydrating it under a skip flag makes the job trust a 1-of-N artifact
+        as complete (job-12 round 2: stale-artifact re-injection) — refused."""
+        import logging as _l
+
+        with caplog.at_level(_l.ERROR, logger="agents.nodes.setup_workspace"):
+            ok, content = self._restore(
+                tmp_path, monkeypatch, b'{"a": "keep", "bad": 25 offices with counts,}'
+            )
+        assert content is None, "lossy-salvaged FM bytes must not land in the workspace"
+        assert ok is False
+        assert any("salvage" in (r.getMessage()) for r in caplog.records)
+
+    def test_lossless_repair_fm_copy_still_rehydrated(self, tmp_path, monkeypatch):
+        """The lossless rungs (0b control chars, 1 bad escapes) keep working:
+        repaired bytes land, nothing is refused."""
         ok, content = self._restore(
-            tmp_path, monkeypatch, b'{"a": "keep", "bad": 25 offices with counts,}'
+            tmp_path, monkeypatch, b'{"a": "line1\x0aline2"}'
         )
+        assert ok is True
         assert content is not None
-        assert json.loads(content.decode("utf-8")) == {"a": "keep"}
+        assert json.loads(content.decode("utf-8")) == {"a": "line1\nline2"}
+
+    def test_salvage_refusal_reported_via_status_dict(self, tmp_path, monkeypatch):
+        """The caller learns WHY the restore refused via the status out-param,
+        so it can clear the governing skip flag."""
+        import src.artifacts as artifacts
+        from agents.nodes.setup_workspace import _restore_from_archive
+
+        monkeypatch.setattr(artifacts, "exists", lambda key: True)
+        monkeypatch.setattr(artifacts, "read", lambda key: b'{"a": "keep", "x": 1 2 3,}')
+        ws = tmp_path / "workspace" / "s"
+        ws.mkdir(parents=True, exist_ok=True)
+        status: dict = {}
+        ok = _restore_from_archive("s", str(ws), "site_analysis.json", status)
+        assert ok is False
+        assert status.get("site_analysis.json") == "salvage-refused"
+        assert not (ws / "site_analysis.json").exists()
 
     def test_valid_fm_copy_byte_identical(self, tmp_path, monkeypatch):
         raw = b'{\n "platform": "sfcc"\n}\n'
@@ -272,3 +306,35 @@ class TestRestoreFromArchiveGuard:
         ok = _restore_from_archive("s", str(ws), "site_analysis.json")
         assert ok is False
         assert json.loads((ws / "site_analysis.json").read_bytes()) == {"local": 1}
+
+
+class TestSetupWorkspaceSalvageFlag:
+    """S5: the node must return cleared skip flags when the FM copy is a lossy
+    salvage, so the producing phase re-runs instead of the job consuming a
+    1-of-N artifact under a "skip" it no longer earned."""
+
+    def _node(self, tmp_path, monkeypatch, fm_body):
+        import importlib
+
+        import src.artifacts as artifacts
+
+        sw = importlib.import_module("agents.nodes.setup_workspace")
+
+        monkeypatch.setattr(sw, "_get_project_root", lambda: str(tmp_path))
+        monkeypatch.setattr(artifacts, "exists", lambda key: True)
+        monkeypatch.setattr(
+            artifacts, "read", lambda key: fm_body if isinstance(fm_body, bytes) else fm_body.encode()
+        )
+        return sw
+
+    def test_salvage_refusal_clears_skip_flag(self, tmp_path, monkeypatch):
+        sw = self._node(tmp_path, monkeypatch, b'{"platform": "sfcc", "bad": 1 2 3,}')
+        update = sw.setup_workspace({"site_slug": "s", "skip_product_analysis": True})
+        assert update.get("skip_product_analysis") is False
+        assert not (tmp_path / "workspace" / "s" / "product_analysis.json").exists()
+
+    def test_lossless_repair_clears_nothing(self, tmp_path, monkeypatch):
+        sw = self._node(tmp_path, monkeypatch, b'{"platform": "sfcc"}')
+        update = sw.setup_workspace({"site_slug": "s", "skip_product_analysis": True})
+        assert update == {}
+        assert (tmp_path / "workspace" / "s" / "product_analysis.json").exists()

@@ -178,7 +178,15 @@ def validate_coverage(state: ScrapeState) -> Command:
     nav_analysis = state.get("navigation_analysis") or {}
     api_ep = nav_analysis.get("api_endpoint")
     api_url = (api_ep or {}).get("url") if isinstance(api_ep, dict) else None
-    if api_url:
+    # S5 (job-12): a bare/poison api_endpoint must not buy the bypass. Loose
+    # rule only — data_source=="api" AND a measured items_per_page>0. Deliberately
+    # NOT the strict count predicate (amn-class descriptors report no total; the
+    # bypass exists for exactly that class), but a mere URL (no data_source, no
+    # page size) no longer skips the gate — priceline-class fresh runs get the
+    # coverage gate armed here too.
+    _ipp = (api_ep or {}).get("items_per_page") if isinstance(api_ep, dict) else None
+    _ipp_ok = isinstance(_ipp, int) and not isinstance(_ipp, bool) and _ipp > 0
+    if api_url and nav_analysis.get("data_source") == "api" and _ipp_ok:
         logger.info(
             "validate_coverage: backend JSON API discovered (%s); fields will be mapped "
             "generically by src.job_fields at scrape time — skipping product_analysis "
