@@ -60,16 +60,36 @@ _TRANSIENT_ERRORS = (
 
 
 def _retry_settings() -> dict:
-    """Read retry config lazily (Django settings may not be ready at import)."""
+    """Read retry config lazily (Django settings may not be ready at import).
+
+    Two classes, two ladders (job12-fix-plan-FINAL §S1). The **rate-limit**
+    class burned its whole budget in ~7.5s on job 12 (4× HTTP 429 in an 8s
+    burst; sleeps 1.6/4.2/1.7s) and the exception then took the whole graph
+    down — it now gets 6 attempts, its own base (2.0) and a 1.0s floor
+    (``uniform(0, x)`` could legally return ~0s → an instant guaranteed-repeat
+    429). Worst case 6×30s = 180s, ~17% of the 900s job wall; the job-12 burst
+    is absorbed with margin. The **transient** class is unchanged.
+    """
     try:
         return {
+            # ── transient (timeout/connection/5xx) — unchanged, test-locked ──
             "transient_max": int(getattr(settings, "LLM_RETRY_TRANSIENT_MAX", 2)),
-            "ratelimit_max": int(getattr(settings, "LLM_RETRY_RATELIMIT_MAX", 3)),
             "backoff_base": float(getattr(settings, "LLM_RETRY_BACKOFF_BASE", 1.5)),
             "backoff_cap": float(getattr(settings, "LLM_RETRY_BACKOFF_CAP", 30.0)),
+            # ── rate limit (429) — classed ladder ──
+            "ratelimit_max": int(getattr(settings, "LLM_RETRY_RATELIMIT_MAX", 6)),
+            "ratelimit_base": float(getattr(settings, "LLM_RETRY_RATELIMIT_BASE", 2.0)),
+            "backoff_floor": float(getattr(settings, "LLM_RETRY_BACKOFF_FLOOR", 1.0)),
         }
     except Exception:
-        return {"transient_max": 2, "ratelimit_max": 3, "backoff_base": 1.5, "backoff_cap": 30.0}
+        return {
+            "transient_max": 2,
+            "ratelimit_max": 6,
+            "backoff_base": 1.5,
+            "ratelimit_base": 2.0,
+            "backoff_cap": 30.0,
+            "backoff_floor": 1.0,
+        }
 
 
 def _parse_retry_after(exc: BaseException) -> float | None:
@@ -85,10 +105,48 @@ def _parse_retry_after(exc: BaseException) -> float | None:
     return None
 
 
-def _backoff_delay(attempt: int, cfg: dict) -> float:
-    """Full-jitter exponential backoff: uniform in [0, min(cap, base * 2**attempt)]."""
+# Retry-After jitter half-width: the jittered sleep is uniform in
+# [0.8·RA, 1.2·RA], clamped to [floor, cap]. Chosen so N workers that 429'd
+# together (all reading the SAME Retry-After) no longer wake in lockstep and
+# re-collide, while every wake-up stays inside the window the provider asked
+# for. ±20% keeps a 10s guidance within 8-12s — materially de-correlated at
+# job-12 burst scale, without inventing a delay the provider didn't ask for.
+_RETRY_AFTER_JITTER = 0.20
+
+
+def _backoff_delay(
+    attempt: int,
+    cfg: dict,
+    kind: str = "transient",
+    retry_after: float | None = None,
+) -> float:
+    """Full-jitter exponential backoff for one retry of ``kind``.
+
+    Transient class keeps its original shape — uniform in
+    ``[0, min(cap, backoff_base·2**attempt)]``. The rate-limit class swaps in
+    ``ratelimit_base`` and never sleeps less than ``backoff_floor`` (a ~0s
+    sleep would re-fire the 429 immediately).
+
+    A provider Retry-After is honored but jittered (see ``_RETRY_AFTER_JITTER``)
+    and then clamped into ``[floor, cap]`` — so a huge guidance collapses onto
+    the cap instead of eating the job wall clock.
+    """
     import random as _r  # local alias to keep module surface clean
-    return _r.uniform(0.0, min(cfg["backoff_cap"], cfg["backoff_base"] * (2 ** attempt)))
+
+    base, floor = (
+        (cfg["ratelimit_base"], cfg["backoff_floor"])
+        if kind == "rate_limit"
+        else (cfg["backoff_base"], 0.0)
+    )
+    cap = cfg["backoff_cap"]
+    if retry_after is not None:
+        delay = _r.uniform(
+            retry_after * (1.0 - _RETRY_AFTER_JITTER),
+            retry_after * (1.0 + _RETRY_AFTER_JITTER),
+        )
+        return min(max(delay, floor), cap)
+    ceiling = max(floor, min(cap, base * (2 ** attempt)))
+    return _r.uniform(floor, ceiling) if ceiling > floor else floor
 
 
 # ── Provider routing (LiteLLM proxy) ─────────────────────────────────────────
@@ -156,65 +214,140 @@ def _litellm_fallback(requested: str) -> Optional[str]:
     return None
 
 
-def _retry_classified_sync(fn, cfg: dict):
+def _provider_code(exc: BaseException) -> Optional[str]:
+    """Provider error code from an openai exception, if it carries one.
+
+    Z.AI's 429s arrive as ``{"error": {"code": 1302, ...}}`` — the SDK surfaces
+    that as ``exc.body``. The bare class name (``RateLimitError``) hides which
+    limit was hit, and job 12's 429s were indistinguishable from any other 429.
+    """
+    for container in (getattr(exc, "body", None), getattr(exc, "error", None)):
+        if not isinstance(container, dict):
+            continue
+        err = container.get("error", container)
+        if isinstance(err, dict):
+            if err.get("code") is not None:
+                return str(err["code"])
+        elif err is not None:
+            return str(err)
+    code = getattr(exc, "code", None)
+    return str(code) if code is not None else None
+
+
+def _error_detail(exc: BaseException) -> str:
+    """Stable ``Class/http=NNN/code=N`` string for the exhaustion record."""
+    parts = [type(exc).__name__]
+    status = getattr(exc, "status_code", None)
+    if status:
+        parts.append(f"http={status}")
+    code = _provider_code(exc)
+    if code is not None:
+        parts.append(f"code={code}")
+    return "/".join(parts)
+
+
+def _retry_budget(kind: str, cfg: dict) -> int:
+    return cfg["ratelimit_max"] if kind == "rate_limit" else cfg["transient_max"]
+
+
+def _retry_classified_sync(fn, cfg: dict, *, model: Optional[str] = None, sleep=time.sleep):
     """Run a sync LLM call with classified retry. Raises the last exception after
     the class's retry budget is exhausted."""
-    attempt = 0
+    attempt, slept = 0, 0.0
     while True:
         try:
             return fn()
         except openai.RateLimitError as exc:
-            attempt = _handle_retry(
-                "rate_limit", exc, attempt, cfg,
-                retry_after=_parse_retry_after(exc), sleep=time.sleep,
+            attempt, slept = _handle_retry(
+                "rate_limit", exc, attempt, slept, cfg,
+                retry_after=_parse_retry_after(exc), sleep=sleep, model=model,
             )
         except _TRANSIENT_ERRORS as exc:
-            attempt = _handle_retry(
-                "transient", exc, attempt, cfg, sleep=time.sleep
+            attempt, slept = _handle_retry(
+                "transient", exc, attempt, slept, cfg, sleep=sleep, model=model
             )
         except _CALLER_BUG_ERRORS:
             raise  # caller/config bug — never retry
         except openai.APIError as exc:
             # Generic APIError (not a recognized subclass) — conservative retry.
-            attempt = _handle_retry("transient", exc, attempt, cfg, sleep=time.sleep)
+            attempt, slept = _handle_retry(
+                "transient", exc, attempt, slept, cfg, sleep=sleep, model=model
+            )
 
 
-async def _retry_classified_async(fn, cfg: dict):
-    """Async counterpart of _retry_classified_sync (uses asyncio.sleep)."""
-    attempt = 0
+async def _retry_classified_async(fn, cfg: dict, *, model: Optional[str] = None, asleep=asyncio.sleep):
+    """Async counterpart of _retry_classified_sync.
+
+    The sleep is awaited HERE, not inside a shared helper: handing
+    ``asyncio.sleep`` to a sync helper just leaks an un-awaited coroutine, so
+    the async path previously had no backoff at all.
+    """
+    attempt, slept = 0, 0.0
     while True:
         try:
             return await fn()
         except openai.RateLimitError as exc:
-            attempt = _handle_retry(
-                "rate_limit", exc, attempt, cfg,
-                retry_after=_parse_retry_after(exc), sleep=asyncio.sleep,
+            attempt, slept, delay = _next_retry(
+                "rate_limit", exc, attempt, slept, cfg,
+                retry_after=_parse_retry_after(exc), model=model,
             )
         except _TRANSIENT_ERRORS as exc:
-            attempt = _handle_retry("transient", exc, attempt, cfg, sleep=asyncio.sleep)
+            attempt, slept, delay = _next_retry("transient", exc, attempt, slept, cfg, model=model)
         except _CALLER_BUG_ERRORS:
             raise
         except openai.APIError as exc:
-            attempt = _handle_retry("transient", exc, attempt, cfg, sleep=asyncio.sleep)
+            attempt, slept, delay = _next_retry("transient", exc, attempt, slept, cfg, model=model)
+        await asleep(delay)
 
 
-def _handle_retry(kind: str, exc, attempt: int, cfg: dict, *, sleep, retry_after=None) -> int:
-    """Decide whether to retry (returning the next attempt #) or re-raise."""
-    budget = cfg["ratelimit_max"] if kind == "rate_limit" else cfg["transient_max"]
+def _handle_retry(
+    kind: str,
+    exc,
+    attempt: int,
+    slept: float,
+    cfg: dict,
+    *,
+    sleep=time.sleep,
+    retry_after=None,
+    model: Optional[str] = None,
+) -> tuple[int, float]:
+    """One sync retry step: sleep this failure's backoff and return
+    ``(next attempt #, total sleep so far)``; on budget exhaustion emit the
+    ``llm-retry-exhausted`` record and re-raise."""
+    attempt, slept, delay = _next_retry(kind, exc, attempt, slept, cfg, retry_after, model)
+    sleep(delay)
+    return attempt, slept
+
+
+def _next_retry(
+    kind: str,
+    exc,
+    attempt: int,
+    slept: float,
+    cfg: dict,
+    retry_after=None,
+    model: Optional[str] = None,
+) -> tuple[int, float, float]:
+    """Resolve this failure into ``(next attempt #, updated sleep total, delay)``.
+
+    Raises the provider exception once the class's budget is exhausted — after
+    emitting the ``llm-retry-exhausted`` record, so a provider outage lands in
+    the logs with its class/model/code instead of surfacing only as a job
+    ``error_message`` (job 12's 429s never reached the log at all).
+    """
+    budget = _retry_budget(kind, cfg)
     if attempt >= budget:
-        logger.warning(
-            "llm classified-retry: %s exhausted after %d attempts: %s",
-            kind, attempt, type(exc).__name__,
+        logger.error(
+            "llm-retry-exhausted class=%s model=%s error=%s attempts=%d slept=%.1fs budget=%d cap=%.1fs",
+            kind, model or "?", _error_detail(exc), attempt, slept, budget, cfg["backoff_cap"],
         )
         raise exc
-    attempt += 1
-    delay = retry_after if retry_after is not None else _backoff_delay(attempt, cfg)
+    delay = _backoff_delay(attempt + 1, cfg, kind, retry_after)
     logger.info(
         "llm classified-retry: %s on attempt %d/%d, sleeping %.1fs: %s",
-        kind, attempt, budget, delay, type(exc).__name__,
+        kind, attempt + 1, budget, delay, type(exc).__name__,
     )
-    sleep(delay)
-    return attempt
+    return attempt + 1, slept + delay, delay
 
 
 class ClassifiedRetryChatOpenAI(ChatOpenAI):
@@ -250,6 +383,9 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
             result = _retry_classified_sync(
                 lambda: _super_generate(messages, stop=stop, run_manager=run_manager, **kwargs),
                 cfg,
+                # The configured model string goes into the exhaustion record so
+                # a provider outage is attributable from the log line alone.
+                model=self._breaker_key(),
             )
         except Exception as exc:
             self._record_breaker(exc)
@@ -265,7 +401,7 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
             return await _super_agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
 
         try:
-            result = await _retry_classified_async(_call, cfg)
+            result = await _retry_classified_async(_call, cfg, model=self._breaker_key())
         except Exception as exc:
             self._record_breaker(exc)
             raise

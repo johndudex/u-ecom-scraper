@@ -9,9 +9,13 @@ Run from repo root:  python3 -m pytest tests/test_llm_provider.py -v
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import sys
 import unittest.mock as mock
+
+import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -243,6 +247,278 @@ class TestGetLlmWiring:
 
         # non-lazy snapshot read at import: verify the map exists + keys by stem
         assert "code-writer" in sub._AGENT_LLM_TIMEOUTS or "code-writer" in sub.AGENT_LLM_TIMEOUTS
+
+
+# ── S1 classified retry ladder (job12-fix-plan-FINAL §S1) ────────────────────
+
+
+class _FakeResponse:
+    """Minimal httpx.Response stand-in — only status_code/headers/request read."""
+
+    def __init__(self, status_code=429, headers=None):
+        self.status_code = status_code
+        self.headers = headers if headers is not None else {}
+        self.request = mock.Mock()
+
+
+def _rate_limit(body=None, headers=None):
+    import openai
+
+    return openai.RateLimitError(
+        message="rate limited", response=_FakeResponse(429, headers), body=body
+    )
+
+
+def _rate_limit_every_call(**kw):
+    """side_effect factory — a Mock side_effect that *returns* an exception
+    would hand it back as a result value, not raise it."""
+
+    def _raise(*_a, **_k):
+        raise _rate_limit(**kw)
+
+    return _raise
+
+
+def _retry_cfg(**over):
+    """Explicit ladder config (the shape ``_retry_settings`` must return)."""
+    cfg = {
+        "transient_max": 2,
+        "ratelimit_max": 6,
+        "backoff_base": 1.5,
+        "ratelimit_base": 2.0,
+        "backoff_cap": 30.0,
+        "backoff_floor": 1.0,
+    }
+    cfg.update(over)
+    return cfg
+
+
+class TestRateLimitLadderSettings:
+    """Rate-limit class gets its own ladder; the transient class is locked."""
+
+    def test_default_settings(self):
+        mod = _llm_mod()
+        with mock.patch.object(mod, "settings", _FakeSettings()):
+            cfg = mod._retry_settings()
+        assert cfg["ratelimit_max"] == 6  # was 3 — job 12 burned it in ~7.5s
+        assert cfg["ratelimit_base"] == 2.0  # was the shared 1.5
+        assert cfg["backoff_floor"] == 1.0  # NEW: uniform(0, x) could sleep ~0s
+        assert cfg["backoff_cap"] == 30.0
+        # transient class UNCHANGED (regression lock)
+        assert cfg["transient_max"] == 2
+        assert cfg["backoff_base"] == 1.5
+
+    def test_settings_file_defaults_match_the_ladder(self):
+        """``_retry_settings``'s getattr fallbacks are NOT what prod reads —
+        ``config/settings.py``'s decouple defaults always shadow them. Lock those
+        so a config revert can't silently re-arm the 3-attempt ladder that job 12
+        burned through."""
+        import re
+        from pathlib import Path
+
+        src = (Path(ROOT) / "webapp" / "config" / "settings.py").read_text(encoding="utf-8")
+
+        def default(key):
+            found = re.search(rf'^{key} = config\("{key}", default=([^,]+),', src, re.M)
+            assert found, f"{key} missing from settings.py"
+            return float(found.group(1))
+
+        assert default("LLM_RETRY_RATELIMIT_MAX") == 6.0
+        assert default("LLM_RETRY_RATELIMIT_BASE") == 2.0
+        assert default("LLM_RETRY_BACKOFF_FLOOR") == 1.0
+        assert default("LLM_RETRY_BACKOFF_CAP") == 30.0
+        assert default("LLM_RETRY_TRANSIENT_MAX") == 2.0
+        assert default("LLM_RETRY_BACKOFF_BASE") == 1.5
+
+    def test_per_class_delay_bounds(self):
+        """transient keeps uniform(0, backoff_base·2^n); rate-limit is
+        floor..min(cap, ratelimit_base·2^n). Patching random.uniform to hand
+        back its bounds makes the ceiling arithmetic observable."""
+        mod = _llm_mod()
+        with mock.patch("random.uniform", lambda lo, hi: (lo, hi)):
+            assert mod._backoff_delay(1, _retry_cfg(), "transient") == (0.0, 3.0)
+            assert mod._backoff_delay(3, _retry_cfg(), "transient") == (0.0, 12.0)
+            assert mod._backoff_delay(1, _retry_cfg(), "rate_limit") == (1.0, 4.0)
+            assert mod._backoff_delay(4, _retry_cfg(), "rate_limit") == (1.0, 30.0)
+            assert mod._backoff_delay(6, _retry_cfg(), "rate_limit") == (1.0, 30.0)
+
+
+class TestRateLimitLadderBehavior:
+    def _exhaust(self, mod, fn, cfg_over=None, **kw):
+        import openai
+
+        delays = []
+        with pytest.raises(openai.RateLimitError):
+            mod._retry_classified_sync(
+                fn, _retry_cfg(**(cfg_over or {})), sleep=delays.append, **kw
+            )
+        return delays
+
+    def test_six_attempts_then_raises(self):
+        mod = _llm_mod()
+        fn = mock.Mock(side_effect=_rate_limit_every_call())
+        delays = self._exhaust(mod, fn)
+        assert fn.call_count == 7  # original call + 6 retries
+        assert len(delays) == 6
+
+    def test_backoff_doubles_from_base_2_and_caps_at_30(self):
+        mod = _llm_mod()
+        bounds = []
+        fn = mock.Mock(side_effect=_rate_limit_every_call())
+        with mock.patch("random.uniform", lambda lo, hi: bounds.append((lo, hi)) or hi):
+            self._exhaust(mod, fn)
+        assert bounds == [
+            (1.0, 4.0),
+            (1.0, 8.0),
+            (1.0, 16.0),
+            (1.0, 30.0),  # base 2.0 → 32, capped
+            (1.0, 30.0),
+            (1.0, 30.0),
+        ]
+
+    def test_floor_enforced(self):
+        mod = _llm_mod()
+        fn = mock.Mock(side_effect=_rate_limit_every_call())
+        delays = self._exhaust(mod, fn)
+        assert len(delays) == 6
+        assert all(d >= 1.0 for d in delays), delays
+
+    def test_cap_enforced(self):
+        mod = _llm_mod()
+        fn = mock.Mock(side_effect=_rate_limit_every_call())
+        delays = self._exhaust(mod, fn, {"ratelimit_base": 1000.0})
+        assert all(d <= 30.0 for d in delays), delays
+
+    def test_worst_case_bounded_under_job_wall_clock(self):
+        """6 × 30s = 180s, 17% of the 900s job wall."""
+        mod = _llm_mod()
+        fn = mock.Mock(side_effect=_rate_limit_every_call())
+        delays = self._exhaust(mod, fn, {"backoff_cap": 30.0})
+        assert sum(delays) <= 6 * 30.0
+
+
+class TestTransientClassUnchanged:
+    """Lock the transient ladder so a future edit can't silently move it."""
+
+    def test_two_retries_then_raises(self):
+        import openai
+
+        mod = _llm_mod()
+        fn = mock.Mock(side_effect=openai.APITimeoutError(request=mock.Mock()))
+        delays = []
+        with pytest.raises(openai.APITimeoutError):
+            mod._retry_classified_sync(fn, _retry_cfg(), sleep=delays.append)
+        assert fn.call_count == 3  # original + 2 retries
+        assert len(delays) == 2
+        assert all(0.0 <= d <= min(30.0, 1.5 * 2 ** (i + 1)) for i, d in enumerate(delays))
+
+    def test_no_floor_on_transient(self):
+        """The floor is a rate-limit-class feature; transient keeps uniform(0, x)."""
+        mod = _llm_mod()
+        with mock.patch("random.uniform", lambda lo, hi: (lo, hi)):
+            lo, _hi = mod._backoff_delay(1, _retry_cfg(), "transient")
+        assert lo == 0.0
+
+
+class TestRetryAfterJitter:
+    def test_honored_within_twenty_percent(self):
+        mod = _llm_mod()
+        fn = mock.Mock(side_effect=_rate_limit_every_call(headers={"retry-after": "10"}))
+        delays = self._exhaust(mod, fn)
+        assert len(delays) == 6
+        assert all(8.0 <= d <= 12.0 for d in delays), delays
+
+    def _exhaust(self, mod, fn):
+        import openai
+
+        delays = []
+        with pytest.raises(openai.RateLimitError):
+            mod._retry_classified_sync(fn, _retry_cfg(), sleep=delays.append)
+        return delays
+
+    def test_jittered_value_clamped_to_floor_and_cap(self):
+        mod = _llm_mod()
+        with mock.patch("random.uniform", lambda lo, hi: hi):  # top of jitter window
+            assert mod._backoff_delay(1, _retry_cfg(), "rate_limit", retry_after=10.0) == 12.0
+            assert mod._backoff_delay(1, _retry_cfg(), "rate_limit", retry_after=60.0) == 30.0
+            assert mod._backoff_delay(1, _retry_cfg(), "rate_limit", retry_after=0.2) == 1.0
+
+
+class TestExhaustionRecord:
+    """Exhaustion must land somewhere greppable (job 12's 429 never did)."""
+
+    def _capture(self, caplog, mod, fn, cfg=None, **kw):
+        import openai
+
+        with caplog.at_level(logging.ERROR, logger="agents.llm"), \
+                pytest.raises(openai.RateLimitError):
+            mod._retry_classified_sync(fn, _retry_cfg(**(cfg or {})), sleep=lambda d: None, **kw)
+        recs = [r for r in caplog.records if r.getMessage().startswith("llm-retry-exhausted")]
+        assert len(recs) == 1
+        return recs[0]
+
+    def test_rate_limit_exhaustion_emits_error(self, caplog):
+        mod = _llm_mod()
+        fn = mock.Mock(side_effect=_rate_limit_every_call(body={"error": {"code": 1302}}))
+        rec = self._capture(caplog, mod, fn, model="glm-5.2")
+        assert rec.levelno == logging.ERROR
+        msg = rec.getMessage()
+        assert "class=rate_limit" in msg
+        assert "model=glm-5.2" in msg
+        assert "RateLimitError" in msg
+        assert "code=1302" in msg  # Z.AI's 1302, not just "429"
+        assert "attempts=6" in msg
+        assert "slept=" in msg
+
+    def test_total_sleep_accumulated(self, caplog):
+        mod = _llm_mod()
+        fn = mock.Mock(side_effect=_rate_limit_every_call())
+        with mock.patch("random.uniform", lambda lo, hi: hi):  # 4+8+16+30+30+30
+            rec = self._capture(caplog, mod, fn)
+        assert "slept=118.0s" in rec.getMessage()
+
+    def test_model_placeholder_when_unknown(self, caplog):
+        mod = _llm_mod()
+        fn = mock.Mock(side_effect=_rate_limit_every_call())
+        rec = self._capture(caplog, mod, fn)
+        assert "model=?" in rec.getMessage()
+
+    def test_transient_exhaustion_emits_record_too(self, caplog):
+        import openai
+
+        mod = _llm_mod()
+        fn = mock.Mock(side_effect=openai.APITimeoutError(request=mock.Mock()))
+        with caplog.at_level(logging.ERROR, logger="agents.llm"), \
+                pytest.raises(openai.APITimeoutError):
+            mod._retry_classified_sync(fn, _retry_cfg(), sleep=lambda d: None, model="glm-5.2")
+        recs = [r for r in caplog.records if r.getMessage().startswith("llm-retry-exhausted")]
+        assert len(recs) == 1
+        msg = recs[0].getMessage()
+        assert "class=transient" in msg and "attempts=2" in msg
+
+
+class TestAsyncLadder:
+    def test_async_backoff_is_actually_awaited(self):
+        """asyncio.sleep handed to a sync helper leaks a bare coroutine → the
+        async path had NO backoff. The await must happen in the async loop."""
+        import openai
+
+        mod = _llm_mod()
+        delays = []
+
+        async def sleeper(d):
+            delays.append(d)
+
+        async def boom():
+            raise _rate_limit()
+
+        async def run():
+            with pytest.raises(openai.RateLimitError):
+                await mod._retry_classified_async(boom, _retry_cfg(), asleep=sleeper)
+
+        asyncio.run(run())
+        assert len(delays) == 6
+        assert all(d >= 1.0 for d in delays)
 
 
 if __name__ == "__main__":

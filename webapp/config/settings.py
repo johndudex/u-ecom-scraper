@@ -217,8 +217,13 @@ LLM_CIRCUIT_BREAKER_COOLDOWN = config("LLM_CIRCUIT_BREAKER_COOLDOWN", default=60
 LLM_CLASSIFIED_RETRY = config("LLM_CLASSIFIED_RETRY", default=True, cast=bool)
 LLM_MAX_RETRIES = config("LLM_MAX_RETRIES", default=5, cast=int)  # only used when classified retry OFF
 LLM_RETRY_TRANSIENT_MAX = config("LLM_RETRY_TRANSIENT_MAX", default=2, cast=int)   # timeout/conn/5xx
-LLM_RETRY_RATELIMIT_MAX = config("LLM_RETRY_RATELIMIT_MAX", default=3, cast=int)   # 429 (honors Retry-After)
-LLM_RETRY_BACKOFF_BASE = config("LLM_RETRY_BACKOFF_BASE", default=1.5, cast=float)
+# 429 class has its own ladder (job 12: 4× 429 in 8s burned 3 attempts in ~7.5s).
+# Worst case 6×30s = 180s inside the 900s job wall. Rollback to the old budget:
+# LLM_RETRY_RATELIMIT_MAX=3, LLM_RETRY_RATELIMIT_BASE=1.5, LLM_RETRY_BACKOFF_FLOOR=0.
+LLM_RETRY_RATELIMIT_MAX = config("LLM_RETRY_RATELIMIT_MAX", default=6, cast=int)   # 429 attempts
+LLM_RETRY_RATELIMIT_BASE = config("LLM_RETRY_RATELIMIT_BASE", default=2.0, cast=float)  # 429 backoff base
+LLM_RETRY_BACKOFF_FLOOR = config("LLM_RETRY_BACKOFF_FLOOR", default=1.0, cast=float)   # 429 min sleep (s)
+LLM_RETRY_BACKOFF_BASE = config("LLM_RETRY_BACKOFF_BASE", default=1.5, cast=float)     # transient class
 LLM_RETRY_BACKOFF_CAP = config("LLM_RETRY_BACKOFF_CAP", default=30.0, cast=float)
 # Phase 2 deterministic context truncation. Replaces the headroom.compress-based
 # pre-model hook (which made a SYNC LLM call inside the cancellation path + added
