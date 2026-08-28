@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock, patch
+
 from model_bakery import baker
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -16,15 +18,37 @@ class TestHomeView(TestCase):
     def test_home_get(self):
         resp = self.client.get(reverse("home"))
         self.assertEqual(resp.status_code, 200)
-        self.assertContains(resp, "New Scrape Job")
+        self.assertContains(resp, "New Scrape")
+        self.assertContains(resp, 'name="url"')
 
     def test_home_post_creates_job(self):
-        resp = self.client.post(reverse("home"), {
-            "url": "https://example.com",
-        })
+        # F10 rejects url_list submissions with no URL source (the default
+        # "product" page type), so a navigating page type is how a job gets
+        # created here. Dispatch is mocked — the eager task would otherwise
+        # start probing the target site.
+        dispatch = MagicMock()
+        dispatch.delay.return_value.id = "test-task-id"
+        with patch("scraper.tasks.run_scrape_task", dispatch):
+            resp = self.client.post(reverse("home"), {
+                "url": "https://example.com",
+                "page_type": "product_navigation",
+            })
         self.assertEqual(ScrapeJob.objects.count(), 1)
         job = ScrapeJob.objects.first()
         self.assertEqual(job.url, "https://example.com")
+        self.assertEqual(job.input_mode, "navigation")
+
+    def test_home_post_rejects_url_list_without_urls(self):
+        # F10 (prod 255-281): the quick form has no URL-list input, so a
+        # url_list submission with nothing in Site.input_urls (or a local
+        # input_urls.json) is refused at POST time instead of dying at
+        # setup_workspace's fail-fast a few nodes into the graph.
+        resp = self.client.post(reverse("home"), {
+            "url": "https://example.com",
+        })
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(ScrapeJob.objects.count(), 0)
+        self.assertContains(resp, "intake form")
 
     def test_home_post_missing_url(self):
         resp = self.client.post(reverse("home"), {})
