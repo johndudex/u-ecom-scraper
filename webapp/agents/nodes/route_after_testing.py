@@ -440,12 +440,18 @@ def _is_double_host(url: str) -> bool:
     return (f"//{host}" in rest) or (f"/{host}/" in rest)
 
 
-def _items_from_output_file(slug: str) -> list[dict]:
+def _items_from_output_file(slug: str, mtime_floor: float | None = None) -> list[dict]:
     """Read the newest scrape output's item rows (any content type).
 
     Scans every top-level list-of-dicts (products/articles/jobs/…) — no
     content-type coupling. Empty when nothing was written (the checks are
     then silent — same no-op-on-missing-data philosophy as the coverage gate).
+
+    ``mtime_floor`` (job 306): the F16 best-of-N picker ranks by substantive
+    count, so a PREVIOUS job's larger production output outranks this run's
+    5-row sample and the checks validate the map against the wrong job's rows.
+    Callers pass the current job's started_at so stale files are excluded —
+    the same stale-artifact re-injection class as prod job 12.
     """
     if not slug:
         return []
@@ -462,6 +468,7 @@ def _items_from_output_file(slug: str) -> list[dict]:
             _os.path.join(root, "workspace", slug),
             _os.path.join(root, "scrapers", slug),
             slug=slug,
+            mtime_floor=mtime_floor,
         )
         if not path or not _os.path.isfile(path):
             return []
@@ -478,6 +485,27 @@ def _items_from_output_file(slug: str) -> list[dict]:
     return []
 
 
+def _job_started_floor(state: ScrapeState) -> float | None:
+    """mtime floor for output reads: this job's started_at (job 306).
+
+    A floor of None means "no job context" (unit tests, playground) — the
+    legacy best-of-N pick then applies. Best-effort by design: a DB hiccup
+    degrades to the legacy behavior rather than blinding the checks.
+    """
+    job_id = (state or {}).get("job_id") if isinstance(state, dict) else None
+    if not job_id:
+        return None
+    try:
+        from scraper.models import ScrapeJob
+
+        started = ScrapeJob.objects.only("started_at").get(pk=job_id).started_at
+    except Exception:
+        return None
+    if not started:
+        return None
+    return max(0.0, started.timestamp() - 5.0)
+
+
 def deterministic_output_issues(slug: str, state: ScrapeState) -> list[dict]:
     """Deterministic checks over the newest OUTPUT file rows.
 
@@ -492,7 +520,7 @@ def deterministic_output_issues(slug: str, state: ScrapeState) -> list[dict]:
 
     Requires ≥3 rows (fewer is a different failure class, already routed).
     """
-    rows = _items_from_output_file(slug)
+    rows = _items_from_output_file(slug, mtime_floor=_job_started_floor(state))
     if len(rows) < 3:
         return []
     issues: list[dict] = []
@@ -590,8 +618,13 @@ def deterministic_output_issues(slug: str, state: ScrapeState) -> list[dict]:
             _map_text = " ".join(
                 str(meta.get(k) or "")
                 for k in ("json_path", "api_path", "api_fallback_path",
-                          "selector", "jsonld_key", "notes")
+                          "selector", "jsonld_key")
             )
+            # Structural anchors ONLY (job 306): 'notes' is prose — the analyzer
+            # legitimately writes "only has numberOfReviews (a count, not a
+            # rating value)" when DECLINING to map, and regexing that prose
+            # fired the check on a correct artifact. A declined map has no
+            # anchor at all → empty _map_text → silent (the right verdict).
             if not _COUNT_TOKEN_RE.search(_map_text):
                 continue
             if not any(

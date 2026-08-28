@@ -417,3 +417,64 @@ class TestDeterministicChecks:
                         "notes": "Average star value; empty when no reviews."},
         }}}
         assert rat.deterministic_output_issues("s", state) == []
+
+    def test_declining_notes_mentioning_count_stays_quiet(self, monkeypatch, tmp_path):
+        """Job-306: the analyzer honestly DECLINED to map ratings (api_path=None,
+        notes explain 'only has numberOfReviews (a count, not a rating value)').
+        'notes' is prose, not an anchor — mentioning a count there must not fire
+        the count-map check on an artifact that maps nothing."""
+        import json as _json
+
+        rows = [
+            {"title": f"p{i}", "url": f"https://x.com/p{i}",
+             "ratings": "1" if i < 2 else ""}
+            for i in range(5)
+        ]
+        (tmp_path / "workspace" / "s").mkdir(parents=True, exist_ok=True)
+        _json.dump({"products": rows, "metadata": {}},
+                   open(tmp_path / "workspace" / "s" / "output_test.json", "w"))
+        monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
+        state = {"product_analysis": {"fields": {
+            "ratings": {"method": "api", "api_path": None, "tested": True,
+                        "examples": [],
+                        "notes": ("The API response has no averageRating/ratingValue"
+                                  " field. It only has numberOfReviews (a count, not"
+                                  " a rating value). Per the >=3-samples rule this"
+                                  " field is NOT available.")},
+        }}}
+        assert rat.deterministic_output_issues("s", state) == []
+
+    def test_stale_previous_job_output_does_not_feed_checks(self, monkeypatch, tmp_path):
+        """Job-306 root cause: the F16 best-of-N picker ranked the PREVIOUS job's
+        36-row production output above this run's 5-row sample, so the checks
+        validated against the wrong job's rows. An mtime floor (the job's
+        started_at) must exclude stale files."""
+        import json as _json
+        import os as _os
+
+        big = [{"title": f"old{i}", "url": f"https://x.com/old{i}",
+                "price": "$5.00", "ratings": "1"}
+               for i in range(36)]
+        small = [{"title": f"new{i}", "url": f"https://x.com/new{i}",
+                  "price": "$6.00", "ratings": ""}
+                 for i in range(5)]
+        ws = tmp_path / "workspace" / "s"
+        prod = tmp_path / "scrapers" / "s"
+        ws.mkdir(parents=True, exist_ok=True)
+        prod.mkdir(parents=True, exist_ok=True)
+        _json.dump({"products": small, "metadata": {}},
+                   open(ws / "output_new.json", "w"))
+        _json.dump({"products": big, "metadata": {}},
+                   open(prod / "output_old.json", "w"))
+        # prod file: much larger AND much older than the workspace file
+        _old = (_os.path.getmtime(str(ws / "output_new.json")) - 86_400 * 7)
+        _os.utime(str(prod / "output_old.json"), (_old, _old))
+        monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
+
+        # legacy (no floor): big stale file wins — documents the trap
+        assert len(rat._items_from_output_file("s")) == 36
+        # floored at "job start" (now-ish): only the fresh sample qualifies
+        import time as _time
+
+        floor = _time.time() - 60
+        assert len(rat._items_from_output_file("s", mtime_floor=floor)) == 5
