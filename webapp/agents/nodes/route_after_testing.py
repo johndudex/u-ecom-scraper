@@ -224,8 +224,23 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
             root = _os.environ.get("PROJECT_ROOT", "/app")
             ws = _os.path.join(root, "workspace", slug)
             if _os.path.isdir(ws):
+                # FRESHNESS FLOOR (job 309 / F16 lesson): only outputs produced
+                # by the CURRENT draft count as ground truth. Without this, the
+                # scan below happily reads output files left by PREVIOUS retry
+                # cycles' drafts — job 309: the http_requests/http_navigation
+                # cycles' verification outputs (a few real items) rescued the
+                # exhausted playwright draft into execution, which then
+                # extracted 0 and finalized COMPLETED. The tester always runs
+                # the current draft AFTER the writer's last edit, so a legit
+                # rescue's outputs are always >= the draft's mtime.
+                _floor = 0.0
+                _draft_fp = _os.path.join(ws, "scraper_draft.py")
+                if _os.path.isfile(_draft_fp):
+                    _floor = _os.path.getmtime(_draft_fp)
                 outs = sorted(
-                    [f for f in _os.listdir(ws) if f.startswith("output_") and f.endswith(".json")],
+                    [f for f in _os.listdir(ws)
+                     if f.startswith("output_") and f.endswith(".json")
+                     and _os.path.getmtime(_os.path.join(ws, f)) >= _floor],
                     key=lambda f: _os.path.getmtime(_os.path.join(ws, f)),
                     reverse=True,
                 )
@@ -288,8 +303,17 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
         _slug = state.get("site_slug", "")
         if _slug:
             _root = _os.environ.get("PROJECT_ROOT", "/app")
+            # Same freshness floor as the primary fallback above (job 309): a
+            # previous cycle's output must not rescue the current draft.
+            _floor2 = 0.0
+            _draft2 = _os.path.join(_root, "workspace", _slug, "scraper_draft.py")
+            if _os.path.isfile(_draft2):
+                _floor2 = _os.path.getmtime(_draft2)
             _pattern = _os.path.join(_root, "workspace", _slug, "output_*.json")
-            _outputs = sorted(_glob.glob(_pattern), key=lambda f: _os.path.getmtime(f), reverse=True)
+            _outputs = sorted(
+                [p for p in _glob.glob(_pattern) if _os.path.getmtime(p) >= _floor2],
+                key=lambda f: _os.path.getmtime(f), reverse=True,
+            )
             # Bug A fix: iterate the last 5 outputs, take the one with the MOST
             # real items (not the newest — the newest may be the 1-item Phase-1
             # crash file while a 5-item Phase-2 file exists alongside it).
@@ -998,6 +1022,29 @@ def route_after_testing(state: ScrapeState) -> str:
         return "code_writer"
 
     if is_final_attempt:
+        # Job 309 (pillowtalk e2e): under skip_approvals the human_approval
+        # auto-approve EXECUTED the draft the tester had just marked
+        # "Ready for execution: false" → 0-item output → finalize blessed it
+        # COMPLETED. Same honest-failure treatment as the contract arm above
+        # and the cascade arm below: with no human to break the loop, a final
+        # FAIL goes to cleanup — UNLESS real items exist (ground truth beats
+        # the tester's verdict, same rescue as the exhausted-cascade arm).
+        if state.get("skip_approvals", False):
+            _rescue_min = 1 if (state.get("input_mode") or "") in ("url_list", "list_page") else 3
+            if _scraper_has_real_items(state, min_count=_rescue_min):
+                logger.info(
+                    "route_after_testing: FINAL attempt FAILED but output has real "
+                    "items → field_confirmation (rescue, skip_approvals → run_execution)"
+                )
+                return "field_confirmation"
+            logger.error(
+                "route_after_testing: FINAL attempt FAILED (assessment=%s, "
+                "confidence=%.2f) + skip_approvals, no real items → cleanup "
+                "(honest failure, not auto-approved execution)",
+                assessment,
+                confidence,
+            )
+            return "cleanup"
         logger.error(
             "route_after_testing: FINAL attempt FAILED (assessment=%s, confidence=%.2f) "
             "→ human_approval",

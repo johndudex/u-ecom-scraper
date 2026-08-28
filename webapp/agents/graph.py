@@ -2396,6 +2396,13 @@ def _invoke_navigation_traverse(
             # "listing" is genuinely discovered, not user-specified.
             _fallback_listing = _site_root
             if _input_mode == "list_page":
+                # Job 309 (pillowtalk e2e): search_criteria is how INTAKE carries
+                # the listing URL, but a list_page job's `url` field is ALSO the
+                # user-provided listing by definition — jobs submitted without
+                # search_criteria (quick form / API / shell) fell through to the
+                # site root, silently redirecting discovery to homepage featured
+                # links (the exact rmwilliams job-227 failure this branch exists
+                # to prevent). Candidate order: search_criteria → state.url → root.
                 _crit = (state.get("search_criteria") or "").strip()
                 try:
                     _cp = _urlparse(_crit)
@@ -2403,6 +2410,13 @@ def _invoke_navigation_traverse(
                         _fallback_listing = _crit
                 except Exception:
                     pass
+                if _fallback_listing is _site_root:
+                    try:
+                        _up = _urlparse((state.get("url") or "").strip())
+                        if _up.scheme in ("http", "https") and _up.netloc == _p.netloc:
+                            _fallback_listing = _up.geturl()
+                    except Exception:
+                        pass
             _disc_fb = {
                 "listing_url": _fallback_listing,
                 "listing_reached": True,
