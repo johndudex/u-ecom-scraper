@@ -1002,6 +1002,22 @@ def _finalize_job(job: ScrapeJob) -> None:
         job.status = ScrapeJob.STATUS_FAILED
     elif final_state.get("execution_status") == "FAILED":
         job.status = ScrapeJob.STATUS_FAILED
+    elif not final_state.get("execution_status") and not job.output_file:
+        # Job 304: the testing-cascade FAIL route lands on cleanup from a
+        # conditional edge (no state-update channel), leaving execution_status
+        # empty — and the old catch-all blessed that COMPLETED with 0 products.
+        # Any job that reaches finalize without EVER executing (no status, no
+        # output) did not succeed; say so.
+        job.status = ScrapeJob.STATUS_FAILED
+        if not job.error_message:
+            job.error_message = (
+                "Pipeline ended before execution (testing cascade exhausted "
+                "without a passing run)"
+            )[:2000]
+        logger.warning(
+            "Job %d: no execution_status and no output at finalize — marking FAILED "
+            "(pipeline never executed)", job.id,
+        )
     else:
         job.status = ScrapeJob.STATUS_COMPLETED
 

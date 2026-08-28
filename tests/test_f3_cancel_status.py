@@ -75,6 +75,20 @@ class TestStatusLadder:
         assert 'elif job.status == ScrapeJob.STATUS_CANCELLED:' in src
         assert 'db_site.status = "in_progress"' in src
 
+    def test_never_executed_job_cannot_finalize_completed(self):
+        """Job 304: cascade-FAIL landed on cleanup with empty execution_status
+        and the catch-all blessed it COMPLETED with 0 products. The ladder must
+        FAIL a finalize that never executed (no status, no output)."""
+        src = open(os.path.join(ROOT, "webapp/scraper/tasks.py")).read()
+        i_failed_branch = src.index('final_state.get("execution_status") == "FAILED"')
+        i_cond = src.index('elif not final_state.get("execution_status")')
+        i_completed = src.rindex("else:\n        job.status = ScrapeJob.STATUS_COMPLETED")
+        guard = src[i_cond:i_completed]
+        assert i_failed_branch < i_cond < i_completed
+        # the guard requires BOTH empty execution_status AND empty output_file
+        assert "and not job.output_file" in guard
+        assert "STATUS_FAILED" in guard
+
 
 class TestApprovalRowRejection:
     """N3: both approval views record rejected on a Cancel choice."""
