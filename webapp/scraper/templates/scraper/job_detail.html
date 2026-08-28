@@ -597,23 +597,35 @@
 
     if (!isTerminal) { liveEl.classList.remove('hidden'); liveEl2.classList.remove('hidden'); } else { return; }
 
-    var es = new EventSource('/jobs/' + jobId + '/events/');
-    es.addEventListener('status', function(e) { updateStatus(JSON.parse(e.data).status); });
-    es.addEventListener('logs', function(e) { var d=JSON.parse(e.data); addLogs(d.logs, true); fetchToolCalls(); setupStepClicks(); });
-    es.addEventListener('done', function(e) { updateStatus(JSON.parse(e.data).status); liveEl.classList.add('hidden'); liveEl2.classList.add('hidden'); es.close(); });
-    es.addEventListener('message', function(e) {
-        var data=JSON.parse(e.data); if(!data||!data.type) return;
-        if(data.type==='logs'){addLogs(data.logs||[], true);fetchToolCalls();setupStepClicks();}
-        else if(data.type==='step'){addStep(data.phase,data.status);}
-        else if(data.type==='status'){updateStatus(data.status);}
-        else if(data.type==='syslog'){addSyslog(data);}
-        else if(data.type==='approval'){
-            var c=document.getElementById('approval-container');if(!c)return;
-            fetch('/jobs/'+jobId+'/pending-approvals/').then(function(r){return r.json();}).then(function(r){if(r.html){c.classList.remove('hidden');c.classList.add('anim-slide-down');c.innerHTML='<div class="flex items-center gap-2 mb-3"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#FBBF24"><path stroke-linecap="round" stroke-linejoin="round" d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0"/></svg><span class="text-sm font-semibold text-warning">Pending Approval Required</span></div>'+r.html;}}).catch(function(){location.reload();});
+    // SSE removed (2026-08-28): gunicorn runs 2 sync workers, so every open
+    // EventSource pins one — two tabs = zero HTTP capacity for the whole UI
+    // (the worker-timeout storm documented in scraper/api/sse.py). Poll the
+    // request/response endpoints instead: /logs/ (logs), /api/ (status +
+    // steps), /pending-approvals/ (banner). Only loss vs SSE: live syslog
+    // lines, which have no polled endpoint.
+    function pollOnce(){
+        var sinceSeq=0; var allE=logContainer.querySelectorAll('.log-entry[data-seq]');
+        for(var i=0;i<allE.length;i++){var s=parseInt(allE[i].dataset.seq);if(s>sinceSeq)sinceSeq=s;}
+        fetch('/jobs/'+jobId+'/logs/?since_seq='+sinceSeq).then(function(r){return r.json();}).then(function(data){
+            if(data.logs&&data.logs.length>0){addLogs(data.logs,true);fetchToolCalls();setupStepClicks();}
+        }).catch(function(){});
+        fetch('/jobs/'+jobId+'/api/').then(function(r){return r.json();}).then(function(d){
+            if(!d||!d.status) return;
+            updateStatus(d.status);
+            (d.steps||[]).forEach(function(st){addStep(st.phase,st.status);});
+            if(d.status==='completed'||d.status==='failed'||d.status==='cancelled'){
+                liveEl.classList.add('hidden');liveEl2.classList.add('hidden');
+                if(pollTimer){clearInterval(pollTimer);pollTimer=null;}
+            }
+        }).catch(function(){});
+        var c=document.getElementById('approval-container');
+        if(c && c.classList.contains('hidden')){
+            fetch('/jobs/'+jobId+'/pending-approvals/').then(function(r){return r.json();}).then(function(r){
+                if(r.html){c.classList.remove('hidden');c.classList.add('anim-slide-down');c.innerHTML='<div class="flex items-center gap-2 mb-3"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="#FBBF24"><path stroke-linecap="round" stroke-linejoin="round" d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0"/></svg><span class="text-sm font-semibold text-warning">Pending Approval Required</span></div>'+r.html;}
+            }).catch(function(){});
         }
-        else if(data.type==='done'){updateStatus(data.status);liveEl.classList.add('hidden');liveEl2.classList.add('hidden');es.close();}
-    });
-    es.onerror = function() { liveEl.classList.add('hidden'); liveEl2.classList.add('hidden'); es.close(); };
+    }
+    var pollTimer = setInterval(pollOnce, 4000);
 })();
 </script>
 {% endblock %}

@@ -876,8 +876,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     checkResult: null,   // last check-site payload (for anti-bot display)
     job: null,           // create-job response (job_id + dashboard URLs)
     jobId: null,
-    es: null,            // EventSource for SSE
-    poll: null,          // setInterval poll backstop
+    poll: null,          // setInterval poll (live updates — SSE was removed)
     terminal: false,
     timeStr: '—',
     recordsStr: '—',
@@ -1774,7 +1773,6 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
   });
 
   function cancelRun(){
-    if(intakeState.es){ try{ intakeState.es.close(); }catch(_){} intakeState.es = null; }
     if(intakeState.poll){ clearInterval(intakeState.poll); intakeState.poll = null; }
     if(intakeState.job && intakeState.job.cancel_url){
       var fd = new FormData();
@@ -1969,22 +1967,12 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     }
   }
   function subscribeToJob(data){
-    if(intakeState.es){ try{ intakeState.es.close(); }catch(_){} }
     if(intakeState.poll){ clearInterval(intakeState.poll); intakeState.poll=null; }
     intakeState.terminal = false;
-    var es = new EventSource(data.events_url);
-    intakeState.es = es;
-    es.addEventListener('status', function(e){ try{ updateJobStatus(JSON.parse(e.data).status); }catch(_){} });
-    es.addEventListener('logs', function(){ refreshJobData(data.api_url, data.tool_calls_url); });
-    es.addEventListener('done', function(e){ try{ updateJobStatus(JSON.parse(e.data).status); }catch(_){} try{es.close();}catch(_){} refreshJobData(data.api_url, data.tool_calls_url); });
-    es.addEventListener('message', function(e){
-      try{ var m=JSON.parse(e.data);
-        if(m.type==='status') updateJobStatus(m.status);
-        else if(m.type==='logs') refreshJobData(data.api_url, data.tool_calls_url);
-        else if(m.type==='done'){ updateJobStatus(m.status); try{es.close();}catch(_){} refreshJobData(data.api_url, data.tool_calls_url); }
-      }catch(_){}
-    });
-    es.onerror = function(){ refreshJobData(data.api_url, data.tool_calls_url); };
+    // SSE removed (2026-08-28): gunicorn runs 2 sync workers, so every open
+    // EventSource pins one — two tabs = zero HTTP capacity for the whole UI
+    // (the worker-timeout storm documented in scraper/api/sse.py). The 4s
+    // poll below is the live-update mechanism; /jobs/<id>/api/ is cheap.
     intakeState.poll = setInterval(function(){ refreshJobData(data.api_url, data.tool_calls_url); if(intakeState.terminal){ clearInterval(intakeState.poll); intakeState.poll=null; } }, 4000);
     refreshJobData(data.api_url, data.tool_calls_url);
   }

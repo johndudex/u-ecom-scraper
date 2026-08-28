@@ -38,4 +38,9 @@ RUN PYTHONPATH=/app DJANGO_SETTINGS_MODULE=config.settings \
     python manage.py collectstatic --noinput
 
 EXPOSE 8000
-CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "3600", "--graceful-timeout", "60", "--worker-tmp-dir", "/dev/shm"]
+# --workers 3: with 2 sync workers, two slow requests (SSE on an old deploy,
+# a hung upstream probe) pinned BOTH workers and froze the UI for minutes.
+# --timeout 600: 3600 kept a pinned worker hostage for an hour before gunicorn
+# reaped it (the worker-timeout storm in scraper/api/sse.py). STREAM_DEADLINE
+# in scraper/api/sse.py must stay BELOW this timeout so streams close cleanly.
+CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3", "--timeout", "600", "--graceful-timeout", "60", "--worker-tmp-dir", "/dev/shm"]

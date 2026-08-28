@@ -37,8 +37,11 @@ logger = logging.getLogger("scraper.api")
 import os
 
 STREAM_BUDGET = int(os.environ.get("PARTNER_STREAM_BUDGET", "1"))
-# hard lifetime of one stream; tests shrink this to drain promptly
-STREAM_DEADLINE_SECONDS = int(os.environ.get("PARTNER_STREAM_DEADLINE", "3600"))
+# hard lifetime of one stream; tests shrink this to drain promptly.
+# MUST stay below the gunicorn --worker timeout (Dockerfile: 600s): a stream
+# that outlives it is reaped mid-request as WORKER TIMEOUT — the documented
+# storm — instead of closing cleanly. EventSource clients reconnect.
+STREAM_DEADLINE_SECONDS = int(os.environ.get("PARTNER_STREAM_DEADLINE", "540"))
 KEEPALIVE_SECONDS = 25  # < 30s silence rule
 TOKEN_TTL = 300
 

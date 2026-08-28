@@ -46,6 +46,11 @@ PERSISTENT_CHROME_PIDS: set[int] = set()
 mcp_process: Optional[subprocess.Popen] = None
 
 # ── /navigate config ─────────────────────────────────────────────────────
+# Process start (wall clock) — /health's uptime. time.monotonic() was WRONG
+# there: it reads as time since an arbitrary epoch (host boot), so the metric
+# reported the RAILWAY HOST's uptime, not this process's (a 97-day "uptime"
+# on a service deployed yesterday). Restarts are now actually visible.
+PROCESS_START = time.time()
 # Independent of PROBE_LOCK and /scrape. Bounds concurrent ephemeral browsers
 # to the memory budget; excess callers get 429 + retry_after.
 NAVIGATE_MAX_CONCURRENT = int(os.environ.get("NAVIGATE_MAX_CONCURRENT", "3"))
@@ -645,7 +650,7 @@ async def health():
             "navigate_slots_busy": nav_busy,
             "navigate_slots_total": NAVIGATE_MAX_CONCURRENT,
             "navigate_queued": nav_queued,
-            "uptime_seconds": time.monotonic(),
+            "uptime_seconds": time.time() - PROCESS_START,
         },
         status_code=200 if status == "ok" else 503,
     )
