@@ -291,8 +291,17 @@ def test_code_writer_emits_embedded_json_block_when_no_api():
     assert "EMBEDDED-JSON LISTING data model" in msg
     assert "map_jobs" in msg  # generic job field resolver
     assert "ayaSearchMenusInitialState.jobsData" in msg  # detected locator surfaced
-    # the embedded-JSON block precedes (supersedes) the generic two-phase text
-    assert msg.index("EMBEDDED-JSON LISTING data model") < msg.index("TWO-PHASE")
+    assert "**120**" in msg  # record_count magnitude surfaced
+    assert "https://site.example/healthcare-jobs/allied/" in msg  # category URLs seeded
+    assert "requests_scraper.py" in msg  # HTTP template for the http_requests strategy
+    # The embedded-JSON model SUPERSEDES the two-phase detail-page text via
+    # EXCLUSIVE replacement (precedence: api > embedded_json > two-phase) — the
+    # builder emits only the embedded section so the LLM never sees two opposing
+    # instructions ("NO per-detail Phase 2" vs "Phase 1: discover item URLs").
+    # So assert absence of the two-phase block, not an ordering between the two.
+    assert "TWO-PHASE" not in msg
+    assert "Phase 1: Discover item URLs" not in msg
+    assert "navigation_scraper.py" not in msg  # browser two-phase template withheld
 
 
 def test_code_writer_api_takes_precedence_over_embedded_json():
@@ -324,3 +333,62 @@ def test_code_writer_falls_back_to_two_phase_without_embedded_signal():
     msg = build_code_writer_message(state)[0].content
     assert "EMBEDDED-JSON LISTING data model" not in msg
     assert "TWO-PHASE" in msg
+
+
+def test_code_writer_replaced_model_keeps_filter_values_drops_twophase_framing():
+    """REGRESSION: the filter + classic-search appends ran AFTER the api/ssr/
+    embedded replacement unguarded, so an embedded/API job with detected
+    filters also got 'apply during Phase 1 discovery' plus the 'browser-driven
+    Phase 1 MUST use Playwright' block — directly contradicting the replacement
+    section's 'NO browser, NO per-detail Phase 2'. Filter VALUES must survive
+    (they still steer which listing URLs to fetch); the two-phase framing must
+    not."""
+    from agents.subagents import build_code_writer_message
+
+    na = _base_state()["navigation_analysis"]
+    na["filters"] = {
+        "has_filters": True,
+        "method": "url",
+        "category_filter": {
+            "strategy": "iterate",
+            "param_name": "category",
+            "values": ["nursing", "allied"],
+        },
+    }
+    na["homepage_nav"] = {"classic_search": {"search_page": "https://site.example/search"}}
+    msg = build_code_writer_message(_base_state(navigation_analysis=na))[0].content
+
+    # Filter values survive…
+    assert "Filter Requirements" in msg
+    assert "ITERATE over 2 options" in msg
+    assert "category" in msg
+    # …but re-framed for the non-two-phase data model.
+    assert "apply while building the listing/category URLs to fetch" in msg
+    assert "apply during Phase 1 discovery" not in msg
+    # The classic-search browser block is suppressed entirely.
+    assert "browser-driven Phase 1" not in msg
+    assert "Playwright in a real" not in msg
+
+
+def test_two_phase_site_still_gets_classic_search_browser_block():
+    """Guard-rail for the suppression: a genuine two-phase (detail_links) site
+    with form/classic search must STILL receive the browser-driven Phase 1
+    block — the fix must not over-suppress."""
+    from agents.subagents import build_code_writer_message
+
+    state = _base_state()
+    state["scraper_analysis"]["data_source"] = "detail_links"
+    state["navigation_analysis"]["data_source"] = "detail_links"
+    state["navigation_analysis"]["embedded_json"] = {"detected": False, "best": None}
+    state["navigation_analysis"]["item_links"] = {"url_examples": ["https://site.example/jobs/1"]}
+    state["navigation_analysis"]["filters"] = {
+        "has_filters": True,
+        "method": "form",
+        "location_filter": {"strategy": "pin", "strategy_value": "Alabama", "selector": "#loc"},
+    }
+    state["navigation_analysis"]["homepage_nav"] = {
+        "classic_search": {"search_page": "https://site.example/search"}
+    }
+    msg = build_code_writer_message(state)[0].content
+    assert "browser-driven Phase 1" in msg
+    assert "Filter Requirements (apply during Phase 1 discovery)" in msg

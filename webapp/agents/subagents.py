@@ -2937,6 +2937,14 @@ def build_code_writer_message(state: dict) -> list:
 
         navigation_section = "\n".join(nav_lines)
 
+        # Set True when one of the precedence data models (api > ssr_div_list >
+        # embedded_json) REPLACES navigation_section below. Those modes are
+        # browser-free / non-two-phase by design (their de-bloat comments), so
+        # the two-phase-framed appends further down (the "Phase 1 discovery"
+        # filter header and the classic-search browser block) must not leak
+        # onto them — they would give the LLM two OPPOSING instructions again.
+        _dm_replaced = False
+
         # If navigate_explore captured a backend JSON search API (React/Vue SPA,
         # e.g. AMN Healthcare's /JobSearch), PREFER a clean HTTP api_scraper over
         # driving the browser.  The API returns fully-populated items, so the
@@ -3075,6 +3083,7 @@ def build_code_writer_message(state: dict) -> list:
             # pages"), which was the top contradiction flagged in the audit.
             # Precedence: api_endpoint > embedded_json > two-phase (below).
             navigation_section = api_section
+            _dm_replaced = True
 
         # SSR div-listing data model: items are server-rendered divs/li with
         # data-*-id on a single listing page (no per-item detail pages).
@@ -3095,6 +3104,7 @@ def build_code_writer_message(state: dict) -> list:
                 f"will 404). Adapt `_find_items` (ITEM_SELECTOR) + `_extract_record` "
                 f"(field selectors) in the template per the Field Map.\n"
             )
+            _dm_replaced = True
 
         # Embedded-JSON listing data model: items live in a <script> JSON blob in
         # the listing/category page (NOT detail pages, NOT an API). Activates only
@@ -3123,6 +3133,7 @@ def build_code_writer_message(state: dict) -> list:
                 # with the two-phase text — the embedded-JSON guidance explicitly
                 # says "NO per-detail Phase 2", contradicting the two-phase block.
                 navigation_section = _emb_section
+                _dm_replaced = True
 
         # Filter requirements (date/location/category — job portals & search sites)
         filters_info = navigation_analysis.get("filters", {}) or {}
@@ -3132,8 +3143,18 @@ def build_code_writer_message(state: dict) -> list:
         fmethod = filters_info.get("method") if filters_info.get("has_filters") else None
         if filters_info.get("has_filters"):
             fmethod = filters_info.get("method", "url")
+            # When a precedence data model replaced the two-phase text, keep
+            # the filter VALUES (category/location/date params still steer
+            # which listing/category URLs to fetch) but drop the two-phase
+            # framing — there is no "Phase 1" in api/ssr/embedded mode.
+            _filter_hdr = (
+                "\n### Filter Requirements (apply while building the listing/"
+                "category URLs to fetch)\n"
+                if _dm_replaced
+                else "\n### Filter Requirements (apply during Phase 1 discovery)\n"
+            )
             filter_lines = [
-                "\n### Filter Requirements (apply during Phase 1 discovery)\n",
+                _filter_hdr,
                 f"This site supports result filtering via: **{fmethod}**\n",
             ]
             for label, key in [
@@ -3202,8 +3223,14 @@ def build_code_writer_message(state: dict) -> list:
         # Form-based / "classic" search discovery CANNOT be done via raw HTTP
         # (anti-forgery tokens + server-side session → HTTP 500). Force a
         # browser-driven Phase 1 and tell the code-writer exactly how.
+        # SKIPPED when a precedence data model replaced the two-phase text:
+        # its "Phase 1 MUST use Playwright" text contradicts the api/ssr/
+        # embedded sections ("no browser / no per-detail Phase 2"). If a
+        # browser fetch is genuinely needed there, the embedded section's
+        # http_navigation template hint already says to adapt Phase 1 to
+        # `_navigate` — that covers it without re-introducing the conflict.
         classic = (navigation_analysis.get("homepage_nav", {}) or {}).get("classic_search")
-        if fmethod == "form" or classic:
+        if not _dm_replaced and (fmethod == "form" or classic):
             navigation_section += (
                 "\n**CRITICAL — browser-driven Phase 1 (form/classic search):** "
                 "This site's search is a POST form protected by anti-forgery tokens "
