@@ -689,6 +689,42 @@ def _finalize_was_cancelled(final_state: dict[str, Any]) -> bool:
     return is_cancel(response)
 
 
+def _output_file_has_zero_items(output_file: str) -> bool:
+    """Jobs 309/310: True when the execution output parses but holds 0 records.
+
+    Content-type-agnostic: any top-level list-of-dicts counts (products/jobs/
+    articles/…), and a bare top-level array counts too. Deliberately
+    conservative — any read/parse problem returns False (the job then takes
+    the normal ladder) so we never fail a job on OUR OWN read error, only on
+    a demonstrably empty extraction.
+    """
+    if not output_file:
+        return False
+    try:
+        import json as _json
+        import os as _os
+
+        path = output_file
+        if not _os.path.isabs(path):
+            path = _os.path.join(_os.environ.get("PROJECT_ROOT", "/app"), path)
+        if not _os.path.isfile(path):
+            return False
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            data = _json.load(f)
+    except Exception:
+        return False
+    if isinstance(data, list):
+        return len([r for r in data if isinstance(r, dict)]) == 0
+    if not isinstance(data, dict):
+        return False
+    for v in data.values():
+        if isinstance(v, list):
+            if any(isinstance(r, dict) for r in v):
+                return False
+    # No list-of-dicts anywhere (or all empty) → zero records.
+    return True
+
+
 def _publish_analysis_artifacts(job_id: int, site_slug: str, ws) -> None:
     """Copy the analysis artifacts from the LOCAL workspace to the File Master.
 
@@ -1017,6 +1053,23 @@ def _finalize_job(job: ScrapeJob) -> None:
         logger.warning(
             "Job %d: no execution_status and no output at finalize — marking FAILED "
             "(pipeline never executed)", job.id,
+        )
+    elif job.output_file and _output_file_has_zero_items(job.output_file):
+        # Jobs 309/310 (pillowtalk e2e): an execution that RUNS but extracts
+        # nothing still lands here — execution_status set + output file
+        # present → the catch-all below blessed it COMPLETED. Job 309: the
+        # stale-rescue executed a draft the tester had failed (0 items). Job
+        # 310: a forced listing URL the draft's discovery couldn't parse
+        # (0 URLs → 0 items). A zero-record output is a failure of the job's
+        # purpose, not a success with an empty file — say so.
+        job.status = ScrapeJob.STATUS_FAILED
+        if not job.error_message:
+            job.error_message = (
+                "Execution produced 0 items (output file contains no records)"
+            )[:2000]
+        logger.warning(
+            "Job %d: output file has 0 items at finalize — marking FAILED",
+            job.id,
         )
     else:
         job.status = ScrapeJob.STATUS_COMPLETED

@@ -105,6 +105,16 @@ from src.discovery import discover_item_urls, config_for_load_more
    backstops the env *read* only; the flag *declarations* are protected by
    nothing but you.
 
+5. **Zero-yield discovery must self-heal, not succeed emptily.** If your
+   discovery function paginates the supplied listing and collects **0 item
+   URLs**, retry ONCE with `DEFAULT_LISTING_URL` before returning empty —
+   the execution harness may pass a listing whose card markup your selector
+   doesn't match (job 310: `data-product-id` anchors exist on `search.php`
+   cards but not on `/collections/…` cards), and 0 URLs at execution means
+   a 0-item output. Log the fallback loudly (`logger.warning`) so the test
+   report shows it. Never return success with 0 discovered URLs while a
+   known-good listing shape is available.
+
 ### Other discovery helpers — DO NOT re-signature
 
 The template's other helpers (`_fetch_html`, `_http_get`, `_http_post`,

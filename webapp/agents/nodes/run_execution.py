@@ -319,6 +319,20 @@ def run_execution(state: ScrapeState) -> dict:
     _working_url = ""
     _listing_reached = False
     _respect_flag = True
+    # Job 310 (pillowtalk e2e): for list_page the JOB URL is the user-provided
+    # listing BY DEFINITION. The navigator may have promoted a different
+    # landing page (discovery.listing_url=/collections/bestsellers/), but the
+    # draft's discovery selector is built from what product_analyzer/code_writer
+    # actually verified — often the job's own listing shape (search.php cards).
+    # Forcing the promoted URL on a draft that can't parse it → fresh discovery
+    # finds 0 URLs → 0-item execution blessed COMPLETED. So for list_page the
+    # job URL outranks every navigator candidate (both the --listing-url chain
+    # and the SCRAPER_LISTING_URL env gate below; F17 still domain-guards it).
+    _job_listing = ""
+    if input_mode == "list_page":
+        _jl = (state.get("url") or "").strip()
+        if _jl.startswith(("http://", "https://")):
+            _job_listing = _jl
     if input_mode == "search_term" and search_criteria:
         args.extend(["--query", search_criteria])
         logger.info("run_execution: search_term job, passing --query '%s'", search_criteria)
@@ -334,17 +348,19 @@ def run_execution(state: ScrapeState) -> dict:
 
         if _listing_reached or not _respect_flag:
             # Nav reached the listing → pass the best listing URL. F7 chain:
-            # discovery.listing_url (the navigator's authoritative contract)
-            # first, then search.working_url / listing_url_used (the
-            # traversal's actual landing page — blank for 8/9 sites' on-disk
-            # analyses if listing_url is absent, so the chain must fall
-            # through, never replace). F17: each candidate domain-guarded
-            # against the job URL's registrable domain (prod 331 shipped 80/80
-            # .com.au rows under a .us job).
+            # list_page job URL first (see _job_listing above), then
+            # discovery.listing_url (the navigator's authoritative contract),
+            # then search.working_url / listing_url_used (the traversal's
+            # actual landing page — blank for 8/9 sites' on-disk analyses if
+            # listing_url is absent, so the chain must fall through, never
+            # replace). F17: each candidate domain-guarded against the job
+            # URL's registrable domain (prod 331 shipped 80/80 .com.au rows
+            # under a .us job).
             _search = _nav.get("search") or {}
             _disc = (_nav.get("discovery") if isinstance(_nav, dict) else None) or {}
             _job_reg = _registrable_of(state.get("url", ""))
             _candidates = [
+                _job_listing,
                 (_disc.get("listing_url") if isinstance(_disc, dict) else ""),
                 (_search.get("working_url") if isinstance(_search, dict) else ""),
                 (_search.get("listing_url_used") if isinstance(_search, dict) else ""),
@@ -402,7 +418,11 @@ def run_execution(state: ScrapeState) -> dict:
     if input_mode in ("navigation", "list_page", "search_term"):
         _nav_env = state.get("navigation_analysis") or {}
         _disc_env = (_nav_env.get("discovery") if isinstance(_nav_env, dict) else None) or {}
-        _env_candidate = (_disc_env.get("listing_url") if isinstance(_disc_env, dict) else "") or ""
+        # Job 310: same list_page priority as the --listing-url chain — the
+        # user-provided listing (job URL) outranks the navigator's promotion.
+        _env_candidate = _job_listing or ""
+        if not _env_candidate:
+            _env_candidate = (_disc_env.get("listing_url") if isinstance(_disc_env, dict) else "") or ""
         if not _env_candidate:
             _env_candidate = _working_url if (_listing_reached or not _respect_flag) else ""
         _job_reg_env = _registrable_of(state.get("url", ""))
