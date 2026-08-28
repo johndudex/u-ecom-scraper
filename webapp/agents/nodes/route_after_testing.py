@@ -143,6 +143,22 @@ def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
     # Code bug: a real exception (not a timeout/blocked access issue).
     if is_traceback:
         return ("scraper", f"code error ({crash[:80]})")
+    # Job-311: a TRANSIENT site-side render block is not a strategy verdict.
+    # When the newest test output stopped with empty_render while an earlier
+    # output in the same phase carried items (evidence attached by
+    # _attach_transient_render_evidence), the draft+strategy demonstrably
+    # work — re-test the same draft ("scraper" action: code_writer fix cycle,
+    # the rung is NOT recorded tried) instead of burning it on a block window
+    # that may already have passed (job 311's had).
+    _tr = report.get("discovery_transient") if isinstance(report, dict) else None
+    if items == 0 and isinstance(_tr, dict) and _tr.get("suspected"):
+        return (
+            "scraper",
+            "transient render block — newest test run rendered 0 items "
+            f"(stop_reason={_tr.get('latest_stop_reason')}) while an earlier "
+            f"run in this phase extracted {_tr.get('best_items')} items; "
+            "re-test the same draft, no strategy switch",
+        )
     # Items extracted but poor → let the caller decide mapping vs refine.
     if items == 0:
         return ("strategy", "no items extracted — likely wrong strategy")

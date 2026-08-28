@@ -107,6 +107,13 @@ _PAGE_PARAM_ALIASES: tuple[tuple[str, str], ...] = (
     ("skip", "offset"),
 )
 
+# End-of-run probe candidates (job-311): when a same-page-only run never left
+# page 1, the site may be an SSR pager whose param is the canonical ``page``
+# itself — which the stuck-primary ladder above never tries (it assumes the
+# primary was configured/tried). ``page`` goes first: it is by far the most
+# common SSR pager param.
+_END_OF_RUN_PROBES: tuple[tuple[str, str], ...] = (("page", "page"),) + _PAGE_PARAM_ALIASES
+
 # state keys (local to one discover_item_urls run — never a cfg mutation, so a
 # caller that reuses its DiscoveryConfig keeps the param it asked for).
 _USED_PARAM_KEY = "page_param_used"        # reporting only: param behind the tail of `urls`
@@ -114,6 +121,16 @@ _ADOPTED_ALIAS_KEY = "page_param_alias"    # control flow: set ONLY on a verifie
 _ADOPTED_MODE_KEY = "page_param_alias_mode"
 _ADOPTED_PAGE_SIZE_KEY = "page_param_alias_page_size"
 _LADDER_EXHAUSTED_KEY = "page_param_ladder_exhausted"
+# Set when the end-of-run probe verified page_param is live (either via the
+# configured param or an adopted alias) — the primitive joins the strategy set
+# for the REST of the run (it must: load_more/scroll cannot continue a param
+# walk, so without this the recovery would win exactly one extra page).
+_END_OF_RUN_LIVE_KEY = "page_param_end_of_run_live"
+# The last page number page_param actually FETCHED. ``pages_visited`` counts
+# iterations (same-page stuck rounds inflate it), so it is not a page identity
+# — walking from ``pages_visited + 1`` would skip real pages (72-of-108 in the
+# job-311 replay). Page 1 is the initial fetch every run starts from.
+_PARAM_PAGE_KEY = "page_param_last_fetched"
 
 # Fallback page size for the offset-style aliases when neither the config nor
 # the page we just fetched yields one. Matches build_page_param_url's own
@@ -209,6 +226,10 @@ class DiscoveryConfig:
     navigate_timeout_ms: int = 30000
     page_settle_after_nav_s: float = 8.0   # mirrors nav template's post-goto sleep
     safe_eval_retries: int = 2             # Coveo "Execution context destroyed" retries
+    # One bounded re-fetch when the first render yields 0 items (job-311 class:
+    # a minutes-long site-side soft-block window serves a loaded page with no
+    # items; 0 sets the retry off).
+    empty_render_retry_wait_ms: int = 8000
 
 
 @dataclass
@@ -578,26 +599,28 @@ def _try_page_param_alias_ladder(page: Any, cfg: DiscoveryConfig,
                                  extract_urls: Callable[[Any], list[str]],
                                  seen: set[str], accumulated: list[str],
                                  next_page_num: int, page_size: int,
-                                 state: dict) -> str:
+                                 state: dict,
+                                 candidates: tuple[tuple[str, str], ...] = _PAGE_PARAM_ALIASES,
+                                 ) -> str:
     """Fallback ladder for a VERIFIED-stuck primary page param.
 
-    Tries ``_PAGE_PARAM_ALIASES`` in order against the CURRENT url; adopts the
+    Tries ``candidates`` in order against the CURRENT url; adopts the
     first candidate that verifies exactly the way the primary param must
     (navigate + extract + ≥1 genuinely new url — the ``seen``-set diff is the
     identical-content detector). Returns ``_PROGRESSED`` on adoption (recording
     the adopted alias in ``state`` so every later page uses it), else ``_STUCK``
     — the caller's accounting is unchanged either way.
 
-    Bounded: ≤ ``len(_PAGE_PARAM_ALIASES)`` probes per discovery run. Once every
+    Bounded: ≤ ``len(candidates)`` probes per discovery run. Once every
     candidate has failed, ``state`` memoizes it and later stuck iterations skip
-    the ladder entirely instead of re-paying 4 navigations per page.
+    the ladder entirely instead of re-paying the navigations per page.
     """
     if state.get(_LADDER_EXHAUSTED_KEY):
         return _STUCK
     current_url = getattr(page, "url", "") or cfg.site_url or ""
     if not current_url:
         return _STUCK
-    for alias, mode in _PAGE_PARAM_ALIASES:
+    for alias, mode in candidates:
         if alias == cfg.page_param_name:
             continue  # already the param that just went stuck
         probe_url = _alias_param_url(
@@ -624,6 +647,9 @@ def _try_page_param_alias_ladder(page: Any, cfg: DiscoveryConfig,
             state[_ADOPTED_MODE_KEY] = mode
             state[_ADOPTED_PAGE_SIZE_KEY] = page_size
             state[_USED_PARAM_KEY] = alias
+            # The probe page was genuinely fetched — the continuation walk
+            # starts from it, not from it again.
+            state[_PARAM_PAGE_KEY] = next_page_num
             logger.info(
                 "discovery: alias %r verified (+%d new urls) — adopted for the "
                 "rest of this run", alias, added,
@@ -632,7 +658,7 @@ def _try_page_param_alias_ladder(page: Any, cfg: DiscoveryConfig,
     state[_LADDER_EXHAUSTED_KEY] = True
     logger.info(
         "discovery: no page-param alias advanced (%d tried) — keeping %r",
-        len(_PAGE_PARAM_ALIASES), cfg.page_param_name,
+        len(candidates), cfg.page_param_name,
     )
     return _STUCK
 
@@ -641,11 +667,18 @@ def _try_page_param(page: Any, cfg: DiscoveryConfig,
                     extract_urls: Callable[[Any], list[str]],
                     seen: set[str], accumulated: list[str],
                     next_page_num: int, state: dict) -> str:
-    if not cfg.page_param_name:
+    # An adopted alias is live regardless of the (dead/wrong) configured
+    # primary — the applicability gate must not starve it.
+    if not cfg.page_param_name and not state.get(_ADOPTED_ALIAS_KEY):
         return _NOT_APPLICABLE
     current_url = getattr(page, "url", "") or cfg.site_url or ""
     if not current_url:
         return _NOT_APPLICABLE
+    # Honest page numbering: the next page is whatever this primitive last
+    # fetched + 1 (page 1 = the initial fetch). ``next_page_num`` from the
+    # caller counts iterations, not param pages, and over-jumps after same-page
+    # stuck rounds.
+    next_num = int(state.get(_PARAM_PAGE_KEY) or 1) + 1
 
     # A previously adopted alias owns every subsequent page (the primary param
     # was already proven dead).
@@ -653,11 +686,12 @@ def _try_page_param(page: Any, cfg: DiscoveryConfig,
     if alias:
         next_url = _alias_param_url(
             current_url, alias, state.get(_ADOPTED_MODE_KEY, "page"),
-            next_page_num, state.get(_ADOPTED_PAGE_SIZE_KEY) or cfg.items_per_page or _DEFAULT_PAGE_SIZE,
+            next_num, state.get(_ADOPTED_PAGE_SIZE_KEY) or cfg.items_per_page or _DEFAULT_PAGE_SIZE,
             dead_param=cfg.page_param_name,
         )
         if not _discovery_goto(page, next_url, cfg, state):
             return _NAV_ERROR
+        state[_PARAM_PAGE_KEY] = next_num
         added = _merge_new(accumulated, seen, _safe_extract(page, extract_urls, cfg.safe_eval_retries))
         return _PROGRESSED if added else _STUCK
 
@@ -668,10 +702,11 @@ def _try_page_param(page: Any, cfg: DiscoveryConfig,
         if alias_name != cfg.page_param_name:
             current_url = _strip_url_param(current_url, alias_name)
     next_url = build_page_param_url(
-        current_url, cfg.page_param_name, next_page_num, cfg.items_per_page,
+        current_url, cfg.page_param_name, next_num, cfg.items_per_page,
     )
     if not _discovery_goto(page, next_url, cfg, state):
         return _NAV_ERROR
+    state[_PARAM_PAGE_KEY] = next_num
     fetched = _safe_extract(page, extract_urls, cfg.safe_eval_retries)
     added = _merge_new(accumulated, seen, fetched)
     if added:
@@ -685,7 +720,7 @@ def _try_page_param(page: Any, cfg: DiscoveryConfig,
     # the server is probably ignoring the param (job 302). The only condition
     # under which the alias ladder fires.
     return _try_page_param_alias_ladder(
-        page, cfg, extract_urls, seen, accumulated, next_page_num,
+        page, cfg, extract_urls, seen, accumulated, next_num,
         _resolve_page_size(cfg, fetched), state,
     )
 
@@ -789,6 +824,20 @@ def discover_item_urls(
     if not _discovery_goto(page, start_url, cfg, state):
         return DiscoveryResult([], stop_reason=state["stop_reason"])
     accumulated = _wait_for_render(page, extract_urls, cfg)
+    if not accumulated and cfg.empty_render_retry_wait_ms > 0:
+        # Job-311 class: a site-side soft-block window serves a loaded page
+        # with no items — the SAME draft extracted items minutes earlier and
+        # again minutes later. One bounded re-fetch (wait → re-goto →
+        # re-render) rides out short windows before discovery declares
+        # empty_render and the pipeline starts switching strategies.
+        logger.info(
+            "discovery: initial render empty — retrying once after %dms",
+            cfg.empty_render_retry_wait_ms,
+        )
+        page.wait_for_timeout(cfg.empty_render_retry_wait_ms)
+        if _discovery_goto(page, start_url, cfg, state):
+            accumulated = _wait_for_render(page, extract_urls, cfg)
+    initial_fetch = list(accumulated)
     seen.update(accumulated)
     if not accumulated:
         _set_stop(state, StopReason.EMPTY_RENDER)
@@ -808,7 +857,16 @@ def discover_item_urls(
         next_page_num = pages_visited + 1
         iteration_outcome: str = _NOT_APPLICABLE
         saw_stuck = False  # a same-page primitive acted but added nothing
-        for name in cfg.strategies:
+        # Once page_param is VERIFIED live (adopted alias / end-of-run probe),
+        # it joins the strategy set for the rest of the run — a same-page-only
+        # config cannot continue a param walk on its own (job-311 recovery).
+        strategies = cfg.strategies
+        if (
+            "page_param" not in strategies
+            and (state.get(_ADOPTED_ALIAS_KEY) or state.get(_END_OF_RUN_LIVE_KEY))
+        ):
+            strategies = strategies + ("page_param",)
+        for name in strategies:
             handler = _PRIMITIVES.get(name)
             if handler is None:
                 logger.warning("discovery: unknown strategy %r — skipped", name)
@@ -821,8 +879,17 @@ def discover_item_urls(
             # fall through to ANOTHER same-page primitive; reaching a nav primitive
             # after a same-page stall ends the iteration as stuck.
             if saw_stuck and not is_same_page:
-                iteration_outcome = _STUCK
-                break
+                # EXCEPTION: a VERIFIED page_param (adopted alias or end-of-run
+                # probe) is the proven-live primitive (the same-page primitives
+                # already failed for good) — the stall must not starve it
+                # (job-311 end-of-run adoption).
+                if name == "page_param" and (
+                    state.get(_ADOPTED_ALIAS_KEY) or state.get(_END_OF_RUN_LIVE_KEY)
+                ):
+                    pass
+                else:
+                    iteration_outcome = _STUCK
+                    break
             if is_same_page:
                 outcome = handler(page, cfg, extract_urls, seen, accumulated)
             elif name == "page_param":
@@ -870,6 +937,61 @@ def discover_item_urls(
             no_progress += 1
             pages_visited += 1
             if no_progress >= cfg.max_no_progress:
+                # ── End-of-run page-param probe (job-311 class) ──
+                # A same-page-only config that never got past the initial page
+                # may simply be a MISCLASSIFIED SSR pager (BigCommerce
+                # search.php paginates ?page=N but carries no load-more
+                # control — the navigator saw load_more, the site serves 108
+                # param pages). Give the page_param machinery ONE bounded,
+                # verified chance before declaring NO_NEW_ITEMS: adoption
+                # requires ≥1 genuinely new URL and the alias ladder memoizes
+                # exhaustion (_LADDER_EXHAUSTED_KEY), so a healthy exhausted
+                # run pays at most len(_PAGE_PARAM_ALIASES) probes once.
+                _probe_outcome = _STUCK
+                # The gate means "never progressed past the initial page":
+                # pages_visited increments in lockstep with every iteration, so
+                # at this terminal pages_visited == 1 + max_no_progress exactly
+                # when NO iteration ever progressed. (A plain ``<= 2`` would be
+                # dead code at the default max_no_progress=3.)
+                if (
+                    pages_visited <= cfg.max_no_progress + 1
+                    and not state.get(_LADDER_EXHAUSTED_KEY)
+                ):
+                    _prev_stop = state.get("stop_reason")
+                    # Honest next page: the gate above proved NOTHING past the
+                    # initial fetch — so the first unvisited page is 2, not
+                    # pages_visited + 1 (iterations ≠ param pages).
+                    _probe_page = int(state.get(_PARAM_PAGE_KEY) or 1) + 1
+                    if cfg.page_param_name or state.get(_ADOPTED_ALIAS_KEY):
+                        _probe_outcome = _try_page_param(
+                            page, cfg, extract_urls, seen, accumulated,
+                            _probe_page, state,
+                        )
+                    else:
+                        _probe_outcome = _try_page_param_alias_ladder(
+                            page, cfg, extract_urls, seen, accumulated,
+                            _probe_page,
+                            _resolve_page_size(cfg, initial_fetch), state,
+                            candidates=_END_OF_RUN_PROBES,
+                        )
+                    if _probe_outcome != _PROGRESSED and (
+                        state.get("stop_reason") == StopReason.NAVIGATE_ERROR.value
+                        and _prev_stop != StopReason.NAVIGATE_ERROR.value
+                    ):
+                        # A 404/timeout on one probe says nothing about the
+                        # run — we DID collect the initial page. Roll the
+                        # sticky NAVIGATE_ERROR back so the honest terminal
+                        # (NO_NEW_ITEMS) is what downstream gates read.
+                        state["stop_reason"] = _prev_stop
+                if _probe_outcome == _PROGRESSED:
+                    state[_END_OF_RUN_LIVE_KEY] = True
+                    logger.info(
+                        "discovery: end-of-run page-param probe verified — "
+                        "continuing (%d urls so far)", len(accumulated),
+                    )
+                    no_progress = 0
+                    pages_visited += 1  # the probed page counts as visited
+                    continue
                 _set_stop(state, StopReason.NO_NEW_ITEMS)
                 break
             continue

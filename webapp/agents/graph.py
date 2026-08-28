@@ -854,6 +854,73 @@ def _attach_discovery_coverage(report: dict, slug: str) -> dict:
     return report
 
 
+def _attach_transient_render_evidence(report: dict, slug: str) -> dict:
+    """Job-311: prove (or refute) a TRANSIENT site-side render block.
+
+    The testing phase runs the draft several times. When the NEWEST output's
+    discovery stopped with ``empty_render`` while an EARLIER output in the
+    same phase carried real items, the draft+strategy demonstrably work and
+    the empty run is a site-side soft-block window — not a wrong strategy.
+    Attach that evidence so ``classify_test_failure`` re-tests the same draft
+    instead of burning the strategy rung (job 311: by the time its strategy
+    switch ran, the window had already passed — the post-mortem probe found
+    12 URLs). No-op unless the newest output is a genuine empty_render.
+    """
+    if not isinstance(report, dict) or not slug or report.get("discovery_transient"):
+        return report
+    try:
+        from django.conf import settings as _settings
+
+        root = str(getattr(_settings, "PROJECT_ROOT", "."))
+        ws_dir = os.path.join(root, "workspace", slug)
+        outs = []
+        for name in os.listdir(ws_dir) if os.path.isdir(ws_dir) else []:
+            if name.startswith("output_") and name.endswith(".json"):
+                p = os.path.join(ws_dir, name)
+                try:
+                    outs.append((os.path.getmtime(p), p))
+                except OSError:
+                    continue
+        if not outs:
+            return report
+        outs.sort()
+        _newest_path = outs[-1][1]
+        newest_cov = {}
+        try:
+            from .nodes.run_execution import _read_discovery_coverage
+
+            newest_cov = _read_discovery_coverage(_newest_path) or {}
+        except Exception:
+            newest_cov = {}
+        if str(newest_cov.get("stop_reason") or "") != "empty_render":
+            return report
+        best_items = 0
+        try:
+            from .nodes.run_execution import _substantive_item_count
+
+            for _mt, p in outs:
+                best_items = max(best_items, _substantive_item_count(p))
+        except Exception:
+            best_items = 0
+        if best_items <= 0:
+            return report  # nothing ever worked — not transient evidence
+        report["discovery_transient"] = {
+            "suspected": True,
+            "latest_stop_reason": "empty_render",
+            "best_items": best_items,
+            "outputs_seen": len(outs),
+        }
+        logger.warning(
+            "_attach_transient_render_evidence: empty_render on newest output "
+            "but an earlier output this phase carried %d items — transient "
+            "render block suspected (job draft is NOT condemned)",
+            best_items,
+        )
+    except Exception as exc:
+        logger.debug("_attach_transient_render_evidence: skipped: %s", exc)
+    return report
+
+
 def _preserve_test_report(slug: str) -> None:
     """Copy test_report.json from LOCAL workspace to the File Master (scrapers analysis/)."""
     if not slug:
@@ -3988,6 +4055,10 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             # so the coverage-aware classifier sees it (the LLM-written report
             # doesn't reliably carry it).
             report = _attach_discovery_coverage(report, slug)
+            # Job-311: detect a transient site-side render block (newest
+            # output empty_render, an earlier one carried items) BEFORE the
+            # classifier turns it into a strategy verdict.
+            report = _attach_transient_render_evidence(report, slug)
             # T2.2/T2.3: deterministically check the OUTPUT rows (double-host
             # URLs, inverted price pairs, mapped-but-empty fields) and merge
             # the findings into report.issues — the tester's LLM misses these
