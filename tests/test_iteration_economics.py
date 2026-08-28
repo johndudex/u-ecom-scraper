@@ -361,3 +361,59 @@ class TestDeterministicChecks:
                    open(tmp_path / "workspace" / "s" / "output_test.json", "w"))
         monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
         assert rat.deterministic_output_issues("s", {}) == []
+
+    def test_rating_mapped_from_count_fires(self, monkeypatch, tmp_path):
+        """Job-303: ratings mapped at numberOfReviews — the 2 review-bearing
+        products shipped their review COUNT as the star value."""
+        import json as _json
+
+        rows = [
+            {"title": f"p{i}", "url": f"https://x.com/p{i}",
+             "ratings": "1" if i < 2 else ""}
+            for i in range(5)
+        ]
+        (tmp_path / "workspace" / "s").mkdir(parents=True, exist_ok=True)
+        _json.dump({"products": rows, "metadata": {}},
+                   open(tmp_path / "workspace" / "s" / "output_test.json", "w"))
+        monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
+        state = {"product_analysis": {"fields": {
+            "ratings": {"method": "embedded_json",
+                        "json_path": "cx-state.product.details.value.numberOfReviews",
+                        "notes": "Number of reviews (integer)."},
+        }}}
+        issues = rat.deterministic_output_issues("s", state)
+        hit = [i for i in issues
+               if i["field"] == "ratings" and i["issue_type"] == "WRONG_VALUE"]
+        assert hit, f"expected rating-from-count issue, got {issues}"
+        assert hit[0]["severity"] == "medium"
+        assert "averageRating" in hit[0]["suggested_fix"]
+        # and it must be a routing blocker
+        blockers = [
+            i for i in issues
+            if str(i.get("issue_type")).upper() == "WRONG_VALUE"
+            and (i.get("suggested_fix") or "").strip()
+            and str(i.get("field") or "").lower()
+            in ("url", "price", "previous_price", "original_price",
+                "ratings", "rating", "average_rating")
+        ]
+        assert blockers
+
+    def test_rating_mapped_to_value_stays_quiet(self, monkeypatch, tmp_path):
+        """Correct map (averageRating) + sparse fills = legitimate — no issue."""
+        import json as _json
+
+        rows = [
+            {"title": f"p{i}", "url": f"https://x.com/p{i}",
+             "ratings": "4.5" if i < 2 else ""}
+            for i in range(5)
+        ]
+        (tmp_path / "workspace" / "s").mkdir(parents=True, exist_ok=True)
+        _json.dump({"products": rows, "metadata": {}},
+                   open(tmp_path / "workspace" / "s" / "output_test.json", "w"))
+        monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
+        state = {"product_analysis": {"fields": {
+            "ratings": {"method": "embedded_json",
+                        "json_path": "cx-state.product.details.value.averageRating",
+                        "notes": "Average star value; empty when no reviews."},
+        }}}
+        assert rat.deterministic_output_issues("s", state) == []

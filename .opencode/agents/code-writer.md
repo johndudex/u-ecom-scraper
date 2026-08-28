@@ -160,6 +160,13 @@ checkpoint load/save, etc.) are **correct as written**. Three hard rules:
    absent). Verify the orientation on your sample items before writing the
    mapping, and leave `previous_price` empty when no second value exists
    rather than duplicating the current price into it.
+3. **Rating-like fields carry the star VALUE, not a review count.** When the
+   Field Map anchors a rating field (`ratings`/`rating`/`average_rating`) at
+   a count-shaped source (`numberOfReviews`, `reviewCount`,
+   `reviews_count`), that map is WRONG — do not implement it as-is. Extract
+   the average/star value instead (`averageRating`, `rating_value`,
+   `aggregateRating.ratingValue`); leave the field empty on items with no
+   reviews. Shipping the count as the rating is a WRONG_VALUE bounce.
 
 ## What NOT to Do
 

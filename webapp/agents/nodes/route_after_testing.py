@@ -395,6 +395,17 @@ def _core_field_zero_coverage(report: dict, state: ScrapeState) -> str | None:
 _SAMPLE_CAP = 5  # code_tester's --sample run is 5-bounded
 _PRICE_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
 _EMPTY_STRINGS = ("", "none", "null", "[]", "n/a", "na")
+# Job-303: product_analyzer mapped `ratings` → numberOfReviews (a COUNT), the
+# writer shipped it, and every review-bearing product got its review count as
+# its star rating. A rating must be the average/star VALUE.
+_RATING_FIELDS = frozenset({
+    "ratings", "rating", "average_rating", "avg_rating", "rating_value",
+    "star_rating", "averagerating",
+})
+_COUNT_TOKEN_RE = re.compile(
+    r"num(?:ber)?\s*_?of\s*_?reviews|review\s*_?count|reviews?\s*_?count",
+    re.IGNORECASE,
+)
 
 
 def _price_value(v) -> Optional[float]:
@@ -566,6 +577,44 @@ def deterministic_output_issues(slug: str, state: ScrapeState) -> list[dict]:
                         "value over a brittle CSS path) instead of shipping empty."
                     ),
                 })
+
+    # 4. rating mapped from a review-COUNT source (job-303 class). Deliberately
+    # NOT the mapped-but-empty check: products without reviews legitimately
+    # leave ratings empty, so sparseness alone is a false-positive magnet. The
+    # defect is in the MAP — a rating field anchored at a count field is wrong
+    # wherever it fires.
+    if isinstance(fields, dict):
+        for fname, meta in fields.items():
+            if not isinstance(meta, dict) or str(fname).lower() not in _RATING_FIELDS:
+                continue
+            _map_text = " ".join(
+                str(meta.get(k) or "")
+                for k in ("json_path", "api_path", "api_fallback_path",
+                          "selector", "jsonld_key", "notes")
+            )
+            if not _COUNT_TOKEN_RE.search(_map_text):
+                continue
+            if not any(
+                str(r.get(fname) or "").strip() not in _EMPTY_STRINGS
+                for r in rows
+            ):
+                continue  # nothing extracted — different failure class
+            issues.append({
+                "field": str(fname),
+                "issue_type": "WRONG_VALUE",
+                "severity": "medium",
+                "description": (
+                    f"Deterministic check: '{fname}' is mapped to a review-COUNT "
+                    f"source ({_map_text.strip()[:80]!r}) — it carries the number "
+                    "of reviews, not the star/average value"
+                ),
+                "suggested_fix": (
+                    f"Map '{fname}' to the average-rating VALUE field "
+                    "(e.g. averageRating / rating_value), never a count field "
+                    "(numberOfReviews / reviewCount). The count answers 'how "
+                    "many reviews exist'; the rating answers 'what score'."
+                ),
+            })
     return issues
 
 
@@ -735,7 +784,8 @@ def route_after_testing(state: ScrapeState) -> str:
         if str(i.get("issue_type") or "").upper() == "WRONG_VALUE"
         and (i.get("suggested_fix") or "").strip()
         and str(i.get("field") or "").lower()
-        in ("url", "price", "previous_price", "original_price")
+        in ("url", "price", "previous_price", "original_price",
+            "ratings", "rating", "average_rating")
     ]
 
     # L2 CLI-contract signal (docs/cli-contract-plan.md): static re-check of the

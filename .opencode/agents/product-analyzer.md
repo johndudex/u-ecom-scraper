@@ -136,6 +136,18 @@ field not existing on the site.
 - If you cannot get 3 samples (budget, dead page), write `tested: false` and
   say so in `notes` — do NOT write "not available".
 
+### Rating-like fields map to the VALUE, never a COUNT
+
+When the requested schema has a rating-shaped field (`ratings`, `rating`,
+`average_rating`, …), map it to the **average/star VALUE**
+(`averageRating`, `rating_value`, `aggregateRating.ratingValue`, a star
+widget's `content`, …). NEVER map it to a review **count** field
+(`numberOfReviews`, `reviewCount`, `reviews_count`) — a count answers "how
+many reviews exist", the rating answers "what score". A count-shipped rating
+is a deterministic WRONG_VALUE finding and the scraper bounces. If the source
+genuinely exposes only a count, mark the rating field NOT available (with the
+≥3-samples evidence) and note the count field's path in `notes`.
+
 ### 5. Field Extraction Plan
 
 > **If the message includes a "User Requirements (schema — ENFORCE)" block,
