@@ -12,6 +12,7 @@ import httpx
 
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
+from django.db.models import Q
 from django.http import (
     FileResponse,
     Http404,
@@ -769,9 +770,12 @@ def _approval_scope(request):
     user=None and were invisible to everyone but Django admin — prod 257 sat
     pending for days)."""
     if request.user.is_superuser:
-        return None  # no filter
-    from django.db.models import Q
-
+        # Match-all Q, NOT None: callers do .filter(_approval_scope(request)),
+        # and filter(None) raised TypeError — every /approvals/ and
+        # /approvals/count/ request by a SUPERUSER 500'd since 41f2828
+        # (prod: badge silently zeroed by the dashboard's .catch(), approvals
+        # page unreachable).
+        return Q()
     return Q(job__user=request.user) | Q(job__user__isnull=True)
 
 

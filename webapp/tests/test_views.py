@@ -122,6 +122,45 @@ class TestApprovalListView(TestCase):
         resp = self.client.get(reverse("approval_list"))
         self.assertContains(resp, "Approve fields?")
 
+    def test_superuser_scope_returns_match_all_not_none(self):
+        """REGRESSION (prod 2026-08-28): _approval_scope returned None for
+        superusers and callers do .filter(scope) → TypeError 500 on BOTH
+        /approvals/ and /approvals/count/ for every superuser request since
+        41f2828. The dashboard's .catch() zeroed the badge, so it shipped
+        unnoticed."""
+        admin = User.objects.create_superuser(username="admin", password="pw")
+        self.client.force_login(admin)
+        job = baker.make(ScrapeJob)
+        baker.make(Approval, job=job, approval_type="field_confirm", question="Approve fields?")
+
+        resp = self.client.get(reverse("approval_list"))
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "Approve fields?")
+
+        count_resp = self.client.get(reverse("approval_count"))
+        self.assertEqual(count_resp.status_code, 200)
+        self.assertEqual(count_resp.json()["count"], 1)
+
+    def test_regular_user_scope_excludes_other_users_jobs(self):
+        """The Q branch must keep working (and not leak other users' approvals)."""
+        owner = User.objects.create_user(username="owner", password="pw")
+        viewer = User.objects.create_user(username="viewer", password="pw")
+        owned_a = baker.make(ScrapeJob, user=owner)
+        owned_b = baker.make(ScrapeJob, user=owner)
+        baker.make(Approval, job=owned_a, approval_type="field_confirm", question="A")
+        baker.make(Approval, job=owned_b, approval_type="field_confirm", question="B")
+
+        self.client.force_login(viewer)
+        count_resp = self.client.get(reverse("approval_count"))
+        self.assertEqual(count_resp.status_code, 200)
+        self.assertEqual(count_resp.json()["count"], 0)
+
+        # ownerless jobs stay visible to regular users (F11)
+        orphan = baker.make(ScrapeJob, user=None)
+        baker.make(Approval, job=orphan, approval_type="field_confirm", question="Orphan")
+        count_resp = self.client.get(reverse("approval_count"))
+        self.assertEqual(count_resp.json()["count"], 1)
+
 
 class TestApprovalDetailView(TestCase):
     def setUp(self):
@@ -142,9 +181,12 @@ class TestApprovalDetailView(TestCase):
         self.assertContains(resp, "Approve these fields?")
 
     def test_approve(self):
+        # The real form submits name="choice" with a decision label
+        # (approval_detail.html:49); the view maps anything not
+        # Cancel/Abort/No/stop to approve (_build_resume_value).
         resp = self.client.post(
             reverse("approval_detail", kwargs={"approval_id": self.approval.id}),
-            {"action": "approve"},
+            {"choice": "Approve"},
         )
         self.approval.refresh_from_db()
         self.assertEqual(self.approval.status, Approval.STATUS_APPROVED)
@@ -152,7 +194,7 @@ class TestApprovalDetailView(TestCase):
     def test_reject(self):
         resp = self.client.post(
             reverse("approval_detail", kwargs={"approval_id": self.approval.id}),
-            {"action": "reject"},
+            {"choice": "Cancel"},
         )
         self.approval.refresh_from_db()
         self.assertEqual(self.approval.status, Approval.STATUS_REJECTED)
