@@ -1609,8 +1609,6 @@ def site_rerun(request, site_id):
     }
 
     if site.scraping_method in BROWSER_METHODS:
-        import httpx
-
         service_url = getattr(
             settings, "BROWSER_SERVICE_URL", "http://browser_service:8001"
         )
@@ -1633,13 +1631,22 @@ def site_rerun(request, site_id):
         if getattr(site, "needs_akamai_bypass", False):
             scrape_json["env_overrides"] = {"STEALTH_BROWSER": "cloak"}
         try:
-            resp = httpx.post(
+            # W8: cap the synchronous hold — this request occupies a gunicorn
+            # worker (and, post-W4, a SCRAPE slot) for the whole duration; a
+            # 3600s HTTP call was its own hazard. 1200s still covers full
+            # re-runs of the largest verified catalogs.
+            _rerun_timeout = min(int(scrape_json.get("timeout") or 0), 1200)
+            scrape_json["timeout"] = _rerun_timeout
+            from agents.tools.browser_http import post_scrape_with_retry
+
+            _res = post_scrape_with_retry(
                 f"{service_url}/scrape",
-                json=scrape_json,
-                timeout=3660,
+                scrape_json,
+                timeout=_rerun_timeout + 60,
             )
-            resp.raise_for_status()
-            result = resp.json()
+            if not _res.ok:
+                raise RuntimeError(_res.error or "browser_service scrape failed")
+            result = _res.data
             _content = result.get("output_content") or ""
             _name = result.get("output_name") or ""
             if _content and _name and slug:

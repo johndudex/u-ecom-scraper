@@ -230,14 +230,19 @@ def _navigate(url, actions=None, extract=None, retry=0):
       - 200 + success=True  → return data (has url/html/data/...)
       - 200 + blocked=True  → terminal (anti-bot wall); return data so caller
                               can distinguish "blocked" from "navigate failed"
-      - 429 / 503 / 502     → retryable; honor Retry-After header
+      - 429 / 503 / 502     → retryable; honor Retry-After (header first, then
+                              the JSON body's retry_after)
       - 5xx / timeouts /    → retryable; exponential backoff (base 2, cap 30s)
         connect errors
       - 404                 → terminal; return the body so the caller can record
                               an error item without burning the retry budget
 
     The `retry` arg is a backoff-exponent floor (callers may pre-bias it).
-    Returns None only after all MAX_RETRIES attempts are exhausted.
+    Returns None only after all MAX_RETRIES attempts are exhausted — EXCEPT a
+    429-exhaustion, which returns a terminal throttled dict
+    (``{"success": False, "throttled": True, "status": 429, ...}``) so discovery
+    can emit stop_reason="navigate_throttled": backpressure is INCONCLUSIVE
+    coverage (the run was refused, not beaten), never a strategy verdict.
     """
     payload = {
         "url": url,
@@ -249,6 +254,7 @@ def _navigate(url, actions=None, extract=None, retry=0):
         "return_what": "all",
     }
     endpoint = f"{BROWSER_SERVICE_URL}/navigate"
+    last_throttled = False
     for attempt in range(MAX_RETRIES):
         try:
             r = httpx.post(endpoint, json=payload, timeout=NAVIGATE_TIMEOUT + 30)
@@ -268,7 +274,15 @@ def _navigate(url, actions=None, extract=None, retry=0):
 
             # 429 / 503 / 502 / other 5xx → retryable.
             if r.status_code in (429, 502, 503):
-                retry_after = r.headers.get("retry_after") or r.headers.get("Retry-After") or 5
+                last_throttled = last_throttled or r.status_code == 429
+                # Retry-After: header first (server emits it), then the JSON
+                # body's retry_after (older server builds) — neither → 5s.
+                retry_after = r.headers.get("Retry-After")
+                if not retry_after:
+                    try:
+                        retry_after = (r.json() or {}).get("retry_after")
+                    except ValueError:
+                        retry_after = None
                 try:
                     retry_after = int(retry_after)
                 except (TypeError, ValueError):
@@ -289,6 +303,10 @@ def _navigate(url, actions=None, extract=None, retry=0):
         time.sleep(min(BACKOFF_BASE ** (attempt + retry), 30))
 
     logger.warning("navigate: exhausted %d retries on %s", MAX_RETRIES, url[:80])
+    if last_throttled:
+        # Throttle, not breakage: terminal marker dict so discovery records
+        # navigate_throttled (INCONCLUSIVE) instead of navigate_error (FAIL).
+        return {"success": False, "throttled": True, "status": 429, "url": url, "html": ""}
     return None
 
 
@@ -420,8 +438,9 @@ def _get_next_page_url(final_url: str, next_page_num: int, html: str = None) -> 
 # MUST outrank exhaustion reasons, otherwise the coverage gate false-PASSes a
 # blocked scraper. See docs/discovery-coverage-gate-contract.md §2.
 _STOP_REASON_PRIORITY = {
-    "navigate_error": 5,   # FAIL  — gave up due to 429/502/503/block (NOT exhaustion)
+    "navigate_error": 5,   # FAIL  — gave up due to 502/503/block (NOT exhaustion)
     "dedup_flat": 4,        # FAIL  — broken dedup / feed injection suspected
+    "navigate_throttled": 3,  # INCONCLUSIVE — 429 backpressure; coverage unproven, NOT a site defect
     "max_pages_hit": 3,     # INCONCLUSIVE — hit a cap, did not exhaust
     "no_new_items": 2,      # PASS/INCONCLUSIVE — consecutive pages were all dupes
     "short_page": 1,        # PASS  — genuine end (last page thinned out)
@@ -565,11 +584,13 @@ def _discover_urls_via_search(
     resp = _navigate(search_url, actions=actions)
     if not resp or not resp.get("success"):
         blocked = bool(resp and resp.get("blocked"))
+        throttled = bool(resp and resp.get("throttled"))
         logger.error(
-            "Phase 1: search navigate failed for %s%s",
+            "Phase 1: search navigate failed for %s%s%s",
             search_url, " (blocked)" if blocked else "",
+            " (throttled)" if throttled else "",
         )
-        return [], "navigate_error"
+        return [], "navigate_throttled" if throttled else "navigate_error"
 
     final_url = resp.get("url") or search_url
     html = resp.get("html", "")
@@ -604,8 +625,13 @@ def _discover_urls_via_search(
             # H4 false-pass guard: _navigate exhausted retries on 429/502/503
             # (or hit a block). This is NOT exhaustion — surface it so the
             # coverage gate can FAIL the run instead of declaring success.
+            # A 429-exhaustion is navigate_throttled (INCONCLUSIVE): the run
+            # was refused by browser-service backpressure, not beaten by the site.
             logger.warning("Phase 1: page %d navigate failed, stopping", current_page + 1)
-            stop_reason = "navigate_error"
+            stop_reason = (
+                "navigate_throttled" if (resp and resp.get("throttled"))
+                else "navigate_error"
+            )
             break
 
         final_url = resp.get("url") or next_url
@@ -811,11 +837,13 @@ def _discover_urls_via_category(
     resp = _navigate(category_url)
     if not resp or not resp.get("success"):
         blocked = bool(resp and resp.get("blocked"))
+        throttled = bool(resp and resp.get("throttled"))
         logger.error(
-            "Phase 1: category navigate failed for %s%s",
+            "Phase 1: category navigate failed for %s%s%s",
             category_url, " (blocked)" if blocked else "",
+            " (throttled)" if throttled else "",
         )
-        return [], "navigate_error"
+        return [], "navigate_throttled" if throttled else "navigate_error"
 
     final_url = resp.get("url") or category_url
     html = resp.get("html", "")
@@ -840,7 +868,10 @@ def _discover_urls_via_category(
         logger.info("Phase 1: Category page %d", current_page + 1)
         resp = _navigate(next_url)
         if not resp or not resp.get("success"):
-            stop_reason = "navigate_error"
+            stop_reason = (
+                "navigate_throttled" if (resp and resp.get("throttled"))
+                else "navigate_error"
+            )
             break
 
         final_url = resp.get("url") or next_url

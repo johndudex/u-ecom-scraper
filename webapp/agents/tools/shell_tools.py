@@ -14,6 +14,8 @@ from typing import Optional
 import httpx
 from langchain_core.tools import tool
 
+from .browser_http import post_scrape_with_retry
+
 logger = logging.getLogger(__name__)
 
 MAX_OUTPUT_CHARS = 10000
@@ -313,9 +315,12 @@ def get_shell_tools(
                                 _extra[_sf] = _fh.read()
                         except OSError:
                             pass
-                resp = httpx.post(
+                # W8: bounded retry on 429/502/503/504 + transport errors — a
+                # bare raise_for_status() turned browser-service backpressure
+                # into an opaque HTTPStatusError mid-test.
+                _res = post_scrape_with_retry(
                     f"{service_url}/scrape",
-                    json={
+                    {
                         "scraper_source": _source,
                         "scraper_name": os.path.basename(full_path),
                         "extra_files": _extra,
@@ -325,10 +330,14 @@ def get_shell_tools(
                     },
                     timeout=timeout + 60,
                 )
-                if resp.status_code == 404:
+                if _res.status_code == 404:
                     return f"Scraper rejected by browser_service (source invalid)"
-                resp.raise_for_status()
-                result = resp.json()
+                if not _res.ok:
+                    return (
+                        f"Scraper run failed ({_res.error_class}): {_res.error}"
+                        + (" — transient, safe to re-run" if _res.transient else "")
+                    )
+                result = _res.data
                 # browser_service returns output CONTENT (no shared FS). Persist
                 # it to the local workspace so downstream (route_after_testing
                 # ground-truth, which reads workspace/{slug}/output_*.json) works.

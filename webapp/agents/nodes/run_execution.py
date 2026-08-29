@@ -572,7 +572,8 @@ def _run_category_sources(state, scraper_path, base_args, site_folder, primary_r
     """
     import json as _json
     import os as _os
-    import httpx
+
+    from ..tools.browser_http import post_scrape_with_retry
 
     try:
         slug = state.get("site_slug", "")
@@ -647,12 +648,21 @@ def _run_category_sources(state, scraper_path, base_args, site_folder, primary_r
                         _cat_source = _cf.read()
                 except OSError:
                     _cat_source = ""
-                resp = httpx.post(
+                # W8: 429/502 backpressure used to land here un-checked — the
+                # error body became output_content="" and the category was
+                # silently skipped, under-counting the merged output.
+                _res = post_scrape_with_retry(
                     f"{service_url}/scrape",
-                    json={"scraper_source": _cat_source, "scraper_name": os.path.basename(scraper_path), "args": cat_args, "timeout": 600, "env_overrides": stealth_env},
+                    {"scraper_source": _cat_source, "scraper_name": os.path.basename(scraper_path), "args": cat_args, "timeout": 600, "env_overrides": stealth_env},
                     timeout=620,
                 )
-                cat_result = resp.json()
+                if not _res.ok:
+                    logger.warning(
+                        "multisource: category %s skipped (%s: %s)",
+                        cat_url[:40], _res.error_class, _res.error,
+                    )
+                    continue
+                cat_result = _res.data
                 cat_content = cat_result.get("output_content") or ""
                 if cat_content:
                     try:
@@ -919,6 +929,8 @@ def _run_via_browser_service(
 ) -> dict[str, Any]:
     import httpx
 
+    from ..tools.browser_http import post_scrape_with_retry
+
     service_url = _get_browser_service_url()
     stealth_env = _stealth_env(state) if state else {}
     # DETERMINISTIC DISCOVERY: inject SCRAPER_LISTING_URL into the browser_service
@@ -984,9 +996,11 @@ def _run_via_browser_service(
                         _extra[_sf] = _fh.read()
                 except OSError:
                     pass
-        resp = httpx.post(
+        # W8: bounded retry on 429/502/503/504 + transport errors — a bare
+        # raise_for_status() turned backpressure into an execution failure.
+        _res = post_scrape_with_retry(
             f"{service_url}/scrape",
-            json={
+            {
                 "scraper_source": _source,
                 "scraper_name": os.path.basename(scraper_path),
                 "extra_files": _extra,
@@ -997,14 +1011,18 @@ def _run_via_browser_service(
             timeout=timeout + 60,
         )
 
-        if resp.status_code == 404:
+        if _res.status_code == 404:
             return {
                 "execution_status": "FAILED",
                 "error_message": "Scraper rejected by browser_service (source invalid)",
             }
 
-        resp.raise_for_status()
-        result = resp.json()
+        if not _res.ok:
+            return {
+                "execution_status": "FAILED",
+                "error_message": _res.error,
+            }
+        result = _res.data
 
         if result.get("returncode", 0) != 0:
             # TAIL + 4000: the exception line lives at the END of a traceback;

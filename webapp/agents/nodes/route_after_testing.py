@@ -125,6 +125,11 @@ def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
     is_selector_crash = bool(_SELECTOR_CRASH_RE.search(crash))
     strat = (strategy or "").strip()
     is_http_like = strat in _HTTP_LIKE_STRATEGIES
+    # W8: discovery stopped on browser-service backpressure (429 throttle).
+    _cov_dc = report.get("discovery_coverage") if isinstance(report, dict) else None
+    is_throttled = (
+        isinstance(_cov_dc, dict) and _cov_dc.get("stop_reason") == "navigate_throttled"
+    )
 
     # Code bug: a wrong CSS selector — the strategy is fine, the selector is
     # wrong. This MUST be checked before the access/strategy branches below,
@@ -132,6 +137,22 @@ def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
     # "switch strategy" and the cascade abandons the only working approach.
     if is_selector_crash:
         return ("scraper", f"selector crash — element not found ({crash[:80]})")
+
+    # Browser-service backpressure: a run stopped by a 429 throttle is UNPROVEN
+    # coverage, not a verdict on the strategy or the code. It must be checked
+    # BEFORE the zero-item branches — a throttled run completes cleanly (no
+    # traceback), so `items == 0 and is_http_like` would strategy-switch (the
+    # strategy never got a fair window), and omitting "navigate_throttled" from
+    # the coverage-FAIL set would otherwise just fall through to "refine"
+    # (code_writer tweaking field mappings on a zero-item run — equally wrong).
+    if is_throttled:
+        return (
+            "scraper",
+            (
+                "navigate throttled (browser-service backpressure) — re-test, "
+                "no strategy switch"
+            ),
+        )
 
     # Access/strategy-class: the strategy can't reach the content.
     if is_timeout and strat in ("playwright", "stealth_browser", "seleniumbase_uc", ""):

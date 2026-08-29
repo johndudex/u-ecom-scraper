@@ -478,7 +478,6 @@ def _read_sibling_files(scraper_path: str) -> dict[str, str]:
 
 def _run_sample_via_queue(scraper_path: str, args: list[str]) -> str:
     try:
-        import httpx
         from django.conf import settings
 
         browser_service_url = getattr(
@@ -490,9 +489,13 @@ def _run_sample_via_queue(scraper_path: str, args: list[str]) -> str:
                 _source = _f.read()
         except OSError as exc:
             return f"[queue error] could not read scraper source: {exc}"
-        resp = httpx.post(
+        # W8: the previous call had NO status check — a 429/502 body became
+        # stdout="" and the user reviewed an empty sample as if it were real.
+        from ..tools.browser_http import post_scrape_with_retry
+
+        _res = post_scrape_with_retry(
             f"{browser_service_url}/scrape",
-            json={
+            {
                 "scraper_source": _source,
                 "scraper_name": os.path.basename(scraper_path),
                 "extra_files": _read_sibling_files(scraper_path),
@@ -501,8 +504,9 @@ def _run_sample_via_queue(scraper_path: str, args: list[str]) -> str:
             },
             timeout=310,
         )
-        data = resp.json()
-        return data.get("stdout", "")[:5000]
+        if not _res.ok:
+            return f"[scrape unavailable] {_res.error}"
+        return (_res.data.get("stdout", "") or "")[:5000]
     except Exception as exc:
         return f"[queue error] {exc}"
 
