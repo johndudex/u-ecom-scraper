@@ -391,6 +391,7 @@ curl -fsI https://<app>.up.railway.app/admin/login/      # → 200
 | healthcheck "service unavailable", all config verified | quoted value (`PORT="8000"`) breaks probe URL | retype values unquoted in Raw Editor |
 | agent tools: `mkdir scrapers: Permission denied` / `sudo: not found` | image never created `/app/scrapers` (root-owned `/app` + uid-1000 worker) | fixed in Dockerfile `754bc6c` — dir pre-created + chowned; redeploy worker |
 | healthcheck 404 | trailing slash in the path field | use `/api/health/raw` exactly |
+| browser `/health` 503 + `navigate_recent.state: degraded` + `error_class: resource` in logs + memory gauge ratio ≈ 1.0 | cgroup memory pressure — ephemeral launches refused/failing (Errno 11 / OOM) | do NOT redeploy; wait out the window (300s), then check `/jobs/` for running jobs before any action |
 
 ---
 

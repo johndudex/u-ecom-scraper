@@ -78,9 +78,16 @@ class TestExecutorSeparation:
         i_restart = src.index("RESTART_EXECUTOR, browser_pool.restart_chrome, request.label")
         assert i_scrape != i_restart
 
-    def test_health_has_its_own_unstarvable_slot_until_w6(self):
+    def test_health_slot_now_lives_in_the_boot_warmup(self):
+        """W6 superseded the per-request HEALTH_EXECUTOR dispatch — /health
+        reads the cached snapshot. The executor's only remaining use is the
+        one-shot boot warm-up in lifespan."""
         src = _src()
         assert "HEALTH_EXECUTOR, browser_pool.check_cdp_liveness" in src
+        health_fn = re.search(r"@app\.get\(\"/health\"\).*?(?=\n@app\.|\nclass )", src, re.S)
+        assert health_fn and "run_in_executor" not in health_fn.group(0), (
+            "/health must dispatch NOTHING (cached liveness)"
+        )
 
 
 class TestScrapeAdmissionControl:

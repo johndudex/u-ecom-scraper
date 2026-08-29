@@ -14,6 +14,13 @@ SCRAPER_CDP_PORT = int(os.environ.get("SCRAPER_CDP_PORT", "9223"))
 XVFB_RESOLUTION = os.environ.get("XVFB_RESOLUTION", "1920x1080x24")
 STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT", "45"))
 CHROME_USER_DATA_DIR = "/tmp/chrome-profiles"
+# W6/W9: when set, the Scraper Chrome (9223) is NOT started at boot — the
+# /scrape path launches it on first use (W9's ensure_scraper_chrome). /health
+# must treat a deliberately-unstarted Chrome as healthy (scraper_not_required)
+# or lazy-by-default + the stricter AND = 503 from boot → the compose
+# healthcheck fails → depends_on service_healthy blocks django/celery from
+# ever starting. Default "0" until W9 flips it.
+SCRAPER_CHROME_LAZY = os.environ.get("SCRAPER_CHROME_LAZY", "0") == "1"
 
 
 class BrowserPool:
@@ -21,6 +28,10 @@ class BrowserPool:
         self._xvfb_proc: Optional[subprocess.Popen] = None
         self._mcp_chrome_proc: Optional[subprocess.Popen] = None
         self._scraper_chrome_proc: Optional[subprocess.Popen] = None
+        # W6: distinguishes "scraper Chrome was never launched" (lazy_idle) from
+        # "was launched and died" (down). Set by any launch attempt — boot or
+        # W9's lazy ensure — so a failed launch is never mistaken for lazy.
+        self._scraper_chrome_started = False
         self._ready = False
         # Serializes restart_chrome across concurrent callers (the CDP liveness
         # loop, /restart-cdp, and the scraper retry path can all call it). Without
@@ -81,6 +92,30 @@ class BrowserPool:
             if self._scraper_chrome_proc
             else None,
         }
+
+    def scraper_chrome_state(self) -> str:
+        """``"up" | "down" | "lazy_idle"`` (W6).
+
+        Lets /health consumers distinguish a deliberately-unstarted Chrome
+        (SCRAPER_CHROME_LAZY, never launched) from a dead one — the two look
+        identical (proc is None) to ``health()``.
+        """
+        proc = self._scraper_chrome_proc
+        if proc is not None and proc.poll() is None:
+            return "up"
+        if self._scraper_chrome_started:
+            return "down"
+        return "lazy_idle"
+
+    def scraper_not_required(self) -> bool:
+        """True while the lazy Scraper Chrome has not yet been launched.
+
+        Feeds /health's lazy-aware AND: ``mcp_cdp_alive AND (scraper_cdp_alive
+        OR scraper_not_required())``. False whenever LAZY is off (today's
+        always-started behavior) or the Chrome has been launched at least once
+        (then its CDP liveness is required, as before).
+        """
+        return bool(SCRAPER_CHROME_LAZY) and self.scraper_chrome_state() == "lazy_idle"
 
     def check_cdp_liveness(self) -> dict:
         """Actually probe CDP endpoints via HTTP (process alive != CDP responsive).
@@ -286,6 +321,7 @@ class BrowserPool:
         # once callers migrate to /navigate (which launches its own ephemeral
         # browsers and does not need this persistent Chrome). Leave running for
         # now. See docs/browser-service-rework-plan.md.
+        self._scraper_chrome_started = True  # any attempt: down, never lazy_idle
         if not self._xvfb_proc:
             errors.append("Skipping Scraper Chrome — Xvfb not running")
             return

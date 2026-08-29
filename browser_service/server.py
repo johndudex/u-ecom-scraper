@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import functools  # F1: run_in_executor takes no kwargs — bind via partial
@@ -155,6 +156,215 @@ def _backpressure(
         content=content,
         headers={"Retry-After": str(derived)},
     )
+
+
+# ── W6/W7: /health truth — cached liveness, outcome counters, gauges ─────
+# /health dispatches NOTHING: the 15s liveness loop owns the CDP probe and
+# publishes each snapshot here; /health reads it synchronously. A per-request
+# probe dispatch on a busy executor is what made /health blind by construction
+# (dispatch on a saturated pool never ran). Warmed once in lifespan so the
+# boot window isn't no_data.
+_CDP_LIVENESS_CACHE: dict = {}
+# cloak binary info is static for the life of the container — computed once at
+# startup (off the loop; the import + binary_info() call are not µs-cheap and
+# used to run per /health request on the event loop).
+_CLOAK_INFO_CACHE: dict = {}
+
+# Rolling /navigate outcome window (W6 ephemeral-path truth + W7 counters).
+# TIME-bounded, not count-bounded: at prod's 30-180s/page cadence a count of
+# 20 outcomes spans 10-100 minutes — up to ~15+ min of total failure before it
+# would say anything, then a poisoned window flaps 503 long after the pressure
+# cleared. 300s is one pressure window.
+NAV_WINDOW_S = 300.0
+NAV_WINDOW_MIN_SAMPLES = 3
+# outcome ∈ {ok, fail, throttled, crash, resource}; "resource" (launch-failure
+# class: Errno 11 / OOM) also counts as fail in the rate. "throttled" (429
+# backpressure) is EXCLUDED from the fail rate — 429 is the system WORKING.
+_NAV_OUTCOMES: deque = deque()
+_NAV_RESOURCE_FAILURES: deque = deque()
+
+
+def _record_nav_outcome(outcome: str) -> None:
+    now = time.monotonic()
+    _NAV_OUTCOMES.append((now, outcome))
+    if outcome == "resource":
+        _NAV_RESOURCE_FAILURES.append(now)
+
+
+def _classify_nav_failure(exc_str: str) -> str:
+    """Map a /navigate catch-all exception to a counter outcome.
+
+    Resource-pressure strings (fork EAGAIN under memory pressure — the 502-
+    window root cause) are launch-failure class: they mean the CONTAINER is
+    out of air, not that the target site did anything. Kept 502 on the wire
+    but counted separately so /health can degrade on them specifically.
+    """
+    low = (exc_str or "").lower()
+    if (
+        "resource temporarily unavailable" in low
+        or "[errno 11]" in low
+        or "cannot allocate memory" in low
+    ):
+        return "resource"
+    return "fail"
+
+
+def _nav_outcome_summary() -> dict:
+    """Summarize the window for /health. Empty window → ``no_data`` (falls
+    through to the persistent-AND — never fakes "ok", never degrades on
+    silence). Degraded when fail_rate ≥ 0.5 or > 3 launch-failures in-window.
+    """
+    now = time.monotonic()
+    while _NAV_OUTCOMES and now - _NAV_OUTCOMES[0][0] > NAV_WINDOW_S:
+        _NAV_OUTCOMES.popleft()
+    while _NAV_RESOURCE_FAILURES and now - _NAV_RESOURCE_FAILURES[0] > NAV_WINDOW_S:
+        _NAV_RESOURCE_FAILURES.popleft()
+    counts = {"ok": 0, "fail": 0, "crash": 0, "resource": 0, "throttled": 0}
+    for _, outcome in _NAV_OUTCOMES:
+        if outcome in counts:
+            counts[outcome] += 1
+    total = sum(counts.values())
+    if total < NAV_WINDOW_MIN_SAMPLES:
+        return {**counts, "total": total, "state": "no_data", "fail_rate": None}
+    judged = total - counts["throttled"]  # throttled excluded from the rate
+    fail_rate = (counts["fail"] + counts["crash"] + counts["resource"]) / judged if judged else None
+    state = "degraded" if (
+        (fail_rate is not None and fail_rate >= 0.5)
+        or len(_NAV_RESOURCE_FAILURES) > 3
+    ) else "ok"
+    return {
+        **counts,
+        "total": total,
+        "state": state,
+        "fail_rate": round(fail_rate, 3) if fail_rate is not None else None,
+    }
+
+
+def _url_host(url: str) -> str:
+    """Host only — /navigate outcome logs must never carry the full
+    querystring (which can embed session keys / search terms)."""
+    try:
+        from urllib.parse import urlparse
+
+        return urlparse(url).hostname or ""
+    except (TypeError, ValueError):
+        return ""
+
+
+def _log_nav_outcome(
+    outcome: str, http_status: int, url: str, elapsed_ms: float, error_class: str = "-"
+) -> None:
+    """The single per-outcome correlation line (W7). Plain text — the operator
+    tails the Railway log UI; access logs stay OFF, so THIS is the surface."""
+    logger.info(
+        "navigate outcome=%s http=%d host=%s elapsed_ms=%d error_class=%s",
+        outcome,
+        http_status,
+        _url_host(url) or "-",
+        int(elapsed_ms),
+        error_class or "-",
+    )
+
+
+def _read_memory_gauge() -> dict:
+    """Memory gauge for /health: cgroup v2 → v1 → /proc/meminfo fallback.
+
+    Returns {current, limit, ratio, source}; keys go null when undeterminable
+    (a gauge that can't be read must never fail /health).
+    """
+    try:
+        with open("/sys/fs/cgroup/memory.current") as fh:
+            current = int(fh.read().strip())
+        with open("/sys/fs/cgroup/memory.max") as fh:
+            raw = fh.read().strip()
+        if raw != "max":
+            limit = int(raw)
+            return {
+                "current": current,
+                "limit": limit,
+                "ratio": round(current / limit, 4) if limit > 0 else None,
+                "source": "cgroup_v2",
+            }
+    except (OSError, ValueError):
+        pass
+    try:
+        with open("/sys/fs/cgroup/memory/memory.usage_in_bytes") as fh:
+            current = int(fh.read().strip())
+        with open("/sys/fs/cgroup/memory/memory.limit_in_bytes") as fh:
+            limit = int(fh.read().strip())
+        if 0 < limit <= (1 << 60):
+            return {
+                "current": current,
+                "limit": limit,
+                "ratio": round(current / limit, 4),
+                "source": "cgroup_v1",
+            }
+    except (OSError, ValueError):
+        pass
+    try:
+        with open("/proc/meminfo") as fh:
+            fields = {}
+            for line in fh:
+                k, _, v = line.partition(":")
+                fields[k.strip()] = int(v.strip().split()[0])  # kB
+            total = fields.get("MemTotal")
+            avail = fields.get("MemAvailable")
+            if total and avail is not None and total > 0:
+                used = total - avail
+                return {
+                    "current": used * 1024,
+                    "limit": total * 1024,
+                    "ratio": round(used / total, 4),
+                    "source": "meminfo",
+                }
+    except (OSError, ValueError, IndexError):
+        pass
+    return {"current": None, "limit": None, "ratio": None, "source": None}
+
+
+def _count_chrome_processes() -> int:
+    """Chrome process count via /proc (no pgrep subprocess, no dispatch)."""
+    n = 0
+    try:
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{name}/comm", "rb") as fh:
+                    if fh.read().decode("utf-8", "replace").strip().startswith("chrome"):
+                        n += 1
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return n
+
+
+def _health_gauges(deadline: float) -> dict:
+    """Inline µs-scale gauges under a hard deadline (W6): any gauge that
+    can't make the ~2s budget degrades to null — /health is always fast and
+    never fails because its own instrumentation failed."""
+    gauges = {
+        "memory": None,
+        "fd_count": None,
+        "chrome_processes": None,
+        "navigate_active_pids": len(NAVIGATE_ACTIVE_PIDS),
+        "scrape_busy": sum(1 for dl in SCRAPE_IN_FLIGHT.values() if dl > time.monotonic()),
+        "misc_queue": MISC_EXECUTOR._work_queue.qsize(),
+        "restart_queue": RESTART_EXECUTOR._work_queue.qsize(),
+    }
+    try:
+        if time.monotonic() < deadline:
+            gauges["memory"] = _read_memory_gauge()
+        if time.monotonic() < deadline:
+            gauges["fd_count"] = len(os.listdir("/proc/self/fd"))
+        if time.monotonic() < deadline:
+            gauges["chrome_processes"] = _count_chrome_processes()
+    except (OSError, ValueError, TypeError, RuntimeError, AttributeError):
+        # a gauge bug must degrade /health's numbers, never the endpoint itself
+        logger.exception("health: gauge computation failed (gauges degraded to null)")
+    return gauges
+
 # PIDs of chrome processes belonging to in-flight /navigate calls. The orphan
 # killer (every CLEANUP_INTERVAL) must not SIGKILL these. Timestamped
 # (monotonic) so the gate can distinguish a live browser from a leaked entry —
@@ -355,33 +565,49 @@ async def _periodic_cdp_liveness():
     consecutive failures we automatically restart the affected Chrome instance.
     """
     failures = {"mcp": 0, "scraper": 0}
+    # W7: chatter downgrade — the DOWN warning fires on state CHANGE only, not
+    # every 15s of a sustained outage (the escalation ERROR + the recovery
+    # INFO bracket the incident; a repeated WARNING every interval just buried
+    # the signal — 81 "CDP liveness DOWN" events, zero real crashes in 111 jobs).
+    _was_alive = {"mcp": True, "scraper": True}
     while True:
         await asyncio.sleep(CDP_LIVENESS_INTERVAL)
         try:
             liveness = await asyncio.get_event_loop().run_in_executor(
                 MISC_EXECUTOR, browser_pool.check_cdp_liveness
             )
+            # W6: publish for /health (which dispatches NOTHING).
+            _CDP_LIVENESS_CACHE.clear()
+            _CDP_LIVENESS_CACHE.update(liveness)
 
             for label, alive, key in (
                 ("mcp", liveness.get("mcp_cdp_alive"), "mcp"),
                 ("scraper", liveness.get("scraper_cdp_alive"), "scraper"),
             ):
+                # W7: a deliberately-unstarted lazy Scraper Chrome is not an
+                # incident — never count failures or emit DOWN chatter for it.
+                if key == "scraper" and browser_pool.scraper_not_required():
+                    failures[key] = 0
+                    _was_alive[key] = True
+                    continue
                 if alive:
-                    if failures[key] > 0:
+                    if not _was_alive[key]:
+                        _was_alive[key] = True
                         logger.info(
-                            "CDP liveness: %s recovered after %d failed probes",
+                            "CDP liveness: %s RECOVERED after %d failed probes",
                             label,
                             failures[key],
                         )
                     failures[key] = 0
                 else:
                     failures[key] += 1
-                    logger.warning(
-                        "CDP liveness: %s DOWN (consecutive failures=%d/%d)",
-                        label,
-                        failures[key],
-                        CDP_MAX_CONSECUTIVE_FAILURES,
-                    )
+                    if _was_alive[key]:
+                        _was_alive[key] = False
+                        logger.warning(
+                            "CDP liveness: %s went DOWN (auto-restart after %d consecutive failures)",
+                            label,
+                            CDP_MAX_CONSECUTIVE_FAILURES,
+                        )
                     if failures[key] >= CDP_MAX_CONSECUTIVE_FAILURES:
                         logger.error(
                             "CDP liveness: auto-restarting %s Chrome after %d consecutive failures",
@@ -755,6 +981,16 @@ async def lifespan(app: FastAPI):
 
     await _start_mcp_process()
 
+    # W6 warm-ups: /health dispatches nothing per-request, so both caches are
+    # filled here once. cloak info is static for the container's life; the
+    # first liveness snapshot saves /health from a 15s no_data boot window.
+    global _CLOAK_INFO_CACHE
+    loop = asyncio.get_event_loop()
+    _CLOAK_INFO_CACHE = await loop.run_in_executor(MISC_EXECUTOR, _cloak_info)
+    _CDP_LIVENESS_CACHE.update(
+        await loop.run_in_executor(HEALTH_EXECUTOR, browser_pool.check_cdp_liveness)
+    )
+
     cleanup_task = asyncio.create_task(_periodic_cleanup())
     liveness_task = asyncio.create_task(_periodic_cdp_liveness())
     try:
@@ -811,19 +1047,34 @@ def _cloak_info() -> dict:
 
 @app.get("/health")
 async def health():
+    # W6: this handler dispatches NOTHING and blocks on nothing slow — every
+    # value is a cached snapshot or a µs-scale inline read under a ~2s deadline
+    # (compose `curl -f` timeout is 10s, Django's probe 5s; a /health that can
+    # be starved by the work it reports on is blind by construction).
+    t0 = time.monotonic()
+    deadline = t0 + 2.0
     h = browser_pool.health()
-    liveness = await asyncio.get_event_loop().run_in_executor(
-        HEALTH_EXECUTOR, browser_pool.check_cdp_liveness
-    )
+    liveness = dict(_CDP_LIVENESS_CACHE)
     config = get_proxy_config()
     dc_available = bool(config.build_proxy_url("datacenter"))
     res_available = bool(config.build_proxy_url("residential"))
     # Check MCP process is alive (not just Chrome CDP port).
     mcp_pid = mcp_process.pid if mcp_process and mcp_process.poll() is None else None
     mcp_process_alive = mcp_pid is not None
-    # Healthy requires ready + at least one CDP endpoint responding + MCP alive.
-    cdp_ok = liveness.get("mcp_cdp_alive") or liveness.get("scraper_cdp_alive")
-    status = "ok" if (h["ready"] and cdp_ok and mcp_process_alive) else "degraded"
+    # W6 lazy-aware AND (was OR): both CDP endpoints must respond, EXCEPT a
+    # deliberately-unstarted lazy Scraper Chrome is not a failure. Without the
+    # lazy escape hatch, SCRAPER_CHROME_LAZY=1 + strict AND = 503 from boot →
+    # the compose healthcheck fails → dependents never start.
+    scraper_ok = bool(liveness.get("scraper_cdp_alive"))
+    cdp_ok = bool(liveness.get("mcp_cdp_alive")) and (
+        scraper_ok or browser_pool.scraper_not_required()
+    )
+    # Ephemeral-path truth: recent /navigate outcomes. no_data (quiet window)
+    # falls through to the persistent-AND — only an actual bad window degrades.
+    nav_recent = _nav_outcome_summary()
+    status = "ok" if (
+        h["ready"] and cdp_ok and mcp_process_alive and nav_recent.get("state") != "degraded"
+    ) else "degraded"
     # /navigate slot accounting (independent of PROBE_LOCK / /scrape)
     nav_busy = min(_navigate_in_flight, NAVIGATE_MAX_CONCURRENT)
     nav_queued = max(0, _navigate_in_flight - NAVIGATE_MAX_CONCURRENT)
@@ -832,15 +1083,19 @@ async def health():
             "status": status,
             **h,
             **liveness,
+            "scraper_chrome_state": browser_pool.scraper_chrome_state(),
             "mcp_pid": mcp_pid,
             "mcp_process_alive": mcp_process_alive,
             "proxy_datacenter": "available" if dc_available else "not configured",
             "proxy_residential": "available" if res_available else "not configured",
-            "cloak": _cloak_info(),
+            "cloak": _CLOAK_INFO_CACHE,
+            "navigate_recent": nav_recent,
+            "gauges": _health_gauges(deadline),
             "navigate_slots_busy": nav_busy,
             "navigate_slots_total": NAVIGATE_MAX_CONCURRENT,
             "navigate_queued": nav_queued,
             "uptime_seconds": time.time() - PROCESS_START,
+            "health_elapsed_ms": round((time.monotonic() - t0) * 1000, 1),
         },
         status_code=200 if status == "ok" else 503,
     )
@@ -1566,6 +1821,7 @@ async def navigate(request: NavigateRequest):
             },
         )
 
+    start = time.monotonic()
     # W4 memory gate: refuse the fork BEFORE the browser launch when the
     # cgroup is already near its ceiling — Errno 11 fork failures under
     # memory pressure were the root cause of the prod 502 windows, and a
@@ -1578,6 +1834,8 @@ async def navigate(request: NavigateRequest):
                 "navigate: memory gate tripped (ratio=%.2f ≥ %.2f) for %s",
                 mem_ratio, NAVIGATE_MEMORY_GATE_RATIO, request.url[:100],
             )
+            _record_nav_outcome("throttled")
+            _log_nav_outcome("throttled", 429, request.url, (time.monotonic() - start) * 1000, "memory_pressure")
             return _backpressure(
                 429,
                 (
@@ -1591,13 +1849,14 @@ async def navigate(request: NavigateRequest):
 
     # Queue-full backpressure (active + queued)
     if _navigate_in_flight >= NAVIGATE_MAX_CONCURRENT + NAVIGATE_MAX_QUEUE:
+        _record_nav_outcome("throttled")
+        _log_nav_outcome("throttled", 429, request.url, (time.monotonic() - start) * 1000)
         return _backpressure(
             429, "navigate concurrency limit reached", 15,
             navigate_in_flight=_navigate_in_flight,
         )
 
     _navigate_in_flight += 1
-    start = time.monotonic()
     try:
         async with NAVIGATE_SEMAPHORE:
             loop = asyncio.get_event_loop()
@@ -1621,6 +1880,8 @@ async def navigate(request: NavigateRequest):
                     timeout=request.timeout + 30,
                 )
                 result["elapsed"] = round(time.monotonic() - start, 2)
+                _record_nav_outcome("ok")
+                _log_nav_outcome("ok", 200, request.url, result["elapsed"] * 1000)
                 return JSONResponse(content=result)
             except _ChromeDeathError as exc:
                 logger.warning(
@@ -1628,6 +1889,8 @@ async def navigate(request: NavigateRequest):
                     request.url[:100],
                     str(exc)[:200],
                 )
+                _record_nav_outcome("crash")
+                _log_nav_outcome("crash", 503, request.url, (time.monotonic() - start) * 1000, "chrome_crash")
                 return _backpressure(
                     503,
                     "browser crash during navigate",
@@ -1637,6 +1900,8 @@ async def navigate(request: NavigateRequest):
                 )
             except asyncio.TimeoutError:
                 logger.warning("navigate: timed out for %s", request.url[:200])
+                _record_nav_outcome("fail")
+                _log_nav_outcome("fail", 408, request.url, (time.monotonic() - start) * 1000)
                 return JSONResponse(
                     status_code=408,
                     content={
@@ -1651,6 +1916,8 @@ async def navigate(request: NavigateRequest):
                 from .scraper_runner import _is_chrome_death
 
                 if _is_chrome_death(str(exc)):
+                    _record_nav_outcome("crash")
+                    _log_nav_outcome("crash", 503, request.url, (time.monotonic() - start) * 1000, "chrome_crash")
                     return _backpressure(
                         503,
                         "browser crash during navigate",
@@ -1658,12 +1925,21 @@ async def navigate(request: NavigateRequest):
                         elapsed=round(time.monotonic() - start, 2),
                         error_class="chrome_crash",
                     )
+                # W6: launch-failure class (fork EAGAIN / OOM) counts separately —
+                # it means the container is out of air, not that the site won.
+                _outcome = _classify_nav_failure(str(exc))
+                _record_nav_outcome(_outcome)
+                _log_nav_outcome(
+                    _outcome, 502, request.url, (time.monotonic() - start) * 1000,
+                    "resource" if _outcome == "resource" else "-",
+                )
                 return JSONResponse(
                     status_code=502,
                     content={
                         "success": False,
                         "error": str(exc)[:500],
                         "elapsed": round(time.monotonic() - start, 2),
+                        **({"error_class": "resource"} if _outcome == "resource" else {}),
                     },
                 )
     finally:

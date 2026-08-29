@@ -2092,6 +2092,13 @@ def _check_browser_service():
                     "scraper_chrome": data.get("scraper_chrome_running"),
                     "xvfb": data.get("xvfb_running"),
                     "mcp_process": data.get("mcp_process_alive"),
+                    # W6: WHY is it degraded — lazy-aware scraper state, the
+                    # recent /navigate outcome window, and the memory gauge.
+                    "scraper_chrome_state": data.get("scraper_chrome_state"),
+                    "navigate_recent": data.get("navigate_recent"),
+                    "memory": data.get("gauges", {}).get("memory")
+                    if isinstance(data.get("gauges"), dict)
+                    else None,
                 },
                 "cdp": {
                     "mcp_port": data.get("mcp_cdp_port"),
