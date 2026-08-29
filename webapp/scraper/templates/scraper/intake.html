@@ -602,6 +602,10 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
         <textarea id="rerun-prompt" placeholder="Optional — e.g. the price field is dropping the £ symbol, keep it; also capture the posted date and the apply link."></textarea>
         <div class="rerun-actions">
           <button class="btn btn-primary" id="rerun-btn"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg> <span id="rerun-btn-label">Re-run as-is</span></button>
+          <label class="hint" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer" title="Ignore all cached analysis — wipe prior artifacts and rebuild site analysis, field mapping, code, and testing from scratch">
+            <input type="checkbox" id="rerun-full">
+            Full rebuild (ignore cached analysis)
+          </label>
           <span class="hint" id="rerun-hint">No notes yet — this will re-run using the schema and navigation you've set below.</span>
         </div>
       </div>
@@ -2029,6 +2033,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     var prompt = X('#rerun-prompt').value.trim();
     var fd = new FormData();
     if(prompt) fd.append('prompt', prompt);
+    if(X('#rerun-full') && X('#rerun-full').checked) fd.append('force_full', '1');
     // Send the edited config from the dashboard's cfg panel so the new job
     // picks up the user's field/nav edits (without this, the new job would
     // copy the OLD job's config and silently drop the edits).

@@ -97,8 +97,12 @@ except Exception:
     soft_time_limit=_RUN_TASK_SOFT_TIME_LIMIT,
     time_limit=_RUN_TASK_TIME_LIMIT,
 )
-def run_scrape_task(self, job_id: int, rescrape: bool = False) -> None:
-    """Celery entry-point: execute the full scrape graph for *job_id*."""
+def run_scrape_task(self, job_id: int, rescrape: bool = False, force_full: bool = False) -> None:
+    """Celery entry-point: execute the full scrape graph for *job_id*.
+
+    ``force_full`` (Full re-run button) implies rescrape semantics AND wipes
+    the stale workspace + analysis archive so every phase regenerates.
+    """
     job = ScrapeJob.objects.get(pk=job_id)
 
     # Record this task's id so external monitors (e.g. the regression monitor)
@@ -137,7 +141,7 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False) -> None:
         )
 
     try:
-        _run_graph_job(job, rescrape=rescrape)
+        _run_graph_job(job, rescrape=rescrape, force_full=force_full)
     except Exception as exc:
         logger.exception("Scrape job %d failed: %s", job_id, exc)
         # F4: the original failure is often a dead DB connection (postgres
@@ -225,7 +229,7 @@ def _emit_running_transition(job: ScrapeJob) -> None:
         logger.warning("job %s: inprogress emit: %s", job.id, exc)
 
 
-def _run_graph_job(job: ScrapeJob, rescrape: bool = False) -> None:
+def _run_graph_job(job: ScrapeJob, rescrape: bool = False, force_full: bool = False) -> None:
     """Build the graph, stream events, and handle interrupts."""
     _seed_pipeline_steps(job)
     service = LangGraphService()
@@ -246,6 +250,11 @@ def _run_graph_job(job: ScrapeJob, rescrape: bool = False) -> None:
     initial_state = _build_initial_state(job)
     if rescrape:
         initial_state["rescrape"] = True
+    if force_full:
+        # Implies rescrape (check_tracker's force_full arm lives inside the
+        # rescrape gate) + the archive wipe / no-selective-reuse behavior.
+        initial_state["rescrape"] = True
+        initial_state["force_full"] = True
 
     # ── Attach RedisLogHandler for system log streaming ────────────────
     from .log_handler import RedisLogHandler

@@ -140,14 +140,31 @@ def check_tracker(state: ScrapeState) -> Command:
     # Instead of wiping + re-running everything, compute a config diff vs the
     # prior completed job for this URL and set selective skip flags. The
     # existing check_accessibility cascade + setup_workspace preserve-set
-    # handle the rest. DON'T call _clean_workspace — preserve the analysis
-    # archive in scrapers/{slug}/analysis/ for setup_workspace to re-hydrate.
+    # handle the rest. DON'T call _clean_workspace (the force_full arm below
+    # is the ONE exception) — preserve the analysis archive in
+    # scrapers/{slug}/analysis/ for setup_workspace to re-hydrate.
     if rescrape and site.status in ("complete", "in_progress"):
-        skip_site, skip_product, skip_code = _compute_rescrape_skip_flags(state, url)
-        logger.info(
-            "check_tracker: selective rescrape for '%s' → skip_site=%s skip_product=%s skip_code=%s",
-            slug, skip_site, skip_product, skip_code,
-        )
+        if state.get("force_full"):
+            # Full re-run (explicit user intent from the Full re-run button):
+            # NO selective reuse, NO archive re-hydration. Wipe the workspace
+            # AND the analysis archive (output_*.json history is kept) so a
+            # killed/poisoned prior run can't re-inject stale artifacts
+            # (job-12 class), then regenerate every phase. Note the flags must
+            # be forced False HERE — _compute_rescrape_skip_flags would still
+            # return True for a completed twin and setup_workspace re-hydrates
+            # anything a True flag names.
+            _clean_workspace(root, slug)
+            skip_site = skip_product = skip_code = False
+            logger.info(
+                "check_tracker: FULL re-run for '%s' — workspace + analysis "
+                "archive wiped, every phase regenerates", slug,
+            )
+        else:
+            skip_site, skip_product, skip_code = _compute_rescrape_skip_flags(state, url)
+            logger.info(
+                "check_tracker: selective rescrape for '%s' → skip_site=%s skip_product=%s skip_code=%s",
+                slug, skip_site, skip_product, skip_code,
+            )
         if site.status != "in_progress":
             site.status = "in_progress"
             site.save(update_fields=["status"])

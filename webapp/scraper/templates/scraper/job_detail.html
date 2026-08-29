@@ -44,6 +44,10 @@
             <a href="{% url 'job_cancel' job_id=job.id %}" class="px-3 py-1 text-xs font-medium text-danger border border-danger/30 rounded-md hover:bg-danger/10 transition-colors">Cancel</a>
             {% elif is_terminal %}
             <a href="{% url 'job_restart' job_id=job.id %}" class="px-3 py-1 text-xs font-medium text-ink-secondary border border-line-strong rounded-md hover:bg-raised transition-colors">Re-run</a>
+            <!-- Full re-run: bypasses the selective rescrape diff — wipes the
+                 stale workspace + analysis archive so EVERY phase regenerates
+                 (a plain Re-run reuses prior analysis when a completed job exists). -->
+            <a href="{% url 'job_restart' job_id=job.id %}?full=1" class="px-3 py-1 text-xs font-medium text-ink-secondary border border-line-strong rounded-md hover:bg-raised transition-colors" title="Ignore all cached analysis — rebuild site analysis, field mapping, code, and testing from scratch">Full re-run</a>
             {% endif %}
         </div>
     </div>

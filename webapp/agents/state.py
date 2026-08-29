@@ -28,6 +28,10 @@ class ScrapeState(TypedDict, total=False):
     currency: str
     sample_only: bool
     rescrape: bool
+    # Full re-run (intake/job_detail button): bypass the selective rescrape diff
+    # entirely — wipe the stale workspace + analysis archive and regenerate EVERY
+    # phase, even when a prior completed job would normally let stages be skipped.
+    force_full: bool
     # Intake-UI jobs skip all human-approval gates (run unattended).
     skip_approvals: bool
     # Intake-UI schema knobs. target_fields ENFORCES the output schema (the

@@ -642,6 +642,13 @@ def job_restart(request, job_id):
         # (job_detail button) sends nothing → falls back to old job's config.
         rerun_prompt = request.POST.get("prompt", "").strip() if request.method == "POST" else ""
 
+        # Full re-run (the "Full re-run" button/link): bypass the selective
+        # rescrape diff — wipe the stale workspace + analysis archive and
+        # regenerate EVERY phase, even when a prior completed job exists.
+        force_full = (
+            request.POST.get("force_full") == "1" or request.GET.get("full") == "1"
+        )
+
         def _post_or_old(field, old_val):
             v = request.POST.get(field)
             return v if v is not None else old_val
@@ -672,7 +679,7 @@ def job_restart(request, job_id):
 
         from .tasks import run_scrape_task
 
-        task = run_scrape_task.delay(new_job.id, rescrape=True)
+        task = run_scrape_task.delay(new_job.id, rescrape=True, force_full=force_full)
         new_job.celery_task_id = task.id
         new_job.save(update_fields=["celery_task_id"])
         if is_ajax:
