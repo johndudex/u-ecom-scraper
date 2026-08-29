@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import functools  # F1: run_in_executor takes no kwargs — bind via partial
 
@@ -58,6 +59,102 @@ NAVIGATE_MAX_QUEUE = int(os.environ.get("NAVIGATE_MAX_QUEUE", "4"))
 MAX_NAVIGATE_HTML = 2_000_000
 MAX_NAVIGATE_ACTIONS = 20
 NAVIGATE_SEMAPHORE = asyncio.Semaphore(NAVIGATE_MAX_CONCURRENT)
+
+# ── W4: dedicated executors ──────────────────────────────────────────────
+# The default executor shared ONE pool between /navigate (multi-minute
+# browser launches), /scrape (multi-minute subprocesses), /health's liveness
+# probe, and the restart path. Under load, navigate/scrape work filled the
+# pool and /health's probe NEVER RAN (dispatch on a saturated executor) —
+# the blind-by-construction failure mode from the 502-window post-mortem.
+# POOL INVARIANT: no endpoint may block on a call that itself runs on the
+# same pool. The live instance is scraper_runner's crash-retry path POSTing
+# /restart-cdp from inside a SCRAPE worker: /restart-cdp must therefore
+# never share a pool with /scrape (it gets its own single thread; a restart
+# is rare and serialized by browser_pool._restart_lock anyway).
+NAVIGATE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=NAVIGATE_MAX_CONCURRENT, thread_name_prefix="navigate"
+)
+# W4 admission control: /scrape is admit-or-429 (no queueing — a queued
+# caller's timeout clock lies because it starts at admission, not arrival).
+SCRAPE_MAX_CONCURRENT = int(os.environ.get("SCRAPE_MAX_CONCURRENT", "2"))
+SCRAPE_MAX_QUEUE = 0
+SCRAPE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=SCRAPE_MAX_CONCURRENT, thread_name_prefix="scrape"
+)
+MISC_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="misc")
+RESTART_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="restart")
+# Own slot so /health can NEVER be starved by probe/render work. W6 removes
+# this dispatch entirely (cached liveness); until then it stays truthful.
+HEALTH_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="health")
+
+# W4 /navigate pre-launch memory gate: refuse the fork when the cgroup is
+# already near its ceiling — Errno 11 (fork EAGAIN) under pressure was the
+# root cause of the prod 502 windows. Falls OPEN when the cgroup files are
+# unreadable (non-Linux cgroup v2 layouts); set ≤0 to disable.
+NAVIGATE_MEMORY_GATE_RATIO = float(os.environ.get("NAVIGATE_MEMORY_GATE_RATIO", "0.85"))
+
+
+def _cgroup_memory_ratio() -> float | None:
+    """Current cgroup memory usage / limit, or None when undeterminable.
+
+    Reads cgroup v2 first (/sys/fs/cgroup/memory.{current,max}), then v1.
+    ``max``/unlimited limits yield None (no meaningful ratio).
+    """
+    try:
+        with open("/sys/fs/cgroup/memory.current") as fh:
+            current = int(fh.read().strip())
+        with open("/sys/fs/cgroup/memory.max") as fh:
+            raw = fh.read().strip()
+        if raw == "max":
+            return None
+        limit = int(raw)
+        return (current / limit) if limit > 0 else None
+    except (OSError, ValueError):
+        pass
+    try:
+        with open("/sys/fs/cgroup/memory/memory.usage_in_bytes") as fh:
+            current = int(fh.read().strip())
+        with open("/sys/fs/cgroup/memory/memory.limit_in_bytes") as fh:
+            limit = int(fh.read().strip())
+        # v1 reports a huge sentinel for "no limit"
+        if limit <= 0 or limit > (1 << 60):
+            return None
+        return current / limit
+    except (OSError, ValueError):
+        return None
+
+
+def _derived_retry_after(base: float | None = None) -> int:
+    """Backpressure retry hint, clamped to [15, 60]s.
+
+    The old hardcoded ``retry_after: 5`` manufactured retry storms: five
+    seconds is inside the window where the memory pressure that caused the
+    rejection is still building, so every client came back at the worst
+    possible moment.
+    """
+    value = 15.0 if base is None else float(base)
+    return int(min(max(value, 15.0), 60.0))
+
+
+def _backpressure(
+    status_code: int,
+    error: str,
+    retry_after: float | None = None,
+    **extra,
+) -> JSONResponse:
+    """429/503 rejection with the retry hint in BOTH header and body.
+
+    Older clients read only the body's ``retry_after``; the W8 template (and
+    anything HTTP-standards-compliant) reads only the header. Emit both.
+    """
+    derived = _derived_retry_after(retry_after)
+    content = {"success": False, "error": error, "retry_after": derived}
+    content.update(extra)
+    return JSONResponse(
+        status_code=status_code,
+        content=content,
+        headers={"Retry-After": str(derived)},
+    )
 # PIDs of chrome processes belonging to in-flight /navigate calls. The orphan
 # killer (every CLEANUP_INTERVAL) must not SIGKILL these. Timestamped
 # (monotonic) so the gate can distinguish a live browser from a leaked entry —
@@ -262,7 +359,7 @@ async def _periodic_cdp_liveness():
         await asyncio.sleep(CDP_LIVENESS_INTERVAL)
         try:
             liveness = await asyncio.get_event_loop().run_in_executor(
-                None, browser_pool.check_cdp_liveness
+                MISC_EXECUTOR, browser_pool.check_cdp_liveness
             )
 
             for label, alive, key in (
@@ -293,7 +390,7 @@ async def _periodic_cdp_liveness():
                         )
                         try:
                             res = await asyncio.get_event_loop().run_in_executor(
-                                None, browser_pool.restart_chrome, label
+                                RESTART_EXECUTOR, browser_pool.restart_chrome, label
                             )
                             logger.info("CDP auto-restart %s result: %s", label, res)
                             # For MCP Chrome, also restart the Playwright MCP process
@@ -326,7 +423,7 @@ async def _periodic_cdp_liveness():
             logger.exception("CDP liveness loop error")
 
 
-async def _cleanup_chrome_artifacts():
+def _cleanup_chrome_artifacts_sync():
     # F1: snapshot + kill atomically under the restart lock so a Chrome that
     # restarts mid-cycle can't have its fresh (un-allowlisted) PID killed.
     # Non-blocking: a restart in progress means the tree is being torn down
@@ -347,6 +444,14 @@ async def _cleanup_chrome_artifacts():
             killed,
             cleaned,
         )
+
+
+async def _cleanup_chrome_artifacts():
+    # W5: this body used to run directly ON the event loop (async def, zero
+    # awaits) — a slow profile-cache rmtree blocked every endpoint for its
+    # whole duration. It now occupies one MISC worker instead.
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(MISC_EXECUTOR, _cleanup_chrome_artifacts_sync)
 
 
 def _proc_children(pid: int) -> set[int]:
@@ -455,6 +560,11 @@ def _kill_orphan_chrome() -> int:
 
 def _clean_chrome_profile_cache() -> int:
     cleaned = 0
+    # W5: bound the whole sweep — a profile dir packed with Service Worker
+    # storage used to rmtree for minutes (on the executor since the sync
+    # extraction, on the LOOP before it). Whatever is left is caught next
+    # cycle; this runs every CLEANUP_INTERVAL anyway.
+    deadline = time.monotonic() + 20.0
     cache_dirs = [
         "Default/Cache",
         "Default/Code Cache",
@@ -464,6 +574,12 @@ def _clean_chrome_profile_cache() -> int:
     ]
     for profile_root in glob.glob("/tmp/chrome-profiles/*/"):
         for cache_dir in cache_dirs:
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "cleanup: profile cache sweep hit its 20s budget (%d dirs cleaned)",
+                    cleaned,
+                )
+                return cleaned
             full_path = os.path.join(profile_root, cache_dir)
             if os.path.isdir(full_path):
                 try:
@@ -697,7 +813,7 @@ def _cloak_info() -> dict:
 async def health():
     h = browser_pool.health()
     liveness = await asyncio.get_event_loop().run_in_executor(
-        None, browser_pool.check_cdp_liveness
+        HEALTH_EXECUTOR, browser_pool.check_cdp_liveness
     )
     config = get_proxy_config()
     dc_available = bool(config.build_proxy_url("datacenter"))
@@ -742,7 +858,7 @@ async def restart_cdp(request: RestartCdpRequest):
     """
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(
-        None, browser_pool.restart_chrome, request.label
+        RESTART_EXECUTOR, browser_pool.restart_chrome, request.label
     )
     if request.label in ("mcp", "all") and not result.get("errors"):
         await asyncio.sleep(2)
@@ -760,7 +876,7 @@ async def probe(request: ProbeRequest):
             loop = asyncio.get_event_loop()
             result = await asyncio.wait_for(
                 loop.run_in_executor(
-                    None,
+                    MISC_EXECUTOR,
                     lambda: run_probe(
                         url=request.url,
                         render_js=request.render_js,
@@ -853,7 +969,7 @@ async def probe_single(request: SingleProbeRequest):
     try:
         loop = asyncio.get_event_loop()
         start = time.monotonic()
-        result = await loop.run_in_executor(None, method_map[method])
+        result = await loop.run_in_executor(MISC_EXECUTOR, method_map[method])
         elapsed = round(time.monotonic() - start, 2)
 
         if result is None:
@@ -1036,7 +1152,7 @@ async def render(request: RenderRequest):
             loop = asyncio.get_event_loop()
             result = await asyncio.wait_for(
                 loop.run_in_executor(
-                    None,
+                    MISC_EXECUTOR,
                     lambda: render_page(
                         url=request.url,
                         timeout=request.timeout,
@@ -1079,6 +1195,25 @@ async def scrape(request: ScrapeRequest):
         getattr(request, "args", [])[:5],
         len(request.scraper_source or ""),
     )
+    # W4 admission control: admit-or-429 (SCRAPE_MAX_QUEUE=0 — a queued
+    # caller's timeout clock starts at admission, not arrival, so queueing
+    # lies). Occupancy is read from SCRAPE_IN_FLIGHT: entries are popped by
+    # _run_scrape_guarded only when the child is REAPED — the executor thread
+    # outlives this response on wait_for timeout, so a response-lifetime
+    # counter would under-count and hide real pool saturation.
+    _now = time.monotonic()
+    scrape_busy = sum(1 for dl in SCRAPE_IN_FLIGHT.values() if dl > _now)
+    if scrape_busy >= SCRAPE_MAX_CONCURRENT + SCRAPE_MAX_QUEUE:
+        logger.warning(
+            "/scrape rejected (busy=%d/%d) — backpressure",
+            scrape_busy, SCRAPE_MAX_CONCURRENT,
+        )
+        return _backpressure(
+            429,
+            f"scrape concurrency limit reached ({scrape_busy}/{SCRAPE_MAX_CONCURRENT})",
+            15,
+            busy=scrape_busy,
+        )
     # Stateless staging: write the caller-supplied source to a private /tmp dir
     # (one per call — no cross-call collision), run it, capture output CONTENT,
     # then clean up. No shared filesystem, no File Master access.
@@ -1126,7 +1261,7 @@ async def scrape(request: ScrapeRequest):
             )
             result = await asyncio.wait_for(
                 loop.run_in_executor(
-                    None,
+                    SCRAPE_EXECUTOR,
                     functools.partial(
                         _run_scrape_guarded,
                         rid=rid,
@@ -1431,15 +1566,34 @@ async def navigate(request: NavigateRequest):
             },
         )
 
+    # W4 memory gate: refuse the fork BEFORE the browser launch when the
+    # cgroup is already near its ceiling — Errno 11 fork failures under
+    # memory pressure were the root cause of the prod 502 windows, and a
+    # rejected launch is far cheaper than a half-launched browser. Falls
+    # open when the ratio can't be read (None).
+    if NAVIGATE_MEMORY_GATE_RATIO > 0:
+        mem_ratio = _cgroup_memory_ratio()
+        if mem_ratio is not None and mem_ratio >= NAVIGATE_MEMORY_GATE_RATIO:
+            logger.warning(
+                "navigate: memory gate tripped (ratio=%.2f ≥ %.2f) for %s",
+                mem_ratio, NAVIGATE_MEMORY_GATE_RATIO, request.url[:100],
+            )
+            return _backpressure(
+                429,
+                (
+                    f"memory pressure ({mem_ratio:.0%} of cgroup limit) — "
+                    "refusing new browser launch"
+                ),
+                30,
+                error_class="memory_pressure",
+                mem_ratio=round(mem_ratio, 3),
+            )
+
     # Queue-full backpressure (active + queued)
     if _navigate_in_flight >= NAVIGATE_MAX_CONCURRENT + NAVIGATE_MAX_QUEUE:
-        return JSONResponse(
-            status_code=429,
-            content={
-                "success": False,
-                "error": "navigate concurrency limit reached",
-                "retry_after": 5,
-            },
+        return _backpressure(
+            429, "navigate concurrency limit reached", 15,
+            navigate_in_flight=_navigate_in_flight,
         )
 
     _navigate_in_flight += 1
@@ -1450,7 +1604,7 @@ async def navigate(request: NavigateRequest):
             try:
                 result = await asyncio.wait_for(
                     loop.run_in_executor(
-                        None,
+                        NAVIGATE_EXECUTOR,
                         _run_navigate_sync,
                         request.url,
                         request.actions,
@@ -1474,14 +1628,12 @@ async def navigate(request: NavigateRequest):
                     request.url[:100],
                     str(exc)[:200],
                 )
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "success": False,
-                        "error": "browser crash during navigate",
-                        "retry_after": 5,
-                        "elapsed": round(time.monotonic() - start, 2),
-                    },
+                return _backpressure(
+                    503,
+                    "browser crash during navigate",
+                    15,
+                    elapsed=round(time.monotonic() - start, 2),
+                    error_class="chrome_crash",
                 )
             except asyncio.TimeoutError:
                 logger.warning("navigate: timed out for %s", request.url[:200])
@@ -1499,14 +1651,12 @@ async def navigate(request: NavigateRequest):
                 from .scraper_runner import _is_chrome_death
 
                 if _is_chrome_death(str(exc)):
-                    return JSONResponse(
-                        status_code=503,
-                        content={
-                            "success": False,
-                            "error": "browser crash during navigate",
-                            "retry_after": 5,
-                            "elapsed": round(time.monotonic() - start, 2),
-                        },
+                    return _backpressure(
+                        503,
+                        "browser crash during navigate",
+                        15,
+                        elapsed=round(time.monotonic() - start, 2),
+                        error_class="chrome_crash",
                     )
                 return JSONResponse(
                     status_code=502,
