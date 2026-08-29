@@ -199,15 +199,17 @@ def get_shell_tools(
             needs_browser = _scraper_needs_browser(full_path)
 
         # Floor the timeout for browser-based scrapers. code_tester's LLM often
-        # passes a tight timeout (or the browser_service /scrape 120s default
-        # applies), but JS-heavy sites (lw.com Coveo, ~15s/page on networkidle)
-        # need ~160s+ even for a small sample — under-budgeting SIGKILLs the run
-        # mid-extraction (exit -1) and triggers a false strategy cascade
-        # (playwright→internal_api). 240s sits within /scrape's 300s cap and
-        # preserves the +60s httpx margin. HTTP runs are unaffected.
-        if needs_browser and timeout < 240:
-            logger.info("run_scraper: flooring browser timeout %ds → 240s", timeout)
-            timeout = 240
+        # passes a tight timeout, but two-phase drafts run discovery AND sample
+        # extraction in ONE process — pillowtalk: 124s discovery (5 pages) +
+        # 5 PDP samples blew the old 240s floor, SIGKILL mid-phase (exit -1)
+        # and a false strategy cascade (job 312; same class as lw.com's
+        # ~160s-only-sample run that set the old floor). 600s covers a full
+        # multi-page walk + samples with headroom; /scrape accepts up to 7200s
+        # and the httpx margin (+60s) scales with it. The runner does NOT retry
+        # timeouts, so the worst case is one bounded 660s wait. HTTP unaffected.
+        if needs_browser and timeout < 600:
+            logger.info("run_scraper: flooring browser timeout %ds → 600s", timeout)
+            timeout = 600
 
         # Write a heartbeat SessionLog entry so the watchdog sees activity
         # during long scraper runs (UC Chrome + residential proxy can take 5+ min)
