@@ -207,14 +207,14 @@ SCRAPER_CDP_PORT=19223
 ```
 
    Why:
-   - **`DISPLAY=:98` — do NOT set it to empty.** v1 said `DISPLAY=""` for headless; that's a documented-looking trap: with DISPLAY empty the code skips Xvfb, both Chrome starters refuse to launch without Xvfb, `/health` returns 503 degraded forever. `:98` = virtual framebuffer, Chrome runs headed-against-Xvfb exactly like compose.
+   - **`DISPLAY=:98` — do NOT set it to empty.** v1 said `DISPLAY=""` for headless; that's a documented-looking trap. Since the W9 guard fix, DISPLAY empty + `CHROME_HEADLESS` unset still fails loudly (Chrome starters refuse: "no Xvfb and CHROME_HEADLESS unset" → `/health` 503 degraded forever). Two supported modes: keep `DISPLAY=:98` (Xvfb framebuffer, Chrome headed-against-Xvfb exactly like compose — the default), or set `CHROME_HEADLESS=1` (skips Xvfb entirely, `--headless=new` + UA override on the MCP Chrome; /navigate-only — the lazy Scraper Chrome will honestly fail to start without X).
    - **`MCP_CDP_PORT`/`SCRAPER_CDP_PORT` are required** even though they look internal: without them the code has a default mismatch (the MCP process points at `:19222` while Chrome binds `:9222`) and browser automation silently breaks. These values make everything self-consistent.
 4. **No start-command override** — the Dockerfile CMD handles stale-lock cleanup + uvicorn :8001. Keep it.
 5. **Healthcheck:** path `/health` (returns 503 while degraded — that's correct behavior; Chrome+MCP take ~30–60s to boot).
 6. Serverless: **OFF** (sleeping Chrome = first-scrape 502s). Resources: **4 GB RAM / 2+ vCPU** minimum. Replicas: 1.
 7. No public domain. No volume (stateless — scraper source arrives in the POST body).
 
-✅ **Checkpoint:** logs show `Browser pool ready: Xvfb=:98, MCP Chrome=:19222, Scraper Chrome=:19223` and `Playwright MCP started ... 0.0.0.0:8111`.
+✅ **Checkpoint:** logs show `Xvfb skipped` is ABSENT, `Browser pool ready: Xvfb=:98, MCP Chrome=:19222, scraper_chrome_state=lazy_idle` and `Playwright MCP started ... 0.0.0.0:8111`. `scraper_chrome_state=lazy_idle` is CORRECT post-W9 — the Scraper Chrome deliberately doesn't start at boot (saves ~250-400MB); it launches on first `/scrape` (`ensure_scraper_chrome: Scraper Chrome launched (lazy start)`). It is NOT a failure. Set `SCRAPER_CHROME_LAZY=0` to restore eager start.
 
 ## Phase 7 — celery-worker (the pipeline)
 
@@ -379,7 +379,7 @@ curl -fsI https://<app>.up.railway.app/admin/login/      # → 200
 | every POST 403s | missing `CSRF_TRUSTED_ORIGINS` | Phase 5 step 7 |
 | login page unstyled | static files missing | Dockerfile ≥ this branch's build-time collectstatic; redeploy |
 | any Django-family service (incl. django's Pre-Deploy) dies: `ModuleNotFoundError: No module named 'src'` | shared `PYTHONPATH` not *shared* to this service | Phase 5 step 3 gate; Share it or add raw |
-| browser-service `/health` 503 + log `Skipping MCP Chrome — Xvfb not running` | someone set `DISPLAY=""` | set `DISPLAY=:98` |
+| browser-service `/health` 503 + log `Skipping MCP Chrome — no Xvfb and CHROME_HEADLESS unset` | someone set `DISPLAY=""` without the headless flag | set `DISPLAY=:98` (or deliberately: `CHROME_HEADLESS=1`) |
 | browser automation connects to nothing | missing `MCP_CDP_PORT`/`SCRAPER_CDP_PORT` | Phase 6 block |
 | job pages error on artifacts | `FILE_MASTER_URL` unset/wrong on django or worker | Phase 3 |
 | django deploy blocked after first success | Pre-Deploy `createsuperuser` failing | ensure `|| true` in the command |

@@ -15,12 +15,21 @@ XVFB_RESOLUTION = os.environ.get("XVFB_RESOLUTION", "1920x1080x24")
 STARTUP_TIMEOUT = int(os.environ.get("STARTUP_TIMEOUT", "45"))
 CHROME_USER_DATA_DIR = "/tmp/chrome-profiles"
 # W6/W9: when set, the Scraper Chrome (9223) is NOT started at boot — the
-# /scrape path launches it on first use (W9's ensure_scraper_chrome). /health
-# must treat a deliberately-unstarted Chrome as healthy (scraper_not_required)
-# or lazy-by-default + the stricter AND = 503 from boot → the compose
+# /scrape path launches it on first use (ensure_scraper_chrome). /health
+# treats a deliberately-unstarted Chrome as healthy (scraper_not_required) —
+# without that, lazy + the stricter AND = 503 from boot → the compose
 # healthcheck fails → depends_on service_healthy blocks django/celery from
-# ever starting. Default "0" until W9 flips it.
-SCRAPER_CHROME_LAZY = os.environ.get("SCRAPER_CHROME_LAZY", "0") == "1"
+# ever starting. Default ON (the persistent Scraper Chrome serves only the
+# deprecated /scrape path; ~250-400MB of idle RSS for nothing); set
+# SCRAPER_CHROME_LAZY=0 via env to restore eager start without a rebuild.
+SCRAPER_CHROME_LAZY = os.environ.get("SCRAPER_CHROME_LAZY", "1") == "1"
+# W9 headless mode — scoped to the MCP Chrome ONLY (the Scraper Chrome is
+# deleted in Phase D of the rework plan; headless+UA polish there is sunk
+# cost — its guards get fixed as part of lazy anyway). Skips Xvfb, appends
+# --headless=new, drops the --display flag and the DISPLAY env. The MCP
+# Chrome already pins an explicit user-agent (below); without that override
+# headless advertises "HeadlessChrome" and gets flagged.
+MCP_HEADLESS = os.environ.get("CHROME_HEADLESS", "0") == "1"
 
 
 class BrowserPool:
@@ -37,28 +46,44 @@ class BrowserPool:
         # loop, /restart-cdp, and the scraper retry path can all call it). Without
         # this, two callers racing terminate()+restart() on the same Chrome
         # produce "NoneType" / "Opening in existing browser session" 500s and
-        # corrupt the singleton state. A single lock is correct: restarts are
-        # rare (only on death) so serializing mcp vs scraper costs nothing, and
-        # it's the cross-thread/cross-loop boundary that needs guarding.
-        self._restart_lock = threading.Lock()
+        # corrupt the singleton state. RLock (not Lock): W9's
+        # restart_chrome→ensure_scraper_chrome nests a second acquire on the
+        # SAME thread — a plain Lock would self-deadlock there.
+        self._restart_lock = threading.RLock()
 
     def startup(self) -> dict:
         errors = []
 
-        if DISPLAY:  # local compose: Xvfb + headed Chrome
+        # W9: Xvfb is required only when actually headed. CHROME_HEADLESS=1
+        # boots with no Xvfb at all; an empty DISPLAY without the flag still
+        # errors loudly below (the old silent "Railway mode" log line was
+        # aspirational — the guards bailed and killed the whole pool).
+        if DISPLAY and not MCP_HEADLESS:  # local compose: Xvfb + headed Chrome
             self._start_xvfb(errors)
         else:
-            logger.info("DISPLAY empty — running headless (no Xvfb, Railway mode)")
+            logger.info(
+                "Xvfb skipped (%s) — Chrome must run with --headless=new",
+                "CHROME_HEADLESS=1" if MCP_HEADLESS else "DISPLAY empty",
+            )
         self._start_mcp_chrome(errors)
-        self._start_scraper_chrome(errors)
+        if SCRAPER_CHROME_LAZY:
+            # W9: the Scraper Chrome serves only the deprecated /scrape path —
+            # don't pay ~250-400MB of idle RSS at boot; ensure_scraper_chrome()
+            # launches it on first use.
+            logger.info(
+                "SCRAPER_CHROME_LAZY=1 — Scraper Chrome not started at boot "
+                "(launched on first /scrape via ensure_scraper_chrome)"
+            )
+        else:
+            self._start_scraper_chrome(errors)
 
         if not errors:
             self._ready = True
             logger.info(
-                "Browser pool ready: Xvfb=%s, MCP Chrome=:%d, Scraper Chrome=:%d",
+                "Browser pool ready: Xvfb=%s, MCP Chrome=:%d, scraper_chrome_state=%s",
                 DISPLAY,
                 MCP_CDP_PORT,
-                SCRAPER_CDP_PORT,
+                self.scraper_chrome_state(),
             )
         else:
             logger.error("Browser pool startup errors: %s", errors)
@@ -71,6 +96,8 @@ class BrowserPool:
         }
 
     def health(self) -> dict:
+        # proc-is-None checks come BEFORE .poll() everywhere below — None is
+        # precisely the lazy initial state post-W9, and None.poll() raises.
         mcp_alive = (
             self._mcp_chrome_proc is not None and self._mcp_chrome_proc.poll() is None
         )
@@ -84,6 +111,7 @@ class BrowserPool:
             and self._xvfb_proc.poll() is None,
             "mcp_chrome_running": mcp_alive,
             "scraper_chrome_running": scraper_alive,
+            "scraper_chrome_state": self.scraper_chrome_state(),
             "mcp_cdp_port": MCP_CDP_PORT,
             "scraper_cdp_port": SCRAPER_CDP_PORT,
             "display": DISPLAY,
@@ -117,11 +145,50 @@ class BrowserPool:
         """
         return bool(SCRAPER_CHROME_LAZY) and self.scraper_chrome_state() == "lazy_idle"
 
+    def scraper_chrome_required(self) -> bool:
+        """The W9 predicate: False while LAZY=1 and never ensured.
+
+        One predicate drives every consumer — check_cdp_liveness skips the
+        scraper leg, the liveness loop never auto-restarts a never-started
+        Chrome, W6's AND falls through, and /scrape's ensure launches on
+        demand.
+        """
+        return not self.scraper_not_required()
+
+    def ensure_scraper_chrome(self) -> bool:
+        """Launch the Scraper Chrome on first use (W9 lazy start).
+
+        Idempotent and lock-guarded: safe to call from every /scrape
+        (executor) task — the common case (already up) is a µs state check
+        that never touches the lock. Uses the restart lock so a concurrent
+        restart/ensure can't race two launches; RLock because restart_chrome
+        legitimately nests this call.
+        """
+        if self.scraper_chrome_state() == "up":
+            return True
+        with self._restart_lock:
+            if self.scraper_chrome_state() == "up":  # lost the race — done
+                return True
+            errors: list = []
+            self._start_scraper_chrome(errors)
+            if errors:
+                logger.error("ensure_scraper_chrome failed: %s", errors)
+                return False
+            logger.info("ensure_scraper_chrome: Scraper Chrome launched (lazy start)")
+            return True
+
     def check_cdp_liveness(self) -> dict:
         """Actually probe CDP endpoints via HTTP (process alive != CDP responsive).
 
         Returns dict with ``mcp_cdp_alive`` / ``scraper_cdp_alive`` booleans and
         the response times in ms (``-1`` on failure).
+
+        W9: the scraper leg is SKIPPED while the lazy Chrome has never been
+        launched — probing it guarantees 3 consecutive failures ~45s after
+        every boot, and the auto-restart would launch the Chrome the lazy
+        start just skipped (the "saved" 250-400MB bought back inside a
+        minute, from inside a blocking restart-lock hold). Reports
+        ``scraper_cdp_alive: None`` (not-applicable) in that state.
         """
         import httpx
 
@@ -135,6 +202,14 @@ class BrowserPool:
                 return (False, -1)
 
         mcp_ok, mcp_ms = _probe(MCP_CDP_PORT)
+        if not self.scraper_chrome_required():
+            return {
+                "mcp_cdp_alive": mcp_ok,
+                "scraper_cdp_alive": None,
+                "mcp_cdp_latency_ms": mcp_ms,
+                "scraper_cdp_latency_ms": None,
+                "scraper_chrome_state": "lazy_idle",
+            }
         scraper_ok, scraper_ms = _probe(SCRAPER_CDP_PORT)
         return {
             "mcp_cdp_alive": mcp_ok,
@@ -193,14 +268,23 @@ class BrowserPool:
 
         # Hold the restart lock for the whole op so concurrent callers can't
         # tear down / relaunch Chrome simultaneously. (Blocking acquire — restart
-        # is rare and the multi-second Chrome startup already dominates latency.)
+        # is rare and the multi-second Chrome startup already dominates latency.
+        # RLock: the lazy branch below nests ensure_scraper_chrome, which
+        # acquires the same lock on this thread.)
         with self._restart_lock:
             # Always run restarts off the event loop thread so async callers
             # (FastAPI handlers) don't block on the multi-second Chrome startup.
             if label in ("mcp", "all"):
                 _do_restart("_mcp_chrome_proc", "_start_mcp_chrome", "MCP")
             if label in ("scraper", "all"):
-                _do_restart("_scraper_chrome_proc", "_start_scraper_chrome", "Scraper")
+                if self.scraper_chrome_state() == "lazy_idle":
+                    # W9: nothing to tear down — an explicit restart of a
+                    # never-started lazy Chrome is operator intent to bring it
+                    # up; ensure (not force-restart).
+                    if self.ensure_scraper_chrome():
+                        result["restarted"].append("scraper")
+                else:
+                    _do_restart("_scraper_chrome_proc", "_start_scraper_chrome", "Scraper")
 
             if not result["errors"]:
                 logger.info(
@@ -253,8 +337,11 @@ class BrowserPool:
             errors.append(f"Xvfb failed: {e}")
 
     def _start_mcp_chrome(self, errors: list):
-        if not self._xvfb_proc:
-            errors.append("Skipping MCP Chrome — Xvfb not running")
+        # W9: Xvfb is required only when headed. In headless mode (no Xvfb by
+        # design) this guard must NOT bail — the old unconditional check made
+        # "Railway mode" aspirational: clearing DISPLAY killed the whole pool.
+        if not self._xvfb_proc and not MCP_HEADLESS:
+            errors.append("Skipping MCP Chrome — no Xvfb and CHROME_HEADLESS unset")
             return
         try:
             args = [
@@ -262,7 +349,6 @@ class BrowserPool:
                 f"--remote-debugging-port={MCP_CDP_PORT}",
                 "--remote-debugging-address=0.0.0.0",
                 "--remote-allow-origins=*",
-                f"--display={DISPLAY}",
                 "--no-first-run",
                 "--no-default-browser-check",
                 "--disable-blink-features=AutomationControlled",
@@ -289,13 +375,22 @@ class BrowserPool:
                 f"--user-data-dir={CHROME_USER_DATA_DIR}/mcp",
                 "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
             ]
-            if not DISPLAY:
+            mcp_headless = MCP_HEADLESS or not DISPLAY
+            if mcp_headless:
                 args.append("--headless=new")
+            else:
+                args.append(f"--display={DISPLAY}")
             self._mcp_chrome_proc = subprocess.Popen(
                 args,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                env={**os.environ, "DISPLAY": DISPLAY},
+                # headless: no --display flag above and NO DISPLAY in the env —
+                # a stray empty DISPLAY var pointing at no X server used to leak in
+                env={
+                    k: v
+                    for k, v in os.environ.items()
+                    if not (mcp_headless and k == "DISPLAY")
+                },
                 start_new_session=True,
             )
             time.sleep(3)
@@ -322,8 +417,12 @@ class BrowserPool:
         # browsers and does not need this persistent Chrome). Leave running for
         # now. See docs/browser-service-rework-plan.md.
         self._scraper_chrome_started = True  # any attempt: down, never lazy_idle
-        if not self._xvfb_proc:
-            errors.append("Skipping Scraper Chrome — Xvfb not running")
+        # W9: same guard rule as the MCP Chrome — Xvfb required only when
+        # headed. (In a CHROME_HEADLESS deployment the launcher below will
+        # still fail its CDP wait, honestly: headless mode is a /navigate-
+        # only deployment; the Scraper Chrome is Phase-D sunk cost.)
+        if not self._xvfb_proc and not MCP_HEADLESS:
+            errors.append("Skipping Scraper Chrome — no Xvfb and CHROME_HEADLESS unset")
             return
         try:
             args = [

@@ -463,10 +463,25 @@ def _scrape_protection_active() -> bool:
 
 
 def _run_scrape_guarded(rid: str, **kwargs):
-    """Executor wrapper: hold the kill-cycle protection until the child exits."""
+    """Executor wrapper: hold the kill-cycle protection until the child exits.
+
+    W9: also owns the lazy Scraper Chrome launch — blocking (multi-second)
+    startup is fine on the executor thread, never on the event loop. Already-
+    up is a µs state check.
+    """
     try:
         from .scraper_runner import run_scraper_script
 
+        if not browser_pool.ensure_scraper_chrome():
+            return {
+                "returncode": -1,
+                "stderr": "Scraper Chrome failed to launch (lazy start) — see browser_service logs",
+                "stdout": "",
+                "output_content": "",
+                "output_name": "",
+                "product_count": 0,
+                "duration": 0,
+            }
         return run_scraper_script(**kwargs)
     finally:
         SCRAPE_IN_FLIGHT.pop(rid, None)
