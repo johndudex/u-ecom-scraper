@@ -2,6 +2,7 @@ FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget gnupg2 curl ca-certificates \
+    tini \
     xvfb xauth python3-tk libtk8.6 \
     fonts-liberation fonts-noto-cjk fonts-wqy-zenhei \
     fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
@@ -62,12 +63,16 @@ RUN mkdir -p /app/scrapers /app/logs /app/workspace /app/data/akamai-cookies
 
 EXPOSE 8001 8111 9222 9223
 
+# tini is PID 1: reaps orphaned grandchildren (killed launchers' Chrome trees —
+# uvicorn as PID 1 never reaped them) and forwards signals. The preamble's
+# ulimit/exports are inherited by tini and everything it supervises.
 CMD ["sh", "-c", "\
     rm -rf /tmp/.X98-lock /tmp/.X11-unix/X98 && \
     rm -rf /tmp/chrome-profiles/mcp/SingletonLock /tmp/chrome-profiles/mcp/SingletonSocket /tmp/chrome-profiles/mcp/SingletonCookie && \
     rm -rf /tmp/chrome-profiles/scraper/SingletonLock /tmp/chrome-profiles/scraper/SingletonSocket /tmp/chrome-profiles/scraper/SingletonCookie && \
     rm -f /app/core.* /core.* && \
     ulimit -c 0 && \
-    LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
-    PYTHONPATH=/app exec uvicorn browser_service.server:app --host 0.0.0.0 --port 8001 --workers 1 --log-level info --no-access-log \
+    export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} && \
+    export PYTHONPATH=/app && \
+    exec tini -- uvicorn browser_service.server:app --host 0.0.0.0 --port 8001 --workers 1 --log-level info --no-access-log \
 "]

@@ -41,6 +41,11 @@ def _server_ns():
         + grab("_collect_persistent_pids")
         + grab("_scrape_protection_active")
         + grab("_run_scrape_guarded")
+        + grab("_track_navigate_pids")
+        + grab("_untrack_navigate_pids")
+        + grab("_proc_state")
+        + grab("_navigate_protection_active")
+        + grab("_kill_orphan_chrome")
     )
 
     import logging
@@ -49,6 +54,8 @@ def _server_ns():
 
     # stubs for names the fns reference
     import time as _time
+    import subprocess as _subprocess
+    from typing import Optional as _Optional
 
     class _FakePool:
         _restart_lock = __import__("threading").Lock()
@@ -58,9 +65,14 @@ def _server_ns():
         "os": os,
         "time": _time,
         "logger": logger,
+        "subprocess": _subprocess,
+        "Optional": _Optional,
         "PERSISTENT_CHROME_PIDS": set(),
         "SCRAPE_IN_FLIGHT": {},
         "SCRAPE_PROTECTION_GRACE_S": 600.0,
+        "NAVIGATE_ACTIVE_PIDS": {},
+        "_navigate_in_flight": 0,
+        "_NAVIGATE_PID_MAX_AGE_S": 300.0,
         "browser_pool": _FakePool(),
     }
     ns["browser_pool"].health = lambda: {"mcp_pid": 100, "scraper_pid": 200}
@@ -146,11 +158,109 @@ class TestScrapeProtection:
         assert "r3" not in ns["SCRAPE_IN_FLIGHT"]
 
 
+class TestNavigateGateW3:
+    """W3: the kill gate must be liveness-based, not counter-based.
+
+    The in-flight counter is decremented by the endpoint's finally, which runs
+    on wait_for timeout while the executor thread's browser is STILL RUNNING
+    (prod: 92.7s response against a 75s deadline) — a purely counter-based gate
+    then lets the next cleanup cycle SIGKILL a live ephemeral browser. The
+    registry must prune dead (incl. zombie) PIDs and expire leaked ones so a
+    bug can never permanently disable the orphan killer.
+    """
+
+    def teardown_method(self):
+        ns = _server_ns()
+        ns["NAVIGATE_ACTIVE_PIDS"].clear()
+        ns["_navigate_in_flight"] = 0
+
+    def test_live_pid_protects(self):
+        ns = _server_ns()
+        ns["_track_navigate_pids"]([os.getpid()])  # a definitely-alive PID
+        assert ns["_navigate_protection_active"]() is True
+        assert os.getpid() in ns["NAVIGATE_ACTIVE_PIDS"]
+
+    def test_dead_pid_is_pruned_not_protective(self):
+        ns = _server_ns()
+        ns["_track_navigate_pids"]([99999999])  # nothing behind this PID
+        assert ns["_navigate_protection_active"]() is False
+        assert 99999999 not in ns["NAVIGATE_ACTIVE_PIDS"]
+
+    def test_in_flight_counter_alone_protects(self):
+        ns = _server_ns()
+        ns["_navigate_in_flight"] = 2
+        assert ns["_navigate_protection_active"]() is True
+        ns["_navigate_in_flight"] = 0
+
+    def test_expired_pid_stops_protecting(self):
+        ns = _server_ns()
+        ns["_track_navigate_pids"]([os.getpid()])
+        # Age the entry past the ceiling+grace bound (leak failsafe).
+        ns["NAVIGATE_ACTIVE_PIDS"][os.getpid()] = ns["time"].monotonic() - 10_000
+        assert ns["_navigate_protection_active"]() is False
+        assert os.getpid() not in ns["NAVIGATE_ACTIVE_PIDS"]
+
+    def test_zombie_state_is_pruned(self):
+        ns = _server_ns()
+        # _proc_state must read /proc state (a zombie satisfies kill(pid, 0)):
+        # a live process yields a 1-char state, a vanished one yields None.
+        live = ns["_proc_state"](os.getpid())
+        assert isinstance(live, str) and len(live) == 1
+        assert ns["_proc_state"](99999999) is None
+
+    def test_untrack_removes_only_given_pids(self):
+        ns = _server_ns()
+        ns["_track_navigate_pids"]([111, 222])
+        ns["_untrack_navigate_pids"]([111])
+        assert 111 not in ns["NAVIGATE_ACTIVE_PIDS"]
+        assert 222 in ns["NAVIGATE_ACTIVE_PIDS"]
+
+    def test_kill_cycle_skips_while_protected(self):
+        ns = _server_ns()
+        ns["_navigate_in_flight"] = 1
+        assert ns["_kill_orphan_chrome"]() == 0
+        ns["_navigate_in_flight"] = 0
+
+    def test_kill_cycle_runs_when_registry_clear(self, monkeypatch=None):
+        ns = _server_ns()
+        # No protection + pgrep finds nothing → loop completes, kills nothing.
+        calls = {}
+
+        class _FakeResult:
+            returncode = 1
+            stdout = ""
+
+        def _fake_run(*a, **kw):
+            calls["ran"] = True
+            return _FakeResult()
+
+        fake_subprocess = types.SimpleNamespace(run=_fake_run)
+        saved = ns["subprocess"]
+        ns["subprocess"] = fake_subprocess
+        try:
+            assert ns["_kill_orphan_chrome"]() == 0
+        finally:
+            ns["subprocess"] = saved
+        assert calls.get("ran") is True
+
+
 class TestKillGateWiring:
     def test_kill_gates_on_scrape_protection(self):
         src = pathlib.Path(os.path.join(ROOT, "browser_service/server.py")).read_text()
         assert "if _scrape_protection_active():" in src
         assert 'logger.info("kill_orphan_chrome: skipping (scrape in flight)")' in src
+
+    def test_kill_gates_on_navigate_protection_not_counter(self):
+        """W3: the navigate gate must consult the liveness-based predicate."""
+        src = pathlib.Path(os.path.join(ROOT, "browser_service/server.py")).read_text()
+        assert "nav_active = _navigate_protection_active()" in src
+        assert "if nav_active:" in src
+
+    def test_registry_is_timestamped_dict_with_no_raw_set_api(self):
+        src = pathlib.Path(os.path.join(ROOT, "browser_service/server.py")).read_text()
+        assert "NAVIGATE_ACTIVE_PIDS: dict[int, float]" in src
+        assert "NAVIGATE_ACTIVE_PIDS.update(" not in src
+        assert "NAVIGATE_ACTIVE_PIDS.difference_update(" not in src
 
     def test_cleanup_uses_nonblocking_lock(self):
         src = pathlib.Path(os.path.join(ROOT, "browser_service/server.py")).read_text()

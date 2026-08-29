@@ -59,11 +59,80 @@ MAX_NAVIGATE_HTML = 2_000_000
 MAX_NAVIGATE_ACTIONS = 20
 NAVIGATE_SEMAPHORE = asyncio.Semaphore(NAVIGATE_MAX_CONCURRENT)
 # PIDs of chrome processes belonging to in-flight /navigate calls. The orphan
-# killer (every CLEANUP_INTERVAL) must not SIGKILL these.
-NAVIGATE_ACTIVE_PIDS: set[int] = set()
+# killer (every CLEANUP_INTERVAL) must not SIGKILL these. Timestamped
+# (monotonic) so the gate can distinguish a live browser from a leaked entry —
+# the in-flight counter alone is decremented by the endpoint's finally, which
+# runs on wait_for timeout while the executor thread's browser is STILL
+# RUNNING (prod observed a 92.7s response against a 75s deadline).
+NAVIGATE_ACTIVE_PIDS: dict[int, float] = {}
+# How long a tracked PID stays protective: the per-call ceiling (NavigateRequest
+# timeout ≤ 180s, + 30s wait_for slack) plus grace. Past this the entry is a
+# leak and stops protecting (same deadline-failsafe shape as SCRAPE_PROTECTION_GRACE_S).
+_NAVIGATE_PID_MAX_AGE_S = 180 + 120
 # Active + queued navigate calls (for queue-full backpressure and the orphan
 # killer safety gate).
 _navigate_in_flight = 0
+
+
+def _track_navigate_pids(pids) -> None:
+    """Register /navigate session PIDs (timestamped)."""
+    now = time.monotonic()
+    for pid in pids:
+        NAVIGATE_ACTIVE_PIDS[int(pid)] = now
+
+
+def _untrack_navigate_pids(pids) -> None:
+    """Release /navigate session PIDs after their browser is closed."""
+    for pid in pids:
+        NAVIGATE_ACTIVE_PIDS.pop(int(pid), None)
+
+
+def _proc_state(pid: int) -> Optional[str]:
+    """Single-char process state from /proc/<pid>/stat, or None if gone.
+
+    Zombie-aware: a zombie still satisfies ``os.kill(pid, 0)``, so liveness
+    checks must read the state field instead (a zombie holds its PID until
+    reaped — with uvicorn as PID 1 pre-tini that can be indefinitely).
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read().decode("utf-8", "replace")
+        # comm can contain spaces/parens — everything after the LAST ')' is fixed-format.
+        return data.rsplit(")", 1)[1].strip().split()[0]
+    except (OSError, IndexError):
+        return None
+
+
+def _navigate_protection_active() -> bool:
+    """True while any /navigate may still own a live ephemeral browser.
+
+    Two layers:
+    - the in-flight counter (covers queued calls),
+    - the per-PID registry with liveness + age checks (covers the
+      counter-decrement race above — the browser outliving its HTTP call).
+
+    Dead PIDs (gone or zombie) are pruned as a side effect; entries older
+    than ``_NAVIGATE_PID_MAX_AGE_S`` are treated as leaked and stop
+    protecting so a bug can never permanently disable the orphan killer.
+    """
+    now = time.monotonic()
+    dead: list[int] = []
+    for pid, ts in NAVIGATE_ACTIVE_PIDS.items():
+        if now - ts > _NAVIGATE_PID_MAX_AGE_S:
+            logger.warning(
+                "navigate pid registry: PID %d tracked %.0fs (max %ds) — treating as leaked",
+                pid,
+                now - ts,
+                _NAVIGATE_PID_MAX_AGE_S,
+            )
+            dead.append(pid)
+            continue
+        state = _proc_state(pid)
+        if state is None or state == "Z":
+            dead.append(pid)
+    for pid in dead:
+        NAVIGATE_ACTIVE_PIDS.pop(pid, None)
+    return _navigate_in_flight > 0 or bool(NAVIGATE_ACTIVE_PIDS)
 
 # ── /scrape in-flight registry (F1) ────────────────────────────────────────
 # A running scraper subprocess drives the SHARED scraper Chrome; the orphan
@@ -334,16 +403,21 @@ def _collect_persistent_pids():
 def _kill_orphan_chrome() -> int:
     killed = 0
     try:
-        # Safety gate: if any /navigate call is in flight, skip the kill cycle
-        # entirely. Its ephemeral browser spawns child chrome processes that
-        # pgrep matches, and we cannot reliably enumerate every child PID. The
-        # per-PID allowlist below is the precision layer; this counter is the
-        # hard guarantee. Navigate calls are short (<=180s); real orphans get
-        # reaped on the next CLEANUP_INTERVAL cycle.
-        if _navigate_in_flight > 0:
+        # Safety gate: if any /navigate call is in flight — or any tracked
+        # session PID is still alive — skip the kill cycle entirely. Ephemeral
+        # browsers spawn child chrome processes that pgrep matches, and we
+        # cannot reliably enumerate every child PID. The per-PID allowlist is
+        # the precision layer; this gate is the hard guarantee. Navigate calls
+        # are short (<=180s); real orphans get reaped on the next
+        # CLEANUP_INTERVAL cycle. The gate is liveness-based (see
+        # _navigate_protection_active): a live browser whose HTTP call already
+        # timed out must NOT be killed just because the counter moved on.
+        nav_active = _navigate_protection_active()
+        if nav_active:
             logger.info(
-                "kill_orphan_chrome: skipping (%d navigate call(s) in flight)",
+                "kill_orphan_chrome: skipping (%d navigate call(s) in flight, %d live session PID(s))",
                 _navigate_in_flight,
+                len(NAVIGATE_ACTIVE_PIDS),
             )
             return 0
         # F1: same gate for /scrape — a running scraper drives the shared
@@ -1206,7 +1280,7 @@ def _run_navigate_sync(
         after = _snapshot_chrome_pids()
         session_pids = after - before
         if session_pids:
-            NAVIGATE_ACTIVE_PIDS.update(session_pids)
+            _track_navigate_pids(session_pids)
 
         # Set cookies on the browser context (before goto, for session continuity)
         if cookies:
@@ -1300,7 +1374,7 @@ def _run_navigate_sync(
         # Remove our session PIDs AFTER the browser is closed (they're dead now,
         # so removing them can't strand another active navigate call).
         if session_pids:
-            NAVIGATE_ACTIVE_PIDS.difference_update(session_pids)
+            _untrack_navigate_pids(session_pids)
 
 
 @app.post("/navigate")

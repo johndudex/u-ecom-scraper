@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import signal
 import sys
 from typing import Any, Optional
 
@@ -426,6 +427,111 @@ class _PageContext:
             self.pw = None
 
 
+def _proc_child_pids(pid: int) -> set[int]:
+    """Direct children of pid via /proc (Linux). Empty on any failure.
+
+    Local copy of server.py's ``_proc_children`` reader — probe.py must not
+    import server.py (it owns the FastAPI app); the reader is 10 lines.
+    """
+    kids: set[int] = set()
+    try:
+        for tid in os.listdir(f"/proc/{pid}/task"):
+            try:
+                with open(f"/proc/{pid}/task/{tid}/children") as fh:
+                    kids.update(int(x) for x in fh.read().split())
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return kids
+
+
+def _hard_kill_tree(root_pid: int, _list_children=_proc_child_pids) -> int:
+    """SIGKILL ``root_pid`` and every descendant (via /proc children BFS).
+
+    Returns the number of processes signalled. Depth-bounded (Chrome trees are
+    shallow); per-PID kills only — never a process group, because the
+    playwright driver is spawned WITHOUT its own session and shares uvicorn's
+    group (killpg there would suicide the service). Anything that escapes
+    (race, vanished /proc entry) is the orphan killer's job.
+    """
+    signalled = 0
+    seen: set[int] = set()
+    frontier = [root_pid]
+    for _ in range(32):
+        if not frontier:
+            break
+        nxt: list[int] = []
+        for pid in frontier:
+            if pid in seen:
+                continue
+            seen.add(pid)
+            try:
+                os.kill(pid, signal.SIGKILL)
+                signalled += 1
+            except (ProcessLookupError, PermissionError):
+                pass
+            nxt.extend(_list_children(pid))
+        frontier = nxt
+    return signalled
+
+
+def _playwright_driver_pid(obj) -> Optional[int]:
+    """Best-effort PID of the playwright node driver behind a Playwright
+    handle or a sync Browser. Private-API shapes are guarded — returns None
+    if the layout ever changes (the leak then reverts to the orphan-killer
+    backstop instead of killing the wrong process)."""
+    for chain in (
+        lambda o: o._transport,  # Playwright handle (sync_playwright().start())
+        lambda o: o._impl_obj._connection._transport,  # sync Browser
+        lambda o: o._connection._transport,  # impl Browser
+    ):
+        try:
+            return chain(obj)._proc.pid
+        except AttributeError:
+            continue
+    return None
+
+
+def _hard_kill_partial_launch(browser=None, pw=None) -> None:
+    """W1: hard-kill the half-built resources of a failed ``_launch_page``.
+
+    Without this, a launch that raises between driver-start and page-ready
+    leaks the node driver AND its whole Chrome tree (prod: failed launches
+    under memory pressure deepened the pressure → next launch failed → doom
+    loop). The caller's ``finally`` closes a still-None context and can't help.
+
+    SIGKILL, never a graceful ``browser.close()``/``pw.stop()``: launch
+    failures happen under exactly the memory pressure this guards against,
+    where the driver may be unresponsive — a blocking close would hold a
+    NAVIGATE executor slot (three such hangs wedge all three threads and
+    callers see 408s instead of 429s). The tree is being discarded; kill it.
+    """
+    roots: list[tuple[str, int]] = []
+    if pw is not None:
+        pid = _playwright_driver_pid(pw)
+        if pid:
+            roots.append(("playwright driver", pid))
+    elif browser is not None:  # cloak path: no pw handle; driver behind browser
+        pid = _playwright_driver_pid(browser)
+        if pid:
+            roots.append(("cloak browser driver", pid))
+    if not roots:
+        logger.warning(
+            "launch failed and no driver PID could be attributed — leaving "
+            "cleanup to the orphan killer"
+        )
+        return
+    for label, pid in roots:
+        killed = _hard_kill_tree(pid)
+        logger.warning(
+            "launch failed: SIGKILLed %d process(es) under %s (PID %d)",
+            killed,
+            label,
+            pid,
+        )
+
+
 def _launch_page(
     method: str = "auto",
     proxy_tier: str = "none",
@@ -442,6 +548,10 @@ def _launch_page(
     Returns a :class:`_PageContext`. Caller MUST ``.close()`` it (usually in a
     ``finally``). The cloak path calls ``cloakbrowser.launch()`` directly — it
     does NOT rely on the ``.pth`` global monkeypatch.
+
+    Both launch sequences are wrapped: a failure between driver-start and
+    page-ready hard-kills the partial driver/Chrome tree before re-raising
+    (see :func:`_hard_kill_partial_launch`).
     """
     config = get_proxy_config()
 
@@ -464,9 +574,14 @@ def _launch_page(
         )
         if proxy:
             launch_kwargs["proxy"] = proxy
-        browser = cloak_launch(**launch_kwargs)
-        page = browser.new_page()
-        page.set_default_timeout(timeout * 1000)
+        browser = None
+        try:
+            browser = cloak_launch(**launch_kwargs)
+            page = browser.new_page()
+            page.set_default_timeout(timeout * 1000)
+        except Exception:
+            _hard_kill_partial_launch(browser=browser)
+            raise
         return _PageContext(page, browser, pw=None, stealth_used=True, method="cloak")
 
     # default: vanilla Playwright
@@ -481,10 +596,16 @@ def _launch_page(
     )
     if proxy:
         launch_kwargs["proxy"] = proxy
-    pw = sync_playwright().start()
-    browser = pw.chromium.launch(**launch_kwargs)
-    page = browser.new_page()
-    page.set_default_timeout(timeout * 1000)
+    pw = None
+    browser = None
+    try:
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(**launch_kwargs)
+        page = browser.new_page()
+        page.set_default_timeout(timeout * 1000)
+    except Exception:
+        _hard_kill_partial_launch(browser=browser, pw=pw)
+        raise
     return _PageContext(page, browser, pw=pw, stealth_used=False, method="playwright")
 
 

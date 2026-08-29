@@ -1,5 +1,6 @@
 import logging
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -107,6 +108,22 @@ class BrowserPool:
             "scraper_cdp_latency_ms": scraper_ms,
         }
 
+    def _kill_process_tree(self, proc: subprocess.Popen) -> None:
+        """Escalate a wedged pool process to SIGKILL of its whole GROUP.
+
+        Pool children are spawned with ``start_new_session=True`` (their own
+        session/group), so killpg takes the entire Chrome/Xvfb tree — including
+        renderer/GPU/utility children that ``proc.kill()`` alone would orphan.
+        Falls back to per-PID kill if the group is already gone.
+        """
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except OSError as exc:
+                logger.debug("fallback kill failed for pid %s: %s", proc.pid, exc)
+
     def restart_chrome(self, label: str = "all") -> dict:
         """Restart one or both Chrome instances without killing Xvfb or the
         FastAPI server.
@@ -128,7 +145,7 @@ class BrowserPool:
                     proc.terminate()
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    self._kill_process_tree(proc)
                 except Exception:
                     pass
             setattr(self, proc_attr, None)
@@ -170,7 +187,7 @@ class BrowserPool:
                     proc.terminate()
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
+                    self._kill_process_tree(proc)
                 except Exception:
                     pass
         logger.info("Browser pool shut down")
@@ -187,6 +204,7 @@ class BrowserPool:
                 ["Xvfb", DISPLAY, "-screen", "0", XVFB_RESOLUTION],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
             time.sleep(1)
             if self._xvfb_proc.poll() is not None:
@@ -243,6 +261,7 @@ class BrowserPool:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 env={**os.environ, "DISPLAY": DISPLAY},
+                start_new_session=True,
             )
             time.sleep(3)
             if self._mcp_chrome_proc.poll() is not None:
@@ -304,6 +323,7 @@ class BrowserPool:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 env={**os.environ, "DISPLAY": DISPLAY},
+                start_new_session=True,
             )
             time.sleep(3)
             if self._scraper_chrome_proc.poll() is not None:
