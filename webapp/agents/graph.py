@@ -3123,6 +3123,120 @@ def _escalate_strategy(
     return analysis, ("cleanup" if skip_approvals else "human_approval")
 
 
+# [job-65 phase 3a] How many times a zero-item execution may recycle through
+# the strategy ladder. 1: the first zero-item execution gets a strategy switch;
+# a second one finalizes honestly instead of looping.
+_EXECUTION_RECYCLE_MAX = 1
+
+
+def _route_after_execution(state: ScrapeState):
+    """Execution-phase strategy recycle on zero-item discovery failure.
+
+    The testing ladder verifies a draft works — then the EXECUTION run can
+    still see zero items. Job-65 citybeach: the tester discovered 1,317 URLs,
+    the execution fetched the same listing minutes later and got
+    200-but-zero-links; nothing in the graph tried a different strategy and
+    the job finalized 0 items. When the execution output shows a FAIL-class
+    discovery coverage stop_reason, the draft's OWN in-run recovery (45s
+    retry, proxy-ladder escalation, JSON-LD ItemList fallback) has already run
+    and failed — the strategy cannot see this site's items. This node recycles
+    ONCE through scraper_analyzer with the failed strategy recorded, so
+    ``_escalate_strategy`` picks the next rung and a fresh
+    code_writer → code_tester pass runs it.
+
+    Everything else goes to cleanup as before: real items (the normal path),
+    plain crashes (code bugs the strategy ladder cannot fix — the finalize
+    gate reports them), url_list jobs (no discovery phase to blame), a
+    coverage stop_reason outside the FAIL class (exhaustion-flavored
+    signatures are Phase 2's test-time gate, not an execution verdict), and
+    the second zero-item execution (recycle budget spent — finalize honestly
+    with execution_status FAILED so cleanup does not promote a 0-item scraper).
+    """
+    job_id = state.get("job_id", 0)
+    status = state.get("execution_status", "")
+    try:
+        items = int(state.get("product_count") or 0)
+    except (TypeError, ValueError):
+        items = 0
+    cov = state.get("discovery_coverage") if isinstance(
+        state.get("discovery_coverage"), dict
+    ) else {}
+    stop_reason = str(cov.get("stop_reason") or "")
+
+    if status == "SUCCESS" and items > 0:
+        return Command(goto="cleanup")
+    if status != "SUCCESS" or items != 0:
+        # Crashed / stalled / no-output executions are code problems, not
+        # strategy problems — the ladder cannot fix a traceback.
+        return Command(goto="cleanup")
+    if (state.get("input_mode") or "") not in ("list_page", "navigation", "search_term"):
+        return Command(goto="cleanup")  # url_list: no discovery phase to recycle
+    from .nodes.route_after_testing import _COVERAGE_FAIL_STOP_REASONS
+
+    if stop_reason not in _COVERAGE_FAIL_STOP_REASONS:
+        logger.warning(
+            "_route_after_execution: 0 items but stop_reason=%r is not a "
+            "FAIL-class coverage reason — cleanup (job %s)", stop_reason, job_id,
+        )
+        return Command(goto="cleanup")
+    if int(state.get("execution_recycle_count") or 0) >= _EXECUTION_RECYCLE_MAX:
+        update: dict[str, Any] = {
+            "execution_status": "FAILED",
+            "error_message": (
+                f"Execution produced 0 items again after a strategy recycle "
+                f"(stop_reason={stop_reason}); the strategy ladder cannot see "
+                f"this site's items."
+            )[:2000],
+        }
+        logger.error(
+            "_route_after_execution: zero-item execution AFTER recycle → "
+            "honest cleanup (job %s, stop_reason=%s)", job_id, stop_reason,
+        )
+        return Command(goto="cleanup", update=update)
+
+    prior_strategy = (state.get("scraper_analysis") or {}).get("strategy", "")
+    if not prior_strategy:
+        logger.error(
+            "_route_after_execution: zero-item execution but no prior strategy "
+            "on state — cannot escalate, cleanup (job %s)", job_id,
+        )
+        return Command(goto="cleanup")
+
+    _reason = f"execution zero-items: stop_reason={stop_reason}"
+    report = state.get("test_report")
+    recycled_report = dict(report) if isinstance(report, dict) else {}
+    recycled_report.update({
+        "overall_assessment": "FAIL",
+        "ready_for_execution": False,
+        # The writer retry must know the draft EXECUTED and still saw nothing
+        # — otherwise a passing tester report reads as "nothing to fix".
+        "feedback_for_writer": (
+            "EXECUTION RECYCLE — the draft passed testing but its Phase-1 "
+            f"discovery found 0 URLs AT EXECUTION (stop_reason={stop_reason}). "
+            "The strategy is being escalated; rebuild the discovery path for "
+            "the new strategy. Keep the shared discovery module wiring intact "
+            "and re-derive the listing URLs/selectors for it."
+        ),
+    })
+    update = {
+        "execution_recycle_count": int(
+            state.get("execution_recycle_count") or 0
+        ) + 1,
+        # Annotated add-channel: appends, and _decide_strategy's dupe guard
+        # sees it so _escalate_strategy moves up the ladder.
+        "strategies_tried": [{"strategy": prior_strategy, "reason": _reason}],
+        "test_report": recycled_report,
+    }
+    _notify_phase(job_id, "scraper_analyzer", "running")
+    logger.warning(
+        "_route_after_execution: zero-item execution (stop_reason=%s) — "
+        "recycling strategy '%s' through the ladder (job %s, recycle %d/%d)",
+        stop_reason, prior_strategy, job_id,
+        update["execution_recycle_count"], _EXECUTION_RECYCLE_MAX,
+    )
+    return Command(goto="scraper_analyzer", update=update)
+
+
 def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
     """Map probe_result.connectivity.method_that_worked to a scraping strategy.
 
@@ -5632,6 +5746,9 @@ def build_scrape_graph(
     # routes straight to run_execution on approve.
     # Execution & post-completion
     workflow.add_node("run_execution", run_execution)
+    # [job-65 phase 3a] Zero-item executions recycle through the strategy
+    # ladder once before cleanup (Command-routed — no static out-edge here).
+    workflow.add_node("route_after_execution", _route_after_execution)
     workflow.add_node("cleanup", _invoke_cleanup)
     workflow.add_node("nav_skill_review", _invoke_nav_skill_review)
     workflow.add_node("skill_learner", _invoke_skill_learner)
@@ -5730,8 +5847,11 @@ def build_scrape_graph(
     # No conditional edge needed — the Command decides.
     # (Wave 2 Cut 2: the old pre_execution_approval hop in between was removed.)
 
-    # run_execution → cleanup (B2: cleanup always runs, never throws)
-    workflow.add_edge("run_execution", "cleanup")
+    # run_execution → route_after_execution (job-65 phase 3a: zero-item
+    # executions recycle through the strategy ladder; everything else routes
+    # to cleanup via the node's Command — NO static out-edge, the D6 lesson:
+    # a static edge unioned with Command routing runs BOTH destinations).
+    workflow.add_edge("run_execution", "route_after_execution")
 
     # cleanup → nav_skill_review (capture navigation learnings post-scrape)
     workflow.add_edge("cleanup", "nav_skill_review")

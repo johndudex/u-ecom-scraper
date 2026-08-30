@@ -103,6 +103,13 @@ class ScrapeState(TypedDict, total=False):
     # the loop is re-running a 900s writer against a draft it cannot improve —
     # escalate to human_approval instead of burning another cycle.
     writer_wall_clock_timeouts: int
+    # [job-65 phase 3a] Execution-phase strategy recycles. When the run reaches
+    # EXECUTION and the draft's Phase 1 discovers 0 URLs with a FAIL-class
+    # coverage stop_reason, route_after_execution sends the job back through
+    # scraper_analyzer → code_writer → code_tester with the failed strategy
+    # recorded (the testing ladder escalates the rung). Capped at 1: the first
+    # zero-item execution recycles; a second one finalizes honestly.
+    execution_recycle_count: int
     # [A2] consecutive code_writer invocations producing a draft byte-identical
     # to the last-tested draft (fixed syntax/CLI issues only, no semantic
     # change). ≥2 means the fix loop cannot improve the draft — escalate
