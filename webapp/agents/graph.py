@@ -3984,7 +3984,27 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
 
 
 
-def _probe_phase1_discovery(slug: str, state: dict, job_id: int) -> tuple[bool, str | None]:
+_PROBE_EXHAUSTION_STOP_REASONS = ("short_page", "no_next_link", "no_new_items")
+
+
+def _normalize_probe_stop_reason(stop_reason: str) -> str:
+    """Graph-level mirror of the draft-side reclassification
+    (src/listing_discovery): an exhaustion-flavored stop_reason on a ZERO-URL
+    probe is the blocked signature, not a genuine catalog end — a real
+    catalog-end requires having seen items. Reclassify to ``empty_first_page``
+    so ``_discovery_coverage_failure`` arms and ``classify_test_failure`` lands
+    on "strategy" (access problem → strategy ladder), never "refine".
+    Hard reasons (navigate_error) and unknown reasons pass through untouched.
+    """
+    sr = str(stop_reason or "")
+    if sr in _PROBE_EXHAUSTION_STOP_REASONS:
+        return "empty_first_page"
+    return sr
+
+
+def _probe_phase1_discovery(
+    slug: str, state: dict, job_id: int
+) -> tuple[bool, str | None, dict | None]:
     """Deterministically run the draft's Phase-1 discovery to catch discovery-path
     bugs that ``--sample`` testing skips.
 
@@ -3994,29 +4014,80 @@ def _probe_phase1_discovery(slug: str, state: dict, job_id: int) -> tuple[bool, 
     ``scraper_draft.py --discover-only --fresh-discovery`` (Phase 1 only, skips
     the expensive Phase 2 extraction) and fails the test on a real crash.
 
-    Returns ``(crashed, traceback_tail)``. Timeouts / unsupported flags are
-    inconclusive (``crashed=False``) — we don't fail on slow or opaque discovery.
+    [job-65 citybeach] The probe also returns its YIELD so a clean-exit run that
+    discovered ZERO item URLs can fail the test deterministically — the
+    ``phases_tested.phase1_discovery`` boolean is otherwise the tester LLM's
+    self-report, and a 0-URL discovery passed testing in every 0-item execution
+    this pipeline has shipped. The probe runs under EXECUTION conditions: the
+    listing URL is injected the same way ``run_execution`` injects
+    ``SCRAPER_LISTING_URL`` (list_page → the job's own URL first — job 310 —
+    else the navigator's ``discovery.listing_url``; F17 domain-guarded).
+
+    Returns ``(crashed, traceback_tail, probe_yield)``. ``probe_yield`` is a
+    dict (``discovered_urls``, ``stop_reason``, ``coverage``) ONLY when a fresh
+    output file was written by THIS probe run (mtime floor — never a stale
+    artifact); timeouts / unsupported flags / no fresh output are inconclusive
+    (``crashed=False, probe_yield=None``) — we don't fail on slow or opaque
+    discovery.
     """
     if not slug:
-        return False, None
+        return False, None, None
     # Only jobs with a discovery phase (nav modes); url_list has no Phase 1.
     if state.get("input_mode") not in ("search_term", "list_page", "navigation"):
-        return False, None
+        return False, None, None
     import subprocess
 
     try:
         root = _get_project_root()
         draft = os.path.join(root, "workspace", slug, "scraper_draft.py")
         if not os.path.isfile(draft):
-            return False, None
+            return False, None, None
         # Only probe if the draft actually supports --discover-only (static AST check).
         from agents.nodes.run_execution import _accepted_cli_flags
 
         accepted = _accepted_cli_flags(draft)
         if accepted is not None and "discover-only" not in accepted:
-            return False, None
-        logger.info("_probe_phase1_discovery: running --discover-only (job %s)", job_id)
+            return False, None, None
+        # C2: mirror run_execution's SCRAPER_LISTING_URL candidate chain so the
+        # probe tests the listing execution will actually use (job 310: for
+        # list_page the JOB URL outranks the navigator's promotion; F17
+        # domain-guards everything).
+        _probe_env_candidate = ""
+        if state.get("input_mode") == "list_page":
+            _jl = (state.get("url") or "").strip()
+            if _jl.startswith(("http://", "https://")):
+                _probe_env_candidate = _jl
+        if not _probe_env_candidate:
+            _nav = state.get("navigation_analysis") or {}
+            _disc = (_nav.get("discovery") if isinstance(_nav, dict) else None) or {}
+            _probe_env_candidate = (
+                _disc.get("listing_url") if isinstance(_disc, dict) else ""
+            ) or ""
+        if _probe_env_candidate:
+            try:
+                from agents.nodes.run_execution import _registrable_of
+
+                _job_reg = _registrable_of(state.get("url", ""))
+                _cand_reg = _registrable_of(_probe_env_candidate)
+                if _job_reg and _cand_reg and _cand_reg != _job_reg:
+                    logger.warning(
+                        "_probe_phase1_discovery: F17 dropped cross-domain listing "
+                        "%s (job domain %s)", _probe_env_candidate[:70], _job_reg,
+                    )
+                    _probe_env_candidate = ""
+            except Exception:
+                pass
+        _probe_env = (
+            {**os.environ, "SCRAPER_LISTING_URL": _probe_env_candidate}
+            if _probe_env_candidate
+            else None
+        )
+        logger.info(
+            "_probe_phase1_discovery: running --discover-only (job %s, listing=%s)",
+            job_id, (_probe_env_candidate or "<draft default>")[:80],
+        )
         probe_args = ["--discover-only", "--fresh-discovery"]
+        _probe_started = time.time()
         # Browser scrapers (Playwright/Selenium) can ONLY run in browser_service —
         # celery-worker has neither installed. Running the draft directly here
         # ModuleNotFoundError-crashes every browser draft, which route_after_testing
@@ -4046,7 +4117,17 @@ def _probe_phase1_discovery(slug: str, state: dict, job_id: int) -> tuple[bool, 
                             pass
                 resp = httpx.post(
                     f"{_get_browser_service_url()}/scrape",
-                    json={"scraper_source": _draft_source, "scraper_name": os.path.basename(draft), "extra_files": _probe_extra, "args": probe_args, "timeout": 180, "max_retries": 1},
+                    json={
+                        "scraper_source": _draft_source,
+                        "scraper_name": os.path.basename(draft),
+                        "extra_files": _probe_extra,
+                        "args": probe_args,
+                        "timeout": 180,
+                        "max_retries": 1,
+                        # C2: execution-conditions listing for browser drafts too.
+                        **({"env_overrides": {"SCRAPER_LISTING_URL": _probe_env_candidate}}
+                           if _probe_env_candidate else {}),
+                    },
                     timeout=180 + 60,
                 )
                 resp.raise_for_status()
@@ -4060,12 +4141,13 @@ def _probe_phase1_discovery(slug: str, state: dict, job_id: int) -> tuple[bool, 
                     "_probe_phase1_discovery: browser_service dispatch failed (%s) — inconclusive",
                     exc,
                 )
-                return False, None
+                return False, None, None
         else:
             proc = subprocess.run(
                 ["python3", draft] + probe_args,
                 cwd=os.path.join(root, "workspace", slug),
                 capture_output=True, text=True, timeout=180,
+                env=_probe_env,
             )
             rc = proc.returncode
             stderr = proc.stderr or ""
@@ -4077,7 +4159,7 @@ def _probe_phase1_discovery(slug: str, state: dict, job_id: int) -> tuple[bool, 
                 "_probe_phase1_discovery: CRASHED (job %s, rc=%s):\n%s",
                 job_id, rc, tail,
             )
-            return True, tail
+            return True, tail, None
         # argparse exit(2) carries NO Traceback — without this hook the probe
         # silently passed a draft whose CLI rejects the execution flags
         # (CLI-contract plan v2 hand-off). Treat it as a crash with the
@@ -4089,38 +4171,59 @@ def _probe_phase1_discovery(slug: str, state: dict, job_id: int) -> tuple[bool, 
                 "(job %s): %s",
                 job_id, tail,
             )
-            return True, tail
+            return True, tail, None
         logger.info(
             "_probe_phase1_discovery: OK (job %s, rc=%s)", job_id, rc
         )
-        # T2.1: surface the probe's discovery yield — the discovered count from
-        # the OUTPUT FILE (the generic contract: every two-phase template emits
-        # metadata.discovery_coverage.discovered_urls) with stdout as fallback
-        # evidence. Deterministic; feeds the volume arbitration downstream.
+        # [job-65 citybeach] Read THIS probe's yield from the output file it
+        # just wrote (mtime floor — a pre-probe artifact must never yield a
+        # verdict). Every two-phase template emits
+        # metadata.discovery_coverage.{discovered_urls, stop_reason}; on a
+        # --discover-only run ``found`` is 0 by construction, so the yield is
+        # ``discovered_urls`` (int; some templates emit a list).
+        probe_yield: dict | None = None
         try:
             _probe_out = _find_newest_output(
                 os.path.join(root, "workspace", slug),
                 os.path.join(root, "scrapers", slug),
                 slug=slug,
             )
-            if _probe_out:
-                _cov = _read_discovery_coverage(_probe_out)
-                _disc = (_cov or {}).get("found") or len(
-                    (_cov or {}).get("discovered_urls") or []
-                )
+            if _probe_out and os.path.getmtime(_probe_out) >= _probe_started - 5:
+                _cov = _read_discovery_coverage(_probe_out) or {}
+                _disc = _cov.get("discovered_urls")
+                if isinstance(_disc, list):
+                    _disc = len(_disc)
+                try:
+                    _disc_n = int(_disc or 0)
+                except (TypeError, ValueError):
+                    _disc_n = 0
+                _sr = str(_cov.get("stop_reason") or "")
+                probe_yield = {
+                    "discovered_urls": _disc_n,
+                    "stop_reason": _sr,
+                    "coverage": dict(_cov),
+                }
                 logger.info(
-                    "_probe_phase1_discovery: discovered=%s (coverage file %s, stdout tail: %r)",
-                    _disc, os.path.basename(_probe_out), _stdout.strip()[-200:],
+                    "_probe_phase1_discovery: discovered=%s stop_reason=%s "
+                    "(probe output %s, stdout tail: %r)",
+                    _disc_n, _sr or "?", os.path.basename(_probe_out),
+                    _stdout.strip()[-200:],
+                )
+            else:
+                logger.info(
+                    "_probe_phase1_discovery: no fresh probe output — yield "
+                    "inconclusive (job %s)", job_id,
                 )
         except Exception as _pexc:
             logger.debug("_probe_phase1_discovery: coverage read skipped: %s", _pexc)
+        return False, None, probe_yield
     except subprocess.TimeoutExpired:
         logger.info(
             "_probe_phase1_discovery: timed out (job %s) — inconclusive", job_id
         )
     except Exception as exc:
         logger.warning("_probe_phase1_discovery: errored (job %s): %s", job_id, exc)
-    return False, None
+    return False, None, None
 
 
 def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
@@ -4310,8 +4413,11 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         # Deterministic Phase-1 discovery probe: catches discovery-path crashes
         # that --sample testing skips (e.g. session.url phantom attributes). On a
         # real crash, force the test to FAIL so route_after_testing retries
-        # code_writer with the traceback.
-        crashed, tb = _probe_phase1_discovery(slug, dict(state), job_id)
+        # code_writer with the traceback. [job-65] A clean-exit run that
+        # discovered ZERO URLs fails the test too — under execution conditions
+        # (same listing injection as run_execution), so a draft whose discovery
+        # cannot see the site never reaches the 0-item execution.
+        crashed, tb, probe_yield = _probe_phase1_discovery(slug, dict(state), job_id)
         if crashed:
             report = report or {}
             report["overall_assessment"] = "FAIL"
@@ -4339,6 +4445,92 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             update["test_report"] = report
             logger.warning(
                 "_invoke_code_tester: discovery probe FAILED the test (job %s) → retry", job_id
+            )
+        elif (
+            probe_yield is not None
+            and probe_yield["discovered_urls"] == 0
+            and isinstance(report, dict)
+            and report.get("discovery_transient")
+        ):
+            # Job-311 lesson: a transient site-side block window must not burn
+            # the strategy ladder — the draft demonstrably worked earlier in
+            # this same testing phase.
+            logger.info(
+                "_invoke_code_tester: probe found 0 URLs but discovery_transient "
+                "evidence is attached — suppressing the zero-yield verdict (job %s)",
+                job_id,
+            )
+        elif probe_yield is not None and probe_yield["discovered_urls"] == 0:
+            report = report or {}
+            report["overall_assessment"] = "FAIL"
+            report["confidence_score"] = 0.0
+            report["ready_for_execution"] = False
+            _zcov = dict(probe_yield.get("coverage") or {})
+            _zsr = _normalize_probe_stop_reason(
+                _zcov.get("stop_reason") or probe_yield.get("stop_reason") or ""
+            )
+            _zcov.update({
+                "stop_reason": _zsr,
+                "ran_phase1": True,
+                "discovered_urls": 0,
+                "probe_scope": "discover_only",
+            })
+            report["discovery_coverage"] = _zcov
+            report.setdefault("phases_tested", {})["phase1_discovery"] = False
+            _zmsg = (
+                "Phase-1 discovery probe: clean exit but ZERO item URLs "
+                f"discovered under execution conditions (stop_reason={_zsr}). "
+                "The draft's discovery cannot see this site's items with the "
+                "current strategy."
+            )
+            report.setdefault("issues", []).insert(
+                0,
+                {"severity": "high", "message": _zmsg, "description": _zmsg},
+            )
+            report["feedback_for_writer"] = (
+                "PHASE-1 DISCOVERY YIELDED 0 URLS — caught by the deterministic "
+                "discovery probe (--discover-only, the listing execution will "
+                f"use, SCRAPER_LISTING_URL injected):\nstop_reason={_zsr}\n"
+                "Fix the discovery selectors/URL-building for this listing's "
+                "markup. Do NOT remove the shared discovery module wiring."
+            )
+            update["test_report"] = report
+            _retry_z = state.get("test_retry_count", 0)
+            _is_last_z = (
+                _retry_z == FINAL_RETRY_SENTINEL or _retry_z >= MAX_TEST_RETRIES
+            )
+            if _is_last_z:
+                update["error_message"] = (
+                    f"{_zmsg} Retries exhausted; refusing a guaranteed-0-item "
+                    "execution."
+                )
+                update["execution_status"] = "FAILED"
+            logger.warning(
+                "_invoke_code_tester: discovery probe ZERO-YIELD FAILED the "
+                "test (job %s, stop_reason=%s, retry_count=%s)",
+                job_id, _zsr, _retry_z,
+            )
+        elif probe_yield is not None:
+            # Probe succeeded with real yield: make the self-reported
+            # phase1_discovery boolean deterministic and record that the
+            # coverage verdict now reflects execution conditions. ``found``
+            # stays the tester's own (the probe skips Phase 2 by design —
+            # _volume_gap reads found/discovered and must see the real one).
+            _pcov = dict(report.get("discovery_coverage") or {}) if isinstance(report, dict) else {}
+            _pcov.update({
+                "stop_reason": probe_yield.get("stop_reason") or _pcov.get("stop_reason"),
+                "ran_phase1": True,
+                "discovered_urls": probe_yield["discovered_urls"],
+                "probe_scope": "discover_only",
+            })
+            report["discovery_coverage"] = _pcov
+            report.setdefault("phases_tested", {})["phase1_discovery"] = (
+                probe_yield["discovered_urls"] > 0
+            )
+            update["test_report"] = report
+            logger.info(
+                "_invoke_code_tester: probe yield %s URLs — phase1_discovery set "
+                "deterministically (job %s)", probe_yield["discovered_urls"], job_id,
             )
 
         # L2 CLI-contract hard gate (docs/cli-contract-plan.md): the LOAD-BEARING

@@ -40,7 +40,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from urllib.parse import urljoin, urlencode
+from urllib.parse import urlencode, urljoin
 
 logger = logging.getLogger(__name__)
 
