@@ -330,8 +330,12 @@ def get_shell_tools(
                     },
                     timeout=timeout + 60,
                 )
-                if _res.status_code == 404:
-                    return f"Scraper rejected by browser_service (source invalid)"
+                # W8 migration: _res is a ScrapeResult (browser_http), not an
+                # httpx.Response — .status_code here raised AttributeError on
+                # EVERY browser-strategy dispatch (sephora job 51: scraper never
+                # executed, CRASH verdict). error_class is the 404 bucket.
+                if _res.error_class == "not_found":
+                    return "Scraper rejected by browser_service (source invalid)"
                 if not _res.ok:
                     return (
                         f"Scraper run failed ({_res.error_class}): {_res.error}"

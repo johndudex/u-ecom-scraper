@@ -1011,7 +1011,10 @@ def _run_via_browser_service(
             timeout=timeout + 60,
         )
 
-        if _res.status_code == 404:
+        # ScrapeResult (browser_http), not httpx.Response — the W8 migration
+        # missed this site and .status_code AttributeError'd here (prod job 51
+        # class). error_class is the 404 bucket ("not_found").
+        if _res.error_class == "not_found":
             return {
                 "execution_status": "FAILED",
                 "error_message": "Scraper rejected by browser_service (source invalid)",
