@@ -78,7 +78,10 @@ def _extracted_item_count(report: dict) -> int:
 # Discovery-coverage gate (Phase 3). Tier 1 stop_reasons that mean the scraper
 # GAVE UP (errors / blocks / rate-limiting), NOT exhausted the source. A boolean
 # ``exhausted`` would have passed these — the H4 false-pass the gate exists to stop.
-_COVERAGE_FAIL_STOP_REASONS = {"navigate_error", "dedup_flat"}
+# ``empty_first_page`` ([job-58 birkenstock]) is the zero-URL run with no hard
+# error: an anti-bot challenge/consent wall served with HTTP 200 yields zero
+# product links, which the template loop misread as a genuine end-of-catalog.
+_COVERAGE_FAIL_STOP_REASONS = {"navigate_error", "dedup_flat", "empty_first_page"}
 
 
 def _discovery_coverage_failure(report: dict) -> Optional[str]:
@@ -86,8 +89,8 @@ def _discovery_coverage_failure(report: dict) -> Optional[str]:
 
     Reads ``test_report.discovery_coverage`` (code_tester copies it from the
     scraper output's ``metadata.discovery_coverage``). Tier 1 (always on, fully
-    generic): ``stop_reason`` in {navigate_error, dedup_flat} → the scraper
-    stopped due to errors/blocks/rate-limiting, NOT exhaustion.
+    generic): ``stop_reason`` in {navigate_error, dedup_flat, empty_first_page}
+    → the scraper stopped due to errors/blocks/rate-limiting, NOT exhaustion.
 
     Returns None when discovery didn't run or signals are absent — the gate is a
     NO-OP on missing data (never blocks).

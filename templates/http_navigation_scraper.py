@@ -439,6 +439,9 @@ def _get_next_page_url(final_url: str, next_page_num: int, html: str = None) -> 
 # blocked scraper. See docs/discovery-coverage-gate-contract.md §2.
 _STOP_REASON_PRIORITY = {
     "navigate_error": 5,   # FAIL  — gave up due to 502/503/block (NOT exhaustion)
+    "empty_first_page": 5,  # FAIL  — [job-58] zero URLs, no hard error = the
+    #                         "200-but-blocked" signature (challenge/consent
+    #                         wall served with HTTP 200), NOT a genuine end
     "dedup_flat": 4,        # FAIL  — broken dedup / feed injection suspected
     "navigate_throttled": 3,  # INCONCLUSIVE — 429 backpressure; coverage unproven, NOT a site defect
     "max_pages_hit": 3,     # INCONCLUSIVE — hit a cap, did not exhaust
@@ -662,6 +665,10 @@ def _discover_urls_via_search(
     unique_urls = list(dict.fromkeys(all_urls))
     if limit:
         unique_urls = unique_urls[:limit]
+    # NOTE: no zero-URL reclassification here. It lives ONCE in main() on the
+    # AGGREGATE url list — per-path reclass + _merge_stop_reason would let one
+    # blocked secondary category (200-but-empty) fail a run whose primary
+    # path found items (T2.1: never fail the run that found items).
     logger.info("Phase 1: Discovered %d total item URLs via search (%s)", len(unique_urls), stop_reason)
     return unique_urls, stop_reason
 
@@ -817,6 +824,7 @@ def _discover_urls_via_form_search(
     unique_urls = list(dict.fromkeys(all_urls))
     if limit:
         unique_urls = unique_urls[:limit]
+    # NOTE: see the search-path note — zero-URL reclassification lives in main().
     logger.info("Phase 1 (form-search): Discovered %d total item URLs across %d options (%s)",
                 len(unique_urls), len(options), stop_reason)
     return unique_urls, stop_reason
@@ -892,6 +900,7 @@ def _discover_urls_via_category(
     unique_urls = list(dict.fromkeys(all_urls))
     if limit:
         unique_urls = unique_urls[:limit]
+    # NOTE: see the search-path note — zero-URL reclassification lives in main().
     logger.info("Phase 1: Discovered %d total item URLs from category (%s)", len(unique_urls), stop_reason)
     return unique_urls, stop_reason
 
@@ -1225,6 +1234,18 @@ def main():
             discovered_urls = discovered_urls[:limit]
         _write_checkpoint(discovered_urls)
         logger.info("Phase 1 complete: %d total URLs discovered", len(discovered_urls))
+
+    # [job-58 birkenstock] Aggregate-level reclassification: ending Phase 1
+    # with ZERO discovered URLs and only PASS-flavored stop reasons is the
+    # "200-but-blocked" signature (an anti-bot challenge/consent wall served
+    # with HTTP 200 renders no item links), NOT a genuine end-of-catalog — a
+    # real catalog-end requires having seen items. Aggregate-only, never
+    # per-path: a blocked secondary category must not fail a run whose
+    # primary path found items (T2.1).
+    if not discovered_urls and aggregate_stop_reason in (
+        "short_page", "no_next_link", "no_new_items"
+    ):
+        aggregate_stop_reason = "empty_first_page"
 
     if not discovered_urls and not args.discover_only:
         logger.warning("No item URLs discovered")

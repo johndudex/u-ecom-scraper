@@ -68,12 +68,31 @@ MAX_PAGES = None
 # → strategy switch) instead of a multi-hour hang. Bounds discovery regardless
 # of the failure mode (blocking, infinite pagination, slow proxy escalation).
 DISCOVERY_DEADLINE_SECONDS = 300
+# [job-58 birkenstock] One-shot re-enumeration delay when Phase 1 ends with
+# ZERO discovered URLs and no hard navigate_error — the "200-but-blocked"
+# signature: an anti-bot challenge or consent wall served with HTTP 200
+# selects zero product links, which used to be classified as a genuine
+# "short_page" end-of-catalog. Backing off once and re-fetching rides out the
+# block window (the tester's run 90s earlier had discovered 15 URLs). Healthy
+# runs never pay this cost. 0 disables the retry.
+EMPTY_DISCOVERY_RETRY_DELAY_S = 45
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+# [job-58 birkenstock] Persistent session — cookies round-trip across every
+# request and the connection pool is reused. Bare requests.get() is a
+# cookieless one-shot per call: Akamai never sees the consent/_abck cookie a
+# real browser carries, every hit re-raises the bot score, and the test
+# phase's ~10 rapid draft runs in 45 minutes burned the worker IP's
+# reputation right before execution ran. A session both looks more human
+# and lets the 45s discovery retry ride out a challenge window with the
+# cookies it was handed.
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TIMESTAMP = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
@@ -137,7 +156,7 @@ def fetch_page(url: str) -> Optional[tuple[BeautifulSoup, int]]:
         for attempt in range(max_retries):
             try:
                 time.sleep(DELAY_BETWEEN_REQUESTS)
-                response = requests.get(url, headers=HEADERS, proxies=proxies, timeout=proxy_config.get_timeout(), verify=ssl_verify)
+                response = SESSION.get(url, proxies=proxies, timeout=proxy_config.get_timeout(), verify=ssl_verify)
                 if response.status_code == 200:
                     response.raise_for_status()
                     return BeautifulSoup(response.text, "html.parser"), response.status_code
@@ -319,6 +338,14 @@ def discover_product_urls() -> tuple[list[str], dict]:
     # navigate_error takes priority over later successes so the classifier sees FAIL.
     if saw_navigate_error:
         stop_reason = "navigate_error"
+    elif not all_urls and stop_reason in ("short_page", "no_next_link", "no_new_items"):
+        # [job-58 birkenstock] Ending every listing with ZERO discovered URLs
+        # and no hard error is the "200-but-blocked" signature: an anti-bot
+        # challenge or consent wall served with HTTP 200 selects zero product
+        # links, which "short_page" would misreport as a genuine end-of-catalog.
+        # A real catalog-end requires having seen items. Reclassify so the
+        # discovery-coverage gate FAILs the run instead of declaring exhaustion.
+        stop_reason = "empty_first_page"
 
     discovery_meta = {
         "stop_reason": stop_reason,
@@ -326,6 +353,34 @@ def discover_product_urls() -> tuple[list[str], dict]:
         "discovered_urls": len(all_urls),
     }
     return all_urls, discovery_meta
+
+
+def discover_product_urls_with_retry() -> tuple[list[str], dict]:
+    """[job-58 birkenstock] One-shot retry around Phase 1 discovery.
+
+    A zero-URL discovery with no hard navigate_error is the "200-but-blocked"
+    signature (see the reclassification in ``discover_product_urls``): the
+    listing fetch SUCCEEDS but yields zero product links. Back off once and
+    re-enumerate — the block window is often shorter than the gap between the
+    test phase's runs (birkenstock's tester run discovered 15 URLs 90s before
+    the blocked execution run). Healthy runs never enter the retry path.
+    """
+    urls, meta = discover_product_urls()
+    if urls or not EMPTY_DISCOVERY_RETRY_DELAY_S:
+        return urls, meta
+    if meta.get("stop_reason") in ("navigate_error", "navigate_throttled"):
+        return urls, meta
+    logger.warning(
+        "Phase 1 discovered 0 URLs (stop_reason=%s, likely 200-but-blocked) — "
+        "retrying once after %ss", meta.get("stop_reason"),
+        EMPTY_DISCOVERY_RETRY_DELAY_S,
+    )
+    time.sleep(EMPTY_DISCOVERY_RETRY_DELAY_S)
+    urls, meta = discover_product_urls()
+    meta["retried_empty_discovery"] = True
+    if not urls and meta.get("stop_reason") not in ("navigate_error", "navigate_throttled"):
+        meta["stop_reason"] = "empty_first_page"
+    return urls, meta
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -415,7 +470,7 @@ def main():
     if args.discover_only or _env_listing:
         logger.info("Discovery mode (%s): running Phase 1, skipping Phase 2 extraction",
                     "env-gate" if _env_listing else "--discover-only")
-        product_urls, discovery_meta = discover_product_urls()
+        product_urls, discovery_meta = discover_product_urls_with_retry()
         discovered_urls_raw = len(product_urls)
         ran_phase1 = True
         save_urls_to_file(INPUT_FILE, product_urls)
@@ -433,7 +488,7 @@ def main():
         skipped_reason = "checkpoint_loaded"
     else:
         logger.info("No input_urls.json found. Discovering products from listing page...")
-        product_urls, discovery_meta = discover_product_urls()
+        product_urls, discovery_meta = discover_product_urls_with_retry()
         discovered_urls_raw = len(product_urls)
         ran_phase1 = True
         save_urls_to_file(INPUT_FILE, product_urls)
