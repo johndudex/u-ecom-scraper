@@ -330,6 +330,13 @@ def main():
                         help="Run Phase 1 discovery only (capped), skip Phase 2 extraction")
     args = parser.parse_args()
 
+    if args.input:
+        # [job-60 zquiet] The runner's CWD is not the scraper's directory
+        # (the tester passes `--input input_urls.json` while CWD=/app), so a
+        # relative seed-file value must resolve against the scraper's own
+        # directory. os.path.join passes absolute paths through untouched.
+        args.input = os.path.join(SCRIPT_DIR, args.input)
+
     start_time = time.time()
 
     logger.info("=" * 80)
