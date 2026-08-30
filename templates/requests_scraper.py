@@ -26,7 +26,7 @@ from html import unescape
 from typing import Optional
 from urllib.parse import urljoin
 
-import requests
+import requests  # noqa: F401 -- drafts' Phase-2 helpers commonly need it
 from bs4 import BeautifulSoup
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -55,6 +55,14 @@ if PAGE_PARAM_NAME.startswith("{") and PAGE_PARAM_NAME.endswith("}"):
 # pages). Default: single listing — back-compat (single-listing sites behave
 # exactly as before: one URL, ?page=N).
 PRODUCT_LISTING_URLS = [PRODUCT_LISTING_URL]
+# Offset-style pagination (SFCC `start`, Algolia-style offsets): when
+# OFFSET_MODE is True the page param carries (page-1)*PAGE_SIZE instead of
+# the page number — e.g. ?start=0&sz=48, ?start=48&sz=48, ... code_writer
+# sets PAGE_SIZE / EXTRA_PAGE_PARAMS from navigation_analysis.pagination.
+PAGE_SIZE = None
+OFFSET_MODE = False
+# Extra query params merged into every listing page URL (e.g. {"sz": 48}).
+EXTRA_PAGE_PARAMS: dict = {}
 DELAY_BETWEEN_REQUESTS = {DELAY_BETWEEN_REQUESTS}
 # Safety cap on listing pagination (None = unlimited). code_writer may set this
 # to bound discovery on very large sites; hitting it yields stop_reason="max_pages_hit".
@@ -89,11 +97,23 @@ HEADERS = {
 # challenge pages, zero links, and the ladder had been stripped so there was
 # nothing to escalate to → 0 items). The module also carries the persistent
 # session (cookies round-trip — a bare requests.get() is a cookieless one-shot
-# that re-raises the bot score on every hit) and the soft-block min_tier
-# mechanism the discovery loop below drives. Full rationale: src/http_fetch.py.
+# that re-raises the bot score on every hit) and the soft-block proxy-tier
+# mechanism the shared discovery module drives. Full rationale: src/http_fetch.py.
 from src.http_fetch import create_fetch_page
 
 fetch_page = create_fetch_page(delay_s=DELAY_BETWEEN_REQUESTS, headers=HEADERS)
+
+# ── LISTING DISCOVERY — SHARED MODULE, NOT YOURS TO REIMPLEMENT (CRITICAL) ───
+# code_writer: keep the import + the main() call VERBATIM. The pagination
+# loop, the soft-block proxy-ladder escalation, the JSON-LD ItemList
+# fallback, and the zero-URL retry live in src/listing_discovery.py
+# (job-65 citybeach: the inline loop was rewritten and the escalation branch
+# deleted — the draft still EMITTED the soft_block_escalations counter, so
+# it looked instrumented, but no code path could ever increment it; the
+# execution-window soft block had no trigger and the job finalized 0 items).
+# The ONLY discovery code you adapt is _extract_listing_links below, plus
+# the data constants.
+from src.listing_discovery import discover_listing_urls_with_retry
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TIMESTAMP = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
@@ -216,170 +236,40 @@ def extract_product_from_page(soup: BeautifulSoup, url: str, status_code: int, s
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# DISCOVERY
+# DISCOVERY - adapt ONLY the callback below; the loop itself is the shared module
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def discover_product_urls() -> tuple[list[str], dict]:
-    """Phase 1: discover product URLs by paginating through listing pages.
+# CSS selector matching THIS site's product anchors on a listing page (from
+# navigation_analysis.discovery selectors).
+PRODUCT_LINK_SELECTOR = "{PRODUCT_LINK_SELECTOR}"
+if PRODUCT_LINK_SELECTOR.startswith("{"):
+    PRODUCT_LINK_SELECTOR = "a[href]"  # unfilled placeholder → permissive default
+# Optional compiled regex a candidate URL must match to count as a product
+# link (e.g. re.compile(r"/us/[^/]+/[^/]+\.html$")). Applied to anchors in
+# _extract_listing_links AND — via url_filter — to JSON-LD ItemList
+# candidates inside the shared module.
+PRODUCT_URL_RE = None
 
-    Returns ``(urls, discovery_meta)`` where ``discovery_meta`` carries the
-    signals required by the discovery-coverage gate (contract §1/§2):
 
-    - ``stop_reason``: why the loop terminated. ``navigate_error`` is sticky
-      across listings and distinguishable from exhaustion (H4).
-    - ``max_pages_hit``: True only when the loop stopped due to a non-None
-      ``MAX_PAGES`` cap.
-    - ``discovered_urls``: raw pre-filter URL count (== len(urls)).
+def _extract_listing_links(soup: BeautifulSoup) -> list[str]:
+    """The ONLY site-adaptable discovery code: this page's product URLs.
+
+    Contract: return a list of ABSOLUTE urls (dupes fine — the shared module
+    dedupes). Return [] when the page carries no product links; NEVER raise.
+    An empty result makes the module do exactly one of two things before it
+    gives up: check the page's JSON-LD ItemList (hidden-SSR listings embed
+    their item set there even when the visible grid hydrates client-side),
+    or escalate the proxy tier (200-but-zero-links soft-block signature).
     """
-    all_urls = []
-    seen = set()
-    # Default per contract §2: a loop that completes without an explicit break
-    # is treated as "ran off the end of pagination" (no next link).
-    stop_reason = "no_next_link"
-    saw_navigate_error = False
-    _deadline_start = time.monotonic()
-    # [job-62 birkenstock] Soft-block escalation state: the proxy tier index
-    # the next fetch starts from, and how many times a 200-but-zero-links
-    # page forced an escalation (surfaced in discovery_coverage).
-    min_tier = 0
-    soft_block_escalations = 0
-
-    # Enumerate every listing/category URL, paginating each until exhausted.
-    # Dedupe across listings via `seen`. For a single-listing site this is
-    # identical to the old ?page=N loop.
-    for listing_url in PRODUCT_LISTING_URLS:
-        page = 1
-        while True:
-            # Fail-fast: a blocked/slow discovery must not run unbounded.
-            if time.monotonic() - _deadline_start > DISCOVERY_DEADLINE_SECONDS:
-                logger.warning(
-                    "Discovery exceeded %ss deadline — stopping (navigate_error). "
-                    "A blocked strategy should fail fast so the gate switches.",
-                    DISCOVERY_DEADLINE_SECONDS,
-                )
-                saw_navigate_error = True
-                stop_reason = "navigate_error"
-                break
-            sep = "&" if "?" in listing_url else "?"
-            paginated_url = f"{listing_url}{sep}{PAGE_PARAM_NAME}={page}"
-            logger.info(f"Fetching listing page {page}: {paginated_url}")
-
-            result = fetch_page(paginated_url, min_tier)
-            if not result:
-                # HTTP error / 429-502-503 / connection failure / rate-limit bail.
-                # This is NOT exhaustion — the loop gave up (H4). navigate_error
-                # is sticky: if any listing failed, the gate must FAIL.
-                saw_navigate_error = True
-                stop_reason = "navigate_error"
-                break
-
-            soup, _ = result
-            links = soup.select("{PRODUCT_LINK_SELECTOR}")
-            new_on_page = 0
-            for link in links:
-                href = link.get("href", "")
-                absolute_url = make_absolute_url(href)
-                if absolute_url and absolute_url not in seen:
-                    seen.add(absolute_url)
-                    all_urls.append(absolute_url)
-                    new_on_page += 1
-
-            logger.info(
-                f"Listing {listing_url} page {page}: {len(links)} products "
-                f"found (total: {len(all_urls)})"
-            )
-
-            # [job-62 birkenstock] A tier that unblocks a listing becomes the
-            # floor for every later fetch (subsequent pages AND Phase-2 item
-            # pages) — without this, extraction would restart unproxied and
-            # re-enter the block.
-            if links and min_tier > fetch_page.min_tier_floor:
-                fetch_page.min_tier_floor = min_tier
-                logger.info(
-                    "Proxy tier index %s unblocked %s — locking it in as the "
-                    "floor for all later fetches", min_tier, listing_url,
-                )
-
-            # Short page: fewer items than expected → genuine end of results.
-            # BUT check for a SOFT BLOCK first [job-62 birkenstock]: HTTP 200
-            # whose body selects zero item links is the anti-bot challenge
-            # signature — is_banned() cannot see it (there is no 403/503
-            # status to test). Escalate one proxy tier and re-fetch the SAME
-            # page. Only page 1 escalates: an empty page >= 2 is a genuine
-            # end-of-catalog, and the ladder length bounds the escalation.
-            if len(links) == 0:
-                if page == 1 and min_tier < fetch_page.tiers_total - 1:
-                    min_tier += 1
-                    soft_block_escalations += 1
-                    logger.warning(
-                        "Page 1 of %s returned 200 with ZERO product links "
-                        "(soft-block signature) — escalating to proxy tier "
-                        "index %s and refetching", listing_url, min_tier,
-                    )
-                    continue
-                stop_reason = "short_page"
-                break
-
-            # Dedup worked: page returned items but none were new → exhausted.
-            if new_on_page == 0:
-                stop_reason = "no_new_items"
-                break
-
-            # MAX_PAGES safety cap (only fires when MAX_PAGES is non-None).
-            if MAX_PAGES is not None and page >= MAX_PAGES:
-                stop_reason = "max_pages_hit"
-                logger.info(f"Hit MAX_PAGES cap ({MAX_PAGES}) at {listing_url}, stopping")
-                break
-
-            page += 1
-
-    # navigate_error takes priority over later successes so the classifier sees FAIL.
-    if saw_navigate_error:
-        stop_reason = "navigate_error"
-    elif not all_urls and stop_reason in ("short_page", "no_next_link", "no_new_items"):
-        # [job-58 birkenstock] Ending every listing with ZERO discovered URLs
-        # and no hard error is the "200-but-blocked" signature: an anti-bot
-        # challenge or consent wall served with HTTP 200 selects zero product
-        # links, which "short_page" would misreport as a genuine end-of-catalog.
-        # A real catalog-end requires having seen items. Reclassify so the
-        # discovery-coverage gate FAILs the run instead of declaring exhaustion.
-        stop_reason = "empty_first_page"
-
-    discovery_meta = {
-        "stop_reason": stop_reason,
-        "max_pages_hit": stop_reason == "max_pages_hit",
-        "discovered_urls": len(all_urls),
-        "soft_block_escalations": soft_block_escalations,
-    }
-    return all_urls, discovery_meta
-
-
-def discover_product_urls_with_retry() -> tuple[list[str], dict]:
-    """[job-58 birkenstock] One-shot retry around Phase 1 discovery.
-
-    A zero-URL discovery with no hard navigate_error is the "200-but-blocked"
-    signature (see the reclassification in ``discover_product_urls``): the
-    listing fetch SUCCEEDS but yields zero product links. Back off once and
-    re-enumerate — the block window is often shorter than the gap between the
-    test phase's runs (birkenstock's tester run discovered 15 URLs 90s before
-    the blocked execution run). Healthy runs never enter the retry path.
-    """
-    urls, meta = discover_product_urls()
-    if urls or not EMPTY_DISCOVERY_RETRY_DELAY_S:
-        return urls, meta
-    if meta.get("stop_reason") in ("navigate_error", "navigate_throttled"):
-        return urls, meta
-    logger.warning(
-        "Phase 1 discovered 0 URLs (stop_reason=%s, likely 200-but-blocked) — "
-        "retrying once after %ss", meta.get("stop_reason"),
-        EMPTY_DISCOVERY_RETRY_DELAY_S,
-    )
-    time.sleep(EMPTY_DISCOVERY_RETRY_DELAY_S)
-    urls, meta = discover_product_urls()
-    meta["retried_empty_discovery"] = True
-    if not urls and meta.get("stop_reason") not in ("navigate_error", "navigate_throttled"):
-        meta["stop_reason"] = "empty_first_page"
-    return urls, meta
+    urls = []
+    for link in soup.select(PRODUCT_LINK_SELECTOR):
+        absolute_url = make_absolute_url(link.get("href", ""))
+        if not absolute_url:
+            continue
+        if PRODUCT_URL_RE is not None and not PRODUCT_URL_RE.search(absolute_url):
+            continue
+        urls.append(absolute_url)
+    return urls
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -459,6 +349,18 @@ def main():
     skipped_reason: Optional[str] = None
     discovery_meta: dict = {"stop_reason": "skipped", "max_pages_hit": False}
 
+    # Shared-module discovery config (data, not code — see the import banner).
+    _discovery_cfg = {
+        "page_param": PAGE_PARAM_NAME,
+        "page_size": PAGE_SIZE,
+        "offset_mode": OFFSET_MODE,
+        "extra_page_params": EXTRA_PAGE_PARAMS,
+        "url_filter": PRODUCT_URL_RE,
+        "max_pages": MAX_PAGES,
+        "deadline_s": DISCOVERY_DEADLINE_SECONDS,
+        "retry_delay_s": EMPTY_DISCOVERY_RETRY_DELAY_S,
+    }
+
     # Phase 1: URL discovery (or load from input).
     # F6 DETERMINISTIC DISCOVERY GATE (env-var): run_execution injects
     # SCRAPER_LISTING_URL because the LLM-adapted argparse may drop
@@ -476,7 +378,10 @@ def main():
     if args.discover_only or _env_listing:
         logger.info("Discovery mode (%s): running Phase 1, skipping Phase 2 extraction",
                     "env-gate" if _env_listing else "--discover-only")
-        product_urls, discovery_meta = discover_product_urls_with_retry()
+        product_urls, discovery_meta = discover_listing_urls_with_retry(
+            fetch_page, PRODUCT_LISTING_URLS, _extract_listing_links,
+            **_discovery_cfg,
+        )
         discovered_urls_raw = len(product_urls)
         ran_phase1 = True
         save_urls_to_file(INPUT_FILE, product_urls)
@@ -494,7 +399,10 @@ def main():
         skipped_reason = "checkpoint_loaded"
     else:
         logger.info("No input_urls.json found. Discovering products from listing page...")
-        product_urls, discovery_meta = discover_product_urls_with_retry()
+        product_urls, discovery_meta = discover_listing_urls_with_retry(
+            fetch_page, PRODUCT_LISTING_URLS, _extract_listing_links,
+            **_discovery_cfg,
+        )
         discovered_urls_raw = len(product_urls)
         ran_phase1 = True
         save_urls_to_file(INPUT_FILE, product_urls)
@@ -559,6 +467,9 @@ def main():
         # exhausted inside Phase 1 vs 45s retry also failed vs no friction).
         "soft_block_escalations": discovery_meta.get("soft_block_escalations", 0),
         "retried_empty_discovery": discovery_meta.get("retried_empty_discovery", False),
+        # Hidden-SSR observability [job-65 citybeach]: how many listing pages
+        # were read from their JSON-LD ItemList instead of anchors.
+        "jsonld_fallback_pages": discovery_meta.get("jsonld_fallback_pages", 0),
     }
 
     output = {

@@ -140,11 +140,47 @@ fetch_page = create_fetch_page(delay_s=DELAY_BETWEEN_REQUESTS, headers=HEADERS)
    0 items. Akamai-class sites allow the first hits, then challenge LATER
    runs. "Direct works now" describes this minute, not the execution window;
    it is never a reason to delete recovery machinery.
-3. **KEEP the discovery loop's `fetch_page(url, min_tier)` call and its
-   zero-links escalation branch verbatim.** The soft-block signature (HTTP
-   200, zero product links on page 1) is invisible to status-code ban checks;
-   the loop's tier escalation is the only recovery for it. Adapt selectors,
-   never the loop.
+3. **KEEP the discovery call's `fetch_page` argument and the
+   `_discovery_cfg` dict verbatim.** The discovery loop — and with it the
+   soft-block tier escalation — lives in `src.listing_discovery` (see the
+   next section); it calls `fetch_page(url, min_tier)` internally.
+
+### Listing discovery — SHARED MODULE (CRITICAL, requests template)
+
+The template's Phase-1 loop is an imported module, NOT inline code:
+
+```python
+from src.listing_discovery import discover_listing_urls_with_retry
+```
+
+**HARD RULES:**
+
+1. **KEEP the import, the `_discovery_cfg = dict(...)` block, and BOTH
+   `discover_listing_urls_with_retry(fetch_page, PRODUCT_LISTING_URLS,
+   _extract_listing_links, **_discovery_cfg)` call sites verbatim.** Do NOT
+   write your own pagination loop, do NOT move the zero-links check into
+   your own code, do NOT re-add a `soft_block_escalations` counter of your
+   own. Job-65 citybeach: the inline loop was rewritten and the escalation
+   branch deleted while the draft still emitted the counter — the output
+   LOOKED instrumented but could never recover from a soft block, and an
+   execution-window block (200 but zero links; the tester had discovered
+   1,317 URLs minutes earlier) finalized 0 items.
+2. **Adapt ONLY `_extract_listing_links(soup)` + the data constants.**
+   Return this page's ABSOLUTE product URLs (dupes fine; `[]` when none —
+   never raise). Set `PRODUCT_LINK_SELECTOR`, optionally `PRODUCT_URL_RE`,
+   the `PRODUCT_LISTING_URLS` list, and the pagination constants
+   (`PAGE_PARAM_NAME`, `PAGE_SIZE` + `OFFSET_MODE` + `EXTRA_PAGE_PARAMS`
+   for offset-style platforms like SFCC `?start=0&sz=48`). Anything else —
+   page-URL building, dedupe, per-page logging, ladder escalation, the
+   JSON-LD ItemList fallback (hidden-SSR listings embed their item URLs
+   there even when the grid hydrates client-side), the 45s retry, the
+   `empty_first_page` reclassification — lives in `src/listing_discovery.py`
+   and is NOT yours to edit or reimplement.
+3. **NEVER filter product links outside `_extract_listing_links`.** If a
+   page's anchors don't look like product URLs, tighten the selector or the
+   regex INSIDE the callback — an empty return value is a signal the module
+   acts on (ItemList check → proxy escalation → honest `empty_first_page`),
+   and pre-filtering elsewhere silently disables that recovery.
 
 ### Other discovery helpers — DO NOT re-signature
 

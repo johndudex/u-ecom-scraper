@@ -7,7 +7,7 @@ The failure: the tester's run discovered 15 URLs and extracted 5/5 (PASS
 ``short_page`` — "genuine end of results". Phase 1 "succeeded" with 0 URLs in
 1.65s → 0 items → the zero-item finalize gate failed the job. Nothing retried.
 
-Three layers fixed here:
+Layers fixed here:
 
 1. ``templates/requests_scraper.py`` — a zero-URL discovery with no hard
    ``navigate_error`` is reclassified to ``empty_first_page`` (a real
@@ -26,19 +26,31 @@ Three layers fixed here:
    cannot strip, and the discovery loop escalates the proxy tier on SOFT
    blocks (200-but-zero-links — invisible to ``is_banned``) with a floor so
    Phase 2 reuses the tier that unblocked Phase 1.
+5. ``src/listing_discovery.py`` + template rewiring [job-65 citybeach] — the
+   prod autopsy showed code_writer deleted the entire zero-links escalation
+   branch while keeping the counter: the draft still EMITTED
+   ``soft_block_escalations`` but no code path could increment it. The whole
+   loop now lives in a shared module (same defense as layer 4); the writer
+   adapts only ``_extract_listing_links`` + data constants. The module also
+   adds the JSON-LD ``ItemList`` fallback (hidden-SSR listings embed their
+   item URLs there while the visible grid hydrates client-side) and logs
+   anchors-served / usable-links / new separately so "0 anchors served" and
+   "300 anchors, none matching" stop being indistinguishable.
 
-The template halves are tested behaviorally (the discovery functions are
-exec-extracted into a namespace with a stubbed ``fetch_page``/``time`` —
-templates themselves stay unimportable) and statically (presence/shape),
-mirroring tests/test_discovery_ladder.py's split.
+The requests-template halves are tested against ``src.listing_discovery``
+directly (stubbed ``fetch_page`` + patched module ``time``) and the
+templates statically (presence/shape), mirroring tests/test_discovery_ladder.py's
+split.
 """
 from __future__ import annotations
 
 import ast
 import importlib
+import json
 import os
 import re
 import sys
+from types import SimpleNamespace
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -54,7 +66,7 @@ REQ = os.path.join(TEMPLATES, "requests_scraper.py")
 NAV = os.path.join(TEMPLATES, "http_navigation_scraper.py")
 
 
-# ─── namespace harness: exec-extract the template discovery functions ───────
+# ─── namespace harness: exec-extract the nav-template discovery functions ────
 
 
 def _grab(src: str, name: str) -> str:
@@ -84,104 +96,129 @@ class _FakeLink:
         return self._href
 
 
+class _FakeScript:
+    def __init__(self, payload: dict):
+        self.string = json.dumps(payload)
+
+
 class _FakeSoup:
-    def __init__(self, hrefs: list[str]):
-        self._hrefs = hrefs
+    """Listing page: ``select()`` returns the anchors the draft's selector
+    matches; ``find_all('a')`` returns EVERY anchor served (the diagnostic
+    split — a page can serve 300 anchors, none product-shaped);
+    ``find_all('script', type='application/ld+json')`` returns JSON-LD."""
+
+    def __init__(self, product_hrefs, anchors=None, jsonld_payloads=None):
+        self._product = product_hrefs
+        self._anchors = product_hrefs if anchors is None else anchors
+        self._jsonld = [_FakeScript(p) for p in (jsonld_payloads or [])]
 
     def select(self, _sel: str) -> list:
-        return [_FakeLink(h) for h in self._hrefs]
+        return [_FakeLink(h) for h in self._product]
+
+    def find_all(self, name, **_kwargs) -> list:
+        if name == "a":
+            return [_FakeLink(h) for h in self._anchors]
+        if name == "script":
+            return self._jsonld
+        return []
 
 
-class _FakeLogger:
-    def __init__(self):
-        self.warnings: list[str] = []
-
-    def info(self, *a, **k):
-        pass
-
-    def error(self, *a, **k):
-        pass
-
-    def warning(self, msg, *a, **k):
-        self.warnings.append(str(msg) % a if a else str(msg))
+def _default_extract(soup) -> list:
+    """Mirror the template's _extract_listing_links: select, absolutize."""
+    out = []
+    for link in soup.select(".prod"):
+        href = link.get("href", "")
+        out.append(href if href.startswith("http") else "https://site.test" + href)
+    return out
 
 
-def _make_ns(fetch_results: list, retry_delay: int = 45, listings: list | None = None):
-    """Namespace with the two extracted functions + controllable stubs.
+def _discover(
+    fetch_results: list,
+    retry_delay: int = 45,
+    listings: list | None = None,
+    url_filter=None,
+    extract_fn=None,
+    **cfg,
+) -> SimpleNamespace:
+    """Run ``discover_listing_urls_with_retry`` against a stubbed fetch_page.
 
-    ``fetch_results``: queue of ``list[str]`` (product hrefs on the page) or
-    None (fetch failure → navigate_error path). Each listing-page fetch pops
-    one entry; an exhausted queue yields empty pages.
-    ``listings``: override PRODUCT_LISTING_URLS (escalation tests use a single
-    listing so tier-call sequences are exact — a second listing re-escalates
-    after the first short-pages, by design).
+    ``fetch_results``: queue of entries — ``list[str]`` (product hrefs on the
+    page), ``dict`` ({product, anchors, jsonld}), or None (fetch failure →
+    navigate_error). An exhausted queue yields empty pages.
+    ``listings``: override the listing URL list (escalation tests use a
+    single listing so tier-call sequences are exact — a second listing
+    re-escalates after the first short-pages, by design).
     """
-    with open(REQ) as fh:
-        src = fh.read()
-    # The template placeholder is a literal CSS selector; make it selectable.
-    src = src.replace('"{PRODUCT_LINK_SELECTOR}"', '".prod"')
-    ns = {
-        "time": _FakeTime(),
-        "logger": _FakeLogger(),
-        "PRODUCT_LISTING_URLS": listings
-        or ["https://site.test/de/a/", "https://site.test/de/b/"],
-        "PAGE_PARAM_NAME": "page",
-        "DISCOVERY_DEADLINE_SECONDS": 300,
-        "MAX_PAGES": None,
-        "EMPTY_DISCOVERY_RETRY_DELAY_S": retry_delay,
-        "make_absolute_url": lambda u, base="": (
-            u if u.startswith("http") else "https://site.test" + u
-        ),
-        "fetch_page": None,  # set below (needs the queue)
-    }
+    ld = importlib.import_module("src.listing_discovery")
+    fake_time = _FakeTime()
+    old_time = ld.time
+    ld.time = fake_time
 
     queue = list(fetch_results)
     tier_calls: list[int] = []
 
     def fetch_page(_url, min_tier=0):
-        # Mirror the real fetch_page contract: None on total failure
-        # (all proxy tiers exhausted), (soup, status) on any HTTP response.
-        # ``min_tier`` is the soft-block escalation index (job-62).
         tier_calls.append(min_tier)
-        r = queue.pop(0) if queue else []
-        return None if r is None else (_FakeSoup(r), 200)
+        r = queue.pop(0) if queue else {}
+        if r is None:
+            return None
+        if isinstance(r, dict):
+            soup = _FakeSoup(
+                r.get("product", []),
+                anchors=r.get("anchors"),
+                jsonld_payloads=r.get("jsonld"),
+            )
+        else:
+            soup = _FakeSoup(r)
+        return soup, 200
 
-    # Closure attributes the discovery loop reads (mirrors src/http_fetch.py):
-    # the escalation bound and the floor the loop raises once a tier works.
+    # Closure attributes the loop reads (mirrors src/http_fetch.py): the
+    # escalation bound and the floor the loop raises once a tier works.
     fetch_page.min_tier_floor = 0
     fetch_page.tiers_total = 3  # none → datacenter → residential
     fetch_page.tier_calls = tier_calls
 
-    ns["fetch_page"] = fetch_page
+    try:
+        urls, meta = ld.discover_listing_urls_with_retry(
+            fetch_page,
+            listings or ["https://site.test/de/a/", "https://site.test/de/b/"],
+            extract_fn or _default_extract,
+            page_param="page",
+            retry_delay_s=retry_delay,
+            deadline_s=cfg.pop("deadline_s", 300),
+            max_pages=cfg.pop("max_pages", None),
+            url_filter=url_filter,
+            **cfg,
+        )
+    finally:
+        ld.time = old_time
 
-    fn_src = _grab(src, "discover_product_urls")
-    fn_src += _grab(src, "discover_product_urls_with_retry")
-    exec(compile(fn_src, REQ, "exec"), ns)  # noqa: S102
-    return ns
+    return SimpleNamespace(
+        urls=urls, meta=meta, fetch_page=fetch_page, time=fake_time,
+        tier_calls=tier_calls,
+    )
 
 
-# ─── behavioral: requests-template discovery ─────────────────────────────────
+# ─── behavioral: listing discovery (job-58/62 signatures) ────────────────────
 
 
 class TestZeroUrlReclassification:
     def test_blocked_zero_url_run_is_empty_first_page_and_retried(self):
         """The job-58 signature: every listing fetch 'succeeds' but yields zero
         product links → empty_first_page, plus exactly one 45s retry."""
-        ns = _make_ns([[], [], [], []])  # both listings × 2 attempts, all empty
-        urls, meta = ns["discover_product_urls_with_retry"]()
-        assert urls == []
-        assert meta["stop_reason"] == "empty_first_page"
-        assert meta["retried_empty_discovery"] is True
-        assert ns["time"].sleeps == [45]
+        h = _discover([[], [], [], []])  # both listings × 2 attempts, all empty
+        assert h.urls == []
+        assert h.meta["stop_reason"] == "empty_first_page"
+        assert h.meta["retried_empty_discovery"] is True
+        assert h.time.sleeps == [45]
 
     def test_zero_urls_without_retry_delay_disabled(self):
         """Retry disabled (delay 0) → single pass, still reclassified."""
-        ns = _make_ns([[], []], retry_delay=0)
-        urls, meta = ns["discover_product_urls_with_retry"]()
-        assert urls == []
-        assert meta["stop_reason"] == "empty_first_page"
-        assert "retried_empty_discovery" not in meta
-        assert ns["time"].sleeps == []
+        h = _discover([[], []], retry_delay=0)
+        assert h.urls == []
+        assert h.meta["stop_reason"] == "empty_first_page"
+        assert "retried_empty_discovery" not in h.meta
+        assert h.time.sleeps == []
 
     def test_escalation_recovers_without_paying_the_retry(self):
         """[job-62 birkenstock] Page 1 blocked at tier 0 (200, zero links) but
@@ -189,55 +226,51 @@ class TestZeroUrlReclassification:
         in the SAME pass — no 45s retry, no empty_first_page. This is the path
         the stripped draft lacked entirely."""
         page1 = ["/de/p/first_1.html", "/de/p/second_2.html"]
-        ns = _make_ns([[], page1, []], listings=["https://site.test/de/a/"])
-        urls, meta = ns["discover_product_urls_with_retry"]()
-        assert len(urls) == 2
-        assert meta["stop_reason"] != "empty_first_page"
-        assert meta["soft_block_escalations"] == 1
-        assert ns["time"].sleeps == []  # retry path never entered
-        assert ns["fetch_page"].tier_calls == [0, 1, 1]  # ladder climbed, then floor held
+        h = _discover([[], page1, []], listings=["https://site.test/de/a/"])
+        assert len(h.urls) == 2
+        assert h.meta["stop_reason"] != "empty_first_page"
+        assert h.meta["soft_block_escalations"] == 1
+        assert h.time.sleeps == []  # retry path never entered
+        assert h.tier_calls == [0, 1, 1]  # ladder climbed, then floor held
 
     def test_genuine_end_after_items_keeps_short_page_no_retry(self):
         """A real catalog-end requires having seen items: listing A yields
         products on page 1 then thins out on page 2 → short_page, PASS, and
         the retry path is never entered."""
-        ns = _make_ns(
+        h = _discover(
             [
                 ["/de/p/a1_1.html", "/de/p/a2_2.html"],  # page 1
                 [],                                      # page 2 (thin)
             ],
             listings=["https://site.test/de/a/"],
         )
-        urls, meta = ns["discover_product_urls_with_retry"]()
-        assert len(urls) == 2
-        assert meta["stop_reason"] == "short_page"
-        assert ns["time"].sleeps == []  # healthy run pays nothing
+        assert len(h.urls) == 2
+        assert h.meta["stop_reason"] == "short_page"
+        assert h.time.sleeps == []  # healthy run pays nothing
 
     def test_one_blocked_listing_does_not_poison_a_working_one(self):
         """Listing A blocked-empty, listing B finds URLs → partial coverage
         succeeds (urls non-empty → no retry); the T2.1 lesson: never fail the
         run that found items. The per-listing emptiness stays visible in the
         last-wins stop_reason but NOT as empty_first_page."""
-        ns = _make_ns([
+        h = _discover([
             [],                                       # listing A tier 0: blocked
             [],                                       # listing A tier 1: blocked
             [],                                       # listing A tier 2: blocked
             ["/de/p/b1_1.html", "/de/p/b2_2.html"],   # listing B page 1
             [],                                       # listing B page 2
         ])
-        urls, meta = ns["discover_product_urls_with_retry"]()
-        assert len(urls) == 2
-        assert meta["stop_reason"] != "empty_first_page"
-        assert ns["time"].sleeps == []
+        assert len(h.urls) == 2
+        assert h.meta["stop_reason"] != "empty_first_page"
+        assert h.time.sleeps == []
 
     def test_hard_navigate_error_neither_retried_nor_reclassified(self):
         """A real fetch failure (proxy escalation exhausted → None) is already
         the FAIL signal — no retry, no reclassification."""
-        ns = _make_ns([None])
-        urls, meta = ns["discover_product_urls_with_retry"]()
-        assert urls == []
-        assert meta["stop_reason"] == "navigate_error"
-        assert ns["time"].sleeps == []
+        h = _discover([None])
+        assert h.urls == []
+        assert h.meta["stop_reason"] == "navigate_error"
+        assert h.time.sleeps == []
 
 
 # ─── behavioral: soft-block proxy escalation [job-62] ─────────────────────────
@@ -249,41 +282,162 @@ class TestSoftBlockEscalation:
         escalations fire (bounded by ladder length), the listing ends
         short_page, and the run still classifies honestly as
         empty_first_page. Friction is visible in discovery_meta."""
-        ns = _make_ns([[]] * 3, retry_delay=0, listings=["https://site.test/de/a/"])
-        urls, meta = ns["discover_product_urls_with_retry"]()
-        assert urls == []
-        assert meta["stop_reason"] == "empty_first_page"
-        assert meta["soft_block_escalations"] == 2
-        assert ns["fetch_page"].tier_calls == [0, 1, 2]
-        assert ns["time"].sleeps == []
+        h = _discover([[]] * 3, retry_delay=0, listings=["https://site.test/de/a/"])
+        assert h.urls == []
+        assert h.meta["stop_reason"] == "empty_first_page"
+        assert h.meta["soft_block_escalations"] == 2
+        assert h.tier_calls == [0, 1, 2]
+        assert h.time.sleeps == []
 
     def test_empty_page_beyond_page_1_never_escalates(self):
         """An empty page >= 2 is a genuine catalog end — only page 1 of a
         listing escalates. Without that guard every thin category tail would
         burn two proxy escalations per listing."""
-        ns = _make_ns(
+        h = _discover(
             [["/de/p/only_1.html"], []],
             retry_delay=0,
             listings=["https://site.test/de/a/"],
         )
-        urls, meta = ns["discover_product_urls_with_retry"]()
-        assert len(urls) == 1
-        assert meta["stop_reason"] == "short_page"
-        assert meta["soft_block_escalations"] == 0
-        assert ns["fetch_page"].tier_calls == [0, 0]
+        assert len(h.urls) == 1
+        assert h.meta["stop_reason"] == "short_page"
+        assert h.meta["soft_block_escalations"] == 0
+        assert h.tier_calls == [0, 0]
 
     def test_escalated_tier_locks_in_as_floor(self):
         """Once a tier unblocks a listing, the closure's min_tier_floor is
         raised so later fetches — subsequent pages AND Phase-2 item pages,
         which call fetch_page(url) with no explicit min_tier — reuse it
         instead of restarting unproxied and re-entering the block."""
-        ns = _make_ns(
+        h = _discover(
             [[], ["/de/p/x_1.html"]],
             retry_delay=0,
             listings=["https://site.test/de/a/"],
         )
-        ns["discover_product_urls_with_retry"]()
-        assert ns["fetch_page"].min_tier_floor == 1
+        assert h.fetch_page.min_tier_floor == 1
+
+
+# ─── behavioral: JSON-LD ItemList fallback [job-65 citybeach] ─────────────────
+
+
+class TestJsonLdItemListFallback:
+    def test_hidden_ssr_listing_discovered_via_itemlist(self):
+        """The job-65 signature: a 200 listing whose grid hydrates client-side
+        serves ZERO product anchors but embeds its item set as a JSON-LD
+        ItemList. Discovery must read it at tier 0 — no escalation, no
+        retry, no empty_first_page — and surface the fallback in meta."""
+        itemlist = {
+            "@type": "ItemList",
+            "itemListElement": [
+                {"item": {"url": "/de/p/a_1.html"}},
+                {"@type": "ListItem", "url": "/de/p/b_2.html"},
+            ],
+        }
+        h = _discover(
+            [
+                {"product": [], "anchors": ["/nav/a", "/nav/b"], "jsonld": [itemlist]},
+                {"product": [], "anchors": ["/nav/a"], "jsonld": []},
+            ],
+            retry_delay=0,
+            listings=["https://site.test/de/a/"],
+        )
+        assert len(h.urls) == 2
+        assert h.meta["stop_reason"] == "short_page"  # genuine thin page-2 tail
+        assert h.meta["soft_block_escalations"] == 0
+        assert h.meta["jsonld_fallback_pages"] == 1
+        assert h.tier_calls == [0, 0]
+
+    def test_breadcrumb_list_is_not_accepted_as_item_source(self):
+        """BreadcrumbList also carries itemListElement — accepting it would
+        discover navigation crumbs as product URLs. Only ItemList counts;
+        a breadcrumb-only page is still 'zero product links' and escalates."""
+        crumb = {
+            "@type": "BreadcrumbList",
+            "itemListElement": [{"item": {"@id": "/de/c/a"}, "name": "A"}],
+        }
+        h = _discover(
+            [{"product": [], "anchors": ["/nav/a"], "jsonld": [crumb]}] * 3,
+            retry_delay=0,
+            listings=["https://site.test/de/a/"],
+        )
+        assert h.urls == []
+        assert h.meta["stop_reason"] == "empty_first_page"
+        assert h.meta["jsonld_fallback_pages"] == 0
+        assert h.tier_calls == [0, 1, 2]
+
+    def test_url_filter_gates_itemlist_candidates(self):
+        """url_filter (the template's PRODUCT_URL_RE) applies to ItemList
+        candidates too — a filtered-to-zero ItemList does not masquerade as
+        discovery, the soft-block path runs instead."""
+        itemlist = {
+            "@type": "ItemList",
+            "itemListElement": [{"item": {"url": "/de/p/a_1.html"}}],
+        }
+        h = _discover(
+            [{"product": [], "anchors": [], "jsonld": [itemlist]}] * 3,
+            retry_delay=0,
+            listings=["https://site.test/de/a/"],
+            url_filter=re.compile(r"/us/"),
+        )
+        assert h.urls == []
+        assert h.meta["jsonld_fallback_pages"] == 0
+        assert h.meta["soft_block_escalations"] == 2
+
+    def test_anchors_served_but_none_matching_still_escalates(self):
+        """THE job-65 bypass, killed: a page serving 300 anchors whose hrefs
+        never match the product shape used to collapse to
+        `new_on_page == 0 → no_new_items` in the rewritten draft, bypassing
+        the escalation branch entirely. The zero-check now runs on the
+        callback's OUTPUT inside the module: 0 usable → escalation fires."""
+        h = _discover(
+            [
+                {"product": [], "anchors": ["/nav/a", "/nav/b", "/nav/c"]},
+                ["/de/p/recovered_1.html"],
+                [],
+            ],
+            retry_delay=0,
+            listings=["https://site.test/de/a/"],
+        )
+        assert len(h.urls) == 1
+        assert h.meta["soft_block_escalations"] == 1
+        assert h.tier_calls == [0, 1, 1]
+
+
+# ─── behavioral: pagination URL building + diagnostics ────────────────────────
+
+
+class TestPaginationAndDiagnostics:
+    def test_numbered_and_offset_page_urls(self):
+        ld = importlib.import_module("src.listing_discovery")
+        assert ld.build_page_url("https://x/c/", 1) == "https://x/c/?page=1"
+        assert ld.build_page_url("https://x/c/?a=1", 3, "p") == "https://x/c/?a=1&p=3"
+        # SFCC-style offset: ?start=0&sz=48, ?start=48&sz=48 ...
+        assert ld.build_page_url(
+            "https://x/c/", 2, "start", page_size=48, offset_mode=True,
+            extra_page_params={"sz": 48},
+        ) == "https://x/c/?start=48&sz=48"
+        try:
+            ld.build_page_url("https://x/c/", 2, "start", offset_mode=True)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("offset_mode without page_size must raise")
+
+    def test_per_page_log_distinguishes_anchors_from_matches(self, caplog):
+        """The diagnostic regression that blinded the job-65 autopsy: the
+        draft logged only the post-filter count. The module logs anchors
+        served, usable product links, and new — all three."""
+        import logging
+
+        ld = importlib.import_module("src.listing_discovery")
+        with caplog.at_level(logging.INFO, logger=ld.__name__):
+            _discover(
+                [{"product": [], "anchors": ["/nav/a", "/nav/b", "/nav/c"]}, []],
+                retry_delay=0,
+                listings=["https://site.test/de/a/"],
+            )
+        assert "3 anchors" in caplog.text
+        assert "0 usable" in caplog.text
+        assert "0 new" in caplog.text
 
 
 # ─── behavioral: pipeline coverage gate ──────────────────────────────────────
@@ -371,18 +525,34 @@ class TestHttpNavigationTemplate:
 
 
 class TestRequestsTemplateCallSites:
-    def test_both_discovery_call_sites_use_the_retry_wrapper(self):
+    def test_both_discovery_call_sites_use_the_shared_module(self):
         with open(REQ) as fh:
             src = fh.read()
-        assert len(re.findall(r"= discover_product_urls_with_retry\(\)", src)) == 2
-        # The only bare calls are the wrapper's own two attempts (initial + retry).
-        assert len(re.findall(r"= discover_product_urls\(\)", src)) == 2
+        # --discover-only/env-gate branch + no-input branch.
+        assert len(re.findall(r"= discover_listing_urls_with_retry\(", src)) == 2
+        # The inline loop is gone — nothing left for code_writer to rewrite.
+        assert "def discover_product_urls" not in src
+        assert "def discover_listing" not in src
+        assert "def discover_" not in src.replace("_extract_listing_links", "")
+        for gone in ("len(links)", "no_new_items", "min_tier", "min_tier_floor"):
+            assert gone not in src, gone
+        # The counter may be READ for the coverage emitter (main) — but never
+        # initialized or incremented outside the module (the job-65 hollow
+        # counter: emitted but no code path could ever raise it).
+        assert "soft_block_escalations +=" not in src
+        assert "soft_block_escalations = " not in src
 
-    def test_wrapper_and_constant_exist(self):
+    def test_import_and_callback_present(self):
         with open(REQ) as fh:
             src = fh.read()
+        assert "from src.listing_discovery import discover_listing_urls_with_retry" in src
+        assert "def _extract_listing_links(soup" in src
+        # The callback filters via the data constants, INSIDE its own body.
+        assert "PRODUCT_URL_RE" in _grab(src, "_extract_listing_links")
+        # The retry delay + ItemList gate are wired through the config dict.
+        assert '"retry_delay_s": EMPTY_DISCOVERY_RETRY_DELAY_S' in src
+        assert '"url_filter": PRODUCT_URL_RE' in src
         assert "EMPTY_DISCOVERY_RETRY_DELAY_S = 45" in src
-        assert "def discover_product_urls_with_retry()" in src
 
     def test_fetch_machinery_is_the_shared_module_not_inline(self):
         """[job-62 birkenstock root cause] code_writer rewrote fetch_page
@@ -399,12 +569,34 @@ class TestRequestsTemplateCallSites:
         assert "def fetch_page" not in src  # nothing inline to strip
         assert "requests.Session()" not in src  # session lives in the module
         assert "proxy_config" not in src  # module owns the ProxyConfig usage
-        assert "min_tier" in src  # discovery loop drives the soft-block ladder
 
         with open(os.path.join(ROOT, "src", "http_fetch.py")) as fh:
             mod = fh.read()
         assert "requests.Session()" in mod  # persistent-session fix retained
         assert "min_tier_floor" in mod and "tiers_total" in mod
+
+    def test_discovery_machinery_is_the_shared_module_not_inline(self):
+        """[job-65 citybeach root cause] code_writer deleted the zero-links
+        escalation branch while keeping the counter — the draft emitted
+        soft_block_escalations but nothing could increment it. The loop now
+        lives in src/listing_discovery.py; the template defines only the
+        callback + data constants."""
+        with open(REQ) as fh:
+            src = fh.read()
+        with open(os.path.join(ROOT, "src", "listing_discovery.py")) as fh:
+            mod = fh.read()
+        # The module owns every recovery mechanism...
+        for machinery in ("soft_block_escalations", "min_tier", "min_tier_floor",
+                          "empty_first_page", "jsonld_item_urls", "no_new_items"):
+            assert machinery in mod, machinery
+        # ...and the template owns none of it (nothing left to strip). The one
+        # allowed reference is main()'s coverage emitter reading the module's
+        # meta — no init, no increment, no loop logic.
+        for machinery in ("min_tier", "min_tier_floor",
+                          "empty_first_page", "no_new_items", "len(links)"):
+            assert machinery not in src, machinery
+        assert "soft_block_escalations +=" not in src
+        assert "soft_block_escalations = " not in src
 
     def test_friction_counters_surface_in_discovery_coverage(self):
         """Job-62's prod output carried retried_empty_discovery in
@@ -416,6 +608,7 @@ class TestRequestsTemplateCallSites:
         main_src = _grab(src, "main")
         assert '"soft_block_escalations"' in main_src
         assert '"retried_empty_discovery"' in main_src
+        assert '"jsonld_fallback_pages"' in main_src
 
 
 if __name__ == "__main__":
