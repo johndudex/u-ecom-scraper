@@ -213,7 +213,14 @@ PIPELINE_PHASES = [
 
 
 def _seed_pipeline_steps(job: ScrapeJob) -> None:
-    for phase in PIPELINE_PHASES:
+    # dagster_converter is opt-in ([dagster-opt-in]): no Step row for jobs that
+    # didn't ask for it, so the pipeline UI never shows a permanently-pending
+    # phase that will never run. _finalize_job's close-lingering-steps loop is
+    # step-status based, so a missing row is harmless there too.
+    phases = PIPELINE_PHASES
+    if not job.dagster_enabled:
+        phases = [p for p in PIPELINE_PHASES if p != "dagster_converter"]
+    for phase in phases:
         Step.objects.get_or_create(job=job, phase=phase)
 
 
@@ -586,6 +593,7 @@ def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
         "sample_only": not job.full_extraction,
         "rescrape": False,
         "skip_approvals": bool(job.skip_approvals),
+        "dagster_enabled": bool(job.dagster_enabled),
         "page_type": page_type,
         "input_mode": input_mode,
         "site_type": site_type,

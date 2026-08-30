@@ -1654,6 +1654,15 @@ components:
           type: string
           maxLength: 4000
           description: Free-text guidance for the analysis agents (advisory).
+        dagster_enabled:
+          type: boolean
+          default: false
+          description: |
+            Opt-in Dagster conversion. When `true`, the pipeline runs a final
+            `dagster_converter` phase that emits a Dagster asset module
+            (`{slug}_dagster.py`, downloadable via `artifact_type=dagster_code`).
+            Default `false` — the phase is skipped entirely and no Dagster step
+            appears in the job's phase list.
         title:
           type: string
           maxLength: 200

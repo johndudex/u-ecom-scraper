@@ -134,6 +134,9 @@ def create_job(request):
             schema_text=schema_text,
             full_extraction=False,
             skip_approvals=True,
+            # Opt-in like the intake checkbox ([dagster-opt-in]) — partners post
+            # dagster_enabled=true only when they want the asset generated.
+            dagster_enabled=bool(body.get("dagster_enabled", False)),
             created_via="api",
             user=request.api_user,
         )

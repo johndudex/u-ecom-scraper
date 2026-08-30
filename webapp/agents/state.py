@@ -34,6 +34,9 @@ class ScrapeState(TypedDict, total=False):
     force_full: bool
     # Intake-UI jobs skip all human-approval gates (run unattended).
     skip_approvals: bool
+    # Dagster conversion is opt-in (intake checkbox / partner-API flag). False
+    # (default) → dagster_converter short-circuits and no step is seeded.
+    dagster_enabled: bool
     # Intake-UI schema knobs. target_fields ENFORCES the output schema (the
     # agents + validate_coverage + normalize_fields read these). Declared here
     # so LangGraph persists them in the graph state (otherwise they'd be stripped).

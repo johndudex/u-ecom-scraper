@@ -233,3 +233,23 @@ class TestDagsterSkipGuard:
         after = Step.objects.filter(job=job, phase="dagster_converter").count()
         assert before == after
         assert out == {"messages": []}
+
+    def test_skips_when_not_opted_in(self, partner, db):
+        """[dagster-opt-in] the phase is opt-in now: no ``dagster_enabled`` in
+        state → short-circuit BEFORE the running notify, even on a SUCCESS
+        job (the old unconditional behavior). Bare dict on purpose — mirrors
+        how the graph harness drives this node."""
+        import agents.graph as graph_mod
+
+        u, _raw = partner
+        job = _job(u, status="completed")
+        from scraper.models import Step
+
+        before = Step.objects.filter(job=job, phase="dagster_converter").count()
+        out = graph_mod._invoke_dagster_converter(
+            {"job_id": job.id, "site_slug": "gap", "execution_status": "SUCCESS"},
+            None,
+        )
+        after = Step.objects.filter(job=job, phase="dagster_converter").count()
+        assert before == after
+        assert out == {"messages": []}

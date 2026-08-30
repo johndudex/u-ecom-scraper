@@ -4372,6 +4372,14 @@ def _invoke_dagster_converter(
     the job status."""
     job_id = state.get("job_id", 0)
     slug = state.get("site_slug", "")
+    # Dagster conversion is OPT-IN ([dagster-opt-in], intake checkbox /
+    # partner-API flag): skip unless the job explicitly asked for it. state.get
+    # (not state[...]) because tests drive this node with a bare dict.
+    if not state.get("dagster_enabled", False):
+        logger.info(
+            "_invoke_dagster_converter: skipping (not opted in, job %s)", job_id
+        )
+        return {"messages": []}
     # P2 (Railway job-1 forensics): skip on non-SUCCESS — converting a
     # scraper for a failed job burned 6 minutes on prod. Same guard pattern
     # as skill_learner/store_job_listings.

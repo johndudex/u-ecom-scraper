@@ -144,6 +144,12 @@ class ScrapeJob(models.Model):
     # which later jobs can overwrite). [per-job-attribution]
     scraper_file = models.CharField(max_length=500, blank=True, default="")
     dagster_file = models.CharField(max_length=500, blank=True, default="")
+    # Dagster conversion is OPT-IN (intake checkbox, partner-API flag): the
+    # dagster_converter phase is skipped unless explicitly requested. It used
+    # to run unconditionally on every successful job — even when nobody wanted
+    # the artifact (job 302: 34 LLM calls / 7m05s of wall time burned on a
+    # module the client never asked for). Default False = off. [dagster-opt-in]
+    dagster_enabled = models.BooleanField(default=False)
     site_folder = models.CharField(max_length=500, blank=True, default="")
     full_extraction = models.BooleanField(default=False)
     auto_queued = models.BooleanField(default=False)

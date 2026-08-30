@@ -536,6 +536,10 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
         <input type="text" id="scope-input" value="10" placeholder="Number of records, e.g. 500" inputmode="numeric" aria-label="how many records">
         <p class="hint hidden" id="scope-hint"></p>
         <textarea id="notes" placeholder="Anything special? e.g. prices in £, skip out-of-stock, phone is inside an image" aria-label="additional directions"></textarea>
+        <label class="hint" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;margin-top:8px" title="Also generate a Dagster asset (dagster_asset.py) wrapping the extractor, for Dagster pipeline integration. Off by default — the job finishes faster without it.">
+          <input type="checkbox" id="dagster-opt">
+          Also generate Dagster code
+        </label>
       </div>
     </div>
 
@@ -1996,6 +2000,8 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     fd.append('scope', scope);
     fd.append('scope_value', X('#scope-input').value.trim());
     fd.append('notes', X('#notes').value.trim());
+    // Dagster conversion is opt-in — only sent when ticked ([dagster-opt-in]).
+    if(X('#dagster-opt') && X('#dagster-opt').checked) fd.append('dagster_enabled', '1');
     if(navMethod==='list'){
       // Prefer attached file lines; fall back to typed/pasted text.
       if(listFileState && listFileState.lines.length){
@@ -2039,6 +2045,9 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     // copy the OLD job's config and silently drop the edits).
     fd.append('target_fields', fieldsArr.join(','));
     if(currentSchema) fd.append('schema_text', currentSchema);  // persist schema on the new (re-run) job
+    // Carry the Dagster opt-in explicitly ('1'/'0') so the new job honours the
+    // current checkbox rather than silently copying the old job's choice.
+    if(X('#dagster-opt')) fd.append('dagster_enabled', X('#dagster-opt').checked ? '1' : '0');
     var navMethod = (document.querySelector('input[name=cfg-nav]:checked')||{}).value || '';
     if(navMethod==='search'){
       fd.append('search_criteria', X('#cfg-search-kw').value);

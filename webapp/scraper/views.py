@@ -674,6 +674,14 @@ def job_restart(request, job_id):
             notes=(rerun_prompt or _post_or_old("notes", job.notes)),
             full_extraction=job.full_extraction,
             skip_approvals=job.skip_approvals,
+            # Dagster opt-in carries to the re-run: the intake re-run form posts
+            # the checkbox state explicitly ('1'/'0'); a bare job_detail re-run
+            # (no checkbox in that form) copies the old job's choice.
+            dagster_enabled=(
+                request.POST.get("dagster_enabled") == "1"
+                if "dagster_enabled" in request.POST
+                else job.dagster_enabled
+            ),
             user=request.user,
         )
 
@@ -2608,6 +2616,8 @@ def intake_create_job(request):
         schema_text=schema_text,
         full_extraction=False,  # "sample" mode
         skip_approvals=True,  # intake jobs run unattended — skip approval gates
+        # Opt-in only — the intake checkbox posts '1' when ticked. [dagster-opt-in]
+        dagster_enabled=request.POST.get("dagster_enabled") == "1",
         user=request.user,
     )
 
