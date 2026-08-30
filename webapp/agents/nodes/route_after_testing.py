@@ -30,6 +30,11 @@ _BLOCKED_RE = re.compile(
     r"robot|rate[\s-]?limit)\b",
     re.IGNORECASE,
 )
+# [A1] An explicit 429 / too-many-requests: the site rate-limited the window.
+# Distinct from _BLOCKED_RE's "rate limit" token — this keys on the status
+# code / reason phrase so a throttled test run routes to a same-draft re-test
+# instead of a strategy switch or a code fix.
+_RATE_LIMITED_RE = re.compile(r"\b429\b|too many requests", re.IGNORECASE)
 # Playwright/Selenium "element not found" crashes — unambiguous CODE bugs (a
 # wrong selector), NOT access/strategy failures. Without this they fall through
 # to the generic "no items extracted — likely wrong strategy" branch and the
@@ -101,12 +106,16 @@ def _discovery_coverage_failure(report: dict) -> Optional[str]:
 def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
     """Classify a failed test into an action + reason.
 
-    Returns (action, reason) where action ∈ {"strategy", "scraper", "mapping", "refine"}:
+    Returns (action, reason) where action ∈ {"strategy", "scraper", "mapping",
+    "refine", "retest"}:
     - "strategy": access/strategy-class failure → switch strategy (timeout, 0-item
       http/api run, blocked). The current strategy can't reach the content.
     - "scraper": a code bug (Python traceback, not a timeout) → fix the scraper.
     - "mapping": items extracted but a core field is at ~0% → re-map (caller checks).
     - "refine": items extracted, fields mostly present, low quality → tweak.
+    - "retest": the run is UNPROVEN coverage (429 / browser-service throttle /
+      transient render block) — re-test the SAME draft, no strategy switch and
+      no code change. Neither the strategy nor the code was on trial.
 
     Deterministic — used as a guard that can override code_tester's LLM diagnosis.
     """
@@ -121,6 +130,7 @@ def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
     items = _extracted_item_count(report or {})
     is_timeout = bool(_TIMEOUT_RE.search(crash))
     is_blocked = bool(_BLOCKED_RE.search(crash))
+    is_rate_limited = bool(_RATE_LIMITED_RE.search(crash))
     is_traceback = bool(_TRACEBACK_RE.search(crash)) and not is_timeout
     is_selector_crash = bool(_SELECTOR_CRASH_RE.search(crash))
     strat = (strategy or "").strip()
@@ -138,6 +148,13 @@ def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
     if is_selector_crash:
         return ("scraper", f"selector crash — element not found ({crash[:80]})")
 
+    # [A1] An explicit 429/too-many-requests is neither a strategy verdict nor
+    # a code bug — the site rate-limited the window. Re-test the same draft
+    # after a backoff (the router owns the backoff + the retest cap). Checked
+    # before the zero-item branches for the same reason as is_throttled below.
+    if is_rate_limited:
+        return ("retest", f"rate limited (429) — back off and re-test ({crash[:80]})")
+
     # Browser-service backpressure: a run stopped by a 429 throttle is UNPROVEN
     # coverage, not a verdict on the strategy or the code. It must be checked
     # BEFORE the zero-item branches — a throttled run completes cleanly (no
@@ -147,7 +164,7 @@ def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
     # (code_writer tweaking field mappings on a zero-item run — equally wrong).
     if is_throttled:
         return (
-            "scraper",
+            "retest",
             (
                 "navigate throttled (browser-service backpressure) — re-test, "
                 "no strategy switch"
@@ -168,13 +185,13 @@ def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
     # When the newest test output stopped with empty_render while an earlier
     # output in the same phase carried items (evidence attached by
     # _attach_transient_render_evidence), the draft+strategy demonstrably
-    # work — re-test the same draft ("scraper" action: code_writer fix cycle,
-    # the rung is NOT recorded tried) instead of burning it on a block window
-    # that may already have passed (job 311's had).
+    # work — re-test the same draft ("retest" action: same draft, no strategy
+    # switch, the rung is NOT recorded tried) instead of burning it on a block
+    # window that may already have passed (job 311's had).
     _tr = report.get("discovery_transient") if isinstance(report, dict) else None
     if items == 0 and isinstance(_tr, dict) and _tr.get("suspected"):
         return (
-            "scraper",
+            "retest",
             "transient render block — newest test run rendered 0 items "
             f"(stop_reason={_tr.get('latest_stop_reason')}) while an earlier "
             f"run in this phase extracted {_tr.get('best_items')} items; "
@@ -230,6 +247,39 @@ def _scraper_produced_valid_output(state: ScrapeState) -> bool:
     return _scraper_has_real_items(state, min_count=_min)
 
 
+def _freshness_floor(state: ScrapeState, draft_path: str) -> float:
+    """[A6] Output-freshness floor keyed to the draft's CONTENT, not its mtime.
+
+    Job 309's floor (draft mtime) stops outputs from PREVIOUS drafts rescuing
+    the current one — but a no-op fix cycle (A2) re-tests a byte-identical
+    draft, and an unchanged draft's mtime stays old: the previous attempt's
+    outputs remain >= floor and the best-of-5 scan happily reads a stale run
+    that predates the current test. When the draft fingerprint matches the one
+    recorded at last test time (state.last_tested_draft_fp, written by
+    _invoke_code_tester), raise the floor to last_tested_at so only THIS
+    attempt's outputs count as ground truth.
+    """
+    import hashlib as _hash
+    import os as _os
+
+    floor = 0.0
+    try:
+        if draft_path and _os.path.isfile(draft_path):
+            floor = _os.path.getmtime(draft_path)
+            with open(draft_path, "rb") as fh:
+                fp = _hash.sha1(fh.read()).hexdigest()
+            last_fp = str(state.get("last_tested_draft_fp") or "")
+            try:
+                last_at = float(state.get("last_tested_at") or 0.0)
+            except (TypeError, ValueError):
+                last_at = 0.0
+            if fp and last_fp and fp == last_fp and last_at > floor:
+                floor = last_at
+    except Exception:
+        pass
+    return floor
+
+
 def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
     """GROUND-TRUTH check: did the scraper extract enough real items to PASS?
 
@@ -270,10 +320,9 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
                 # extracted 0 and finalized COMPLETED. The tester always runs
                 # the current draft AFTER the writer's last edit, so a legit
                 # rescue's outputs are always >= the draft's mtime.
-                _floor = 0.0
-                _draft_fp = _os.path.join(ws, "scraper_draft.py")
-                if _os.path.isfile(_draft_fp):
-                    _floor = _os.path.getmtime(_draft_fp)
+                _floor = _freshness_floor(
+                    state, _os.path.join(ws, "scraper_draft.py")
+                )
                 outs = sorted(
                     [f for f in _os.listdir(ws)
                      if f.startswith("output_") and f.endswith(".json")
@@ -342,10 +391,8 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
             _root = _os.environ.get("PROJECT_ROOT", "/app")
             # Same freshness floor as the primary fallback above (job 309): a
             # previous cycle's output must not rescue the current draft.
-            _floor2 = 0.0
             _draft2 = _os.path.join(_root, "workspace", _slug, "scraper_draft.py")
-            if _os.path.isfile(_draft2):
-                _floor2 = _os.path.getmtime(_draft2)
+            _floor2 = _freshness_floor(state, _draft2)
             _pattern = _os.path.join(_root, "workspace", _slug, "output_*.json")
             _outputs = sorted(
                 [p for p in _glob.glob(_pattern) if _os.path.getmtime(p) >= _floor2],
@@ -998,7 +1045,10 @@ def route_after_testing(state: ScrapeState) -> str:
             logger.warning(
                 "route_after_testing: %s — bouncing to code_writer", _volume_reason
             )
-            return "scraper_analyzer"
+            # [A5] go straight to code_writer: scraper_analyzer re-picks the
+            # SAME strategy (nothing about it failed) and the writer regenerates
+            # from scratch; a pagination gap is a targeted edit.
+            return "code_writer"
 
     # T2.2 deterministic-defect bounce (same shape): the WRONG_VALUE issues
     # carry a mechanical suggested_fix, so a targeted fix beats shipping.
@@ -1017,7 +1067,9 @@ def route_after_testing(state: ScrapeState) -> str:
                 len(_det_blockers),
                 _det_blockers[0].get("description", "")[:120],
             )
-            return "scraper_analyzer"
+            # [A5] direct to code_writer — the WRONG_VALUE carries a mechanical
+            # suggested_fix; a strategy re-pick regenerates instead of editing.
+            return "code_writer"
 
     # Count-regression bounce (bounded, same shape as the contract bounce):
     # a big discovery drop vs the site's prior run is a precisely-known fix
@@ -1030,7 +1082,9 @@ def route_after_testing(state: ScrapeState) -> str:
             )
         else:
             logger.warning("route_after_testing: %s — bouncing to code_writer", _count_regression)
-            return "scraper_analyzer"
+            # [A5] direct to code_writer — missing pagination/categories is a
+            # targeted edit to the working draft, not a strategy question.
+            return "code_writer"
 
     # L2 CLI-contract bounce (before the strategy cascade — a contract violation
     # is a precisely-known fix, not a strategy question; classify_test_failure
@@ -1167,6 +1221,33 @@ def route_after_testing(state: ScrapeState) -> str:
         )
         return "human_approval"
 
+    # [A1/QW-3] "retest": unproven coverage (429 / browser-service throttle /
+    # transient render block). Re-test the SAME draft — code_tester →
+    # code_tester — after a backoff. The retest counter is maintained inside
+    # _invoke_code_tester (same-draft fingerprint → increment, changed draft →
+    # reset) because routing functions cannot mutate state. test_retry_count
+    # deliberately does NOT advance: this is not a strategy or code failure,
+    # and it must not consume the fix budget or approach FINAL_RETRY_SENTINEL.
+    if _action == "retest":
+        _retests = int(state.get("test_retest_count", 0) or 0)
+        if _retests < 2:
+            import time as _time
+
+            _backoff = min(30.0 * (_retests + 1), 60.0)
+            logger.warning(
+                "route_after_testing: %s — re-testing the same draft after a "
+                "%.0fs backoff (retest %d/2, retry budget untouched)",
+                _reason, _backoff, _retests + 1,
+            )
+            _time.sleep(_backoff)
+            return "code_tester"
+        logger.warning(
+            "route_after_testing: %s — retest budget exhausted (%d), treating "
+            "as a code-fix failure",
+            _reason, _retests,
+        )
+        _action = "scraper"
+
     if _action == "strategy":
         logger.info(
             "route_after_testing: STRATEGY switch — '%s' failed (%s) → scraper_analyzer "
@@ -1211,16 +1292,21 @@ def route_after_testing(state: ScrapeState) -> str:
                 MAX_TEST_RETRIES + 1,
             )
             return "product_analyzer"
+        # [A5] Default: a refine-class failure (items extracted, quality gaps)
+        # is a CODE fix — send it straight to code_writer. Routing through
+        # scraper_analyzer re-picks the SAME strategy and the writer
+        # regenerates from scratch (job 46: ~25 min of regenerate loops on a
+        # draft that was one targeted edit away from passing).
         logger.info(
             "route_after_testing: %s (confidence=%.2f, high_severity=%s), "
-            "retry %d/%d via scraper_analyzer",
+            "retry %d/%d via code_writer (targeted fix)",
             assessment,
             confidence,
             high_severity,
             retry_count + 1,
             MAX_TEST_RETRIES + 1,
         )
-        return "scraper_analyzer"
+        return "code_writer"
 
     if confidence >= MIN_CONFIDENCE_PARTIAL and _scraper_produced_valid_output(state):
         logger.warning(

@@ -86,7 +86,9 @@ class TestClassifierThrottledBranch:
         from webapp.agents.nodes.route_after_testing import classify_test_failure
 
         action, reason = classify_test_failure(self._report(), "http_navigation")
-        assert action == "scraper", "a throttle never got a fair window — re-test"
+        # [A1] "retest": a throttle never got a fair window — re-test the SAME
+        # draft; neither strategy switch nor a code fix applies.
+        assert action == "retest", "a throttle never got a fair window — re-test"
         assert "throttled" in reason.lower()
 
     def test_throttled_outranks_http_zero_item_strategy_switch(self):
@@ -96,7 +98,9 @@ class TestClassifierThrottledBranch:
         from webapp.agents.nodes.route_after_testing import classify_test_failure
 
         action, _ = classify_test_failure(self._report(), "http_navigation")
-        assert action == "scraper"
+        # [A1] the throttled branch precedes the zero-item strategy switch and
+        # routes to "retest" (same draft), never "strategy".
+        assert action == "retest"
 
     def test_throttled_is_not_a_coverage_fail(self):
         """_COVERAGE_FAIL_STOP_REASONS must exclude navigate_throttled — a

@@ -10,6 +10,7 @@ For lightweight scrapers, runs in-process via subprocess.
 import json
 import logging
 import os
+import re
 import select
 import signal
 import subprocess
@@ -931,6 +932,12 @@ def _run_via_browser_service(
 
     from ..tools.browser_http import post_scrape_with_retry
 
+    # QW-0 Step emits (deferred like the heartbeat import below — graph
+    # imports this node module).
+    from ..graph import _notify_phase
+
+    _exec_job_id = (state or {}).get("job_id", 0)
+
     service_url = _get_browser_service_url()
     stealth_env = _stealth_env(state) if state else {}
     # DETERMINISTIC DISCOVERY: inject SCRAPER_LISTING_URL into the browser_service
@@ -1059,12 +1066,23 @@ def _run_via_browser_service(
                 logger.info("run_execution: pruned %d empty records", _pruned)
         except Exception as exc:
             logger.warning("run_execution: prune step: %s", exc)
+        # [A3] normalize formatted price strings ("$17.00") to numerics so the
+        # tester's WRONG_VALUE pass and the deterministic checker agree.
+        try:
+            _norm = normalize_output_prices(output_file)
+            if _norm:
+                logger.info(
+                    "run_execution: normalized %d price string(s) to numeric", _norm
+                )
+        except Exception as exc:
+            logger.warning("run_execution: price normalize step: %s", exc)
         # F9 quality gate (nav modes): collapse-level failure rates -> FAILED
         _q = _extraction_quality_gate(
             output_file, state.get("input_mode", ""), result.get("product_count", 0),
             target_fields=list(state.get("target_fields") or []),
         )
         if _q:
+            _notify_phase(_exec_job_id, "execution", "failed")
             return {
                 "execution_status": "FAILED",
                 "output_file": output_file,
@@ -1073,6 +1091,7 @@ def _run_via_browser_service(
                 "error_message": _q,
             }
 
+        _notify_phase(_exec_job_id, "execution", "done")
         return {
             "execution_status": "SUCCESS",
             "output_file": output_file,
@@ -1082,17 +1101,20 @@ def _run_via_browser_service(
         }
 
     except httpx.ConnectError:
+        _notify_phase(_exec_job_id, "execution", "failed")
         return {
             "execution_status": "FAILED",
             "error_message": f"browser_service ({service_url}) is unreachable",
         }
     except httpx.TimeoutException:
+        _notify_phase(_exec_job_id, "execution", "failed")
         return {
             "execution_status": "FAILED",
             "error_message": f"Scraper timed out on browser_service after {timeout}s",
         }
     except Exception as exc:
         logger.exception("run_execution: browser_service dispatch failed")
+        _notify_phase(_exec_job_id, "execution", "failed")
         return {
             "execution_status": "FAILED",
             "error_message": f"browser_service dispatch failed: {exc}",
@@ -1344,6 +1366,75 @@ _FALLBACK_CORE_FIELDS = [
     "author", "publish_date", "company", "location",
     "content", "snippet", "rank", "posts",
 ] + list(_PRICE_ALIASES[1:])
+
+
+# ── [A3] Price normalization at persist time ─────────────────────────────────
+# The deterministic checker (route_after_testing._price_value) happily parses
+# "$17.00" / "1,299.00" — but the tester's LLM condemns the same string as a
+# WRONG_VALUE ("not a clean price"), and consumers get inconsistent types.
+# Normalizing formatted price strings to floats at persist time removes the
+# disagreement class: what the checker tolerates, the tester no longer sees.
+
+_PRICE_TOKEN_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
+# Whatever remains after stripping the number tokens must be nothing but
+# currency symbols/codes and separators for the string to count as a bare price.
+_PRICE_RESIDUE_RE = re.compile(
+    r"^[\s$€£¥₹.,\-]*(?:USD|AUD|NZD|GBP|EUR|CAD)?[\s$€£¥₹.,\-]*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_price_string(v: str) -> Optional[float]:
+    """Parse a price-ish string the same way the framework's checker does —
+    but ONLY when the string is nothing but a price. ``"From $10"`` /
+    ``"Free"`` stay strings; ``"$17.00"`` → 17.0."""
+    s = str(v).strip()
+    m = _PRICE_TOKEN_RE.search(s)
+    if not m:
+        return None
+    if not _PRICE_RESIDUE_RE.match(_PRICE_TOKEN_RE.sub("", s)):
+        return None
+    try:
+        return float(m.group(0).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def normalize_output_prices(output_file: str) -> int:
+    """Rewrite price-alias fields in an output JSON to numeric values when the
+    scraper emitted formatted strings. Returns the number of fields rewritten
+    (0 on any read/parse problem — never raises)."""
+    try:
+        with open(output_file, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    changed = 0
+    for key in ("products", "jobs", "articles", "results", "items", "threads", "pages"):
+        rows = data.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for fld in _PRICE_ALIASES:
+                v = row.get(fld)
+                if isinstance(v, str):
+                    num = _parse_price_string(v)
+                    if num is not None:
+                        row[fld] = num
+                        changed += 1
+        break  # the rows live under the first populated item key only
+    if not changed:
+        return 0
+    try:
+        with open(output_file, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+    except Exception:
+        return 0
+    return changed
 
 
 def _find_newest_output(

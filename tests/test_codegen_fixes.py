@@ -313,4 +313,6 @@ class TestCountRegressionBand:
                             "issues": []},
             "test_retry_count": 0,
         })
-        assert out == "scraper_analyzer"
+        # [A5] the count-regression band bounces to code_writer directly (the
+        # log always said "bouncing to code_writer" — the router now agrees).
+        assert out == "code_writer"

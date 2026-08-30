@@ -252,5 +252,85 @@ class TestNeverRaises:
         assert bh.ScrapeResult(error="x").error_class == "fatal"
 
 
+class TestAttemptTimeoutSlicing:
+    """QW-5 (job-312): retries must get a REAL window, not a sliver.
+
+    A retry attempt sliced to near-zero always fails and reads as a scrape
+    defect → false strategy cascade. Attempt 1 keeps the full timeout,
+    middle attempts are capped by the remaining budget, and the final
+    attempt is floored at FINAL_ATTEMPT_MIN_S even past the nominal budget
+    (bounded overshoot: budget + one attempt)."""
+
+    def test_attempt1_keeps_full_timeout(self):
+        deadline = 10_000.0 + time.monotonic()
+        assert bh._attempt_timeout(660.0, deadline, 1, 3) == 660.0
+
+    def test_middle_attempt_capped_by_remaining(self):
+        deadline = 240.0 + time.monotonic()
+        # real clock ticks microseconds between here and the helper — allow it
+        assert bh._attempt_timeout(660.0, deadline, 2, 3) == pytest.approx(
+            240.0, abs=1e-2
+        )
+
+    def test_middle_attempt_keeps_min_budget_floor(self):
+        deadline = 2.0 + time.monotonic()
+        assert bh._attempt_timeout(660.0, deadline, 2, 3) == bh.MIN_ATTEMPT_BUDGET_S
+
+    def test_final_attempt_floored_past_budget(self):
+        deadline = time.monotonic() - 1  # budget exhausted
+        assert bh._attempt_timeout(660.0, deadline, 3, 3) == bh.FINAL_ATTEMPT_MIN_S
+
+    def test_final_attempt_never_exceeds_caller_timeout(self):
+        deadline = time.monotonic() - 1
+        # A caller that asked for 120s per attempt must not be stretched to 300s.
+        assert bh._attempt_timeout(120.0, deadline, 3, 3) == 120.0
+
+    def test_final_attempt_with_plenty_remaining_stays_capped(self):
+        deadline = 500.0 + time.monotonic()
+        assert bh._attempt_timeout(660.0, deadline, 3, 3) == pytest.approx(
+            500.0, abs=1e-2
+        )
+
+    def test_exhausted_budget_final_attempt_still_fires(self, monkeypatch):
+        """Integration: short-circuit exempts the final attempt, which runs
+        with the QW-5 floor even though the nominal budget is spent."""
+        recorded_timeouts = []
+
+        def fake_post(url, json=None, timeout=None):
+            recorded_timeouts.append(timeout)
+            if len(recorded_timeouts) < 3:
+                return _Resp(429, {"retry_after": 2})
+            return _Resp(200, {"product_count": 4})
+
+        class _Clock:
+            now = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+            @classmethod
+            def sleep(cls, s):
+                cls.now += s
+
+        fake_httpx = types.SimpleNamespace(post=fake_post, codes=httpx.codes)
+        monkeypatch.setattr(bh, "httpx", fake_httpx)
+        monkeypatch.setattr(bh, "time", types.SimpleNamespace(
+            monotonic=_Clock.monotonic, sleep=_Clock.sleep,
+        ))
+
+        res = bh.post_scrape_with_retry(
+            URL, PAYLOAD, timeout=660.0, total_budget_s=8.0, max_attempts=3
+        )
+        assert res.ok is True
+        assert res.attempts == 3
+        # attempt 1: full timeout; attempt 2: remaining budget (8 - 2s sleep);
+        # attempt 3: QW-5 floor despite the budget being spent (4s left, and
+        # the second retry_after sleep takes it below zero).
+        assert recorded_timeouts[0] == 660.0
+        assert recorded_timeouts[1] == 6.0
+        assert recorded_timeouts[2] == bh.FINAL_ATTEMPT_MIN_S
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

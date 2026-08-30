@@ -29,6 +29,76 @@ def _get_project_root() -> str:
     return os.getcwd()
 
 
+# Two-part TLDs where the registrable domain is name + BOTH parts (mirrors
+# run_execution._registrable — keep the two lists in sync).
+_TWO_PART_TLDS = frozenset({
+    "co.uk", "org.uk", "com.au", "co.nz", "co.za", "com.br", "co.jp",
+    "com.sg", "com.mx",
+})
+
+
+def _registrable(host: str) -> str:
+    """Registrable domain (last 2 labels, 3 for two-part TLDs) — 'www.' stripped."""
+    parts = [p for p in (host or "").lower().split(".") if p]
+    if len(parts) >= 2 and ".".join(parts[-2:]) in _TWO_PART_TLDS and len(parts) >= 3:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:]) if len(parts) >= 2 else ".".join(parts)
+
+
+def _filter_seed_urls(urls: list, job_url: str) -> list[str]:
+    """[A4] Sanitize the seed URL list before it reaches the scraper.
+
+    Job 45 burned ~17 minutes of test cycles on a seed list polluted with
+    non-item URLs (pagination links, nav links, a different domain). The
+    scraper dutifully tried to extract product fields from all of them and the
+    tester failed the run. Drop, with a logged reason:
+    - non-http(s) or pathless entries ("https://site.com" with no path)
+    - URLs outside the job's registrable domain (off-site / CDN / tracker links)
+    - exact duplicates (first occurrence wins)
+    """
+    from urllib.parse import urlparse
+
+    try:
+        _job_host = urlparse(job_url or "").hostname or ""
+    except Exception:
+        _job_host = ""
+    job_dom = _registrable(_job_host)
+
+    kept: list[str] = []
+    seen: set[str] = set()
+    dropped: dict[str, int] = {}
+    for raw in urls or []:
+        u = str(raw or "").strip()
+        if not u:
+            continue
+        try:
+            p = urlparse(u)
+        except Exception:
+            dropped["unparseable"] = dropped.get("unparseable", 0) + 1
+            continue
+        if p.scheme not in ("http", "https") or not p.hostname:
+            dropped["not-http"] = dropped.get("not-http", 0) + 1
+            continue
+        if not p.path.strip("/") and not p.query:
+            dropped["no-path"] = dropped.get("no-path", 0) + 1
+            continue
+        if job_dom and _registrable(p.hostname) != job_dom:
+            dropped["off-domain"] = dropped.get("off-domain", 0) + 1
+            continue
+        if u in seen:
+            dropped["duplicate"] = dropped.get("duplicate", 0) + 1
+            continue
+        seen.add(u)
+        kept.append(u)
+    if dropped:
+        logger.warning(
+            "setup_workspace: filtered seed URLs — kept %d, dropped %s",
+            len(kept),
+            ", ".join(f"{k}={v}" for k, v in sorted(dropped.items())),
+        )
+    return kept
+
+
 def _publish_leftover_outputs(workspace_dir: str, slug: str) -> int:
     """Publish any leftover workspace output_*.json to the File Master.
 
@@ -216,7 +286,7 @@ def setup_workspace(state: ScrapeState) -> dict[str, Any]:
         _restore("scraper_analysis.json", "skip_code_generation")
         _restore("test_report.json", "skip_code_generation")
 
-    input_urls = state.get("input_urls") or []
+    input_urls = _filter_seed_urls(state.get("input_urls") or [], state.get("url", ""))
     if input_urls:
         input_path = os.path.join(workspace_dir, "input_urls.json")
         try:

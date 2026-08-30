@@ -267,7 +267,9 @@ class TestRouteArbitration:
     def test_beyond_sample_volume_gap_bounces(self, monkeypatch):
         report_over = {"results": {"successful_extractions": 30}}
         state = _job302_state(report_overrides=report_over)
-        assert rat.route_after_testing(state) == "scraper_analyzer"
+        # [A5] the volume-gap bounce targets code_writer directly — the
+        # strategy prompt adds LLM latency without addressing a volume defect.
+        assert rat.route_after_testing(state) == "code_writer"
 
     def test_deterministic_wrong_value_blocks_pass_and_override(self, monkeypatch):
         """A double-host WRONG_VALUE with an anchored fix is a known mechanical
@@ -281,8 +283,9 @@ class TestRouteArbitration:
                 "suggested_fix": "Join with urljoin(base_url, raw_url).",
             }],
         }
+        # [A5] deterministic mechanical defects target code_writer directly.
         assert rat.route_after_testing(_job302_state(report_overrides=report_over)) == (
-            "scraper_analyzer"
+            "code_writer"
         )
 
     def test_unanchored_llm_wrong_value_stays_advisory(self, monkeypatch):

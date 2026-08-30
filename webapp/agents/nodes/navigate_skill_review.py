@@ -20,7 +20,14 @@ from typing import Any
 
 from django.conf import settings
 
-from agents.graph import _log_agent_context, _persist_agent_logs
+from agents.graph import (
+    _agent_config,
+    _invoke_agent_with_timeout,
+    _log_agent_context,
+    _persist_agent_logs,
+    _start_heartbeat,
+    _stop_heartbeat,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +48,20 @@ def navigate_skill_review(state: dict, config=None) -> dict[str, Any]:
     )
 
     root = getattr(settings, "PROJECT_ROOT", os.getcwd())
+
+    # [QW-2] Known-site re-run marker: skip_site_analysis means this job is a
+    # RE-scrape of an already-analyzed site. The navigation skills were already
+    # reviewed on the first run (learned sections persist in the skill files),
+    # so an LLM re-review re-derives the same sections every re-scrape —
+    # minutes of tail latency for zero new knowledge. NEVER gate fresh sites:
+    # first-run learning is the point of this node.
+    if state.get("skip_site_analysis"):
+        logger.info(
+            "navigate_skill_review: known-site re-run (skip_site_analysis) — "
+            "skills already reviewed on the first run, skipping (job %s)",
+            job_id,
+        )
+        return {}
 
     # Bail out early if there are no navigation findings to review. This
     # node only makes sense after a successful navigation_explore run.
@@ -68,8 +89,18 @@ def navigate_skill_review(state: dict, config=None) -> dict[str, Any]:
         if config:
             agent_cfg.update(config)
 
+        # [QW-2] wall-clock cap + recursion cap (underscore key so
+        # AGENT_RECURSION_MAP["nav_skill_review"] applies) + heartbeat — this
+        # was a raw un-walled invoke; a hung LLM call here stalled the whole
+        # tail of the job. Timeout returns a dead-result dict, which the
+        # report check below treats exactly like "agent wrote nothing" —
+        # the node stays non-blocking.
+        hb = _start_heartbeat(job_id, "nav-skill-review")
         try:
-            result = agent.invoke({"messages": messages}, config=agent_cfg)
+            result = _invoke_agent_with_timeout(
+                agent, messages, _agent_config(config, "nav_skill_review"),
+                "nav_skill_review", job_id,
+            )
         except Exception as exc:
             logger.warning(
                 "navigate_skill_review: agent invocation error (job %s): %s — "
@@ -78,6 +109,8 @@ def navigate_skill_review(state: dict, config=None) -> dict[str, Any]:
                 str(exc)[:200],
             )
             return {}
+        finally:
+            _stop_heartbeat(hb)
 
         _persist_agent_logs(state, result, "nav-skill-review", agent_cfg)
 

@@ -31,7 +31,14 @@ def _load_fn():
         assert m, f"{name} not found"
         return m.group(0)
 
-    fn_src = grab("_is_dead_product") + grab("_scraper_has_real_items")
+    # [A6] _scraper_has_real_items delegates its freshness floor to
+    # _freshness_floor — extract it too, or the fallback's broad except
+    # swallows the NameError and the output-file rescue silently degrades.
+    fn_src = (
+        grab("_freshness_floor")
+        + grab("_is_dead_product")
+        + grab("_scraper_has_real_items")
+    )
 
     import logging
     from src.content_types import output_filter_fields, has_substantive_field

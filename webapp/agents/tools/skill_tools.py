@@ -61,25 +61,9 @@ def get_skill_tools(skills_dir: Optional[str] = None) -> list:
 
         logger.info("Loaded skill '%s' (%d chars)", skill_name, len(content))
 
-        if len(content) > 3000:
-            try:
-                from headroom import compress as _compress
-
-                cr = _compress(
-                    [{"role": "tool", "content": content}],
-                    model="glm-5-turbo",
-                )
-                compressed = cr.messages[0]["content"]
-                if len(content) - len(compressed) > 200:
-                    logger.info(
-                        "Skill '%s' compressed: %d → %d chars",
-                        skill_name,
-                        len(content),
-                        len(compressed),
-                    )
-                    content = compressed
-            except Exception:
-                pass
+        # [QW-4] headroom.compress removed (sync LLM call on the tool path,
+        # non-deterministic re-phrasing of reference material agents are
+        # supposed to follow verbatim).
 
         return content
 

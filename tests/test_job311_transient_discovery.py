@@ -282,7 +282,8 @@ class TestTransientEvidenceAndClassification:
             },
         }
         action, reason = classify_test_failure(report, "playwright")
-        assert action == "scraper", "transient must NOT switch strategy"
+        # [A1] "retest": same draft, no strategy switch, no strategy recorded.
+        assert action == "retest", "transient must NOT switch strategy"
         assert "transient" in reason.lower()
 
     def test_no_evidence_keeps_strategy_verdict(self):

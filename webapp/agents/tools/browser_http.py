@@ -17,7 +17,11 @@ bounded-retry policy:
 - **Budget:** ``total_budget_s`` (default ``timeout + 240``) short-circuits
   the remaining attempts. Attempt counts alone allow ~33 minutes inside one
   tool call (3 × 660s + backoff) — long enough to trip the celery/LLM
-  timeout layers this helper is meant to protect.
+  timeout layers this helper is meant to protect. QW-5 (job-312): the final
+  attempt is exempt from the short-circuit and gets at least
+  ``FINAL_ATTEMPT_MIN_S`` even past the nominal budget, so worst case is
+  budget + one bounded attempt — a retry with a real window instead of a
+  guaranteed-loss sliver that reads as a scrape defect.
 
 Never raises: failures come back as ``ScrapeResult(ok=False)`` with a
 ``transient``/``throttled`` classification the caller can surface honestly.
@@ -53,6 +57,11 @@ DEFAULT_BUDGET_SLACK_S = 240.0
 MIN_ATTEMPT_BUDGET_S = 5.0
 DEFAULT_RETRY_AFTER_S = 5.0
 MAX_RETRY_AFTER_S = 60.0
+# QW-5 (job-312): floor for the final attempt's per-attempt timeout. A retry
+# sliced to a sliver of the caller's timeout always fails and misreads as a
+# scrape defect (false strategy cascade); the last attempt gets a real window
+# even past the nominal budget (bounded overshoot: budget + one attempt).
+FINAL_ATTEMPT_MIN_S = 300.0
 
 
 @dataclass
@@ -104,6 +113,26 @@ def _sleep_for_retry(resp: httpx.Response | None, deadline: float) -> bool:
     return True
 
 
+def _attempt_timeout(
+    timeout: float, deadline: float, attempt: int, max_attempts: int
+) -> float:
+    """Per-attempt httpx timeout for this attempt (QW-5, job-312).
+
+    Attempt 1 keeps the FULL timeout — healthy single-attempt runs pay
+    nothing. Middle attempts get what's left of the budget (floored at
+    ``MIN_ATTEMPT_BUDGET_S``) so they can't overrun it. The final attempt is
+    floored at ``FINAL_ATTEMPT_MIN_S`` (capped by the caller's timeout) even
+    past the nominal budget — a real chance instead of a guaranteed loss.
+    Never exceeds the caller's ``timeout``.
+    """
+    if attempt <= 1:
+        return timeout
+    remaining = deadline - time.monotonic()
+    if attempt >= max_attempts:
+        return max(min(timeout, remaining), min(FINAL_ATTEMPT_MIN_S, timeout))
+    return min(timeout, max(remaining, MIN_ATTEMPT_BUDGET_S))
+
+
 def _summarize_failure(result: ScrapeResult) -> str:
     if result.throttled:
         return (
@@ -141,13 +170,27 @@ def post_scrape_with_retry(
     result = ScrapeResult()
 
     for attempt in range(1, max_attempts + 1):
+        is_final = attempt == max_attempts
         # Short-circuit: attempt-counts alone can hold a worker for ~33 min.
-        if attempt > 1 and deadline - time.monotonic() < MIN_ATTEMPT_BUDGET_S:
+        # The final attempt is exempt (QW-5) — it gets a real window bounded
+        # by FINAL_ATTEMPT_MIN_S instead of a guaranteed-loss sliver.
+        if (
+            not is_final
+            and attempt > 1
+            and deadline - time.monotonic() < MIN_ATTEMPT_BUDGET_S
+        ):
             result.attempts = attempt - 1
             break
         result.attempts = attempt
+        attempt_timeout = _attempt_timeout(timeout, deadline, attempt, max_attempts)
+        if attempt_timeout < timeout:
+            logger.info(
+                "browser_http: %s attempt %d/%d timeout sliced %.0fs -> %.0fs "
+                "(retry budget)",
+                url, attempt, max_attempts, timeout, attempt_timeout,
+            )
         try:
-            resp = httpx.post(url, json=payload, timeout=timeout)
+            resp = httpx.post(url, json=payload, timeout=attempt_timeout)
         except TRANSIENT_EXCEPTIONS as exc:
             result.status = None
             result.transient = True

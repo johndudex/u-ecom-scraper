@@ -80,24 +80,10 @@ def _format_result(result: dict) -> str:
         parts.append(result["stderr"])
     output = "\n".join(parts) if parts else "(no output)"
 
-    if len(output) > 4000:
-        try:
-            from headroom import compress as _compress
-
-            cr = _compress(
-                [{"role": "tool", "content": output}],
-                model="glm-5-turbo",
-            )
-            compressed = cr.messages[0]["content"]
-            if len(output) - len(compressed) > 200:
-                logger.info(
-                    "run_scraper output compressed: %d → %d chars",
-                    len(output),
-                    len(compressed),
-                )
-                output = compressed
-        except Exception:
-            pass
+    # [QW-4] headroom.compress removed: it was a synchronous LLM call on the
+    # agent's event path (P0 precondition for the async-cancellation refactor)
+    # that re-phrased tool output non-deterministically. Deterministic
+    # truncation only.
     if len(output) > MAX_OUTPUT_CHARS:
         output = output[:MAX_OUTPUT_CHARS] + "\n... (truncated)"
     if result.get("returncode", 0) != 0:
@@ -357,6 +343,21 @@ def get_shell_tools(
                         result["output_file"] = _local_output
                     except OSError as exc:
                         logger.warning("run_scraper: could not persist output locally: %s", exc)
+                    # [A3] normalize formatted price strings ("$17.00") to
+                    # numerics at persist time, same as run_execution — the
+                    # tester's WRONG_VALUE pass and the deterministic checker
+                    # then agree on every output they both read.
+                    try:
+                        from agents.nodes.run_execution import normalize_output_prices
+
+                        _norm = normalize_output_prices(_local_output)
+                        if _norm:
+                            logger.info(
+                                "run_scraper: normalized %d price string(s) to "
+                                "numeric in %s", _norm, _output_name,
+                            )
+                    except Exception as _norm_exc:
+                        logger.debug("run_scraper: price normalize skipped: %s", _norm_exc)
                 output = _format_result(result)
                 output += f"\n[ran on browser_service, duration: {result.get('duration', '?')}s]"
                 if result.get("output_file"):

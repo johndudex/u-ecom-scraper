@@ -280,8 +280,6 @@ def _format_tool_result(tool_name: str, result: Any) -> str:
     call path stays clean:
 
     - Joins all content items (text preferred, else stringified).
-    - For snapshot tools, runs ``headroom.compress`` when the output is large
-      (keeps big a11y/snapshot trees from blowing up the LLM context).
     - Truncates to a per-tool-type limit (evaluate gets a much larger limit
       so structured JSON stays parseable).
     """
@@ -296,26 +294,8 @@ def _format_tool_result(tool_name: str, result: Any) -> str:
     else:
         output = str(result)
 
-    # Snapshot compression — large accessibility/snapshot trees can dominate
-    # the LLM context window. Compress in place when the saving is meaningful.
-    if tool_name in _SNAPSHOT_TOOLS and len(output) > _MAX_TOOL_OUTPUT_CHARS:
-        try:
-            from headroom import compress as _compress
-
-            cr = _compress(
-                [{"role": "tool", "content": output}],
-                model="glm-5-turbo",
-            )
-            compressed = cr.messages[0]["content"]
-            if len(output) - len(compressed) > 200:
-                logger.info(
-                    "Snapshot compressed: %d → %d chars",
-                    len(output),
-                    len(compressed),
-                )
-                output = compressed
-        except Exception:
-            pass
+    # [QW-4] Snapshot headroom.compress removed (sync LLM call on the tool
+    # path, non-deterministic re-phrasing) — deterministic truncation only.
 
     # Truncate large outputs — but use a much higher limit for evaluate
     # calls (structured JSON data must remain valid).

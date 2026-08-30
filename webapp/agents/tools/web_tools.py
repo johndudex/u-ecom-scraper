@@ -79,24 +79,8 @@ def get_web_tools() -> list:
 
             content = content[:30000] or "(empty page)"
 
-            if len(content) > 4000:
-                try:
-                    from headroom import compress as _compress
-
-                    cr = _compress(
-                        [{"role": "tool", "content": content}],
-                        model="glm-5-turbo",
-                    )
-                    compressed = cr.messages[0]["content"]
-                    if len(content) - len(compressed) > 200:
-                        logger.info(
-                            "web_fetch compressed: %d → %d chars",
-                            len(content),
-                            len(compressed),
-                        )
-                        content = compressed
-                except Exception:
-                    pass
+            # [QW-4] headroom.compress removed (sync LLM call on the tool path,
+            # non-deterministic re-phrasing) — deterministic 30k cap only.
 
             return content
 

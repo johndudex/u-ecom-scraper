@@ -85,6 +85,30 @@ class ScrapeState(TypedDict, total=False):
     # (capped by MAX_REMAPS). Set when route_after_testing sends a mapping
     # failure back to product_analyzer.
     remap_count: int
+    # [A1/QW-3] code_tester → code_tester re-tests of the SAME draft (429 /
+    # throttling / transient render). Tracked separately from test_retry_count
+    # (which carries FINAL_RETRY_SENTINEL semantics and drives escalation) so a
+    # same-draft retry neither burns nor advances the strategy-fix budget.
+    test_retest_count: int
+    # [A2/A6] fingerprint (sha1 of draft source) + wall-clock ts of the draft
+    # the tester LAST tested. route_after_testing compares against the current
+    # draft to detect a no-op fix cycle (A2: escalate instead of looping
+    # scraper_analyzer → code_writer → code_tester on an unchanged draft) and
+    # to keep the stale-output freshness floor honest when the draft is
+    # unchanged (A6: an old output predates this ATTEMPT, not just this job).
+    last_tested_draft_fp: str
+    last_tested_at: float
+    # [S-4 cheap half] consecutive code_writer invocations that died on
+    # wall-clock timeout while an existing draft was already on disk. ≥2 means
+    # the loop is re-running a 900s writer against a draft it cannot improve —
+    # escalate to human_approval instead of burning another cycle.
+    writer_wall_clock_timeouts: int
+    # [A2] consecutive code_writer invocations producing a draft byte-identical
+    # to the last-tested draft (fixed syntax/CLI issues only, no semantic
+    # change). ≥2 means the fix loop cannot improve the draft — escalate
+    # instead of looping scraper_analyzer → code_writer → code_tester again.
+    # Reset to 0 whenever the draft actually changes.
+    noop_fix_cycles: int
     # Append-only log of scraping strategies that failed testing + why, so the
     # strategy cascade never re-picks a strategy that already failed. Each entry
     # is {"strategy": <name>, "reason": <why it failed>}. route_after_testing

@@ -26,7 +26,10 @@ with open(_SRC, "r", encoding="utf-8") as _fh:
 import re as _re
 
 _shared: dict = {"os": os, "json": json, "time": __import__("time"),
-                 "logger": mock.MagicMock()}
+                 "logger": mock.MagicMock(),
+                 # [A3] the _item_has_core_field extraction window now spans
+                 # the module-level _PRICE_*_RE = re.compile(...) globals.
+                 "re": _re}
 for _fname in ("_item_has_core_field", "_substantive_item_count",
                "_extraction_quality_gate"):
     _pat = _re.compile(

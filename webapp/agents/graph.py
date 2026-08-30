@@ -1221,10 +1221,18 @@ def _notify_phase(job_id: int, node_name: str, status: str) -> None:
         job = ScrapeJob.objects.get(pk=job_id)
         step, _ = Step.objects.get_or_create(job=job, phase=phase)
         step.status = status
-        if status == "done":
-            step.completed_at = timezone.now()
-        elif status == "running" and not step.started_at:
+        # Latest-attempt span: a "running" (re)start opens a fresh span, so a
+        # retried phase shows its LAST run's duration instead of the union of
+        # every attempt (the job-46 double-booking bug — "118m" that was
+        # really two attempts summed). done/failed/skipped close the span;
+        # a running with no prior start still gets one (backstop).
+        if status == "running":
             step.started_at = timezone.now()
+            step.completed_at = None
+        elif not step.started_at:
+            step.started_at = timezone.now()
+        if status in ("done", "failed", "skipped"):
+            step.completed_at = timezone.now()
         step.save()
     except Exception as exc:
         logger.warning("_notify_phase(%s, %s): %s", node_name, status, exc)
@@ -3803,7 +3811,61 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 "_invoke_code_writer: invocation died (%s) but draft exists — proceeding to test (job %s)",
                 _cw_err or "no messages", job_id,
             )
+            # [S-4 cheap half] count consecutive wall-clock deaths on a usable
+            # draft. One death → still worth testing the draft that DID get
+            # written. Two in a row → the loop would keep re-running the full
+            # writer window against a draft it cannot improve (the most
+            # expensive pathological cycle there is) — escalate instead.
+            if "wall-clock timeout" in _cw_err:
+                _wc = int(state.get("writer_wall_clock_timeouts") or 0) + 1
+                update["writer_wall_clock_timeouts"] = _wc
+                logger.warning(
+                    "_invoke_code_writer: wall-clock timeout #%d with a usable "
+                    "draft on disk (job %s)", _wc, job_id,
+                )
+                if _wc >= 2:
+                    _wc_note = (
+                        "code_writer hit its wall-clock timeout twice in a row "
+                        f"({_cw_err or 'no detail'}) while a draft already "
+                        "existed — the generation loop is not making progress."
+                    )
+                    _notify_phase(job_id, "code_writer", "failed")
+                    if state.get("skip_approvals", False):
+                        logger.error(
+                            "_invoke_code_writer: repeated writer wall-clock "
+                            "deaths + skip_approvals → cleanup (honest failure, "
+                            "job %s)", job_id,
+                        )
+                        return Command(
+                            goto="cleanup",
+                            update={
+                                **update,
+                                "messages": [],
+                                "error_message": _wc_note,
+                            },
+                        )
+                    return Command(
+                        goto="human_approval",
+                        update={
+                            **update,
+                            "messages": [],
+                            "interrupt_reason": "code_writer_wall_clock",
+                            "interrupt_message": _wc_note + (
+                                " The existing draft can still be tested or the "
+                                "strategy adjusted — retry or cancel."
+                            ),
+                            "interrupt_options": ["Retry code generation", "Cancel"],
+                            "interrupt_decisions": [
+                                {"type": "approve", "label": "Retry code generation",
+                                 "allow_feedback": True},
+                                {"type": "reject", "label": "Cancel", "allow_feedback": False},
+                            ],
+                        },
+                    )
 
+        if not _cw_dead:
+            # Healthy run — reset the consecutive wall-clock-death counter.
+            update["writer_wall_clock_timeouts"] = 0
         _notify_phase(job_id, "code_writer", "done")
         if _PATCHES_ENABLED:
             # Strategy-drift patches REMOVED (verify-then-delete via run_node --no-patches):
@@ -3839,6 +3901,73 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         # ship 1 seed item at execution. Bounce back into THIS agent loop with
         # a targeted fix instruction before code_tester burns its budget.
         _enforce_cli_contract(agent, state, config, job_id, slug)
+
+        # [A2] No-op-fix gate: a draft byte-identical to the one the tester
+        # ALREADY tested means this cycle changed nothing — the previous
+        # cycle's FAIL verdict still stands, and routing back through
+        # scraper_analyzer would re-pick the same strategy and regenerate the
+        # same code (job 46: ~25 min of regenerate loops on a draft one edit
+        # away from passing). Count consecutive no-op cycles on a dedicated
+        # counter; the second one escalates instead of re-testing identical
+        # code a third time.
+        try:
+            import hashlib as _hashlib
+
+            _new_fp = ""
+            if os.path.isfile(_draft_path):
+                with open(_draft_path, "rb") as _fp_fh:
+                    _new_fp = _hashlib.sha1(_fp_fh.read()).hexdigest()
+            _tested_fp = str(state.get("last_tested_draft_fp") or "")
+            if _new_fp and _tested_fp and _new_fp == _tested_fp:
+                _noop = int(state.get("noop_fix_cycles") or 0) + 1
+                update["noop_fix_cycles"] = _noop
+                logger.warning(
+                    "_invoke_code_writer: draft is UNCHANGED from the last "
+                    "tested version (no-op fix cycle %d, job %s)", _noop, job_id,
+                )
+                if _noop >= 2:
+                    _noop_note = (
+                        "code_writer produced an identical draft twice after "
+                        "failed tests — the fix loop is no longer making "
+                        "progress on this strategy."
+                    )
+                    _notify_phase(job_id, "code_writer", "failed")
+                    if state.get("skip_approvals", False):
+                        logger.error(
+                            "_invoke_code_writer: no-op fix loop + skip_approvals "
+                            "→ cleanup (honest failure, job %s)", job_id,
+                        )
+                        return Command(
+                            goto="cleanup",
+                            update={
+                                **update,
+                                "messages": [],
+                                "error_message": _noop_note,
+                            },
+                        )
+                    return Command(
+                        goto="human_approval",
+                        update={
+                            **update,
+                            "messages": [],
+                            "interrupt_reason": "noop_fix_loop",
+                            "interrupt_message": _noop_note + (
+                                " Edit the scraper or change the strategy/fields,"
+                                " then retry."
+                            ),
+                            "interrupt_options": ["Retry code generation", "Cancel"],
+                            "interrupt_decisions": [
+                                {"type": "approve", "label": "Retry code generation",
+                                 "allow_feedback": True},
+                                {"type": "reject", "label": "Cancel", "allow_feedback": False},
+                            ],
+                        },
+                    )
+            else:
+                # Draft changed (or nothing to compare yet) — reset the streak.
+                update["noop_fix_cycles"] = 0
+        except Exception as _noop_exc:
+            logger.debug("_invoke_code_writer: no-op gate skipped: %s", _noop_exc)
 
         update["messages"] = []
         scraper_analysis = state.get("scraper_analysis") or {}
@@ -4029,6 +4158,34 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         _persist_agent_logs(state, result, "code-tester", config)
         _notify_phase(job_id, "code_tester", "done")
         update = {"messages": []}
+        # [A2/A1/A6] Fingerprint the draft THIS test just ran + track same-draft
+        # re-tests. The fingerprint feeds route_after_testing's freshness floor
+        # (A6) and the writer's no-op-fix gate (A2); the same-draft counter is
+        # the retest cap's budget (A1/QW-3 — routing functions cannot mutate
+        # state, so it is maintained here where the same-draft fact is directly
+        # observable: same fingerprint twice in a row = re-test, changed draft
+        # = reset).
+        _draft_fp = ""
+        try:
+            import hashlib as _hashlib
+
+            _draft_for_fp = (
+                os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
+                if slug else ""
+            )
+            if _draft_for_fp and os.path.isfile(_draft_for_fp):
+                with open(_draft_for_fp, "rb") as _fp_fh:
+                    _draft_fp = _hashlib.sha1(_fp_fh.read()).hexdigest()
+        except Exception as _fp_exc:
+            logger.debug("_invoke_code_tester: draft fingerprint failed: %s", _fp_exc)
+        update["last_tested_draft_fp"] = _draft_fp
+        update["last_tested_at"] = time.time()
+        if _draft_fp:
+            _prev_fp = str(state.get("last_tested_draft_fp") or "")
+            _prev_retests = int(state.get("test_retest_count", 0) or 0)
+            update["test_retest_count"] = (
+                _prev_retests + 1 if _draft_fp == _prev_fp else 0
+            )
         report = _load_test_report(slug)
         # only attempt the repair when the report FILE exists but would not
         # parse (a genuinely-missing file is the F19 no-report path, not a
@@ -4297,10 +4454,17 @@ def _invoke_skill_learner(state: ScrapeState, config: RunnableConfig) -> dict[st
     # copies learning_report.json into scrapers/<slug>/analysis/). Mirrors
     # _invoke_store_job_listings's guard. != SUCCESS is forward-compatible
     # with a future PARTIAL status.
-    if state.get("execution_status", "FAILED") != "SUCCESS":
+    # [QW-1] Also skip when code generation was skipped (re-scrape reusing the
+    # existing scraper): nothing new was learned about generation, and the
+    # tail LLM call only re-derives what the first run already recorded.
+    if (
+        state.get("execution_status", "FAILED") != "SUCCESS"
+        or state.get("skip_code_generation")
+    ):
         logger.info(
-            "_invoke_skill_learner: skipping (execution_status=%s, job %s)",
-            state.get("execution_status"), job_id,
+            "_invoke_skill_learner: skipping (execution_status=%s, "
+            "skip_code_generation=%s, job %s)",
+            state.get("execution_status"), state.get("skip_code_generation"), job_id,
         )
         _notify_phase(job_id, "skill_learner", "skipped")
         return {"messages": []}
@@ -4312,9 +4476,17 @@ def _invoke_skill_learner(state: ScrapeState, config: RunnableConfig) -> dict[st
         _log_agent_context(state, "skill-learner", messages)
         slug = state.get("site_slug", "")
         agent = create_skill_learner(site_slug=slug)
-        result = agent.invoke(
-            {"messages": messages}, config=_agent_config(config, "skill-learner")
-        )
+        # [QW-1] underscore key so AGENT_RECURSION_MAP["skill_learner"] applies,
+        # wall-clock cap + heartbeat like every other LLM tail phase (this was
+        # the last raw un-walled invoke on the happy path).
+        hb = _start_heartbeat(job_id, "skill-learner")
+        try:
+            result = _invoke_agent_with_timeout(
+                agent, messages, _agent_config(config, "skill_learner"),
+                "skill_learner", job_id,
+            )
+        finally:
+            _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "skill-learner", config)
         _notify_phase(job_id, "skill_learner", "done")
 
@@ -4401,8 +4573,10 @@ def _invoke_dagster_converter(
         )
         if not scraper_exists:
             logger.info("_invoke_dagster_converter: no scraper found for %s — skipping", slug)
+            _notify_phase(job_id, "dagster_converter", "skipped")
             return {"messages": []}
     except Exception:
+        _notify_phase(job_id, "dagster_converter", "skipped")
         return {"messages": []}
 
     set_tool_context(dict(state), agent_name="dagster_converter")
@@ -4540,6 +4714,7 @@ def _invoke_dagster_converter(
                             "left as-is, per-job copy at jobs/dagster-%s.py",
                             slug, job_id,
                         )
+                    _notify_phase(job_id, "dagster_converter", "done")
                     return {"messages": [], "dagster_path": per_job_key}
             except SyntaxError as exc:
                 logger.warning(
@@ -4551,9 +4726,11 @@ def _invoke_dagster_converter(
                 "_invoke_dagster_converter: agent did not write %s_dagster.py",
                 slug,
             )
+        _notify_phase(job_id, "dagster_converter", "failed")
         return {"messages": []}
     except Exception as exc:
         logger.warning("_invoke_dagster_converter: failed (non-blocking): %s", exc)
+        _notify_phase(job_id, "dagster_converter", "failed")
         return {"messages": []}
     finally:
         clear_tool_context()
@@ -4578,8 +4755,10 @@ def _invoke_store_job_listings(
 
     # Guard: only for job content types + successful execution + output exists
     if "job" not in page_type.lower():
+        _notify_phase(job_id, "store_job_listings", "skipped")
         return {"messages": []}
     if exec_status != "SUCCESS":
+        _notify_phase(job_id, "store_job_listings", "skipped")
         return {"messages": []}
     if not output_file:
         # Try to find the latest output file (newest mtime across workspace
@@ -4593,6 +4772,7 @@ def _invoke_store_job_listings(
             output_file = ""
     if not output_file or not os.path.isfile(output_file):
         logger.info("_invoke_store_job_listings: no output file for %s — skipping", slug)
+        _notify_phase(job_id, "store_job_listings", "skipped")
         return {"messages": []}
 
     try:
@@ -4608,6 +4788,7 @@ def _invoke_store_job_listings(
         items = data.get(output_key) or data.get("jobs") or data.get("products") or []
         if not items:
             logger.info("_invoke_store_job_listings: no items in %s — skipping", output_file)
+            _notify_phase(job_id, "store_job_listings", "skipped")
             return {"messages": []}
 
         # Known fields → model columns; everything else → extra_data
@@ -4742,9 +4923,11 @@ def _invoke_store_job_listings(
             "_invoke_store_job_listings: %d created, %d updated from %s (job %s)",
             created_count, updated_count, output_file, job_id,
         )
+        _notify_phase(job_id, "store_job_listings", "done")
         return {"messages": [], "listings_stored": created_count + updated_count}
     except Exception as exc:
         logger.warning("_invoke_store_job_listings: failed (non-blocking): %s", exc)
+        _notify_phase(job_id, "store_job_listings", "failed")
         return {"messages": []}
 
 
@@ -4786,6 +4969,35 @@ def _persist_agent_logs(
     job_id = state.get("job_id")
     if not job_id:
         return
+
+    # [QW-6] A wall-clock abandonment produced NO messages, so the early
+    # return below hid it: the job's tool-call trail just went silent for
+    # 900s with zero DB record of why. Write one ToolCallLog row so the
+    # abandonment is visible (and countable) in the tool-calls view.
+    _err = str(result.get("_error") or "") if isinstance(result, dict) else ""
+    if "wall-clock timeout" in _err or (
+        str(result.get("_error_class") or "") == "WallClockTimeout"
+        if isinstance(result, dict)
+        else False
+    ):
+        try:
+            from scraper.models import ToolCallLog
+
+            ToolCallLog.objects.create(
+                job_id=job_id,
+                agent=agent_name,
+                tool_name="wall_clock_timeout",
+                tool_call_id="",
+                call_seq=ToolCallLog.objects.filter(job_id=job_id).count(),
+                args_summary=_err[:500],
+                result_summary="agent exceeded its wall clock; thread abandoned",
+            )
+        except Exception as _wc_exc:
+            logger.warning(
+                "_persist_agent_logs: wall-clock row failed for %s: %s",
+                agent_name, _wc_exc,
+            )
+
     messages = result.get("messages", [])
     if not messages:
         return
@@ -5312,6 +5524,10 @@ def build_scrape_graph(
             "scraper_analyzer": "scraper_analyzer",
             "product_analyzer": "product_analyzer",
             "code_writer": "code_writer",
+            # [QW-3/A1] same-draft re-test for unproven-coverage failures
+            # (429 / throttle / transient render) — capped by
+            # state.test_retest_count, maintained inside _invoke_code_tester.
+            "code_tester": "code_tester",
             "human_approval": "human_approval",
             "cleanup": "cleanup",
         },
