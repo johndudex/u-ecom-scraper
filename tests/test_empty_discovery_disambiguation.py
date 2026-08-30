@@ -19,6 +19,13 @@ Three layers fixed here:
    ``_STOP_REASON_PRIORITY`` so aggregation carries it.
 3. ``webapp/agents/nodes/route_after_testing.py`` — ``empty_first_page``
    joins the Tier-1 coverage-FAIL stop-reason set.
+4. ``src/http_fetch.py`` + template wiring [job-62 birkenstock re-run] — the
+   prod re-run showed the 45s retry re-hitting the same burned IP because
+   code_writer had stripped the draft's proxy ladder ("analysis says direct
+   works"). The fetch machinery now lives in a shared module the writer
+   cannot strip, and the discovery loop escalates the proxy tier on SOFT
+   blocks (200-but-zero-links — invisible to ``is_banned``) with a floor so
+   Phase 2 reuses the tier that unblocked Phase 1.
 
 The template halves are tested behaviorally (the discovery functions are
 exec-extracted into a namespace with a stubbed ``fetch_page``/``time`` —
@@ -99,12 +106,15 @@ class _FakeLogger:
         self.warnings.append(str(msg) % a if a else str(msg))
 
 
-def _make_ns(fetch_results: list, retry_delay: int = 45):
+def _make_ns(fetch_results: list, retry_delay: int = 45, listings: list | None = None):
     """Namespace with the two extracted functions + controllable stubs.
 
     ``fetch_results``: queue of ``list[str]`` (product hrefs on the page) or
     None (fetch failure → navigate_error path). Each listing-page fetch pops
     one entry; an exhausted queue yields empty pages.
+    ``listings``: override PRODUCT_LISTING_URLS (escalation tests use a single
+    listing so tier-call sequences are exact — a second listing re-escalates
+    after the first short-pages, by design).
     """
     with open(REQ) as fh:
         src = fh.read()
@@ -113,10 +123,8 @@ def _make_ns(fetch_results: list, retry_delay: int = 45):
     ns = {
         "time": _FakeTime(),
         "logger": _FakeLogger(),
-        "PRODUCT_LISTING_URLS": [
-            "https://site.test/de/a/",
-            "https://site.test/de/b/",
-        ],
+        "PRODUCT_LISTING_URLS": listings
+        or ["https://site.test/de/a/", "https://site.test/de/b/"],
         "PAGE_PARAM_NAME": "page",
         "DISCOVERY_DEADLINE_SECONDS": 300,
         "MAX_PAGES": None,
@@ -128,12 +136,21 @@ def _make_ns(fetch_results: list, retry_delay: int = 45):
     }
 
     queue = list(fetch_results)
+    tier_calls: list[int] = []
 
-    def fetch_page(_url):
+    def fetch_page(_url, min_tier=0):
         # Mirror the real fetch_page contract: None on total failure
         # (all proxy tiers exhausted), (soup, status) on any HTTP response.
+        # ``min_tier`` is the soft-block escalation index (job-62).
+        tier_calls.append(min_tier)
         r = queue.pop(0) if queue else []
         return None if r is None else (_FakeSoup(r), 200)
+
+    # Closure attributes the discovery loop reads (mirrors src/http_fetch.py):
+    # the escalation bound and the floor the loop raises once a tier works.
+    fetch_page.min_tier_floor = 0
+    fetch_page.tiers_total = 3  # none → datacenter → residential
+    fetch_page.tier_calls = tier_calls
 
     ns["fetch_page"] = fetch_page
 
@@ -166,26 +183,31 @@ class TestZeroUrlReclassification:
         assert "retried_empty_discovery" not in meta
         assert ns["time"].sleeps == []
 
-    def test_retry_recovers_when_block_window_passes(self):
-        """First pass blocked-empty; the 45s backoff rides out the window and
-        the second pass finds URLs (the tester had found 15 ninety seconds
-        earlier). Discovery succeeds; the retry is recorded."""
+    def test_escalation_recovers_without_paying_the_retry(self):
+        """[job-62 birkenstock] Page 1 blocked at tier 0 (200, zero links) but
+        the datacenter tier serves the listing: escalation recovers discovery
+        in the SAME pass — no 45s retry, no empty_first_page. This is the path
+        the stripped draft lacked entirely."""
         page1 = ["/de/p/first_1.html", "/de/p/second_2.html"]
-        ns = _make_ns([[], [], page1, []])
+        ns = _make_ns([[], page1, []], listings=["https://site.test/de/a/"])
         urls, meta = ns["discover_product_urls_with_retry"]()
         assert len(urls) == 2
-        assert meta["retried_empty_discovery"] is True
         assert meta["stop_reason"] != "empty_first_page"
-        assert ns["time"].sleeps == [45]
+        assert meta["soft_block_escalations"] == 1
+        assert ns["time"].sleeps == []  # retry path never entered
+        assert ns["fetch_page"].tier_calls == [0, 1, 1]  # ladder climbed, then floor held
 
     def test_genuine_end_after_items_keeps_short_page_no_retry(self):
         """A real catalog-end requires having seen items: listing A yields
         products on page 1 then thins out on page 2 → short_page, PASS, and
         the retry path is never entered."""
-        ns = _make_ns([
-            ["/de/p/a1_1.html", "/de/p/a2_2.html"],  # listing A page 1
-            [],                                      # listing A page 2 (thin)
-        ])
+        ns = _make_ns(
+            [
+                ["/de/p/a1_1.html", "/de/p/a2_2.html"],  # page 1
+                [],                                      # page 2 (thin)
+            ],
+            listings=["https://site.test/de/a/"],
+        )
         urls, meta = ns["discover_product_urls_with_retry"]()
         assert len(urls) == 2
         assert meta["stop_reason"] == "short_page"
@@ -197,7 +219,9 @@ class TestZeroUrlReclassification:
         run that found items. The per-listing emptiness stays visible in the
         last-wins stop_reason but NOT as empty_first_page."""
         ns = _make_ns([
-            [],                                       # listing A: blocked
+            [],                                       # listing A tier 0: blocked
+            [],                                       # listing A tier 1: blocked
+            [],                                       # listing A tier 2: blocked
             ["/de/p/b1_1.html", "/de/p/b2_2.html"],   # listing B page 1
             [],                                       # listing B page 2
         ])
@@ -214,6 +238,52 @@ class TestZeroUrlReclassification:
         assert urls == []
         assert meta["stop_reason"] == "navigate_error"
         assert ns["time"].sleeps == []
+
+
+# ─── behavioral: soft-block proxy escalation [job-62] ─────────────────────────
+
+
+class TestSoftBlockEscalation:
+    def test_ladder_exhaustion_is_bounded_and_still_classifies_empty(self):
+        """Every tier serves 200-with-zero-links: exactly tiers_total-1
+        escalations fire (bounded by ladder length), the listing ends
+        short_page, and the run still classifies honestly as
+        empty_first_page. Friction is visible in discovery_meta."""
+        ns = _make_ns([[]] * 3, retry_delay=0, listings=["https://site.test/de/a/"])
+        urls, meta = ns["discover_product_urls_with_retry"]()
+        assert urls == []
+        assert meta["stop_reason"] == "empty_first_page"
+        assert meta["soft_block_escalations"] == 2
+        assert ns["fetch_page"].tier_calls == [0, 1, 2]
+        assert ns["time"].sleeps == []
+
+    def test_empty_page_beyond_page_1_never_escalates(self):
+        """An empty page >= 2 is a genuine catalog end — only page 1 of a
+        listing escalates. Without that guard every thin category tail would
+        burn two proxy escalations per listing."""
+        ns = _make_ns(
+            [["/de/p/only_1.html"], []],
+            retry_delay=0,
+            listings=["https://site.test/de/a/"],
+        )
+        urls, meta = ns["discover_product_urls_with_retry"]()
+        assert len(urls) == 1
+        assert meta["stop_reason"] == "short_page"
+        assert meta["soft_block_escalations"] == 0
+        assert ns["fetch_page"].tier_calls == [0, 0]
+
+    def test_escalated_tier_locks_in_as_floor(self):
+        """Once a tier unblocks a listing, the closure's min_tier_floor is
+        raised so later fetches — subsequent pages AND Phase-2 item pages,
+        which call fetch_page(url) with no explicit min_tier — reuse it
+        instead of restarting unproxied and re-entering the block."""
+        ns = _make_ns(
+            [[], ["/de/p/x_1.html"]],
+            retry_delay=0,
+            listings=["https://site.test/de/a/"],
+        )
+        ns["discover_product_urls_with_retry"]()
+        assert ns["fetch_page"].min_tier_floor == 1
 
 
 # ─── behavioral: pipeline coverage gate ──────────────────────────────────────
@@ -314,18 +384,38 @@ class TestRequestsTemplateCallSites:
         assert "EMPTY_DISCOVERY_RETRY_DELAY_S = 45" in src
         assert "def discover_product_urls_with_retry()" in src
 
-    def test_fetch_page_uses_persistent_session(self):
-        """[job-58 root-cause trigger] Bare requests.get() is a cookieless
-        one-shot per call — Akamai never sees the consent/_abck cookie a real
-        browser round-trips, so the test phase's rapid draft runs burn the
-        worker IP's reputation before execution. fetch_page must go through
-        a module-level Session (cookies persist, connections are reused)."""
+    def test_fetch_machinery_is_the_shared_module_not_inline(self):
+        """[job-62 birkenstock root cause] code_writer rewrote fetch_page
+        inline and STRIPPED the proxy ladder because analysis said "direct
+        works" — the tester passed, execution got 200-wrapped challenge pages,
+        and the draft had nothing to escalate to → 0 items. The machinery now
+        lives in src/http_fetch.py (the same structural defense as
+        src/discovery.py): the template imports it, defines no fetch loop of
+        its own, and keeps no proxy objects for the writer to reason about."""
         with open(REQ) as fh:
             src = fh.read()
-        assert "requests.Session()" in src
-        fetch_body = _grab(src, "fetch_page")
-        assert "SESSION.get(" in fetch_body
-        assert "requests.get(" not in fetch_body
+        assert "from src.http_fetch import create_fetch_page" in src
+        assert re.search(r"^fetch_page = create_fetch_page\(", src, re.MULTILINE)
+        assert "def fetch_page" not in src  # nothing inline to strip
+        assert "requests.Session()" not in src  # session lives in the module
+        assert "proxy_config" not in src  # module owns the ProxyConfig usage
+        assert "min_tier" in src  # discovery loop drives the soft-block ladder
+
+        with open(os.path.join(ROOT, "src", "http_fetch.py")) as fh:
+            mod = fh.read()
+        assert "requests.Session()" in mod  # persistent-session fix retained
+        assert "min_tier_floor" in mod and "tiers_total" in mod
+
+    def test_friction_counters_surface_in_discovery_coverage(self):
+        """Job-62's prod output carried retried_empty_discovery in
+        discovery_meta only — discovery_coverage (the artifact the gate and
+        any auditor read) had neither friction counter, so the execution
+        output alone could not say WHY the run was blocked. Both surface."""
+        with open(REQ) as fh:
+            src = fh.read()
+        main_src = _grab(src, "main")
+        assert '"soft_block_escalations"' in main_src
+        assert '"retried_empty_discovery"' in main_src
 
 
 if __name__ == "__main__":

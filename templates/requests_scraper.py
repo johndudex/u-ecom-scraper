@@ -30,7 +30,6 @@ import requests
 from bs4 import BeautifulSoup
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from src.proxy import ProxyConfig, should_warn_residential, warn_residential_usage
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION - Update these values
@@ -57,7 +56,6 @@ if PAGE_PARAM_NAME.startswith("{") and PAGE_PARAM_NAME.endswith("}"):
 # exactly as before: one URL, ?page=N).
 PRODUCT_LISTING_URLS = [PRODUCT_LISTING_URL]
 DELAY_BETWEEN_REQUESTS = {DELAY_BETWEEN_REQUESTS}
-MAX_RETRIES = 3
 # Safety cap on listing pagination (None = unlimited). code_writer may set this
 # to bound discovery on very large sites; hitting it yields stop_reason="max_pages_hit".
 MAX_PAGES = None
@@ -83,16 +81,19 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# [job-58 birkenstock] Persistent session — cookies round-trip across every
-# request and the connection pool is reused. Bare requests.get() is a
-# cookieless one-shot per call: Akamai never sees the consent/_abck cookie a
-# real browser carries, every hit re-raises the bot score, and the test
-# phase's ~10 rapid draft runs in 45 minutes burned the worker IP's
-# reputation right before execution ran. A session both looks more human
-# and lets the 45s discovery retry ride out a challenge window with the
-# cookies it was handed.
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
+# ── HTTP FETCH — SHARED MODULE, NOT YOURS TO REIMPLEMENT (CRITICAL) ──────────
+# code_writer: keep the import + wiring below VERBATIM. Do NOT write your own
+# fetch loop and do NOT drop the proxy ladder because analysis said "direct
+# works" — Akamai-class sites allow the first hits, then challenge LATER runs
+# (job-58 birkenstock: tester 5/5 PASS; execution minutes later got 200-wrapped
+# challenge pages, zero links, and the ladder had been stripped so there was
+# nothing to escalate to → 0 items). The module also carries the persistent
+# session (cookies round-trip — a bare requests.get() is a cookieless one-shot
+# that re-raises the bot score on every hit) and the soft-block min_tier
+# mechanism the discovery loop below drives. Full rationale: src/http_fetch.py.
+from src.http_fetch import create_fetch_page
+
+fetch_page = create_fetch_page(delay_s=DELAY_BETWEEN_REQUESTS, headers=HEADERS)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TIMESTAMP = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
@@ -116,8 +117,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-proxy_config = ProxyConfig.get_instance()
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS
@@ -139,38 +138,6 @@ def make_absolute_url(url: str, base: str = SITE_URL) -> str:
     if url.startswith("//"):
         return f"https:{url}"
     return urljoin(base, url)
-
-
-def fetch_page(url: str) -> Optional[tuple[BeautifulSoup, int]]:
-    ssl_verify = proxy_config.config.get("strategy", {}).get("ssl_verify", False)
-    escalation = proxy_config.get_escalation_tier()
-
-    for tier in ["none", *escalation]:
-        if should_warn_residential(tier):
-            warn_residential_usage(url)
-
-        proxies = proxy_config.get_proxy_dict(tier) if tier != "none" else None
-        max_retries = proxy_config.get_max_retries(tier) if tier != "none" else MAX_RETRIES
-        cooldown = proxy_config.get_cooldown(tier) if tier != "none" else DELAY_BETWEEN_REQUESTS * 2
-
-        for attempt in range(max_retries):
-            try:
-                time.sleep(DELAY_BETWEEN_REQUESTS)
-                response = SESSION.get(url, proxies=proxies, timeout=proxy_config.get_timeout(), verify=ssl_verify)
-                if response.status_code == 200:
-                    response.raise_for_status()
-                    return BeautifulSoup(response.text, "html.parser"), response.status_code
-                if proxy_config.is_banned(response.status_code, response.text):
-                    logger.warning(f"Ban detected ({response.status_code}) on tier '{tier}', escalating...")
-                    break
-                response.raise_for_status()
-                return BeautifulSoup(response.text, "html.parser"), response.status_code
-            except requests.RequestException as e:
-                logger.error(f"Failed to fetch {url} (attempt {attempt + 1}/{max_retries}, tier={tier}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(cooldown)
-
-    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -271,6 +238,11 @@ def discover_product_urls() -> tuple[list[str], dict]:
     stop_reason = "no_next_link"
     saw_navigate_error = False
     _deadline_start = time.monotonic()
+    # [job-62 birkenstock] Soft-block escalation state: the proxy tier index
+    # the next fetch starts from, and how many times a 200-but-zero-links
+    # page forced an escalation (surfaced in discovery_coverage).
+    min_tier = 0
+    soft_block_escalations = 0
 
     # Enumerate every listing/category URL, paginating each until exhausted.
     # Dedupe across listings via `seen`. For a single-listing site this is
@@ -292,7 +264,7 @@ def discover_product_urls() -> tuple[list[str], dict]:
             paginated_url = f"{listing_url}{sep}{PAGE_PARAM_NAME}={page}"
             logger.info(f"Fetching listing page {page}: {paginated_url}")
 
-            result = fetch_page(paginated_url)
+            result = fetch_page(paginated_url, min_tier)
             if not result:
                 # HTTP error / 429-502-503 / connection failure / rate-limit bail.
                 # This is NOT exhaustion — the loop gave up (H4). navigate_error
@@ -317,8 +289,34 @@ def discover_product_urls() -> tuple[list[str], dict]:
                 f"found (total: {len(all_urls)})"
             )
 
+            # [job-62 birkenstock] A tier that unblocks a listing becomes the
+            # floor for every later fetch (subsequent pages AND Phase-2 item
+            # pages) — without this, extraction would restart unproxied and
+            # re-enter the block.
+            if links and min_tier > fetch_page.min_tier_floor:
+                fetch_page.min_tier_floor = min_tier
+                logger.info(
+                    "Proxy tier index %s unblocked %s — locking it in as the "
+                    "floor for all later fetches", min_tier, listing_url,
+                )
+
             # Short page: fewer items than expected → genuine end of results.
+            # BUT check for a SOFT BLOCK first [job-62 birkenstock]: HTTP 200
+            # whose body selects zero item links is the anti-bot challenge
+            # signature — is_banned() cannot see it (there is no 403/503
+            # status to test). Escalate one proxy tier and re-fetch the SAME
+            # page. Only page 1 escalates: an empty page >= 2 is a genuine
+            # end-of-catalog, and the ladder length bounds the escalation.
             if len(links) == 0:
+                if page == 1 and min_tier < fetch_page.tiers_total - 1:
+                    min_tier += 1
+                    soft_block_escalations += 1
+                    logger.warning(
+                        "Page 1 of %s returned 200 with ZERO product links "
+                        "(soft-block signature) — escalating to proxy tier "
+                        "index %s and refetching", listing_url, min_tier,
+                    )
+                    continue
                 stop_reason = "short_page"
                 break
 
@@ -351,6 +349,7 @@ def discover_product_urls() -> tuple[list[str], dict]:
         "stop_reason": stop_reason,
         "max_pages_hit": stop_reason == "max_pages_hit",
         "discovered_urls": len(all_urls),
+        "soft_block_escalations": soft_block_escalations,
     }
     return all_urls, discovery_meta
 
@@ -555,6 +554,11 @@ def main():
         "max_pages_hit": discovery_meta.get("max_pages_hit", False),
         "ran_phase1": ran_phase1,
         "skipped_reason": skipped_reason,
+        # Anti-bot friction counters [job-58/job-62 birkenstock]: surfaced so
+        # an execution output alone explains WHY a run was blocked (ladder
+        # exhausted inside Phase 1 vs 45s retry also failed vs no friction).
+        "soft_block_escalations": discovery_meta.get("soft_block_escalations", 0),
+        "retried_empty_discovery": discovery_meta.get("retried_empty_discovery", False),
     }
 
     output = {

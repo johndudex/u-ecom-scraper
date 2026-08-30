@@ -38,19 +38,18 @@ so the first attempt you hand off actually works. **Do NOT hand off an untested 
 
 ## Proxy Integration
 
-When writing scrapers, integrate proxy support using the shared proxy utility:
+For requests-based templates, proxy + fetch machinery is **already wired** — the
+template imports the shared module and you must keep that wiring:
 
 ```python
-import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from src.proxy import ProxyConfig
+from src.http_fetch import create_fetch_page
+fetch_page = create_fetch_page(delay_s=DELAY_BETWEEN_REQUESTS, headers=HEADERS)
 ```
 
-**Escalation:** try without proxy first → if blocked (403/503/429), retry with
-**datacenter** proxy → if datacenter blocked, **ask before** trying **residential**
-proxy. Always log before using residential (expensive).
-
-Read proxy config from: `config/proxy.json`. Shared utility: `src/proxy.py`.
+NEVER hand-roll `from src.proxy import ProxyConfig` in a draft, and NEVER
+simplify `fetch_page` to a bare `session.get()`/`requests.get()` — see the
+hard rule below for why. Shared utility (used by the module, not by you):
+`src/proxy.py`, config `config/proxy.json`.
 
 ## Template Fidelity — CRITICAL
 
@@ -114,6 +113,38 @@ from src.discovery import discover_item_urls, config_for_load_more
    a 0-item output. Log the fallback loudly (`logger.warning`) so the test
    report shows it. Never return success with 0 discovered URLs while a
    known-good listing shape is available.
+
+### HTTP fetch — SHARED MODULE (CRITICAL, requests templates)
+
+The template's `fetch_page` is built from an imported module, NOT inline code:
+
+```python
+from src.http_fetch import create_fetch_page
+fetch_page = create_fetch_page(delay_s=DELAY_BETWEEN_REQUESTS, headers=HEADERS)
+```
+
+**THREE HARD RULES:**
+
+1. **KEEP both lines verbatim.** Do NOT delete the import, do NOT replace
+   `fetch_page` with your own request loop, do NOT re-add
+   `from src.proxy import ProxyConfig`. Session persistence (cookies
+   round-trip), the proxy ladder (none → datacenter → residential), hard-block
+   escalation (403/503/429), and the soft-block `min_tier` mechanism the
+   discovery loop drives all live inside `src.http_fetch` and are NOT yours
+   to edit.
+2. **NEVER strip the ladder because the analysis said "direct works".** That
+   is the exact job-58/job-62 birkenstock trap, twice: analysis and `--sample`
+   testing ran unblocked, then the execution run minutes later got
+   200-wrapped challenge pages with zero product links — and the draft, its
+   ladder stripped, re-hit the same burned IP on the 45s retry and finalized
+   0 items. Akamai-class sites allow the first hits, then challenge LATER
+   runs. "Direct works now" describes this minute, not the execution window;
+   it is never a reason to delete recovery machinery.
+3. **KEEP the discovery loop's `fetch_page(url, min_tier)` call and its
+   zero-links escalation branch verbatim.** The soft-block signature (HTTP
+   200, zero product links on page 1) is invisible to status-code ban checks;
+   the loop's tier escalation is the only recovery for it. Adapt selectors,
+   never the loop.
 
 ### Other discovery helpers — DO NOT re-signature
 
