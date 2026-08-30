@@ -143,6 +143,9 @@ DJANGO_SUPERUSER_PASSWORD=<invent>            # ⋮ → Seal
 
 # ── healthcheck port (gunicorn binds 8000; see note) ──
 PORT=8000
+
+# ── TLS: the edge already 301s http→https; the app must NOT (see step 9) ──
+SECURE_SSL_REDIRECT=False
 ```
 
    Why each (one-liners):
@@ -177,6 +180,7 @@ CSRF_TRUSTED_ORIGINS=https://<your-app>.up.railway.app
    `ALLOWED_HOSTS=<your-app>.up.railway.app,healthcheck.railway.app`
    **Values must be UNQUOTED** (live failure #6): the Raw Editor stores what you paste verbatim — `PORT="8000"` keeps the quote characters, and a quoted PORT breaks the probe URL at the connection level ("service unavailable" with a perfectly healthy app).
    **Escape hatch (live-verified #7):** a failing healthcheck BLOCKS the deployment from going active — the domain 404s ("Application not found") even though the app serves fine. If stuck: Settings → Healthcheck → **clear the path** → redeploy → deployment activates, domain routes. Re-add later after verifying `curl https://<app>.up.railway.app/api/health/raw` → ok. A healthcheck is protection, not a requirement.
+   **SSL-redirect trap (live failure #8, 2026-08-30):** `settings.py` defaults `SECURE_SSL_REDIRECT=True` when `DEBUG=False`, and prod had no override. Railway's healthcheck probes the container over **plaintext HTTP** (no `X-Forwarded-Proto`), so SecurityMiddleware 301-redirected every probe → "1/1 replicas never became healthy" → deploy failed with a **build that was perfectly fine** (all 14 attempts logged `HTTP 301`). This only surfaced on the first deploy after the healthcheck was added, because it was applied without a redeploy. Two facts make `False` safe: Railway's **edge already 301s http→https** on the public domain (verified — the redirect response carries `x-railway-*` headers and no Django headers; it never reaches the app), and the internal network is plaintext by design. Fix: set `SECURE_SSL_REDIRECT=False` on django (Variables tab) **and redeploy** — variable changes don't apply to a running deployment. Diagnosing this class of failure: a build-log healthcheck showing repeated `HTTP 301` = a redirect, so check APPEND_SLASH (path spelling — this route has NO trailing slash), login redirects (don't probe `/health/`), and SSL redirect, in that order.
 9. Serverless: **OFF**. Resources: 1 GB is fine.
 
 ✅ **Checkpoint:** open `https://<app>.up.railway.app/api/health/raw` → `ok`. `/accounts/login/` renders with CSS (proves whitenoise+collectstatic).
