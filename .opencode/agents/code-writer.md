@@ -128,10 +128,10 @@ fetch_page = create_fetch_page(delay_s=DELAY_BETWEEN_REQUESTS, headers=HEADERS)
 1. **KEEP both lines verbatim.** Do NOT delete the import, do NOT replace
    `fetch_page` with your own request loop, do NOT re-add
    `from src.proxy import ProxyConfig`. Session persistence (cookies
-   round-trip), the proxy ladder (none → datacenter → residential), hard-block
-   escalation (403/503/429), and the soft-block `min_tier` mechanism the
-   discovery loop drives all live inside `src.http_fetch` and are NOT yours
-   to edit.
+   round-trip), the proxy ladder (none → datacenter → residential → curl_cffi
+   browser-TLS fingerprint), hard-block escalation (403/503/429), and the
+   soft-block `min_tier` mechanism the discovery loop drives all live inside
+   `src.http_fetch` and are NOT yours to edit.
 2. **NEVER strip the ladder because the analysis said "direct works".** That
    is the exact job-58/job-62 birkenstock trap, twice: analysis and `--sample`
    testing ran unblocked, then the execution run minutes later got
