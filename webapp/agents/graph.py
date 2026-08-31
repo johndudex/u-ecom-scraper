@@ -3951,6 +3951,26 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
             _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "code-writer", config)
 
+        # [jobs-79/80] Snapshot EVERY completed draft to THIS job's FM key
+        # immediately — promotion to production only happens at cleanup, which
+        # a wedged/killed run never reaches. setup_workspace restores from this
+        # key when the local draft is missing (watchdog re-drive after an
+        # ephemeral-volume recycle), so the job resumes with the draft its
+        # writer actually produced instead of regenerating from nothing.
+        try:
+            _cw_draft = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
+            if os.path.isfile(_cw_draft):
+                import src.artifacts as _art
+
+                _art.write(
+                    _art.scrapers_key(slug, "jobs", f"scraper-draft-{job_id}.py"),
+                    open(_cw_draft, "rb").read(),
+                )
+        except Exception as _snap_exc:
+            logger.warning(
+                "_invoke_code_writer: draft FM snapshot failed (job %s): %s", job_id, _snap_exc
+            )
+
         # T0.3/T0.4: a dead invocation (wall-clock timeout, provider exception)
         # used to be indistinguishable from a healthy return — the flow then
         # paid code_tester's full (un-walled) invoke against a draft that was
@@ -3963,19 +3983,49 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         _cw_err = str(_cw_result.get("_error") or "")
         _cw_dead = bool(_cw_err) or not _cw_result.get("messages")
         _draft_path = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
-        if _cw_dead and not os.path.isfile(_draft_path):
-            _err_note = _cw_err or "invocation returned no messages and wrote no draft"
+        # [jobs-79/80] An ALIVE invocation that produced no draft is the same
+        # failure as a dead one: the writer replied text-only (no tool calls)
+        # — the agent loop ended "successfully" with nothing on disk, the
+        # tester then burned its whole cascade CRASHing on the missing file
+        # (3 cycles, both prod jobs). The writer's one job is the draft; treat
+        # no-draft as failure regardless of how chatty the invocation was.
+        if not os.path.isfile(_draft_path):
+            _err_note = _cw_err or (
+                "invocation returned no draft"
+                if _cw_result.get("messages")
+                else "invocation returned no messages and wrote no draft"
+            )
             _err_count = int(state.get("code_writer_error_count") or 0)
             logger.error(
-                "_invoke_code_writer: dead invocation — %s (error_count=%d, job %s)",
-                _err_note, _err_count + 1, job_id,
+                "_invoke_code_writer: %s invocation — %s (error_count=%d, job %s)",
+                "dead" if _cw_dead else "no-op", _err_note, _err_count + 1, job_id,
             )
             _notify_phase(job_id, "code_writer", "failed")
             update["code_writer_error"] = _err_note
             update["code_writer_error_count"] = _err_count + 1
             update["messages"] = []
             if _err_count + 1 >= 2:
-                # Second consecutive death — stop burning wall-clock, escalate.
+                # Second consecutive no-draft — stop burning wall-clock.
+                # [jobs-79/80] skip_approvals jobs must CLEANUP here, not
+                # interrupt: human_approval auto-approves ("Retry code
+                # generation") and the writer no-ops again — an unbounded
+                # auto-approve loop. Mirror the S-4 wall-clock arm.
+                if state.get("skip_approvals", False):
+                    logger.error(
+                        "_invoke_code_writer: repeated no-draft writer failures + "
+                        "skip_approvals → cleanup (honest failure, job %s)", job_id,
+                    )
+                    return Command(
+                        goto="cleanup",
+                        update={
+                            **update,
+                            "messages": [],
+                            "error_message": (
+                                f"code_writer failed twice without producing a draft "
+                                f"({_err_note})"
+                            ),
+                        },
+                    )
                 return Command(
                     goto="human_approval",
                     update={
