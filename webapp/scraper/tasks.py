@@ -79,16 +79,19 @@ def _publish_job_status(job_id: int, status: str) -> None:
 # KEEPS RUNNING, so only a process-level kill reclaims it (and the worker slot).
 # soft_time_limit → SoftTimeLimitExceeded (task can catch + finalize the job);
 # time_limit → Celery SIGKILLs the worker (reclaims the abandoned thread + any
-# leaked resources). Defaults (2h / 2h6m) sit well above any legitimate run
-# (aya's 26k-job extraction finishes <1h); tune via settings if a site needs more.
+# leaked resources). Defaults (3h / 3h6m) sit above a full-catalogue run:
+# graph phases + an EXECUTION_MAX_TIMEOUT-capped subprocess must fit inside
+# the soft limit for the job to finalize [job-68 theiconic died at exactly 2h
+# mid-code-tester under the old 2h default; job-315 citybeach needs ~110 min
+# total]. Tune via settings if a site needs more.
 try:
     from django.conf import settings as _settings
     _RUN_TASK_SOFT_TIME_LIMIT = int(
-        getattr(_settings, "CELERY_TASK_SOFT_TIME_LIMIT", 7200)
+        getattr(_settings, "CELERY_TASK_SOFT_TIME_LIMIT", 10800)
     )
-    _RUN_TASK_TIME_LIMIT = int(getattr(_settings, "CELERY_TASK_TIME_LIMIT", 7560))
+    _RUN_TASK_TIME_LIMIT = int(getattr(_settings, "CELERY_TASK_TIME_LIMIT", 11160))
 except Exception:
-    _RUN_TASK_SOFT_TIME_LIMIT, _RUN_TASK_TIME_LIMIT = 7200, 7560
+    _RUN_TASK_SOFT_TIME_LIMIT, _RUN_TASK_TIME_LIMIT = 10800, 11160
 
 
 @shared_task(

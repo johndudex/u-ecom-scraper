@@ -279,6 +279,46 @@ def _stealth_env(state: ScrapeState) -> dict[str, str]:
     return {"STEALTH_BROWSER": "cloak"} if _needs_cloak(state) else {}
 
 
+# [job-315 citybeach] Progress-aware wall-clock extension. EXECUTION_TIMEOUT is
+# a BASE budget, not a verdict: citybeach's healthy 1,317-item extraction
+# (Progress line every ~90s, 25 items per 90s) died at 72% under the flat
+# 3600s backstop — extraction alone at a polite ~2.4s/item needs ~79 min.
+# The template's extraction progress lines are evidence of life, so the
+# monitor extends the deadline to cover the REMAINING items at a generous
+# per-item allowance, clamped to EXECUTION_MAX_TIMEOUT (which must stay under
+# the celery task soft time limit so a ceiling-capped run still finalizes).
+# Hangs remain the stall detector's job (EXECUTION_STALL_TIMEOUT) — a hung
+# scraper emits no Progress lines and no activity.
+_EXTRACTION_PROGRESS_RE = re.compile(r"Progress:\s*\[(\d+)/(\d+)\]")
+_EXEC_PER_ITEM_SECONDS = 12  # ~4x the observed polite pace
+_EXEC_EXTENSION_SLACK_S = 600  # last page write + output serialization
+
+
+def _extended_wall_clock_deadline(
+    deadline: float,
+    now: float,
+    chunk_text: str,
+    started_at: float,
+    max_total: float,
+) -> float:
+    """Extend ``deadline`` for extraction progress seen in a stderr chunk.
+
+    Pure arithmetic; the monitor loop calls it per chunk. Uses the LAST
+    ``Progress: [k/N]`` match in the chunk. Never shortens an existing
+    deadline, never extends past ``started_at + max_total``, and a completed
+    total (``k == N``) extends nothing.
+    """
+    matches = _EXTRACTION_PROGRESS_RE.findall(chunk_text)
+    if not matches:
+        return deadline
+    done, total = (int(g) for g in matches[-1])
+    remaining = total - done
+    if remaining <= 0:
+        return deadline
+    proposed = now + remaining * _EXEC_PER_ITEM_SECONDS + _EXEC_EXTENSION_SLACK_S
+    return min(max(deadline, proposed), started_at + max_total)
+
+
 def run_execution(state: ScrapeState) -> dict:
     from ..graph import _notify_phase
 
@@ -795,6 +835,7 @@ def _run_in_process(
         from django.conf import settings as _settings
         _stall = getattr(_settings, "EXECUTION_STALL_TIMEOUT", 300)
         _hard = getattr(_settings, "EXECUTION_TIMEOUT", 3600)
+        _max_total = getattr(_settings, "EXECUTION_MAX_TIMEOUT", 9600)
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd,
             env={**os.environ, **(env_overrides or {}),
@@ -814,6 +855,7 @@ def _run_in_process(
         stderr_buf = bytearray()
         last_activity = time.time()
         stall_reason = ""
+        deadline = start + _hard  # progress lines extend this (job-315)
         while True:
             ready, _, _ = select.select([proc.stderr], [], [], 5.0)
             if ready:
@@ -823,6 +865,26 @@ def _run_in_process(
                     stderr_buf.extend(chunk)
                     if len(stderr_buf) > 200_000:
                         del stderr_buf[:100_000]
+                    # [job-315] "Progress: [k/N]" on stderr = measured life.
+                    # Extend the wall-clock to budget the remaining items —
+                    # bookkeeping must never kill the monitor, hence try/except.
+                    try:
+                        _new_deadline = _extended_wall_clock_deadline(
+                            deadline, time.time(),
+                            chunk.decode("utf-8", "replace"), start, _max_total,
+                        )
+                        if _new_deadline > deadline + 1:
+                            logger.info(
+                                "run_execution: extraction progress extended "
+                                "wall-clock deadline to +%ds (ceiling %ds)",
+                                int(_new_deadline - start), _max_total,
+                            )
+                        deadline = _new_deadline
+                    except Exception as _ext_exc:
+                        logger.warning(
+                            "run_execution: deadline extension check failed: %s",
+                            _ext_exc,
+                        )
                 elif proc.poll() is not None:
                     break  # EOF and process exited
             elif proc.poll() is not None:
@@ -834,8 +896,11 @@ def _run_in_process(
                 )
                 _kill_process_group(proc)
                 break
-            if time.time() - start > _hard:
-                stall_reason = f"scraper exceeded {_hard}s wall-clock"
+            if time.time() > deadline:
+                stall_reason = (
+                    f"scraper exceeded {int(time.time() - start)}s wall-clock "
+                    f"(base {_hard}s, progress-extension ceiling {_max_total}s)"
+                )
                 _kill_process_group(proc)
                 break
         try:

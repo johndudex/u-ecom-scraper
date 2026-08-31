@@ -279,9 +279,16 @@ SCRAPER_EXECUTION_MODE = config("SCRAPER_EXECUTION_MODE", default="auto")
 #   EXECUTION_STALL_TIMEOUT — kill the scraper if it emits NO stderr output for
 #       this many seconds (productive scrapers log page/item progress; a hang
 #       stops). Default 300s (legit scrapes log every few seconds).
-#   EXECUTION_TIMEOUT — hard wall-clock backstop. Default 3600s (1h).
+#   EXECUTION_TIMEOUT — base wall-clock budget. Default 3600s (1h).
+#   EXECUTION_MAX_TIMEOUT — absolute ceiling the deadline may progress-extend
+#       to (run_execution reads "Progress: [k/N]" off the scraper's stderr and
+#       budgets the REMAINING items). Must stay under the celery task soft
+#       time limit so a ceiling-capped run still finalizes inside the task.
+#       [job-315 citybeach: a healthy 1,317-item extraction (Progress every
+#       ~90s) died at 72% under the flat 3600s backstop.]
 EXECUTION_STALL_TIMEOUT = config("EXECUTION_STALL_TIMEOUT", default=300, cast=int)
 EXECUTION_TIMEOUT = config("EXECUTION_TIMEOUT", default=3600, cast=int)
+EXECUTION_MAX_TIMEOUT = config("EXECUTION_MAX_TIMEOUT", default=9600, cast=int)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 SCRAPERS_DIR = PROJECT_ROOT / "scrapers"
