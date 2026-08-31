@@ -472,6 +472,13 @@ def load_urls_from_file(filepath: str) -> list[str]:
 
 
 def save_urls_to_file(filepath: str, urls: list[str]) -> None:
+    # [job-77] A 0-URL discovery must not DESTROY an existing seed file: the
+    # adoreme execution discovered 0 under a PDP listing and left a 16-byte
+    # {"urls": []} as the site's canonical input_urls.json. Skip the empty
+    # overwrite when a seed already exists; a non-empty refresh still writes.
+    if not urls and os.path.exists(filepath):
+        logger.warning(f"Refusing to overwrite {filepath} with an empty URL list")
+        return
     os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else ".", exist_ok=True)
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump({"urls": urls}, f, indent=2, ensure_ascii=False)
