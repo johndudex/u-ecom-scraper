@@ -1337,6 +1337,53 @@ def _archive_existing_scraper(slug: str) -> str | None:
         return None
 
 
+def _archive_failure_evidence(slug: str, job_id: int, execution_status: str) -> None:
+    """[pillowtalk gap → jobs 71/76 RCA] Keep a FAILED job's test report.
+
+    On non-SUCCESS, copy ``workspace/{slug}/test_report.json`` to the File
+    Master as ``scrapers/{slug}/analysis/test_report-{job_id}.json`` — the
+    workspace is wiped by the next job's setup, and both job-71/job-76
+    post-mortems had to reconstruct the cascade from truncated session logs
+    because the report was gone. Corrupt-guarded like every FM publish.
+    SUCCESS skips (the tracker flow already publishes the report).
+    """
+    if not slug or execution_status == "SUCCESS":
+        return
+    try:
+        import src.artifacts as artifacts
+
+        from .tools.filesystem_tools import guard_json_bytes
+
+        root = _get_project_root()
+        report = os.path.join(root, "workspace", slug, "test_report.json")
+        if not os.path.isfile(report):
+            return
+        with open(report, "rb") as _f:
+            _bytes = _f.read()
+        _guarded, _note = guard_json_bytes(_bytes)
+        if _guarded is None:
+            logger.error(
+                "_archive_failure_evidence: test_report.json is corrupt and "
+                "unrepairable (%s) — SKIPPED (job %s)", _note, job_id,
+            )
+            return
+        if _note:
+            logger.warning(
+                "_archive_failure_evidence: test_report.json was corrupt — "
+                "archiving REPAIRED version (%s, job %s)", _note, job_id,
+            )
+        artifacts.write(
+            artifacts.scrapers_key(slug, "analysis", f"test_report-{job_id}.json"),
+            _guarded,
+        )
+        logger.info(
+            "_archive_failure_evidence: test_report.json → scrapers/%s/analysis/ "
+            "(job %s, execution_status=%s)", slug, job_id, execution_status,
+        )
+    except Exception as exc:
+        logger.warning("_archive_failure_evidence: failed: %s", exc)
+
+
 def _promote_scraper(
     slug: str, job_id: int, execution_status: str, archive_key: str | None
 ) -> str | None:
@@ -3737,6 +3784,23 @@ def _select_template_file(state: ScrapeState) -> str:
     return select_template_file(state)
 
 
+def _noop_should_escalate(noop_cycles: int, test_retry_count: int) -> bool:
+    """[A2/job-73 RC2] Should the no-op-fix gate escalate right now?
+
+    A byte-identical draft escalates on the SECOND consecutive no-op. But
+    with the main retry budget exhausted (``test_retry_count >=
+    MAX_TEST_RETRIES``) there is no later round to absorb the waste — the
+    first no-op escalates too, so the final round is never spent re-testing
+    identical code (job 73: a read-only writer round burned the last test;
+    the verdict could not have changed, the round was simply lost).
+    """
+    if noop_cycles <= 0:
+        return False
+    if noop_cycles >= 2:
+        return True
+    return test_retry_count >= MAX_TEST_RETRIES
+
+
 def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
     job_id = state.get("job_id", 0)
     _notify_phase(job_id, "code_writer", "running")
@@ -4039,7 +4103,9 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     "_invoke_code_writer: draft is UNCHANGED from the last "
                     "tested version (no-op fix cycle %d, job %s)", _noop, job_id,
                 )
-                if _noop >= 2:
+                if _noop_should_escalate(
+                    _noop, int(state.get("test_retry_count", 0) or 0)
+                ):
                     _noop_note = (
                         "code_writer produced an identical draft twice after "
                         "failed tests — the fix loop is no longer making "
@@ -4123,26 +4189,88 @@ def _normalize_probe_stop_reason(stop_reason: str) -> str:
     return sr
 
 
+def _probe_listing_candidates(state: dict) -> tuple[str, str]:
+    """(primary, alternate) ``SCRAPER_LISTING_URL`` candidates for the Phase-1
+    probe, mirroring run_execution's chain (job 310: for list_page the JOB URL
+    outranks the navigator's promotion; the navigator's ``discovery.listing_url``
+    is the only candidate otherwise). The alternate is what the single retry
+    uses when the primary yields zero (job-76: the list_page job URL was an
+    ITEM page — as a listing it can only ever yield 0).
+    """
+    primary = ""
+    if state.get("input_mode") == "list_page":
+        _jl = (state.get("url") or "").strip()
+        if _jl.startswith(("http://", "https://")):
+            primary = _jl
+    _nav = state.get("navigation_analysis") or {}
+    _disc = (_nav.get("discovery") if isinstance(_nav, dict) else None) or {}
+    _alt = (_disc.get("listing_url") if isinstance(_disc, dict) else "") or ""
+    return primary, _alt
+
+
+def _probe_retry_warranted(state: dict, probe_yield: dict | None) -> bool:
+    """Should the Phase-1 probe retry once on the navigator's listing?
+
+    Only a CLEAN-EXIT ZERO on the primary candidate warrants it: a crash is a
+    code bug (not a listing choice), a nonzero yield means discovery works,
+    and an inconclusive probe (timeout, dispatch failure) has no evidence
+    either way. No distinct same-domain navigator listing → nothing better to
+    try. F17 applies to the retry candidate too.
+    """
+    if not isinstance(probe_yield, dict) or probe_yield.get("discovered_urls", 0) != 0:
+        return False
+    primary, alt = _probe_listing_candidates(state)
+    if not primary or not alt or alt == primary:
+        # primary is only set for list_page; other modes already ran on alt.
+        return False
+    try:
+        from agents.nodes.run_execution import _registrable_of
+
+        _job_reg = _registrable_of(primary)
+        _alt_reg = _registrable_of(alt)
+        if not (_job_reg and _alt_reg and _alt_reg == _job_reg):
+            return False
+    except Exception:
+        return False
+    return True
+
+
 def _probe_phase1_discovery(
     slug: str, state: dict, job_id: int
 ) -> tuple[bool, str | None, dict | None]:
-    """Deterministically run the draft's Phase-1 discovery to catch discovery-path
-    bugs that ``--sample`` testing skips.
+    """Probe the draft's Phase-1 discovery, retrying ONCE on the navigator's
+    listing when the primary candidate yields zero.
 
-    ``--sample`` scrapes pre-seeded URLs and never enters Phase 1, so a crash in
-    discovery/pagination (e.g. a hallucinated ``session.url``) sails through
-    testing and only blows up at execution. This probe runs
-    ``scraper_draft.py --discover-only --fresh-discovery`` (Phase 1 only, skips
-    the expensive Phase 2 extraction) and fails the test on a real crash.
+    [job-76 myhouse] The list_page job URL is tried first (job-310 contract),
+    but when that URL is an ITEM page the probe tests a listing that can only
+    ever yield 0 — while the navigator's promoted listing works. One retry,
+    only on a clean-exit zero, only with a distinct same-domain navigator
+    listing (see ``_probe_retry_warranted``). Both candidates dead → the
+    honest zero stands and the caller's zero-yield gate fires on real
+    evidence.
+    """
+    crashed, tb, probe_yield = _probe_phase1_discovery_once(slug, state, job_id)
+    if not crashed and _probe_retry_warranted(state, probe_yield):
+        _primary, _alt = _probe_listing_candidates(state)
+        logger.info(
+            "_probe_phase1_discovery: primary listing yielded 0 (job %s) — "
+            "retrying once with the navigator's listing %s",
+            job_id, _alt[:80],
+        )
+        crashed, tb, probe_yield = _probe_phase1_discovery_once(
+            slug, state, job_id, listing_override=_alt
+        )
+    return crashed, tb, probe_yield
 
-    [job-65 citybeach] The probe also returns its YIELD so a clean-exit run that
-    discovered ZERO item URLs can fail the test deterministically — the
-    ``phases_tested.phase1_discovery`` boolean is otherwise the tester LLM's
-    self-report, and a 0-URL discovery passed testing in every 0-item execution
-    this pipeline has shipped. The probe runs under EXECUTION conditions: the
-    listing URL is injected the same way ``run_execution`` injects
-    ``SCRAPER_LISTING_URL`` (list_page → the job's own URL first — job 310 —
-    else the navigator's ``discovery.listing_url``; F17 domain-guarded).
+
+def _probe_phase1_discovery_once(
+    slug: str, state: dict, job_id: int, listing_override: str = ""
+) -> tuple[bool, str | None, dict | None]:
+    """One ``--discover-only`` probe run of the draft's Phase-1 discovery.
+
+    ``listing_override`` (the retry path) replaces the candidate chain's
+    primary — the F17 domain guard still applies. See
+    ``_probe_phase1_discovery`` for the contract.
 
     Returns ``(crashed, traceback_tail, probe_yield)``. ``probe_yield`` is a
     dict (``discovered_urls``, ``stop_reason``, ``coverage``) ONLY when a fresh
@@ -4172,18 +4300,10 @@ def _probe_phase1_discovery(
         # C2: mirror run_execution's SCRAPER_LISTING_URL candidate chain so the
         # probe tests the listing execution will actually use (job 310: for
         # list_page the JOB URL outranks the navigator's promotion; F17
-        # domain-guards everything).
-        _probe_env_candidate = ""
-        if state.get("input_mode") == "list_page":
-            _jl = (state.get("url") or "").strip()
-            if _jl.startswith(("http://", "https://")):
-                _probe_env_candidate = _jl
-        if not _probe_env_candidate:
-            _nav = state.get("navigation_analysis") or {}
-            _disc = (_nav.get("discovery") if isinstance(_nav, dict) else None) or {}
-            _probe_env_candidate = (
-                _disc.get("listing_url") if isinstance(_disc, dict) else ""
-            ) or ""
+        # domain-guards everything). The retry passes listing_override to test
+        # the navigator's promotion after the primary yielded zero (job-76).
+        _primary, _alt = _probe_listing_candidates(state)
+        _probe_env_candidate = listing_override or _primary or _alt
         if _probe_env_candidate:
             try:
                 from agents.nodes.run_execution import _registrable_of
@@ -4369,6 +4489,14 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
     set_tool_context(dict(state), agent_name="code_tester")
     try:
         logger.info("_invoke_code_tester: starting (job %s)", job_id)
+        # [A6/job-73 RC1] Stamp the test START. _freshness_floor raises the
+        # output floor to last_tested_at on a same-draft re-test — stamping at
+        # node EXIT (after the draft wrote its outputs) excluded the current
+        # attempt's own passing output from every gate: job 73's 20/20 run was
+        # invisible to ground truth and the cascade "exhausted" on a working
+        # scraper. Entry stamp keeps A6's protection (prior attempts' outputs
+        # predate it) while this attempt's outputs stay visible.
+        _test_started_at = time.time()
         messages = build_code_tester_message(state)
         _log_agent_context(state, "code-tester", messages)
         slug = state.get("site_slug", "")
@@ -4406,7 +4534,7 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         except Exception as _fp_exc:
             logger.debug("_invoke_code_tester: draft fingerprint failed: %s", _fp_exc)
         update["last_tested_draft_fp"] = _draft_fp
-        update["last_tested_at"] = time.time()
+        update["last_tested_at"] = _test_started_at
         if _draft_fp:
             _prev_fp = str(state.get("last_tested_draft_fp") or "")
             _prev_retests = int(state.get("test_retest_count", 0) or 0)
@@ -4751,6 +4879,9 @@ def _invoke_cleanup(state: ScrapeState, config: RunnableConfig) -> dict[str, Any
         scraper_path = _promote_scraper(
             slug, job_id, state.get("execution_status", ""), archive_path
         )
+        # Keep the failed cycle's evidence (pillowtalk gap): the workspace is
+        # wiped by the next job; a FAILED job must leave its test report.
+        _archive_failure_evidence(slug, job_id, state.get("execution_status", ""))
         _notify_phase(job_id, "cleanup", "done")
         out: dict[str, Any] = {"messages": []}
         if scraper_path:

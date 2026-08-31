@@ -234,6 +234,21 @@ def _is_dead_product(p: dict) -> bool:
     return False
 
 
+def _is_discovery_output(data: dict) -> bool:
+    """Is this output file a ``--discover-only`` artifact (URL stubs, no
+    extraction)?
+
+    Two-phase templates tag their output with ``metadata.phase`` (job-76
+    myhouse: the discovery file's 40 ``{url, src_url}`` stubs polluted every
+    consumer that just counted rows). Files without the tag are treated as
+    extraction — pre-tagging outputs keep their old meaning.
+    """
+    try:
+        return (data.get("metadata") or {}).get("phase") == "discovery"
+    except AttributeError:
+        return False
+
+
 def _scraper_produced_valid_output(state: ScrapeState) -> bool:
     """Did the scraper produce at least 1 valid item? (output-file-aware)
 
@@ -305,6 +320,22 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
             output_key = ct_config.get("output_key", "products") if ct_config else "products"
             sample_products = so.get(output_key) or so.get("products", [])
 
+    # Content-type-aware "real item" check (price for products, company/location
+    # for jobs, etc.). Falls back to title-only for unknown content types.
+    # [job-73 F2] Computed BEFORE the file scan: the scan now ranks candidate
+    # output files by GOOD item count, which needs this predicate.
+    try:
+        from src.content_types import output_filter_fields
+        ct_config = state.get("content_type_config") or {}
+        ct = ct_config.get("content_type", "") if ct_config else ""
+        fields = output_filter_fields(ct) or []
+    except Exception:
+        fields = []
+    try:
+        from src.content_types import has_substantive_field
+    except Exception:
+        has_substantive_field = lambda p: bool(p.get("title"))  # type: ignore
+
     # FALLBACK: read the actual output JSON file (ground truth from the scraper run)
     if not sample_products:
         try:
@@ -333,6 +364,22 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
                     key=lambda f: _os.path.getmtime(_os.path.join(ws, f)),
                     reverse=True,
                 )
+                if not outs:
+                    # [job-73 F5] The floor is the only thing that can empty
+                    # this scan — say so, loudly. Job 73's 20/20 output was
+                    # excluded with zero signal; only the routing warning
+                    # remained, and the failure looked like "no items".
+                    logger.warning(
+                        "route_after_testing: ground-truth scan found NO output "
+                        "files in %s — freshness floor %.0f excluded everything "
+                        "(draft mtime %.0f, last_tested_at %.0f). If outputs "
+                        "exist on disk with later mtimes, the A6 floor is "
+                        "blinding the current attempt.",
+                        ws, _floor,
+                        _os.path.getmtime(_os.path.join(ws, "scraper_draft.py"))
+                        if _os.path.isfile(_os.path.join(ws, "scraper_draft.py")) else 0.0,
+                        float(state.get("last_tested_at") or 0.0),
+                    )
                 ct_config = state.get("content_type_config") or {}
                 output_key = ct_config.get("output_key", "products") if ct_config else "products"
                 # Bug A fix: take the BEST output file (max real items), not the
@@ -340,33 +387,39 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
                 # (1 item — discovery crash). The newest file is always the WORST
                 # result → 1 < 3 → cascade. Taking MAX across the last 5 files
                 # lets the 5-item Phase-2 result pass the gate.
+                # [job-73 F2] "Best" = most GOOD items (core-field-carrying,
+                # non-dead), not most raw rows: an untagged --discover-only
+                # stub file (40 {url, src_url} rows) must not outrank a
+                # 20-row extraction file and then fail the filter below.
                 _best_items = []
+                _best_good = 0
                 for _out_name in outs[:5]:
                     try:
                         _data = _json.load(open(_os.path.join(ws, _out_name)))
+                        # job-76 myhouse: a --discover-only run's output holds
+                        # URL stubs ({url, src_url}), never extraction — it
+                        # must not stand in for Phase-2 ground truth.
+                        if _is_discovery_output(_data):
+                            continue
                         _items = _data.get(output_key) or _data.get("products", [])
-                        if len(_items) > len(_best_items):
+                        _live_i = [p for p in _items if not _is_dead_product(p)]
+                        _good_i = (
+                            [p for p in _live_i if any(p.get(f) for f in fields)]
+                            if fields
+                            else [p for p in _live_i if has_substantive_field(p)]
+                        )
+                        if len(_good_i) > _best_good:
                             _best_items = _items
+                            _best_good = len(_good_i)
                     except Exception:
                         pass
                 sample_products = _best_items
         except Exception:
             pass
 
-    # Content-type-aware "real item" check (price for products, company/location
-    # for jobs, etc.). Falls back to title-only for unknown content types.
-    try:
-        from src.content_types import output_filter_fields
-        ct_config = state.get("content_type_config") or {}
-        ct = ct_config.get("content_type", "") if ct_config else ""
-        fields = output_filter_fields(ct) or []
-    except Exception:
-        fields = []
+    # Content-type-aware "real item" check — fields/has_substantive_field are
+    # computed above (the file scan ranks by them too).
     live = [p for p in sample_products if not _is_dead_product(p)]
-    try:
-        from src.content_types import has_substantive_field
-    except Exception:
-        has_substantive_field = lambda p: bool(p.get("title"))  # type: ignore
     if fields:
         # F15: when the content type defines filter fields, a "real" item must
         # carry at least one of THEM — not just any substantive field. The old
@@ -408,6 +461,8 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
                 try:
                     with open(_out_path, "r") as _f:
                         _out = _json.load(_f)
+                    if _is_discovery_output(_out):
+                        continue  # discovery stubs are never extraction truth
                     for _ck in ("products", "jobs", "articles", "results", "items", "threads", "pages"):
                         _items = _out.get(_ck)
                         if isinstance(_items, list) and _items:
@@ -1020,6 +1075,11 @@ def route_after_testing(state: ScrapeState) -> str:
     # F15: a core field at ~0% coverage ALSO overrides ground-truth (job 337:
     # 36 rows with only `brand` populated, price/availability empty, FAIL/0.35
     # report, shipped COMPLETED).
+    # job-71 popsockets: the item-count bar matches _scraper_produced_valid_output
+    # (1 for url_list/list_page, 3 for discovery-driven modes) — the old
+    # hardcoded 3 meant a url_list job whose every URL extracted (1 rich item)
+    # could never clear the override its own pre-check used.
+    _override_min = 1 if (state.get("input_mode") or "").strip() in ("url_list", "list_page") else 3
     if (
         not _cov_reason
         and not missing_core
@@ -1027,11 +1087,12 @@ def route_after_testing(state: ScrapeState) -> str:
         and not _count_regression
         and not _volume_reason
         and not _det_blockers
-        and _scraper_has_real_items(state, min_count=3)
+        and _scraper_has_real_items(state, min_count=_override_min)
     ):
         logger.info(
-            "route_after_testing: GROUND-TRUTH PASS — scraper produced ≥3 real "
-            "items (overriding code_tester's high_severity flags)"
+            "route_after_testing: GROUND-TRUTH PASS — scraper produced ≥%d real "
+            "items (overriding code_tester's high_severity flags)",
+            _override_min,
         )
         return "field_confirmation"
 

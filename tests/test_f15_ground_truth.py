@@ -14,7 +14,6 @@ import os
 import re
 import sys
 import json
-import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -34,9 +33,13 @@ def _load_fn():
     # [A6] _scraper_has_real_items delegates its freshness floor to
     # _freshness_floor — extract it too, or the fallback's broad except
     # swallows the NameError and the output-file rescue silently degrades.
+    # [job-76] same for _is_discovery_output: the scan now skips tagged
+    # --discover-only artifacts, and a missing helper means the NameError is
+    # swallowed by the same broad except → silent False.
     fn_src = (
         grab("_freshness_floor")
         + grab("_is_dead_product")
+        + grab("_is_discovery_output")
         + grab("_scraper_has_real_items")
     )
 
@@ -169,6 +172,10 @@ class TestOverrideGateSite:
         # reformatted the condition to parenthesized multi-line. The F15
         # semantic is unchanged: the ground-truth override is blocked when a
         # core field sits at ~0% coverage (job 337's brand-only rows).
+        # job-71: the item bar is `_override_min` — mode-aware (1 for
+        # url_list/list_page, 3 for discovery-driven modes) — instead of a
+        # hardcoded 3, so a list_page job's 1 rich item can clear the same
+        # override its own pre-check used.
         src = open(os.path.join(ROOT, "webapp/agents/nodes/route_after_testing.py")).read()
         assert re.search(
             r"if \(\s*"
@@ -178,12 +185,18 @@ class TestOverrideGateSite:
             r"and not _count_regression\s*"
             r"and not _volume_reason\s*"
             r"and not _det_blockers\s*"
-            r"and _scraper_has_real_items\(state, min_count=3\)\s*"
+            r"and _scraper_has_real_items\(state, min_count=_override_min\)\s*"
             r"\):",
             src,
         ), (
             "ground-truth override must be gated on: no coverage failure, no "
             "core field at ~0% coverage, no CLI-contract violation, no "
             "count regression vs prior runs, no volume gap, no deterministic "
-            "output defect, and >=3 real items"
+            "output defect, and >= the mode-aware real-item bar (_override_min)"
         )
+        # and the bar itself must stay mode-aware (not a bare constant)
+        assert re.search(
+            r'_override_min = 1 if \(state\.get\("input_mode"\) or ""\)\.strip\(\)'
+            r' in \("url_list", "list_page"\) else 3',
+            src,
+        ), "_override_min must be 1 for url_list/list_page, 3 otherwise"
