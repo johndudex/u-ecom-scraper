@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from html import unescape
 from typing import Optional
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from src.proxy import ProxyConfig, build_proxy_url
@@ -200,7 +200,20 @@ EXTRACT_PRODUCT_URLS_JS = """
 
 
 def scrape_product(page, url: str, src_url: str, index: int) -> dict:
-    page.goto(url, wait_until="networkidle", timeout=PAGE_LOAD_TIMEOUT)
+    try:
+        page.goto(url, wait_until="networkidle", timeout=PAGE_LOAD_TIMEOUT)
+    except PlaywrightTimeoutError:
+        # [job-78 superdrug] A networkidle timeout means the document LOADED but
+        # the page never goes quiet (cloak/anti-bot beacons keep firing) — the
+        # DOM is rendered, so extract from it instead of failing the item.
+        # Failing here on a cloak site costs PAGE_LOAD_TIMEOUT per PDP and
+        # zeroes the whole run even after discovery succeeded. A hard
+        # navigation failure (DNS/refused/aborted) raises a non-Timeout error
+        # and still propagates to the caller's per-item handling.
+        logger.warning(
+            f"networkidle not reached in {PAGE_LOAD_TIMEOUT}ms on {url} "
+            f"— extracting from the rendered DOM"
+        )
     page.wait_for_timeout(2000)
 
     data = page.evaluate(EXTRACT_PRODUCT_JS, src_url)
@@ -519,7 +532,15 @@ def main():
         page = context.new_page()
 
         logger.info("Warming up session...")
-        page.goto(SITE_URL, wait_until="networkidle", timeout=PAGE_LOAD_TIMEOUT)
+        try:
+            page.goto(SITE_URL, wait_until="networkidle", timeout=PAGE_LOAD_TIMEOUT)
+        except PlaywrightTimeoutError:
+            # Same contract as scrape_product: never-idle anti-bot pages still
+            # have a rendered DOM — a warm-up timeout must not kill the run
+            # before extraction starts (job-78).
+            logger.warning(
+                f"networkidle not reached on warm-up {SITE_URL} — continuing"
+            )
         page.wait_for_timeout(5000)
 
         for i, url in enumerate(product_urls):
