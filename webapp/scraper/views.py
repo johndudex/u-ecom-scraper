@@ -970,19 +970,67 @@ def _resolve_job_output(job):
         cutoff = job.started_at - timedelta(seconds=120)
         in_window = []
         for k in outs:
-            try:
-                ts = datetime.strptime(_fname(k), "output_%Y-%m-%d_%H%M%S.json").replace(
-                    tzinfo=dt_timezone.utc
-                )
-            except ValueError:
+            ts = _output_key_ts(_fname(k))
+            if ts is None:
                 continue
             if ts >= cutoff:
                 in_window.append(k)
         if in_window:
-            return in_window[0], _fname(in_window[0])
+            # job-76 myhouse: a --discover-only artifact (URL stubs) must not
+            # be surfaced as the job's output ("40 products" on a FAILED job).
+            extracted = [k for k in in_window if not _is_discovery_output_key(k)]
+            pick = extracted[0] if extracted else None
+            if pick:
+                return pick, _fname(pick)
+            return None, None
         return None, None
-    newest = sorted(outs, key=_fname)[-1]
-    return newest, _fname(newest)
+    newest = [k for k in sorted(outs, key=_fname) if not _is_discovery_output_key(k)]
+    if not newest:
+        return None, None
+    return newest[-1], _fname(newest[-1])
+
+
+def _output_key_ts(fname: str):
+    """Parse the run timestamp from an ``output_*.json`` FM key.
+
+    Handles both naming generations: ``output_%Y-%m-%d_%H%M%S.json`` and the
+    unique-per-process ``output_%Y-%m-%d_%H%M%S_%f_<pid>.json`` (job-71 — the
+    old strict strptime silently skipped every new-format name, which would
+    have blanked the run-window output lookup).
+    """
+    stem = fname.split("/")[-1]
+    if not (stem.startswith("output_") and stem.endswith(".json")):
+        return None
+    body = stem[len("output_"): -len(".json")]
+    try:
+        return datetime.strptime(body, "%Y-%m-%d_%H%M%S").replace(tzinfo=dt_timezone.utc)
+    except ValueError:
+        pass
+    # Unique-per-process name: output_<date>_<time>_<micros>_<pid> — the run
+    # stamp is the date + time segments.
+    segs = body.split("_")
+    if len(segs) >= 4:
+        try:
+            return datetime.strptime("_".join(segs[:2]), "%Y-%m-%d_%H%M%S").replace(
+                tzinfo=dt_timezone.utc
+            )
+        except ValueError:
+            return None
+    return None
+
+
+def _is_discovery_output_key(key: str) -> bool:
+    """True when the FM artifact is a ``--discover-only`` output (URL stubs).
+
+    Mirrors ``agents.nodes.route_after_testing._is_discovery_output`` — kept
+    local so views don't import the agent graph. Files without the
+    ``metadata.phase`` tag are treated as extraction (pre-tagging outputs).
+    """
+    try:
+        data = _fm_read_json(key)
+    except Exception:
+        return False
+    return isinstance(data, dict) and (data.get("metadata") or {}).get("phase") == "discovery"
 
 
 def _job_output_preview(job) -> dict | None:
