@@ -100,6 +100,7 @@ HEADERS = {
 # that re-raises the bot score on every hit) and the soft-block proxy-tier
 # mechanism the shared discovery module drives. Full rationale: src/http_fetch.py.
 from src.http_fetch import create_fetch_page
+from src.page_analysis import phase2_instant_fail
 
 fetch_page = create_fetch_page(delay_s=DELAY_BETWEEN_REQUESTS, headers=HEADERS)
 
@@ -167,6 +168,61 @@ def make_absolute_url(url: str, base: str = SITE_URL) -> str:
     return urljoin(base, url)
 
 
+# ── FIELD NORMALIZERS — inline on purpose, NOT a src import ──────────────────
+# Drafts execute in the browser-service image: a NEW src import would ImportError
+# there until that image is rebuilt, so the ~25 lines live in each python-side
+# template verbatim (playwright/UC normalize in-page via JS and don't need them).
+
+def _norm_price(value) -> Optional[str]:
+    """Strip currency symbols/whitespace from a price.
+
+    "£1,234.56" → "1234.56", "1.234,56 €" → "1234.56", 24.99 (a JSON-LD
+    number) → "24.99". Returns None when no digits are present — an
+    unparseable price is EMPTY, never zero (0 would read as a real product
+    priced at nothing). The currency stays in its own ``currency`` field.
+    """
+    if value is None:
+        return None
+    cleaned = re.sub(r"[^\d.,-]", "", str(value).strip())
+    if not re.search(r"\d", cleaned):
+        return None
+    if "," in cleaned and "." in cleaned:
+        # Both separators present: whichever comes LAST is the decimal one.
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        # "1,234" (grouping) vs "1,5" (decimal comma): a comma followed by
+        # exactly three digits is grouping, anything else is a decimal comma.
+        cleaned = re.sub(r",(?=\d{3}(?:\D|$))", "", cleaned).replace(",", ".")
+    return cleaned
+
+
+def _norm_availability(value) -> Optional[str]:
+    """Normalize availability to ``in_stock`` / ``out_of_stock``.
+
+    Accepts the schema.org URI form, InStock / In Stock / in_stock / Available
+    and their negatives. Anything unrecognised passes through lowercased —
+    availability is never invented (an unknown state is data, not an error).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "in_stock" if value else "out_of_stock"
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if "://" in text:  # e.g. http://schema.org/InStock
+        text = text.rsplit("/", 1)[-1]
+    compact = text.replace("-", "_").replace(" ", "")
+    if compact in ("in_stock", "instock", "available"):
+        return "in_stock"
+    if compact in ("out_of_stock", "outofstock", "unavailable", "sold_out", "soldout"):
+        return "out_of_stock"
+    return text
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # EXTRACTION - CUSTOMIZE selectors below
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -216,15 +272,15 @@ def extract_product_from_page(soup: BeautifulSoup, url: str, status_code: int, s
         offers = jsonld.get("offers", [{}])
         if isinstance(offers, list):
             offers = offers[0] if offers else {}
-        product["price"] = offers.get("price", "")
+        product["price"] = _norm_price(offers.get("price", ""))
         high_price = offers.get("highPrice", "")
         if high_price and float(high_price) > float(product["price"] or 0):
-            product["original_price"] = high_price
+            product["original_price"] = _norm_price(high_price)
     else:
         price_el = soup.select_one("{PRICE_SELECTOR}")
-        product["price"] = price_el.get_text(strip=True) if price_el else ""
+        product["price"] = _norm_price(price_el.get_text(strip=True)) if price_el else ""
         orig_el = soup.select_one("{ORIGINAL_PRICE_SELECTOR}")
-        product["original_price"] = orig_el.get_text(strip=True) if orig_el else ""
+        product["original_price"] = _norm_price(orig_el.get_text(strip=True)) if orig_el else ""
 
     # Currency
     product["currency"] = jsonld.get("offers", {}).get("priceCurrency", "USD") if jsonld else "USD"
@@ -232,12 +288,11 @@ def extract_product_from_page(soup: BeautifulSoup, url: str, status_code: int, s
     # Availability
     if jsonld:
         avail = jsonld.get("offers", {}).get("availability", "")
-        product["availability"] = "In Stock" if "InStock" in avail else "Out of Stock"
+        product["availability"] = _norm_availability(avail)
     else:
         stock_el = soup.select_one("{AVAILABILITY_SELECTOR}")
         if stock_el:
-            stock_text = stock_el.get_text(strip=True).lower()
-            product["availability"] = "In Stock" if "in stock" in stock_text else "Out of Stock"
+            product["availability"] = _norm_availability(stock_el.get_text(strip=True))
 
     return product
 
@@ -440,13 +495,23 @@ def main():
 
     if not args.discover_only:
         # Phase 2: extract fields from each discovered item page.
+        phase2_start = time.monotonic()
         for i, url in enumerate(product_urls):
             result = fetch_page(url)
             if result:
                 soup, status_code = result
                 product = extract_product_from_page(soup, url, status_code, SRC_URL)
                 product["id"] = i + 1
-                results.append(product)
+                # Emission filter (ported from playwright_scraper): a row with
+                # NO substantive field beyond the boilerplate keys is a page
+                # that rendered nothing — shipping it as a product poisons the
+                # item count every downstream gate reads.
+                _BK = {"url", "src_url", "scraped_at", "status_code", "remarks", "id", "title"}
+                if any(v for k, v in product.items() if k not in _BK):
+                    results.append(product)
+                else:
+                    logger.warning(f"No substantive data extracted from: {url}")
+                    failed += 1
             else:
                 logger.error(f"Failed to fetch: {url}")
                 failed += 1
@@ -456,6 +521,27 @@ def main():
                 logger.info(f"Progress: [{i + 1}/{len(product_urls)}] ({percent:.1f}%)")
     else:
         logger.info("--discover-only: skipping Phase 2 extraction (results list left empty)")
+
+    # [T3.13c/job-76 myhouse] Mechanical "fetch actually happened" detector:
+    # every real fetch sleeps >= DELAY_BETWEEN_REQUESTS inside fetch_page, so
+    # N items can never take less than ~N*delay. Finishing in under half that
+    # floor means the network was never hit — cached stubs, instant failures,
+    # or a loop that fetched nothing at all. Surfaced in discovery_coverage so
+    # the gates and the tester see the tell without wall-clock archaeology.
+    phase2_instant = False
+    if not args.discover_only and product_urls:
+        phase2_elapsed = time.monotonic() - phase2_start
+        phase2_instant = phase2_instant_fail(
+            phase2_elapsed, len(product_urls), DELAY_BETWEEN_REQUESTS
+        )
+        if phase2_instant:
+            logger.warning(
+                "PHASE2 INSTANT FAIL: %s items in %.2fs (< %.2fs floor at "
+                "delay=%ss) — fetches never actually happened",
+                len(product_urls), phase2_elapsed,
+                len(product_urls) * DELAY_BETWEEN_REQUESTS * 0.5,
+                DELAY_BETWEEN_REQUESTS,
+            )
 
     # discovery_coverage block — contract §1. Always emitted so the gate can read
     # a uniform schema regardless of which path produced the output.
@@ -484,6 +570,9 @@ def main():
         # Hidden-SSR observability [job-65 citybeach]: how many listing pages
         # were read from their JSON-LD ItemList instead of anchors.
         "jsonld_fallback_pages": discovery_meta.get("jsonld_fallback_pages", 0),
+        # [T3.13c/job-76 myhouse] True when Phase 2 finished faster than its
+        # per-fetch delay floor allows — the fetches never actually happened.
+        "phase2_instant_fail": phase2_instant,
     }
 
     output = {

@@ -6,5 +6,9 @@ seleniumbase>=4.30.0
 selenium>=4.20.0
 cloudscraper>=1.2.71
 httpx>=0.27.0
-curl_cffi>=0.7.0
+# PINNED (spike-verified 0.16.2): the fingerprint probe rung impersonates a
+# specific browser TLS/HTTP2 fingerprint via the "chrome"/"safari184" targets.
+# "chrome" is an alias for the newest fingerprint in the installed version, so
+# an unpinned bump would silently change the TLS fingerprint this rung relies on.
+curl_cffi==0.16.2
 ruff>=0.5.0

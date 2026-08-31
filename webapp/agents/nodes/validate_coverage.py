@@ -61,6 +61,15 @@ def _extract_covered_fields(analysis: dict) -> set[str]:
     if isinstance(fields_info, dict):
         for k, v in fields_info.items():
             if isinstance(v, dict) and (v.get("method") or v.get("selector")):
+                # [T3.13e/wave-13] presence → resolved: a mapping the live-render
+                # check PROVED dead (field_verification wrote tested="empty") is
+                # not coverage — it is a mapped-and-broken source. The downgrade
+                # is gated to the PROVEN-DEAD verdict ONLY (merely unverified or
+                # skipped fields keep presence credit), so the job-12 bypass
+                # shapes and every analysis without a verification block are
+                # untouched.
+                if str(v.get("tested") or "").strip().lower() == "empty":
+                    continue
                 covered.add(k)
 
     if not covered:
@@ -74,6 +83,20 @@ def _extract_covered_fields(analysis: dict) -> set[str]:
             )
 
     return covered
+
+
+def _proven_dead_fields(analysis: dict) -> list[str]:
+    """Mapped fields the live-render check proved produce NOTHING (T3.13e)."""
+    fields_info = analysis.get("fields", {})
+    if not isinstance(fields_info, dict):
+        return []
+    return sorted(
+        str(k)
+        for k, v in fields_info.items()
+        if isinstance(v, dict)
+        and (v.get("method") or v.get("selector"))
+        and str(v.get("tested") or "").strip().lower() == "empty"
+    )
 
 
 def validate_coverage(state: ScrapeState) -> Command:
@@ -210,6 +233,16 @@ def validate_coverage(state: ScrapeState) -> Command:
         )
         missing_str = ", ".join(sorted(missing)) if missing else "(unknown)"
         covered_str = ", ".join(sorted(covered)) if covered else "(none)"
+        # [T3.13e] Tell the human WHY presence alone didn't count: these
+        # mappings exist but the live-render check proved them dead.
+        dead = _proven_dead_fields(analysis)
+        dead_note = (
+            f" Live-render verification proved these mapped sources DEAD "
+            f"(produced no value on the real page): {', '.join(dead)} — they "
+            f"do not count as coverage."
+            if dead
+            else ""
+        )
         if coverage_retries >= MAX_COVERAGE_RETRIES:
             options = ["Continue anyway", "Abort"]
             return Command(
@@ -221,6 +254,7 @@ def validate_coverage(state: ScrapeState) -> Command:
                         f"Field coverage still low after {coverage_retries} retry(s): "
                         f"{len(covered)}/{len(core)} core fields ({coverage_ratio:.0%}). "
                         f"Covered: {covered_str}. Missing: {missing_str}. "
+                        f"{dead_note} "
                         f"Continue with partial coverage, or abort?"
                     ),
                     "interrupt_options": options,
@@ -249,7 +283,7 @@ def validate_coverage(state: ScrapeState) -> Command:
                     f"{len(covered)}/{len(core)} core fields covered "
                     f"({coverage_ratio:.0%}). "
                     f"Covered: {covered_str}. "
-                    f"Missing: {missing_str}."
+                    f"Missing: {missing_str}.{dead_note}"
                 ),
                 "interrupt_options": options,
                 "interrupt_decisions": options_to_decisions(options),

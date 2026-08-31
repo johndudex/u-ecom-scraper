@@ -47,6 +47,77 @@ ESCALATION_STEPS = [
     ("cloak_residential", "residential"),
 ]
 
+# ── curl_cffi fingerprint sub-ladder (T3.8) ───────────────────────────────
+# ``fingerprint_*`` is an HTTP-CLIENT tier (browser TLS/HTTP2 + header-order
+# impersonation), NOT a browser: no JS runs, so an SPA shell still needs a
+# browser step afterwards. It is spliced into every proxy tier right after
+# that tier's plain-HTTP step and before its browser launches — a curl
+# handshake costs ~1-2s where a Chrome launch costs 15-45s, and a site that
+# 403s httpx on TLS fingerprint alone is passed without launching anything.
+#
+# Method names follow the existing ``{mechanism}_{tier}`` convention used by
+# ``playwright_*``/``cloak_*``, so the full set is:
+#   fingerprint_chrome_none / fingerprint_chrome_datacenter /
+#   fingerprint_chrome_residential / fingerprint_safari184_none /
+#   fingerprint_safari184_datacenter / fingerprint_safari184_residential
+# All start with the stable ``fingerprint_`` prefix (HTTP-flavoured — this is
+# deliberately NOT in the stealth/browser method prefix sets).
+#
+# Profile SUB-LADDER, empirically chosen (C5 spike): "chrome" and "safari184"
+# passed sephora.de (200, ~855KB) where "chrome136"/"firefox133" were
+# 403-blocked, so those two are deliberately absent. "chrome" is curl_cffi's
+# alias for the newest Chrome fingerprint in the PINNED library version —
+# which is why requirements.txt pins ``curl_cffi==0.16.2`` (an unpinned bump
+# would silently change the TLS fingerprint this rung depends on).
+FINGERPRINT_PROFILES = ("chrome", "safari184")
+FINGERPRINT_METHOD_PREFIX = "fingerprint_"
+
+# "0" removes the rungs entirely and restores the pre-T3.8 ladder byte for
+# byte; anything else (including unset) keeps them. Fail-escalating: the
+# rungs only execute when every step above them already failed.
+FINGERPRINT_STEP_ENV = "SCRAPER_PROBE_FINGERPRINT_STEP"
+
+
+def fingerprint_step_enabled() -> bool:
+    return os.environ.get(FINGERPRINT_STEP_ENV, "1").strip().lower() != "0"
+
+
+def _fingerprint_steps_for_tier(proxy_tier: str) -> list[tuple[str, str]]:
+    return [
+        (f"{FINGERPRINT_METHOD_PREFIX}{profile}_{proxy_tier}", proxy_tier)
+        for profile in FINGERPRINT_PROFILES
+    ]
+
+
+def active_escalation_steps() -> list[tuple[str, str]]:
+    """The escalation ladder actually run: ``ESCALATION_STEPS`` with the
+    fingerprint rungs spliced in after each tier's plain-HTTP step (or the
+    unmodified base ladder when ``SCRAPER_PROBE_FINGERPRINT_STEP=0``)."""
+    if not fingerprint_step_enabled():
+        return list(ESCALATION_STEPS)
+    steps: list[tuple[str, str]] = []
+    for step_name, proxy_tier in ESCALATION_STEPS:
+        steps.append((step_name, proxy_tier))
+        if step_name.startswith("direct_http"):
+            steps.extend(_fingerprint_steps_for_tier(proxy_tier))
+    return steps
+
+
+def parse_fingerprint_method(method_name: str) -> Optional[tuple[str, str]]:
+    """Split a fingerprint method name into ``(profile, proxy_tier)``.
+
+    ``fingerprint_safari184_datacenter`` → ``("safari184", "datacenter")``.
+    Returns None for anything that is not a fingerprint step, so callers can
+    use it as the dispatch test.
+    """
+    if not method_name.startswith(FINGERPRINT_METHOD_PREFIX):
+        return None
+    profile, sep, proxy_tier = method_name[len(FINGERPRINT_METHOD_PREFIX):].rpartition("_")
+    if not sep or profile not in FINGERPRINT_PROFILES or proxy_tier not in PROXY_TIERS:
+        return None
+    return profile, proxy_tier
+
+
 # Legacy probe-method aliases. ``uc_chrome`` is gone (consolidated into cloak);
 # cached start_method hints naming these are routed to the cloak successor so
 # existing ProbeCache rows keep their skip-ahead behaviour instead of falling
@@ -84,6 +155,12 @@ def _dispatch_step(method_name: str, url: str, timeout: int, country: Optional[s
     if method_name.startswith("direct_http_"):
         tier = method_name.replace("direct_http_", "")
         return _try_direct_http(url, timeout=timeout, proxy_tier=tier, country=country)
+    fingerprint = parse_fingerprint_method(method_name)
+    if fingerprint:
+        profile, tier = fingerprint
+        return _try_fingerprint(
+            url, tier, profile=profile, timeout=min(timeout, 20), country=country
+        )
     if method_name.startswith("cloak_"):
         tier = method_name.replace("cloak_", "")
         return _try_cloak(url, tier, timeout=min(timeout, 40), country=country)
@@ -94,7 +171,14 @@ def _dispatch_step(method_name: str, url: str, timeout: int, country: Optional[s
     return None
 
 
-def run_probe(url: str, render_js: bool = True, timeout: int = 120, start_method: Optional[str] = None, country: Optional[str] = None) -> dict[str, Any]:
+def run_probe(
+    url: str,
+    render_js: bool = True,
+    timeout: int = 120,
+    start_method: Optional[str] = None,
+    country: Optional[str] = None,
+    proxy_tier: Optional[str] = None,
+) -> dict[str, Any]:
     steps_log = []
     debug_path = "/tmp/probe_debug.json"
 
@@ -102,17 +186,28 @@ def run_probe(url: str, render_js: bool = True, timeout: int = 120, start_method
         steps_log.append(msg)
         logger.info("PROBE [%s]: %s", url[:80], msg)
 
-    _log_step(f"Starting probe: render_js={render_js}, timeout={timeout}, start_method={start_method}")
+    _log_step(
+        f"Starting probe: render_js={render_js}, timeout={timeout}, "
+        f"start_method={start_method}, proxy_tier={proxy_tier}, "
+        f"fingerprint_step={fingerprint_step_enabled()}"
+    )
 
     if country is None:
         country = detect_country(url)
         if country:
             _log_step(f"Auto-detected country: {country}")
 
+    # Optional tier restriction from the /probe payload: run only the rungs
+    # that belong to this proxy tier (caller hint, default = whole ladder).
+    escalation_steps = active_escalation_steps()
+    if proxy_tier:
+        escalation_steps = [s for s in escalation_steps if s[1] == proxy_tier]
+        _log_step(f"Proxy tier filter: {len(escalation_steps)} step(s) at tier '{proxy_tier}'")
+
     start_method = _resolve_start_method(start_method)
     skip_index = 0
     if start_method:
-        for i, (step_name, _) in enumerate(ESCALATION_STEPS):
+        for i, (step_name, _) in enumerate(escalation_steps):
             if step_name == start_method:
                 skip_index = i
                 _log_step(f"Cache hint: starting at step {i} ({step_name})")
@@ -124,15 +219,15 @@ def run_probe(url: str, render_js: bool = True, timeout: int = 120, start_method
             return result
         return result or _failure_result("all_failed", "none", "Direct HTTP failed and render_js=false")
 
-    for i, (step_name, proxy_tier) in enumerate(ESCALATION_STEPS):
+    for i, (step_name, step_proxy_tier) in enumerate(escalation_steps):
         if i < skip_index:
             continue
 
         # Skip unconfigured proxy tiers (default deployment has no proxies —
         # datacenter/residential steps would launch through NO proxy, identical
         # to the 'none' tier already tried, wasting 30-45s each).
-        if not _proxy_tier_configured(proxy_tier):
-            _log_step(f"{step_name}: skipped (proxy tier '{proxy_tier}' not configured)")
+        if not _proxy_tier_configured(step_proxy_tier):
+            _log_step(f"{step_name}: skipped (proxy tier '{step_proxy_tier}' not configured)")
             continue
 
         _log_step(f"{step_name}: trying...")
@@ -185,6 +280,7 @@ def render_page(
     start_method: Optional[str] = None,
     country: Optional[str] = None,
     accept_language: Optional[str] = None,
+    proxy_tier: Optional[str] = None,
 ) -> dict[str, Any]:
     """Fetch a page and return the full HTML using the correct access method.
 
@@ -195,6 +291,9 @@ def render_page(
 
     Returns a dict with: ``success``, ``html``, ``status_code``, ``method``,
     ``title``, ``proxy_tier``, ``error``.
+
+    ``proxy_tier`` optionally restricts the escalation to one tier (same
+    meaning as :func:`run_probe`'s).
     """
     if country is None:
         country = detect_country(url)
@@ -214,9 +313,16 @@ def render_page(
         start_method = mapped
 
     start_method = _resolve_start_method(start_method)
+    escalation_steps = active_escalation_steps()
+    if proxy_tier:
+        escalation_steps = [s for s in escalation_steps if s[1] == proxy_tier]
+        logger.info(
+            "RENDER [%s]: proxy tier filter '%s' -> %d step(s)",
+            url[:80], proxy_tier, len(escalation_steps),
+        )
     skip_index = 0
     if start_method:
-        for i, (step_name, _) in enumerate(ESCALATION_STEPS):
+        for i, (step_name, _) in enumerate(escalation_steps):
             if step_name == start_method:
                 skip_index = i
                 logger.info(
@@ -224,17 +330,17 @@ def render_page(
                 )
                 break
 
-    for i, (step_name, proxy_tier) in enumerate(ESCALATION_STEPS):
+    for i, (step_name, step_proxy_tier) in enumerate(escalation_steps):
         if i < skip_index:
             continue
 
         # Skip unconfigured proxy tiers (default deployment has no proxies —
         # datacenter/residential steps would launch through NO proxy, identical
         # to the 'none' tier already tried, wasting 30-45s each).
-        if not _proxy_tier_configured(proxy_tier):
+        if not _proxy_tier_configured(step_proxy_tier):
             logger.info(
                 "RENDER [%s]: skipping %s (proxy tier '%s' not configured)",
-                url[:80], step_name, proxy_tier,
+                url[:80], step_name, step_proxy_tier,
             )
             continue
 
@@ -250,14 +356,14 @@ def render_page(
         if result and result.get("success"):
             html = _render_captured_html
             if not html:
-                html = _refetch_html(url, step_name, proxy_tier, timeout, country)
+                html = _refetch_html(url, step_name, step_proxy_tier, timeout, country)
             return {
                 "success": True,
                 "html": html[:MAX_RENDER_HTML],
                 "status_code": result.get("status_code", 200),
                 "method": result.get("method", step_name),
                 "title": result.get("title", ""),
-                "proxy_tier": proxy_tier,
+                "proxy_tier": step_proxy_tier,
                 "error": "",
             }
 
@@ -307,6 +413,13 @@ def _refetch_html(
 
         if step_name.startswith("playwright_"):
             return _render_via_browser(url, step_name, proxy_tier, timeout, country)
+
+        fingerprint = parse_fingerprint_method(step_name)
+        if fingerprint:
+            profile, tier = fingerprint
+            return _render_via_fingerprint(
+                url, tier, profile=profile, timeout=min(timeout, 20), country=country
+            )
 
     except Exception as exc:
         logger.warning("RENDER re-fetch failed (%s): %s", step_name, exc)
@@ -726,14 +839,7 @@ def _try_direct_http(url: str, timeout: int = 15, proxy_tier: str = "none", coun
         meta = extract_meta_tags(html)
         title = extract_title(html)
 
-        body_text = ""
-        if len(html) > 500:
-            import re as _re
-            match = _re.search(r"<body[^>]*>(.*?)</body>", html, _re.DOTALL | _re.IGNORECASE)
-            if match:
-                raw = match.group(1)
-                text = _re.sub(r"<[^>]+>", " ", raw)
-                body_text = _re.sub(r"\s+", " ", text).strip()[:1500]
+        body_text = _extract_body_text(html)
 
         if proxy_tier == "none" and _detect_akamai(html, resp.status_code):
             return {
@@ -790,6 +896,189 @@ def _try_direct_http(url: str, timeout: int = 15, proxy_tier: str = "none", coun
     except Exception as exc:
         logger.info("Direct HTTP (%s) failed: %s", proxy_tier, exc)
         return None
+
+
+def _fingerprint_session(
+    profile: str,
+    proxy_url: Optional[str],
+    timeout: int,
+):
+    """Build a curl_cffi session impersonating ``profile``.
+
+    Split out so both the probe step and the render re-fetch share one
+    construction site (and one place to learn about a curl_cffi API change).
+    Import is inside the function: curl_cffi is a browser-image dependency and
+    probe.py must stay importable where it is not installed.
+    """
+    from curl_cffi import requests as curl_requests
+
+    # NOTE: no explicit User-Agent here. The impersonated TLS handshake is only
+    # coherent with curl_cffi's own matching header set (``default_headers``);
+    # stamping src.page_analysis.get_user_agent() on top would pair one
+    # browser's JA3 with another's UA — the mismatch this rung exists to avoid.
+    kwargs: dict[str, Any] = {"impersonate": profile, "timeout": timeout}
+    if proxy_url:
+        kwargs["proxy"] = proxy_url
+    return curl_requests.Session(**kwargs)
+
+
+def _try_fingerprint(
+    url: str,
+    proxy_tier: str = "none",
+    profile: str = "chrome",
+    timeout: int = 20,
+    country: Optional[str] = None,
+) -> Optional[dict]:
+    """Probe via curl_cffi browser-TLS impersonation (HTTP client, NOT a browser).
+
+    Sits after the plain-HTTP step in each proxy tier (see
+    :func:`active_escalation_steps`). Deliberately a *profile sub-ladder*
+    rather than a single impersonate value — a fresh Session per profile, each
+    attempt individually guarded, so one raising profile (unknown alias, TLS
+    negotiation failure) returns instead of killing the step.
+
+    Success uses the same bar as the neighbouring steps: a real status plus
+    meaningful content (:func:`_classify_block` + the 2000-byte floor). A 200
+    whose body is a tiny challenge page is a FAIL here just as it is for
+    ``direct_http``.
+
+    Returns ``None`` only when the library itself is unavailable (the rung
+    then costs nothing); a fetched-but-rejected page returns
+    ``success=False`` so the escalation log records why the rung failed.
+    """
+    method_name = f"{FINGERPRINT_METHOD_PREFIX}{profile}_{proxy_tier}"
+    try:
+        config = get_proxy_config()
+        proxy_url = (
+            config.build_proxy_url(proxy_tier, country=country)
+            if proxy_tier != "none"
+            else None
+        )
+    except Exception as exc:
+        logger.info("Fingerprint (%s) setup failed: %s", method_name, exc)
+        return None
+
+    # Fresh Session per attempt: curl_cffi keeps connection + cookie state on
+    # the session, and a profile that was just challenged must not hand that
+    # state to the next profile.
+    try:
+        with _fingerprint_session(profile, proxy_url, timeout) as session:
+            resp = session.get(url, timeout=timeout)
+    except Exception as exc:
+        logger.info("Fingerprint (%s) failed: %s", method_name, exc)
+        return None
+
+    status_code = resp.status_code
+    html = resp.text or ""
+    _capture_html_for_render(html)
+    blocked = is_blocked(html[:5000])
+    jsonld = extract_jsonld(html)
+    meta = extract_meta_tags(html)
+    title = extract_title(html)
+    body_text = _extract_body_text(html)
+
+    block_class = _classify_block(html, status_code)
+    has_content = len(html) > 2000 and block_class is None
+
+    if has_content:
+        has_price_in_jsonld = any(has_price(block) for block in jsonld)
+        needs_browser = not has_price_in_jsonld and len(jsonld) == 0
+        spa_detected, spa_framework = _detect_spa(html, body_text)
+        if spa_detected:
+            needs_browser = True
+            selector_results = f"SPA detected ({spa_framework}) — JS rendering required"
+        else:
+            selector_results = "Skipped — fingerprint HTTP"
+
+        return {
+            "success": True,
+            "method": method_name,
+            "proxy_tier": proxy_tier,
+            "status_code": status_code,
+            "title": title,
+            "body_length": len(html),
+            "body_text": body_text,
+            "needs_browser": needs_browser,
+            "blocked": False,
+            "jsonld": jsonld,
+            "meta": meta,
+            "selector_results": selector_results,
+            "error": "",
+            "spa_detected": spa_detected,
+            "spa_framework": spa_framework,
+            "fingerprint_profile": profile,
+        }
+
+    logger.info(
+        "Fingerprint (%s) rejected: status=%s bytes=%d block=%s/%s",
+        method_name, status_code, len(html), block_class, blocked,
+    )
+    return {
+        "success": False,
+        "method": method_name,
+        "proxy_tier": proxy_tier,
+        "status_code": status_code,
+        "title": title,
+        "body_length": len(html),
+        "body_text": body_text,
+        "needs_browser": True,
+        "blocked": True,
+        # Deliberately NOT ``needs_akamai_bypass``: this is an early, cheap
+        # rung — tripping the cloak bypass here would also stop the ladder
+        # before the (untried) datacenter/residential tiers.
+        "jsonld": jsonld,
+        "meta": meta,
+        "selector_results": "Skipped — page blocked, empty or challenge-shaped",
+        "error": f"fingerprint fetch rejected (block={block_class or 'unknown'})",
+        "fingerprint_profile": profile,
+    }
+
+
+def _extract_body_text(html: str, limit: int = 1500) -> str:
+    """Visible text of ``<body>`` (first ``limit`` chars), '' if unavailable.
+
+    Shared by the HTTP-flavoured probe steps so their ``body_text`` payload
+    (which feeds the downstream captcha/LLM checks) has one implementation.
+    """
+    if len(html) <= 500:
+        return ""
+    import re as _re
+
+    match = _re.search(r"<body[^>]*>(.*?)</body>", html, _re.DOTALL | _re.IGNORECASE)
+    if not match:
+        return ""
+    text = _re.sub(r"<[^>]+>", " ", match.group(1))
+    return _re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def _render_via_fingerprint(
+    url: str,
+    proxy_tier: str,
+    profile: str = "chrome",
+    timeout: int = 20,
+    country: Optional[str] = None,
+) -> str:
+    """Full-HTML re-fetch for a ``fingerprint_*`` step (render_page fallback).
+
+    ``_try_fingerprint`` already captures the HTML inline, so this normally
+    never runs — it exists so a caller that reaches :func:`_refetch_html`
+    with a fingerprint method still gets content instead of ''.
+    """
+    try:
+        config = get_proxy_config()
+        proxy_url = (
+            config.build_proxy_url(proxy_tier, country=country)
+            if proxy_tier != "none"
+            else None
+        )
+        with _fingerprint_session(profile, proxy_url, timeout) as session:
+            resp = session.get(url, timeout=timeout)
+        return resp.text or ""
+    except Exception as exc:
+        logger.warning(
+            "RENDER re-fetch failed (%s_%s): %s", profile, proxy_tier, exc
+        )
+    return ""
 
 
 def _try_playwright(url: str, proxy_tier: str, timeout: int = 25, country: Optional[str] = None) -> Optional[dict]:

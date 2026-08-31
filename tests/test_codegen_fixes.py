@@ -289,7 +289,7 @@ class TestCountRegressionBand:
         )
         assert _narrowed is True
 
-    def test_band_triggered_on_big_regression(self, db):
+    def test_band_triggered_on_big_regression(self, db, monkeypatch):
         """Full-scope test extracting 7 vs prior 3,616 → bounce to writer."""
         import secrets as _sec
 
@@ -297,6 +297,11 @@ class TestCountRegressionBand:
         rat = importlib.import_module("agents.nodes.route_after_testing")
         from django.contrib.auth.models import User
         from scraper.models import ScrapeJob
+
+        # job_id 999998 is intentionally nonexistent — the [T3.13h] CASCADE
+        # row would violate the SessionLog FK at teardown.
+        import agents.graph as _graph
+        monkeypatch.setattr(_graph, "_log_event_row", lambda *a, **k: None)
 
         u = User.objects.create_user("_cr2_" + _sec.token_hex(3), password="x")
         ScrapeJob.objects.create(

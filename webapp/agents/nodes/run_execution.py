@@ -17,6 +17,7 @@ import subprocess
 import time
 from typing import Any, Optional
 
+from ..constants import STEALTH_METHOD_PREFIXES
 from ..state import ScrapeState
 
 logger = logging.getLogger(__name__)
@@ -177,7 +178,7 @@ def cli_contract_violation(
     - search_term: any of the above, or
         M4  declares --query AND consumes args.query
     """
-    from ..constants import API_STRATEGIES, NAV_INPUT_MODES, SCRAPER_ENV_LISTING
+    from ..constants import API_STRATEGIES, NAV_INPUT_MODES, SCRAPER_ENV_LISTING, STEALTH_METHOD_PREFIXES
 
     im = (input_mode or "").strip().lower()
     if im not in NAV_INPUT_MODES:
@@ -267,10 +268,10 @@ def _needs_cloak(state: ScrapeState) -> bool:
             or (conn.get("method_that_worked") if isinstance(conn, dict) else "")
             or ""
         )
-        if isinstance(method, str) and method.startswith(("uc_chrome", "cloak")):
+        if isinstance(method, str) and method.startswith(STEALTH_METHOD_PREFIXES):
             return True
     pm = state.get("probe_method") or ""
-    if isinstance(pm, str) and pm.startswith(("uc_chrome", "cloak")):
+    if isinstance(pm, str) and pm.startswith(STEALTH_METHOD_PREFIXES):
         return True
     return False
 
@@ -1162,6 +1163,32 @@ def _run_in_process(
         logger.info("run_execution: scraper exited with code %d in %ds", returncode, elapsed)
 
         if returncode != 0:
+            # [T2.10/wave-13] The template's DISCOVERY_ZERO exit (rc=3) is a
+            # ZERO-DISCOVERY verdict, not a crash: Phase 1 ran cleanly and saw
+            # no item URLs under the given listing. Tag it no_fresh_output so
+            # the RC1 listing fallback fires, and attach a FAIL-class
+            # discovery_coverage so _route_after_execution can recycle the
+            # strategy — a bare FAILED here sent the clean-zero shape straight
+            # to cleanup (job-85's trap).
+            if returncode == 3 or "DISCOVERY_ZERO" in stderr:
+                logger.error(
+                    "run_execution: DISCOVERY_ZERO (rc=%d) — Phase 1 found no "
+                    "item URLs; tagging zero-discovery for fallback/recycle",
+                    returncode,
+                )
+                return {
+                    "execution_status": "FAILED",
+                    "no_fresh_output": True,
+                    "discovery_coverage": {
+                        "ran_phase1": True,
+                        "discovered_urls": 0,
+                        "stop_reason": "empty_first_page",
+                        "zero_discovery_exit": True,
+                    },
+                    "error_message": (
+                        f"Scraper exited with code {returncode}. {stderr[-4000:]}"
+                    ),
+                }
             return {
                 "execution_status": "FAILED",
                 "error_message": f"Scraper exited with code {returncode}. {stderr[-4000:]}",
@@ -1352,6 +1379,31 @@ def _run_via_browser_service(
             # 351: "page.goto timeout" was invisible — 2000 chars of log start
             # ate the whole budget). TextField on the model — no DB cap.
             stderr = result.get("stderr", "")[-4000:]
+            # [T2.10/wave-13] Same DISCOVERY_ZERO tagging as the in-process
+            # path: the template's rc=3 exit is a zero-discovery verdict, not
+            # a crash — the listing fallback and the strategy recycle must
+            # both see it.
+            if result.get("returncode") == 3 or "DISCOVERY_ZERO" in (
+                result.get("stderr") or ""
+            ):
+                logger.error(
+                    "run_execution: DISCOVERY_ZERO (browser_service, rc=%s) — "
+                    "tagging zero-discovery for fallback/recycle",
+                    result.get("returncode"),
+                )
+                return {
+                    "execution_status": "FAILED",
+                    "no_fresh_output": True,
+                    "discovery_coverage": {
+                        "ran_phase1": True,
+                        "discovered_urls": 0,
+                        "stop_reason": "empty_first_page",
+                        "zero_discovery_exit": True,
+                    },
+                    "error_message": (
+                        f"Scraper exited with code {result['returncode']}. {stderr}"
+                    ),
+                }
             return {
                 "execution_status": "FAILED",
                 "error_message": f"Scraper exited with code {result['returncode']}. {stderr}",

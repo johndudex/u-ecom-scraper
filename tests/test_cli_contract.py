@@ -248,12 +248,16 @@ class TestRouteAfterTesting:
         # A PASS also needs phases_tested.phase1_discovery=True (the pre-existing
         # phase-coverage gate) — without it the route legitimately sends the job
         # to scraper_analyzer for a discovery-validating re-test.
+        # [wave-13] A PASS now also needs a nonzero extracted count — a verdict
+        # with zero items behind it is the phantom-PASS class the campaign
+        # killed (job-76/81), so the compliant shape carries real evidence.
         state = {
             "test_report": {
                 "overall_assessment": "PASS",
                 "confidence_score": 0.9,
                 "ready_for_execution": True,
                 "issues": [],
+                "results": {"successful_extractions": 7},
                 "phases_tested": {"phase1_discovery": True, "phase2_extraction": True},
             }
         }

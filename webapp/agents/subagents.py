@@ -176,6 +176,10 @@ _API_EXTRACTION_CAP = 600
 # exists to shrink.
 _ISSUE_FIX_CAP = 300
 _WRITER_FEEDBACK_CAP = 600
+# T2.6: the EXACT-FAILURE block (failing run's argv + error tail) gets its own
+# cap so a chatty crash can't eat the feedback/caps above — the writer must
+# always see WHAT TO PRESERVE even when the failure text is huge.
+_EXACT_FAILURE_CAP = 1200
 
 # T1.5 (I7): exact strategy tokens a mechanism_reassessment verdict may carry.
 # Value-match, NOT a key-alias set, and NEVER ``scraping_mechanism`` (a key
@@ -356,7 +360,11 @@ def _summarize_product_analysis(
     - the per-field extraction map (method + selector/API path + fallback +
       JS snippet + API notes) — compacted; ``examples``/``expectations``/
       ``tested`` are dropped (validation is code_tester's concern, not
-      extraction). API-method fields are PINNED into the rendered set: the
+      extraction) EXCEPT as the [T1.8] UNVERIFIED evidence probe: a field
+      carrying neither an example value nor a verified/tested flag renders
+      with an explicit ``[UNVERIFIED — analyzer guess…]`` marker so
+      code_writer knows to wire a fallback instead of trusting the selector.
+      API-method fields are PINNED into the rendered set: the
       core-first ``_MAX_FIELDS`` cap would otherwise drop the non-core API
       field the map was extended to surface.
     - ``page_structure``, ``extraction_methods``, ``jsonld_extraction``,
@@ -443,7 +451,60 @@ def _summarize_product_analysis(
                 if len(notes) > _FIELD_NOTE_CAP:
                     notes = notes[: _FIELD_NOTE_CAP - 1] + "…"
                 line += f' notes="{notes}"'
+        # [T1.8/wave-13] Honesty marker: a map entry with NO live-page
+        # evidence (no example value, not flagged verified/tested) is the
+        # analyzer's best GUESS. The writer must treat it as a hypothesis —
+        # wire a fallback source — not as ground truth. Job-118 class: a
+        # price mapped from an unverified selector sat empty on all 20
+        # extracted rows and nothing downstream said the map was a guess.
+        # [T2.7/wave-13] `tested` carries either the analyzer's boolean or a
+        # field_verification string verdict ("verified"/"empty"/"skipped") —
+        # bool("empty") is truthy, so a string-verdict-aware read is required
+        # or a PROVEN-DEAD source would suppress the honesty marker.
+        try:
+            _has_example = bool(
+                info.get("example")
+                or info.get("examples")
+                or info.get("sample_value")
+            )
+            _tested_raw = info.get("tested")
+            if isinstance(_tested_raw, str):
+                _tested_ok = _tested_raw.strip().lower() == "verified"
+            else:
+                _tested_ok = bool(_tested_raw)
+            _verified = bool(info.get("verified")) or _tested_ok
+            if str(_tested_raw or "").strip().lower() == "empty":
+                line += (
+                    " [VERIFIED EMPTY — the live-render check produced NO value "
+                    "for this source; do NOT ship this mapping as-is — re-anchor "
+                    "to a populated source (JSON-LD / embedded JSON / CSS) first]"
+                )
+            elif _tested_ok and info.get("resolved_value"):
+                line += f' value="{str(info["resolved_value"])[:60]}"'
+            elif isinstance(info, dict) and not _has_example and not _verified:
+                line += (
+                    " [UNVERIFIED — analyzer guess, no live-page evidence; "
+                    "wire a fallback source and verify on the live page]"
+                )
+        except AttributeError:
+            pass
         lines.append(line)
+    # [T2.7/wave-13] Verification summary (written by normalize_fields' live
+    # render): counts + the named dead sources, so the writer sees at a glance
+    # which map entries are proven vs guessed.
+    _fv = pa.get("field_verification")
+    if isinstance(_fv, dict) and _fv:
+        _fv_line = (
+            f"**Field Verification** (live render via {_fv.get('method', '?')}): "
+            f"verified={_fv.get('verified', 0)}, empty={_fv.get('empty', 0)}, "
+            f"skipped={_fv.get('skipped', 0)} — `verified` sources are PROVEN on "
+            "the live page (trust them); `empty` sources produced NOTHING and "
+            "must be re-anchored before shipping."
+        )
+        _ef = _fv.get("empty_fields")
+        if _ef:
+            _fv_line += f" Dead sources: {', '.join(str(x) for x in _ef[:10])}."
+        lines.append(_fv_line)
     # T1.5 (I7): mechanism_reassessment is CONDITIONAL — render by default,
     # suppress only when the strategy gate armed and rejected the verdict
     # (injecting it then argues against the message's own strategy).
@@ -465,7 +526,14 @@ def _summarize_product_analysis(
     ):
         val = pa.get(key)
         if val:
-            lines.append(f"**{label}:** {_json.dumps(val, ensure_ascii=False)}")
+            _rendered = _json.dumps(val, ensure_ascii=False)
+            # [T1.9/wave-13] A raw analyzer JSON-LD dump can be the single
+            # largest block in the writer seed; cap it. The actionable
+            # structure still reaches the writer through the field map and
+            # _fetch_rendered_jsonld's projection.
+            if key == "jsonld_extraction" and len(_rendered) > 2500:
+                _rendered = _rendered[:2500] + " …(truncated)"
+            lines.append(f"**{label}:** {_rendered}")
     # T1.1: api_extraction bounded to url + code pattern + sample keys + ONE
     # example entry (never the raw block — the seed is truncation-exempt).
     _api_section = _render_api_extraction(pa.get("api_extraction"))
@@ -1231,11 +1299,26 @@ def build_site_analyzer_message(state: dict) -> list:
         conn = probe_result["connectivity"]
         verified = probe_result.get("captcha_verified", False)
         has_verified_probe = True
+        _probed_url_line = (
+            f"probed_url: {probe_result.get('probed_url', '')}\n"
+            if probe_result.get("probed_url")
+            else ""
+        )
+        # T3.7: state the anchor explicitly when the probe ran somewhere other
+        # than the job URL — otherwise the analyzer's evidence is a false anchor.
+        _probed_anchor_note = (
+            "The evidence above was collected on `probed_url` — if it differs from "
+            "the job URL, your analysis anchors to the probed URL, not the job URL. "
+            if probe_result.get("probed_url")
+            and probe_result.get("probed_url") != state.get("url")
+            else ""
+        )
         cached_probe = (
             f"\n### Pre-verified Probe Result (from accessibility check)\n"
             f"The page has ALREADY been probed{' and verified as captcha-free' if verified else ''}. "
             f"Do NOT call probe_page again — use this data directly:\n"
             f"```\n"
+            f"{_probed_url_line}"
             f"method_that_worked: {conn.get('method_that_worked', 'unknown')}\n"
             f"http_method: {conn.get('http_method', 'none')}\n"
             f"browser_method: {conn.get('browser_method', 'none')}\n"
@@ -1245,6 +1328,7 @@ def build_site_analyzer_message(state: dict) -> list:
             f"```\n"
             f"**IMPORTANT**: The connectivity methods above bypass captcha/anti-bot. "
             f"Use `method_that_worked` in your site_analysis.json connectivity section. "
+            f"{_probed_anchor_note}"
             f"If `http_method` is available, HTTP requests may also work. "
             f"If `browser_method` is available but different from `method_that_worked`, "
             f"prefer `method_that_worked` for scraping.\n"
@@ -1385,6 +1469,44 @@ def _fetch_api_sample(api_url: str, limit: int = 3) -> str:
     return json.dumps(compact, indent=2, ensure_ascii=False)[:4000]
 
 
+_JSONLD_MAX_KEYS = 40
+_JSONLD_SAMPLE = 120
+
+
+def _project_jsonld(node, _depth: int = 0) -> str:
+    """[T1.9/wave-13] Structure-preserving projection of a JSON-LD node.
+
+    Blind character-slicing cuts mid-object and drops exactly the deep keys
+    field maps are built from (offers.price, aggregateRating.ratingValue).
+    This renders @type plus every scalar key with a SHORT value sample, and
+    recurses ONE level into dict/list values (offers, brand) so the nested
+    keys survive. Bounded: 40 keys per node, 120-char samples, 2 levels.
+    """
+    import json
+
+    if isinstance(node, list):
+        return "\n".join(_project_jsonld(n, _depth) for n in node[:6])
+    if not isinstance(node, dict):
+        return str(node)[:_JSONLD_SAMPLE]
+    lines = []
+    t = node.get("@type")
+    if t:
+        lines.append(f"@type: {t}")
+    for k, v in node.items():
+        if k == "@type" or len(lines) >= _JSONLD_MAX_KEYS:
+            break
+        if isinstance(v, dict) and _depth < 2:
+            lines.append(f"{k}: {{{_project_jsonld(v, _depth + 1)}}}")
+        elif isinstance(v, list) and v and isinstance(v[0], dict) and _depth < 2:
+            lines.append(
+                f"{k}: [{_project_jsonld(v[0], _depth + 1)}] (len={len(v)})"
+            )
+        else:
+            s = v if isinstance(v, str) else json.dumps(v, default=str)
+            lines.append(f"{k}: {str(s)[:_JSONLD_SAMPLE]}")
+    return "\n  ".join(lines)
+
+
 def _fetch_rendered_jsonld(url: str) -> str:
     """Fetch the JS-rendered HTML of a sample page (via browser_service ``/render``,
     which applies the anti-bot cloak) and extract its JSON-LD blocks.
@@ -1393,6 +1515,10 @@ def _fetch_rendered_jsonld(url: str) -> str:
     repeatedly browsing heavy SPA pages — the react agent's snapshot iteration
     blows the 15-min budget on myntra/calvklein. One /render here replaces many
     browser calls. Returns the JSON-LD blocks as text (truncated) or ``''``.
+
+    [T1.9] Parseable blocks are rendered through ``_project_jsonld`` so nested
+    pricing/offer structure survives; unparseable blocks keep the legacy raw
+    (truncated) text.
     """
     import json
     import re
@@ -1420,7 +1546,15 @@ def _fetch_rendered_jsonld(url: str) -> str:
     out = []
     for b in blocks[:6]:
         b = b.strip()
-        if b:
+        if not b:
+            continue
+        try:
+            parsed = json.loads(b)
+        except Exception:
+            parsed = None
+        if parsed is not None:
+            out.append(_project_jsonld(parsed)[:1500])
+        else:
             out.append(b[:1500])
     jsonld = ("\n---\n".join(out))[:4000] if out else ""
 
@@ -1523,6 +1657,64 @@ def _nested_schema_section(state: dict) -> str:
         "DROPPED. Types are shape hints only — not validated.\n"
     )
     return "\n".join(lines) + "\n"
+
+
+def _remap_sample_urls(state: dict, slug: str, limit: int = 5) -> list[str]:
+    """[T3.13d] Real item URLs from the failed run, for the remap message.
+
+    Sources (first hit wins): ``test_report.discovery_coverage.discovered_urls``
+    when the template emitted the list form; else the newest workspace output
+    files' item ``url``/``src_url`` — the pages the failed extraction actually
+    touched. Best-effort throughout: [] on any absence, and the remap message
+    then falls back to its original single-sample behavior.
+    """
+    urls: list[str] = []
+    report = state.get("test_report") or {}
+    cov = report.get("discovery_coverage") if isinstance(report, dict) else None
+    if isinstance(cov, dict):
+        cand = cov.get("discovered_urls")
+        if isinstance(cand, list):
+            urls = [str(u) for u in cand if isinstance(u, str) and u.startswith("http")]
+    if not urls:
+        try:
+            import json as _json
+
+            from django.conf import settings as _settings
+
+            root = str(
+                getattr(_settings, "PROJECT_ROOT", os.environ.get("PROJECT_ROOT", "."))
+            )
+            ws = os.path.join(root, "workspace", slug)
+            outs = sorted(
+                [
+                    f for f in (os.listdir(ws) if os.path.isdir(ws) else [])
+                    if f.startswith("output_") and f.endswith(".json")
+                ],
+                key=lambda f: os.path.getmtime(os.path.join(ws, f)),
+                reverse=True,
+            )[:3]
+            for name in outs:
+                try:
+                    with open(os.path.join(ws, name), errors="ignore") as fh:
+                        data = _json.load(fh)
+                except Exception:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                for v in data.values():
+                    if isinstance(v, list) and v and isinstance(v[0], dict):
+                        urls = [
+                            str(r.get("url") or r.get("src_url") or "")
+                            for r in v
+                            if isinstance(r, dict)
+                        ]
+                        urls = [u for u in urls if u.startswith("http")]
+                        break
+                if urls:
+                    break
+        except Exception:
+            return []
+    return list(dict.fromkeys(urls))[:limit]
 
 
 def build_product_analyzer_message(state: dict) -> list:
@@ -1660,11 +1852,26 @@ def build_product_analyzer_message(state: dict) -> list:
     if isinstance(remediation, dict) and remediation.get("target") == "mapping":
         failed_fields = [f for f in (remediation.get("fields") or []) if isinstance(f, str)]
         fields_str = ", ".join(failed_fields) or "(unspecified)"
+        # [T3.13d] Hand the remap the URLs the failed run actually touched —
+        # ``results.sample_products`` is never populated (not in code_tester's
+        # report schema), so every remap cycle re-verified against the SAME
+        # single sample page and could pass there while failing on real pages.
+        _remap_urls = _remap_sample_urls(state, slug)
+        _remap_urls_block = ""
+        if _remap_urls:
+            _remap_urls_block = (
+                "URLs from the failed run — verify each re-mapped field against 2-3 of "
+                "these REAL URLs (probe or ONE httpx fetch), not just the original "
+                "sample page:\n"
+                + "\n".join(f"  - {u}" for u in _remap_urls)
+                + "\n"
+            )
         remap_context = (
             f"\n### CRITICAL — RE-MAP FAILED FIELDS (mapping-failure recovery)\n"
             f"code_tester ran the generated scraper and these required fields FAILED because their "
             f"MAPPING in product_analysis.json is missing/wrong/unverified:\n"
             f"  **{fields_str}**\n"
+            f"{_remap_urls_block}"
             f"Steps:\n"
             f"1. Read `workspace/{slug}/test_report.json` (why each field failed).\n"
             f"2. Read `workspace/{slug}/product_analysis.json` (the current mapping).\n"
@@ -2289,6 +2496,70 @@ def _summarize_test_report(state: dict) -> str:
             "\n**⚠️ REMEDIATION INSTRUCTION (apply this fix — do NOT rewrite "
             "from scratch):**\n" + _feedback
         )
+    # T2.6: retry writers kept breaking WORKING phases because the summary never
+    # said what worked — a "price MISSING" report reads as "rewrite everything",
+    # and the rewrite discarded the proven Phase-1 discovery (jobs 71/76/81).
+    # Both sources here are attached deterministically (graph.py attaches
+    # phases_tested + discovery_coverage), no LLM trust involved.
+    _phases = report.get("phases_tested")
+    _cov_t26 = report.get("discovery_coverage")
+    _preserve: list[str] = []
+    if isinstance(_cov_t26, dict):
+        try:
+            _disc_n = int(_cov_t26.get("discovered_urls") or 0)
+        except (TypeError, ValueError):
+            _disc_n = 0
+        if _disc_n > 0:
+            _preserve.append(
+                f"Phase-1 discovery WORKED: {_disc_n} item URLs discovered "
+                f"(stop_reason={_cov_t26.get('stop_reason') or 'n/a'}). DO NOT "
+                "rewrite, 'simplify', or replace the discovery/pagination code — "
+                "the rewrite discards a proven Phase 1 and re-discovers from zero."
+            )
+    if isinstance(_phases, dict):
+        _ran = [k for k, v in _phases.items() if v]
+        if _ran:
+            _preserve.append(
+                "Phases tested and completed: " + ", ".join(sorted(_ran)) + "."
+            )
+    _res_t26 = report.get("results")
+    _succ = 0
+    if isinstance(_res_t26, dict):
+        try:
+            _succ = int(_res_t26.get("successful_extractions") or 0)
+        except (TypeError, ValueError):
+            _succ = 0
+    if _succ > 0:
+        _preserve.append(
+            f"{_succ} sample item(s) extracted successfully — the run mechanics "
+            "(fetch → parse → output) work. Fix ONLY the listed issues; keep the "
+            "fetching/parsing structure intact."
+        )
+    if _preserve:
+        lines.append("\n**✅ WHAT TO PRESERVE (proven working in the failed run):**")
+        lines.extend(f"  - {p}" for p in _preserve)
+
+    # T2.6: the exact invocation the failing run used, so a targeted fix lands
+    # in the code path that actually ran (best-effort — the tester logs every
+    # run_scraper launch; an unavailable DB must never break the builder).
+    try:
+        from scraper.models import SessionLog
+
+        _row = (
+            SessionLog.objects.filter(
+                job_id=state.get("job_id") or 0,
+                content__startswith="[RUN_SCRAPER]",
+            )
+            .order_by("-id")
+            .values_list("content", flat=True)
+            .first()
+        )
+        if _row:
+            lines.append("\n**EXACT FAILURE CONTEXT** (the run being judged):")
+            lines.append(f"  `{str(_row).strip()}`")
+    except Exception:
+        pass
+
     # Fix A: surface the RAW error so code_writer makes a targeted fix instead of
     # regenerating from scratch (which reintroduces variance).
     strategy_error = report.get("strategy_error") if isinstance(report, dict) else None
@@ -2305,10 +2576,16 @@ def _summarize_test_report(state: dict) -> str:
             f"Rewrite using the correct strategy; do NOT keep the wrong approach."
         )
     elif crash_error:
+        # T2.6: a traceback's verdict lives in its LAST lines — tail 40 lines
+        # under the dedicated cap instead of head-slicing 1500 chars (which
+        # kept the banner and cut the actual exception).
+        _crash_text = "\n".join(str(crash_error).splitlines()[-40:])
+        if len(_crash_text) > _EXACT_FAILURE_CAP:
+            _crash_text = _crash_text[: _EXACT_FAILURE_CAP - 1] + "…"
         lines.append(
             "\n**⚠️ THE SCRAPER CRASHED — make a MINIMAL, targeted fix for THIS error "
             "(do NOT rewrite from scratch — that reintroduces variance):**\n"
-            f"```\n{str(crash_error)[:1500]}\n```"
+            f"```\n{_crash_text}\n```"
         )
     if retry_count > 0 and retry_count != FINAL_RETRY_SENTINEL:
         lines.append(f"\n*{retry_count} previous attempt(s) failed.*")
@@ -2410,6 +2687,118 @@ def _render_critical_fix(scraper_analysis: dict) -> str:
                 + "\n"
             )
     return section
+
+
+def _checkpoint_discovery_section(state: dict) -> str:
+    """T2.4: relay the PREVIOUS cycle's discovery checkpoint into the writer seed.
+
+    ``discovered_urls_checkpoint.json`` persists across cycles within a run
+    (the workspace wipe is per-JOB, which is correct — cross-run reuse is the
+    H3 contamination class). Job-88's shape: cycle-2 discovered 8 URLs and
+    extracted 5/5, then cycle-3 regenerated the draft, ran a FRESH Phase 1
+    that found 0, and the checkpoint sat unused in the workspace. Surfacing
+    those URLs tells the writer (a) discovery mechanics were PROVEN and (b)
+    exactly which URLs a rewritten Phase 1 must still find.
+    """
+    slug = str(state.get("site_slug") or "").strip()
+    if not slug:
+        return ""
+    try:
+        from django.conf import settings
+
+        root = str(getattr(settings, "PROJECT_ROOT", "") or "")
+    except Exception:
+        root = os.environ.get("PROJECT_ROOT", "")
+    if not root:
+        return ""
+    path = os.path.join(root, "workspace", slug, "discovered_urls_checkpoint.json")
+    try:
+        import json as _json
+
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            data = _json.load(fh)
+    except Exception:
+        return ""
+    urls = data.get("urls") if isinstance(data, dict) else None
+    if not isinstance(urls, list) or not urls:
+        return ""
+    sample = [str(u) for u in urls[:25] if str(u).strip()]
+    if not sample:
+        return ""
+    lines = [
+        f"\n### PROVEN DISCOVERY (previous cycle's checkpoint: {len(urls)} URLs)",
+        "Phase-1 discovery ALREADY WORKED in a previous attempt on this exact run "
+        "(workspace/" + slug + "/discovered_urls_checkpoint.json). These item URLs are "
+        "GROUND TRUTH — if you touch Phase 1, your rewritten discovery MUST still "
+        "find them. Do NOT regenerate discovery from scratch and hope.",
+    ]
+    lines.extend(f"  {i + 1}. {u}" for i, u in enumerate(sample))
+    if len(urls) > len(sample):
+        lines.append(f"  … and {len(urls) - len(sample)} more.")
+    return "\n".join(lines) + "\n"
+
+
+def _platform_distillation(state: dict) -> str:
+    """T3.11: ≤2KB deterministic platform distillation for code_writer.
+
+    Digests the site mechanics the writer keeps re-deriving — platform, item
+    URL shape, discovery/pagination, field headings — from the analysis
+    artifacts already in state. Replaces the disabled full-skill injection
+    (``skills_section = ""``): 25KB/skill looped the writer; this is ~1KB and
+    never guesses (every line comes from an artifact, "" when absent).
+    """
+    site_analysis = state.get("site_analysis") if isinstance(
+        state.get("site_analysis"), dict
+    ) else {}
+    nav = state.get("navigation_analysis") if isinstance(
+        state.get("navigation_analysis"), dict
+    ) else {}
+    scraper_analysis = state.get("scraper_analysis") if isinstance(
+        state.get("scraper_analysis"), dict
+    ) else {}
+
+    lines: list[str] = ["\n### SITE MECHANICS (deterministic digest — from analysis artifacts)"]
+
+    def _add(label: str, value) -> None:
+        text = str(value or "").strip()
+        if text and len(lines) < 40:
+            lines.append(f"- {label}: {text[:300]}")
+
+    _add("Platform", site_analysis.get("platform"))
+    _add(
+        "Strategy",
+        scraper_analysis.get("strategy") or site_analysis.get("scraping_mechanism"),
+    )
+    search = nav.get("search") if isinstance(nav.get("search"), dict) else {}
+    _add("Search URL pattern", search.get("url_pattern"))
+    _add("Search input selector", search.get("input_selector"))
+    discovery = nav.get("discovery") if isinstance(nav.get("discovery"), dict) else {}
+    _add("Promoted listing URL", discovery.get("listing_url"))
+    pagination = nav.get("pagination") if isinstance(nav.get("pagination"), dict) else {}
+    _add("Pagination type", pagination.get("type"))
+    _add("Pagination page param", pagination.get("page_param_name"))
+    _add("Next-button selector", pagination.get("next_button_selector"))
+    item_links = nav.get("item_links") if isinstance(nav.get("item_links"), dict) else {}
+    _add("Item URL pattern", item_links.get("url_pattern"))
+    _add("Item container selector", item_links.get("container_selector"))
+    _add("Item link selector", item_links.get("link_selector"))
+    api = nav.get("api_endpoint") if isinstance(nav.get("api_endpoint"), dict) else {}
+    _add("Backend JSON API", api.get("url") or api.get("api_url"))
+    try:
+        _fields = [
+            str(f) for f in (state.get("target_fields") or [])
+            if str(f).strip()
+        ]
+        if _fields:
+            lines.append(f"- Fields to extract: {', '.join(_fields[:20])}")
+    except Exception:
+        pass
+    if len(lines) <= 1:
+        return ""  # no artifact data — stay silent, don't emit an empty header
+    block = "\n".join(lines) + "\n"
+    if len(block) > 2048:
+        block = block[:2047] + "…\n"
+    return block
 
 
 def build_code_writer_message(state: dict) -> list:
@@ -2618,12 +3007,26 @@ def build_code_writer_message(state: dict) -> list:
                     )
         except Exception:
             pass
-        template_hint = (
-            f"\n### Template\nRead the template at: templates/{template_file} "
-            f"and use it as your base. The scraper will run on a dedicated worker "
-            f"container that has Chrome, SeleniumBase, Playwright, and CloakBrowser "
-            f"installed.{_cloak_note}"
-        )
+        # T2.5: when edit-over-write is active (graph verified a parseable draft
+        # from THIS template exists), "use the template as your base" is a
+        # rewrite invitation — it discards the prior draft's accumulated fixes.
+        # Point the writer at the draft instead.
+        _eow_base = str(state.get("last_writer_template") or "")
+        if _eow_base and _eow_base == template_file:
+            template_hint = (
+                f"\n### EDIT MODE — DO NOT REGENERATE\nA working draft already exists at "
+                f"workspace/{slug}/scraper_draft.py (built from templates/{template_file}). "
+                "Treat THAT draft as your base: apply ONLY the targeted edits the test "
+                "report asks for. Do NOT restart from the template — that discards prior "
+                "fixes and reintroduces past failures.\n"
+            )
+        else:
+            template_hint = (
+                f"\n### Template\nRead the template at: templates/{template_file} "
+                f"and use it as your base. The scraper will run on a dedicated worker "
+                f"container that has Chrome, SeleniumBase, Playwright, and CloakBrowser "
+                f"installed.{_cloak_note}"
+            )
 
     scraper_analysis_section = ""
     if scraper_analysis:
@@ -2632,12 +3035,44 @@ def build_code_writer_message(state: dict) -> list:
 
         proxy_instructions = ""
         if no_proxy:
-            proxy_instructions = (
-                "\n**PROXY: Do NOT use any proxy.** The scraper_analyzer verified that "
-                "direct connection (no proxy) works. The scraper MUST accept `--no-proxy` "
-                "flag and should default to NO proxy for this site. Do NOT import or use "
-                "the proxy module.\n"
+            # T3.5: "direct works" is only TRUE when the probe's working method
+            # was itself a direct-HTTP tier. no_proxy_flag can also mean "the
+            # analyzer chose no proxy for a BROWSER strategy" — telling the
+            # writer "direct connection works" then shipped bare
+            # requests.get() paths against sites the probe only reached through
+            # a browser (the job-62 birkenstock 200-challenge soft block).
+            _conn_t35 = site_analysis.get("connectivity") if isinstance(
+                site_analysis.get("connectivity"), dict
+            ) else {}
+            _probe_t35 = state.get("probe_result") if isinstance(
+                state.get("probe_result"), dict
+            ) else {}
+            _conn_t35 = _conn_t35 or (_probe_t35.get("connectivity") if isinstance(
+                _probe_t35.get("connectivity"), dict
+            ) else {})
+            _method_t35 = str(
+                _conn_t35.get("method_that_worked")
+                or _probe_t35.get("method")
+                or ""
             )
+            if _method_t35.startswith("direct_http"):
+                proxy_instructions = (
+                    "\n**PROXY: Do NOT use any proxy.** The probe VERIFIED that direct "
+                    "HTTP (no proxy) reaches this site. The scraper MUST accept "
+                    "`--no-proxy` flag and should default to NO proxy for this site. "
+                    "Do NOT import or use the proxy module.\n"
+                )
+            else:
+                _reached = _method_t35 or "an unknown probe method"
+                proxy_instructions = (
+                    "\n**PROXY: Do NOT use any proxy.** The strategy for this site uses "
+                    "no proxy tier. **CAUTION: the probe did NOT verify direct HTTP — "
+                    f"it reached the site via `{_reached}`. Direct HTTP may be BLOCKED "
+                    "(soft challenge / 403). Do NOT ship a bare `requests.get()` fetch "
+                    "path unless the strategy is genuinely HTTP-based; for browser "
+                    "strategies fetch every page through the browser.** The scraper MUST "
+                    "accept `--no-proxy` flag. Do NOT import or use the proxy module.\n"
+                )
         elif proxy_tier == "datacenter":
             proxy_instructions = (
                 "\n**PROXY: Use datacenter proxy.** The scraper should use the datacenter "
@@ -2928,12 +3363,26 @@ def build_code_writer_message(state: dict) -> list:
                 "http_navigation_scraper.py" if mechanism == "http_navigation"
                 else "playwright_scraper.py"
             )
-        nav_template_hint = (
-            f"\n### Template\nRead the template at: templates/{_nav_template_file} "
-            "and use it as your base for the two-phase architecture. "
-            "Adapt the Phase 1 (navigation) and Phase 2 (extraction) logic "
-            "to match this site's patterns.\n"
-        )
+        # T2.5 (nav half): same edit-over-write suppression as the url_list hint —
+        # when the surviving draft came from this template, the draft IS the base.
+        _eow_nav = str(state.get("last_writer_template") or "")
+        if _eow_nav and _eow_nav == _nav_template_file:
+            nav_template_hint = (
+                f"\n### EDIT MODE — DO NOT REGENERATE\nA working two-phase draft already "
+                f"exists at workspace/{slug}/scraper_draft.py (built from "
+                f"templates/{_nav_template_file}). Treat THAT draft as your base: apply "
+                "ONLY the targeted edits the test report asks for, keeping the proven "
+                "Phase 1 (navigation/discovery) and Phase 2 (extraction) structure. Do NOT "
+                "restart from the template — that discards prior fixes and re-discovers "
+                "from zero.\n"
+            )
+        else:
+            nav_template_hint = (
+                f"\n### Template\nRead the template at: templates/{_nav_template_file} "
+                "and use it as your base for the two-phase architecture. "
+                "Adapt the Phase 1 (navigation) and Phase 2 (extraction) logic "
+                "to match this site's patterns.\n"
+            )
 
         navigation_section = "\n".join(nav_lines)
 
@@ -3321,12 +3770,12 @@ def build_code_writer_message(state: dict) -> list:
                     "sync_playwright). Use the `playwright` strategy.\n"
                 )
 
-    # Skills reuse (P0-17): code_writer is the primary consumer of skill
-    # Skills disabled for code_writer — each skill adds ~25KB of context that
-    # blows past the truncation budget and causes the LLM to loop (lose its
-    # scratchpad each iteration). The analysis JSONs already contain everything
-    # the skills would say (field mappings, extraction methods, navigation patterns).
-    skills_section = ""
+    # T3.11: code_writer-only ≤2KB platform distillation. The full-skill
+    # injection was disabled (each skill ~25KB blew the writer's truncation
+    # budget and looped it); this deterministic digest carries the four things
+    # the writer keeps needing — platform, item-URL shape, discovery/pagination
+    # mechanics, field headings — straight from the analysis artifacts.
+    skills_section = _platform_distillation(state)
 
     # CLI contract tail — rendered from the SAME constants the deterministic
     # guard consumes (agents.constants.required_cli_flags), so the prompt and
@@ -3442,7 +3891,9 @@ def build_code_writer_message(state: dict) -> list:
         "For navigation scrapers, src_url is the listing/search page URL.\n"
         '- **original_price**: Empty string `""` if not on sale, otherwise include '
         'currency symbol like `"$2,000.00"`\n'
-        '- **availability**: Normalize to `"In Stock"` or `"Out of Stock"`\n'
+        '- **availability**: Normalize to the exact tokens `"in_stock"` or '
+        '`"out_of_stock"` (lowercase snake_case — pass schema.org '
+        '`http://schema.org/InStock` URIs through the same normalizer)\n'
         '- **currency**: ISO 4217 code e.g. `"USD"`, `"EUR"`\n\n'
         "### Soft 404 Detection (CRITICAL)\n"
         "Many e-commerce sites return HTTP 200 for deleted/expired products but show "
@@ -3537,6 +3988,9 @@ def build_code_writer_message(state: dict) -> list:
             "site has a backend products API, FIND IT (check XHR/fetch in the browser) "
             "— do not conclude 'there is no API' from one page's HTML alone.\n"
         )
+    _ckpt_section = _checkpoint_discovery_section(state)
+    if _ckpt_section:
+        content = content + _ckpt_section
     _user_req = _user_requirements_section(state)
     if _user_req:
         content = _user_req + content
@@ -3861,7 +4315,8 @@ def build_code_tester_message(state: dict) -> list:
         f"```\n"
         f"Decision rule — for each FAILED **required** field, compare the scraper output against "
         f"`product_analysis.json`'s mapping for that field:\n"
-        f"- If the field's mapping is **missing / `tested: false` / selector looks wrong or "
+        f"- If the field's mapping is **missing / `tested: false` / `tested: \"empty\"` (the "
+        f"live-render check found the source dead) / selector looks wrong or "
         f"unverified** → the root cause is the MAPPING → set `target: \"mapping\"` and list those "
         f"fields. The pipeline re-runs product_analyzer to fix the mapping (not just regenerate the "
         f"scraper with the same bad input).\n"

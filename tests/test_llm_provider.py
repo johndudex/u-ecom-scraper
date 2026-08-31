@@ -93,10 +93,31 @@ class TestProviderResolver:
 
 
 class TestLitellmFallbackParam:
-    def test_litellm_model_gets_empty_string(self):
+    def test_litellm_model_unconfigured_falls_to_zai_main(self):
+        # [T3.13g] LITELLM_FALLBACK_MODEL unset → the breaker's fallback is
+        # Z.AI direct (ZAI_MAIN_MODEL), NOT "" — "" disables the breaker's
+        # swap entirely, which left a dead litellm proxy with no way back.
+        # Cross-provider-safe: _provider_for resolves the endpoint FROM the
+        # swapped name, so a ZAI name routes to ZAI direct with streaming off.
         mod = _llm_mod()
         with mock.patch.object(mod, "settings", _FakeSettings()):
+            assert mod._litellm_fallback("litellm/standardcompute") == "glm-5-turbo"
+
+    def test_litellm_model_explicit_none_opts_out(self):
+        # LITELLM_FALLBACK_MODEL=none → "" — the only way to get the old
+        # no-swap behavior (effective_model's "" sentinel = leave model as-is).
+        mod = _llm_mod()
+        with mock.patch.object(
+            mod, "settings", _FakeSettings(LITELLM_FALLBACK_MODEL="none")
+        ):
             assert mod._litellm_fallback("litellm/standardcompute") == ""
+
+    def test_litellm_model_configured_value_honored(self):
+        mod = _llm_mod()
+        with mock.patch.object(
+            mod, "settings", _FakeSettings(LITELLM_FALLBACK_MODEL="litellm/backup")
+        ):
+            assert mod._litellm_fallback("litellm/standardcompute") == "litellm/backup"
 
     def test_zai_model_gets_none(self):
         mod = _llm_mod()

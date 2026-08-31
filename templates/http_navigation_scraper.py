@@ -61,7 +61,10 @@ from bs4 import BeautifulSoup
 
 # Make src.* importable (scraper runs from scrapers/{slug}/).
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from src.page_analysis import extract_jsonld  # noqa: E402  (pure-python helper, no browser import)
+from src.page_analysis import (  # noqa: E402  (pure-python helper, no browser import)
+    extract_jsonld,
+    phase2_instant_fail,
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION — code_writer substitutes {PLACEHOLDERS} from analysis artifacts.
@@ -107,6 +110,11 @@ BACKOFF_BASE = 2.0  # exponential: BACKOFF_BASE ** attempt, capped at 30s
 # routinely receive HTTP 429 — _navigate absorbs it via retry_after backoff.
 # Do NOT raise above 4 without also raising the server semaphore.
 PHASE2_WORKERS = 4
+# [T3.13c/job-76 myhouse] Lower bound on one real /navigate item fetch (a
+# browser navigation never returns faster). Feeds the phase2_instant_fail
+# detector — Phase 2 finishing in under half of items*floor/workers means
+# the network was never hit.
+PHASE2_MIN_FETCH_S = 0.5
 
 # ── Phase 1: Navigation ─────────────────────────────────────────────────────
 SEARCH_URL_PATTERN = "{SEARCH_URL_PATTERN}"        # e.g. "https://site.com/search?q={query}"
@@ -910,6 +918,61 @@ def _discover_urls_via_category(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+# ── FIELD NORMALIZERS — inline on purpose, NOT a src import ──────────────────
+# Drafts execute in the browser-service image: a NEW src import would ImportError
+# there until that image is rebuilt, so the ~25 lines live in each python-side
+# template verbatim (playwright/UC normalize in-page via JS and don't need them).
+
+def _norm_price(value) -> Optional[str]:
+    """Strip currency symbols/whitespace from a price.
+
+    "£1,234.56" → "1234.56", "1.234,56 €" → "1234.56", 24.99 (a JSON-LD
+    number) → "24.99". Returns None when no digits are present — an
+    unparseable price is EMPTY, never zero (0 would read as a real product
+    priced at nothing). The currency stays in its own ``currency`` field.
+    """
+    if value is None:
+        return None
+    cleaned = re.sub(r"[^\d.,-]", "", str(value).strip())
+    if not re.search(r"\d", cleaned):
+        return None
+    if "," in cleaned and "." in cleaned:
+        # Both separators present: whichever comes LAST is the decimal one.
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        # "1,234" (grouping) vs "1,5" (decimal comma): a comma followed by
+        # exactly three digits is grouping, anything else is a decimal comma.
+        cleaned = re.sub(r",(?=\d{3}(?:\D|$))", "", cleaned).replace(",", ".")
+    return cleaned
+
+
+def _norm_availability(value) -> Optional[str]:
+    """Normalize availability to ``in_stock`` / ``out_of_stock``.
+
+    Accepts the schema.org URI form, InStock / In Stock / in_stock / Available
+    and their negatives. Anything unrecognised passes through lowercased —
+    availability is never invented (an unknown state is data, not an error).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "in_stock" if value else "out_of_stock"
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if "://" in text:  # e.g. http://schema.org/InStock
+        text = text.rsplit("/", 1)[-1]
+    compact = text.replace("-", "_").replace(" ", "")
+    if compact in ("in_stock", "instock", "available"):
+        return "in_stock"
+    if compact in ("out_of_stock", "outofstock", "unavailable", "sold_out", "soldout"):
+        return "out_of_stock"
+    return text
+
+
 def _populate_from_jsonld(item: dict, jsonld_blocks: list[dict]) -> None:
     """Fill ``item`` from JSON-LD blocks, CONTENT_TYPE-aware.
 
@@ -937,7 +1000,7 @@ def _populate_from_jsonld(item: dict, jsonld_blocks: list[dict]) -> None:
                 price = offer.get("price", "")
                 currency = offer.get("priceCurrency", CURRENCY)
                 if price:
-                    item["price"] = f"{currency}{price}"
+                    item["price"] = _norm_price(price)
                     item["currency"] = currency
                     break
             avail = ""
@@ -946,9 +1009,7 @@ def _populate_from_jsonld(item: dict, jsonld_blocks: list[dict]) -> None:
                     avail = offer["availability"]
                     break
             if avail:
-                item["availability"] = "Out of Stock" if (
-                    "OutOfStock" in avail or "SoldOut" in avail
-                ) else "In Stock"
+                item["availability"] = _norm_availability(avail)
             if "currency" not in item:
                 item["currency"] = CURRENCY
             item["description"] = block.get("description", "")
@@ -1267,6 +1328,7 @@ def main():
     # / stop_reason / dimensions_* instead).
     total = len(discovered_urls)
     items: list[dict] = []
+    phase2_instant = False
     if args.discover_only:
         logger.info(
             "--discover-only: skipping Phase 2 extraction (%d URLs discovered, "
@@ -1278,6 +1340,7 @@ def main():
             total, PHASE2_WORKERS,
         )
         completed = 0
+        phase2_start = time.monotonic()
         with ThreadPoolExecutor(max_workers=PHASE2_WORKERS) as pool:
             futures = {
                 pool.submit(_extract_item_safe, url, src_url_base): url
@@ -1297,6 +1360,20 @@ def main():
                     "Progress: [%d/%d] (%.1f%%) %s — %s",
                     completed, total, (completed / total) * 100, status, url[:90],
                 )
+        # [T3.13c/job-76 myhouse] Mechanical "fetch actually happened"
+        # detector — surfaced in discovery_coverage below.
+        phase2_instant = phase2_instant_fail(
+            time.monotonic() - phase2_start, total, PHASE2_MIN_FETCH_S,
+            workers=PHASE2_WORKERS,
+        )
+        if phase2_instant:
+            logger.warning(
+                "PHASE2 INSTANT FAIL: %s items in %.2fs (< %.2fs floor at "
+                "%s workers) — the item fetches never actually happened",
+                total, time.monotonic() - phase2_start,
+                total * PHASE2_MIN_FETCH_S * 0.5 / PHASE2_WORKERS,
+                PHASE2_WORKERS,
+            )
 
     # ── Output filter ───────────────────────────────────────────────────────
     # Drop extraction failures + items lacking any core field for this type.
@@ -1325,6 +1402,9 @@ def main():
         "max_pages_hit": max_pages_hit,
         "ran_phase1": ran_phase1,
         "skipped_reason": skipped_reason,
+        # [T3.13c/job-76 myhouse] True when Phase 2 finished faster than its
+        # per-fetch floor allows — the item fetches never actually happened.
+        "phase2_instant_fail": phase2_instant,
     }
 
     output = {

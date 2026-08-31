@@ -237,3 +237,33 @@ def format_probe_result(
     parts.append("Common selectors:")
     parts.append(selector_results)
     return "\n".join(parts)
+
+
+def phase2_instant_fail(
+    elapsed_s: float, n_items: int, min_per_fetch_s: float, workers: int = 1
+) -> bool:
+    """Mechanical "did the Phase-2 fetches actually happen" detector.
+
+    [T3.13c / job-76 myhouse] An execution run that reported a 40-item test
+    run hours earlier then "extracted" in 0.81 seconds could only have done
+    so by never hitting the network — cached stubs served instantly, every
+    call failed fast, or the loop fetched nothing at all. A run whose
+    per-fetch lower bound is ``min_per_fetch_s`` cannot finish ``n_items``
+    fetches faster than ``n_items * min_per_fetch_s`` (÷ ``workers`` for a
+    concurrent loop); finishing in less than HALF that floor is the tell.
+
+    Arms ONLY when both ``n_items`` and ``min_per_fetch_s`` are positive —
+    an unconfigured delay never flags (no floor to violate). Emitted as the
+    ``phase2_instant_fail`` counter in ``metadata.discovery_coverage`` so
+    the gates and the tester see it without wall-clock archaeology.
+    """
+    try:
+        n = int(n_items)
+        floor = float(min_per_fetch_s or 0)
+        elapsed = float(elapsed_s or 0)
+        w = max(int(workers or 1), 1)
+    except (TypeError, ValueError):
+        return False
+    if n <= 0 or floor <= 0:
+        return False
+    return elapsed < (n * floor * 0.5) / w

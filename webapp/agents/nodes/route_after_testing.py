@@ -7,7 +7,13 @@ import logging
 import re
 from typing import Optional
 
-from ..constants import DEAD_STATUS_CODES, FINAL_RETRY_SENTINEL, MAX_REMAPS, MAX_TEST_RETRIES
+from ..constants import (
+    DEAD_STATUS_CODES,
+    FINAL_RETRY_SENTINEL,
+    MAX_REMAPS,
+    MAX_TEST_RETRIES,
+    STEALTH_METHOD_PREFIXES,
+)
 from ..state import ScrapeState
 
 logger = logging.getLogger(__name__)
@@ -44,6 +50,20 @@ _SELECTOR_CRASH_RE = re.compile(
     r"failed to find element|eval_on_selector|query_selector|"
     r"element.{0,20}not found|no element found|locator.{0,20}not found|"
     r"waiting for selector|unable to find element",
+    re.IGNORECASE,
+)
+# [T1.4/wave-13] The draft file itself is missing — the tester ran `python
+# scraper_draft.py …` against a file that was never written (writer no-op) or
+# was destroyed (wipe/re-drive race). ANCHORED on scraper_draft.py: a bare
+# "No such file" is any ENOENT (input_urls.json, a probe artifact) and must
+# NOT route here. 58% of the campaign's test verdicts were missing-draft
+# cycles — as a strategy verdict they mis-swap rungs; as its own class they
+# route to a draft re-generation (code_writer) that touches neither the
+# strategy ladder nor the fix budget.
+_ABSENT_DRAFT_RE = re.compile(
+    r"scraper_draft\.py[^,\n]{0,80}(?:no such file|can't open|does not exist|not found)"
+    r"|(?:no such file|can't open)[^,\n]{0,80}scraper_draft\.py"
+    r"|scraper_draft\.py.{0,60}was never (?:generated|written)",
     re.IGNORECASE,
 )
 
@@ -90,13 +110,21 @@ _COVERAGE_FAIL_STOP_REASONS = {
 }
 
 
-def _discovery_coverage_failure(report: dict) -> Optional[str]:
+def _discovery_coverage_failure(report: dict, state: Optional[ScrapeState] = None) -> Optional[str]:
     """Return a short reason if discovery coverage is insufficient, else None.
 
     Reads ``test_report.discovery_coverage`` (code_tester copies it from the
     scraper output's ``metadata.discovery_coverage``). Tier 1 (always on, fully
     generic): ``stop_reason`` in {navigate_error, dedup_flat, empty_first_page}
     → the scraper stopped due to errors/blocks/rate-limiting, NOT exhaustion.
+
+    ``state`` (optional trailing kwarg — all single-arg callers stay valid)
+    scopes the one ambiguous signal: ``navigate_error`` on a run that EXTRACTED
+    items AND satisfied its declared scope (firstn/filter/scope_value) is
+    advisory, not a veto — the scraper reached what was asked of it (job-118
+    class: 20/20 extracted under firstn against a 1000+-item catalogue). The
+    zero-URL stop reasons (empty_first_page/empty_render/dedup_flat) stay
+    UNCONDITIONAL — they carry no items and no scope can excuse zero.
 
     Returns None when discovery didn't run or signals are absent — the gate is a
     NO-OP on missing data (never blocks).
@@ -108,15 +136,25 @@ def _discovery_coverage_failure(report: dict) -> Optional[str]:
         return None
     stop_reason = cov.get("stop_reason")
     if stop_reason in _COVERAGE_FAIL_STOP_REASONS:
+        if stop_reason == "navigate_error" and state is not None:
+            _extracted = _extracted_item_count(report)
+            _scope = (state.get("scope") or "").strip().lower()
+            _scope_satisfied = _scope in ("firstn", "filter") or bool(
+                (state.get("scope_value") or "").strip()
+            )
+            if _extracted > 0 and _scope_satisfied:
+                return None
         return f"discovery {stop_reason} (gave up, not exhausted)"
     return None
 
 
-def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
+def classify_test_failure(
+    report: dict, strategy: str, state: Optional[ScrapeState] = None
+) -> tuple[str, str]:
     """Classify a failed test into an action + reason.
 
     Returns (action, reason) where action ∈ {"strategy", "scraper", "mapping",
-    "refine", "retest"}:
+    "refine", "retest", "absent"}:
     - "strategy": access/strategy-class failure → switch strategy (timeout, 0-item
       http/api run, blocked). The current strategy can't reach the content.
     - "scraper": a code bug (Python traceback, not a timeout) → fix the scraper.
@@ -125,6 +163,11 @@ def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
     - "retest": the run is UNPROVEN coverage (429 / browser-service throttle /
       transient render block) — re-test the SAME draft, no strategy switch and
       no code change. Neither the strategy nor the code was on trial.
+    - "absent": [T1.4] the draft file itself never existed for this run — a
+      draft re-generation, not a strategy verdict.
+
+    ``state`` (optional trailing kwarg) only scopes the navigate_error coverage
+    signal; every existing two-arg caller is unchanged.
 
     Deterministic — used as a guard that can override code_tester's LLM diagnosis.
     """
@@ -137,6 +180,7 @@ def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
         if isinstance(_sc, dict):
             crash = _sc.get("crash_error") or _sc.get("error_message") or ""
     items = _extracted_item_count(report or {})
+    is_absent_draft = bool(_ABSENT_DRAFT_RE.search(crash))
     is_timeout = bool(_TIMEOUT_RE.search(crash))
     is_blocked = bool(_BLOCKED_RE.search(crash))
     is_rate_limited = bool(_RATE_LIMITED_RE.search(crash))
@@ -156,6 +200,12 @@ def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
     # "switch strategy" and the cascade abandons the only working approach.
     if is_selector_crash:
         return ("scraper", f"selector crash — element not found ({crash[:80]})")
+
+    # [T1.4] Missing draft ≠ strategy verdict. Checked before every crash
+    # classifier: no strategy rung, code fix, or retest can act on a run whose
+    # subject file was never on disk. The router owns the counter + cap.
+    if is_absent_draft:
+        return ("absent", f"scraper_draft.py missing at test time ({crash[:100]})")
 
     # [A1] An explicit 429/too-many-requests is neither a strategy verdict nor
     # a code bug — the site rate-limited the window. Re-test the same draft
@@ -209,11 +259,29 @@ def classify_test_failure(report: dict, strategy: str) -> tuple[str, str]:
     # Items extracted but poor → let the caller decide mapping vs refine.
     if items == 0:
         return ("strategy", "no items extracted — likely wrong strategy")
+    # [T1.7(a)/wave-13] A mapping remediation with items on the table outranks
+    # the coverage verdict: the tester named the broken fields and a fix
+    # target — that is a precisely-known edit, while the coverage signal only
+    # says discovery under-covered. Promoting it HERE (not in the caller's
+    # refine→mapping promo, which coverage's "strategy" return could never
+    # reach) makes the mapping arm reachable for the first time on
+    # coverage-flagged runs (job-118 class: 20/20 extracted, price empty,
+    # remediation.target=mapping buried under a coverage verdict). Coverage is
+    # kept as context in the reason.
+    _remediation_early = report.get("remediation") if isinstance(report, dict) else None
+    if (
+        isinstance(_remediation_early, dict)
+        and _remediation_early.get("target") == "mapping"
+        and _remediation_early.get("fields")
+    ):
+        _cov_ctx = _discovery_coverage_failure(report, state)
+        _ctx = f"; discovery: {_cov_ctx}" if _cov_ctx else ""
+        return ("mapping", f"field gap: {_remediation_early.get('fields')}{_ctx}")
     # Discovery-coverage failure: items WERE extracted, but discovery gave up
     # (navigate_error/dedup_flat). This is a strategy/access problem (the current
     # approach can't cover the source), not a field-quality problem — switch
     # strategy rather than "refine".
-    _cov = _discovery_coverage_failure(report)
+    _cov = _discovery_coverage_failure(report, state)
     if _cov:
         return ("strategy", _cov)
     return ("refine", f"{items} items, low quality")
@@ -271,7 +339,9 @@ def _scraper_produced_valid_output(state: ScrapeState) -> bool:
     return _scraper_has_real_items(state, min_count=_min)
 
 
-def _freshness_floor(state: ScrapeState, draft_path: str) -> float:
+def _freshness_floor(
+    state: ScrapeState, draft_path: str, relaxed_floor: float | None = None
+) -> float:
     """[A6] Output-freshness floor keyed to the draft's CONTENT, not its mtime.
 
     Job 309's floor (draft mtime) stops outputs from PREVIOUS drafts rescuing
@@ -282,6 +352,14 @@ def _freshness_floor(state: ScrapeState, draft_path: str) -> float:
     recorded at last test time (state.last_tested_draft_fp, written by
     _invoke_code_tester), raise the floor to last_tested_at so only THIS
     attempt's outputs count as ground truth.
+
+    ``relaxed_floor`` (C5/job-88): when the current attempt never reached
+    extraction (a zero-yield discovery stop — empty_first_page/empty_render),
+    the draft's extraction machinery is UNPROVEN either way, and this job's own
+    earlier attempts' outputs stay admissible ground truth. Callers pass the
+    job-start floor (``_job_started_floor``) — never 0/None-unsafe: it only
+    LOWERS the floor (min), so job-309's cross-draft protection still excludes
+    anything older than this job.
     """
     import hashlib as _hash
     import os as _os
@@ -299,9 +377,31 @@ def _freshness_floor(state: ScrapeState, draft_path: str) -> float:
                 last_at = 0.0
             if fp and last_fp and fp == last_fp and last_at > floor:
                 floor = last_at
+            if relaxed_floor is not None and relaxed_floor > 0:
+                floor = min(floor, relaxed_floor)
     except Exception:
         pass
     return floor
+
+
+def _zero_yield_stop(state: ScrapeState) -> bool:
+    """[C5/job-88] Did the CURRENT attempt stop on a zero-yield discovery wall?
+
+    empty_first_page / empty_render: the run got HTTP 200s but zero links —
+    an access window, not an extraction verdict. Under that signature the
+    freshness floor relaxes to this job's start (earlier attempts of the SAME
+    job are admissible ground truth); cross-job artifacts stay excluded.
+    """
+    try:
+        report = state.get("test_report") or {}
+        cov = report.get("discovery_coverage") if isinstance(report, dict) else None
+        if isinstance(cov, dict) and cov.get("stop_reason") in (
+            "empty_first_page", "empty_render",
+        ):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
@@ -319,6 +419,15 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
     """
     report = state.get("test_report") or {}
     sample_products = report.get("sample_products") or []
+    # [C5/job-88] Zero-yield discovery stop → this job's earlier attempts stay
+    # admissible ground truth (best-effort: any miss degrades to the strict
+    # A6 floor, never the reverse).
+    _relaxed_floor = None
+    try:
+        if _zero_yield_stop(state):
+            _relaxed_floor = _job_started_floor(state)
+    except Exception:
+        _relaxed_floor = None
     if not sample_products:
         so = report.get("sample_output") or {}
         if isinstance(so, dict):
@@ -337,6 +446,29 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
         fields = output_filter_fields(ct) or []
     except Exception:
         fields = []
+    # [C5/job-118] SCHEMA-AWARE field set: when the job's own schema asks for
+    # NONE of the content type's filter fields, judge rows by the fields the
+    # user actually requested. Job 118 requested no availability (and the run
+    # filled neither price nor currency), so the products filter set marked
+    # all 20 real rows "not real" and closed every rescue arm. The F15 guard
+    # is untouched: whenever the schema DOES include any filter field, the
+    # content-type set stays authoritative (job-337 brand-only rows stay
+    # blocked). The predicate itself — ``any(p.get(f) for f in fields)`` —
+    # is byte-identical below.
+    try:
+        _schema_fields: list = [
+            str(f).strip().lower() for f in (state.get("target_fields") or []) if str(f).strip()
+        ]
+        _os_schema = state.get("output_schema")
+        if not _schema_fields and isinstance(_os_schema, dict):
+            _schema_fields = [
+                str(k).strip().lower() for k in _os_schema.keys() if str(k).strip()
+            ]
+        _schema_fields = [f for f in _schema_fields if f not in ("title", "url", "src_url")]
+        if _schema_fields and fields and not (set(fields) & set(_schema_fields)):
+            fields = _schema_fields
+    except Exception:
+        pass
     try:
         from src.content_types import has_substantive_field
     except Exception:
@@ -361,7 +493,8 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
                 # the current draft AFTER the writer's last edit, so a legit
                 # rescue's outputs are always >= the draft's mtime.
                 _floor = _freshness_floor(
-                    state, _os.path.join(ws, "scraper_draft.py")
+                    state, _os.path.join(ws, "scraper_draft.py"),
+                    relaxed_floor=_relaxed_floor,
                 )
                 outs = sorted(
                     [f for f in _os.listdir(ws)
@@ -454,7 +587,9 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
             # Same freshness floor as the primary fallback above (job 309): a
             # previous cycle's output must not rescue the current draft.
             _draft2 = _os.path.join(_root, "workspace", _slug, "scraper_draft.py")
-            _floor2 = _freshness_floor(state, _draft2)
+            _floor2 = _freshness_floor(
+                state, _draft2, relaxed_floor=_relaxed_floor
+            )
             _pattern = _os.path.join(_root, "workspace", _slug, "output_*.json")
             _outputs = sorted(
                 [p for p in _glob.glob(_pattern) if _os.path.getmtime(p) >= _floor2],
@@ -555,6 +690,64 @@ def _core_field_zero_coverage(report: dict, state: ScrapeState) -> str | None:
         if is_zero:
             return field
     return None
+
+
+def _requested_field_zero_coverage(report: dict, state: ScrapeState) -> list[str]:
+    """T2.8: user-REQUESTED non-core fields the scraper left at ~0% coverage.
+
+    Core misses route through ``_core_field_zero_coverage`` (strict — forces a
+    remap retry, job-337). A requested non-core field sitting empty is a
+    mapping bug too, but it must not escalate severity by itself: this
+    sibling only IDENTIFIES them so the caller can inject a medium targeted
+    issue the writer's next cycle acts on. Returns the field names ([] none).
+    """
+    results = report.get("results") or {}
+    field_coverage = results.get("field_coverage") or {}
+    if not field_coverage:
+        return []
+    successful = results.get("successful_extractions", 0)
+    try:
+        successful = int(successful)
+    except (ValueError, TypeError):
+        successful = 0
+    if successful <= 0:
+        return []
+    requested = {str(f).lower() for f in (state.get("target_fields") or [])}
+    if not requested:
+        return []
+    core: set[str] = set()
+    try:
+        from src.content_types import get_content_type
+
+        ct = get_content_type((state.get("page_type") or "product").lower())
+        if ct and getattr(ct, "core_fields", None):
+            core = {str(f).lower() for f in ct.core_fields}
+    except Exception:
+        pass
+    cfg = state.get("content_type_config") or {}
+    if cfg.get("core_field_names"):
+        core = {str(f).lower() for f in cfg["core_field_names"]}
+
+    missing: list[str] = []
+    for field, info in field_coverage.items():
+        fkey = str(field).lower()
+        if fkey not in requested or fkey in core:
+            continue
+        if not isinstance(info, dict):
+            continue
+        status = str(info.get("status") or "").upper()
+        cov = info.get("coverage", info.get("coverage_pct"))
+        is_zero = status == "MISSING"
+        if isinstance(cov, str):
+            try:
+                is_zero = is_zero or float(cov.strip().rstrip("%")) < 1.0
+            except ValueError:
+                pass
+        elif isinstance(cov, (int, float)):
+            is_zero = is_zero or float(cov) < 1.0
+        if is_zero:
+            missing.append(field)
+    return missing
 
 
 # ── T2.1/T2.2/T2.3 deterministic output signals ──────────────────────────────
@@ -865,6 +1058,40 @@ def _volume_gap(report: dict, state: ScrapeState) -> Optional[str]:
     return None
 
 
+def _log_cascade(state: ScrapeState, action: str, reason: str) -> None:
+    """[T3.13h] One SessionLog row per test-cascade cycle.
+
+    During the 70-112 campaign the job log showed verdicts and re-runs but
+    never the ROUTER's decision (which arm fired, why, on which retry) — every
+    re-drive RCA needed celery log archaeology to reconstruct the cascade.
+    This mirrors graph._log_event_row (lazy import: graph imports this module's
+    node, so a module-level import would be circular).
+    """
+    try:
+        job_id = (state or {}).get("job_id")
+        if not job_id:
+            return
+        from ..graph import _log_event_row
+
+        _log_event_row(
+            job_id,
+            "route_after_testing",
+            "[CASCADE] action={action} retry={retry}/{max_retries} "
+            "strategy={strategy} remaps={remaps} reason={reason}".format(
+                action=action,
+                retry=state.get("test_retry_count", 0),
+                max_retries=MAX_TEST_RETRIES,
+                strategy=(state.get("scraper_analysis") or {}).get("strategy", "")
+                if isinstance(state.get("scraper_analysis"), dict)
+                else "",
+                remaps=state.get("remap_count", 0),
+                reason=str(reason)[:200],
+            ),
+        )
+    except Exception:
+        pass
+
+
 def route_after_testing(state: ScrapeState) -> str:
     report = state.get("test_report")
     retry_count = state.get("test_retry_count", 0)
@@ -916,6 +1143,7 @@ def route_after_testing(state: ScrapeState) -> str:
                 retry_count + 1,
                 MAX_TEST_RETRIES + 1,
             )
+            _log_cascade(state, "retry-no-report", f"no test_report (retry {retry_count + 1})")
             return "scraper_analyzer"
         # Retries exhausted with no test_report — check output files before giving up.
         _rescue_min = 1 if (state.get("input_mode") or "") in ("url_list", "list_page") else 3
@@ -950,6 +1178,42 @@ def route_after_testing(state: ScrapeState) -> str:
             missing_core,
         )
 
+    # T2.8 severity half: user-REQUESTED non-core fields at ~0% coverage get a
+    # medium targeted remap issue injected into the report (so the writer's
+    # next cycle fixes the mapping instead of re-guessing) — they do NOT
+    # escalate severity or force a route; the strict gate stays core-only.
+    _missing_requested = _requested_field_zero_coverage(report, state)
+    if _missing_requested:
+        _injected = [
+            {
+                "severity": "medium",
+                "field": f,
+                "status": "MISSING",
+                "problem": (
+                    f"User-requested field '{f}' has ~0% coverage — the scraper "
+                    "never populates it"
+                ),
+                "suggested_fix": (
+                    f"Remap '{f}' to a populated source verified on the live page "
+                    "(JSON-LD, embedded JSON, or a CSS selector that returns real "
+                    "values); do NOT leave it empty and do NOT rewrite the scraper's "
+                    "other working parts."
+                ),
+            }
+            for f in _missing_requested
+        ]
+        _existing_issues = report.get("issues")
+        if isinstance(_existing_issues, list):
+            _existing_issues.extend(_injected)
+        else:
+            report["issues"] = _injected
+        issues = report.get("issues", [])
+        logger.warning(
+            "route_after_testing: requested non-core field(s) %s at ~0%% coverage — "
+            "injected medium remap issue(s) for code_writer",
+            _missing_requested,
+        )
+
     # Count-regression band (job-10 lesson: 3,616 → 68 undetected). Compare
     # the tester's extracted count against the best prior COMPLETED run on
     # this site — scope-matched (skipped when this run narrows: --limit/
@@ -961,9 +1225,15 @@ def route_after_testing(state: ScrapeState) -> str:
     try:
         _slug_cr = (state.get("site_slug") or "").strip()
         _scope_cr = (state.get("scope") or "").strip().lower()
-        _narrowed = _scope_cr in ("firstn", "filter") or bool(
-            (state.get("scope_value") or "").strip()
-            and _scope_cr == "firstn"
+        # [C5/job-118] Scope-MATCH, not just scope-flag: a run bounded by an
+        # explicit scope OR by its input mode (url_list/list_page extract from
+        # the user's own bounded URL set — 20 sample URLs vs a prior 1000-item
+        # full-catalogue run is a different scope, not a discovery regression)
+        # must not be judged against a prior run's catalogue-sized count.
+        _narrowed = (
+            _scope_cr in ("firstn", "filter")
+            or bool((state.get("scope_value") or "").strip())
+            or (state.get("input_mode") or "").strip() in ("url_list", "list_page")
         )
         if _slug_cr and not _narrowed:
             from scraper.models import ScrapeJob as _SJ
@@ -996,7 +1266,9 @@ def route_after_testing(state: ScrapeState) -> str:
     # Discovery-coverage signal: computed once, used to (a) downgrade a
     # field-PASS, (b) bypass the ground-truth override, and (c) exempt the cascade
     # from the anti-bot downgrade. None ⇒ no coverage problem (gate is a no-op).
-    _cov_reason = _discovery_coverage_failure(report)
+    # [T1.6] state scopes the ambiguous navigate_error signal (scope-satisfied
+    # runs with items become advisory); the zero-URL stops stay unconditional.
+    _cov_reason = _discovery_coverage_failure(report, state)
 
     # T2.1 volume signal (sample-scope-guarded) + T2.2 deterministic output
     # blockers. The blocker shape is narrow by design: a WRONG_VALUE on a
@@ -1047,6 +1319,7 @@ def route_after_testing(state: ScrapeState) -> str:
     if (
         assessment == "PASS"
         and confidence >= MIN_CONFIDENCE_PASS
+        and _extracted_item_count(report) > 0
         and not high_severity
         and not _contract_bad
         and not _count_regression
@@ -1076,6 +1349,7 @@ def route_after_testing(state: ScrapeState) -> str:
                     "tested (tester used --input, bypassing discovery). Routing to "
                     "scraper_analyzer for a discovery-validating re-test."
                 )
+                _log_cascade(state, "phase1-untested", "PASS rejected: discovery not tested")
                 return "scraper_analyzer"
         if _cov_reason:
             # Field quality is fine BUT discovery coverage is insufficient (scraper
@@ -1106,22 +1380,49 @@ def route_after_testing(state: ScrapeState) -> str:
     # (1 for url_list/list_page, 3 for discovery-driven modes) — the old
     # hardcoded 3 meant a url_list job whose every URL extracted (1 rich item)
     # could never clear the override its own pre-check used.
-    _override_min = 1 if (state.get("input_mode") or "").strip() in ("url_list", "list_page") else 3
-    if (
-        not _cov_reason
-        and not missing_core
-        and not _contract_bad
-        and not _count_regression
-        and not _volume_reason
-        and not _det_blockers
-        and _scraper_has_real_items(state, min_count=_override_min)
-    ):
-        logger.info(
-            "route_after_testing: GROUND-TRUTH PASS — scraper produced ≥%d real "
-            "items (overriding code_tester's high_severity flags)",
-            _override_min,
-        )
-        return "field_confirmation"
+    # [T1.7(b)/wave-13] DETERMINISTIC EMPTY-CORE pre-arm: the deterministic
+    # scanner (deterministic_output_issues, merged into report.issues by the
+    # tester node) PROVES a core field empty on >80% of output rows — hard
+    # evidence the run must not ship via ground-truth override (job-118:
+    # price requested, empty on every extracted row). This wraps the override
+    # as a pre-arm so the six-veto guard text below stays byte-identical
+    # (f15 pin) while the mapping/remap + fix arms stay reachable.
+    _det_empty_core_fields: set[str] = set()
+    try:
+        from src.content_types import get_content_type as _gct_dec
+
+        _pt_dec = (state.get("page_type") or "product").lower()
+        _ct_dec = _gct_dec(_pt_dec)
+        if _ct_dec and getattr(_ct_dec, "core_fields", None):
+            _det_empty_core_fields = {str(f).lower() for f in _ct_dec.core_fields}
+    except Exception:
+        _det_empty_core_fields = set()
+    _cfg_dec = state.get("content_type_config") or {}
+    if isinstance(_cfg_dec, dict) and _cfg_dec.get("core_field_names"):
+        _det_empty_core_fields = {str(f).lower() for f in _cfg_dec["core_field_names"]}
+    _det_empty_core = [
+        i for i in issues
+        if str(i.get("issue_type") or "").upper() == "MISSING"
+        and str(i.get("description") or "").startswith("Deterministic check:")
+        and str(i.get("field") or "").lower() in _det_empty_core_fields
+    ]
+    if not _det_empty_core:
+        _override_min = 1 if (state.get("input_mode") or "").strip() in ("url_list", "list_page") else 3
+        if (
+            not _cov_reason
+            and not missing_core
+            and not _contract_bad
+            and not _count_regression
+            and not _volume_reason
+            and not _det_blockers
+            and _scraper_has_real_items(state, min_count=_override_min)
+        ):
+            logger.info(
+                "route_after_testing: GROUND-TRUTH PASS — scraper produced ≥%d real "
+                "items (overriding code_tester's high_severity flags)",
+                _override_min,
+            )
+            return "field_confirmation"
 
     # T2.1 volume-gap bounce (bounded, contract-bounce shape): a big
     # discovered-vs-extracted gap on a beyond-sample run is a precisely-known
@@ -1139,6 +1440,7 @@ def route_after_testing(state: ScrapeState) -> str:
             # [A5] go straight to code_writer: scraper_analyzer re-picks the
             # SAME strategy (nothing about it failed) and the writer regenerates
             # from scratch; a pagination gap is a targeted edit.
+            _log_cascade(state, "volume-gap", _volume_reason)
             return "code_writer"
 
     # T2.2 deterministic-defect bounce (same shape): the WRONG_VALUE issues
@@ -1160,6 +1462,7 @@ def route_after_testing(state: ScrapeState) -> str:
             )
             # [A5] direct to code_writer — the WRONG_VALUE carries a mechanical
             # suggested_fix; a strategy re-pick regenerates instead of editing.
+            _log_cascade(state, "deterministic-defect", _det_blockers[0].get("description", "")[:120])
             return "code_writer"
 
     # Count-regression bounce (bounded, same shape as the contract bounce):
@@ -1175,6 +1478,7 @@ def route_after_testing(state: ScrapeState) -> str:
             logger.warning("route_after_testing: %s — bouncing to code_writer", _count_regression)
             # [A5] direct to code_writer — missing pagination/categories is a
             # targeted edit to the working draft, not a strategy question.
+            _log_cascade(state, "count-regression", _count_regression)
             return "code_writer"
 
     # L2 CLI-contract bounce (before the strategy cascade — a contract violation
@@ -1201,6 +1505,7 @@ def route_after_testing(state: ScrapeState) -> str:
             "(targeted fix, retry %d/%d)",
             _retry_now + 1, MAX_TEST_RETRIES,
         )
+        _log_cascade(state, "contract-violation", "CLI contract violation")
         return "code_writer"
 
     if is_final_attempt:
@@ -1243,7 +1548,7 @@ def route_after_testing(state: ScrapeState) -> str:
     # recorded into state.strategies_tried by _decide_strategy (the router
     # can't update state), so scraper_analyzer picks a DIFFERENT strategy.
     _strategy = (state.get("scraper_analysis") or {}).get("strategy", "")
-    _action, _reason = classify_test_failure(report, _strategy)
+    _action, _reason = classify_test_failure(report, _strategy, state)
     # Anti-bot guard: for anti-bot sites, playwright+cloak is the ONLY viable
     # strategy (http/api are blocked too), so switching away is futile — a 0-item
     # Playwright failure there is a code/cloak bug to FIX, not a strategy to switch.
@@ -1259,7 +1564,7 @@ def route_after_testing(state: ScrapeState) -> str:
     _anti_bot = bool(
         state.get("anti_bot_detected")
         or (isinstance(_ab, dict) and _ab.get("detected"))
-        or str(_meth).startswith(("uc_chrome", "cloak"))
+        or str(_meth).startswith(STEALTH_METHOD_PREFIXES)
     )
     if _action == "strategy" and _anti_bot and _strategy in ("playwright", "stealth_browser", "seleniumbase_uc", "http_navigation", "") and not _cov_reason:
         # Coverage failures are exempt from the anti-bot downgrade: a coverage gap
@@ -1275,6 +1580,41 @@ def route_after_testing(state: ScrapeState) -> str:
             _action, _reason = "mapping", f"field gap: {remediation.get('fields')}"
         elif remediation.get("target") == "strategy":
             _action, _reason = "strategy", "code_tester: strategy"
+
+    # [T1.4] ABSENT-DRAFT arm — ABOVE the retry-exhausted gate (absent cycles
+    # deliberately never touch test_retry_count, so the exhausted gate can't
+    # bound them; this arm's own counter does). The fix for a missing draft is
+    # regenerating the draft (code_writer), never a strategy swap and never a
+    # scraper_analyzer re-entry (which would bump the fix budget for a
+    # filesystem-shaped failure). Counter lives in _invoke_code_tester
+    # (reset-on-parse, increment-on-missing); routing functions can't mutate.
+    if _action == "absent":
+        _absent_n = int(state.get("draft_absent_count") or 0)
+        if _absent_n < 3:
+            import time as _time_absent
+
+            _absent_backoff = min(10.0 * (_absent_n + 1), 30.0)
+            logger.warning(
+                "route_after_testing: %s — regenerating draft via code_writer "
+                "after %.0fs backoff (absent %d/3, retry budget untouched)",
+                _reason, _absent_backoff, _absent_n + 1,
+            )
+            _time_absent.sleep(_absent_backoff)
+            _log_cascade(state, "absent-draft", _reason)
+            return "code_writer"
+        if state.get("skip_approvals", False):
+            logger.error(
+                "route_after_testing: draft absent %d cycles in a row + "
+                "skip_approvals → cleanup (honest failure: nothing to test)",
+                _absent_n,
+            )
+            return "cleanup"
+        logger.error(
+            "route_after_testing: draft absent %d cycles in a row → "
+            "human_approval (writer cannot deliver a draft)",
+            _absent_n,
+        )
+        return "human_approval"
 
     # Cap on the strategy/scraper cascade: the early-return branches below
     # previously bypassed MAX_TEST_RETRIES (only the LLM fallback enforced it).
@@ -1331,6 +1671,7 @@ def route_after_testing(state: ScrapeState) -> str:
                 _reason, _backoff, _retests + 1,
             )
             _time.sleep(_backoff)
+            _log_cascade(state, "retest", _reason)
             return "code_tester"
         logger.warning(
             "route_after_testing: %s — retest budget exhausted (%d), treating "
@@ -1348,6 +1689,7 @@ def route_after_testing(state: ScrapeState) -> str:
             retry_count + 1,
             MAX_TEST_RETRIES + 1,
         )
+        _log_cascade(state, "strategy-switch", _reason)
         return "scraper_analyzer"
     if _action == "scraper":
         logger.info(
@@ -1356,6 +1698,7 @@ def route_after_testing(state: ScrapeState) -> str:
             retry_count + 1,
             MAX_TEST_RETRIES + 1,
         )
+        _log_cascade(state, "code-fix", _reason)
         return "code_writer"
 
     if retry_count < MAX_TEST_RETRIES:
@@ -1382,6 +1725,7 @@ def route_after_testing(state: ScrapeState) -> str:
                 retry_count + 1,
                 MAX_TEST_RETRIES + 1,
             )
+            _log_cascade(state, "mapping-remap", str(remediation.get("fields")))
             return "product_analyzer"
         # [A5] Default: a refine-class failure (items extracted, quality gaps)
         # is a CODE fix — send it straight to code_writer. Routing through
@@ -1397,6 +1741,7 @@ def route_after_testing(state: ScrapeState) -> str:
             retry_count + 1,
             MAX_TEST_RETRIES + 1,
         )
+        _log_cascade(state, "refine-fix", f"{assessment} confidence={confidence:.2f}")
         return "code_writer"
 
     if confidence >= MIN_CONFIDENCE_PARTIAL and _scraper_produced_valid_output(state):

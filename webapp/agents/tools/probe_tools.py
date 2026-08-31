@@ -42,6 +42,12 @@ ESCALATION_STEPS = [
 ]
 
 HTTP_METHODS = {"direct_http", "direct_http_datacenter", "direct_http_residential"}
+# T3.2 naming reconcile: browser_service's probe ladder now also emits
+# ``fingerprint_{chrome|safari184}_{tier}`` (curl_cffi TLS-impersonation,
+# HTTP-flavoured — NOT a browser step) and ``cloak_{tier}`` stealth-browser
+# steps. Classify by prefix so the http/browser split (which drives the
+# "find a second working method of the OTHER type" pass) stays correct.
+_HTTP_METHOD_PREFIXES = ("direct_http", "fingerprint_")
 BROWSER_METHODS = {
     "playwright_none",
     "playwright_datacenter",
@@ -49,6 +55,9 @@ BROWSER_METHODS = {
     "uc_chrome_none",
     "uc_chrome_datacenter",
     "uc_chrome_residential",
+    "cloak_none",
+    "cloak_datacenter",
+    "cloak_residential",
 }
 
 
@@ -266,7 +275,7 @@ def _classify_method(step_name: str) -> str:
     """Classify an escalation step as 'http' or 'browser'."""
     if "akamai" in step_name:
         return "browser"
-    if step_name in HTTP_METHODS:
+    if step_name in HTTP_METHODS or str(step_name).startswith(_HTTP_METHOD_PREFIXES):
         return "http"
     return "browser"
 
@@ -390,17 +399,25 @@ def run_probe_with_captcha_check(
                         url[:80],
                     )
                     _log_probe_step(f"{step_name} blocked by Akamai, trying bypass...")
+                    # T3.2: /probe-akamai was deleted — the cloak stealth step
+                    # IS the bypass now, requested through the same
+                    # /probe-single contract as every other ladder rung
+                    # (timeout clamped: /probe-single caps timeout at 120).
                     try:
                         ak_resp = httpx.post(
-                            f"{service_url}/probe-akamai",
-                            json={"url": url, "timeout": PROBE_TIMEOUT},
+                            f"{service_url}/probe-single",
+                            json={
+                                "url": url,
+                                "method": "cloak_none",
+                                "timeout": min(PROBE_TIMEOUT, 90),
+                            },
                             timeout=PROBE_TIMEOUT + 10,
                         )
                         ak_resp.raise_for_status()
                         ak_data = ak_resp.json()
                         ak_data["_request_url"] = url
                         ak_data["proxy_tier"] = proxy_tier
-                        methods_tried.append(f"{step_name}_akamai")
+                        methods_tried.append("cloak_none")
                         if ak_data.get("success"):
                             captcha_result = _verify_captcha_free(ak_data)
                             if captcha_result.get("captcha_detected"):
@@ -422,7 +439,7 @@ def run_probe_with_captcha_check(
                         _log_probe_step(
                             f"{step_name} Akamai bypass SUCCEEDED — real content"
                         )
-                        return _handle_success(ak_data, f"{step_name}_akamai")
+                        return _handle_success(ak_data, "cloak_none")
                     except Exception as ak_exc:
                         logger.warning(
                             "probe_page[accessibility]: Akamai bypass failed for %s: %s",
@@ -686,13 +703,19 @@ def get_probe_tools() -> list:
 
             if data.get("needs_akamai_bypass") and not data.get("success"):
                 logger.info(
-                    "probe_page: Akamai detected, escalating to /probe-akamai for %s",
+                    "probe_page: Akamai detected, escalating to cloak bypass via /probe-single for %s",
                     url[:100],
                 )
                 try:
+                    # T3.2: /probe-akamai deleted — the cloak stealth step IS
+                    # the bypass; same /probe-single contract, clamped timeout.
                     ak_resp = httpx.post(
-                        f"{service_url}/probe-akamai",
-                        json={"url": url, "timeout": PROBE_TIMEOUT},
+                        f"{service_url}/probe-single",
+                        json={
+                            "url": url,
+                            "method": "cloak_none",
+                            "timeout": min(PROBE_TIMEOUT, 90),
+                        },
                         timeout=PROBE_TIMEOUT + 10,
                     )
                     ak_resp.raise_for_status()

@@ -216,17 +216,29 @@ def _provider_for(model: str) -> tuple[str, str, str]:
 
 
 def _litellm_fallback(requested: str) -> Optional[str]:
-    """Provider-local breaker fallback for ``requested``.
+    """Breaker fallback for ``requested``.
 
-    litellm models → ``LITELLM_FALLBACK_MODEL`` (empty string = no swap; the
-    proxy exposes one model, so there is nothing to fall back TO — a
-    cross-provider GLM fallback would 404).
+    [T3.13g/wave-13] litellm models → ``LITELLM_FALLBACK_MODEL`` if set, else
+    ``ZAI_MAIN_MODEL`` — a REAL default. Previously the default was ``""``
+    (no swap): when the proxy route dies mid-stream (job 84's writer deaths —
+    peer-closed / chunked-read), all breaker attempts re-hit the SAME flaky
+    route and the phase is lost. The swap is safe cross-provider because
+    ``_provider_for`` resolves the endpoint FROM the swapped name — a ZAI
+    model name routes to Z.AI direct (streaming off), never through the proxy,
+    so the old "GLM-name through the proxy would 404" objection doesn't apply.
+    Set ``LITELLM_FALLBACK_MODEL`` to keep the swap proxy-local (operator
+    override); set it to a literal ``"none"`` to disable swapping entirely.
     ZAI models → ``None`` = use the configured ``ZAI_FALLBACK_MODEL`` default
     (effective_model treats None as "not specified", NOT as "no fallback" —
     the distinction matters, see llm_breaker.effective_model).
     """
     if _is_litellm_model(requested):
-        return getattr(settings, "LITELLM_FALLBACK_MODEL", "")
+        configured = str(getattr(settings, "LITELLM_FALLBACK_MODEL", "") or "").strip()
+        if configured.lower() == "none":
+            return ""  # explicit opt-out → effective_model's no-swap sentinel
+        if configured:
+            return configured
+        return getattr(settings, "ZAI_MAIN_MODEL", "") or ""
     return None
 
 
@@ -528,9 +540,10 @@ def get_llm(model: Optional[str] = None, temperature: float = 0.3, timeout: Opti
             "Set LITELLM_API_KEY on the worker, or unset the prefix in "
             "CODE_WRITER_MODEL to return to Z.AI."
         )
-    # ORDER IS LOAD-BEARING: breaker swap first (provider-local fallback — a
-    # litellm model falls back only within litellm, or not at all), THEN resolve
-    # the provider from the swapped name, so base_url follows the actual model.
+    # ORDER IS LOAD-BEARING: breaker swap first (a litellm model falls back to
+    # LITELLM_FALLBACK_MODEL, or to Z.AI direct when that's unset — [T3.13g]),
+    # THEN resolve the provider from the swapped name, so base_url follows the
+    # actual model.
     effective = effective_model(requested, fallback=_litellm_fallback(requested))
     base_url, api_key, model_name = _provider_for(effective)
     base_kwargs = dict(

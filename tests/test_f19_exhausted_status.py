@@ -48,7 +48,10 @@ class TestF19:
         assert i_guard < i_fire
 
     def test_MAX_TEST_RETRIES_imported(self):
-        assert "MAX_TEST_RETRIES,\n)" in _src
+        # position-independent: wave-13's STEALTH_METHOD_PREFIXES import
+        # reordered the constants block; the contract is only "the constant is
+        # imported into graph.py" (trailing comma = inside the paren block)
+        assert "MAX_TEST_RETRIES,\n" in _src
 
     def test_import_of_substantive_count(self):
         assert "_substantive_item_count,\n" in _src

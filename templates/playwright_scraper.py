@@ -29,7 +29,7 @@ from typing import Optional
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from src.proxy import ProxyConfig, build_proxy_url
+from src.proxy import ProxyConfig, build_playwright_proxy
 from src.geo import detect_country
 from src.discovery import discover_item_urls, config_for_load_more, config_from_dict
 
@@ -46,6 +46,21 @@ SCRAPING_METHOD = "playwright"
 # silent NameError-caught no-op on every playwright-strategy scraper.
 OUTPUT_KEY = "products"
 SITE_SLUG = "{SITE_SLUG}"
+# Proxy tier for the Phase-2 extraction browser, baked from
+# scraper_analysis.proxy_tier (code_writer fills the placeholder the same way
+# it fills SITE_NAME et al). Mirrors http_navigation_scraper's PROXY_TIER. The
+# probe's method_that_worked is the truth source: shipping a hardcoded tier
+# here is how a datacenter-verified site ends up launched with no proxy at all
+# (and vice versa — a 407-class site launched against a tier the probe never
+# validated).
+PROXY_TIER = "{PROXY_TIER}"
+if PROXY_TIER.startswith("{") and PROXY_TIER.endswith("}"):
+    PROXY_TIER = ""
+# Run-level override wins over the generation-time guess: the env var is what
+# THIS run was actually probed/launched with (staged via the browser_service
+# env_overrides channel), and an unfilled placeholder must not silently turn a
+# proxied site into a direct one.
+PROXY_TIER = os.environ.get("SCRAPER_PROXY_TIER", "").strip() or (PROXY_TIER or "none")
 
 PRODUCT_LISTING_URL = "{PRODUCT_LISTING_URL}"
 SRC_URL = "{PRODUCT_LISTING_URL}"
@@ -110,7 +125,11 @@ def get_browser(pw, headless=True, proxy=None):
                 "--disable-blink-features=AutomationControlled", "--disable-infobars",
                 "--no-first-run"]}
     if proxy:
-        launch_args["proxy"] = {"server": proxy}
+        # Playwright's proxy mapping ({"server", "username", "password"}) or a
+        # bare server URL. Chromium ignores credentials embedded IN the server
+        # URL — they must be sibling keys, or every request dies with
+        # net::ERR_INVALID_AUTH_CREDENTIALS / 407.
+        launch_args["proxy"] = proxy if isinstance(proxy, dict) else {"server": proxy}
     return pw.chromium.launch(**launch_args)
 
 
@@ -511,7 +530,13 @@ def main():
     results = []
     failed = 0
 
-    proxy_server = build_proxy_url("datacenter", proxy_config, country=detect_country(SITE_URL)) or None
+    # Tier from scraper_analysis.proxy_tier (PROXY_TIER above), NOT a hardcoded
+    # "datacenter", and creds as SIBLING KEYS — Chromium drops credentials
+    # embedded in the proxy server URL, which turned every proxied run into
+    # net::ERR_INVALID_AUTH_CREDENTIALS / 407 (job-79 class).
+    playwright_proxy = build_playwright_proxy(
+        PROXY_TIER, proxy_config, country=detect_country(SITE_URL)
+    )
     launch_args = {
         "headless": args.headless,
         "args": [
@@ -520,11 +545,14 @@ def main():
             "--no-first-run",
         ],
     }
-    if proxy_server:
-        launch_args["proxy"] = {"server": proxy_server}
+    if playwright_proxy:
+        launch_args["proxy"] = playwright_proxy
+        logger.info(
+            "Proxy enabled (tier=%s, server=%s)", PROXY_TIER, playwright_proxy["server"]
+        )
 
     with sync_playwright() as p:
-        browser = get_browser(p, headless=args.headless, proxy=proxy_server)
+        browser = get_browser(p, headless=args.headless, proxy=playwright_proxy)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},

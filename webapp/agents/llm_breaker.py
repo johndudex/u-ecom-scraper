@@ -127,8 +127,8 @@ def effective_model(
 
     - ``None`` (not specified) → use the configured ``ZAI_FALLBACK_MODEL``.
     - ``""`` (empty string) → NO fallback: return ``primary`` even when tripped
-      (used for litellm models — the proxy has one model; a GLM-name fallback
-      would be sent to the wrong provider and 404).
+      (now only the EXPLICIT litellm opt-out — ``LITELLM_FALLBACK_MODEL=none``;
+      the default litellm fallback is Z.AI direct, see llm._litellm_fallback).
     - anything else → that model, verbatim.
     """
     if not primary:

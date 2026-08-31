@@ -31,7 +31,6 @@ logging.basicConfig(
 )
 
 PROBE_LOCK = asyncio.Lock()
-AKAMAI_SEMAPHORE = asyncio.Semaphore(2)
 
 CLEANUP_INTERVAL = 1800
 CDP_LIVENESS_INTERVAL = 15
@@ -837,12 +836,10 @@ class ProbeRequest(BaseModel):
     timeout: int = Field(default=120, ge=10, le=300)
     start_method: Optional[str] = Field(default=None)
     country: Optional[str] = Field(default=None)
-
-
-class AkamaiProbeRequest(BaseModel):
-    url: str
-    proxy_tier: str = Field(default="none")
-    timeout: int = Field(default=120, ge=10, le=300)
+    # Optional: restrict the escalation ladder to a single proxy tier
+    # ("none" | "datacenter" | "residential") instead of walking all three.
+    # Unset (the default, and what every current caller sends) = whole ladder.
+    proxy_tier: Optional[str] = Field(default=None)
 
 
 class SingleProbeRequest(BaseModel):
@@ -850,6 +847,9 @@ class SingleProbeRequest(BaseModel):
     method: str = Field(
         description=(
             "One of: direct_http, direct_http_datacenter, direct_http_residential, "
+            "fingerprint_chrome_none, fingerprint_chrome_datacenter, "
+            "fingerprint_chrome_residential, fingerprint_safari184_none, "
+            "fingerprint_safari184_datacenter, fingerprint_safari184_residential, "
             "playwright_none, playwright_datacenter, playwright_residential, "
             "cloak_none, cloak_datacenter, cloak_residential. "
             "(uc_chrome_* are accepted as deprecated aliases for cloak_*.)"
@@ -1153,6 +1153,7 @@ async def probe(request: ProbeRequest):
                         timeout=request.timeout,
                         start_method=request.start_method,
                         country=request.country,
+                        proxy_tier=request.proxy_tier,
                     ),
                 ),
                 timeout=request.timeout + 60,
@@ -1179,7 +1180,12 @@ async def probe(request: ProbeRequest):
 
 @app.post("/probe-single")
 async def probe_single(request: SingleProbeRequest):
-    from .probe import _try_direct_http, _try_playwright, _try_cloak
+    from .probe import (
+        _try_cloak,
+        _try_direct_http,
+        _try_fingerprint,
+        _try_playwright,
+    )
     from src.geo import detect_country as _detect_country
 
     method = request.method
@@ -1193,6 +1199,48 @@ async def probe_single(request: SingleProbeRequest):
         ),
         "direct_http_residential": lambda: _try_direct_http(
             request.url, min(request.timeout, 15), "residential", country=country
+        ),
+        # curl_cffi browser-TLS fingerprint rungs (HTTP-flavoured — the client
+        # impersonates a browser's TLS/HTTP2 stack but no JS runs). Every
+        # fingerprint_* name below is a real method, never an alias, and the
+        # profile + proxy tier are both encoded in the name so the caller's
+        # methods_tried/classification stay unambiguous.
+        "fingerprint_chrome_none": lambda: _try_fingerprint(
+            request.url, "none", profile="chrome", timeout=min(request.timeout, 20)
+        ),
+        "fingerprint_chrome_datacenter": lambda: _try_fingerprint(
+            request.url,
+            "datacenter",
+            profile="chrome",
+            timeout=min(request.timeout, 20),
+            country=country,
+        ),
+        "fingerprint_chrome_residential": lambda: _try_fingerprint(
+            request.url,
+            "residential",
+            profile="chrome",
+            timeout=min(request.timeout, 20),
+            country=country,
+        ),
+        "fingerprint_safari184_none": lambda: _try_fingerprint(
+            request.url,
+            "none",
+            profile="safari184",
+            timeout=min(request.timeout, 20),
+        ),
+        "fingerprint_safari184_datacenter": lambda: _try_fingerprint(
+            request.url,
+            "datacenter",
+            profile="safari184",
+            timeout=min(request.timeout, 20),
+            country=country,
+        ),
+        "fingerprint_safari184_residential": lambda: _try_fingerprint(
+            request.url,
+            "residential",
+            profile="safari184",
+            timeout=min(request.timeout, 20),
+            country=country,
         ),
         "playwright_none": lambda: _try_playwright(
             request.url, "none", min(request.timeout, 25)
@@ -1277,136 +1325,6 @@ async def probe_single(request: SingleProbeRequest):
                 "elapsed": 0,
             },
         )
-
-
-@app.post("/probe-akamai")
-async def probe_akamai(request: AkamaiProbeRequest):
-    # DEPRECATED: /probe-akamai + src/akamai_bypass are superseded by the cloak
-    # stealth path. Akamai detection in run_probe already routes to _try_cloak.
-    # Kept (not deleted) because it has callers and needs A/B testing against
-    # cloak before removal. See docs/browser-service-rework-plan.md.
-    logger.warning(
-        "/probe-akamai is deprecated — akamai detection now routes to cloak in "
-        "run_probe; src/akamai_bypass is slated for removal pending A/B testing; "
-        "see docs/browser-service-rework-plan.md"
-    )
-    from src.akamai_bypass.config import build_akamai_config_from_proxy_tier
-    from src.akamai_bypass.orchestrator import AkamaiOrchestrator
-    from src.page_analysis import (
-        extract_jsonld,
-        extract_meta_tags,
-        extract_title,
-        is_blocked,
-    )
-
-    async with AKAMAI_SEMAPHORE:
-        try:
-            cfg = build_akamai_config_from_proxy_tier(request.proxy_tier)
-            cfg.headless = True
-            orchestrator = AkamaiOrchestrator(cfg)
-
-            result = await asyncio.wait_for(
-                orchestrator.probe(request.url),
-                timeout=request.timeout,
-            )
-
-            if result and result.get("html"):
-                html = result["html"]
-                blocked = is_blocked(html[:5000])
-                jsonld = extract_jsonld(html)
-                meta = extract_meta_tags(html)
-                title = result.get("title", "") or extract_title(html)
-
-                selector_results = "Skipped — Akamai bypass probe"
-                has_content = len(html) > 5000 and not blocked
-
-                if has_content:
-                    try:
-                        import lxml.html
-
-                        tree = lxml.html.fromstring(html)
-                        results = []
-                        from src.page_analysis import COMMON_SELECTORS
-
-                        for name, selector in COMMON_SELECTORS.items():
-                            try:
-                                elements = tree.cssselect(selector)
-                                if not elements:
-                                    results.append(f"  {name} ({selector}): NOT FOUND")
-                                    continue
-                                first_text = ""
-                                for el in elements[:3]:
-                                    text = (el.text_content() or "").strip()[:100]
-                                    if text:
-                                        first_text = text
-                                        break
-                                if first_text:
-                                    results.append(
-                                        f'  {name} ({selector}): "{first_text}" [found: {len(elements)}]'
-                                    )
-                                else:
-                                    results.append(
-                                        f"  {name} ({selector}): EMPTY [found: {len(elements)}]"
-                                    )
-                            except Exception as exc:
-                                results.append(f"  {name} ({selector}): ERROR - {exc}")
-                        selector_results = "\n".join(results)
-                    except Exception as e:
-                        logger.warning(
-                            "Selector testing failed for Akamai probe: %s", e
-                        )
-                        selector_results = f"Selector test error: {e}"
-
-                return JSONResponse(
-                    content={
-                        "success": has_content,
-                        "method": result.get("method", "akamai_bypass"),
-                        "proxy_tier": request.proxy_tier,
-                        "status_code": 200,
-                        "title": title[:200],
-                        "body_length": len(html),
-                        "needs_browser": True,
-                        "blocked": blocked,
-                        "jsonld": jsonld,
-                        "meta": meta,
-                        "selector_results": selector_results,
-                        "error": ""
-                        if has_content
-                        else "Akamai bypass succeeded but content still blocked or empty",
-                    }
-                )
-
-            return JSONResponse(
-                content={
-                    "success": False,
-                    "method": "akamai_bypass",
-                    "proxy_tier": request.proxy_tier,
-                    "status_code": 0,
-                    "title": "",
-                    "body_length": 0,
-                    "needs_browser": True,
-                    "blocked": True,
-                    "jsonld": [],
-                    "meta": {},
-                    "selector_results": {},
-                    "error": "All Akamai bypass layers failed",
-                }
-            )
-
-        except asyncio.TimeoutError:
-            return JSONResponse(
-                status_code=504,
-                content={
-                    "success": False,
-                    "error": f"Akamai probe timed out after {request.timeout}s",
-                },
-            )
-        except Exception as exc:
-            logger.exception("Akamai probe failed for %s", request.url[:200])
-            return JSONResponse(
-                status_code=500,
-                content={"success": False, "error": str(exc)[:500]},
-            )
 
 
 @app.post("/render")

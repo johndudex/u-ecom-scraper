@@ -19,15 +19,18 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
+import tempfile
 import time
+import zipfile
 from datetime import datetime, timezone
 from typing import Optional
 
 from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from src.proxy import build_proxy_url
+from src.proxy import ProxyConfig, build_proxy_url
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -636,17 +639,17 @@ def _extract_item_data(page, url: str, src_url: str) -> dict:
                 if isinstance(offers, dict):
                     price = offers.get("price", "")
                     currency = offers.get("priceCurrency", CURRENCY)
-                    item["price"] = f"{currency}{price}" if price else ""
-                    item["availability"] = "In Stock"
+                    item["price"] = _norm_price(price) if price else ""
+                    item["availability"] = "in_stock"
                     avail = offers.get("availability", "")
-                    if "OutOfStock" in avail or "SoldOut" in avail:
-                        item["availability"] = "Out of Stock"
+                    if avail:
+                        item["availability"] = _norm_availability(avail)
                 elif isinstance(offers, list):
                     for offer in offers:
                         if isinstance(offer, dict):
                             price = offer.get("price", "")
                             currency = offer.get("priceCurrency", CURRENCY)
-                            item["price"] = f"{currency}{price}" if price else ""
+                            item["price"] = _norm_price(price) if price else ""
                             break
                 item["currency"] = block.get("offers", {}).get("priceCurrency", CURRENCY) if isinstance(block.get("offers"), dict) else CURRENCY
                 item["description"] = block.get("description", "")
@@ -705,6 +708,61 @@ def _error_item(url: str, src_url: str, error: str) -> dict:
     }
 
 
+# ── FIELD NORMALIZERS — inline on purpose, NOT a src import ──────────────────
+# Drafts execute in the browser-service image: a NEW src import would ImportError
+# there until that image is rebuilt, so the ~25 lines live in each python-side
+# template verbatim (playwright/UC normalize in-page via JS and don't need them).
+
+def _norm_price(value) -> Optional[str]:
+    """Strip currency symbols/whitespace from a price.
+
+    "£1,234.56" → "1234.56", "1.234,56 €" → "1234.56", 24.99 (a JSON-LD
+    number) → "24.99". Returns None when no digits are present — an
+    unparseable price is EMPTY, never zero (0 would read as a real product
+    priced at nothing). The currency stays in its own ``currency`` field.
+    """
+    if value is None:
+        return None
+    cleaned = re.sub(r"[^\d.,-]", "", str(value).strip())
+    if not re.search(r"\d", cleaned):
+        return None
+    if "," in cleaned and "." in cleaned:
+        # Both separators present: whichever comes LAST is the decimal one.
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        # "1,234" (grouping) vs "1,5" (decimal comma): a comma followed by
+        # exactly three digits is grouping, anything else is a decimal comma.
+        cleaned = re.sub(r",(?=\d{3}(?:\D|$))", "", cleaned).replace(",", ".")
+    return cleaned
+
+
+def _norm_availability(value) -> Optional[str]:
+    """Normalize availability to ``in_stock`` / ``out_of_stock``.
+
+    Accepts the schema.org URI form, InStock / In Stock / in_stock / Available
+    and their negatives. Anything unrecognised passes through lowercased —
+    availability is never invented (an unknown state is data, not an error).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "in_stock" if value else "out_of_stock"
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if "://" in text:  # e.g. http://schema.org/InStock
+        text = text.rsplit("/", 1)[-1]
+    compact = text.replace("-", "_").replace(" ", "")
+    if compact in ("in_stock", "instock", "available"):
+        return "in_stock"
+    if compact in ("out_of_stock", "outofstock", "unavailable", "sold_out", "soldout"):
+        return "out_of_stock"
+    return text
+
+
 def _browser_alive(page) -> bool:
     """Trivial probe — returns False if the page/context/browser has died.
 
@@ -720,6 +778,82 @@ def _browser_alive(page) -> bool:
         return True
     except Exception:
         return False
+
+
+def _make_proxy_auth_extension(
+    proxy_host: str, proxy_port, proxy_user: str, proxy_pass: str
+) -> Optional[str]:
+    """Build a Chrome extension ZIP that answers proxy auth challenges.
+
+    Modeled on ``undetected_chromedriver_scraper._make_proxy_auth_extension``.
+    Chromium IGNORES credentials embedded in a ``--proxy-server`` URL — every
+    request through an authenticated proxy is answered with 407 /
+    ``net::ERR_INVALID_AUTH_CREDENTIALS`` and the whole run yields nothing. The
+    credentials must be supplied by a ``webRequest.onAuthRequired`` listener,
+    which only an extension can provide.
+
+    Returns the path to the zip, or None when anything went wrong (the caller
+    then launches unproxied rather than half-proxied). Loaded via
+    ``--load-extension``, which requires ``--headless=new``: CLASSIC headless
+    does not load extensions at all.
+    """
+    try:
+        manifest_json = """
+{
+    "version": "1.0.0",
+    "manifest_version": 2,
+    "name": "Proxy Auth",
+    "permissions": [
+        "proxy",
+        "tabs",
+        "unlimitedStorage",
+        "storage",
+        "<all_urls>",
+        "webRequest",
+        "webRequestBlocking"
+    ],
+    "background": {
+        "scripts": ["background.js"]
+    }
+}
+"""
+        background_js = """
+var config = {
+    mode: "fixed_servers",
+    rules: {
+        singleProxy: {
+            scheme: "http",
+            host: "%s",
+            port: parseInt(%s)
+        },
+        bypassList: ["localhost"]
+    }
+};
+chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
+function callbackFn(details) {
+    return {
+        authCredentials: {
+            username: "%s",
+            password: "%s"
+        }
+    };
+}
+chrome.webRequest.onAuthRequired.addListener(
+    callbackFn,
+    {urls: ["<all_urls>"]},
+    ['blocking']
+);
+""" % (proxy_host, proxy_port, proxy_user, proxy_pass)
+
+        tmp_dir = tempfile.mkdtemp(prefix="proxy_ext_")
+        ext_path = os.path.join(tmp_dir, "proxy_auth_extension.zip")
+        with zipfile.ZipFile(ext_path, "w") as zf:
+            zf.writestr("manifest.json", manifest_json)
+            zf.writestr("background.js", background_js)
+        return ext_path
+    except Exception as exc:
+        logger.warning("Proxy auth extension could not be built: %s", exc)
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -766,8 +900,23 @@ def main():
     limit = 5 if args.sample else args.limit
 
     proxy_url = None
+    # Credentials for the configured tier, when it has any. They can NOT ride in
+    # --proxy-server (Chromium ignores creds in the URL → 407 /
+    # net::ERR_INVALID_AUTH_CREDENTIALS on every request), so they go into a
+    # one-shot auth extension instead and the server arg is left credential-free.
+    proxy_auth_ext = None
     if not args.no_proxy and PROXY_TIER != "none":
         proxy_url = build_proxy_url(PROXY_TIER)
+        _tier = ProxyConfig.get_instance().config.get(PROXY_TIER, {})
+        if proxy_url and _tier.get("username"):
+            _ext = _make_proxy_auth_extension(
+                _tier.get("host", ""), _tier.get("port", ""),
+                _tier.get("username", ""), _tier.get("password", ""),
+            )
+            if _ext:
+                proxy_auth_ext = _ext
+                proxy_url = "http://%s:%s" % (_tier.get("host"), _tier.get("port"))
+                logger.info("Proxy auth extension loaded for tier '%s'", PROXY_TIER)
 
     start_time = time.time()
     discovered_urls: list[str] = []
@@ -793,10 +942,20 @@ def main():
     with sync_playwright() as p:
         def _launch_browser():
             browser_args = []
+            headless = args.headless
             if proxy_url:
                 browser_args.append(f"--proxy-server={proxy_url}")
-            logger.debug("Phase 1: launching browser (proxy=%s, headless=%s)", bool(proxy_url), args.headless)
-            b = p.chromium.launch(headless=args.headless, args=browser_args)
+            if proxy_auth_ext:
+                # Extensions only load outside classic headless — classic
+                # --headless ignores --load-extension entirely, which would
+                # leave every proxied request unanswered (407).
+                headless = False
+                browser_args.append("--headless=new")
+                browser_args.append(f"--disable-extensions-except={proxy_auth_ext}")
+                browser_args.append(f"--load-extension={proxy_auth_ext}")
+            logger.debug("Phase 1: launching browser (proxy=%s, headless=%s, auth_ext=%s)",
+                         bool(proxy_url), headless, bool(proxy_auth_ext))
+            b = p.chromium.launch(headless=headless, args=browser_args)
             ctx = b.new_context(
                 viewport={"width": 1920, "height": 1080},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",

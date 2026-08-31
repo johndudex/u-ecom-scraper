@@ -44,6 +44,16 @@ DEAD_STATUS_CODES: frozenset[int] = frozenset({301, 302, 303, 307, 308, 404, 410
 CONTRACT_VIOLATION_MARKER: str = "CLI CONTRACT VIOLATION"
 SCRAPER_ENV_LISTING: str = "SCRAPER_LISTING_URL"
 
+# [T3.1/wave-13] Probe method prefixes that mean a STEALTH browser tier was
+# what actually reached the site. Widening-only shared constant: every
+# "is this stealth-proven?" site in the graph/routers reads this tuple, so a
+# future stealth flavor (e.g. the fingerprint probe family) is one edit —
+# before, 6 hand-maintained `("uc_chrome", "cloak")` tuples drifted (the
+# drift is exactly how akamai_*-suffixed successes fell out of the
+# anti-bot/override logic). Widening-only: the non-stealth branch of every
+# consumer is byte-identical under this tuple.
+STEALTH_METHOD_PREFIXES: tuple[str, ...] = ("uc_chrome", "cloak")
+
 NAV_INPUT_MODES: frozenset[str] = frozenset({"navigation", "list_page", "search_term"})
 # Matches _select_template_file's api family (graph.py) — "api" / "internal_api".
 API_STRATEGIES: frozenset[str] = frozenset({"api", "internal_api"})

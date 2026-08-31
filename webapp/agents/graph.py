@@ -55,6 +55,7 @@ from langchain_core.runnables import RunnableConfig
 from .constants import (
     FINAL_RETRY_SENTINEL,
     MAX_TEST_RETRIES,
+    STEALTH_METHOD_PREFIXES,
 )
 from .decisions import options_to_decisions
 from .nodes import (
@@ -438,7 +439,7 @@ def _enforce_anti_bot_strategy(analysis: dict, slug: str, filename: str) -> dict
     method = (conn.get("method_that_worked") if isinstance(conn, dict) else "") or ""
     detected = bool(
         (isinstance(anti_bot, dict) and anti_bot.get("detected"))
-        or str(method).startswith(("uc_chrome", "cloak"))
+        or str(method).startswith(STEALTH_METHOD_PREFIXES)
     )
     if not detected:
         return analysis
@@ -1738,6 +1739,10 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
             logger.warning("check_accessibility: failed to update job status: %s", exc)
 
         _notify_phase(job_id, "accessibility_check", "done")
+        # T3.7: tag WHICH url the probe actually hit — downstream analyzers
+        # otherwise assume the job URL and build on a false anchor when the
+        # probe resolved elsewhere (redirects, listing candidates).
+        data.setdefault("probed_url", url)
         return Command(
             update={
                 "error_message": error_msg,
@@ -1753,6 +1758,9 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
     proxy_tier = data.get("proxy_tier", "none")
 
     agent_probe_result: dict[str, Any] = {
+        # T3.7: the analyzer message reads this so it can state which URL the
+        # connectivity evidence actually came from.
+        "probed_url": url,
         "connectivity": {
             "method_that_worked": method,
             "http_method": data.get("http_method"),
@@ -3199,6 +3207,25 @@ def _decide_strategy(state: ScrapeState) -> dict[str, Any]:
         analysis, _exhausted_goto = _escalate_strategy(
             analysis, _all_tried, skip_approvals=bool(state.get("skip_approvals"))
         )
+        # [T2.1/wave-13] Before routing out on an exhausted strategy ladder,
+        # spend the SECOND axis: escalate the proxy tier and re-run the
+        # derived strategy at it. Bounded (2 extra cycles max) and honest —
+        # a different IP class is a new experiment, recorded as such.
+        if _exhausted_goto and _two_dim_ladder_enabled():
+            _tiered = _escalate_tier_axis(analysis)
+            if _tiered is not None:
+                analysis = _tiered
+                _exhausted_goto = None
+                _new_tried = _new_tried + [{
+                    "strategy": analysis.get("strategy"),
+                    "reason": "proxy-tier escalation after strategy-ladder exhaustion",
+                    "tier": analysis.get("proxy_tier"),
+                }]
+                logger.warning(
+                    "_decide_strategy: strategy ladder exhausted — escalating "
+                    "proxy tier to %s and re-running %s (job %s)",
+                    analysis.get("proxy_tier"), analysis.get("strategy"), job_id,
+                )
         if _exhausted_goto:
             logger.error(
                 "_decide_strategy: all strategies tried+failed — routing to %s "
@@ -3236,6 +3263,61 @@ def _decide_strategy(state: ScrapeState) -> dict[str, Any]:
 
 
 _STRATEGY_ESCALATION = ["http_requests", "http_navigation", "playwright", "internal_api"]
+
+# [T2.1/wave-13] Second escalation axis: PROXY TIER. When the strategy ladder
+# is exhausted, everything tried so far failed AT ONE NETWORK IDENTITY — a
+# datacenter/residential IP is a genuinely different experiment, not the
+# doomed re-run the exhaustion rule exists to stop. Tiers escalate sideways
+# (none → datacenter → residential) BEFORE routing out; the derived strategy
+# is re-run at the higher tier (code_writer reads scraper_analysis.proxy_tier
+# and bakes it into the draft). Env kill-switch: SCRAPER_TWO_DIM_LADDER=0.
+_PROXY_TIER_LADDER = ("none", "datacenter", "residential")
+
+
+def _two_dim_ladder_enabled() -> bool:
+    try:
+        return os.environ.get("SCRAPER_TWO_DIM_LADDER", "1").strip().lower() not in (
+            "0", "false", "no",
+        )
+    except Exception:
+        return False
+
+
+def _tier_configured(tier: str) -> bool:
+    """Is a real proxy configured for this tier? An unconfigured tier would
+    silently run unproxied — manufacturing the same experiment twice."""
+    if tier == "none":
+        return True
+    try:
+        from src.proxy import build_proxy_url
+
+        return bool(build_proxy_url(tier))
+    except Exception:
+        return False
+
+
+def _escalate_tier_axis(analysis: dict[str, Any]) -> dict[str, Any] | None:
+    """One rung up the proxy-tier axis.
+
+    Returns the UPDATED analysis (strategy unchanged, tier raised), or None
+    when the tier ladder is also exhausted / the next tier has no configured
+    proxy. Durability across cycles is handled by _derive_strategy, which
+    honors a stronger prior tier.
+    """
+    current = str(analysis.get("proxy_tier") or "none") or "none"
+    idx = _PROXY_TIER_LADDER.index(current) if current in _PROXY_TIER_LADDER else 0
+    for nxt in _PROXY_TIER_LADDER[idx + 1:]:
+        if not _tier_configured(nxt):
+            continue
+        analysis["proxy_tier"] = nxt
+        analysis["no_proxy_flag"] = False
+        analysis["strategy_justification"] = (
+            f"Deterministic tier escalation: strategy ladder exhausted — "
+            f"re-running {analysis.get('strategy')} at proxy tier {nxt} "
+            f"(was {current})"
+        )
+        return analysis
+    return None
 
 
 def _escalate_strategy(
@@ -3313,6 +3395,10 @@ def _route_after_execution(state: ScrapeState):
     signatures are Phase 2's test-time gate, not an execution verdict), and
     the second zero-item execution (recycle budget spent — finalize honestly
     with execution_status FAILED so cleanup does not promote a 0-item scraper).
+    [T2.10] One widening: a FAILED execution whose failure IS the
+    zero-discovery verdict (template DISCOVERY_ZERO rc=3, tagged by
+    run_execution) recycles like the SUCCESS zero — the ladder, not cleanup,
+    owns an access failure.
     """
     job_id = state.get("job_id", 0)
     status = state.get("execution_status", "")
@@ -3327,13 +3413,29 @@ def _route_after_execution(state: ScrapeState):
 
     if status == "SUCCESS" and items > 0:
         return Command(goto="cleanup")
-    if status != "SUCCESS" or items != 0:
+    # [T2.10/wave-13] A FAILED execution is not automatically a code problem:
+    # the http_navigation template exits 3 with DISCOVERY_ZERO when Phase 1
+    # ran cleanly and saw no item URLs — run_execution tags EXACTLY that shape
+    # (rc=3 / stderr marker) with ``no_fresh_output``. That is the SAME
+    # strategy verdict as the SUCCESS zero — a clean-zero execution that
+    # rc!=0'd used to fly straight past this recycle into cleanup (job-85's
+    # trap). Admit ONLY runs carrying the run_execution tag: a raw FAIL-class
+    # stop_reason is NOT enough, or a rc=1 traceback whose run happened to
+    # record empty_first_page coverage would be misread as an access problem
+    # and recycled (tracebacks are code problems; the ladder cannot fix them).
+    from .nodes.route_after_testing import _COVERAGE_FAIL_STOP_REASONS
+
+    _zero_discovery_failed = (
+        status != "SUCCESS"
+        and items == 0
+        and bool(state.get("no_fresh_output"))
+    )
+    if (status != "SUCCESS" or items != 0) and not _zero_discovery_failed:
         # Crashed / stalled / no-output executions are code problems, not
         # strategy problems — the ladder cannot fix a traceback.
         return Command(goto="cleanup")
     if (state.get("input_mode") or "") not in ("list_page", "navigation", "search_term"):
         return Command(goto="cleanup")  # url_list: no discovery phase to recycle
-    from .nodes.route_after_testing import _COVERAGE_FAIL_STOP_REASONS
 
     if stop_reason not in _COVERAGE_FAIL_STOP_REASONS:
         logger.warning(
@@ -3426,7 +3528,7 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
     # Anti-bot signal: explicit flag OR only-working-method is a stealth browser.
     _ab = probe.get("anti_bot") or {}
     anti_bot = isinstance(_ab, dict) and bool(_ab.get("detected"))
-    if not anti_bot and method.startswith(("uc_chrome", "cloak")):
+    if not anti_bot and method.startswith(STEALTH_METHOD_PREFIXES):
         anti_bot = True
 
     # Proxy tier from the method suffix (mirrors the prompt mapping).
@@ -3436,6 +3538,24 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
         proxy_tier = "datacenter"
     else:
         proxy_tier = "none"
+    # [T2.1/wave-13] Tier durability: a previously-escalated tier must survive
+    # re-derivation — the probe method doesn't change between cycles, so a
+    # pure re-derive would silently drop back to the probe's tier and repeat
+    # the exact experiment that exhausted the ladder. Honor the STRONGER of
+    # the two (probe evidence vs. escalation); a downgrade never happens.
+    try:
+        _prior_tier = str(
+            (state.get("scraper_analysis") or {}).get("proxy_tier") or ""
+        )
+    except Exception:
+        _prior_tier = ""
+    if (
+        _prior_tier in _PROXY_TIER_LADDER
+        and proxy_tier in _PROXY_TIER_LADDER
+        and _PROXY_TIER_LADDER.index(_prior_tier)
+        > _PROXY_TIER_LADDER.index(proxy_tier)
+    ):
+        proxy_tier = _prior_tier
 
     meth = method.lower()
     # Listing-page JS-rendering signal (navigate_explore._verify_rendering, propagated
@@ -3472,7 +3592,7 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
             _form_method = (_search.get("form_method") or "").upper()
         if _form_method == "POST":
             strategy = "http_requests"
-        elif method.startswith(("uc_chrome", "cloak")):
+        elif method.startswith(STEALTH_METHOD_PREFIXES):
             # [job-83 woolworths] The probe's escalation ladder tries every
             # playwright tier BEFORE it reaches a working uc_chrome/cloak
             # method — so a stealth method_that_worked means every playwright
@@ -3619,7 +3739,7 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
     # sites keep the job-12 priceline semantics untouched — there the
     # reassessment carries a genuinely measured page verdict this heuristic
     # cascade never ran.
-    _override_suppressed = bool(method.startswith(("uc_chrome", "cloak")))
+    _override_suppressed = bool(method.startswith(STEALTH_METHOD_PREFIXES))
     _strategy_source = ""
     if (
         _rec_recommended in ("http_requests", "http_navigation", "playwright")
@@ -3631,8 +3751,16 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
         and strategy != _rec_recommended
     ):
         if _override_suppressed:
+            # [T1.10/wave-13] This string must NOT contain the
+            # "mechanism_reassessment" token: subagents._suppress_mechanism_
+            # reassessment reads that token as "the verdict was APPLIED" and
+            # renders the contradicting block into the writer seed — the
+            # suppression branch was defeating its own suppression (jobs
+            # 114/115 shipped doomed playwright drafts even after N13 because
+            # the writer still read "recommend playwright" here). "ignored" +
+            # "stealth-proven" stay (pinned by test_job83_job88_classes).
             _strategy_source = (
-                f"; mechanism_reassessment[{_rec_key}]={_rec_recommended!r} "
+                f"; product-analyzer verdict[{_rec_key}]={_rec_recommended!r} "
                 f"ignored — stealth-proven probe disproved playwright and "
                 f"http_requests at every probe tier"
             )
@@ -3663,6 +3791,20 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
             "next_button_selector": _disc_pag.get("next_button_selector"),
             "max_pages": _disc_pag.get("max_pages"),
         }
+
+    # [T3.4-restricted/wave-13] The probe method's tier suffix describes the
+    # BROWSER experiment that worked. A pure-HTTP strategy on a NON-stealth
+    # method must not inherit it — the writer would otherwise bake a paid
+    # proxy tier into a requests/API draft whose access path (POST replay,
+    # backend API) the probe never disproved. Stealth-proven methods KEEP
+    # their tier: the probe measured that every direct tier was blocked, and
+    # an http draft faces the same wall.
+    _browser_shaped = strategy in (
+        "playwright", "http_navigation", "stealth_browser",
+        "seleniumbase_uc", "undetected_chromedriver",
+    )
+    if not _browser_shaped and not method.startswith(STEALTH_METHOD_PREFIXES):
+        proxy_tier = "none"
 
     analysis: dict[str, Any] = {
         "strategy": strategy,
@@ -4106,6 +4248,34 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         except Exception as _exc:
             logger.warning("_invoke_code_writer: could not read template %s: %s", _template_file, _exc)
 
+        # [T2.5/wave-13] Edit-over-write: when the SAME template was the base
+        # last cycle AND a parseable draft from that cycle is still on disk,
+        # hand the writer the DRAFT in place of the pristine template. The
+        # writer then refines a known-good base instead of regenerating from
+        # scratch (job 46 class: ~25 min of from-scratch loops when the draft
+        # was one targeted edit from passing). A template CHANGE (strategy
+        # switch) skips this — regeneration is then genuinely required.
+        _eow_active = False
+        try:
+            from .draft_safety import draft_parses
+
+            if (
+                _template_code
+                and str(state.get("last_writer_template") or "") == _template_file
+            ):
+                _eow_draft = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
+                if draft_parses(_eow_draft):
+                    with open(_eow_draft, "r", encoding="utf-8", errors="replace") as _ef:
+                        _template_code = _ef.read()
+                    _eow_active = True
+                    logger.info(
+                        "_invoke_code_writer: edit-over-write — same template %s with a "
+                        "parseable draft; the existing DRAFT is the base (no regen)",
+                        _template_file,
+                    )
+        except Exception as _eow_exc:
+            logger.warning("_invoke_code_writer: edit-over-write check failed: %s", _eow_exc)
+
         agent = create_code_writer(site_slug=slug, template_code=_template_code)
         hb = _start_heartbeat(job_id, "code-writer")
         # F5: try/finally — an exception here previously leaked the timer chain.
@@ -4115,6 +4285,41 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         finally:
             _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "code-writer", config)
+
+        # [B1.3/wave-13] Fence recovery: a writer that put the COMPLETE scraper
+        # inside a ```python fence in its reply but never called write_file
+        # still did the work — the draft is in the transcript. Recover it here,
+        # before the failure counters and the FM snapshot run: write the
+        # largest parseable fenced block to the draft path and let the normal
+        # post-invocation checks see a healthy draft. No code_writer_error_count
+        # bump — this is delivery-format recovery, not a failure.
+        try:
+            from .draft_safety import draft_parses, extract_fenced_python
+
+            _cw_pre = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
+            if not draft_parses(_cw_pre):
+                _cw_msgs = (result.get("messages") or []) if isinstance(result, dict) else []
+                _cw_text = ""
+                for _m in reversed(_cw_msgs):
+                    _c = getattr(_m, "content", None)
+                    if isinstance(_c, str) and _c.strip():
+                        _cw_text = _c
+                        break
+                if _cw_text:
+                    _fenced = extract_fenced_python(_cw_text)
+                    if _fenced:
+                        os.makedirs(os.path.dirname(_cw_pre), exist_ok=True)
+                        with open(_cw_pre, "w", encoding="utf-8") as _ff:
+                            _ff.write(_fenced)
+                        logger.warning(
+                            "_invoke_code_writer: no draft on disk — recovered %d-char "
+                            "scraper from the response's python fence (job %s)",
+                            len(_fenced), job_id,
+                        )
+        except Exception as _fence_exc:
+            logger.warning(
+                "_invoke_code_writer: fence recovery failed (job %s): %s", job_id, _fence_exc
+            )
 
         # [jobs-79/80] Snapshot EVERY completed draft to THIS job's FM key
         # immediately — promotion to production only happens at cleanup, which
@@ -4289,6 +4494,11 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         if not _cw_dead:
             # Healthy run — reset the consecutive wall-clock-death counter.
             update["writer_wall_clock_timeouts"] = 0
+        # [T2.5] Record the template this successful draft was built on, so the
+        # NEXT cycle can hand the writer its own draft back (edit-over-write)
+        # whenever the base template is unchanged. Set only on the usable-draft
+        # path — a failed cycle must not arm the next one.
+        update["last_writer_template"] = _template_file
         _notify_phase(job_id, "code_writer", "done")
         if _PATCHES_ENABLED:
             # Strategy-drift patches REMOVED (verify-then-delete via run_node --no-patches):
@@ -4483,7 +4693,17 @@ def _probe_yield_dead(probe_yield: dict) -> bool:
     try:
         from src.listing_discovery import listing_yield_failure
 
-        return listing_yield_failure(probe_yield)
+        # [85-gap-c/wave-13] A --discover-only probe's ``coverage.found`` is 0
+        # BY CONSTRUCTION (Phase 2 never ran), not a filter verdict. Passed
+        # through verbatim, the predicate's found==0 arm reduces to
+        # "discovered>2 + exhaustion stop ⇒ dead" — which declares a healthy
+        # SMALL catalogue (job-85's own 2-page listing ends ``no_next_link``
+        # with a real yield) a dead listing. Nulling it selects the
+        # predicate's "no post-filter signal" arm: judge by raw yield only,
+        # which is the only signal a probe has.
+        _cov_pf = dict(probe_yield.get("coverage") or {})
+        _cov_pf["found"] = None
+        return listing_yield_failure({**probe_yield, "coverage": _cov_pf})
     except Exception:
         return int(probe_yield.get("discovered_urls") or 0) == 0
 
@@ -4779,6 +4999,40 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
     # code_writer --no-patches (0 seleniumbase). The deterministic pre-test guard
     # no longer fires; strategy drift is handled by the normal test→retry loop.
     set_tool_context(dict(state), agent_name="code_tester")
+    # [B1.2/wave-13] Draft-presence guard at tester entry. A missing or
+    # unparseable draft turns the whole invocation into a pre-ordained
+    # "No such file" absent-draft cycle — a window burned on a filesystem
+    # race, not on the code. Restore the job's own FM-archived draft FIRST;
+    # only count absence when the restore cannot save the run. The counter
+    # feeds route_after_testing's absent arm (reset on a parseable draft,
+    # incremented on absence) because routing functions cannot mutate state.
+    _te_absent = 0
+    try:
+        from .draft_safety import draft_parses, restore_job_draft
+
+        _te_slug = state.get("site_slug", "")
+        _te_draft = (
+            os.path.join(_get_project_root(), "workspace", _te_slug, "scraper_draft.py")
+            if _te_slug else ""
+        )
+        if _te_draft and not draft_parses(_te_draft):
+            _te_restored = restore_job_draft(
+                _get_project_root(), _te_slug, state.get("job_id", 0)
+            )
+            if _te_restored:
+                logger.warning(
+                    "_invoke_code_tester: draft absent/unparseable at entry — "
+                    "restored job archive copy %s", _te_restored,
+                )
+        if not (_te_draft and draft_parses(_te_draft)):
+            _te_absent = int(state.get("draft_absent_count") or 0) + 1
+            logger.error(
+                "_invoke_code_tester: NO parseable draft at entry (absent %d) "
+                "— the tester will run against a missing file (job %s)",
+                _te_absent, job_id,
+            )
+    except Exception as _te_exc:
+        logger.warning("_invoke_code_tester: draft entry guard failed: %s", _te_exc)
     try:
         logger.info("_invoke_code_tester: starting (job %s)", job_id)
         # [A6/job-73 RC1] Stamp the test START. _freshness_floor raises the
@@ -4804,7 +5058,7 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         finally:
             _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "code-tester", config)
-        update = {"messages": []}
+        update = {"messages": [], "draft_absent_count": _te_absent}
         # [job-81 N-C] A dead invocation invalidates whatever verdict is on
         # disk: the report was written by a PREVIOUS cycle about a PREVIOUS
         # draft (job 81: the "cascade exhausted" routing consumed cycle-2's
@@ -4823,13 +5077,9 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 "predating this attempt will be rejected (job %s)",
                 _ct_err or "no messages", job_id,
             )
-            if "wall-clock timeout" in _ct_err:
-                update["tester_wall_clock_timeouts"] = (
-                    int(state.get("tester_wall_clock_timeouts") or 0) + 1
-                )
-        else:
-            # Healthy invocation — reset the consecutive-death counter.
-            update["tester_wall_clock_timeouts"] = 0
+        # [B2.6] The escalation counter itself is set BELOW, after the verdict
+        # is resolved — "invocation alive but produced no verdict" burns the
+        # same window as a wall-clock death and must count too (parity).
         _notify_phase(job_id, "code_tester", "done")
         # [A2/A1/A6] Fingerprint the draft THIS test just ran + track same-draft
         # re-tests. The fingerprint feeds route_after_testing's freshness floor
@@ -4898,6 +5148,23 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             # state, so a dead/no-op attempt would silently route on the
             # LAST cycle's verdict even with the file-level mtime floor).
             update["test_report"] = None
+        # [B2.6/wave-13] Parity: the escalation counter keys on "no verdict
+        # for THIS attempt", not merely "the invocation object died". A
+        # healthy invocation that wrote no on-disk report burned the same
+        # window against the same wall — count it. healthy+report → 0;
+        # dead+wall-clock → +1 (unchanged); alive+no report → +1;
+        # dead-non-wall-clock (provider crash) stays untouched — different
+        # failure class, and the retry ladder already owns it.
+        if report:
+            update["tester_wall_clock_timeouts"] = 0
+        elif _ct_dead and "wall-clock timeout" in _ct_err:
+            update["tester_wall_clock_timeouts"] = (
+                int(state.get("tester_wall_clock_timeouts") or 0) + 1
+            )
+        elif not _ct_dead:
+            update["tester_wall_clock_timeouts"] = (
+                int(state.get("tester_wall_clock_timeouts") or 0) + 1
+            )
         # [job-81 N-C] Two consecutive wall-clock deaths and STILL no verdict
         # for this attempt: stage the escalation — route_after_testing's
         # no-report arm sends counter>=2 to human_approval (or cleanup under

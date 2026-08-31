@@ -140,14 +140,71 @@ def fetch_api(endpoint: str, params: Optional[dict] = None) -> Optional[dict]:
     return None
 
 
+# ── FIELD NORMALIZERS — inline on purpose, NOT a src import ──────────────────
+# Drafts execute in the browser-service image: a NEW src import would ImportError
+# there until that image is rebuilt, so the ~25 lines live in each python-side
+# template verbatim (playwright/UC normalize in-page via JS and don't need them).
+
+def _norm_price(value) -> Optional[str]:
+    """Strip currency symbols/whitespace from a price.
+
+    "£1,234.56" → "1234.56", "1.234,56 €" → "1234.56", 24.99 (a JSON-LD
+    number) → "24.99". Returns None when no digits are present — an
+    unparseable price is EMPTY, never zero (0 would read as a real product
+    priced at nothing). The currency stays in its own ``currency`` field.
+    """
+    if value is None:
+        return None
+    cleaned = re.sub(r"[^\d.,-]", "", str(value).strip())
+    if not re.search(r"\d", cleaned):
+        return None
+    if "," in cleaned and "." in cleaned:
+        # Both separators present: whichever comes LAST is the decimal one.
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        # "1,234" (grouping) vs "1,5" (decimal comma): a comma followed by
+        # exactly three digits is grouping, anything else is a decimal comma.
+        cleaned = re.sub(r",(?=\d{3}(?:\D|$))", "", cleaned).replace(",", ".")
+    return cleaned
+
+
+def _norm_availability(value) -> Optional[str]:
+    """Normalize availability to ``in_stock`` / ``out_of_stock``.
+
+    Accepts the schema.org URI form, InStock / In Stock / in_stock / Available
+    and their negatives. Anything unrecognised passes through lowercased —
+    availability is never invented (an unknown state is data, not an error).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "in_stock" if value else "out_of_stock"
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if "://" in text:  # e.g. http://schema.org/InStock
+        text = text.rsplit("/", 1)[-1]
+    compact = text.replace("-", "_").replace(" ", "")
+    if compact in ("in_stock", "instock", "available"):
+        return "in_stock"
+    if compact in ("out_of_stock", "outofstock", "unavailable", "sold_out", "soldout"):
+        return "out_of_stock"
+    return text
+
+
 def transform_api_product(api_product: dict, index: int, src_url: str) -> dict:
     """CUSTOMIZE: Update field mapping to match the target API response structure."""
     price = api_product.get("price", "") or ""
     return {
         "id": index,
         "title": api_product.get("title", "") or api_product.get("name", ""),
-        "price": f"${price}" if price else "",
-        "availability": "In Stock" if api_product.get("available", True) else "Out of Stock",
+        # Symbol-free price: baking "$" into the field makes every downstream
+        # numeric comparison (and currency inference) wrong.
+        "price": _norm_price(price),
+        "availability": _norm_availability(api_product.get("available", True)),
         "original_price": api_product.get("original_price", "") or api_product.get("compare_at_price", "") or api_product.get("highPrice", ""),
         "currency": api_product.get("currency", "USD"),
         "url": api_product.get("url", "") or "",

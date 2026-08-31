@@ -32,7 +32,7 @@ def _find_site(url: str):
         return None
 
 
-def _clean_workspace(root: str, slug: str) -> None:
+def _clean_workspace(root: str, slug: str, keep_draft: bool = False) -> None:
     import shutil
 
     workspace_dir = os.path.join(root, "workspace", slug)
@@ -40,6 +40,14 @@ def _clean_workspace(root: str, slug: str) -> None:
 
     if os.path.isdir(workspace_dir):
         for fname in os.listdir(workspace_dir):
+            # [wave-13 B1] ``keep_draft`` arms (re-drive re-entry) must not
+            # destroy a draft THIS job wrote — setup_workspace's mtime guard
+            # and per-job FM restore exist precisely for that work. The
+            # force_full arm keeps keep_draft=False: a user-declared full
+            # re-run must be able to kill a poisoned prior draft (job-12
+            # class), so the sledgehammer stays available there.
+            if keep_draft and fname == "scraper_draft.py":
+                continue
             fpath = os.path.join(workspace_dir, fname)
             try:
                 if os.path.isfile(fpath):
@@ -53,6 +61,12 @@ def _clean_workspace(root: str, slug: str) -> None:
     if os.path.isdir(scrapers_dir):
         for fname in os.listdir(scrapers_dir):
             if fname.startswith("output_") and fname.endswith(".json"):
+                continue
+            # [wave-13 B1] jobs/ is the per-job draft archive code_writer
+            # snapshots to the FM and setup_workspace restores from — wiping
+            # the local mirror destroyed the restore source mid-job. Never
+            # sweep it here; FM-side retention is governed by artifacts.
+            if fname == "jobs":
                 continue
             fpath = os.path.join(scrapers_dir, fname)
             try:
@@ -110,6 +124,36 @@ def _compute_rescrape_skip_flags(state, url: str):
         return False, False, False
 
 
+def _log_resume_invocation(state: ScrapeState, site_status: str, rescrape: bool) -> None:
+    """[T3.13h] One SessionLog row when this invocation reuses a prior Site.
+
+    During the 70-112 campaign, re-drives and new jobs against an EXISTING
+    site were indistinguishable in the job log — "did this run re-inject the
+    prior artifacts or start clean?" needed DB archaeology per job. Emitted
+    once, at check_tracker, before any skip-flag resolution.
+    """
+    try:
+        job_id = state.get("job_id")
+        if not job_id:
+            return
+        from ..graph import _log_event_row
+
+        _log_event_row(
+            job_id,
+            "check_tracker",
+            "[RESUME-INVOCATION] site_status={status} rescrape={rescrape} "
+            "force_full={force_full} input_mode={mode} — prior Site record "
+            "reused (not a fresh site)".format(
+                status=site_status,
+                rescrape=rescrape,
+                force_full=bool(state.get("force_full")),
+                mode=state.get("input_mode", ""),
+            ),
+        )
+    except Exception:
+        pass
+
+
 def check_tracker(state: ScrapeState) -> Command:
     """Read the Site model, set skip-flags, and route appropriately.
 
@@ -135,6 +179,8 @@ def check_tracker(state: ScrapeState) -> Command:
 
     if site is None:
         return _handle_new_site(url, slug, site_type)
+
+    _log_resume_invocation(state, site.status, rescrape)
 
     # ── Selective rescrape: skip stages whose inputs didn't change ───────
     # Instead of wiping + re-running everything, compute a config diff vs the
@@ -332,7 +378,9 @@ def _handle_in_progress(site, slug: str, root: str, input_mode: str = "") -> Com
         logger.info(
             "check_tracker: navigation mode — starting fresh (ignoring cached artifacts)"
         )
-        _clean_workspace(root, slug)
+        # keep_draft: a watchdog re-drive of a navigation job must not lose the
+        # draft its own writer already produced (jobs-79/80 class).
+        _clean_workspace(root, slug, keep_draft=True)
         return Command(
             update={
                 "site_status": "in_progress",                "skip_site_analysis": False,
@@ -384,7 +432,7 @@ def _handle_in_progress(site, slug: str, root: str, input_mode: str = "") -> Com
         )
 
     logger.info("check_tracker: no artifacts for %s, starting from scratch", slug)
-    _clean_workspace(root, slug)
+    _clean_workspace(root, slug, keep_draft=True)
 
     return Command(
         update={

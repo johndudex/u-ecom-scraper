@@ -89,11 +89,23 @@ def _state(**extra):
 
 
 class TestForceFullInCheckTracker:
-    def test_force_full_wipes_and_regenerates_despite_completed_twin(self, tmp_path):
+    def test_force_full_wipes_and_regenerates_despite_completed_twin(self, tmp_path, monkeypatch):
         """The core contract: identical completed twin + force_full → NO skip
         flags, archive + workspace wiped, output history kept."""
+        import agents.graph as _graph
         from webapp.agents.nodes.check_tracker import check_tracker
 
+        # _state() deliberately uses a nonexistent job_id (999) — the [T3.13h]
+        # RESUME-INVOCATION row would violate the SessionLog FK at teardown.
+        # Patch BOTH package aliases: this file imports webapp.agents.*, whose
+        # relative ``..graph`` resolves to webapp.agents.graph, not agents.graph.
+        monkeypatch.setattr(_graph, "_log_event_row", lambda *a, **k: None)
+        try:
+            import webapp.agents.graph as _graph_wa
+
+            monkeypatch.setattr(_graph_wa, "_log_event_row", lambda *a, **k: None)
+        except ImportError:
+            pass
         ctx = _make_site_and_prior_job(tmp_path)
         _plant_stale_artifacts(tmp_path)
         with ctx:
@@ -110,11 +122,19 @@ class TestForceFullInCheckTracker:
         # Output history preserved.
         assert (tmp_path / "scrapers" / "full-rerun-example" / "output_2026-08-29_000000.json").exists()
 
-    def test_no_force_full_still_skips_selectively(self, tmp_path):
+    def test_no_force_full_still_skips_selectively(self, tmp_path, monkeypatch):
         """Without the flag the selective diff is untouched: identical twin →
         everything skipped, archive preserved for re-hydration."""
+        import agents.graph as _graph
         from webapp.agents.nodes.check_tracker import check_tracker
 
+        monkeypatch.setattr(_graph, "_log_event_row", lambda *a, **k: None)
+        try:
+            import webapp.agents.graph as _graph_wa
+
+            monkeypatch.setattr(_graph_wa, "_log_event_row", lambda *a, **k: None)
+        except ImportError:
+            pass
         ctx = _make_site_and_prior_job(tmp_path)
         _plant_stale_artifacts(tmp_path)
         with ctx:

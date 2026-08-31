@@ -90,7 +90,8 @@ PRODUCT_FIELDS = (
     FieldDef("title", "Title", "text", required=True, jsonld_key="name"),
     FieldDef("price", "Price", "text", required=True, jsonld_key="offers.price"),
     FieldDef("availability", "Availability", "text", jsonld_key="offers.availability",
-             notes="Normalize to 'In Stock' / 'Out of Stock'"),
+             notes="Normalize to 'in_stock' / 'out_of_stock' (template "
+                   "normalizers emit these exact tokens)"),
     FieldDef("original_price", "Original Price", "text", jsonld_key="offers.highPrice",
              notes="Only map if a separate was/compare-at price exists"),
     FieldDef("currency", "Currency", "text", jsonld_key="offers.priceCurrency",

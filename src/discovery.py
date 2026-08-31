@@ -76,6 +76,7 @@ __all__ = [
     "click_load_more",
     "build_page_param_url",
     "find_next_button_url",
+    "pdp_candidates",
     "DEFAULT_LOAD_MORE_SELECTORS",
     "DEFAULT_NEXT_BUTTON_SELECTORS",
 ]
@@ -397,6 +398,102 @@ def _merge_new(accumulated: list[str], seen: set[str], new_urls: list[str]) -> i
             accumulated.append(u)
             added += 1
     return added
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PDP-LIKENESS — the shape filter for runs with NO site URL pattern.
+#
+# The extraction callback is supposed to own link quality (that is the contract
+# above), but a listing page whose item links are indistinguishable from its nav
+# links yields a candidate set polluted with category/cart/account URLs, which
+# then get scraped as items (0-field rows) or starve Phase 2. When the caller
+# HAS a pattern (``url_filter``), that wins — never apply both to the same set.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Path segments that read "item detail page".
+_PDP_SEGMENTS = frozenset({
+    "product", "products", "item", "items", "pdp", "dp", "p", "prod", "sku",
+})
+# Substrings that read the same way (platform-specific shapes: Magento
+# ``/catalog/product/view``, Amazon ``/dp/``, ``-p-1234`` style ids, ``.html``
+# PDP suffixes).
+_PDP_SUBSTRINGS = (
+    "/product/", "/products/", "/item/", "/dp/", "/p/", "-p-", ".html", ".htm",
+)
+# Segments/params that read "listing, nav or utility page" — the junk a
+# permissive anchor selector drags in.
+_PDP_NEGATIVE_SEGMENTS = frozenset({
+    "category", "categories", "collection", "collections", "list", "listing",
+    "search", "results", "shop", "brand", "brands", "sitemap", "cart",
+    "checkout", "account", "login", "register", "wishlist", "compare", "blog",
+    "news", "about", "contact", "help", "faq", "store", "stores", "page",
+})
+# SFCC ``cgid``/``start``/``sz``, facet/sort/paging params — a PDP never needs
+# them, a listing almost always has one.
+_PDP_NEGATIVE_PARAMS = frozenset({
+    "cgid", "start", "sz", "offset", "page", "pagenumber", "q", "query", "s",
+    "sort", "filter", "ref", "sessionid", "gclid", "utm_source",
+})
+
+
+def _pdp_score(url: str) -> int:
+    """Heuristic PDP-likeness of ``url`` — higher is more item-like.
+
+    Positive signals: product-ish path segment, a platform PDP shape
+    (``/dp/``, ``-p-``, ``.html``), deeper paths. Negative: listing/nav
+    segments and listing/facet query params. 0 = no signal either way (kept —
+    only an explicit NEGATIVE is enough to drop a URL).
+    """
+    try:
+        parsed = urlparse(url)
+        path = (parsed.path or "").lower()
+        params = {k.lower() for k, _v in parse_qsl(parsed.query, keep_blank_values=True)}
+    except Exception:  # unparseable → no positive signal, no penalty
+        return 0
+
+    segments = [seg for seg in path.split("/") if seg]
+    score = 0
+    if any(seg in _PDP_SEGMENTS for seg in segments):
+        score += 2
+    if any(marker in path for marker in _PDP_SUBSTRINGS):
+        score += 2
+    if len(segments) >= 3 and score > 0:
+        score += 1
+    if any(seg in _PDP_NEGATIVE_SEGMENTS for seg in segments):
+        score -= 2
+    if params & _PDP_NEGATIVE_PARAMS:
+        score -= 1
+    return score
+
+
+def pdp_candidates(urls: list, min_score: int = 0) -> list:
+    """The PDP-like subset of ``urls``, order-preserving.
+
+    Runs ONLY when the caller has no ``url_filter`` — with one, the site's own
+    product-URL pattern is the better signal and the two must never both apply
+    (double-filtering the same set with unrelated rules).
+
+    Defensive: when NOTHING clears ``min_score`` the input is returned
+    unchanged. The heuristic is a guess about an unknown site; emptying a
+    yield on a guess would turn a working crawl into a zero-discovery failure
+    (the exact class this is meant to reduce).
+    """
+    candidates = [u for u in urls if u]
+    if not candidates:
+        return candidates
+    kept = [u for u in candidates if _pdp_score(u) >= min_score]
+    if not kept:
+        logger.info(
+            "pdp_candidates: %s candidates, none scored >= %s — keeping all",
+            len(candidates), min_score,
+        )
+        return candidates
+    if len(kept) != len(candidates):
+        logger.info(
+            "pdp_candidates: kept %s of %s candidates (min_score=%s)",
+            len(kept), len(candidates), min_score,
+        )
+    return kept
 
 
 def _discovery_goto(page: Any, url: str, cfg: DiscoveryConfig,

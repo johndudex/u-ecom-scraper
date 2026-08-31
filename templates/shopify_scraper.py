@@ -92,6 +92,61 @@ def clean_html(html_str: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# ── FIELD NORMALIZERS — inline on purpose, NOT a src import ──────────────────
+# Drafts execute in the browser-service image: a NEW src import would ImportError
+# there until that image is rebuilt, so the ~25 lines live in each python-side
+# template verbatim (playwright/UC normalize in-page via JS and don't need them).
+
+def _norm_price(value) -> Optional[str]:
+    """Strip currency symbols/whitespace from a price.
+
+    "£1,234.56" → "1234.56", "1.234,56 €" → "1234.56", 24.99 (a JSON-LD
+    number) → "24.99". Returns None when no digits are present — an
+    unparseable price is EMPTY, never zero (0 would read as a real product
+    priced at nothing). The currency stays in its own ``currency`` field.
+    """
+    if value is None:
+        return None
+    cleaned = re.sub(r"[^\d.,-]", "", str(value).strip())
+    if not re.search(r"\d", cleaned):
+        return None
+    if "," in cleaned and "." in cleaned:
+        # Both separators present: whichever comes LAST is the decimal one.
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        # "1,234" (grouping) vs "1,5" (decimal comma): a comma followed by
+        # exactly three digits is grouping, anything else is a decimal comma.
+        cleaned = re.sub(r",(?=\d{3}(?:\D|$))", "", cleaned).replace(",", ".")
+    return cleaned
+
+
+def _norm_availability(value) -> Optional[str]:
+    """Normalize availability to ``in_stock`` / ``out_of_stock``.
+
+    Accepts the schema.org URI form, InStock / In Stock / in_stock / Available
+    and their negatives. Anything unrecognised passes through lowercased —
+    availability is never invented (an unknown state is data, not an error).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "in_stock" if value else "out_of_stock"
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if "://" in text:  # e.g. http://schema.org/InStock
+        text = text.rsplit("/", 1)[-1]
+    compact = text.replace("-", "_").replace(" ", "")
+    if compact in ("in_stock", "instock", "available"):
+        return "in_stock"
+    if compact in ("out_of_stock", "outofstock", "unavailable", "sold_out", "soldout"):
+        return "out_of_stock"
+    return text
+
+
 def make_product(product_data: dict, index: int, src_url: str, status_code: int = 200) -> dict:
     first_variant = product_data.get("variants", [{}])[0] if product_data.get("variants") else {}
     price = first_variant.get("price", "")
@@ -100,9 +155,11 @@ def make_product(product_data: dict, index: int, src_url: str, status_code: int 
     return {
         "id": index,
         "title": product_data.get("title", ""),
-        "price": f"${price}" if price else "",
-        "availability": "In Stock" if first_variant.get("available", False) else "Out of Stock",
-        "original_price": f"${compare_price}" if compare_price and compare_price != price else "",
+        # Symbol-free price: baking "$" into the field makes every downstream
+        # numeric comparison (and currency inference) wrong.
+        "price": _norm_price(price) if price else "",
+        "availability": _norm_availability(first_variant.get("available", False)),
+        "original_price": _norm_price(compare_price) if compare_price and compare_price != price else "",
         "currency": "USD",
         "url": f"{SITE_URL}/products/{product_data.get('handle', '')}",
         "src_url": src_url,

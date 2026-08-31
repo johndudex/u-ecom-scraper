@@ -21,6 +21,20 @@ Two block signatures handled:
   loop). ``min_tier`` slices the ladder: 0 = none→datacenter→residential,
   1 = datacenter→residential, 2 = residential only.
 
+Two INDEPENDENT soft-block signals, deliberately kept apart:
+
+- ZERO LINKS (structural): the body is a real page whose item set is empty or
+  invisible. Only the caller can tell (it knows the page's expected anchor),
+  so it stays the discovery loop's job — see ``src/listing_discovery.py``.
+- CHALLENGE SHAPE (this module): the body is NOT the page at all — it is an
+  anti-bot challenge, consent wall or error stub served with a 200 status.
+  ``detect_soft_block`` recognises the generic shapes (challenge markers,
+  or a body under the configured minimum size) and ``fetch_page`` RETURNS a
+  falsy :class:`SoftBlock` instead of a soup. It does NOT escalate and does
+  NOT retry: one escalation owner, the caller, which already owns the tier
+  ladder. Gated by ``SCRAPER_SOFT_BLOCK_MIN_BYTES`` (default "0" = off, so
+  prod is unaffected until the env var is staged).
+
 The closure carries ``min_tier_floor`` (raised by discovery once a higher
 tier starts working) so Phase-2 item fetches reuse the tier that unblocked
 Phase 1 instead of starting unproxied again.
@@ -41,7 +55,7 @@ import logging
 import os
 import time
 from collections.abc import Callable
-from typing import Optional
+from typing import Optional, Union
 
 import requests
 from bs4 import BeautifulSoup
@@ -81,6 +95,96 @@ def resolve_tiers(
     return ladder[max(0, int(min_tier)):]
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOFT-BLOCK (challenge-shape) DETECTION
+#
+# A 200 status proves nothing: Akamai/Cloudflare/queueing pages are served with
+# 200 and a body that is not the page. These markers are deliberately GENERIC
+# and site-agnostic (no per-site tuning, no is_banned's config-driven marker
+# list — that one is empty under prod defaults, so it never fires).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Case-insensitive substrings that identify a challenge page (title, heading or
+# embedded challenge payload).
+CHALLENGE_MARKERS: tuple = (
+    "attention required",
+    "access denied",
+    "verify you are human",
+    "verifying you are human",
+    "checking your browser",
+    "just a moment",
+    "cf-chl",
+    "cf_chl",
+    "captcha",
+    "_abck",
+    "akamai",
+)
+
+SOFT_BLOCK_MIN_BYTES_ENV = "SCRAPER_SOFT_BLOCK_MIN_BYTES"
+
+
+def soft_block_min_bytes() -> int:
+    """Minimum-body floor: a listing under this many bytes is a challenge stub.
+
+    0 (the default, and what prod ships) turns the whole detector OFF — a
+    mis-set floor must never be able to reject real pages. Read per call so a
+    staged env change takes effect without a process restart.
+    """
+    raw = os.environ.get(SOFT_BLOCK_MIN_BYTES_ENV, "0")
+    try:
+        return max(0, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 0
+
+
+class SoftBlock:
+    """Falsy signal that a 200 response was a challenge, not the page.
+
+    Falsy ON PURPOSE: every existing caller already treats a falsy ``fetch_page``
+    result as "this fetch failed", so a caller that never learns about
+    :class:`SoftBlock` degrades to safe behaviour instead of trying to parse a
+    challenge page. Callers that DO check (the discovery loop) escalate the
+    proxy tier and re-fetch — ``fetch_page`` itself never does, so there is
+    exactly one escalation owner.
+    """
+
+    __slots__ = ("reason", "markers", "body_bytes")
+
+    def __init__(self, reason: str, markers: tuple = (), body_bytes: int = 0):
+        self.reason = reason
+        self.markers = tuple(markers)
+        self.body_bytes = int(body_bytes)
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return (
+            f"SoftBlock(reason={self.reason!r}, markers={self.markers!r}, "
+            f"body_bytes={self.body_bytes})"
+        )
+
+
+def detect_soft_block(text: str) -> Optional[SoftBlock]:
+    """Challenge-shape detector for an HTTP 200 body. ``None`` = looks real.
+
+    Two shapes, either of which trips it:
+    - a generic challenge marker in the body;
+    - a body smaller than the ``SCRAPER_SOFT_BLOCK_MIN_BYTES`` floor (the
+      zero-item-anchor check, approximated: no real listing is that small).
+    """
+    floor = soft_block_min_bytes()
+    if floor <= 0 or not text:
+        return None
+    lowered = text.lower()
+    hits = tuple(m for m in CHALLENGE_MARKERS if m in lowered)
+    if hits:
+        return SoftBlock("challenge_marker", hits, len(text))
+    if len(text) < floor:
+        return SoftBlock("under_min_bytes", (), len(text))
+    return None
+
+
 def create_fetch_page(delay_s: float = 2.0, headers: Optional[dict] = None) -> Callable:
     """Build a ``fetch_page(url, min_tier=0)`` closure for one scraper run.
 
@@ -116,7 +220,9 @@ def create_fetch_page(delay_s: float = 2.0, headers: Optional[dict] = None) -> C
             fingerprint_enabled = False
             curl_session = None
 
-    def fetch_page(url: str, min_tier: int = 0) -> Optional[tuple[BeautifulSoup, int]]:
+    def fetch_page(
+        url: str, min_tier: int = 0
+    ) -> Optional[Union[tuple[BeautifulSoup, int], SoftBlock]]:
         floor = int(getattr(fetch_page, "min_tier_floor", 0))
         tiers = resolve_tiers(
             max(min_tier, floor), escalation, fingerprint_tier=fingerprint_enabled
@@ -161,6 +267,19 @@ def create_fetch_page(delay_s: float = 2.0, headers: Optional[dict] = None) -> C
                         verify=ssl_verify,
                     )
                     if response.status_code == 200:
+                        # 200 is not proof of success: challenge pages ship as
+                        # 200. Report the block and return — NO retry, NO tier
+                        # escalation here (the caller owns the ladder; see
+                        # discover_listing_urls). Off entirely unless
+                        # SCRAPER_SOFT_BLOCK_MIN_BYTES is staged.
+                        block = detect_soft_block(response.text)
+                        if block is not None:
+                            logger.warning(
+                                "SOFT BLOCK (200) on tier '%s' for %s — %s; "
+                                "returning the signal for the caller to escalate",
+                                tier, url[:80], block,
+                            )
+                            return block
                         return BeautifulSoup(response.text, "html.parser"), 200
                     if proxy_config.is_banned(response.status_code, response.text):
                         logger.warning(

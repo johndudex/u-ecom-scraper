@@ -43,6 +43,9 @@ import time
 from collections.abc import Callable
 from urllib.parse import urlencode, urljoin
 
+from src.discovery import pdp_candidates
+from src.http_fetch import SoftBlock
+
 logger = logging.getLogger(__name__)
 
 # Stop reasons that mean "ran out of listing" rather than "could not see the
@@ -102,6 +105,11 @@ def listing_yield_failure(cov: dict | None) -> bool:
     found = cov.get("found")
     if found is None and isinstance(cov.get("coverage"), dict):
         # Probe-yield shape: the full coverage dict rides along nested.
+        # NOTE: ``found`` only means something on a run that EXTRACTED — a
+        # --discover-only probe's found is 0 by construction, so the probe
+        # caller (graph._probe_yield_dead) nulls it before calling this
+        # predicate. A literal nested 0 from any other caller keeps the old
+        # zero-usable-yield verdict.
         found = cov["coverage"].get("found")
     try:
         found_n = int(found) if found is not None else None
@@ -230,7 +238,11 @@ def discover_listing_urls(
     page's usable product URLs (absolute, site-filtered) — the ONLY
     site-adaptable part. ``url_filter`` (optional regex) additionally gates
     JSON-LD ItemList candidates so hidden-SSR discovery respects the same
-    product-URL shape the anchors do.
+    product-URL shape the anchors do — and the anchor results themselves (a
+    permissive selector must not ship nav/category links the pattern excludes).
+    With NO ``url_filter`` the generic PDP-likeness partition
+    (``src.discovery.pdp_candidates``) is the only shape signal applied, and it
+    runs instead of — never alongside — ``url_filter``.
 
     Returns ``(urls, discovery_meta)``; ``discovery_meta`` carries the
     signals the discovery-coverage gate reads (contract §1/§2):
@@ -290,7 +302,15 @@ def discover_listing_urls(
             logger.info(f"Fetching listing page {page}: {paginated_url}")
 
             result = fetch_page(paginated_url, min_tier)
-            if not result:
+            # [job-58 birkenstock] A 200-wrapped challenge is NOT a navigation
+            # failure: the fetch succeeded, the body is just not the listing.
+            # fetch_page reports the challenge shape (see
+            # src.http_fetch.detect_soft_block) and THIS loop escalates — a
+            # soft block is handled exactly like a page that yielded zero
+            # links, so the existing escalation branch below stays the single
+            # recovery owner.
+            soft_blocked = isinstance(result, SoftBlock)
+            if not result and not soft_blocked:
                 # HTTP error / 429-502-503 / connection failure / rate-limit bail.
                 # This is NOT exhaustion — the loop gave up (H4). navigate_error
                 # is sticky: if any listing failed, the gate must FAIL.
@@ -299,19 +319,39 @@ def discover_listing_urls(
                 break
             pages_fetched += 1
 
-            soup, _ = result
-            page_urls = list(extract_fn(soup))
-            anchors_served = len(soup.find_all("a"))
-            extraction_mode = "anchors"
+            if soft_blocked:
+                soup = None
+                page_urls = []
+                anchors_served = 0
+                extraction_mode = "soft_block"
+            else:
+                soup, _ = result
+                page_urls = list(extract_fn(soup))
+                anchors_served = len(soup.find_all("a"))
+                extraction_mode = "anchors"
+                # Link quality: the site's own product-URL pattern gates BOTH
+                # sources of candidates — the anchors extract_fn returns and
+                # the hidden-SSR ItemList fallback below. Anchors used to be
+                # trusted unconditionally, so a permissive selector shipped
+                # nav/category links the regex was written to exclude.
+                if url_filter is not None:
+                    page_urls = [u for u in page_urls if url_filter.search(u)]
+                elif page_urls:
+                    # No site pattern known → the generic PDP-likeness
+                    # partition is the only remaining shape signal. NEVER both:
+                    # with a url_filter present this partition does not run.
+                    page_urls = pdp_candidates(page_urls)
 
             # Hidden-SSR fallback: a 200 page whose grid hydrates client-side
             # still embeds its item set as a JSON-LD ItemList. Check it BEFORE
             # declaring the page empty (and before burning a proxy tier on
             # what is not a block at all).
-            if not page_urls:
+            if soup is not None and not page_urls:
                 candidates = jsonld_item_urls(soup, paginated_url)
                 if url_filter is not None:
                     candidates = [u for u in candidates if url_filter.search(u)]
+                elif candidates:
+                    candidates = pdp_candidates(candidates)
                 if candidates:
                     page_urls = candidates
                     extraction_mode = "jsonld_itemlist"

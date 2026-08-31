@@ -73,6 +73,20 @@ def update_probe_result(result: dict) -> None:
         return
     _ctx["probe_method"] = method
     _ctx["anti_bot"] = bool(result.get("blocked", False))
+    # T3.6: same stealth fallback set_tool_context applies — if the ONLY
+    # working access method is a stealth browser, vanilla access was blocked
+    # even without an explicit anti-bot flag. ``fingerprint_*`` (curl_cffi TLS
+    # impersonation) is deliberately NOT here: it is HTTP-flavoured, and the
+    # http_fetch proxy ladder — not the cloak browser — owns those sites.
+    if not _ctx["anti_bot"]:
+        try:
+            from ..constants import STEALTH_METHOD_PREFIXES
+
+            if str(method).startswith(STEALTH_METHOD_PREFIXES):
+                _ctx["anti_bot"] = True
+        except Exception:
+            if str(method).startswith(("uc_chrome", "cloak")):
+                _ctx["anti_bot"] = True
 
 
 def clear_tool_context() -> None:

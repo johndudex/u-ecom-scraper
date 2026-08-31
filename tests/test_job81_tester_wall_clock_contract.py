@@ -351,10 +351,13 @@ class TestEscalationRouting:
         from agents.nodes.route_after_testing import route_after_testing
 
         # A fresh PASS verdict overrides the historical counter — the draft
-        # was judged; route on the verdict.
+        # was judged; route on the verdict. [wave-13] The verdict must carry
+        # extraction evidence (nonzero count): a zero-item PASS is the
+        # phantom-PASS class and stays rejected.
         assert route_after_testing({
             "test_report": {"overall_assessment": "PASS",
-                            "confidence_score": 0.95, "issues": []},
+                            "confidence_score": 0.95, "issues": [],
+                            "results": {"successful_extractions": 12}},
             "test_retry_count": 0, "tester_wall_clock_timeouts": 2,
         }) == "field_confirmation"
 

@@ -181,6 +181,41 @@ def build_proxy_url(tier: str, config: Optional[ProxyConfig] = None, country: Op
     return f"http://{username}:{password}@{host}:{port}"
 
 
+def build_playwright_proxy(
+    tier: str, config: Optional[ProxyConfig] = None, country: Optional[str] = None
+) -> Optional[dict]:
+    """Build Playwright's ``launch(proxy=...)`` dict for the given tier.
+
+    Playwright (like Chromium itself) ignores credentials embedded in the
+    ``server`` URL, so the creds ride in their own keys:
+
+        {"server": "http://host:port", "username": ..., "password": ...}
+
+    Shipping ``{"server": "http://user:pass@host:port"}`` instead is the
+    net::ERR_INVALID_AUTH_CREDENTIALS / 407 class (every request through the
+    proxy is challenged and nothing ever answers). Mirrors
+    ``browser_service/config.py:ProxyConfig.build_playwright_proxy`` — the same
+    3-key shape the probe ladder already uses. Returns None when the tier has
+    no host/username (caller runs unproxied).
+    """
+    if config is None:
+        config = get_proxy_config()
+    tier_data = config.config.get(tier, {})
+    host = tier_data.get("host")
+    username = tier_data.get("username")
+    password = tier_data.get("password")
+    port = tier_data.get("port")
+    if not host or not username:
+        return None
+    if country:
+        username = f"{username}-country-{country}"
+    return {
+        "server": f"http://{host}:{port}",
+        "username": username,
+        "password": password,
+    }
+
+
 def should_warn_residential(tier: str, config: Optional[ProxyConfig] = None) -> bool:
     """Check if using residential proxy should trigger a warning."""
     if tier != "residential":

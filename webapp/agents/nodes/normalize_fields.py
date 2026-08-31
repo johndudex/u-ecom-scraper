@@ -168,6 +168,30 @@ def _deterministic_job_mapping(analysis: dict, content_type_config: dict) -> dic
     return out
 
 
+def _verify_mappings(slug: str, state: ScrapeState, analysis: dict) -> dict:
+    """[T2.7] Exercise every mapped field source against ONE live render of the
+    sample page (src.field_verification). Mutates analysis["fields"][*]
+    (tested / resolved_value) and stores the summary at
+    analysis["field_verification"] so code_writer sees VERIFIED mappings instead
+    of guesses. Strictly additive: any failure returns the analysis unchanged.
+    """
+    try:
+        from src.field_verification import verify_enabled, verify_field_mappings
+    except Exception as exc:
+        logger.debug("normalize_fields: field_verification unavailable: %s", exc)
+        return {}
+    if not verify_enabled():
+        return {}
+    try:
+        analysis, summary = verify_field_mappings(slug, state, analysis)
+        if summary:
+            analysis["field_verification"] = summary
+    except Exception as exc:
+        logger.warning("normalize_fields: field verification errored (no-op): %s", exc)
+        return {}
+    return summary
+
+
 def normalize_fields(state: ScrapeState) -> dict[str, Any]:
     slug = state["site_slug"]
     analysis = _load_analysis(slug)
@@ -191,6 +215,7 @@ def normalize_fields(state: ScrapeState) -> dict[str, Any]:
             merged = _merge_fields(existing_fields, job_mapped, DIRECT_FIELDS)
             merged = _prune_to_schema(merged, state)
             analysis["fields"] = merged
+            _verify_mappings(slug, state, analysis)
             _save_analysis(slug, analysis)
             logger.info(
                 "normalize_fields: job fields mapped via resolver: %s",
@@ -208,6 +233,7 @@ def normalize_fields(state: ScrapeState) -> dict[str, Any]:
     merged = _merge_fields(existing_fields, {}, DIRECT_FIELDS)
     merged = _prune_to_schema(merged, state)
     analysis["fields"] = merged
+    _verify_mappings(slug, state, analysis)
     _save_analysis(slug, analysis)
 
     logger.info(
