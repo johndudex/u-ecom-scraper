@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from collections.abc import Callable
 from urllib.parse import urlencode, urljoin
@@ -185,6 +186,18 @@ def discover_listing_urls(
     floor = int(getattr(fetch_page, "min_tier_floor", 0))
     tiers_total = int(getattr(fetch_page, "tiers_total", 1))
 
+    # [job-316 citybeach] Probe page cap: the test-time discovery probe only
+    # needs to know whether this listing yields item URLs, not walk a deep
+    # catalogue (citybeach: 29 pages ≈ 8 min — the probe's 180s bound could
+    # never reach a verdict, so the Phase-2 zero-yield gate ran blind exactly
+    # on the biggest catalogues). The probe sets SCRAPER_DISCOVERY_MAX_PAGES;
+    # template callers pass explicit max_pages (or none) and are unaffected.
+    if max_pages is None:
+        try:
+            max_pages = int(os.environ.get("SCRAPER_DISCOVERY_MAX_PAGES") or 0) or None
+        except ValueError:
+            max_pages = None
+
     # Enumerate every listing/category URL, paginating each until exhausted.
     # Dedupe across listings via `seen`. For a single-listing site this is
     # identical to a plain ?page=N loop.
@@ -317,6 +330,7 @@ def discover_listing_urls(
     discovery_meta = {
         "stop_reason": stop_reason,
         "max_pages_hit": stop_reason == "max_pages_hit",
+        "page_cap": max_pages,
         "discovered_urls": len(all_urls),
         "soft_block_escalations": soft_block_escalations,
         "pages_fetched": pages_fetched,

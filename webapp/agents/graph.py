@@ -4099,6 +4099,13 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
 
 
 _PROBE_EXHAUSTION_STOP_REASONS = ("short_page", "no_next_link", "no_new_items")
+# [job-316 citybeach] Page cap the discovery probe hands every --discover-only
+# run (local env and browser_service env_overrides). The probe's verdict is
+# "does this listing yield item URLs" — 3 pages answers that in ~1 min where a
+# full 29-page walk blew the probe's 180s bound and left the Phase-2 gate
+# blind on deep catalogues. src.listing_discovery honors it only when the
+# caller passes no explicit max_pages.
+_PROBE_DISCOVERY_PAGE_CAP = "3"
 
 
 def _normalize_probe_stop_reason(stop_reason: str) -> str:
@@ -4191,11 +4198,9 @@ def _probe_phase1_discovery(
                     _probe_env_candidate = ""
             except Exception:
                 pass
-        _probe_env = (
-            {**os.environ, "SCRAPER_LISTING_URL": _probe_env_candidate}
-            if _probe_env_candidate
-            else None
-        )
+        _probe_env = {**os.environ, "SCRAPER_DISCOVERY_MAX_PAGES": _PROBE_DISCOVERY_PAGE_CAP}
+        if _probe_env_candidate:
+            _probe_env["SCRAPER_LISTING_URL"] = _probe_env_candidate
         logger.info(
             "_probe_phase1_discovery: running --discover-only (job %s, listing=%s)",
             job_id, (_probe_env_candidate or "<draft default>")[:80],
@@ -4239,8 +4244,13 @@ def _probe_phase1_discovery(
                         "timeout": 180,
                         "max_retries": 1,
                         # C2: execution-conditions listing for browser drafts too.
-                        **({"env_overrides": {"SCRAPER_LISTING_URL": _probe_env_candidate}}
-                           if _probe_env_candidate else {}),
+                        # The page cap rides along so browser drafts probe fast
+                        # for the same reason local ones do.
+                        **({"env_overrides": {
+                            **({"SCRAPER_LISTING_URL": _probe_env_candidate}
+                               if _probe_env_candidate else {}),
+                            "SCRAPER_DISCOVERY_MAX_PAGES": _PROBE_DISCOVERY_PAGE_CAP,
+                        }}),
                     },
                     timeout=180 + 60,
                 )
