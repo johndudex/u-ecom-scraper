@@ -245,9 +245,63 @@ def setup_workspace(state: ScrapeState) -> dict[str, Any]:
     if state.get("skip_code_generation"):
         skip_files.add("scraper_draft.py")
 
+    # [jobs-79/80] A watchdog re-drive of the SAME job must not destroy the
+    # job's own in-flight work: on a first-time site no skip_* flags are set,
+    # so the wipe below deleted `scraper_draft.py` that this job's writer had
+    # written (and the tester had already validated) — the re-drive then
+    # depended on a code_writer no-op regenerating it, 3 tester cycles
+    # CRASHed on the missing file, and the job died "cascade exhausted" with
+    # a working draft it had owned an hour earlier. A draft written after
+    # THIS job was created is live work, not stale cross-run residue; older
+    # drafts (prior jobs / user full re-runs, new created_at) still wipe.
+    # discovered_urls_checkpoint.json is deliberately NOT protected — the H3
+    # contamination bug depends on it never surviving into a fresh run.
+    _job_created = None
+    try:
+        from scraper.models import ScrapeJob
+
+        _job = ScrapeJob.objects.filter(pk=state.get("job_id")).only("created_at").first()
+        if _job is not None:
+            _job_created = _job.created_at.timestamp()
+    except Exception as exc:
+        logger.warning("setup_workspace: could not read job created_at: %s", exc)
+    _draft_in_ws = os.path.join(workspace_dir, "scraper_draft.py")
+    if not state.get("skip_code_generation") and os.path.isfile(_draft_in_ws) and _job_created:
+        try:
+            if os.path.getmtime(_draft_in_ws) >= _job_created - 60:
+                skip_files.add("scraper_draft.py")
+                logger.info(
+                    "setup_workspace: preserving scraper_draft.py written by THIS job "
+                    "(mtime >= job created_at) — watchdog re-drive, not stale residue"
+                )
+        except OSError:
+            pass
+
     removed = _clean_stale_artifacts(workspace_dir, skip_files)
     if removed:
         logger.info("setup_workspace: cleaned %d stale artifacts from %s", removed, slug)
+
+    # [jobs-79/80] If the draft is gone anyway (worker volume was recycled —
+    # Railway redeploys wipe the ephemeral FS), restore THIS job's own archive:
+    # code_writer snapshots every draft it completes to
+    # scrapers/{slug}/jobs/scraper-draft-{job_id}.py. The key is per-job, so a
+    # fresh user re-run (new job id) can never inherit a stale draft from it.
+    if not os.path.isfile(_draft_in_ws) and state.get("job_id"):
+        try:
+            import src.artifacts as artifacts
+
+            _per_job_key = artifacts.scrapers_key(
+                slug, "jobs", f"scraper-draft-{state.get('job_id')}.py"
+            )
+            if artifacts.exists(_per_job_key):
+                with open(_draft_in_ws, "wb") as _f:
+                    _f.write(artifacts.read(_per_job_key))
+                logger.info(
+                    "setup_workspace: restored scraper_draft.py from THIS job's FM "
+                    "draft archive (job %s)", state.get("job_id"),
+                )
+        except Exception as exc:
+            logger.warning("setup_workspace: per-job draft restore failed: %s", exc)
 
     if state.get("skip_code_generation"):
         draft_in_ws = os.path.join(workspace_dir, "scraper_draft.py")
