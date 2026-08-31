@@ -319,6 +319,134 @@ def _extended_wall_clock_deadline(
     return min(max(deadline, proposed), started_at + max_total)
 
 
+def _distinct_same_domain_listing(state: ScrapeState, primary_listing: str) -> str:
+    """[job-77 RC1] The navigator-promoted listing, when it is a DIFFERENT
+    same-domain URL than the one execution just used.
+
+    Returns "" when there is nothing better to try: no navigation analysis,
+    no discovery.listing_url, cross-domain (F17), or identical to the
+    primary. Mirrors the F6 probe retry's candidate discipline.
+    """
+    import os as _os
+
+    nav = state.get("navigation_analysis") or {}
+    disc = (nav.get("discovery") if isinstance(nav, dict) else None) or {}
+    alt = (disc.get("listing_url") if isinstance(disc, dict) else "") or ""
+    alt = str(alt).strip()
+    primary = str(primary_listing or "").strip()
+    if not alt or not primary or alt == primary:
+        return ""
+    job_reg = _registrable_of(state.get("url", ""))
+    alt_reg = _registrable_of(alt)
+    if job_reg and alt_reg and alt_reg != job_reg:
+        return ""
+    return alt
+
+
+def _args_with_listing_url(base_args: list, alt_url: str) -> list:
+    """Swap the value after an existing ``--listing-url`` flag, or append the
+    flag pair when the primary run carried none."""
+    out = list(base_args)
+    for i, a in enumerate(out):
+        if a == "--listing-url" and i + 1 < len(out):
+            out[i + 1] = alt_url
+            return out
+    out.extend(["--listing-url", alt_url])
+    return out
+
+
+def _execution_zero_discovery(result: dict) -> bool:
+    """[job-77 RC1] Did the execution run CLEAN but discover 0 item URLs?
+
+    Only a clean zero warrants the listing fallback — a crash/timeout is a
+    code or access problem that the strategy ladder owns, not a listing
+    choice (same rule as the F6 probe retry). Reads the run's own
+    ``metadata.discovery_coverage``: ``discovered_urls == 0`` or the
+    job-58 ``empty_first_page`` stop reason.
+    """
+    output_file = (result or {}).get("output_file") or ""
+    if not output_file or not os.path.isfile(output_file):
+        return False
+    try:
+        import json as _json
+
+        with open(output_file, "r", encoding="utf-8", errors="replace") as f:
+            data = _json.load(f)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    cov = (data.get("metadata") or {}).get("discovery_coverage") or {}
+    if not isinstance(cov, dict):
+        return False
+    if str(cov.get("stop_reason") or "") == "empty_first_page":
+        return True
+    disc = cov.get("discovered_urls")
+    if isinstance(disc, list):
+        disc = len(disc)
+    try:
+        return int(disc or 0) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _maybe_retry_execution_listing(
+    result: dict,
+    state: ScrapeState,
+    primary_listing: str,
+    redispatch,
+) -> dict:
+    """[job-77 RC1] One bounded listing fallback for a clean-zero execution.
+
+    The job-310 contract injects the list_page JOB URL as the discovery
+    listing unconditionally — but when the job URL is an ITEM page (adoreme
+    job 77: …/kaia-black-2-1), discovery on it can only ever yield 0, while
+    the navigator had already verified and promoted the real listing
+    (…/bras — 107 URLs, 10 s). Testing proved the draft works; execution was
+    pointed at the one URL that cannot. Mirrors the F6 probe retry:
+    re-dispatch ONCE with the promoted same-domain listing and adopt its
+    result when it yields items. ``redispatch(alt_url)`` runs the whole
+    execution again under the caller's control (subprocess or
+    browser_service path); both attempts stay bounded at one retry.
+    """
+    try:
+        if (result or {}).get("execution_status") == "FAILED":
+            return result
+        if not _execution_zero_discovery(result):
+            return result
+        alt = _distinct_same_domain_listing(state, primary_listing)
+        if not alt:
+            return result
+        logger.warning(
+            "run_execution: clean zero (0 discovered URLs) under listing %s — "
+            "retrying ONCE with the navigator-promoted listing %s [job-77 RC1]",
+            str(primary_listing)[:80], alt[:80],
+        )
+        retry_result = redispatch(alt)
+        if not isinstance(retry_result, dict) or not retry_result:
+            return result
+        _n = int(retry_result.get("product_count") or 0)
+        if _n > 0:
+            logger.info(
+                "run_execution: listing fallback produced %d items (primary "
+                "had 0) — adopting the retry result", _n,
+            )
+            retry_result["listing_fallback"] = {
+                "primary_listing": primary_listing, "fallback_listing": alt,
+                "adopted": True,
+            }
+            return retry_result
+        # The fallback also yielded nothing — keep the primary result (the
+        # honest zero now rests on evidence from BOTH listings).
+        logger.warning(
+            "run_execution: listing fallback also produced 0 items — keeping "
+            "the primary (honest zero, both listings tried)"
+        )
+    except Exception as exc:
+        logger.warning("run_execution: listing fallback skipped: %s", exc)
+    return result
+
+
 def run_execution(state: ScrapeState) -> dict:
     from ..graph import _notify_phase
 
@@ -582,6 +710,15 @@ def run_execution(state: ScrapeState) -> dict:
         # uses the SAME value the in-process path would (single source of truth).
         _state_bs = dict(state)
         _state_bs["_listing_url_env"] = _listing_url_env
+
+        def _redispatch_browser(alt_url: str) -> dict:
+            _bs = dict(state)
+            _bs["_listing_url_env"] = alt_url
+            return _run_via_browser_service(
+                scraper_path, _args_with_listing_url(args, alt_url),
+                site_folder, _bs,
+            )
+
         result = _run_via_browser_service(scraper_path, args, site_folder, _state_bs)
 
         # MULTI-SOURCE: for navigation jobs, also run the scraper against
@@ -593,14 +730,31 @@ def run_execution(state: ScrapeState) -> dict:
                 _state_bs, scraper_path, args, site_folder, result, search_criteria
             )
 
-        return result
+        # [job-77 RC1] bounded listing fallback on a clean zero (see helper).
+        return _maybe_retry_execution_listing(
+            result, state, _listing_url_env or _working_url, _redispatch_browser
+        )
 
-    return _run_in_process(
+    def _redispatch_inprocess(alt_url: str) -> dict:
+        return _run_in_process(
+            scraper_path, _args_with_listing_url(args, alt_url),
+            root, site_folder, workspace_folder, job_id=job_id,
+            env_overrides=_stealth_env(state),
+            listing_url_env=alt_url,
+            input_mode=input_mode,
+            target_fields=list(state.get("target_fields") or []),
+        )
+
+    result = _run_in_process(
         scraper_path, args, root, site_folder, workspace_folder, job_id=job_id,
         env_overrides=_stealth_env(state),
         listing_url_env=_listing_url_env,
         input_mode=input_mode,
         target_fields=list(state.get("target_fields") or []),
+    )
+    # [job-77 RC1] bounded listing fallback on a clean zero (see helper).
+    return _maybe_retry_execution_listing(
+        result, state, _listing_url_env or _working_url, _redispatch_inprocess
     )
 
 
