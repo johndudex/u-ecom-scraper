@@ -9,6 +9,7 @@ import logging
 import os
 import shlex
 import subprocess
+import time
 from typing import Optional
 
 import httpx
@@ -25,6 +26,12 @@ BROWSER_SERVICE_URL = os.environ.get(
     "BROWSER_SERVICE_URL", "http://browser_service:8001"
 )
 SCRAPER_HTTP_TIMEOUT = int(os.environ.get("SCRAPER_HTTP_TIMEOUT", "7200"))
+
+# [job-81] Floor for browser-based scraper runs. Exported so the graph can
+# derive the code_tester invocation window from the SAME constant — the
+# tester's prompt mandates up to two blocking runs (discovery + sample), so
+# its wall clock must be derived from this floor, not hand-tuned beside it.
+BROWSER_RUN_TIMEOUT_FLOOR = int(os.environ.get("BROWSER_RUN_TIMEOUT_FLOOR", "600"))
 
 BROWSER_IMPORTS = {
     "seleniumbase",
@@ -195,9 +202,43 @@ def get_shell_tools(
         # multi-page walk + samples with headroom; /scrape accepts up to 7200s
         # and the httpx margin (+60s) scales with it. The runner does NOT retry
         # timeouts, so the worst case is one bounded 660s wait. HTTP unaffected.
-        if needs_browser and timeout < 600:
-            logger.info("run_scraper: flooring browser timeout %ds → 600s", timeout)
-            timeout = 600
+        if needs_browser and timeout < BROWSER_RUN_TIMEOUT_FLOOR:
+            logger.info(
+                "run_scraper: flooring browser timeout %ds → %ds",
+                timeout, BROWSER_RUN_TIMEOUT_FLOOR,
+            )
+            timeout = BROWSER_RUN_TIMEOUT_FLOOR
+
+        # [job-81 N-B] Honesty guard: a blocking browser run that CANNOT finish
+        # inside the invoking agent's remaining wall clock must not be launched
+        # — job 81's tester launched a 600s-floored run with 370s of window
+        # left, the invocation was abandoned mid-flight, and the run's result
+        # was lost with it. Skip with an explicit marker the agent can report
+        # truthfully (phases_tested=false) instead of a silent loss. No
+        # deadline known (e.g. run_execution) → guard stays dormant.
+        if needs_browser:
+            try:
+                from agents.tools.context import get_tool_deadline
+
+                _deadline = get_tool_deadline()
+            except Exception:
+                _deadline = None
+            if _deadline is not None:
+                _remaining = _deadline - time.time()
+                if _remaining < timeout + 90:  # run + httpx margin + staging
+                    logger.warning(
+                        "run_scraper: SKIPPING browser run — needs ~%ds but only "
+                        "~%ds left before the agent wall clock (%.0fs)",
+                        timeout, max(int(_remaining), 0), _remaining,
+                    )
+                    return (
+                        f"SKIPPED: insufficient wall clock — this browser run "
+                        f"needs ~{timeout}s but only ~{max(int(_remaining), 0)}s "
+                        f"remain before the agent invocation's hard timeout. The "
+                        f"phase was NOT tested. Do not retry it in this "
+                        f"invocation; record honestly in the report which phases "
+                        f"ran and which were skipped."
+                    )
 
         # Write a heartbeat SessionLog entry so the watchdog sees activity
         # during long scraper runs (UC Chrome + residential proxy can take 5+ min)

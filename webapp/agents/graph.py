@@ -99,7 +99,12 @@ from .subagents import (
     build_skill_learner_message,
     create_dagster_converter,
 )
-from .tools.context import set_tool_context, clear_tool_context
+from .tools.context import (
+    set_tool_context,
+    clear_tool_context,
+    set_tool_deadline,
+    get_tool_deadline,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -761,8 +766,16 @@ def _warn_unaddressed_critical_fix(slug: str, scraper_analysis: dict) -> None:
 
 
 
-def _load_test_report(slug: str) -> dict | None:
-    """Load the test report JSON from the agent's workspace folder."""
+def _load_test_report(slug: str, min_mtime: float | None = None) -> dict | None:
+    """Load the test report JSON from the agent's workspace folder.
+
+    ``min_mtime`` (epoch seconds): when given, a report whose file mtime
+    PREDATES it is rejected as stale — [job-81] a dead code_tester invocation
+    must never adopt the PREVIOUS cycle's verdict (its "cascade exhausted"
+    routing fired on a report written 70 minutes earlier while a fresh draft
+    sat unjudged). The report for THIS attempt must have been written during
+    THIS attempt.
+    """
     if not slug:
         return None
     report_path = os.path.join("workspace", slug, "test_report.json")
@@ -777,6 +790,18 @@ def _load_test_report(slug: str) -> dict | None:
             pass
     if not os.path.isfile(report_path):
         return None
+    if min_mtime is not None:
+        try:
+            _mtime = os.path.getmtime(report_path)
+            if _mtime < min_mtime:
+                logger.warning(
+                    "_load_test_report: report mtime %.0f predates the current "
+                    "test attempt (%.0f) — rejecting as stale",
+                    _mtime, min_mtime,
+                )
+                return None
+        except OSError:
+            pass
     try:
         with open(report_path, "r", encoding="utf-8") as f:
             data = json.loads(f.read())
@@ -1749,6 +1774,28 @@ _AGENT_INVOKE_TIMEOUT = _env_int("AGENT_INVOKE_TIMEOUT", 900)  # seconds — har
     # code_writer (read template + generate ~500 lines + self-test + fix).
 
 
+def _tester_invoke_timeout() -> int:
+    """[job-81 N-A] The code_tester's wall clock, derived from its own contract.
+
+    The tester's prompt MANDATES up to two blocking browser runs (phase-1
+    discovery + phase-2 sample), and run_scraper floors every browser run at
+    BROWSER_RUN_TIMEOUT_FLOOR (+60s httpx margin). The flat 900s
+    AGENT_INVOKE_TIMEOUT cannot contain that mandated work: job 81's two ~510s
+    runs left 370s of window mid-cascade — abandonment was structural, not a
+    slow-site anomaly. Derive the window from the tool budget the prompt tells
+    the tester to spend: 2 × floored run + LLM/analysis margin. Healthy runs
+    that finish early are untouched; AGENT_INVOKE_TIMEOUT stays the floor, so
+    raising it via env still wins. NOT a cap on the work — a backstop sized to
+    the work.
+    """
+    from .tools.shell_tools import BROWSER_RUN_TIMEOUT_FLOOR
+
+    return max(
+        _AGENT_INVOKE_TIMEOUT,
+        2 * (BROWSER_RUN_TIMEOUT_FLOOR + 60) + 300,
+    )
+
+
 def _async_execution_enabled() -> bool:
     """Kill-switch for Phase 4 async cancellation (Per-Phase Execution Contract).
 
@@ -1840,6 +1887,13 @@ def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, t
     Both return ``{"messages": []}`` on timeout (callers treat as
     budget-exhausted).
     """
+    # [job-81 N-B] Publish the deadline so blocking tools (run_scraper's
+    # browser dispatch) can refuse work that cannot finish before this fires.
+    try:
+        set_tool_deadline(time.time() + timeout)
+    except Exception:
+        pass
+
     if _async_execution_enabled():
         return _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout)
 
@@ -4591,13 +4645,39 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         _ct_cfg = _agent_config(config, "code_tester")
         try:
             result = _invoke_agent_with_timeout(
-                agent, messages, _ct_cfg, "code_tester", job_id
+                agent, messages, _ct_cfg, "code_tester", job_id,
+                timeout=_tester_invoke_timeout(),
             )
         finally:
             _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "code-tester", config)
-        _notify_phase(job_id, "code_tester", "done")
         update = {"messages": []}
+        # [job-81 N-C] A dead invocation invalidates whatever verdict is on
+        # disk: the report was written by a PREVIOUS cycle about a PREVIOUS
+        # draft (job 81: the "cascade exhausted" routing consumed cycle-2's
+        # CRASH report, 70 min stale, while cycle-3's fresh draft sat
+        # unjudged). The mtime floor on _load_test_report below enforces that.
+        # Count consecutive wall-clock deaths on a DEDICATED counter (mirrors
+        # the writer's arm): route_after_testing escalates at 2 — this node
+        # must NOT Command-route, its conditional edge to route_after_testing
+        # would union with the goto and run both destinations (D6).
+        _ct_res = result if isinstance(result, dict) else {}
+        _ct_err = str(_ct_res.get("_error") or "")
+        _ct_dead = bool(_ct_err) or not _ct_res.get("messages")
+        if _ct_dead:
+            logger.error(
+                "_invoke_code_tester: invocation DIED (%s) — on-disk reports "
+                "predating this attempt will be rejected (job %s)",
+                _ct_err or "no messages", job_id,
+            )
+            if "wall-clock timeout" in _ct_err:
+                update["tester_wall_clock_timeouts"] = (
+                    int(state.get("tester_wall_clock_timeouts") or 0) + 1
+                )
+        else:
+            # Healthy invocation — reset the consecutive-death counter.
+            update["tester_wall_clock_timeouts"] = 0
+        _notify_phase(job_id, "code_tester", "done")
         # [A2/A1/A6] Fingerprint the draft THIS test just ran + track same-draft
         # re-tests. The fingerprint feeds route_after_testing's freshness floor
         # (A6) and the writer's no-op-fix gate (A2); the same-draft counter is
@@ -4626,15 +4706,24 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             update["test_retest_count"] = (
                 _prev_retests + 1 if _draft_fp == _prev_fp else 0
             )
-        report = _load_test_report(slug)
+        # [job-81 N-C] min_mtime: only a report written DURING this attempt
+        # (after the entry stamp) is this attempt's verdict. A dead/no-op
+        # invocation would otherwise adopt the previous cycle's report.
+        report = _load_test_report(slug, min_mtime=_test_started_at)
         # only attempt the repair when the report FILE exists but would not
         # parse (a genuinely-missing file is the F19 no-report path, not a
         # corruption case — repairing it would be a no-op call).
         _report_path = os.path.join(
             _get_project_root(), "workspace", slug, "test_report.json"
         ) if slug else ""
-        if not report and slug and os.path.isfile(_report_path):
-            # Artifact-corruption coverage: code_tester does NOT go through
+        if (
+            not report and slug and os.path.isfile(_report_path)
+            # [job-81 N-C] Only repair a file THIS attempt wrote. A corrupt
+            # report from a PREVIOUS cycle predates the stamp — repairing it
+            # would bump its mtime past the floor and re-adopt the stale
+            # verdict the floor just rejected.
+            and os.path.getmtime(_report_path) >= _test_started_at
+        ):
             # _run_budgeted_agent, so it never had an artifact_fix_fn. A corrupt
             # test_report.json (the priceline instance: literal control chars)
             # made _load_test_report return None and route_after_testing then
@@ -4642,11 +4731,65 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             # once and reload BEFORE concluding the report is missing.
             try:
                 _fix_json_artifact(slug, "test_report.json")
-                report = _load_test_report(slug)
+                # The repair rewrote the file — its mtime is fresh, so the
+                # same floor applies cleanly.
+                report = _load_test_report(slug, min_mtime=_test_started_at)
             except Exception as exc:
                 logger.warning(
                     "_invoke_code_tester: test_report repair failed: %s", exc
                 )
+        if not report:
+            # This attempt produced NO verdict — a previous cycle's report
+            # must not ride along in LangGraph state (the key persists across
+            # cycles unless overwritten; route_after_testing reads it from
+            # state, so a dead/no-op attempt would silently route on the
+            # LAST cycle's verdict even with the file-level mtime floor).
+            update["test_report"] = None
+        # [job-81 N-C] Two consecutive wall-clock deaths and STILL no verdict
+        # for this attempt: stage the escalation — route_after_testing's
+        # no-report arm sends counter>=2 to human_approval (or cleanup under
+        # skip_approvals, where an auto-approved retry would just burn a third
+        # full window against the same wall). The FRESH draft is never judged
+        # by what happened here; the interrupt offers re-testing it, not
+        # regenerating it.
+        _ct_twc = int(
+            update.get(
+                "tester_wall_clock_timeouts",
+                state.get("tester_wall_clock_timeouts") or 0,
+            )
+            or 0
+        )
+        if not report and _ct_twc >= 2:
+            _ct_note = (
+                "code_tester hit its wall-clock timeout twice in a row "
+                f"({_ct_err or 'no detail'}) — the site is too slow for the "
+                "testing window or the runs are wedging; testing is not "
+                "making progress. A draft exists but no verdict was produced "
+                "for it."
+            )
+            if state.get("skip_approvals", False):
+                logger.error(
+                    "_invoke_code_tester: repeated wall-clock deaths + "
+                    "skip_approvals → honest failure (job %s)", job_id,
+                )
+                update["error_message"] = _ct_note
+                update["execution_status"] = "FAILED"
+            else:
+                update["interrupt_reason"] = "code_tester_wall_clock"
+                update["interrupt_message"] = _ct_note + (
+                    " The existing draft can still be re-tested or executed "
+                    "anyway — retry, execute, or cancel."
+                )
+                update["interrupt_options"] = [
+                    "Retry testing", "Execute anyway", "Cancel",
+                ]
+                update["interrupt_decisions"] = [
+                    {"type": "approve", "label": "Retry testing",
+                     "allow_feedback": True},
+                    {"type": "approve", "label": "Execute anyway",
+                     "allow_feedback": False},
+                    {"type": "reject", "label": "Cancel", "allow_feedback": False},
+                ]
         if report:
             # Phase 4a: deterministically attach the scraper's discovery_coverage
             # so the coverage-aware classifier sees it (the LLM-written report
@@ -5804,6 +5947,31 @@ def route_from_human_approval(state: ScrapeState) -> str:
         logger.info("route_from_human_approval: coverage_exhausted -> proceed to scraper_analyzer")
         return "scraper_analyzer"
 
+    # code_tester_wall_clock (job-81 N-C): two consecutive DEAD code_tester
+    # invocations left the draft unjudged. MUST be handled BEFORE the
+    # approve_values clobber below (same reason as code_writer_failed).
+    # "Retry testing" → re-run the test on the SAME draft (it was never
+    # judged); "Execute anyway" → proceed as if the test passed (human's
+    # call); anything else ends the job.
+    if reason == "code_tester_wall_clock":
+        if "execute" in (label or "").lower():
+            logger.info(
+                "route_from_human_approval: code_tester_wall_clock -> "
+                "field_confirmation (execute unjudged draft on human's call)"
+            )
+            return "field_confirmation"
+        if "retry" in (label or "").lower():
+            logger.info(
+                "route_from_human_approval: code_tester_wall_clock -> code_tester "
+                "(re-test the unjudged draft)"
+            )
+            return "code_tester"
+        logger.info(
+            "route_from_human_approval: code_tester_wall_clock -> end "
+            "(draft never judged)"
+        )
+        return "__end__"
+
     # code_writer_failed (T0.4): two consecutive DEAD code_writer invocations.
     # MUST be handled BEFORE the approve_values clobber below — the retry
     # option is decision-type approve, so its label would be overwritten to
@@ -6130,6 +6298,7 @@ def build_scrape_graph(
             "setup_workspace": "setup_workspace",
             "scraper_analyzer": "scraper_analyzer",
             "code_writer": "code_writer",
+            "code_tester": "code_tester",
             "field_confirmation": "field_confirmation",
             "run_execution": "run_execution",
             "skill_learner": "skill_learner",

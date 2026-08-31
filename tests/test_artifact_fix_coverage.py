@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -97,7 +98,13 @@ class TestCodeTesterRepairThenReload:
         slug = "s"
         ws = tmp_path / "workspace" / slug
         ws.mkdir(parents=True, exist_ok=True)
-        (ws / "test_report.json").write_text(body, encoding="utf-8")
+        artifact = ws / "test_report.json"
+        artifact.write_text(body, encoding="utf-8")
+        # [job-81 N-C] the repair gate only fires for a file written DURING
+        # the attempt (mtime >= the node's entry stamp) — the LLM writes the
+        # report mid-invoke, after the stamp. Stamp the fixture accordingly.
+        _during_attempt = time.time() + 120
+        os.utime(artifact, (_during_attempt, _during_attempt))
 
         monkeypatch.setattr(g, "_get_project_root", lambda: str(tmp_path))
         monkeypatch.setattr(g, "build_code_tester_message", lambda state: [])

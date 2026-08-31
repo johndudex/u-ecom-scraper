@@ -868,6 +868,27 @@ def route_after_testing(state: ScrapeState) -> str:
     # the exhausted-retries error is recorded by the CALLER (code_tester's
     # exhausted-retry return) — see _invoke_code_tester. This fn only routes.
     if not report:
+        # [job-81 N-C] Two consecutive code_tester wall-clock deaths and no
+        # verdict for the current attempt: the draft is UNJUDGED, not failed
+        # — regenerating it (the default no-report ladder below) would
+        # discard usable work. Escalate: a human decides re-test vs execute
+        # vs cancel; under skip_approvals an auto-approved retry would just
+        # burn a third window against the same wall, so it's an honest
+        # cleanup instead. The interrupt_* fields are staged by the tester
+        # node (routing functions cannot mutate state).
+        _twc = int(state.get("tester_wall_clock_timeouts") or 0)
+        if _twc >= 2:
+            if state.get("skip_approvals", False):
+                logger.error(
+                    "route_after_testing: code_tester wall-clock ×2 + "
+                    "skip_approvals → cleanup (honest failure, draft unjudged)"
+                )
+                return "cleanup"
+            logger.error(
+                "route_after_testing: code_tester wall-clock ×2, no verdict "
+                "→ human_approval (draft unjudged)"
+            )
+            return "human_approval"
         if is_final_attempt:
             # Output-file rescue: even with no test_report, the scraper may have
             # produced real output during testing. Under skip_approvals,

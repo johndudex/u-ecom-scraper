@@ -32,6 +32,7 @@ _ctx: dict = {
     "agent_name": "",
     "probe_method": "",
     "anti_bot": False,
+    "tool_deadline": None,
 }
 
 
@@ -79,6 +80,23 @@ def clear_tool_context() -> None:
     _ctx["agent_name"] = ""
     _ctx["probe_method"] = ""
     _ctx["anti_bot"] = False
+    _ctx["tool_deadline"] = None
+
+
+def set_tool_deadline(deadline: Optional[float]) -> None:
+    """Stamp the invoking agent's wall-clock deadline (epoch seconds).
+
+    [job-81] Blocking tools (run_scraper's browser dispatch) compare their own
+    floored timeout against what's actually left of the invocation so a run
+    that CANNOT finish is skipped with an honest marker instead of being
+    abandoned mid-flight with its result lost. ``None`` (no deadline known)
+    disables the guard — tools never refuse work for lack of information.
+    """
+    _ctx["tool_deadline"] = deadline
+
+
+def get_tool_deadline() -> Optional[float]:
+    return _ctx["tool_deadline"]
 
 
 def get_state() -> Optional[dict]:

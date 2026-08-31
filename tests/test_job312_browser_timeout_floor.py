@@ -35,28 +35,32 @@ def _src() -> str:
 class TestBrowserTimeoutFloor:
     def test_floor_is_600_for_browser_scrapers(self):
         src = _src()
-        assert "if needs_browser and timeout < 600:" in src, (
-            "browser timeout floor must be 600s — two-phase drafts (discovery "
-            "+ sample extraction in one subprocess) need ~350s+; the old 240s "
-            "floor SIGKILLed healthy runs mid-flight (job 312)"
+        # [job-81] the floor is the exported constant BROWSER_RUN_TIMEOUT_FLOOR
+        # (default 600) so the graph can derive the code_tester window from the
+        # SAME number — the tester's prompt mandates up to two floored runs.
+        assert 'BROWSER_RUN_TIMEOUT_FLOOR = int(os.environ.get("BROWSER_RUN_TIMEOUT_FLOOR", "600"))' in src, (
+            "browser timeout floor must default to 600s — two-phase drafts "
+            "(discovery + sample extraction in one subprocess) need ~350s+; "
+            "the old 240s floor SIGKILLed healthy runs mid-flight (job 312)"
         )
-        assert "flooring browser timeout %ds → 600s" in src
+        assert "if needs_browser and timeout < BROWSER_RUN_TIMEOUT_FLOOR:" in src
+        assert "timeout = BROWSER_RUN_TIMEOUT_FLOOR" in src
 
     def test_floor_applies_after_browser_detection(self):
         """The floor must sit AFTER needs_browser is decided (exec_mode sniff),
         so HTTP scrapers keep their tight budgets."""
         src = _src()
         i_sniff = src.find('_scraper_needs_browser(full_path)')
-        i_floor = src.find("if needs_browser and timeout < 600:")
+        i_floor = src.find("if needs_browser and timeout < BROWSER_RUN_TIMEOUT_FLOOR:")
         assert -1 < i_sniff < i_floor, "floor must follow browser detection"
 
     def test_http_path_has_no_floor(self):
         """The http branch must not inherit the 600s floor — HTTP scrapers
         (api/internal_api strategies) are fast and their budgets stay tight."""
         src = _src()
-        i_floor = src.find("if needs_browser and timeout < 600:")
+        i_floor = src.find("if needs_browser and timeout < BROWSER_RUN_TIMEOUT_FLOOR:")
         http_branch = src[src.find("http-based, running locally"):]
-        assert "timeout = 600" not in http_branch
+        assert "timeout = BROWSER_RUN_TIMEOUT_FLOOR" not in http_branch
         assert i_floor != -1
 
 
