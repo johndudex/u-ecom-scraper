@@ -559,3 +559,198 @@ class TestMisconfigGuard:
              mock.patch.object(mod, "effective_model", side_effect=lambda p, fallback=None: p):
             llm = mod.get_llm(model="glm-5-turbo")  # must NOT raise
             assert llm.openai_api_base == "https://zai.example/v4"
+
+
+# ── Streaming retry lane [job-84 chemistwarehouse] ───────────────────────────
+
+
+class TestStreamingRetryLane:
+    """``streaming=True`` models (every litellm call — get_llm sets it to dodge
+    the proxy's ~60s non-stream 504) route invoke() through ``_stream``/
+    ``_astream``, NOT ``_generate``: job 84's code_writer died on the FIRST
+    mid-stream transport error because the classified retry only wrapped
+    ``_generate``. The streaming lane must carry the same classified retry +
+    breaker recording, and bare httpx transport errors must classify transient.
+    """
+
+    def _make(self, mod, model="litellm/standardcompute"):
+        llm = mod.ClassifiedRetryChatOpenAI(
+            model_name=model,
+            openai_api_base="https://litellm.example/v1",
+            openai_api_key="k",
+            max_retries=0,
+        )
+        llm._breaker_name = model
+        return llm
+
+    @staticmethod
+    def _chunk(text):
+        from langchain_core.messages import AIMessageChunk
+        from langchain_core.outputs import ChatGenerationChunk
+
+        return ChatGenerationChunk(message=AIMessageChunk(content=text))
+
+    def test_remote_protocol_error_is_classified_transient(self):
+        import httpx
+
+        mod = _llm_mod()
+        # job 84's actual death: openai's SSE reader has no `except httpx.*`,
+        # so the proxy tearing down the chunked response surfaced as a BARE
+        # httpx exception that missed every openai-based arm.
+        assert isinstance(
+            httpx.RemoteProtocolError("incomplete chunked read"),
+            mod._TRANSIENT_ERRORS,
+        )
+        assert isinstance(httpx.ConnectError("reset"), mod._TRANSIENT_ERRORS)
+
+    def test_stream_retries_transient_and_yields_same_chunks(self):
+        import httpx
+        from langchain_openai import ChatOpenAI
+
+        mod = _llm_mod()
+        llm = self._make(mod)
+        a, b = self._chunk("hel"), self._chunk("lo")
+        attempts = []
+
+        def flaky_super_stream(self_, messages, stop=None, run_manager=None, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise httpx.RemoteProtocolError("peer closed connection")
+            return iter([a, b])
+
+        with mock.patch("random.uniform", lambda lo, hi: 0.0), \
+             mock.patch.object(ChatOpenAI, "_stream", flaky_super_stream):
+            got = list(llm._stream([("user", "hi")]))
+        assert len(attempts) == 2, "the transient death must be retried"
+        assert got == [a, b]
+
+    def test_mid_stream_death_after_partial_chunks_is_retried(self):
+        """A stream that yields THEN dies raises from iteration — the retry
+        wraps the full consumption, so only the complete second stream is
+        returned (an LLM stream cannot be resumed mid-flight)."""
+        import httpx
+        from langchain_openai import ChatOpenAI
+
+        mod = _llm_mod()
+        llm = self._make(mod)
+        attempts = []
+
+        def flaky_super_stream(self_, messages, stop=None, run_manager=None, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                yield self._chunk("par")
+                raise httpx.RemoteProtocolError("incomplete chunked read")
+            yield self._chunk("full")
+
+        with mock.patch("random.uniform", lambda lo, hi: 0.0), \
+             mock.patch.object(ChatOpenAI, "_stream", flaky_super_stream):
+            got = [c.message.content for c in llm._stream([("user", "hi")])]
+        assert len(attempts) == 2
+        assert got == ["full"]
+
+    def test_stream_records_success_under_configured_key(self):
+        from langchain_openai import ChatOpenAI
+
+        mod = _llm_mod()
+        llm = self._make(mod)
+
+        with mock.patch.object(
+            ChatOpenAI, "_stream",
+            lambda self_, *a, **k: iter([self._chunk("ok")]),
+        ), mock.patch.object(mod, "record_success") as rs:
+            list(llm._stream([("user", "hi")]))
+        rs.assert_called_once_with("litellm/standardcompute")
+
+    def test_stream_exhaustion_records_failure_and_raises(self):
+        import httpx
+        from langchain_openai import ChatOpenAI
+
+        mod = _llm_mod()
+        llm = self._make(mod)
+
+        def always_dies(self_, messages, stop=None, run_manager=None, **kwargs):
+            raise httpx.RemoteProtocolError("teardown")
+
+        with mock.patch.object(mod, "_retry_settings", return_value=_retry_cfg(
+                transient_max=0)), \
+             mock.patch.object(ChatOpenAI, "_stream", always_dies), \
+             mock.patch.object(mod, "record_failure") as rf:
+            with pytest.raises(httpx.RemoteProtocolError):
+                list(llm._stream([("user", "hi")]))
+        rf.assert_called_once_with("litellm/standardcompute")
+
+    def test_stream_caller_bug_not_recorded_and_not_retried(self):
+        import openai
+        from langchain_openai import ChatOpenAI
+
+        mod = _llm_mod()
+        llm = self._make(mod)
+        calls = []
+
+        def bad_request(self_, messages, stop=None, run_manager=None, **kwargs):
+            calls.append(1)
+            raise openai.BadRequestError(message="bad", response=mock.Mock(), body=None)
+
+        with mock.patch.object(mod, "_retry_settings", return_value=_retry_cfg()), \
+             mock.patch.object(ChatOpenAI, "_stream", bad_request), \
+             mock.patch.object(mod, "record_failure") as rf:
+            with pytest.raises(openai.BadRequestError):
+                list(llm._stream([("user", "hi")]))
+        assert len(calls) == 1, "caller bugs must fail fast, no retry"
+        rf.assert_not_called()
+
+    def test_astream_retries_transient(self):
+        import httpx
+        from langchain_openai import ChatOpenAI
+
+        mod = _llm_mod()
+        llm = self._make(mod)
+        a = self._chunk("x")
+        attempts = []
+
+        async def flaky_super_astream(self_, messages, stop=None, run_manager=None, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise httpx.RemoteProtocolError("boom")
+            yield a
+
+        async def run():
+            return [c async for c in llm._astream([("user", "hi")])]
+
+        with mock.patch("random.uniform", lambda lo, hi: 0.0), \
+             mock.patch.object(ChatOpenAI, "_astream", flaky_super_astream):
+            got = asyncio.run(run())
+        assert len(attempts) == 2
+        assert got == [a]
+
+    def test_stream_override_survives_bind_tools(self):
+        """bind_tools returns a RunnableBinding that delegates to the wrapped
+        model's _stream — the retry must apply there too (the react loop only
+        ever calls the bound runnable)."""
+        import httpx
+        from langchain_core.tools import tool
+        from langchain_openai import ChatOpenAI
+
+        mod = _llm_mod()
+        llm = self._make(mod)
+
+        @tool
+        def noop() -> str:
+            """does nothing"""
+            return ""
+
+        attempts = []
+
+        def flaky_super_stream(self_, messages, stop=None, run_manager=None, **kwargs):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise httpx.RemoteProtocolError("teardown")
+            return iter([self._chunk("ok")])
+
+        bound = llm.bind_tools([noop])
+        with mock.patch("random.uniform", lambda lo, hi: 0.0), \
+             mock.patch.object(ChatOpenAI, "_stream", flaky_super_stream):
+            # the public .stream() unwraps ChatGenerationChunks to messages
+            got = [c.content for c in bound.stream([("user", "hi")])]
+        assert len(attempts) == 2, "bound runnable must route through the retry lane"
+        assert "ok" in got  # public .stream() also appends a trailing aggregate chunk

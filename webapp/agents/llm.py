@@ -58,6 +58,22 @@ _TRANSIENT_ERRORS = (
     openai.InternalServerError,
 )
 
+# [job-84 chemistwarehouse] Mid-stream transport deaths arrive as BARE httpx
+# exceptions: openai's SSE reader has no `except httpx.*` clauses, so the
+# proxy tearing down a chunked response ("peer closed connection without
+# sending complete message body (incomplete chunked read)") escapes the
+# openai hierarchy entirely and fell through every retry arm on attempt 1.
+# TransportError is the common ancestor of RemoteProtocolError/ReadError/
+# WriteError/ConnectError — exactly the transient class.
+try:
+    import httpx as _httpx
+
+    _HTTPX_TRANSPORT_ERRORS = (_httpx.TransportError,)
+except Exception:  # pragma: no cover — httpx ships with langchain-openai
+    _HTTPX_TRANSPORT_ERRORS = ()
+
+_TRANSIENT_ERRORS = _TRANSIENT_ERRORS + _HTTPX_TRANSPORT_ERRORS
+
 
 def _retry_settings() -> dict:
     """Read retry config lazily (Django settings may not be ready at import).
@@ -359,15 +375,17 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
     _breaker_name: Optional[str] = PrivateAttr(default=None)
     """``ChatOpenAI`` with classified, bounded, jittered per-call retry.
 
-    Override of ``_generate``/``_agenerate`` (the methods langchain routes
-    ``invoke``/``ainvoke`` to) survives ``bind_tools`` (which returns a
-    ``RunnableBinding`` that delegates to the underlying model's ``_generate``),
-    so the retry applies to every LLM call the react loop makes. The base
-    ``max_retries`` MUST be 0 — the SDK's own retry is blind + unbounded in
-    effect, which is what this class replaces.
+    Overrides of ``_generate``/``_agenerate`` (the methods langchain routes
+    ``invoke``/``ainvoke`` to) AND ``_stream``/``_astream`` (the lane
+    ``streaming=True`` models are routed through instead — without which the
+    retry was dead code for every ``litellm/`` code_writer call, job 84)
+    survive ``bind_tools`` (which returns a ``RunnableBinding`` that delegates
+    to the underlying model's methods), so the retry applies to every LLM call
+    the react loop makes. The base ``max_retries`` MUST be 0 — the SDK's own
+    retry is blind + unbounded in effect, which is what this class replaces.
 
-    Also the breaker's observation point: ``_generate``/``_agenerate`` intercept
-    every outcome and record under ``self.model_name`` (the configured string,
+    Also the breaker's observation point: the four overrides intercept every
+    outcome and record under ``self.model_name`` (the configured string,
     prefix intact). The old CircuitBreakerCallback never worked on
     langchain-core 1.5.1+ — callbacks don't receive the ``serialized`` payload —
     so recording moved here (record/lookup keys identical by construction).
@@ -407,6 +425,52 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
             raise
         record_success(self._breaker_key())
         return result
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
+        # [job-84 chemistwarehouse] With ``streaming=True`` (every litellm
+        # model — get_llm sets it to dodge the proxy's ~60s non-stream 504)
+        # langchain routes invoke() through ``_stream``, NOT ``_generate``:
+        # the retry override above was dead code for code_writer, and the
+        # first mid-stream transport death failed the whole phase. Retry wraps
+        # the FULL consumption — a stream that dies mid-flight raises from
+        # iteration, not from the call — then replays the buffered chunks.
+        cfg = _retry_settings()
+        _super_stream = super(ClassifiedRetryChatOpenAI, self)._stream
+        try:
+            chunks = _retry_classified_sync(
+                lambda: list(
+                    _super_stream(messages, stop=stop, run_manager=run_manager, **kwargs)
+                ),
+                cfg,
+                model=self._breaker_key(),
+            )
+        except Exception as exc:
+            self._record_breaker(exc)
+            raise
+        record_success(self._breaker_key())
+        yield from chunks
+
+    async def _astream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
+        # Async counterpart of ``_stream`` (LLM_ASYNC_EXECUTION path).
+        cfg = _retry_settings()
+        _super_astream = super(ClassifiedRetryChatOpenAI, self)._astream
+
+        async def _consume():
+            return [
+                chunk
+                async for chunk in _super_astream(
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                )
+            ]
+
+        try:
+            chunks = await _retry_classified_async(_consume, cfg, model=self._breaker_key())
+        except Exception as exc:
+            self._record_breaker(exc)
+            raise
+        record_success(self._breaker_key())
+        for chunk in chunks:
+            yield chunk
 
     def _breaker_key(self) -> str:
         """Configured model string (prefix intact); falls back to model_name
