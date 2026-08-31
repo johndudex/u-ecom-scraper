@@ -3651,6 +3651,23 @@ def build_code_tester_message(state: dict) -> list:
                 )
     except Exception:
         pass  # fall back to the generic instruction above
+    # [job-88 selfridges] The volume assertion below must carry the SAME scope
+    # waiver as the deterministic gate (_volume_gap bails for firstn/filter or
+    # any scope_value). This job was firstn/10: its requests draft discovered 8
+    # real URLs and extracted 5/5 correct products — ~80% of the user's actual
+    # ask — but the LLM applied the unbounded "> 1 page worth" bar, flagged it
+    # NEEDS_FIXES, and the writer responded by switching to a browser template
+    # that discovered 0. The cascade destroyed a working scraper.
+    _scope_l = str(state.get("scope") or "").strip().lower()
+    if _scope_l in ("firstn", "filter") or str(state.get("scope_value") or "").strip():
+        _tester_volume_rule = (
+            " BOUNDED SCOPE: this job runs under a firstn/filter scope, so a "
+            "small genuine yield that covers the scope is CORRECT — do NOT "
+            "flag sub-page-size discovery as a volume defect (the "
+            "deterministic gate waives it for bounded scopes too)."
+        )
+    else:
+        _tester_volume_rule = ""
     nav_validation = ""
     if input_mode in ("navigation", "list_page", "search_term"):
         nav_analysis = state.get("navigation_analysis") or {}
@@ -3785,7 +3802,8 @@ def build_code_tester_message(state: dict) -> list:
         f"run discovery EXACTLY as execution does, so a dropped CLI flag fails HERE instead "
         f"of in production:{_tester_phase1_instruction} "
         f"Assert `metadata.discovered_urls` > 1 page worth (e.g. > items_per_page) — if it "
-        f"returns only ~1 page, pagination/discovery is broken (HIGH severity). If argparse "
+        f"returns only ~1 page, pagination/discovery is broken (HIGH severity)."
+        f"{_tester_volume_rule} If argparse "
         f"rejects a flag (exit 2, `unrecognized arguments: ...`), that is a HIGH severity "
         f"issue whose problem text MUST start with `CLI CONTRACT VIOLATION:` and name the "
         f"missing flags — set `target: \"scraper\"`. For url_list jobs, skip this (no Phase 1).\n"

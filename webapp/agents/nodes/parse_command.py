@@ -57,6 +57,13 @@ def parse_command(state: ScrapeState) -> Command:
             "content_analysis_retries": 0,
             "product_analysis_retries": 0,
             "test_retry_count": 0,
+            # [job-83 woolworths] A re-drive reuses the graph thread, so the
+            # checkpoint restores the PREVIOUS run's test_report — and
+            # _invoke_code_writer bumps the retry counter whenever it sees a
+            # truthy report. This job entered its FIRST test as "Cycle 2" and
+            # burned 1 of 3 cycles CRASHing on a draft that never existed.
+            # A fresh run starts with no test report, period.
+            "test_report": None,
             "reanalyze_count": 0,
             "execution_status": "",
             "output_file": "",

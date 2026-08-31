@@ -534,12 +534,16 @@ def main():
         logger.info("Warming up session...")
         try:
             page.goto(SITE_URL, wait_until="networkidle", timeout=PAGE_LOAD_TIMEOUT)
-        except PlaywrightTimeoutError:
-            # Same contract as scrape_product: never-idle anti-bot pages still
-            # have a rendered DOM — a warm-up timeout must not kill the run
-            # before extraction starts (job-78).
+        except Exception:
+            # Same contract as scrape_product, widened [job-83 woolworths]:
+            # never-idle anti-bot pages still have a rendered DOM (job-78
+            # timeout case), and HARD navigation errors — net::ERR_INVALID_
+            # AUTH_CREDENTIALS, DNS, refused — must not kill the run at the
+            # warm-up either: this call has NO per-item caller above it, so
+            # anything it raises ends the whole run before extraction starts.
+            # The per-item loop below owns item-level failures.
             logger.warning(
-                f"networkidle not reached on warm-up {SITE_URL} — continuing"
+                f"warm-up goto failed on {SITE_URL} — continuing to extraction"
             )
         page.wait_for_timeout(5000)
 

@@ -397,7 +397,11 @@ def _execution_zero_discovery(result: dict) -> bool:
     0``, the job-58 ``empty_first_page`` stop reason, or — since job 85 —
     a junk-only yield (a PDP-as-listing's 1 self link with ``found: 0``),
     which the old raw-count check read as success.
+    A run flagged ``no_fresh_output`` (clean rc=0, no output file — the
+    template's zero-discovery exit, job 88) qualifies with no file to read.
     """
+    if (result or {}).get("no_fresh_output"):
+        return True
     output_file = (result or {}).get("output_file") or ""
     if not output_file or not os.path.isfile(output_file):
         return False
@@ -448,9 +452,15 @@ def _maybe_retry_execution_listing(
     result when it yields items. ``redispatch(alt_url)`` runs the whole
     execution again under the caller's control (subprocess or
     browser_service path); both attempts stay bounded at one retry.
+    [job-88 selfridges] The FAILED guard admits the ``no_fresh_output``
+    shape — a clean rc=0 run that wrote no output file IS the clean zero
+    (its discovery found nothing to extract), and that exact run shape was
+    the one where the rescue never fired.
     """
     try:
-        if (result or {}).get("execution_status") == "FAILED":
+        if (result or {}).get("execution_status") == "FAILED" and not (
+            result or {}
+        ).get("no_fresh_output"):
             return result
         if not _execution_zero_discovery(result):
             return result
@@ -458,8 +468,9 @@ def _maybe_retry_execution_listing(
         if not alt:
             return result
         logger.warning(
-            "run_execution: clean zero (0 discovered URLs) under listing %s — "
-            "retrying ONCE with the navigator-promoted listing %s [job-77 RC1]",
+            "run_execution: clean zero (0 discovered URLs or no output file) "
+            "under listing %s — retrying ONCE with the navigator-promoted "
+            "listing %s [job-77 RC1]",
             str(primary_listing)[:80], alt[:80],
         )
         retry_result = redispatch(alt)
@@ -1169,6 +1180,12 @@ def _run_in_process(
         if not output_file:
             return {
                 "execution_status": "FAILED",
+                # [job-88 selfridges] A clean rc=0 run that wrote NOTHING is the
+                # zero-discovery shape by template contract (http_navigation
+                # exits 0 on zero discovery) — mark it so the RC1 listing
+                # fallback can fire; without the flag both guards below
+                # short-circuited and the rescue was structurally unreachable.
+                "no_fresh_output": True,
                 "error_message": (
                     "Execution produced no output file (rc=0 but no fresh "
                     "output_*.json with mtime >= subprocess start; discovery "

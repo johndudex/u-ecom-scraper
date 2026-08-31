@@ -81,7 +81,13 @@ def _extracted_item_count(report: dict) -> int:
 # ``empty_first_page`` ([job-58 birkenstock]) is the zero-URL run with no hard
 # error: an anti-bot challenge/consent wall served with HTTP 200 yields zero
 # product links, which the template loop misread as a genuine end-of-catalog.
-_COVERAGE_FAIL_STOP_REASONS = {"navigate_error", "dedup_flat", "empty_first_page"}
+# ``empty_render`` ([jobs 83/88]) is the browser-tier sibling: every session
+# rendered an EMPTY page (200 OK, zero links) — a soft wall, never a catalog end.
+# Its absence here let the anti-bot downgrade rewrite the tester's
+# ``target: "strategy"`` verdict into ``scraper`` (job 83).
+_COVERAGE_FAIL_STOP_REASONS = {
+    "navigate_error", "dedup_flat", "empty_first_page", "empty_render",
+}
 
 
 def _discovery_coverage_failure(report: dict) -> Optional[str]:

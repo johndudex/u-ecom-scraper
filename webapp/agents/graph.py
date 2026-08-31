@@ -1286,6 +1286,29 @@ def _notify_phase(job_id: int, node_name: str, status: str) -> None:
         pass
 
 
+def _log_event_row(job_id: int, agent: str, content: str) -> None:
+    """One SessionLog row for a deterministic phase event (no agent loop).
+
+    [jobs 83/88 RCA] browser_traverse — whose result IS the discovery
+    contract every downstream phase leans on (working_url, listing_url,
+    rendering_verified, items_per_page) — used to emit ZERO log rows, so
+    neither RCA could be read from the job log at all.
+    """
+    try:
+        from scraper.models import SessionLog
+
+        seq = SessionLog.objects.filter(job_id=job_id).count()
+        SessionLog.objects.create(
+            job_id=job_id,
+            role=SessionLog.ROLE_SYSTEM,
+            agent=agent,
+            content=content[:4000],
+            seq=seq,
+        )
+    except Exception:
+        pass
+
+
 def _budget_setting(name: str, default: int) -> int:
     """Budget/timeout constant, env-overridable via Django settings.
 
@@ -2615,6 +2638,27 @@ def _invoke_navigation_traverse(
                 _fallback_listing, _root_method, job_id,
             )
 
+        # [jobs 83/88 RCA] The traversal result IS the discovery contract the
+        # whole pipeline leans on — surface it in the job log. This phase
+        # previously emitted zero SessionLog rows, so neither RCA could be
+        # reconstructed from the UI.
+        _log_event_row(
+            job_id,
+            "navigator",
+            "[NAV-SUMMARY] reached=%s working_url=%s listing_url=%s "
+            "listing_reached=%s mechanism=%s form_method=%s item_links=%d notes=%s"
+            % (
+                getattr(result, "reached", "?"),
+                str(getattr(result, "goal_url", "") or "")[:120],
+                str(_disc_fb.get("listing_url") or "")[:120],
+                _disc_fb.get("listing_reached"),
+                getattr(result, "mechanism", "") or "?",
+                getattr(result, "goal_method", "GET") or "GET",
+                len(url_examples or []),
+                str(getattr(result, "notes", "") or "")[:200],
+            ),
+        )
+
         analysis = {
             "discovery_method": "browser_traverse" if result.reached else "fallback",
             "search": {
@@ -3426,7 +3470,21 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
         _search = _nav.get("search") if isinstance(_nav, dict) else None
         if isinstance(_search, dict):
             _form_method = (_search.get("form_method") or "").upper()
-        strategy = "http_requests" if _form_method == "POST" else "playwright"
+        if _form_method == "POST":
+            strategy = "http_requests"
+        elif method.startswith(("uc_chrome", "cloak")):
+            # [job-83 woolworths] The probe's escalation ladder tries every
+            # playwright tier BEFORE it reaches a working uc_chrome/cloak
+            # method — so a stealth method_that_worked means every playwright
+            # tier that ran was BLOCKED (woolworths: playwright_none/
+            # datacenter/residential all failed; uc_chrome_none + uc_chrome_
+            # residential succeeded). Bare playwright cannot render here, and
+            # _enforce_anti_bot_strategy deliberately leaves it unrewritten.
+            # Derive the probe-proven browser flavor instead: http_navigation's
+            # /navigate applies the cloak fingerprint server-side.
+            strategy = "http_navigation"
+        else:
+            strategy = "playwright"
     elif _rendering == "csr":
         # navigate_explore._verify_rendering: lighter CSR where the server-side
         # /navigate render surfaces the links.
@@ -3879,6 +3937,22 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
     try:
         logger.info("_invoke_code_writer: starting (job %s)", job_id)
         update = {}
+        # [job-83 woolworths] Belt for the parse_command null: a truthy
+        # state test_report whose file is GONE is a stale report from a
+        # previous run riding the graph checkpoint (resume paths can outrank
+        # the update). Counting it burned a whole test cycle before the first
+        # test ran.
+        if state.get("test_report") and not os.path.isfile(
+            os.path.join(
+                _get_project_root(), "workspace",
+                state.get("site_slug") or "", "test_report.json",
+            )
+        ):
+            logger.warning(
+                "_invoke_code_writer: test_report in state but no file on disk — "
+                "stale report from a previous run, ignoring it (job %s)", job_id,
+            )
+            state = {**state, "test_report": None}
         # Count a test-retry whenever re-entering from route_after_testing with a
         # prior test_report (a real test failure). The test_retry_count budget
         # caps the regenerate-test loop (MAX_TEST_RETRIES).
@@ -3949,7 +4023,16 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 try:
                     if os.path.isfile(iu_path):
                         with open(iu_path, "r") as _ef:
-                            _existing = _json.load(_ef).get("urls", [])
+                            _loaded = _json.load(_ef)
+                        # [job-88 selfridges] the writer sometimes seeds a BARE
+                        # JSON array — `.get` on a list raised AttributeError
+                        # and the preserve check silently degraded to an
+                        # overwrite that destroyed the discovered URL set.
+                        _existing = (
+                            _loaded.get("urls", [])
+                            if isinstance(_loaded, dict)
+                            else _loaded if isinstance(_loaded, list) else []
+                        )
                         if len(_existing) > len(sample_urls):
                             logger.info(
                                 "_invoke_code_writer: preserving existing input_urls.json "
@@ -4042,14 +4125,32 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         _cw_err = str(_cw_result.get("_error") or "")
         _cw_dead = bool(_cw_err) or not _cw_result.get("messages")
         _draft_path = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
+        # [jobs 83/88 RCA] A killed invocation that ALREADY wrote its draft used
+        # to sail through this detector — including a HALF-WRITTEN draft that
+        # only fails at test time (both prod jobs' cycle 1 burned on it).
+        # Deterministic floor: a dead invocation's draft must at least parse,
+        # else it counts as absent (the LLM self-check loops it skipped are
+        # gone with the invocation).
+        _draft_ok = os.path.isfile(_draft_path)
+        _draft_note = ""
+        if _draft_ok and _cw_dead:
+            try:
+                import ast as _ast
+
+                with open(_draft_path, "r", encoding="utf-8", errors="replace") as _df:
+                    _ast.parse(_df.read(), filename=_draft_path)
+            except Exception as _c_exc:
+                _draft_ok = False
+                _draft_note = f"dead invocation left an uncompilable draft: {_c_exc}"
+                logger.error("_invoke_code_writer: %s (job %s)", _draft_note, job_id)
         # [jobs-79/80] An ALIVE invocation that produced no draft is the same
         # failure as a dead one: the writer replied text-only (no tool calls)
         # — the agent loop ended "successfully" with nothing on disk, the
         # tester then burned its whole cascade CRASHing on the missing file
         # (3 cycles, both prod jobs). The writer's one job is the draft; treat
         # no-draft as failure regardless of how chatty the invocation was.
-        if not os.path.isfile(_draft_path):
-            _err_note = _cw_err or (
+        if not _draft_ok:
+            _err_note = _cw_err or _draft_note or (
                 "invocation returned no draft"
                 if _cw_result.get("messages")
                 else "invocation returned no messages and wrote no draft"

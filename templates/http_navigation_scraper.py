@@ -1248,8 +1248,17 @@ def main():
         aggregate_stop_reason = "empty_first_page"
 
     if not discovered_urls and not args.discover_only:
-        logger.warning("No item URLs discovered")
-        sys.exit(0)
+        # [job-88 selfridges] A clean exit-0 with no output file makes the run
+        # indistinguishable from "wrote nothing" — the executor's only signal
+        # is an ABSENCE its rescue gates cannot read. Exit non-zero with a
+        # marker so the run lands in the diagnosed-failure branch (full stderr
+        # tail) and the strategy ladder instead of the honesty floor.
+        logger.error("DISCOVERY_ZERO: no item URLs discovered under the given listing")
+        print(
+            "DISCOVERY_ZERO: no item URLs discovered under the given listing",
+            file=sys.stderr,
+        )
+        sys.exit(3)
 
     # ── Phase 2: Extract data concurrently (--discover-only skips it) ────────
     # --discover-only (contract §3): run Phase 1 to exhaustion, emit the output

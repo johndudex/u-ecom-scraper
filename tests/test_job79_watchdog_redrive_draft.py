@@ -189,13 +189,21 @@ class TestWriterNodePins:
         )
 
     def test_alive_noop_invocation_takes_the_failure_path(self):
+        # [job-83 wave-11 refined the belt] The branch condition is now
+        # `if not _draft_ok:` where `_draft_ok` STARTS as the file check —
+        # the job-79 contract (no-draft branch keys off the FILE, not the
+        # invocation's liveness) is preserved — and a dead invocation's draft
+        # must additionally ast.parse (the partial-draft floor).
         tail = self._writer_tail()
-        m = re.search(r"if not os\.path\.isfile\(_draft_path\):", tail)
+        m = re.search(r"_draft_ok = os\.path\.isfile\(_draft_path\)", tail)
         assert m, (
-            "the no-draft branch must key off the FILE, not the invocation's "
-            "liveness — job 79/80's writer returned text-only (no tool calls), "
-            "the agent loop ended 'healthy', and the tester burned 3 cycles on "
-            "a missing file"
+            "the no-draft gate must still START from the FILE check — job "
+            "79/80's writer returned text-only (no tool calls), the agent "
+            "loop ended 'healthy', and the tester burned 3 cycles on a "
+            "missing file"
+        )
+        assert re.search(r"if not _draft_ok:", tail), (
+            "the no-draft branch must consume the _draft_ok gate"
         )
         assert "invocation returned no draft" in tail
 

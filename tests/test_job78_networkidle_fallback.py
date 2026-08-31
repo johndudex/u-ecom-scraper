@@ -125,15 +125,22 @@ class TestSourcePins:
         )
 
     def test_warmup_goto_is_guarded(self):
+        # [job-83 woolworths widened this] The warm-up catch is now BROAD: hard
+        # navigation errors (net::ERR_INVALID_AUTH_CREDENTIALS, DNS, refused)
+        # must not kill the run either — this goto has no per-item caller above
+        # it, so anything it raises ends the whole run before extraction. The
+        # timeout-only contract survives at the per-item site below
+        # (test_scrape_product_goto_is_guarded).
         src = open(TEMPLATE).read()
         m = re.search(
             r'Warming up session.*?\)\s*\n\s*try:\s*\n\s*'
-            r'page\.goto\(SITE_URL.*?except PlaywrightTimeoutError:',
+            r'page\.goto\(SITE_URL.*?except Exception:',
             src, re.S,
         )
         assert m, (
-            "the main() warm-up goto must catch the timeout too — a never-idle "
-            "homepage must not kill the run before extraction starts"
+            "the main() warm-up goto must catch broadly (timeout AND hard nav "
+            "errors) — a never-idle or hard-failing homepage must not kill the "
+            "run before extraction starts"
         )
 
     def test_scrape_product_goto_is_guarded(self):
