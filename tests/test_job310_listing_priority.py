@@ -11,7 +11,10 @@ finalize catch-all blessed the job COMPLETED with 0 products.
 Fixes pinned here:
 - list_page: the job URL (the user-provided listing, by definition) outranks
   the navigator's promotion in BOTH the --listing-url chain and the env gate
-  (run_execution.py);
+  (run_execution.py). [rag-bone job 72 revision] A URL-shaped search_criteria
+  — the user's own listing assertion, which the intake UI fills with the real
+  listing while `url` holds a sample PDP — outranks the job URL; the job URL
+  still outranks every navigator candidate when criteria is not a URL.
 - finalize: an output file that parses but holds 0 records → FAILED, not
   COMPLETED (tasks.py `_output_file_has_zero_items`);
 - code-writer prompt: zero-yield discovery must retry DEFAULT_LISTING_URL.
@@ -40,14 +43,22 @@ class TestListPageListingPriority:
     def test_cli_chain_puts_job_listing_first(self):
         src = self._src()
         assert "_job_listing" in src, "list_page job-URL priority missing"
-        # first candidate in the --listing-url chain, before discovery.listing_url
-        assert src.index("_candidates = [") < src.index('_disc.get("listing_url")')
-        assert "_job_listing,\n" in src.split("_candidates = [", 1)[1][:120]
+        # candidate chain opens with the user's URL-shaped criteria assertion
+        # (job 72) then the job URL (job 310) — both ahead of the navigator's
+        # discovery.listing_url.
+        head = src.split("_candidates = [", 1)[1][:200]
+        assert head.index("_url_shaped_criteria(state)") < head.index("_job_listing,")
+        assert head.index("_job_listing,") < head.index('_disc.get("listing_url")')
 
     def test_env_gate_puts_job_listing_first(self):
         src = self._src()
-        assert '_env_candidate = _job_listing or ""' in src, (
-            "SCRAPER_LISTING_URL env gate must prefer the list_page job URL"
+        assert '_env_candidate = _url_shaped_criteria(state) or _job_listing or ""' in src, (
+            "SCRAPER_LISTING_URL env gate must prefer the user's listing "
+            "assertion (job 72), then the list_page job URL (job 310)"
+        )
+        # the navigator's promotion is only a THIRD fallback
+        assert src.index('_env_candidate = _url_shaped_criteria(state) or _job_listing or ""') < src.index(
+            '_disc_env.get("listing_url")'
         )
 
     def test_navigation_mode_unaffected(self):

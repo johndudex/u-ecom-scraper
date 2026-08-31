@@ -4319,33 +4319,62 @@ def _normalize_probe_stop_reason(stop_reason: str) -> str:
 
 def _probe_listing_candidates(state: dict) -> tuple[str, str]:
     """(primary, alternate) ``SCRAPER_LISTING_URL`` candidates for the Phase-1
-    probe, mirroring run_execution's chain (job 310: for list_page the JOB URL
-    outranks the navigator's promotion; the navigator's ``discovery.listing_url``
-    is the only candidate otherwise). The alternate is what the single retry
-    uses when the primary yields zero (job-76: the list_page job URL was an
-    ITEM page — as a listing it can only ever yield 0).
+    probe, mirroring run_execution's chain. [rag-bone job 72] a URL-shaped
+    search_criteria is the USER'S OWN listing assertion — the intake UI puts
+    the sample PDP in ``url`` and the real listing in search_criteria — so it
+    outranks the list_page job URL (which stays ahead of every navigator
+    candidate, job-310 contract). The alternate is what the single retry uses
+    when the primary yields zero (job-76: the list_page job URL was an ITEM
+    page — as a listing it can only ever yield 0). [job-85] the navigator's
+    ``discovery.listing_url`` is the retry candidate when it was not already
+    the primary — job 85's real listing lived only in search_criteria.
     """
+    _sc = str(state.get("search_criteria") or "").strip()
+    criteria = _sc if _sc.startswith(("http://", "https://")) else ""
     primary = ""
     if state.get("input_mode") == "list_page":
-        _jl = (state.get("url") or "").strip()
+        _jl = criteria or (state.get("url") or "").strip()
         if _jl.startswith(("http://", "https://")):
             primary = _jl
     _nav = state.get("navigation_analysis") or {}
     _disc = (_nav.get("discovery") if isinstance(_nav, dict) else None) or {}
     _alt = (_disc.get("listing_url") if isinstance(_disc, dict) else "") or ""
+    if not _alt:
+        # criteria is only a useful retry when the primary is something else.
+        _alt = "" if criteria == primary else criteria
+    if _alt == primary:
+        _alt = ""
     return primary, _alt
+
+
+def _probe_yield_dead(probe_yield: dict) -> bool:
+    """[job-85 supercheapauto] Is this probe yield a DEAD listing?
+
+    The shared predicate (``src.listing_discovery.listing_yield_failure``)
+    treats a junk-only yield — a PDP-as-listing's 1 self link, raw count 1-2
+    with no usable yield — the same as a raw zero. The old
+    ``discovered_urls == 0`` check armed nothing for that class, so the probe
+    blessed a listing execution could never crawl.
+    """
+    try:
+        from src.listing_discovery import listing_yield_failure
+
+        return listing_yield_failure(probe_yield)
+    except Exception:
+        return int(probe_yield.get("discovered_urls") or 0) == 0
 
 
 def _probe_retry_warranted(state: dict, probe_yield: dict | None) -> bool:
     """Should the Phase-1 probe retry once on the navigator's listing?
 
-    Only a CLEAN-EXIT ZERO on the primary candidate warrants it: a crash is a
-    code bug (not a listing choice), a nonzero yield means discovery works,
-    and an inconclusive probe (timeout, dispatch failure) has no evidence
-    either way. No distinct same-domain navigator listing → nothing better to
-    try. F17 applies to the retry candidate too.
+    Only a CLEAN-EXIT DEAD YIELD on the primary candidate warrants it: a
+    crash is a code bug (not a listing choice), a real yield means discovery
+    works ([job-85] "real" means usable — a PDP's 1 junk link is dead, not
+    working), and an inconclusive probe (timeout, dispatch failure) has no
+    evidence either way. No distinct same-domain navigator listing → nothing
+    better to try. F17 applies to the retry candidate too.
     """
-    if not isinstance(probe_yield, dict) or probe_yield.get("discovered_urls", 0) != 0:
+    if not isinstance(probe_yield, dict) or not _probe_yield_dead(probe_yield):
         return False
     primary, alt = _probe_listing_candidates(state)
     if not primary or not alt or alt == primary:
@@ -4928,7 +4957,7 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             )
         elif (
             probe_yield is not None
-            and probe_yield["discovered_urls"] == 0
+            and _probe_yield_dead(probe_yield)
             and isinstance(report, dict)
             and report.get("discovery_transient")
         ):
@@ -4936,11 +4965,12 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             # the strategy ladder — the draft demonstrably worked earlier in
             # this same testing phase.
             logger.info(
-                "_invoke_code_tester: probe found 0 URLs but discovery_transient "
-                "evidence is attached — suppressing the zero-yield verdict (job %s)",
+                "_invoke_code_tester: probe found no usable URLs but "
+                "discovery_transient evidence is attached — suppressing the "
+                "zero-yield verdict (job %s)",
                 job_id,
             )
-        elif probe_yield is not None and probe_yield["discovered_urls"] == 0:
+        elif probe_yield is not None and _probe_yield_dead(probe_yield):
             report = report or {}
             report["overall_assessment"] = "FAIL"
             report["confidence_score"] = 0.0
@@ -4958,7 +4988,7 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             report["discovery_coverage"] = _zcov
             report.setdefault("phases_tested", {})["phase1_discovery"] = False
             _zmsg = (
-                "Phase-1 discovery probe: clean exit but ZERO item URLs "
+                "Phase-1 discovery probe: clean exit but no usable item URLs "
                 f"discovered under execution conditions (stop_reason={_zsr}). "
                 "The draft's discovery cannot see this site's items with the "
                 "current strategy."

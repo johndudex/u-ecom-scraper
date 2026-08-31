@@ -50,6 +50,75 @@ logger = logging.getLogger(__name__)
 # found across every listing — a real catalog-end requires having seen items.
 _EXHAUSTION_REASONS = ("short_page", "no_next_link", "no_new_items")
 
+# [job-85 supercheapauto] Gates used to key on ``discovered_urls == 0``, but a
+# job URL that is an ITEM page yields exactly 1 junk link (itself / related
+# products) — which reads as success while the usable yield is 0. A real
+# listing page serves dozens of cards; 1-2 links is a detail page, not a
+# catalog.
+ZERO_YIELD_JUNK_LINKS = 2
+
+
+def listing_yield_failure(cov: dict | None) -> bool:
+    """True when discovery exited cleanly but produced NO usable item URLs.
+
+    [job-85 supercheapauto] One shared definition of "this listing cannot be
+    crawled", consumed by RC1's execution listing fallback and the graph's
+    Phase-1 probe gates (they previously keyed on ``discovered_urls == 0``,
+    which a PDP-as-listing's single junk link defeats: ``discovered_urls: 1,
+    found: 0, stop_reason: "short_page"`` armed nothing and the run shipped
+    0 items as SUCCESS).
+
+    Failure shapes:
+    - ``empty_first_page`` — the job-58 200-but-blocked signature;
+    - zero usable yield (``found`` when the run reports it, else the raw
+      link count) with an exhaustion-flavored stop reason — the crawl gave
+      up before ever seeing a catalog;
+    - a tiny raw yield (≤ ``ZERO_YIELD_JUNK_LINKS`` links) with no usable
+      yield.
+
+    NEVER a failure: ``max_pages_hit`` (genuine catalog end), hard errors
+    (``navigate_error`` / ``navigate_throttled`` — access problems owned by
+    the strategy ladder, not the listing choice), and any missing or
+    unknowable signal (gates stay no-op on missing data).
+    """
+    if not isinstance(cov, dict):
+        return False
+    sr = str(cov.get("stop_reason") or "")
+    if sr == "empty_first_page":
+        return True
+    if sr in ("max_pages_hit", "navigate_error", "navigate_throttled"):
+        return False
+    disc = cov.get("discovered_urls")
+    if isinstance(disc, (list, tuple)):
+        disc = len(disc)
+    try:
+        disc_n = int(disc or 0)
+    except (TypeError, ValueError):
+        disc_n = 0
+    if disc_n == 0:
+        # Raw zero (the legacy RC1 contract): nothing was ever seen, so any
+        # non-hard stop reason counts as a dead listing.
+        return True
+    found = cov.get("found")
+    if found is None and isinstance(cov.get("coverage"), dict):
+        # Probe-yield shape: the full coverage dict rides along nested.
+        found = cov["coverage"].get("found")
+    try:
+        found_n = int(found) if found is not None else None
+    except (TypeError, ValueError):
+        found_n = None
+    if found_n is None:
+        # No post-filter yield reported (the probe path reports raw links
+        # only) — the raw count IS the yield, and ≤2 links is a detail
+        # page's self/related links, not a catalog.
+        return disc_n <= ZERO_YIELD_JUNK_LINKS
+    if found_n != 0:
+        return False
+    # Zero usable yield alongside nonzero raw links: exhaustion-flavored
+    # stop = the crawl never saw a catalog; tiny raw yield = the "listing"
+    # was an item page.
+    return sr in _EXHAUSTION_REASONS or disc_n <= ZERO_YIELD_JUNK_LINKS
+
 
 def build_page_url(
     listing_url: str,

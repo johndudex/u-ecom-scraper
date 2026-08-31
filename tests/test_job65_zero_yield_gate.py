@@ -251,13 +251,24 @@ class TestCallerGateStatic:
 
     @staticmethod
     def _zero_branch(tester_src: str) -> str:
-        # The zero-check string appears in BOTH the suppression branch and the
+        # The zero-check appears in BOTH the suppression branch and the
         # force-FAIL branch — the force-FAIL branch is the SECOND occurrence
         # (order pinned by test_transient_evidence_suppresses_...).
-        first = tester_src.find('probe_yield["discovered_urls"] == 0')
-        i = tester_src.find('probe_yield["discovered_urls"] == 0', first + 1)
+        # [job-85 wave 7] the check itself is now the shared predicate
+        # ``_probe_yield_dead(probe_yield)`` — a raw ``== 0`` comparison would
+        # re-open the junk-yield blindness (a PDP's 1 self link read as
+        # success).
+        first = tester_src.find("_probe_yield_dead(probe_yield)")
+        i = tester_src.find("_probe_yield_dead(probe_yield)", first + 1)
         assert i != -1, "zero-yield force-FAIL branch missing"
         return tester_src[i : i + 3200]
+
+    def test_zero_checks_use_the_shared_predicate(self, tester_src):
+        """A bare ``discovered_urls == 0`` here would bless a PDP's junk link
+        (the exact job-85 miss) — every zero-verdict must go through
+        ``_probe_yield_dead``."""
+        assert 'probe_yield["discovered_urls"] == 0' not in tester_src
+        assert tester_src.count("_probe_yield_dead(probe_yield)") >= 2
 
     def test_zero_yield_force_fails_the_test(self, tester_src):
         gate = self._zero_branch(tester_src)
@@ -271,13 +282,13 @@ class TestCallerGateStatic:
             assert marker in gate, marker
 
     def test_transient_evidence_suppresses_the_zero_yield_verdict(self, tester_src):
-        # The suppression branch is `(zero and report.get("discovery_transient"))`
+        # The suppression branch is `(dead and report.get("discovery_transient"))`
         # and must sit BEFORE the force-FAIL branch: "discovery_transient"
-        # belongs to the FIRST zero-check condition, the force-FAIL branch is
+        # belongs to the FIRST dead-check condition, the force-FAIL branch is
         # the SECOND one.
         j = tester_src.find("discovery_transient")
-        first = tester_src.find('probe_yield["discovered_urls"] == 0')
-        second = tester_src.find('probe_yield["discovered_urls"] == 0', first + 1)
+        first = tester_src.find("_probe_yield_dead(probe_yield)")
+        second = tester_src.find("_probe_yield_dead(probe_yield)", first + 1)
         assert first != -1 and second != -1
         assert first < j < second
 

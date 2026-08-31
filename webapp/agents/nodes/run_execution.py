@@ -319,6 +319,31 @@ def _extended_wall_clock_deadline(
     return min(max(deadline, proposed), started_at + max_total)
 
 
+def _url_shaped_criteria(state: ScrapeState) -> str:
+    """The user's search_criteria when it is itself a URL (job 85's real
+    listing lived ONLY in search_criteria while the job URL was a PDP)."""
+    sc = str(state.get("search_criteria") or "").strip()
+    if sc.startswith(("http://", "https://")):
+        return sc
+    return ""
+
+
+def _scope_target(state: ScrapeState) -> int:
+    """The record count this job was ASKED for (intake scope), minimum 1.
+
+    [rag-bone job 72] scope=firstn/10 asked for 10 and got 1 — every
+    zero-keyed gate read that as success. With a target, rescue paths can arm
+    on "under-delivered" instead of only "delivered nothing". A job with no
+    parseable firstn scope targets 1 → rescue arms on a true zero only
+    (unchanged pre-job-72 behavior)."""
+    try:
+        if str(state.get("scope") or "").strip().lower() == "firstn":
+            return max(1, int(str(state.get("scope_value") or "").strip() or 0))
+    except (TypeError, ValueError):
+        pass
+    return 1
+
+
 def _distinct_same_domain_listing(state: ScrapeState, primary_listing: str) -> str:
     """[job-77 RC1] The navigator-promoted listing, when it is a DIFFERENT
     same-domain URL than the one execution just used.
@@ -326,21 +351,27 @@ def _distinct_same_domain_listing(state: ScrapeState, primary_listing: str) -> s
     Returns "" when there is nothing better to try: no navigation analysis,
     no discovery.listing_url, cross-domain (F17), or identical to the
     primary. Mirrors the F6 probe retry's candidate discipline.
+    [job-85 supercheapauto] A URL-shaped search_criteria is a second
+    candidate behind the navigator's promotion — the user's own listing
+    assertion outranks nothing but is better than a dead PDP.
     """
-    import os as _os
-
     nav = state.get("navigation_analysis") or {}
     disc = (nav.get("discovery") if isinstance(nav, dict) else None) or {}
-    alt = (disc.get("listing_url") if isinstance(disc, dict) else "") or ""
-    alt = str(alt).strip()
     primary = str(primary_listing or "").strip()
-    if not alt or not primary or alt == primary:
-        return ""
     job_reg = _registrable_of(state.get("url", ""))
-    alt_reg = _registrable_of(alt)
-    if job_reg and alt_reg and alt_reg != job_reg:
-        return ""
-    return alt
+    candidates = [
+        (disc.get("listing_url") if isinstance(disc, dict) else "") or "",
+        _url_shaped_criteria(state),
+    ]
+    for candidate in candidates:
+        alt = str(candidate or "").strip()
+        if not alt or not primary or alt == primary:
+            continue
+        alt_reg = _registrable_of(alt)
+        if job_reg and alt_reg and alt_reg != job_reg:
+            continue
+        return alt
+    return ""
 
 
 def _args_with_listing_url(base_args: list, alt_url: str) -> list:
@@ -356,13 +387,16 @@ def _args_with_listing_url(base_args: list, alt_url: str) -> list:
 
 
 def _execution_zero_discovery(result: dict) -> bool:
-    """[job-77 RC1] Did the execution run CLEAN but discover 0 item URLs?
+    """[job-77 RC1] Did the execution run CLEAN but discover no usable item URLs?
 
     Only a clean zero warrants the listing fallback — a crash/timeout is a
     code or access problem that the strategy ladder owns, not a listing
     choice (same rule as the F6 probe retry). Reads the run's own
-    ``metadata.discovery_coverage``: ``discovered_urls == 0`` or the
-    job-58 ``empty_first_page`` stop reason.
+    ``metadata.discovery_coverage`` through the shared predicate
+    (``src.listing_discovery.listing_yield_failure``): ``discovered_urls ==
+    0``, the job-58 ``empty_first_page`` stop reason, or — since job 85 —
+    a junk-only yield (a PDP-as-listing's 1 self link with ``found: 0``),
+    which the old raw-count check read as success.
     """
     output_file = (result or {}).get("output_file") or ""
     if not output_file or not os.path.isfile(output_file):
@@ -379,15 +413,21 @@ def _execution_zero_discovery(result: dict) -> bool:
     cov = (data.get("metadata") or {}).get("discovery_coverage") or {}
     if not isinstance(cov, dict):
         return False
-    if str(cov.get("stop_reason") or "") == "empty_first_page":
-        return True
-    disc = cov.get("discovered_urls")
-    if isinstance(disc, list):
-        disc = len(disc)
     try:
-        return int(disc or 0) == 0
-    except (TypeError, ValueError):
-        return False
+        from src.listing_discovery import listing_yield_failure
+
+        return listing_yield_failure(cov)
+    except Exception:
+        # Shared module unavailable — degrade to the legacy raw-count check.
+        disc = cov.get("discovered_urls")
+        if isinstance(disc, list):
+            disc = len(disc)
+        if str(cov.get("stop_reason") or "") == "empty_first_page":
+            return True
+        try:
+            return int(disc or 0) == 0
+        except (TypeError, ValueError):
+            return False
 
 
 def _maybe_retry_execution_listing(
@@ -517,18 +557,23 @@ def run_execution(state: ScrapeState) -> dict:
 
         if _listing_reached or not _respect_flag:
             # Nav reached the listing → pass the best listing URL. F7 chain:
-            # list_page job URL first (see _job_listing above), then
-            # discovery.listing_url (the navigator's authoritative contract),
-            # then search.working_url / listing_url_used (the traversal's
-            # actual landing page — blank for 8/9 sites' on-disk analyses if
-            # listing_url is absent, so the chain must fall through, never
-            # replace). F17: each candidate domain-guarded against the job
-            # URL's registrable domain (prod 331 shipped 80/80 .com.au rows
-            # under a .us job).
+            # URL-shaped search_criteria FIRST (the user's own listing
+            # assertion — [rag-bone job 72] the intake UI puts the sample PDP
+            # in `url` and the real listing in search_criteria; the tester
+            # discovered 25 URLs through exactly this URL while execution got
+            # 2 off the PDP), then the list_page job URL (job-310 contract —
+            # still outranks every NAVIGATOR candidate, see _job_listing
+            # above), then discovery.listing_url, then search.working_url /
+            # listing_url_used (the traversal's actual landing page — blank
+            # for 8/9 sites' on-disk analyses if listing_url is absent, so
+            # the chain must fall through, never replace). F17: each candidate
+            # domain-guarded against the job URL's registrable domain (prod
+            # 331 shipped 80/80 .com.au rows under a .us job).
             _search = _nav.get("search") or {}
             _disc = (_nav.get("discovery") if isinstance(_nav, dict) else None) or {}
             _job_reg = _registrable_of(state.get("url", ""))
             _candidates = [
+                _url_shaped_criteria(state),
                 _job_listing,
                 (_disc.get("listing_url") if isinstance(_disc, dict) else ""),
                 (_search.get("working_url") if isinstance(_search, dict) else ""),
@@ -587,9 +632,10 @@ def run_execution(state: ScrapeState) -> dict:
     if input_mode in ("navigation", "list_page", "search_term"):
         _nav_env = state.get("navigation_analysis") or {}
         _disc_env = (_nav_env.get("discovery") if isinstance(_nav_env, dict) else None) or {}
-        # Job 310: same list_page priority as the --listing-url chain — the
-        # user-provided listing (job URL) outranks the navigator's promotion.
-        _env_candidate = _job_listing or ""
+        # Same priority as the --listing-url chain: URL-shaped search_criteria
+        # (the user's listing assertion, [rag-bone job 72]) first, then the
+        # job-310 list_page job URL, then the navigator's promotion.
+        _env_candidate = _url_shaped_criteria(state) or _job_listing or ""
         if not _env_candidate:
             _env_candidate = (_disc_env.get("listing_url") if isinstance(_disc_env, dict) else "") or ""
         if not _env_candidate:
@@ -773,21 +819,28 @@ def _run_category_sources(state, scraper_path, base_args, site_folder, primary_r
     try:
         slug = state.get("site_slug", "")
         root = _os.environ.get("PROJECT_ROOT", "/app")
+        cat_links: list = []
+        # [job-85 supercheapauto] navigation_findings.json is one navigation
+        # artifact among several — its absence used to hard-return and blind
+        # this entire pass. Read whatever exists.
         nf_path = _os.path.join(root, "workspace", slug, "navigation_findings.json")
-        if not _os.path.isfile(nf_path):
-            return primary_result
-
-        nf = _json.load(open(nf_path))
-        # Get category URLs from homepage_nav.category_links
-        hp = nf.get("homepage_nav") or {}
-        cat_links = hp.get("category_links") or []
-        # Also check navigation_analysis categories
+        if _os.path.isfile(nf_path):
+            nf = _json.load(open(nf_path))
+            # Get category URLs from homepage_nav.category_links
+            hp = nf.get("homepage_nav") or {}
+            cat_links = list(hp.get("category_links") or [])
+        # Also check navigation_analysis categories (+ its promoted listing,
+        # kept aside as a zero-rescue candidate below — re-running the
+        # promotion on a HEALTHY primary would only re-discover the same URLs).
         na_path = _os.path.join(root, "workspace", slug, "navigation_analysis.json")
+        _promoted = ""
         if _os.path.isfile(na_path):
             na = _json.load(open(na_path))
             na_cats = na.get("categories") or []
             if isinstance(na_cats, list):
-                cat_links = list(cat_links) + list(na_cats)
+                cat_links = cat_links + list(na_cats)
+            _disc = na.get("discovery") if isinstance(na.get("discovery"), dict) else {}
+            _promoted = str(_disc.get("listing_url") or "").strip()
 
         # Filter to categories related to the search term
         term = search_term.lower()
@@ -801,12 +854,6 @@ def _run_category_sources(state, scraper_path, base_args, site_folder, primary_r
                 relevant.append(cat_url)
                 seen.add(cat_url)
 
-        if not relevant:
-            logger.info("multisource: no category pages matching '%s'", search_term)
-            return primary_result
-
-        logger.info("multisource: %d category pages match '%s'", len(relevant), search_term)
-
         # Load primary output products
         ct_config = state.get("content_type_config") or {}
         output_key = ct_config.get("output_key", "products") if ct_config else "products"
@@ -816,6 +863,35 @@ def _run_category_sources(state, scraper_path, base_args, site_folder, primary_r
         if primary_file and _os.path.isfile(primary_file):
             primary_data = _json.load(open(primary_file))
             primary_products = primary_data.get(output_key, [])
+
+        # [job-85 supercheapauto] Zero-rescue candidates: when the primary run
+        # extracted NOTHING, the navigator's promoted listing and the user's
+        # own URL-shaped search_criteria are direct targets — job 85's real
+        # listing lived only in search_criteria while the job URL was a PDP.
+        # [rag-bone job 72] "Nothing" widened to "fewer than the job asked
+        # for": scope=firstn/10 delivered 1 and every zero-keyed gate read it
+        # as success. Never added on a healthy primary: a top-up re-run of
+        # the same listing would only re-discover the same URLs (dedup saves
+        # the output, but the wall clock is real) — so candidates still skip
+        # the listing the primary run already used.
+        if len(primary_products) < _scope_target(state):
+            _used = str(state.get("_listing_url_env") or "").strip()
+            for _direct in (_promoted, _url_shaped_criteria(state)):
+                _u = str(_direct or "").strip()
+                if _u and _u != _used and _u not in seen:
+                    logger.info(
+                        "multisource: primary yielded %d items (< target %d) — "
+                        "rescue candidate %s",
+                        len(primary_products), _scope_target(state), _u[:70],
+                    )
+                    relevant.append(_u)
+                    seen.add(_u)
+
+        if not relevant:
+            logger.info("multisource: no category pages matching '%s'", search_term)
+            return primary_result
+
+        logger.info("multisource: %d category pages match '%s'", len(relevant), search_term)
 
         existing_urls = set(p.get("url", "") for p in primary_products)
         all_products = list(primary_products)
