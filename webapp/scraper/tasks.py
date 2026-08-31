@@ -1364,6 +1364,47 @@ def _graph_is_interrupted(graph: Any, config: dict[str, Any]) -> bool:
 # ═══════════════════════════════════════════════════════════════════════════
 
 STUCK_JOB_ACTIVITY_TIMEOUT_MINUTES = 30
+# [jobs 79/80] A task that Celery still reports ACTIVE is alive — log silence
+# then means a long quiet phase (browser run, probe ladder), not a corpse.
+# Only revoke such a task after a much longer silence: the wedge backstop.
+ACTIVE_SILENCE_REVOKE_MINUTES = 90
+
+
+def _task_liveness(task_id: str) -> str:
+    """Is this Celery task executing anywhere? ``active`` / ``absent`` /
+    ``unknown``.
+
+    [jobs 79/80] Log silence is NOT proof of death: both re-drive tasks had
+    their worker children destroyed at ~14:00:01 (probable container OOM),
+    and the watchdog's 14:38 revoke was post-mortem cleanup mislabelled as a
+    hung scrape. Asking Celery which tasks are actually running turns
+    "silent" into a real discriminator:
+
+    - ``absent``  — workers REPLIED and the task runs nowhere → the worker
+      child is gone (``acks_late=False`` → no redelivery); fail immediately
+      with an honest message instead of waiting out the silence rule.
+    - ``active``  — a worker owns the task; silence means a long quiet
+      phase. The caller only revokes past ``ACTIVE_SILENCE_REVOKE_MINUTES``.
+    - ``unknown`` — inspect failed or no worker replied (broker hiccup,
+      saturated pool). No evidence either way — the caller falls back to
+      the silence rule.
+    """
+    if not task_id:
+        return "unknown"
+    try:
+        from celery import current_app
+
+        reply = current_app.control.inspect(timeout=2.0).active()
+    except Exception:
+        return "unknown"
+    if reply is None:
+        # Nobody answered — NOT evidence the task is gone.
+        return "unknown"
+    for worker_tasks in reply.values():
+        for t in worker_tasks or ():
+            if isinstance(t, dict) and t.get("id") == task_id:
+                return "active"
+    return "absent"
 
 
 @shared_task
@@ -1375,6 +1416,12 @@ def cleanup_stuck_jobs() -> None:
     ``STUCK_JOB_ACTIVITY_TIMEOUT_MINUTES``, the worker almost certainly
     crashed (OOM, segfault, etc.) and the job must be manually marked
     as failed — otherwise it stays RUNNING forever.
+
+    Silence alone is no longer the verdict ([jobs 79/80]): before revoking,
+    ``_task_liveness`` asks Celery whether the task still executes. An
+    ``absent`` task fails immediately with an honest "worker process lost"
+    message; an ``active`` task is left alone until the much longer wedge
+    backstop, since silence there means a long quiet phase, not a corpse.
 
     Jobs in WAITING_APPROVAL are untouched — they are genuinely waiting
     for human input.
@@ -1412,6 +1459,17 @@ def cleanup_stuck_jobs() -> None:
 
         idle_minutes = int((timezone.now() - last_activity).total_seconds() / 60)
 
+        # Liveness check BEFORE revoking ([jobs 79/80] class): silent ≠ dead.
+        _task_id = getattr(job, "celery_task_id", "") or ""
+        _liveness = _task_liveness(_task_id)
+        if _liveness == "active" and idle_minutes < ACTIVE_SILENCE_REVOKE_MINUTES:
+            logger.warning(
+                "Stuck job %d: silent %d min but celery task %s is ACTIVE — "
+                "not revoking (long quiet phase, not a corpse)",
+                job.id, idle_minutes, _task_id,
+            )
+            continue
+
         # Actually terminate the Celery task, not just the DB row. Without this,
         # the worker keeps running the hung graph (LLM-phase hangs, abandoned
         # agent threads, an in-process 200-page discovery loop) while the DB row
@@ -1424,13 +1482,28 @@ def cleanup_stuck_jobs() -> None:
         # redelivery resume from the langgraph checkpoint instead of being
         # silently dropped (and the job stuck RUNNING forever). Harmless when
         # acks_late is off (today's default).
-        error_msg = (
-            f"No activity for {idle_minutes} min — job appears hung "
-            f"(stalled agent phase or wedged scrape); celery task revoked."
-        )
+        if _liveness == "absent":
+            error_msg = (
+                f"Worker process lost: celery task {_task_id} is not active on "
+                f"any worker (silent {idle_minutes} min; acks_late=False means "
+                f"no redelivery). Failed by the stuck-job watchdog."
+            )
+        elif _liveness == "active":
+            error_msg = (
+                f"No activity for {idle_minutes} min while the task still "
+                f"reports ACTIVE — treated as wedged (stalled agent phase or "
+                f"hung scrape); celery task revoked."
+            )
+        else:
+            error_msg = (
+                f"No activity for {idle_minutes} min — job appears hung "
+                f"(stalled agent phase or wedged scrape); celery task revoked."
+            )
         logger.error(
-            "Stuck job %d: no activity for %d min (last: %s), marking failed + revoking",
+            "Stuck job %d: liveness=%s, no activity for %d min (last: %s), "
+            "marking failed + revoking",
             job.id,
+            _liveness,
             idle_minutes,
             last_activity.isoformat(timespec="seconds"),
         )
@@ -1439,7 +1512,6 @@ def cleanup_stuck_jobs() -> None:
         job.completed_at = timezone.now()
         job.save(update_fields=["status", "error_message", "completed_at"])
 
-        _task_id = getattr(job, "celery_task_id", "") or ""
         if _task_id:
             try:
                 from celery import current_app

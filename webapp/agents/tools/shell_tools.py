@@ -10,6 +10,7 @@ import os
 import shlex
 import subprocess
 import time
+from contextlib import contextmanager
 from typing import Optional
 
 import httpx
@@ -314,6 +315,14 @@ def get_shell_tools(
                 (_disc_ts.get("listing_url") if isinstance(_disc_ts, dict) else "")
                 or ""
             )
+            if not _listing_ts:
+                # [rag-bone job 72] the tester must not be the ONLY phase that
+                # knows about a listing asserted solely in search_criteria —
+                # the tester proved 25 URLs there while execution (which reads
+                # the full candidate chain) discovered 2 off the sample PDP.
+                _sc_ts = str(_ts.get("search_criteria") or "").strip()
+                if _sc_ts.startswith(("http://", "https://")):
+                    _listing_ts = _sc_ts
             if _listing_ts and _ts.get("input_mode") in ("navigation", "list_page", "search_term"):
                 env_overrides = dict(env_overrides or {})
                 env_overrides["SCRAPER_LISTING_URL"] = _listing_ts
@@ -345,18 +354,19 @@ def get_shell_tools(
                 # W8: bounded retry on 429/502/503/504 + transport errors — a
                 # bare raise_for_status() turned browser-service backpressure
                 # into an opaque HTTPStatusError mid-test.
-                _res = post_scrape_with_retry(
-                    f"{service_url}/scrape",
-                    {
-                        "scraper_source": _source,
-                        "scraper_name": os.path.basename(full_path),
-                        "extra_files": _extra,
-                        "args": cmd_args,
-                        "timeout": timeout,
-                        "env_overrides": env_overrides,
-                    },
-                    timeout=timeout + 60,
-                )
+                with _dispatch_alive():
+                    _res = post_scrape_with_retry(
+                        f"{service_url}/scrape",
+                        {
+                            "scraper_source": _source,
+                            "scraper_name": os.path.basename(full_path),
+                            "extra_files": _extra,
+                            "args": cmd_args,
+                            "timeout": timeout,
+                            "env_overrides": env_overrides,
+                        },
+                        timeout=timeout + 60,
+                    )
                 # W8 migration: _res is a ScrapeResult (browser_http), not an
                 # httpx.Response — .status_code here raised AttributeError on
                 # EVERY browser-strategy dispatch (sephora job 51: scraper never
@@ -418,14 +428,15 @@ def get_shell_tools(
                 # Inherit env + inject discovery env vars (same as browser path).
                 _run_env = dict(os.environ)
                 _run_env.update(env_overrides or {})
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    cwd=cwd,
-                    env=_run_env,
-                )
+                with _dispatch_alive():
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout,
+                        cwd=cwd,
+                        env=_run_env,
+                    )
                 return _format_result({
                     "returncode": result.returncode,
                     "stdout": result.stdout,
@@ -437,3 +448,41 @@ def get_shell_tools(
                 return f"Error running scraper: {exc}"
 
     return [run_bash, run_scraper]
+
+
+@contextmanager
+def _dispatch_alive():
+    """[jobs 79/80] ``[EXEC-ALIVE]`` heartbeat across run_scraper's blocking
+    dispatch (browser_service POST / local subprocess).
+
+    The pre-dispatch ``[RUN_SCRAPER] Starting`` row STARTS the watchdog's
+    30-min silence clock — a 10-min browser run behind an otherwise-quiet
+    phase then reads as a corpse (jobs 79/80 went silent at exactly that
+    row). The dispatch is independently bounded (browser timeout floored at
+    ``BROWSER_RUN_TIMEOUT_FLOOR`` + 60s httpx margin; subprocess ``timeout=``),
+    so — same doctrine as run_execution's ``[EXEC-ALIVE]`` rows — these beats
+    can only rescue a genuinely-live run, never mask a hang: the context ends
+    when the dispatch returns and the beats stop with it.
+    """
+    _hb = None
+    try:
+        from agents.tools.context import get_state
+        from agents.graph import _start_heartbeat
+
+        _job_id = ((get_state() or {}).get("job_id") or 0)
+        if _job_id:
+            _hb = _start_heartbeat(
+                _job_id, "run_scraper", interval=240, prefix="[EXEC-ALIVE]",
+            )
+    except Exception:
+        _hb = None
+    try:
+        yield
+    finally:
+        if _hb is not None:
+            try:
+                from agents.graph import _stop_heartbeat
+
+                _stop_heartbeat(_hb)
+            except Exception:
+                pass

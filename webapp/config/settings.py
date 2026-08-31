@@ -129,11 +129,17 @@ CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
 # memory (abandoned threads, large contexts, aya's 26K-record parse) by warm-
 # recycling the worker after a task if its RSS exceeds the ceiling, or after N
 # tasks. Warm recycle = finish the current task, THEN recycle → no task loss,
-# so acks_late is NOT required for this. Ceiling is set below the 3g mem_limit
-# (2.5g = 2621440 KiB) so the recycle fires before the kernel OOM-kills the
-# worker (the 16% celery-OOM failure class). Tune from measured aya peak.
+# so acks_late is NOT required for this.
+#
+# [jobs 79/80] GEOMETRY: warm recycle can only fire BETWEEN tasks — it cannot
+# intervene mid-task. With concurrency=2 the old 2.5g ceiling allowed
+# 2 × 2.5g = 5g against the container's 3g mem_limit, so two long-lived tasks
+# crossing the container limit together produced a near-simultaneous double
+# child SIGKILL (jobs 79/80 died within 320 ms of each other at 14:00:01).
+# 1.2g per child × 2 = 2.4g leaves the parent + headroom under 3g, and the
+# (warm, lossless) recycle now fires before the kernel has to.
 CELERY_WORKER_MAX_MEMORY_PER_CHILD = config(
-    "CELERY_WORKER_MAX_MEMORY_PER_CHILD", default=2621440, cast=int
+    "CELERY_WORKER_MAX_MEMORY_PER_CHILD", default=1228800, cast=int
 )
 CELERY_WORKER_MAX_TASKS_PER_CHILD = config(
     "CELERY_WORKER_MAX_TASKS_PER_CHILD", default=10, cast=int
@@ -170,10 +176,15 @@ CELERY_BEAT_SCHEDULE = {
 
 # Fold B5: delivery HTTP must never share the scrape workers' 2-slot pool —
 # one hung partner endpoint ≈ 10 min of zero scrape capacity otherwise.
+# [jobs 79/80] Same for the watchdog: cleanup_stuck_jobs is beat-scheduled on
+# the scrape pool it polices — with both slots busy it queued for 8+ min
+# (the "38 min" idle report for a 30-min threshold). The events worker is a
+# separate 4-slot pool → true 5-min cadence.
 CELERY_TASK_ROUTES = {
     "scraper.events.dispatcher.deliver_callback": "events",
     "scraper.events.dispatcher.dispatch_pending_callbacks": "events",
     "scraper.events.reconciler.dispatch_pending_callbacks": "events",
+    "scraper.tasks.cleanup_stuck_jobs": "events",
 }
 
 ZAI_API_KEY = config("ZAI_API_KEY", default="")
