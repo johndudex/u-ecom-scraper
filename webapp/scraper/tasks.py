@@ -709,6 +709,75 @@ def _finalize_was_cancelled(final_state: dict[str, Any]) -> bool:
     return is_cancel(response)
 
 
+def _diagnose_no_execution(site_slug: str, job_id: int) -> str:
+    """Job-74 class: say WHY a job reached finalize without ever executing.
+
+    The catch-all below fires for two very different failures, and the old
+    message called both "testing cascade exhausted": (a) the cascade actually
+    exhausted (job-73 madewell), and (b) a draft that PASSED testing with real
+    items but execution never ran at all (job-74 thenile cycle 1: tester PASS
+    0.85, 5/5 fields, then the pipeline surfaced at cleanup with no
+    execution_status — an approval/interrupt-resume gap, not a scraper
+    defect). Diagnosing (b) as (a) sent the RCA down the wrong path.
+
+    Reads the test report from wherever it survived: the F7 failure archive
+    (cleanup archives it for every non-SUCCESS job), the FM site folder, or
+    the workspace. Best-effort — falls back to the generic message.
+    """
+    import json as _json
+    import os as _os
+
+    try:
+        import src.artifacts as artifacts
+
+        candidates: list[Any] = []
+        if site_slug:
+            candidates.append(
+                artifacts.scrapers_key(site_slug, "analysis", f"test_report-{job_id}.json")
+            )
+            candidates.append(artifacts.scrapers_key(site_slug, "test_report.json"))
+        root = _os.environ.get("PROJECT_ROOT", "/app")
+        if site_slug:
+            candidates.append(
+                _os.path.join(root, "workspace", site_slug, "test_report.json")
+            )
+        for key in candidates:
+            try:
+                if hasattr(artifacts, "exists") and not str(key).startswith("/"):
+                    if not artifacts.exists(key):
+                        continue
+                    report = artifacts.read_json(key)
+                else:
+                    if not _os.path.isfile(str(key)):
+                        continue
+                    with open(str(key), "r", encoding="utf-8", errors="replace") as f:
+                        report = _json.load(f)
+            except Exception:
+                continue
+            if not isinstance(report, dict):
+                continue
+            assessment = str(report.get("overall_assessment") or "").upper()
+            try:
+                confidence = float(report.get("confidence_score") or 0.0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            if assessment == "PASS":
+                return (
+                    f"Tested PASS (confidence={confidence:.2f}) but execution "
+                    "never ran — the pipeline ended between approval and "
+                    "execution (interrupt/resume gap), not a scraper failure"
+                )[:2000]
+            # A non-PASS report IS the exhausted-cascade case — keep the
+            # historical message for it.
+            break
+    except Exception:
+        pass
+    return (
+        "Pipeline ended before execution (testing cascade exhausted "
+        "without a passing run)"
+    )[:2000]
+
+
 def _output_file_has_zero_items(output_file: str) -> bool:
     """Jobs 309/310: True when the execution output parses but holds 0 records.
 
@@ -1066,13 +1135,10 @@ def _finalize_job(job: ScrapeJob) -> None:
         # output) did not succeed; say so.
         job.status = ScrapeJob.STATUS_FAILED
         if not job.error_message:
-            job.error_message = (
-                "Pipeline ended before execution (testing cascade exhausted "
-                "without a passing run)"
-            )[:2000]
+            job.error_message = _diagnose_no_execution(site_slug, job.id)
         logger.warning(
             "Job %d: no execution_status and no output at finalize — marking FAILED "
-            "(pipeline never executed)", job.id,
+            "(pipeline never executed): %s", job.id, job.error_message,
         )
     elif job.output_file and _output_file_has_zero_items(job.output_file):
         # Jobs 309/310 (pillowtalk e2e): an execution that RUNS but extracts
