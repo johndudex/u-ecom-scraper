@@ -1385,7 +1385,8 @@ def _archive_failure_evidence(slug: str, job_id: int, execution_status: str) -> 
 
 
 def _promote_scraper(
-    slug: str, job_id: int, execution_status: str, archive_key: str | None
+    slug: str, job_id: int, execution_status: str, archive_key: str | None,
+    product_count: int | None = None,
 ) -> str | None:
     """Deterministic, failure-safe scraper finalization (replaces the LLM cp).
 
@@ -1395,6 +1396,11 @@ def _promote_scraper(
     2. Promote to production ``scrapers/{slug}/scraper.py`` ONLY on SUCCESS. On
        non-success, leave production untouched and restore the prior good scraper
        from the archive key (defends against any stray clobber).
+       [job-77] SUCCESS with an explicit 0-item count does NOT promote either —
+       execution ran, extracted nothing, and the dead draft still became the
+       site's production scraper.py (verified byte-identical in prod FM). A
+       scraper that extracts nothing under execution conditions must not stand
+       in for a working one. Unknown count (None) keeps the legacy behavior.
 
     Returns the per-job scraper KEY (or None if no draft was produced). The draft
     read is local (workspace stays on the worker); all scrapers/ writes go to FM.
@@ -1417,7 +1423,13 @@ def _promote_scraper(
             promoted = per_job_key
             logger.info("_promote_scraper: per-job copy → jobs/scraper-%s.py", job_id)
 
-        if execution_status == "SUCCESS":
+        if execution_status == "SUCCESS" and product_count == 0:
+            logger.warning(
+                "_promote_scraper: SUCCESS but 0 items extracted — NOT promoting "
+                "a zero-yield draft to production scraper.py (job %s) [job-77]",
+                job_id,
+            )
+        elif execution_status == "SUCCESS":
             if promoted:
                 artifacts.write(prod_key, artifacts.read(per_job_key))
                 logger.info(
@@ -4427,12 +4439,23 @@ def _probe_phase1_discovery_once(
         # ``discovered_urls`` (int; some templates emit a list).
         probe_yield: dict | None = None
         try:
+            # [job-77 RC4] The floor is LOAD-BEARING here, not just a filter:
+            # without it the F16 substantive-count ranking picks the tester's
+            # older NON-EMPTY output over this probe's fresh 0-item one, the
+            # getmtime check below then (correctly) rejects the stale file as
+            # inconclusive — and the zero-yield gate is structurally blind in
+            # exactly the case it exists for (probe 0 next to a 5-item testing
+            # file). A floored call also bypasses the FM fallback and, with
+            # only this probe's files eligible, the count ranking reduces to
+            # max() over the wrapper's own attempts — correct for the
+            # retry-once-then-last-attempt-verdict contract.
             _probe_out = _find_newest_output(
                 os.path.join(root, "workspace", slug),
                 os.path.join(root, "scrapers", slug),
                 slug=slug,
+                mtime_floor=_probe_started - 5,
             )
-            if _probe_out and os.path.getmtime(_probe_out) >= _probe_started - 5:
+            if _probe_out:
                 _cov = _read_discovery_coverage(_probe_out) or {}
                 _disc = _cov.get("discovered_urls")
                 if isinstance(_disc, list):
@@ -4877,7 +4900,8 @@ def _invoke_cleanup(state: ScrapeState, config: RunnableConfig) -> dict[str, Any
         # Deterministic, failure-safe scraper promotion (the agent no longer cp's
         # scraper.py — see build_cleanup_message). Per-job copy + success gate.
         scraper_path = _promote_scraper(
-            slug, job_id, state.get("execution_status", ""), archive_path
+            slug, job_id, state.get("execution_status", ""), archive_path,
+            product_count=state.get("product_count"),
         )
         # Keep the failed cycle's evidence (pillowtalk gap): the workspace is
         # wiped by the next job; a FAILED job must leave its test report.
