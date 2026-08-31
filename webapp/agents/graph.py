@@ -3126,7 +3126,12 @@ def _decide_strategy(state: ScrapeState) -> dict[str, Any]:
             # intake jobs go to cleanup (honest failure, artifacts preserved);
             # jobs with approvals get the human "final retry feedback" gate.
             return Command(goto=_exhausted_goto, update=update)
-        return update
+        # [job-82 D6] Command routing, like the happy path above the exhausted
+        # arm — a registered static scraper_analyzer → code_writer edge
+        # shadowed the exhausted arm's goto with a ghost code_writer re-entry,
+        # silently bypassing the never-retry-a-dead-strategy honesty rule
+        # (job-12).
+        return Command(goto="code_writer", update=update)
     except Exception:
         _notify_phase(job_id, "scraper_analyzer", "failed")
         raise
@@ -4216,7 +4221,14 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         strategy = scraper_analysis.get("strategy", "")
         if strategy:
             update["scraping_method"] = strategy
-        return update
+        # [job-82 D6] Route via Command — this node carries NO static out-edge
+        # any more. With a registered static code_writer → code_tester edge,
+        # LangGraph ran BOTH this destination and every failure Command's
+        # destination in the same superstep, so the writer's dead-invocation
+        # escalation ladder (scraper_analyzer bounce, human_approval, cleanup)
+        # executed only as ghost siblings racing the doomed tester cycle.
+        # Same contract as _route_after_execution.
+        return Command(goto="code_tester", update=update)
     except Exception:
         _notify_phase(job_id, "code_writer", "failed")
         raise
@@ -5521,6 +5533,32 @@ def _persist_agent_logs(
 
     messages = result.get("messages", [])
     if not messages:
+        # [job-82] A dead invocation from a NON-wall-clock exception (provider
+        # 5xx, unclassified httpx read error, decode/validation failure)
+        # previously left NO trace in the job's DB rows — the SessionLog
+        # showed a healthy-looking silence and the exception surfaced only in
+        # a truncated celery log line. One ToolCallLog row makes every
+        # invocation-ending exception visible (and classifiable) in the
+        # tool-calls view, for every agent, not just code_writer.
+        _di_class = str(result.get("_error_class") or "") if isinstance(result, dict) else ""
+        if _err or _di_class:
+            try:
+                from scraper.models import ToolCallLog
+
+                ToolCallLog.objects.create(
+                    job_id=job_id,
+                    agent=agent_name,
+                    tool_name="dead_invocation",
+                    tool_call_id="",
+                    call_seq=ToolCallLog.objects.filter(job_id=job_id).count(),
+                    args_summary=(_di_class or "unknown")[:200],
+                    result_summary=_err[:500] or "invocation ended with an exception and no messages",
+                )
+            except Exception as _di_exc:
+                logger.warning(
+                    "_persist_agent_logs: dead-invocation row failed for %s: %s",
+                    agent_name, _di_exc,
+                )
         return
 
     # Observability (job 9-vs-10 lesson): persist the RESOLVED model per invoke
@@ -6032,12 +6070,17 @@ def build_scrape_graph(
     # From validate_coverage, Command goto may be: scraper_analyzer,
     # human_approval, code_tester
 
-    # scraper_analyzer → code_writer
-    workflow.add_edge("scraper_analyzer", "code_writer")
-
-    # code_writer → code_tester (the read-only code_review phase was removed;
-    # code_tester validates functionality and route_after_testing handles retries).
-    workflow.add_edge("code_writer", "code_tester")
+    # scraper_analyzer → code_writer and code_writer → code_tester are
+    # COMMAND-ROUTED now (D6 shadow branch, prod job 82): both nodes return
+    # Command on every exit — the happy paths target exactly what these static
+    # edges pointed at, and the failure arms (dead writer → scraper_analyzer /
+    # human_approval / cleanup; strategy ladder exhausted → cleanup /
+    # human_approval) previously fired only as GHOST siblings running in
+    # parallel with the doomed static-edge destination, because LangGraph
+    # unions a Command goto with any registered static out-edge. Mirror of the
+    # product_analyzer (F13) and run_execution (job-65) precedents above.
+    # (The read-only code_review phase was removed; code_tester validates
+    # functionality and route_after_testing handles retries.)
 
     # code_tester → route_after_testing (conditional)
     workflow.add_conditional_edges(

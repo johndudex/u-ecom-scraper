@@ -136,8 +136,12 @@ class TestDeadWriterRouting:
         state = {"job_id": 0, "site_slug": "t", "code_writer_error_count": 0,
                  "scraper_analysis": {"strategy": "http_requests"}}
         result = self._run(monkeypatch, tmp_path, state, {"messages": []})
-        assert not isinstance(result, _Command)
-        assert result.get("scraping_method") == "http_requests"
+        # [job-82 D6] "draft usable → keep testing" is now a Command — the
+        # static code_writer → code_tester edge is gone. What the pin actually
+        # guards: this path must NOT escalate (no human_approval interrupt).
+        assert isinstance(result, _Command)
+        assert result.goto == "code_tester"
+        assert (result.update or {}).get("scraping_method") == "http_requests"
 
     def test_resume_routing_for_code_writer_failed(self):
         assert g.route_from_human_approval({

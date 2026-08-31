@@ -31,8 +31,14 @@ class TestTopology:
 
     def test_no_static_edge_from_command_returning_nodes(self):
         src = self._graph_src()
-        # product_analyzer and site_analyzer must have NO registered out-edges
-        for node in ("product_analyzer", "site_analyzer"):
+        # product_analyzer and site_analyzer must have NO registered out-edges.
+        # [job-82] code_writer and scraper_analyzer join them: their static
+        # edges (→ code_tester / → code_writer) unioned with the failure arms'
+        # Command gotos, so dead-writer escalation and the strategy-ladder
+        # exhausted arm ran only as ghost siblings racing the doomed
+        # static-edge destination — the D6 shadow branch, again.
+        for node in ("product_analyzer", "site_analyzer",
+                     "code_writer", "scraper_analyzer"):
             assert not re.search(
                 rf'add_edge\("{node}"\s*,', src
             ), f"{node} still has a static out-edge"
@@ -54,6 +60,21 @@ class TestTopology:
     def test_remap_still_routes_to_code_writer(self):
         src = self._graph_src()
         assert 'goto="code_writer"' in src  # the remap path, unchanged
+
+    def test_writer_and_strategy_happy_paths_route_via_command(self):
+        """[job-82] The happy-path pins are load-bearing: with the static
+        edges deleted, a happy path that still returned a plain dict would
+        leave code_tester (or code_writer) unreachable on success and the
+        graph would still compile. Match the EXACT return forms — a bare
+        goto="code_tester" pin is vacuous (validate_coverage routes there
+        too)."""
+        src = self._graph_src()
+        assert re.search(
+            r'return Command\(goto="code_tester", update=update\)', src
+        ), "_invoke_code_writer happy path must return Command(goto='code_tester', ...)"
+        assert re.search(
+            r'return Command\(goto="code_writer", update=update\)', src
+        ), "_decide_strategy happy path must return Command(goto='code_writer', ...)"
 
 
 class TestLiveGraph:
@@ -99,6 +120,35 @@ class TestLiveGraph:
                                           "branch:to:update_tracker_analysis"))
         ]
         assert not static_branch, f"static branch writer still present: {static_branch}"
+
+    def test_code_writer_writers_no_static_branch(self):
+        """[job-82] The D6 shadow on code_writer: with
+        add_edge("code_writer", "code_tester") registered, every failure-arm
+        Command's destination ALSO ran in the same superstep — the dead-writer
+        escalation ladder executed as ghosts racing the doomed tester cycle."""
+        g = self._build()
+        writers = getattr(g.nodes["code_writer"], "writers", None) or []
+        static_branch = [w for w in writers if "branch:to:code_tester" in repr(w)]
+        assert not static_branch, (
+            f"static branch writer still present: {static_branch}"
+        )
+
+    def test_scraper_analyzer_writers_no_static_branch(self):
+        """[job-82] Same shadow on scraper_analyzer: its static edge to
+        code_writer ghost-ran alongside the exhausted arm's Command, silently
+        bypassing the never-retry-a-dead-strategy rule (job-12)."""
+        g = self._build()
+        writers = getattr(g.nodes["scraper_analyzer"], "writers", None) or []
+        static_branch = [w for w in writers if "branch:to:code_writer" in repr(w)]
+        assert not static_branch, (
+            f"static branch writer still present: {static_branch}"
+        )
+
+    def test_code_tester_still_reachable_from_writer(self):
+        """Deleting the static edge must not orphan code_tester: the writer's
+        happy-path Command is now its entry from code generation."""
+        g = self._build()
+        assert "code_tester" in g.nodes
 
     def test_normalize_fields_still_reachable(self):
         """Every previous entry path into normalize_fields must still work:
