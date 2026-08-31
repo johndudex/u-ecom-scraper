@@ -53,8 +53,11 @@ DELAY_BETWEEN_REQUESTS = {DELAY_BETWEEN_REQUESTS}
 PAGE_LOAD_TIMEOUT = 30000
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TIMESTAMP = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
-OUTPUT_FILE = os.path.join(SCRIPT_DIR, f"output_{TIMESTAMP}.json")
+# Unique per process: a second-resolution timestamp collides when two runs
+# of this draft start in the same second (job-71 popsockets — the discovery
+# run's empty products array overwrote the passing extraction result).
+TIMESTAMP = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S_%f")
+OUTPUT_FILE = os.path.join(SCRIPT_DIR, f"output_{TIMESTAMP}_{os.getpid()}.json")
 INPUT_FILE = os.path.join(SCRIPT_DIR, "input_urls.json")
 LOG_FILE = os.path.join(os.path.dirname(SCRIPT_DIR), "logs", f"{SITE_SLUG}.log")
 
@@ -468,6 +471,7 @@ def main():
             },
             "products": [],
             "metadata": {
+                "phase": "discovery",
                 "total_discovered": len(_probe_result.urls),
                 "discovery_coverage": _probe_coverage,
             },
@@ -564,6 +568,7 @@ def main():
         },
         "products": results,
         "metadata": {
+            "phase": "extraction",
             "scraping_duration_seconds": round(time.time() - start_time, 2),
             "failed_products": failed,
             "rate_limit_delay": DELAY_BETWEEN_REQUESTS,

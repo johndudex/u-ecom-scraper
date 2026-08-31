@@ -339,7 +339,9 @@ def main():
 
     output_file = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
-        f"output_{time.strftime('%Y-%m-%d_%H%M%S')}.json",
+        # Unique per process: a second-resolution timestamp collides when two
+        # runs of this draft start in the same second (job-71 popsockets).
+        f"output_{time.strftime('%Y-%m-%d_%H%M%S')}_{os.getpid()}.json",
     )
     with open(output_file, "w") as f:
         json.dump(output, f, indent=2, ensure_ascii=False, default=str)

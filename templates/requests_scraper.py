@@ -116,8 +116,15 @@ fetch_page = create_fetch_page(delay_s=DELAY_BETWEEN_REQUESTS, headers=HEADERS)
 from src.listing_discovery import discover_listing_urls_with_retry
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TIMESTAMP = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
-OUTPUT_FILE = os.path.join(SCRIPT_DIR, f"output_{TIMESTAMP}.json")
+# job-71 popsockets: a second-resolution timestamp collided when code_tester
+# launched this draft's phases as parallel tool calls 1 ms apart — the
+# --discover-only run's empty products array overwrote the passing Phase-2
+# result and every output-file gate then saw zero items (the testing cascade
+# exhausted on a scraper that had actually worked). Microsecond stamp + pid
+# makes the path unique per process; metadata.phase tells consumers
+# discovery artifacts from extraction results.
+TIMESTAMP = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S_%f")
+OUTPUT_FILE = os.path.join(SCRIPT_DIR, f"output_{TIMESTAMP}_{os.getpid()}.json")
 INPUT_FILE = os.path.join(SCRIPT_DIR, "input_urls.json")
 LOG_FILE = os.path.join(os.path.dirname(SCRIPT_DIR), "logs", f"{SITE_SLUG}.log")
 
@@ -482,6 +489,9 @@ def main():
         },
         "products": results,
         "metadata": {
+            # job-76 myhouse: lets every consumer tell a discovery artifact
+            # (URL stubs, no fields) from an extraction result.
+            "phase": "discovery" if args.discover_only else "extraction",
             "scraping_duration_seconds": round(time.time() - start_time, 2),
             "failed_products": failed,
             "rate_limit_delay": DELAY_BETWEEN_REQUESTS,

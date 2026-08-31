@@ -961,6 +961,9 @@ def main():
         },
         OUTPUT_KEY: items,
         "metadata": {
+            # job-76 myhouse: lets every consumer tell a discovery artifact
+            # (URL stubs, no fields) from an extraction result.
+            "phase": "discovery" if args.discover_only else "extraction",
             "scraping_duration_seconds": round(time.time() - start_time, 1),
             "discovered_urls": len(discovered_urls),
             "extracted_items": len(items),
@@ -968,8 +971,13 @@ def main():
         },
     }
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
-    output_filename = os.path.join(SCRIPT_DIR, f"output_{timestamp}.json")
+    # Unique per process: a second-resolution timestamp collides when two
+    # runs of this draft start in the same second (job-71 popsockets — the
+    # discovery run clobbered the extraction result).
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S_%f")
+    output_filename = os.path.join(
+        SCRIPT_DIR, f"output_{timestamp}_{os.getpid()}.json"
+    )
 
     with open(output_filename, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False, default=str)

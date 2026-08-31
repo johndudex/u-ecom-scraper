@@ -59,8 +59,11 @@ UC_RECONNECT_TIME = 4
 BLOCK_RESET_THRESHOLD = 2
 SESSIONS_BEFORE_FULL_RESET = 10
 
-TIMESTAMP = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
-OUTPUT_FILE = os.path.join(SCRIPT_DIR, f"output_{TIMESTAMP}.json")
+# Unique per process: a second-resolution timestamp collides when two runs
+# of this draft start in the same second (job-71 popsockets — the discovery
+# run's empty products array overwrote the passing extraction result).
+TIMESTAMP = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S_%f")
+OUTPUT_FILE = os.path.join(SCRIPT_DIR, f"output_{TIMESTAMP}_{os.getpid()}.json")
 INPUT_FILE = os.path.join(SCRIPT_DIR, "input_urls.json")
 LOG_FILE = os.path.join(os.path.dirname(SCRIPT_DIR.rstrip("/")), "logs", f"{SITE_SLUG}.log")
 
