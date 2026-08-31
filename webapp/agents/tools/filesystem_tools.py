@@ -232,15 +232,21 @@ def get_filesystem_tools(
             )
 
     @tool
-    def read_file(path: str) -> str:
+    def read_file(path: str, offset: int = 0) -> str:
         """Read the content of a file and return it as a string.
 
         Args:
             path: Absolute or relative path to the file within the project.
+            offset: Character position to start reading from. Use this to
+                page through files larger than 50K chars — each call returns
+                up to 50K chars starting at `offset`. A large file is fully
+                readable as: read_file(path) → read_file(path, offset=50000)
+                → read_file(path, offset=100000) → ...
 
         Returns:
             The file content as text, or an error message if the file
-            cannot be read. Files larger than 50K chars are truncated.
+            cannot be read. Files larger than 50K chars are returned in
+            50K pages — the truncation notice states the next offset.
         """
         try:
             safe = _enforce_root(path, root)
@@ -259,12 +265,21 @@ def get_filesystem_tools(
             return f"Error reading '{path}': {e}"
 
         MAX_READ_CHARS = 50_000
+        if offset:
+            if offset < 0 or offset >= len(content):
+                return (
+                    f"offset {offset:,} out of range: file is "
+                    f"{len(content):,} chars"
+                )
+            content = content[offset:]
         if len(content) > MAX_READ_CHARS:
+            next_offset = offset + MAX_READ_CHARS
             return (
                 content[:MAX_READ_CHARS]
-                + f"\n\n... [TRUNCATED: file is {len(content):,} chars, "
-                f"showing first {MAX_READ_CHARS:,}. "
-                f"Use search_content for targeted queries on large files.]"
+                + f"\n\n... [TRUNCATED: file is {len(content):,} chars from "
+                f"offset {offset:,}, showing chars {offset:,}-"
+                f"{next_offset - 1:,}. Re-call read_file with "
+                f"offset={next_offset:,} for the next portion.]"
             )
         return content
 
@@ -415,7 +430,9 @@ def get_filesystem_tools(
 
         Returns:
             Matching files with line numbers and excerpt lines, or a message
-            if nothing was found.
+            if nothing was found. ``path`` may be a FILE (that exact file is
+            searched; ``include`` is ignored for an explicit file) or a
+            directory (walked recursively, ``include`` filters filenames).
         """
         if workspace_scope and path == ".":
             effective_path = os.path.join("workspace", workspace_scope)
@@ -431,22 +448,34 @@ def get_filesystem_tools(
         except re.error as e:
             return f"Invalid regex pattern '{pattern}': {e}"
 
+        if not os.path.exists(base):
+            return f"Path not found: {effective_path}"
+
         results: list[str] = []
         try:
-            for dirpath, _dirnames, filenames in os.walk(base):
-                for fname in filenames:
-                    if include and not fnmatch.fnmatch(fname, include):
-                        continue
-                    fpath = os.path.join(dirpath, fname)
-                    rel = os.path.relpath(fpath, root)
-                    try:
-                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                            for lineno, line in enumerate(f, 1):
-                                if compiled.search(line):
-                                    excerpt = line.rstrip()[:200]
-                                    results.append(f"{rel}:{lineno}: {excerpt}")
-                    except Exception:
-                        continue
+            # A FILE base means "search this exact file". os.walk on a file
+            # iterates zero times, which used to report a false "No matches"
+            # and sent code_writer into probe-script workarounds (job-71
+            # popsockets: ~20 wasted calls on template paths).
+            if os.path.isfile(base):
+                candidates = [base]
+            else:
+                candidates = [
+                    os.path.join(dirpath, fname)
+                    for dirpath, _dirnames, filenames in os.walk(base)
+                    for fname in filenames
+                    if not include or fnmatch.fnmatch(fname, include)
+                ]
+            for fpath in candidates:
+                rel = os.path.relpath(fpath, root)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        for lineno, line in enumerate(f, 1):
+                            if compiled.search(line):
+                                excerpt = line.rstrip()[:200]
+                                results.append(f"{rel}:{lineno}: {excerpt}")
+                except Exception:
+                    continue
         except Exception as e:
             return f"Error searching content: {e}"
 
