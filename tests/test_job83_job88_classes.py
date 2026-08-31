@@ -40,6 +40,10 @@ Fixes pinned here (generic, no caps):
 - N12 input_urls.json preserve check tolerates a bare JSON array.
 - Partial-draft floor: a dead writer invocation's draft must parse (ast) or it
   counts as no draft.
+- N13 [jobs 114/115] the job-12 mechanism_reassessment override is suppressed
+  on stealth-proven probes — the product-analyzer's "recommend playwright"
+  opinion shipped two doomed drafts after wave-11 N1 fixed the cascade, because
+  the override sat AFTER it and outranked the probe's measurement.
 
 Run: docker compose exec -T django python -m pytest tests/test_job83_job88_classes.py -q
 """
@@ -326,6 +330,94 @@ class TestHttpNavigationZeroExit:
         src = self._template()
         assert "args.discover_only:" in src
         assert "empty_first_page" in src
+
+
+# ─── N13: probe-proven stealth outranks the mechanism_reassessment opinion ───
+
+
+class TestStealthProbeSuppressesReassessment:
+    """[jobs 114/115] The job-12 S3 override let the product-analyzer's PROSE
+    ("recommend playwright") overrule the probe's MEASUREMENT. The probe ladder
+    tries every playwright tier AND every direct-http tier before uc_chrome/
+    cloak succeeds, so a stealth method_that_worked disproves both — an LLM
+    opinion cannot un-disprove them. On stealth-proven sites the override is
+    suppressed entirely; non-stealth (priceline) semantics stay untouched."""
+
+    def _state(self, method="cloak_datacenter", form="GET", rendering="browser",
+               recommended=None, rec_key="product_analysis"):
+        state = {
+            "url": JOB88_PDP,
+            "site_slug": "s",
+            "input_mode": "list_page",
+            "probe_result": {
+                "connectivity": {"method_that_worked": method},
+                "anti_bot": {"detected": True},
+            },
+            "navigation_analysis": {
+                "rendering_verified": rendering,
+                "search": {"form_method": form},
+                "discovery_method": "fallback",
+            },
+        }
+        if recommended is not None:
+            state[rec_key] = {"mechanism_reassessment": {"recommended": recommended}}
+        return state
+
+    def test_stealth_probe_ignores_playwright_recommendation(self):
+        """The exact 114 shape: cloak_datacenter proven, nav fallback with
+        rendering=browser, product_analysis says playwright. The cascade's
+        http_navigation must survive."""
+        from webapp.agents.graph import _derive_strategy
+
+        a = _derive_strategy(self._state(recommended="playwright"))
+        assert a["strategy"] == "http_navigation"
+        assert "ignored" in a["strategy_justification"]
+        assert "stealth-proven" in a["strategy_justification"]
+        assert "outranks" not in a["strategy_justification"]
+
+    def test_stealth_probe_ignores_http_requests_recommendation(self):
+        """Plain requests is equally probe-disproven — the override can't arm
+        it either."""
+        from webapp.agents.graph import _derive_strategy
+
+        a = _derive_strategy(self._state(recommended="http_requests"))
+        assert a["strategy"] == "http_navigation"
+
+    def test_suppression_consults_content_analysis_key_too(self):
+        """Both artifact keys carry the reassessment (gradual migration) — the
+        suppression must cover the content_analysis variant too."""
+        from webapp.agents.graph import _derive_strategy
+
+        a = _derive_strategy(
+            self._state(recommended="playwright", rec_key="content_analysis")
+        )
+        assert a["strategy"] == "http_navigation"
+        assert "ignored" in a["strategy_justification"]
+
+    def test_stealth_post_form_keeps_cascade_http_requests(self):
+        """POST-form replay is NOT probe-disproven (the probe never tests POST
+        replay; locumtenens contract) — and the suppressed override must not
+        trample the cascade's pick either."""
+        from webapp.agents.graph import _derive_strategy
+
+        a = _derive_strategy(
+            self._state(method="uc_chrome_residential", form="POST",
+                        recommended="playwright")
+        )
+        assert a["strategy"] == "http_requests"
+        assert "ignored" in a["strategy_justification"]
+
+    def test_non_stealth_reassessment_still_outranks(self):
+        """Regression lock (job-12 priceline): a non-stealth probe keeps the
+        S3 precedence — the measured-page verdict wins over the cascade."""
+        from webapp.agents.graph import _derive_strategy
+
+        a = _derive_strategy(self._state(
+            method="direct_http", rendering="csr", recommended="playwright",
+        ))
+        assert a["strategy"] == "playwright"
+        assert "outranks" in a["strategy_justification"]
+        assert "ignored" not in a["strategy_justification"]
 
 
 # ─── N12 + partial-draft floor: writer-side deterministic guards ─────────────

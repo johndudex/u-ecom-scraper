@@ -3604,6 +3604,22 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
                         )
                 if _rec_recommended:
                     break
+    # [job-114 citychic / job-115 sephora.cz] Probe-proven stealth outranks the
+    # reassessment OPINION. The probe ladder tries every playwright tier AND
+    # every direct-http tier BEFORE it reaches a working uc_chrome/cloak method
+    # — so a stealth method_that_worked MEASURES that bare playwright and plain
+    # requests are blocked. The product-analyzer's prose verdict ("recommend
+    # playwright") is an opinion about that same measurement and cannot
+    # un-disprove it (both jobs shipped doomed playwright drafts this way —
+    # 114's override literally read: mechanism_reassessment[recommended]='
+    # playwright' outranks count=None descriptor). On a stealth-proven site the
+    # override is therefore SUPPRESSED — never applied, not even capped: it
+    # must not trample the cascade's POST-form http_requests pick either
+    # (POST replay is not probe-disproven; locumtenens contract). Non-stealth
+    # sites keep the job-12 priceline semantics untouched — there the
+    # reassessment carries a genuinely measured page verdict this heuristic
+    # cascade never ran.
+    _override_suppressed = bool(method.startswith(("uc_chrome", "cloak")))
     _strategy_source = ""
     if (
         _rec_recommended in ("http_requests", "http_navigation", "playwright")
@@ -3614,11 +3630,18 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
         )
         and strategy != _rec_recommended
     ):
-        strategy = _rec_recommended
-        _strategy_source = (
-            f"; mechanism_reassessment[{_rec_key}]={_rec_recommended!r} "
-            f"outranks count={_api_count!r} descriptor"
-        )
+        if _override_suppressed:
+            _strategy_source = (
+                f"; mechanism_reassessment[{_rec_key}]={_rec_recommended!r} "
+                f"ignored — stealth-proven probe disproved playwright and "
+                f"http_requests at every probe tier"
+            )
+        else:
+            strategy = _rec_recommended
+            _strategy_source = (
+                f"; mechanism_reassessment[{_rec_key}]={_rec_recommended!r} "
+                f"outranks count={_api_count!r} descriptor"
+            )
 
     # Discovery config: propagate the navigator's pagination detection so the
     # template uses the RIGHT config_for_* preset (load_more vs page_param vs
