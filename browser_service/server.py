@@ -204,34 +204,45 @@ RUN_DIR_MAX_AGE_S = float(os.environ.get("RUN_DIR_MAX_AGE_S", str(6 * 3600)))
 def _probe_mcp_http() -> None:
     """One liveness-loop pass: does the MCP server actually SERVE over HTTP?
 
-    Synchronous (runs on MISC_EXECUTOR inside the 15s loop). An SSE endpoint
-    never "completes" a GET — it holds the connection and streams — so the
-    verdict is derived from httpx raising or not: ANY response (even a 405)
-    proves the HTTP server accepts and answers; a timeout/refusal does not.
-    Publishes ``{"state": up|down|unknown, "checked_at", "error"}``; never
-    raises (a probe bug must not kill the liveness loop).
+    Synchronous (runs on MISC_EXECUTOR inside the 15s loop). /sse is an SSE
+    stream: headers arrive at once, the body NEVER ends — so the verdict comes
+    from whether the server ANSWERS AT ALL, and the connection is closed
+    without reading the body (an eager body read — e.g. httpx.get — blocks
+    forever and reports every healthy server as a read-timeout). Any answer,
+    even an HTTP error status, proves the server accepts and serves; a
+    connection refusal or header timeout does not. Publishes
+    ``{"state": up|down|unknown, "checked_at", "error"}``; never raises (a
+    probe bug must not kill the liveness loop).
     """
-    try:
-        import httpx
+    import urllib.error
+    import urllib.request
 
-        try:
-            httpx.get(
-                f"http://127.0.0.1:{MCP_HTTP_PORT}/sse",
-                timeout=MCP_HTTP_PROBE_TIMEOUT_S,
-            )
-            _MCP_HTTP_CACHE.clear()
-            _MCP_HTTP_CACHE.update(
-                {"state": "up", "checked_at": time.time(), "error": ""}
-            )
-        except Exception as exc:
-            _MCP_HTTP_CACHE.clear()
-            _MCP_HTTP_CACHE.update(
-                {
-                    "state": "down",
-                    "checked_at": time.time(),
-                    "error": f"{type(exc).__name__}: {str(exc)[:200]}",
-                }
-            )
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{MCP_HTTP_PORT}/sse",
+        headers={"Accept": "text/event-stream"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=MCP_HTTP_PROBE_TIMEOUT_S):
+            pass  # headers received — serving; the with-block closes the stream
+        _MCP_HTTP_CACHE.clear()
+        _MCP_HTTP_CACHE.update(
+            {"state": "up", "checked_at": time.time(), "error": ""}
+        )
+    except urllib.error.HTTPError:
+        # an HTTP *status* still proves the HTTP server is alive and answering
+        _MCP_HTTP_CACHE.clear()
+        _MCP_HTTP_CACHE.update(
+            {"state": "up", "checked_at": time.time(), "error": ""}
+        )
+    except (OSError, ValueError) as exc:  # URLError/timeout/socket + decode
+        _MCP_HTTP_CACHE.clear()
+        _MCP_HTTP_CACHE.update(
+            {
+                "state": "down",
+                "checked_at": time.time(),
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            }
+        )
     except Exception as exc:  # probe itself failed — keep last known state
         logger.warning("mcp http probe: unavailable (%s)", exc)
 

@@ -230,12 +230,16 @@ class TestRunEnvHardening:
 
 
 class TestMcpHttpProbe:
-    def test_up_when_httpx_answers(self, monkeypatch):
-        import httpx
+    def _run_probe(self, monkeypatch, urlopen_impl):
+        """Exec _probe_mcp_http with urllib.request.urlopen patched.
 
-        monkeypatch.setattr(httpx, "get", lambda *a, **k: object())
-        # os is in the ns because the grabbed source also executes the
-        # module-level constant assignments that follow the def (RUN_DIR_MAX_AGE_S).
+        os/deque are in the ns because the grabbed source also executes the
+        module-level constant assignments that follow the def.
+        """
+        import urllib.error
+        import urllib.request
+
+        monkeypatch.setattr(urllib.request, "urlopen", urlopen_impl)
         ns = {
             "os": os,
             "deque": __import__("collections").deque,
@@ -244,33 +248,51 @@ class TestMcpHttpProbe:
             "_MCP_HTTP_CACHE": {"state": "unknown", "checked_at": 0.0, "error": ""},
             "time": time,
             "logger": _FakeLogger(),
+            "urllib": urllib,
+            "urllib_error": urllib.error,
         }
         exec(compile(_grab("_probe_mcp_http"), "<p>", "exec"), ns)
         ns["_probe_mcp_http"]()
-        assert ns["_MCP_HTTP_CACHE"]["state"] == "up"
-        assert ns["_MCP_HTTP_CACHE"]["error"] == ""
-        assert ns["_MCP_HTTP_CACHE"]["checked_at"] > 0
+        return ns["_MCP_HTTP_CACHE"]
 
-    def test_down_when_httpx_refuses(self, monkeypatch):
-        import httpx
+    def test_up_when_the_server_answers_headers(self, monkeypatch):
+        import io
 
-        def _boom(*a, **k):
-            raise httpx.ConnectError("connection refused")
+        cache = self._run_probe(monkeypatch, lambda req, timeout=None: io.BytesIO(b""))
+        assert cache["state"] == "up"
+        assert cache["error"] == ""
+        assert cache["checked_at"] > 0
 
-        monkeypatch.setattr(httpx, "get", _boom)
-        ns = {
-            "os": os,
-            "deque": __import__("collections").deque,
-            "MCP_HTTP_PORT": 8111,
-            "MCP_HTTP_PROBE_TIMEOUT_S": 0.2,
-            "_MCP_HTTP_CACHE": {"state": "up", "checked_at": 1.0, "error": ""},
-            "time": time,
-            "logger": _FakeLogger(),
-        }
-        exec(compile(_grab("_probe_mcp_http"), "<p>", "exec"), ns)
-        ns["_probe_mcp_http"]()
-        assert ns["_MCP_HTTP_CACHE"]["state"] == "down"
-        assert "ConnectError" in ns["_MCP_HTTP_CACHE"]["error"]
+    def test_up_even_on_an_http_error_status(self, monkeypatch):
+        """An HTTP *status* (404/405/…) still proves the server is serving."""
+        import urllib.error
+
+        def _http_error(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 404, "nope", {}, None)
+
+        cache = self._run_probe(monkeypatch, _http_error)
+        assert cache["state"] == "up"
+
+    def test_down_when_connection_refused(self, monkeypatch):
+        def _refuse(req, timeout=None):
+            raise ConnectionRefusedError("connection refused")
+
+        cache = self._run_probe(monkeypatch, _refuse)
+        assert cache["state"] == "down"
+        assert "ConnectionRefusedError" in cache["error"]
+
+    def test_down_on_header_timeout_never_confused_with_up(self, monkeypatch):
+        """THE regression this probe guards: an SSE body never ends — an eager
+        body read must not be required for an 'up' verdict, and a timeout is
+        honestly 'down'."""
+        import socket
+
+        def _hang(req, timeout=None):
+            raise socket.timeout("timed out")
+
+        cache = self._run_probe(monkeypatch, _hang)
+        assert cache["state"] == "down"
+        assert "timeout" in cache["error"].lower()
 
     def test_wired_into_the_liveness_loop_not_health(self):
         src = _src()
