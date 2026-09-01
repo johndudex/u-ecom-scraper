@@ -267,7 +267,21 @@ def scrape_product(page, url: str, src_url: str, index: int) -> dict:
 # code_writer copies what it SEES — an import + call — so pagination stays
 # deterministic. Only the extract_urls callback (EXTRACT_PRODUCT_URLS_JS) is
 # site-specific and remains in this file for code_writer to adapt.
+#
+# [job-318] EXTRACT_PRODUCT_URLS_JS must use STRICT product-card selectors.
+# Do NOT OR a permissive catch-all (``a[href*="/intl/"]``) into the selector
+# list to "improve coverage": every nav/footer/category anchor then matches,
+# and Phase-2 slices the HEAD of the discovered list — so the run processes
+# gift-card/category pages instead of products (9 of 10 items failed). The
+# engine's PDP-likeness ranking sinks such links, but the strict selector is
+# the first line of defence.
 MAX_DISCOVER_PAGES = 200
+
+# Limit-capped runs (``--limit N`` / ``--sample``) stop Phase-1 once this many
+# candidates are discovered (main() sets it; None = crawl to exhaustion). The
+# 4× margin leaves room for the engine's PDP ranking to demote non-product
+# links ahead of the ``[:limit]`` slice.
+DISCOVERY_TARGET_URLS = None
 
 # Last Phase-1 outcome, for the output's metadata.discovery_coverage block
 # (discovery-coverage-gate contract §1). Module-level so BOTH discovery call
@@ -309,6 +323,8 @@ def discover_product_urls(page) -> list[str]:
         _cfg = config_for_load_more(max_pages=MAX_DISCOVER_PAGES)
     else:
         _cfg.max_pages = _cfg.max_pages or MAX_DISCOVER_PAGES
+    if DISCOVERY_TARGET_URLS:
+        _cfg.target_urls = DISCOVERY_TARGET_URLS
 
     result = discover_item_urls(page, PRODUCT_LISTING_URL, _extract, _cfg)
     logger.info(
@@ -395,6 +411,14 @@ def main():
     logger.info("=" * 80)
 
     product_urls = []
+
+    # [job-318] A limit-capped run doesn't need the whole catalogue: cap Phase-1
+    # at 4× the item target so discovery stops on the listing's head pages
+    # instead of crawling to exhaustion (job-318: 200 pages / ~44 min to feed
+    # a --limit 10 slice). Exhaustive runs (no --limit/--sample) unchanged.
+    global DISCOVERY_TARGET_URLS
+    _item_cap = max(args.limit or 0, 20 if args.sample else 0)
+    DISCOVERY_TARGET_URLS = _item_cap * 4 if _item_cap else None
 
     # DETERMINISTIC DISCOVERY GATE (env-var driven, bypasses argparse/codegen):
     # run_execution sets SCRAPER_LISTING_URL=<url> for nav/list_page/search_term

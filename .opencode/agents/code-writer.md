@@ -124,6 +124,15 @@ from src.discovery import discover_item_urls, config_for_load_more
    a 0-item output. Log the fallback loudly (`logger.warning`) so the test
    report shows it. Never return success with 0 discovered URLs while a
    known-good listing shape is available.
+6. **`EXTRACT_PRODUCT_URLS_JS` uses STRICT product-card selectors only.**
+   NEVER OR a permissive catch-all (`a[href*="/intl/"]`, `a[href^="/"]`,
+   `main a`) into the selector list to "increase coverage" — every
+   nav/footer/category anchor then matches, and Phase-2 slices the HEAD of
+   the discovered list, so the run processes gift-card/category/account
+   pages instead of products (job 318: 9 of 10 items failed, 1 good item
+   was the gift-card page). If the strict card selectors yield 0 links,
+   add a *tighter structural* selector (a class on the card wrapper, an
+   ItemList JSON-LD fallback) — not an origin-wide sweep.
 
 ### HTTP fetch — SHARED MODULE (CRITICAL, requests templates)
 

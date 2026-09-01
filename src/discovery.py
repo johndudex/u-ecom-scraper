@@ -54,7 +54,7 @@ helper serves Playwright templates and the browser_service runner. Mirrors the
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Callable, Optional, Protocol
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -77,6 +77,7 @@ __all__ = [
     "build_page_param_url",
     "find_next_button_url",
     "pdp_candidates",
+    "rank_pdp",
     "DEFAULT_LOAD_MORE_SELECTORS",
     "DEFAULT_NEXT_BUTTON_SELECTORS",
 ]
@@ -180,6 +181,8 @@ class StopReason(str, Enum):
     MAX_PAGES_HIT = "max_pages_hit"   # hit the configured ``max_pages`` cap
     NAVIGATE_ERROR = "navigate_error" # HTTP error / timeout / exception mid-loop
     EMPTY_RENDER = "empty_render"     # initial page never rendered any items
+    TARGET_MET = "target_met"         # ``cfg.target_urls`` reached — limit-capped
+                                      # run has its head of candidates (job-318)
 
 
 # Per-iteration primitive outcome. Internal — the orchestrator translates these
@@ -231,6 +234,20 @@ class DiscoveryConfig:
     # a minutes-long site-side soft-block window serves a loaded page with no
     # items; 0 sets the retry off).
     empty_render_retry_wait_ms: int = 8000
+
+    # ── yield quality (job-318) ──
+    # Stop the loop once ``len(accumulated) >= target_urls`` — a limit-capped
+    # run (``--limit N`` / sample) only needs the head of the listing, not the
+    # whole catalogue (job-318 crawled 200 pages / ~44 min to feed a
+    # ``--limit 10`` run). None = crawl to natural exhaustion, as before.
+    target_urls: int | None = None
+    # Reorder the final URL list most-PDP-like first (stable — see
+    # :func:`rank_pdp`). Default on: Phase-2 selection slices the HEAD of this
+    # list, so ordering is the cheap, drop-free defense against nav junk.
+    pdp_rank: bool = True
+    # Additionally DROP non-PDP-shaped URLs (:func:`pdp_candidates`). Opt-in:
+    # a wrong drop is permanent, while a wrong order only costs position.
+    pdp_filter: bool = False
 
 
 @dataclass
@@ -440,9 +457,17 @@ def _pdp_score(url: str) -> int:
     """Heuristic PDP-likeness of ``url`` — higher is more item-like.
 
     Positive signals: product-ish path segment, a platform PDP shape
-    (``/dp/``, ``-p-``, ``.html``), deeper paths. Negative: listing/nav
-    segments and listing/facet query params. 0 = no signal either way (kept —
-    only an explicit NEGATIVE is enough to drop a URL).
+    (``/dp/``, ``-p-``, ``.html``), a hyphenated leaf slug, deeper paths.
+    Negative: a listing/nav/utility word as the LAST path segment (the page
+    IS that listing — ``/shop``, ``/cart``) and listing/facet query params.
+    0 = no signal either way (kept — only an explicit NEGATIVE is enough to
+    drop a URL).
+
+    [job-318] the negative used to hit ANY segment, which scored real
+    Magento-style PDPs (``/intl/shop/<category>/<product-slug>``) at −2 —
+    BELOW the very utility pages it exists to demote. A mid-path ``shop`` /
+    ``category`` segment is a namespace, not a page type; only the leaf
+    names the page.
     """
     try:
         parsed = urlparse(url)
@@ -457,13 +482,33 @@ def _pdp_score(url: str) -> int:
         score += 2
     if any(marker in path for marker in _PDP_SUBSTRINGS):
         score += 2
+    if segments:
+        leaf = segments[-1]
+        if "-" in leaf.strip("-") and any(c.isalpha() for c in leaf):
+            score += 2
     if len(segments) >= 3 and score > 0:
         score += 1
-    if any(seg in _PDP_NEGATIVE_SEGMENTS for seg in segments):
+    if len(segments) >= 4 and score > 0:
+        score += 1
+    if segments and segments[-1] in _PDP_NEGATIVE_SEGMENTS:
         score -= 2
     if params & _PDP_NEGATIVE_PARAMS:
         score -= 1
     return score
+
+
+def rank_pdp(urls: list) -> list:
+    """Order ``urls`` most-PDP-like first; ties keep discovery order (stable).
+
+    [job-318] Phase-2 selection slices the HEAD of the discovered list
+    (``urls[:limit]``), and a permissive anchor extractor fills that head in
+    DOM order — header nav first (gift-card, categories, account…), product
+    grid last. 9 of the 10 processed URLs were non-product pages. Sinking
+    them to the tail is drop-free: a wrong order only costs position, a
+    wrong drop removes the URL permanently.
+    """
+    # _pdp_score never raises (it catches internally), so the sort can't either.
+    return sorted(urls, key=_pdp_score, reverse=True)
 
 
 def pdp_candidates(urls: list, min_score: int = 0) -> list:
@@ -879,6 +924,11 @@ def discover_item_urls(
 ) -> DiscoveryResult:
     """Drive a listing page through pagination and return all discovered item URLs.
 
+    Applies the yield-quality post-processing (:func:`rank_pdp` /
+    :func:`pdp_candidates`, per ``cfg.pdp_rank`` / ``cfg.pdp_filter``) to the
+    raw crawl result before returning — see ``_discover_item_urls_raw`` for
+    the loop itself.
+
     Parameters
     ----------
     page
@@ -913,6 +963,26 @@ def discover_item_urls(
         after the configured one went stuck).
     """
     cfg = cfg or DiscoveryConfig()
+    result = _discover_item_urls_raw(page, start_url, extract_urls, cfg, on_progress)
+    if not result.urls or not (cfg.pdp_rank or cfg.pdp_filter):
+        return result
+    urls = pdp_candidates(result.urls) if cfg.pdp_filter else list(result.urls)
+    if cfg.pdp_rank:
+        urls = rank_pdp(urls)
+    if urls == result.urls:
+        return result
+    return replace(result, urls=urls)
+
+
+def _discover_item_urls_raw(
+    page: Any,
+    start_url: str,
+    extract_urls: Callable[[Any], list[str]],
+    cfg: DiscoveryConfig,
+    on_progress: Callable[[int, int, list[str]], None] | None = None,
+) -> DiscoveryResult:
+    """The pagination loop proper — navigate, iterate primitives, accumulate."""
+    state = {"stop_reason": StopReason.NO_NEXT_LINK.value}
     state = {"stop_reason": StopReason.NO_NEXT_LINK.value}
     seen: set[str] = set()
     accumulated: list[str] = []
@@ -948,6 +1018,18 @@ def discover_item_urls(
             return DiscoveryResult(
                 accumulated, stop_reason=state["stop_reason"],
                 max_pages_hit=True, pages_visited=pages_visited,
+                param_used=state.get(_USED_PARAM_KEY),
+            )
+
+        # [job-318] A limit-capped run only needs the head of the listing —
+        # stop once enough candidates exist instead of crawling to natural
+        # exhaustion (that run visited 200 pages / ~44 min to feed a
+        # ``--limit 10`` slice). Checked at loop top so a first page that
+        # already meets the target skips pagination entirely.
+        if cfg.target_urls is not None and len(accumulated) >= cfg.target_urls:
+            return DiscoveryResult(
+                accumulated, stop_reason=StopReason.TARGET_MET.value,
+                pages_visited=pages_visited,
                 param_used=state.get(_USED_PARAM_KEY),
             )
 
