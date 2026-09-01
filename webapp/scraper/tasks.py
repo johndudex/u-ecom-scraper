@@ -20,6 +20,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from celery import shared_task
+from celery.signals import task_failure
 from django.conf import settings
 from django.utils import timezone
 
@@ -73,6 +74,135 @@ def _publish_job_status(job_id: int, status: str) -> None:
         pass
 
 
+def _finalize_job_failed(job_id: int, error_message: str, close_steps: bool = False) -> None:
+    """Persist an honest FAILED row for *job_id* (F4-safe).
+
+    Shared by the in-task ``except`` path and the ``task_failure`` signal
+    handler (worker-child process death): recycle DB connections first, then
+    guard every write so the row always finalizes even on a dead connection
+    (prod 284/332/333 — the failure is often the DB connection itself).
+    """
+    try:
+        from django.db import close_old_connections
+
+        close_old_connections()
+    except Exception:
+        pass
+    message = (error_message or "unknown failure")[-4000:]
+    try:
+        job = ScrapeJob.objects.get(pk=job_id)
+    except Exception:
+        logger.error("Job %s: cannot finalize FAILED — row missing", job_id)
+        return
+    job.status = ScrapeJob.STATUS_FAILED
+    job.error_message = message  # tail: keep the exception, not the banner
+    job.completed_at = timezone.now()
+    try:
+        job.save(update_fields=["status", "error_message", "completed_at"])
+    except Exception:
+        try:
+            job = ScrapeJob.objects.get(pk=job_id)  # fresh instance+connection
+            job.status = ScrapeJob.STATUS_FAILED
+            job.error_message = message
+            job.completed_at = timezone.now()
+            job.save(update_fields=["status", "error_message", "completed_at"])
+        except Exception:
+            logger.error("Job %s: could not persist FAILED status (job stranded)", job_id)
+    try:
+        _publish_job_status(job_id, ScrapeJob.STATUS_FAILED)
+    except Exception:
+        pass
+    if close_steps:
+        # A SIGKILLed child leaves Step rows RUNNING forever (UI shows a phase
+        # that will never finish); the in-task path doesn't need this because
+        # _run_graph_job's own finalization closes them.
+        try:
+            Step.objects.filter(
+                job_id=job_id, status__in=(Step.STATUS_RUNNING, Step.STATUS_PENDING)
+            ).update(status=Step.STATUS_FAILED, completed_at=timezone.now())
+        except Exception:
+            pass
+    try:
+        from scraper.models import Site
+
+        db_site = Site.objects.filter(url=(job.url or "").rstrip("/")).first()
+        if db_site and db_site.status == "in_progress":
+            db_site.status = "failed"
+            db_site.save(update_fields=["status"])
+            logger.info("Job %s: reset Site '%s' to failed", job_id, db_site.slug)
+    except Exception:
+        pass
+
+
+# [wave-14 job-133] Process-death honesty. When a prefork CHILD is SIGKILLed
+# (container OOM / hard time_limit), no Python ever runs again in that child —
+# the task body's own except-block cannot fire, and with acks_late=False there
+# is no redelivery, so the job row stays RUNNING until the 30-min watchdog
+# *guesses* from silence. The ``task_failure`` signal fires in the worker
+# PARENT, which is exactly the survivor that receives WorkerLostError /
+# TimeLimitExceeded. (``worker_lost`` is not a Celery 5.x signal, and
+# ``Task.on_failure`` runs in the dying child — both dead ends.)
+try:
+    from billiard.exceptions import TimeLimitExceeded as _BilliardTimeLimitExceeded
+    from billiard.exceptions import WorkerLostError as _BilliardWorkerLostError
+
+    _PROCESS_DEATH_EXCUSES: tuple[type[BaseException], ...] = (
+        _BilliardWorkerLostError,
+        _BilliardTimeLimitExceeded,
+    )
+except Exception:  # pragma: no cover — billiard is a hard celery dependency
+    _PROCESS_DEATH_EXCUSES = ()
+
+_TASK_FAILURE_SENDERS = {
+    "scraper.tasks.run_scrape_task",
+    "scraper.tasks.resume_scrape_task",
+}
+
+
+@task_failure.connect
+def _on_task_process_death(
+    sender=None, task_id=None, args=None, exception=None, **_extra: Any
+) -> None:
+    """Mark the job FAILED the moment the worker parent reports child death."""
+    if not _PROCESS_DEATH_EXCUSES or not isinstance(
+        exception, _PROCESS_DEATH_EXCUSES
+    ):
+        return  # everything else is finalized by the task body itself
+    if getattr(sender, "name", None) not in _TASK_FAILURE_SENDERS:
+        return
+    try:
+        job = None
+        if args:
+            try:
+                job = ScrapeJob.objects.filter(pk=int(args[0])).first()
+            except (TypeError, ValueError):
+                job = None
+        if job is None and task_id:
+            job = ScrapeJob.objects.filter(celery_task_id=task_id).first()
+        if job is None or job.status != ScrapeJob.STATUS_RUNNING:
+            # Not ours, already finalized, or waiting on a human (WAITING_
+            # APPROVAL jobs are continued by a NEW resume task after approval,
+            # so a dead child there strands nothing — don't clobber that row).
+            # Idempotent if the watchdog marked it first.
+            return
+        exitcode = getattr(exception, "exitcode", None)
+        detail = f"{type(exception).__name__}: {exception}"
+        if exitcode is not None:
+            detail += f" (exitcode={exitcode})"
+        message = (
+            f"Worker child process died mid-job ({detail}). This class means "
+            f"the celery worker's child was SIGKILLed — almost always container "
+            f"memory pressure (OOM) or the {_RUN_TASK_TIME_LIMIT}s hard time "
+            f"limit. No Python ran after the kill, so no phase could finalize. "
+            f"Failed by the task-failure handler; acks_late=False means no "
+            f"redelivery — re-drive manually."
+        )
+        logger.error("Job %s: process-death finalize — %s", job.id, detail)
+        _finalize_job_failed(job.id, message, close_steps=True)
+    except Exception:
+        logger.exception("task_failure handler could not finalize job")
+
+
 # Celery-level deadline for a scrape job. The dominant job-level failure is
 # LLM-phase hangs (code_generation / product_analysis): the per-phase
 # _AGENT_INVOKE_TIMEOUT abandons its daemon thread on timeout, but the thread
@@ -108,19 +238,23 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False, force_full: bool 
     """
     job = ScrapeJob.objects.get(pk=job_id)
 
-    # Record this task's id so external monitors (e.g. the regression monitor)
-    # can revoke+terminate it on a per-phase timeout — otherwise a DB-only
-    # "cancel" leaves the celery task running as a zombie, clogging the worker.
-    _task_id = getattr(self.request, "id", "") or ""
-    if _task_id and job.celery_task_id != _task_id:
-        job.celery_task_id = _task_id
-        job.save(update_fields=["celery_task_id"])
-
     if job.status in (ScrapeJob.STATUS_RUNNING, ScrapeJob.STATUS_WAITING_APPROVAL):
         logger.warning(
             "Job %d: skipping duplicate dispatch (status=%s)", job_id, job.status
         )
         return
+
+    # Record this task's id so external monitors (e.g. the regression monitor)
+    # can revoke+terminate it on a per-phase timeout — otherwise a DB-only
+    # "cancel" leaves the celery task running as a zombie, clogging the worker.
+    # [wave-14 job-133] This stamp sits BELOW the duplicate-dispatch guard: a
+    # skipped duplicate used to steal the stamp, overwriting the LIVE task's id
+    # with its own discarded id — the watchdog then inspected a task that runs
+    # nowhere, concluded "absent", and revoked the healthy run (false corpse).
+    _task_id = getattr(self.request, "id", "") or ""
+    if _task_id and job.celery_task_id != _task_id:
+        job.celery_task_id = _task_id
+        job.save(update_fields=["celery_task_id"])
 
     # Same-site serialization: if another job is already RUNNING for this URL,
     # requeue with a delay (workspace/{slug}/ is shared → concurrent writes
@@ -149,47 +283,10 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False, force_full: bool 
         logger.exception("Scrape job %d failed: %s", job_id, exc)
         # F4: the original failure is often a dead DB connection (postgres
         # OOM restart). Saving on the same dead connection re-raises and the
-        # task dies with the job stranded RUNNING (prod 284/332/333). Recycle
-        # connections first, and guard every save so the row always finalizes.
-        try:
-            from django.db import close_old_connections
-
-            close_old_connections()
-        except Exception:
-            pass
-        job.status = ScrapeJob.STATUS_FAILED
-        job.error_message = str(exc)[-4000:]  # tail: keep the exception, not the banner
-        job.completed_at = timezone.now()
-        try:
-            job.save(update_fields=["status", "error_message", "completed_at"])
-        except Exception:
-            try:
-                job = ScrapeJob.objects.get(pk=job_id)  # fresh instance+connection
-                job.status = ScrapeJob.STATUS_FAILED
-                job.error_message = str(exc)[-4000:]  # tail: keep the exception, not the banner
-                job.completed_at = timezone.now()
-                job.save(update_fields=["status", "error_message", "completed_at"])
-            except Exception:
-                logger.error(
-                    "Job %d: could not persist FAILED status (job stranded)", job_id
-                )
-        try:
-            _publish_job_status(job_id, ScrapeJob.STATUS_FAILED)
-        except Exception:
-            pass
-
-        try:
-            from scraper.models import Site
-
-            db_site = Site.objects.filter(url=job.url.rstrip("/")).first()
-            if db_site and db_site.status == "in_progress":
-                db_site.status = "failed"
-                db_site.save(update_fields=["status"])
-                logger.info(
-                    "Job %d: reset Site '%s' to failed", job_id, db_site.slug
-                )
-        except Exception:
-            pass
+        # task dies with the job stranded RUNNING (prod 284/332/333).
+        # _finalize_job_failed recycles connections and guards every save so
+        # the row always finalizes.
+        _finalize_job_failed(job_id, str(exc))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1383,6 +1480,13 @@ def _task_liveness(task_id: str) -> str:
     - ``absent``  — workers REPLIED and the task runs nowhere → the worker
       child is gone (``acks_late=False`` → no redelivery); fail immediately
       with an honest message instead of waiting out the silence rule.
+      [wave-14 job-133] ``absent`` is only trusted when the SAME worker set
+      also answers a second probe: a partial inspect reply (one PidBox —
+      often just the events pool's self-reply — answering ``active()`` while
+      the pool holding the task is too busy to respond) is indistinguishable
+      from a complete "runs nowhere" answer. When the probe sets disagree,
+      the verdict degrades to ``unknown`` and the caller falls back to the
+      silence rule instead of revoking a live run.
     - ``active``  — a worker owns the task; silence means a long quiet
       phase. The caller only revokes past ``ACTIVE_SILENCE_REVOKE_MINUTES``.
     - ``unknown`` — inspect failed or no worker replied (broker hiccup,
@@ -1394,7 +1498,8 @@ def _task_liveness(task_id: str) -> str:
     try:
         from celery import current_app
 
-        reply = current_app.control.inspect(timeout=2.0).active()
+        insp = current_app.control.inspect(timeout=5.0)
+        reply = insp.active()
     except Exception:
         return "unknown"
     if reply is None:
@@ -1404,6 +1509,15 @@ def _task_liveness(task_id: str) -> str:
         for t in worker_tasks or ():
             if isinstance(t, dict) and t.get("id") == task_id:
                 return "active"
+    # Not in any reported active set — but a PARTIAL reply is not proof. Ask
+    # a second probe: only if the same workers that answered active() also
+    # answer ping() do we trust "runs nowhere".
+    try:
+        ping = insp.ping()
+    except Exception:
+        return "unknown"
+    if ping is None or set(ping.keys()) != set(reply.keys()):
+        return "unknown"
     return "absent"
 
 
@@ -1483,10 +1597,22 @@ def cleanup_stuck_jobs() -> None:
         # silently dropped (and the job stuck RUNNING forever). Harmless when
         # acks_late is off (today's default).
         if _liveness == "absent":
+            # Report the ACTUAL broker config instead of a hardcoded assumption.
+            try:
+                from celery import current_app as _celery_app
+
+                _acks_late = bool(_celery_app.conf.task_acks_late)
+            except Exception:
+                _acks_late = False
+            _redelivery = (
+                "acks_late=True — a broker redelivery may still re-run it"
+                if _acks_late
+                else "acks_late=False means no redelivery"
+            )
             error_msg = (
                 f"Worker process lost: celery task {_task_id} is not active on "
-                f"any worker (silent {idle_minutes} min; acks_late=False means "
-                f"no redelivery). Failed by the stuck-job watchdog."
+                f"any worker (silent {idle_minutes} min; {_redelivery}). "
+                f"Failed by the stuck-job watchdog."
             )
         elif _liveness == "active":
             error_msg = (

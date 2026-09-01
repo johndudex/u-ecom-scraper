@@ -45,24 +45,34 @@ import pytest  # noqa: E402
 # ─── _task_liveness ──────────────────────────────────────────────────────────
 
 
+_DERIVED = object()
+
+
 class _FakeInspect:
-    def __init__(self, reply):
+    def __init__(self, reply, ping_reply=_DERIVED):
         self._reply = reply
+        self._ping_reply = ping_reply
         self.timeout = None
 
     def active(self):
         return self._reply
 
+    def ping(self):
+        if self._ping_reply is _DERIVED:
+            # Default: the SAME worker set answers the second probe.
+            return {name: {"ok": "pong"} for name in (self._reply or {})}
+        return self._ping_reply
+
 
 class TestTaskLiveness:
-    def _patch(self, monkeypatch, reply):
+    def _patch(self, monkeypatch, reply, ping_reply=_DERIVED):
         import scraper.tasks as wt
 
         captured = {}
 
         def fake_inspect(timeout=None):
             captured["timeout"] = timeout
-            return _FakeInspect(reply)
+            return _FakeInspect(reply, ping_reply)
 
         monkeypatch.setattr(
             "celery.current_app.control.inspect", fake_inspect, raising=False
@@ -74,7 +84,7 @@ class TestTaskLiveness:
             "worker1@railway": [{"id": "abc-123", "name": "scraper.tasks.run_job"}],
         })
         assert wt._task_liveness("abc-123") == "active"
-        assert cap["timeout"] == 2.0
+        assert cap["timeout"] == 5.0
 
     def test_absent_when_workers_reply_without_the_task(self, monkeypatch):
         wt, _ = self._patch(monkeypatch, {
@@ -82,6 +92,44 @@ class TestTaskLiveness:
             "worker2@railway": [],
         })
         assert wt._task_liveness("abc-123") == "absent"
+
+    def test_partial_reply_degrades_to_unknown(self, monkeypatch):
+        """[wave-14 job-133] A PARTIAL inspect reply (one PidBox — often just
+        the events pool's self-reply — answered active() while the pool holding
+        the task was too busy to respond) is indistinguishable from a complete
+        'runs nowhere' answer. When the second probe's worker set disagrees,
+        the verdict must degrade to unknown (silence rule), never 'absent'."""
+        wt, _ = self._patch(
+            monkeypatch,
+            {"worker1@railway": [{"id": "other-999"}]},
+            ping_reply={"worker1@railway": {"ok": "pong"},
+                        "worker2@railway": {"ok": "pong"}},
+        )
+        assert wt._task_liveness("abc-123") == "unknown"
+
+    def test_ping_none_is_unknown(self, monkeypatch):
+        """active() was answered but the cross-check probe got nothing."""
+        wt, _ = self._patch(
+            monkeypatch,
+            {"worker1@railway": [{"id": "other-999"}]},
+            ping_reply=None,
+        )
+        assert wt._task_liveness("abc-123") == "unknown"
+
+    def test_ping_exception_is_unknown(self, monkeypatch):
+        import scraper.tasks as wt
+
+        class _HalfDeadInspect(_FakeInspect):
+            def ping(self):
+                raise RuntimeError("second probe failed")
+
+        def fake_inspect(timeout=None):
+            return _HalfDeadInspect({"worker1@railway": [{"id": "other-999"}]})
+
+        monkeypatch.setattr(
+            "celery.current_app.control.inspect", fake_inspect, raising=False
+        )
+        assert wt._task_liveness("abc-123") == "unknown"
 
     def test_none_reply_is_unknown_not_absent(self, monkeypatch):
         """No worker answered (broker hiccup, saturated pool) — that is NOT
@@ -152,10 +200,11 @@ class TestDispatchAlive:
         src = open(os.path.join(
             ROOT, "webapp", "agents", "tools", "shell_tools.py"
         )).read()
-        # The blocking browser POST beats while it waits.
-        assert "with _dispatch_alive():\n                    _res = post_scrape_with_retry(" in src
-        # So does the local subprocess run.
-        assert "with _dispatch_alive():\n                    result = subprocess.run(" in src
+        # The blocking browser POST beats while it waits, budgeted by its own
+        # bound (timeout+60 httpx margin) [wave-14 job-133].
+        assert "with _dispatch_alive(timeout + 60):\n                    _res = post_scrape_with_retry(" in src
+        # So does the local subprocess run (bound = its timeout=).
+        assert "with _dispatch_alive(timeout):\n                    result = subprocess.run(" in src
 
     def test_heartbeat_uses_the_counted_prefix(self):
         """[EXEC-ALIVE] rows COUNT as watchdog activity ([HEARTBEAT] is

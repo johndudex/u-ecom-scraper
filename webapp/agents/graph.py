@@ -1136,6 +1136,7 @@ _HEARTBEAT_MAX_BEATS = 60
 def _start_heartbeat(
     job_id: int, agent_name: str, interval: int = 300,
     prefix: str = "[HEARTBEAT]",
+    beat_budget: int | None = None,
 ) -> _HeartbeatHandle:
     """Start a background heartbeat that writes a SessionLog entry every
     ``interval`` seconds during long agent executions.
@@ -1155,6 +1156,18 @@ def _start_heartbeat(
     healthy long scrape whose only signal is heartbeats gets SIGKILLed
     as "crashed" the moment the watchdog is revived.
 
+    ``beat_budget`` [wave-14 job-133] — the phase's own deadline in seconds
+    (e.g. run_scraper's floored browser-dispatch bound). When given, the
+    interval shrinks to ``max(30, beat_budget // 3)`` (never LONGER than the
+    caller's ``interval``) so at least two beats land INSIDE the bounded
+    window. A death mid-dispatch is then provable from the row sequence
+    ("started" row present, later beats absent) instead of being
+    indistinguishable from "the first beat wasn't due yet".
+
+    The FIRST beat fires synchronously at t=0 and writes a "started" row:
+    it stamps the dispatch moment, so postmortems can tell "dispatch began
+    and the process died inside the run" from "the run never started".
+
     Returns a ``_HeartbeatHandle`` that must be passed to ``_stop_heartbeat``
     when the agent finishes. The handle's stop flag is what actually ends the
     chain — ``_beat`` checks it before rescheduling, so cancellation is reliable
@@ -1165,6 +1178,9 @@ def _start_heartbeat(
     run forever even if _stop_heartbeat is never called.
     """
     handle = _HeartbeatHandle()
+
+    if beat_budget is not None and beat_budget > 0:
+        interval = min(interval, max(30, beat_budget // 3))
 
     def _beat() -> None:
         if handle.stop.is_set():
@@ -1177,6 +1193,7 @@ def _start_heartbeat(
                 job_id, agent_name, _HEARTBEAT_MAX_BEATS,
             )
             return
+        _first = handle.beats == 1
         _job_terminal = False
         try:
             from scraper.models import ScrapeJob, SessionLog
@@ -1190,15 +1207,26 @@ def _start_heartbeat(
             ).exists()
             if not _job_terminal:
                 seq = SessionLog.objects.filter(job_id=job_id).count()
+                _content = (
+                    f"{prefix} Agent {agent_name} started (beat every {interval}s)"
+                    if _first
+                    else f"{prefix} Agent {agent_name} still running..."
+                )
                 SessionLog.objects.create(
                     job_id=job_id,
                     role=SessionLog.ROLE_SYSTEM,
                     agent=agent_name,
-                    content=f"{prefix} Agent {agent_name} still running...",
+                    content=_content,
                     seq=seq,
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            # [wave-14 job-133] A silently-swallowed beat failure made the
+            # heartbeat's OWN health unobservable — "beat didn't fire" and
+            # "beat's DB write failed" were indistinguishable in postmortems.
+            logger.warning(
+                "heartbeat for job %s (%s) beat %d failed: %s",
+                job_id, agent_name, handle.beats, exc,
+            )
         if handle.stop.is_set() or _job_terminal:
             return
         # Re-check before rescheduling — _stop_heartbeat may have fired while
@@ -1210,10 +1238,7 @@ def _start_heartbeat(
         handle.timers.append(timer)
         timer.start()
 
-    timer = threading.Timer(interval, _beat)
-    timer.daemon = True
-    handle.timers.append(timer)
-    timer.start()
+    _beat()  # t=0 beat — stamps the start moment synchronously
     return handle
 
 
@@ -1881,6 +1906,14 @@ def _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout):
             "— cancelled (socket closed), returning empty (job %s)",
             phase, timeout, job_id,
         )
+        # [wave-14 job-133] The container's stdout log is not the job log —
+        # postmortems read SessionLog. Record the invoke death as activity
+        # (it IS activity: the phase's window ended).
+        _log_event_row(
+            job_id, phase,
+            f"[INVOKE-TIMEOUT] {phase} exceeded {timeout}s wall-clock — "
+            f"invocation cancelled, phase did not complete",
+        )
         # T0.3: the dead invocation must be DISTINGUISHABLE from a healthy
         # budget-exhausted return — both paths used to be bare {"messages": []}
         # and `_error` was read by nobody, so a wall-clock death was invisible
@@ -1948,6 +1981,14 @@ def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, t
             "_invoke_agent_with_timeout[%s]: agent.invoke exceeded %ds wall-clock "
             "— abandoning thread, returning empty (job %s)",
             phase, timeout, job_id,
+        )
+        # [wave-14 job-133] SessionLog twin of the async-path row (postmortems
+        # read the job log, not container stdout).
+        _log_event_row(
+            job_id, phase,
+            f"[INVOKE-TIMEOUT] {phase} exceeded {timeout}s wall-clock — "
+            f"thread abandoned (leaks until the task time limit), phase did "
+            f"not complete",
         )
         # T0.3 (sync twin of the async-path marker): surface the dead invocation.
         return {"messages": [], "_error": f"wall-clock timeout after {timeout}s",

@@ -21,6 +21,7 @@ unreachable.
 
 import asyncio
 import logging
+import time
 from contextlib import AsyncExitStack
 from typing import Any, Optional
 
@@ -70,6 +71,15 @@ _MAX_EVALUATE_OUTPUT_CHARS = 200000
 
 _cached_tools: list[BaseTool] | None = None
 _PREFIX = "playwright_"
+
+# [wave-14 job-133] An empty ``_cached_tools`` used to persist for the worker's
+# whole lifetime: one transient MCP outage (05:04 server-side CDP-connect
+# timeout) registered ZERO tools, and every later agent invocation on that
+# worker inherited the empty list without ever re-probing. A failed probe is
+# now a short-TTL negative cache — after the TTL the next registration attempt
+# re-runs tools/list, so recovery is automatic once the MCP server returns.
+_MCP_NEGATIVE_CACHE_TTL = 10.0
+_cached_tools_at: float = 0.0
 
 # --- Pooled MCP session state -------------------------------------------
 # A single ClientSession is reused across tool calls to skip the SSE
@@ -282,7 +292,12 @@ def _format_tool_result(tool_name: str, result: Any) -> str:
     - Joins all content items (text preferred, else stringified).
     - Truncates to a per-tool-type limit (evaluate gets a much larger limit
       so structured JSON stays parseable).
+    - [wave-14 job-133] Surfaces the MCP ``isError`` flag. A failed tool call
+      can still carry plausible-looking text (e.g. a timeout message that
+      reads like a status line) — without this marker the agent treated the
+      text as success and reasoned on from a false premise.
     """
+    output: str
     if hasattr(result, "content") and result.content:
         parts = []
         for item in result.content:
@@ -309,6 +324,8 @@ def _format_tool_result(tool_name: str, result: Any) -> str:
             output[:max_chars]
             + f"\n\n[... truncated {len(output)} → {max_chars} chars]"
         )
+    if getattr(result, "isError", False):
+        output = f"[TOOL ERROR] {output}"
     return output
 
 
@@ -451,10 +468,27 @@ async def create_playwright_tools(mcp_url: Optional[str] = None) -> list[BaseToo
 
 
 def create_playwright_tools_sync(mcp_url: Optional[str] = None, fresh: bool = False) -> list[BaseTool]:
-    global _cached_tools, playwright_status
+    global _cached_tools, _cached_tools_at, playwright_status
 
     if _cached_tools is not None and not fresh:
-        return _cached_tools
+        if _cached_tools:
+            return _cached_tools
+        # Empty cache = a previously FAILED probe. Only trust it inside the
+        # short negative-cache TTL; past that, re-probe so an MCP recovery is
+        # picked up instead of poisoning the worker for its whole lifetime.
+        _age = time.monotonic() - _cached_tools_at
+        if _age < _MCP_NEGATIVE_CACHE_TTL:
+            logger.warning(
+                "Playwright MCP tools negative-cached (failed probe %.0fs ago, "
+                "TTL %.0fs) — returning 0 tools without re-probing",
+                _age, _MCP_NEGATIVE_CACHE_TTL,
+            )
+            return _cached_tools
+        logger.info(
+            "Playwright MCP negative cache expired (%.0fs old) — re-probing",
+            _age,
+        )
+        _cached_tools = None
 
     resolved_url = _resolve_mcp_url(mcp_url)
 
@@ -476,6 +510,7 @@ def create_playwright_tools_sync(mcp_url: Optional[str] = None, fresh: bool = Fa
             tool_count=0,
         )
         _cached_tools = []
+        _cached_tools_at = time.monotonic()
         return _cached_tools
 
     tools: list[BaseTool] = []

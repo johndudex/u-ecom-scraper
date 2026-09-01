@@ -243,10 +243,12 @@ def get_shell_tools(
 
         # Write a heartbeat SessionLog entry so the watchdog sees activity
         # during long scraper runs (UC Chrome + residential proxy can take 5+ min)
+        _scrape_job_id = 0  # hoisted: also sent in the /scrape payload
         try:
             from agents.tools.context import get_state
             tool_state = get_state()
             job_id = (tool_state or {}).get("job_id", 0)
+            _scrape_job_id = int(job_id or 0)
             if job_id:
                 from scraper.models import SessionLog
                 seq = SessionLog.objects.filter(job_id=job_id).count()
@@ -354,7 +356,7 @@ def get_shell_tools(
                 # W8: bounded retry on 429/502/503/504 + transport errors — a
                 # bare raise_for_status() turned browser-service backpressure
                 # into an opaque HTTPStatusError mid-test.
-                with _dispatch_alive():
+                with _dispatch_alive(timeout + 60):
                     _res = post_scrape_with_retry(
                         f"{service_url}/scrape",
                         {
@@ -364,6 +366,10 @@ def get_shell_tools(
                             "args": cmd_args,
                             "timeout": timeout,
                             "env_overrides": env_overrides,
+                            # [wave-14 job-133] Correlate browser_service-side
+                            # run dirs/logs with the DB job (rid registry,
+                            # orphan cleanup). Old peers ignore unknown fields.
+                            "job_id": _scrape_job_id,
                         },
                         timeout=timeout + 60,
                     )
@@ -428,7 +434,7 @@ def get_shell_tools(
                 # Inherit env + inject discovery env vars (same as browser path).
                 _run_env = dict(os.environ)
                 _run_env.update(env_overrides or {})
-                with _dispatch_alive():
+                with _dispatch_alive(timeout):
                     result = subprocess.run(
                         cmd,
                         capture_output=True,
@@ -451,7 +457,7 @@ def get_shell_tools(
 
 
 @contextmanager
-def _dispatch_alive():
+def _dispatch_alive(timeout: int | None = None):
     """[jobs 79/80] ``[EXEC-ALIVE]`` heartbeat across run_scraper's blocking
     dispatch (browser_service POST / local subprocess).
 
@@ -463,6 +469,12 @@ def _dispatch_alive():
     so — same doctrine as run_execution's ``[EXEC-ALIVE]`` rows — these beats
     can only rescue a genuinely-live run, never mask a hang: the context ends
     when the dispatch returns and the beats stop with it.
+
+    ``timeout`` [wave-14 job-133] — that bound, passed as the heartbeat's
+    ``beat_budget``: the interval shrinks to bound/3 and the t=0 "started" row
+    stamps the dispatch moment, so a death INSIDE the dispatch is provable
+    from the row sequence (started → beats stop early) instead of being
+    indistinguishable from "the 240s beat wasn't due yet".
     """
     _hb = None
     try:
@@ -473,6 +485,7 @@ def _dispatch_alive():
         if _job_id:
             _hb = _start_heartbeat(
                 _job_id, "run_scraper", interval=240, prefix="[EXEC-ALIVE]",
+                beat_budget=timeout,
             )
     except Exception:
         _hb = None
