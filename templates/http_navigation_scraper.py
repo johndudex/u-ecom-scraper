@@ -38,15 +38,50 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 import httpx
 
 # Simple HTTP helpers for form-search discovery (direct HTTP, not browser_service).
+
+# [wave-15 3.4] One shared ladder closure per process (cookie continuity, job-58).
+_FETCH_TEXT = None
+
+
+def _get_fetch_text():
+    global _FETCH_TEXT
+    if _FETCH_TEXT is None:
+        from src.http_fetch import create_fetch_text
+
+        _FETCH_TEXT = create_fetch_text(
+            delay_s=1.0,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+    return _FETCH_TEXT
+
+
 def _http_get(url: str) -> tuple[str, int]:
-    """Plain HTTP GET. Returns (html, status_code)."""
+    """HTTP GET through the shared proxy ladder [wave-15 3.4].
+
+    The bare httpx GET this used to be ran unproxied with no escalation —
+    the SSR fallback path always egressed from the direct IP, burning it
+    against Akamai-class reputation even on runs whose browser phase needed
+    a proxy. Returns (html, status_code); ("", 0) when every tier fails —
+    the same falsy contract as before. Falls back to the bare GET when the
+    image predates the shared module.
+    """
     try:
-        with httpx.Client(headers={"User-Agent": "Mozilla/5.0"}, timeout=30, follow_redirects=True) as c:
-            r = c.get(url)
-            return r.text, r.status_code
-    except Exception as exc:
-        logger.warning("_http_get %s failed: %s", url[:60], exc)
+        result = _get_fetch_text()(url)
+    except ImportError:
+        try:
+            with httpx.Client(headers={"User-Agent": "Mozilla/5.0"}, timeout=30, follow_redirects=True) as c:
+                r = c.get(url)
+                return r.text, r.status_code
+        except Exception as exc:
+            logger.warning("_http_get %s failed: %s", url[:60], exc)
+            return "", 0
+    if not result:
         return "", 0
+    return result
 
 def _http_post(url: str, data: dict) -> tuple[str, int]:
     """Plain HTTP POST. Returns (html, status_code)."""
@@ -159,6 +194,13 @@ ITEM_URL_PATTERN = "{ITEM_URL_PATTERN}"                # e.g. r"/product/([^/]+)
 # ── Phase 2: Extraction ─────────────────────────────────────────────────────
 SCRAPING_METHOD = "{SCRAPING_METHOD}"              # informational (e.g. "http_navigation")
 PROXY_TIER = "{PROXY_TIER}"                        # "none" | "datacenter" | "residential"
+# [wave-15 3.5] The staged probe tier overrides the writer's guess (an
+# UNFILLED placeholder or a wrong guess alike): run_execution stages
+# SCRAPER_PROXY_TIER from the probe's working method, so every /navigate
+# call egresses the SAME identity the probe proved works.
+_env_tier = (os.environ.get("SCRAPER_PROXY_TIER") or "").strip().lower()
+if _env_tier in ("none", "datacenter", "residential"):
+    PROXY_TIER = _env_tier
 DELAY_BETWEEN_REQUESTS = {DELAY_BETWEEN_REQUESTS}
 
 # ── Output ──────────────────────────────────────────────────────────────────
@@ -231,6 +273,22 @@ def _load_checkpoint() -> list[str]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+# [wave-15 3.2] Geo-pin proxied egress to the site's country: a datacenter/
+# residential peer from the WRONG country re-rolls geo-sensitive bot scoring
+# and can trip geo-CDN redirects mid-run. Unproxied runs carry no country —
+# Bright Data isn't in play and detect_country would only be guessing.
+try:
+    from src.geo import detect_country as _detect_country
+except Exception:  # stripped image without src/ — degrade, never die
+    _detect_country = None
+
+
+def _effective_proxy_tier() -> str:
+    """PROXY_TIER with the UNFILLED-placeholder case resolved (never sent raw)."""
+    tier = PROXY_TIER if (PROXY_TIER and not PROXY_TIER.startswith("{")) else "none"
+    return tier if tier in ("none", "datacenter", "residential") else "none"
+
+
 def _navigate(url, actions=None, extract=None, retry=0):
     """POST /navigate with exponential backoff. Returns the response dict or None.
 
@@ -257,7 +315,12 @@ def _navigate(url, actions=None, extract=None, retry=0):
         "actions": actions or [],
         "extract": extract or {},
         "stealth": "cloak" if str(STEALTH).lower() == "cloak" else "none",
-        "proxy_tier": PROXY_TIER if (PROXY_TIER and PROXY_TIER != "{PROXY_TIER}") else "none",
+        "proxy_tier": _effective_proxy_tier(),
+        "country": (
+            _detect_country(SITE_URL)
+            if (_detect_country and _effective_proxy_tier() != "none")
+            else None
+        ),
         "timeout": NAVIGATE_TIMEOUT,
         "return_what": "all",
     }

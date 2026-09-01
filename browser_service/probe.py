@@ -219,6 +219,7 @@ def run_probe(
             return result
         return result or _failure_result("all_failed", "none", "Direct HTTP failed and render_js=false")
 
+    last_blocked: Optional[dict] = None  # last Akamai-blocked result (returned if nothing bypasses)
     for i, (step_name, step_proxy_tier) in enumerate(escalation_steps):
         if i < skip_index:
             continue
@@ -240,13 +241,22 @@ def run_probe(
             )
 
         if result and result.get("needs_akamai_bypass"):
-            _log_step(f"{step_name}: Akamai detected — trying CloakBrowser stealth bypass")
-            cloak_res = _try_cloak(url, "none", timeout=min(timeout, 40), country=country)
+            # [wave-15 3.1] Bypass with the DETECTING rung's tier — this used
+            # to hard-code "none", so a datacenter/residential detection sent
+            # the bypass out unproxied (different egress, usually still
+            # blocked). And when the bypass fails, CONTINUE the ladder: a
+            # proxied deployment still has its remaining tiers to try.
+            bypass_method = f"cloak_{step_proxy_tier}"
+            _log_step(f"{step_name}: Akamai detected — trying {bypass_method} stealth bypass")
+            cloak_res = _try_cloak(
+                url, step_proxy_tier, timeout=min(timeout, 40), country=country
+            )
             if cloak_res and cloak_res.get("success"):
-                _log_step("cloak_none: SUCCEEDED (Akamai bypassed)")
+                _log_step(f"{bypass_method}: SUCCEEDED (Akamai bypassed)")
                 return cloak_res
-            _log_step(f"{step_name}: cloak did not bypass Akamai; stopping escalation")
-            return result
+            last_blocked = result
+            _log_step(f"{step_name}: {bypass_method} did not bypass Akamai; continuing escalation")
+            continue
 
         if result and result.get("success"):
             _log_step(f"{step_name}: SUCCEEDED")
@@ -258,6 +268,10 @@ def run_probe(
             json.dump({"url": url, "steps": steps_log}, f, indent=2)
     except Exception:
         pass
+    # Preserve the Akamai signal: a rung that detected Akamai is a different
+    # diagnosis (and a different bypass prescription) than a generic failure.
+    if last_blocked is not None:
+        return last_blocked
     return _failure_result("all_failed", "none", "All probe methods failed")
 
 
@@ -841,11 +855,16 @@ def _try_direct_http(url: str, timeout: int = 15, proxy_tier: str = "none", coun
 
         body_text = _extract_body_text(html)
 
-        if proxy_tier == "none" and _detect_akamai(html, resp.status_code):
+        # [wave-15 3.1] Akamai detection on EVERY tier — the none-only gate
+        # meant a datacenter/residential rung that got Akamai-blocked was
+        # misreported as a generic failure, so the bypass never fired and the
+        # caller never learned the block was Akamai.
+        if _detect_akamai(html, resp.status_code):
+            method_name = f"direct_http_{proxy_tier}" if proxy_tier != "none" else "direct_http"
             return {
                 "success": False,
-                "method": "direct_http",
-                "proxy_tier": "none",
+                "method": method_name,
+                "proxy_tier": proxy_tier,
                 "status_code": resp.status_code,
                 "title": title,
                 "body_length": len(html),

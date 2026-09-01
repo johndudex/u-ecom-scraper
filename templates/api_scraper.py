@@ -296,12 +296,40 @@ def fetch_all_products_via_api() -> tuple[list[str], list[dict]]:
     return urls, all_products
 
 
+# [wave-15 3.4] Per-item fetch closure — ONE per process (the Session must
+# persist across items for cookie continuity, job-58).
+_FETCH_JSON = None
+
+
+def _get_fetch_json():
+    global _FETCH_JSON
+    if _FETCH_JSON is None:
+        from src.http_fetch import create_fetch_json
+
+        _FETCH_JSON = create_fetch_json(
+            delay_s=DELAY_BETWEEN_REQUESTS, headers=API_HEADERS
+        )
+    return _FETCH_JSON
+
+
 def scrape_product(url: str, src_url: str) -> Optional[dict]:
     try:
         time.sleep(DELAY_BETWEEN_REQUESTS)
-        response = requests.get(url, headers=HEADERS, timeout=15)
-        response.raise_for_status()
-        data = response.json()
+        # [wave-15 3.4] Per-item JSON fetch rides the SAME proxy ladder as
+        # fetch_api discovery — the old bare requests.get ran unproxied, so
+        # Phase 2 lost every item whenever Phase 1 needed a proxied tier.
+        # Falls back to the bare GET only when the image predates the module.
+        try:
+            result = _get_fetch_json()(url)
+        except ImportError:
+            logger.warning("src.http_fetch unavailable — falling back to a bare GET")
+            response = requests.get(url, headers=API_HEADERS, timeout=15)
+            response.raise_for_status()
+            result = (response.json(), response.status_code)
+        if not result:
+            logger.error(f"Failed to scrape {url}: proxy ladder returned no JSON")
+            return None
+        data, _status = result
         return transform_api_product(data, 0, src_url)
     except Exception as e:
         logger.error(f"Failed to scrape {url}: {e}")

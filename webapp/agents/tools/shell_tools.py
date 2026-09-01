@@ -416,6 +416,22 @@ def get_shell_tools(
             if is_anti_bot_detected():
                 env_overrides = {"STEALTH_BROWSER": "cloak"}
                 logger.info("run_scraper: anti-bot detected → STEALTH_BROWSER=cloak")
+            # [wave-15 3.5] Tester parity: the test run stages the SAME proxy
+            # tier execution will, so a draft whose items only arrive on a
+            # proxied tier is tested under that identity — not passed on a
+            # lucky direct-IP window that execution then loses.
+            from agents.tools.context import get_probe_method
+
+            _pm = str(get_probe_method() or "")
+            for _tier in ("residential", "datacenter"):
+                if _pm.endswith(f"_{_tier}"):
+                    env_overrides = dict(env_overrides or {})
+                    env_overrides["SCRAPER_PROXY_TIER"] = _tier
+                    logger.info(
+                        "run_scraper: probe method %s → SCRAPER_PROXY_TIER=%s",
+                        _pm, _tier,
+                    )
+                    break
         except Exception:
             pass
         # DETERMINISTIC DISCOVERY: inject SCRAPER_LISTING_URL so the scraper's

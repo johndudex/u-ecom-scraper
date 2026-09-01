@@ -49,7 +49,15 @@ MAX_PAGES = 50                 # hard cap on pages to scrape
 PAGE_PARAM = "page"            # query param for pagination (?page=2)
 
 # Proxy
-PROXY_TIER = os.environ.get("PROXY_TIER", "none")
+# [wave-15 3.3] Tier resolution mirrors playwright_scraper: code_writer fills
+# {PROXY_TIER} from scraper_analysis; SCRAPER_PROXY_TIER (staged by
+# scraper_runner) overrides at runtime; an UNFILLED placeholder fails safe to
+# "none". The old bare os.environ.get("PROXY_TIER") read an env that is never
+# staged into the subprocess, so the tier was silently "none" on every run.
+PROXY_TIER = "{PROXY_TIER}"
+if PROXY_TIER.startswith("{") and PROXY_TIER.endswith("}"):
+    PROXY_TIER = ""
+PROXY_TIER = os.environ.get("SCRAPER_PROXY_TIER", "").strip() or (PROXY_TIER or "none")
 STEALTH = os.environ.get("STEALTH", os.environ.get("STEALTH_BROWSER", "none")).lower()
 _env_stealth = (os.environ.get("STEALTH_BROWSER") or os.environ.get("SCRAPER_STEALTH") or "").strip().lower()
 if _env_stealth in ("cloak", "true", "1"):
@@ -71,16 +79,25 @@ logger = logging.getLogger(__name__)
 # ── HTTP fetch with proxy escalation ──────────────────────────────────────────
 
 def _get_proxy():
-    """Return a proxies dict for httpx, or None."""
+    """Return the httpx proxy URL for the configured tier, or None.
+
+    [wave-15 3.3] This used to call ProxyConfig.from_file()/get_proxies() —
+    neither exists in src.proxy, so the import failed, the except swallowed
+    it, and EVERY fetch ran unproxied even on a proxied tier.
+    build_proxy_url() is the real API (single URL, country-scoped username),
+    and httpx >=0.28 takes it via ``proxy=`` (plural ``proxies=`` is removed
+    and raises TypeError).
+    """
     if PROXY_TIER == "none":
         return None
     try:
         import sys as _sys, os as _os
         _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".."))
-        from src.proxy import ProxyConfig
-        cfg = ProxyConfig.from_file("config/proxy.json")
-        return cfg.get_proxies(PROXY_TIER)
-    except Exception:
+        from src.geo import detect_country
+        from src.proxy import build_proxy_url
+        return build_proxy_url(PROXY_TIER, country=detect_country(SITE_URL))
+    except Exception as exc:
+        logger.warning("Proxy lookup for tier '%s' failed: %s", PROXY_TIER, exc)
         return None
 
 
@@ -92,12 +109,12 @@ def _fetch(url, retry=0):
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
-    proxies = _get_proxy()
+    proxy_url = _get_proxy()
     time.sleep(REQUEST_DELAY)
 
     for attempt in range(MAX_RETRIES):
         try:
-            with httpx.Client(headers=headers, timeout=30, follow_redirects=True, proxies=proxies) as client:
+            with httpx.Client(headers=headers, timeout=30, follow_redirects=True, proxy=proxy_url) as client:
                 resp = client.get(url)
             if resp.status_code < 400:
                 return resp.text, resp.status_code, str(resp.url)

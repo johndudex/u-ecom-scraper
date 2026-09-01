@@ -276,8 +276,40 @@ def _needs_cloak(state: ScrapeState) -> bool:
     return False
 
 
+_PROXY_TIERS = ("residential", "datacenter")
+
+
+def _scraper_proxy_tier(state: ScrapeState) -> str:
+    """The probe's working proxy TIER, staged as SCRAPER_PROXY_TIER [wave-15 3.5].
+
+    The generated templates read SCRAPER_PROXY_TIER, so a site whose probe
+    only succeeded on a proxied tier starts there instead of re-running the
+    whole ladder from "none" — identity parity: discovery and extraction
+    share ONE egress identity instead of flip-flopping mid-run (a tier
+    change mid-run re-rolls the bot-score dice per phase).
+    """
+    probe = state.get("probe_result") or {}
+    method = state.get("probe_method") or ""
+    if not method and isinstance(probe, dict):
+        conn = probe.get("connectivity") or {}
+        method = (
+            probe.get("method")
+            or (conn.get("method_that_worked") if isinstance(conn, dict) else "")
+            or ""
+        )
+    method = method if isinstance(method, str) else ""
+    for tier in _PROXY_TIERS:
+        if method.endswith(f"_{tier}"):
+            return tier
+    return ""  # no signal → don't stage; templates default to "none"/ladder top
+
+
 def _stealth_env(state: ScrapeState) -> dict[str, str]:
-    return {"STEALTH_BROWSER": "cloak"} if _needs_cloak(state) else {}
+    env = {"STEALTH_BROWSER": "cloak"} if _needs_cloak(state) else {}
+    tier = _scraper_proxy_tier(state)
+    if tier:
+        env["SCRAPER_PROXY_TIER"] = tier
+    return env
 
 
 # [job-315 citybeach] Progress-aware wall-clock extension. EXECUTION_TIMEOUT is

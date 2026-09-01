@@ -403,12 +403,19 @@ def run_probe_with_captcha_check(
                     # IS the bypass now, requested through the same
                     # /probe-single contract as every other ladder rung
                     # (timeout clamped: /probe-single caps timeout at 120).
+                    # [wave-15 3.1] Bypass with the DETECTING rung's tier —
+                    # this used to hardcode cloak_none, so when a
+                    # datacenter/residential rung caught the Akamai block the
+                    # bypass ran unproxied (different Bright Data peer, often
+                    # still blocked) and the cache recorded the WRONG identity
+                    # as the method that worked.
+                    _bypass_method = f"cloak_{proxy_tier}"
                     try:
                         ak_resp = httpx.post(
                             f"{service_url}/probe-single",
                             json={
                                 "url": url,
-                                "method": "cloak_none",
+                                "method": _bypass_method,
                                 "timeout": min(PROBE_TIMEOUT, 90),
                             },
                             timeout=PROBE_TIMEOUT + 10,
@@ -417,21 +424,27 @@ def run_probe_with_captcha_check(
                         ak_data = ak_resp.json()
                         ak_data["_request_url"] = url
                         ak_data["proxy_tier"] = proxy_tier
-                        methods_tried.append("cloak_none")
+                        methods_tried.append(_bypass_method)
                         if ak_data.get("success"):
                             captcha_result = _verify_captcha_free(ak_data)
                             if captcha_result.get("captcha_detected"):
                                 captcha_info = captcha_result
-                            logger.info(
-                                "probe_page[accessibility]: Akamai bypass returned captcha (%s) for %s",
-                                captcha_result.get("captcha_type"),
-                                url[:80],
-                            )
-                            _log_probe_step(
-                                f"{step_name} Akamai bypass returned captcha: "
-                                f"{captcha_result.get('captcha_type')}"
-                            )
-                            return None
+                                # [wave-15 3.1] This block (through the
+                                # return) used to sit OUTSIDE the if — every
+                                # successful bypass was discarded as a
+                                # captcha page and the "returned real
+                                # content" handler below was dead code, so
+                                # the ladder never accepted a bypass win.
+                                logger.info(
+                                    "probe_page[accessibility]: Akamai bypass returned captcha (%s) for %s",
+                                    captcha_result.get("captcha_type"),
+                                    url[:80],
+                                )
+                                _log_probe_step(
+                                    f"{step_name} Akamai bypass returned captcha: "
+                                    f"{captcha_result.get('captcha_type')}"
+                                )
+                                return None
                         logger.info(
                             "probe_page[accessibility]: Akamai bypass returned real content for %s",
                             url[:80],
@@ -439,7 +452,7 @@ def run_probe_with_captcha_check(
                         _log_probe_step(
                             f"{step_name} Akamai bypass SUCCEEDED — real content"
                         )
-                        return _handle_success(ak_data, "cloak_none")
+                        return _handle_success(ak_data, _bypass_method)
                     except Exception as ak_exc:
                         logger.warning(
                             "probe_page[accessibility]: Akamai bypass failed for %s: %s",
@@ -597,22 +610,23 @@ def get_probe_tools() -> list:
     def probe_page(url: str, render_js: bool = True) -> str:
         """Test page accessibility with automatic proxy escalation.
 
-        Delegates to browser_service which runs the tier-first escalation chain:
-        1. Direct HTTP (no proxy)
-        2. Playwright (no proxy)
-        3. UC Chrome (no proxy)
-        4. Direct HTTP (datacenter proxy)
-        5. Playwright (datacenter proxy)
-        6. UC Chrome (datacenter proxy)
-        7. Direct HTTP (residential proxy)
-        8. Playwright (residential proxy)
-        9. UC Chrome (residential proxy)
+        Delegates to browser_service. Each identity is a (transport,
+        proxy-tier) pair; the escalation ladder walks transports from cheap
+        to expensive, and within each transport walks tiers none →
+        datacenter → residential (unconfigured tiers are skipped):
 
-        If Akamai Bot Manager is detected, automatically escalates to
-        the 3-layer Akamai bypass:
-        Layer 1: TLS fingerprint pre-warming (curl_cffi)
-        Layer 2: Playwright stealth browser with anti-fingerprinting
-        Layer 3: SeleniumBase UC Chrome fallback
+        1. direct_http[_tier] — plain HTTP GET
+        2. fingerprint_{chrome,safari184}_tier — curl_cffi browser-TLS
+           impersonation (browser client hello/HTTP2, no JS)
+        3. playwright_tier — real Chromium via Playwright
+        4. cloak_tier — CloakBrowser stealth Chromium
+           (anti-fingerprinting); `uc_chrome_*` names are accepted as
+           deprecated aliases of cloak_* for cached results
+
+        When any rung detects Akamai Bot Manager, the CloakBrowser rung of
+        the SAME tier is tried immediately as the bypass; if it fails the
+        ladder continues to the next identity instead of stopping, so a
+        proxied deployment still gets its remaining tiers.
 
         The probe cache remembers which method worked for a domain,
         so subsequent probes skip straight to that method for speed.
@@ -709,11 +723,14 @@ def get_probe_tools() -> list:
                 try:
                     # T3.2: /probe-akamai deleted — the cloak stealth step IS
                     # the bypass; same /probe-single contract, clamped timeout.
+                    # [wave-15 3.1] same-tier bypass here too — the /probe
+                    # aggregate's proxy_tier is the tier that detected Akamai.
+                    _bypass_method = f"cloak_{data.get('proxy_tier', 'none') or 'none'}"
                     ak_resp = httpx.post(
                         f"{service_url}/probe-single",
                         json={
                             "url": url,
-                            "method": "cloak_none",
+                            "method": _bypass_method,
                             "timeout": min(PROBE_TIMEOUT, 90),
                         },
                         timeout=PROBE_TIMEOUT + 10,

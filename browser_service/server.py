@@ -1539,7 +1539,7 @@ async def probe_single(request: SingleProbeRequest):
             request.url, "residential", min(request.timeout, 35), country=country
         ),
         "cloak_none": lambda: _try_cloak(
-            request.url, "none", min(request.timeout, 45)
+            request.url, "none", min(request.timeout, 45), country=country
         ),
         "cloak_datacenter": lambda: _try_cloak(
             request.url, "datacenter", min(request.timeout, 45), country=country
@@ -1552,7 +1552,7 @@ async def probe_single(request: SingleProbeRequest):
         # naming ``uc_chrome_*`` still resolve on /probe-single instead of 400'ing.
         # The result payload reports ``cloak_*`` as the method that worked.
         "uc_chrome_none": lambda: _try_cloak(
-            request.url, "none", min(request.timeout, 45)
+            request.url, "none", min(request.timeout, 45), country=country
         ),
         "uc_chrome_datacenter": lambda: _try_cloak(
             request.url, "datacenter", min(request.timeout, 45), country=country

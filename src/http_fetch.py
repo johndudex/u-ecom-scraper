@@ -51,6 +51,7 @@ the dependency the ladder is exactly the legacy three tiers. Kill switch:
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -185,13 +186,15 @@ def detect_soft_block(text: str) -> Optional[SoftBlock]:
     return None
 
 
-def create_fetch_page(delay_s: float = 2.0, headers: Optional[dict] = None) -> Callable:
-    """Build a ``fetch_page(url, min_tier=0)`` closure for one scraper run.
+def _ladder_clients(
+    headers: Optional[dict],
+) -> tuple:
+    """Shared per-run setup for the fetch factories (create_fetch_page/text/json).
 
-    The Session is per-factory (per-scraper-process): cookies round-trip
-    across every request and the connection pool is reused, which is what
-    keeps an Akamai bot score from re-rising on every hit (job-58 trigger).
-    ``headers`` (the template's HEADERS, UA especially) are applied once.
+    One owner so the factories cannot drift on session identity — the
+    cookie round-trip across a reused Session is the anti-bot defense
+    (job-58). Returns ``(proxy_config, ssl_verify, escalation, session,
+    curl_session, fingerprint_enabled)``.
     """
     proxy_config = ProxyConfig.get_instance()
     ssl_verify = proxy_config.config.get("strategy", {}).get("ssl_verify", False)
@@ -219,6 +222,26 @@ def create_fetch_page(delay_s: float = 2.0, headers: Optional[dict] = None) -> C
             logger.warning("curl_cffi fingerprint tier disabled: %s", exc)
             fingerprint_enabled = False
             curl_session = None
+
+    return proxy_config, ssl_verify, escalation, session, curl_session, fingerprint_enabled
+
+
+def create_fetch_page(delay_s: float = 2.0, headers: Optional[dict] = None) -> Callable:
+    """Build a ``fetch_page(url, min_tier=0)`` closure for one scraper run.
+
+    The Session is per-factory (per-scraper-process): cookies round-trip
+    across every request and the connection pool is reused, which is what
+    keeps an Akamai bot score from re-rising on every hit (job-58 trigger).
+    ``headers`` (the template's HEADERS, UA especially) are applied once.
+    """
+    (
+        proxy_config,
+        ssl_verify,
+        escalation,
+        session,
+        curl_session,
+        fingerprint_enabled,
+    ) = _ladder_clients(headers)
 
     def fetch_page(
         url: str, min_tier: int = 0
@@ -304,3 +327,143 @@ def create_fetch_page(delay_s: float = 2.0, headers: Optional[dict] = None) -> C
     fetch_page.min_tier_floor = 0
     fetch_page.tiers_total = 1 + len(escalation) + (1 if fingerprint_enabled else 0)
     return fetch_page
+
+
+def create_fetch_text(delay_s: float = 2.0, headers: Optional[dict] = None) -> Callable:
+    """Build a ``fetch_text(url, params=None, min_tier=0)`` closure — the SAME
+    session, proxy ladder and soft-block contract as :func:`create_fetch_page`,
+    returning ``(text, status_code)`` instead of a parsed soup.
+
+    Why it exists [wave-15 3.4]: the API-family and HTTP-navigation templates
+    run the shared ladder for discovery but fetched every item page / SSR page
+    with a bare ``requests.get(url, headers=HEADERS)`` — unproxied, no
+    escalation. When Phase 1 only succeeded on a proxied tier, Phase 2 re-ran
+    the SAME URLs from the burned direct IP and every item fetch failed
+    (identity parity: the run changes egress mid-flight and loses the
+    identity that worked). Import this instead — the LLM cannot strip what it
+    never sees.
+
+    The ladder loop is deliberately a sibling of ``fetch_page``'s, not a
+    refactor of it: the established factory is pinned by the full suite and
+    by live jobs, so it ships byte-identical and drifts never.
+    """
+    (
+        proxy_config,
+        ssl_verify,
+        escalation,
+        session,
+        curl_session,
+        fingerprint_enabled,
+    ) = _ladder_clients(headers)
+
+    def fetch_text(
+        url: str, params: Optional[dict] = None, min_tier: int = 0
+    ) -> Optional[Union[tuple[str, int], SoftBlock]]:
+        floor = int(getattr(fetch_text, "min_tier_floor", 0))
+        tiers = resolve_tiers(
+            max(min_tier, floor), escalation, fingerprint_tier=fingerprint_enabled
+        )
+
+        for tier in tiers:
+            if tier == "fingerprint":
+                get_exc: type = Exception
+                proxies = proxy_config.get_proxy_dict("residential")
+                max_retries = proxy_config.get_max_retries("residential")
+                cooldown = proxy_config.get_cooldown("residential")
+                client = curl_session
+            else:
+                get_exc = requests.RequestException
+                proxies = proxy_config.get_proxy_dict(tier) if tier != "none" else None
+                max_retries = (
+                    proxy_config.get_max_retries(tier) if tier != "none" else 3
+                )
+                cooldown = (
+                    proxy_config.get_cooldown(tier) if tier != "none" else delay_s * 2
+                )
+                client = session
+
+            if should_warn_residential(tier):
+                warn_residential_usage(url)
+
+            for attempt in range(max_retries):
+                try:
+                    time.sleep(delay_s)
+                    if tier == "fingerprint":
+                        logger.info(
+                            "Fetching %s via curl_cffi fingerprint tier "
+                            "(impersonate=%s)", url[:80], CURL_IMPERSONATE,
+                        )
+                    response = client.get(
+                        url,
+                        params=params,
+                        proxies=proxies,
+                        timeout=proxy_config.get_timeout(),
+                        verify=ssl_verify,
+                    )
+                    if response.status_code == 200:
+                        # Same contract as fetch_page: a challenge ships as
+                        # 200 — report it, escalate NOWHERE (the caller owns
+                        # the ladder).
+                        block = detect_soft_block(response.text)
+                        if block is not None:
+                            logger.warning(
+                                "SOFT BLOCK (200) on tier '%s' for %s — %s; "
+                                "returning the signal for the caller to escalate",
+                                tier, url[:80], block,
+                            )
+                            return block
+                        return response.text, 200
+                    if proxy_config.is_banned(response.status_code, response.text):
+                        logger.warning(
+                            "Ban detected (%s) on tier '%s' for %s — escalating",
+                            response.status_code, tier, url[:80],
+                        )
+                        break  # next tier
+                    response.raise_for_status()
+                    return response.text, response.status_code
+                except get_exc as e:
+                    logger.error(
+                        "Failed to fetch %s (attempt %s/%s, tier=%s): %s",
+                        url[:80], attempt + 1, max_retries, tier, e,
+                    )
+                    if attempt < max_retries - 1:
+                        time.sleep(cooldown)
+
+        return None
+
+    fetch_text.min_tier_floor = 0
+    fetch_text.tiers_total = 1 + len(escalation) + (1 if fingerprint_enabled else 0)
+    return fetch_text
+
+
+def create_fetch_json(delay_s: float = 2.0, headers: Optional[dict] = None) -> Callable:
+    """Build a ``fetch_json(url, params=None, min_tier=0)`` closure over
+    :func:`create_fetch_text` — returns ``(parsed_json, status_code)``.
+
+    For the API-family templates' per-item fetches (``scrape_product``): the
+    old inline ``requests.get(...).json()`` had no ladder, so a PDP JSON
+    endpoint that needed a proxied tier returned a challenge/403 and the item
+    was silently dropped (``except: return None``). A 200 body that does not
+    parse as JSON is a failed fetch (None), never an exception.
+    """
+    fetch_text = create_fetch_text(delay_s=delay_s, headers=headers)
+
+    def fetch_json(
+        url: str, params: Optional[dict] = None, min_tier: int = 0
+    ) -> Optional[Union[tuple[Union[dict, list], int], SoftBlock]]:
+        result = fetch_text(url, params=params, min_tier=min_tier)
+        if not result:
+            return result
+        text, status = result
+        try:
+            return json.loads(text), status
+        except (TypeError, ValueError) as exc:
+            logger.warning(
+                "fetch_json: non-JSON 200 body (%d bytes) from %s: %s",
+                len(text), url[:80], exc,
+            )
+            return None
+
+    fetch_json.min_tier_floor = 0
+    fetch_json.tiers_total = fetch_text.tiers_total
+    return fetch_json
