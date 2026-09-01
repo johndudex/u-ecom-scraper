@@ -1651,6 +1651,31 @@ def cleanup_stuck_jobs() -> None:
             except Exception as exc:
                 logger.warning("Stuck job %d: revoke failed: %s", job.id, exc)
 
+        # [wave-14] The celery revoke kills THIS worker's task — but the wedge
+        # is often the /scrape SUBPROCESS inside browser_service, which has no
+        # celery parent and would keep burning the shared Scraper Chrome until
+        # its own timeout. Cancel it by job id (lock-free, short timeout, never
+        # raises). Runs AFTER the job is marked FAILED so a wedge that already
+        # ended still just gets an honest "nothing in flight".
+        try:
+            from agents.tools.browser_http import cancel_scrape
+
+            _cancel = cancel_scrape(job.id)
+            if _cancel.get("requested") is False and _cancel.get("error"):
+                logger.warning(
+                    "Stuck job %d: browser_service cancel unavailable: %s",
+                    job.id,
+                    _cancel["error"],
+                )
+            elif _cancel.get("flagged"):
+                logger.info(
+                    "Stuck job %d: browser_service cancelled run(s) %s",
+                    job.id,
+                    _cancel.get("flagged"),
+                )
+        except Exception as exc:
+            logger.warning("Stuck job %d: browser_service cancel failed: %s", job.id, exc)
+
         Step.objects.filter(
             job=job, status__in=(Step.STATUS_RUNNING, Step.STATUS_PENDING)
         ).update(

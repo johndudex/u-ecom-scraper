@@ -30,12 +30,26 @@ Never raises: failures come back as ``ScrapeResult(ok=False)`` with a
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# [wave-14] browser_service base URL for the /cancel helper. django settings
+# first (the webapp runs inside Django), env fallback for bare-process tests.
+try:  # pragma: no cover - trivial config resolution
+    from django.conf import settings as _dj_settings
+
+    BROWSER_SERVICE_URL = getattr(
+        _dj_settings, "BROWSER_SERVICE_URL", ""
+    ) or os.environ.get("BROWSER_SERVICE_URL", "http://browser_service:8001")
+except Exception:  # pragma: no cover - django not configured
+    BROWSER_SERVICE_URL = os.environ.get(
+        "BROWSER_SERVICE_URL", "http://browser_service:8001"
+    )
 
 # Retry only what backpressure/instability looks like — NOT a scrape bug.
 RETRYABLE_STATUS_CODES = frozenset({429, 502, 503, 504})
@@ -235,3 +249,27 @@ def post_scrape_with_retry(
     if not result.ok and not result.error:
         result.error = _summarize_failure(result)
     return result
+
+
+def cancel_scrape(job_id: int, rid: str = "") -> dict:
+    """[wave-14] Ask browser_service to cancel in-flight /scrape run(s).
+
+    Fire-and-forget: the cancel endpoint is lock-free and answers in
+    microseconds, but this client still uses a SHORT timeout and never raises —
+    a caller that is cancelling is usually also giving up, and a cancel that
+    hangs its caller just relocates the hang. Returns the browser_service
+    report (``flagged``/``killed``/``unknown``) or ``{"requested": False,
+    "error": ...}`` when unreachable.
+    """
+    try:
+        resp = httpx.post(
+            f"{BROWSER_SERVICE_URL}/cancel",
+            json={"rid": rid or "", "job_id": int(job_id or 0)},
+            timeout=10.0,
+        )
+        if resp.status_code == 200:
+            return resp.json() or {}
+        return {"requested": False, "error": f"HTTP {resp.status_code}"}
+    except Exception as exc:
+        logger.warning("cancel_scrape(job=%s): browser_service unreachable: %s", job_id, exc)
+        return {"requested": False, "error": str(exc)[:200]}

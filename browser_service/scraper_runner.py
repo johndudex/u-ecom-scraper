@@ -5,8 +5,9 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 
@@ -15,6 +16,98 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = os.environ.get("PROJECT_ROOT", "/app")
 DISPLAY = os.environ.get("DISPLAY", ":98")
 BROWSER_SERVICE_URL = os.environ.get("BROWSER_SERVICE_URL", "http://127.0.0.1:8001")
+
+# ── Active-run registry + cancellation [wave-14 job-133/317] ────────────────
+# rid (the /tmp run-dir basename, e.g. "scrape_ab12...") → run metadata. The
+# registry lets /cancel reach a run by rid or by the django job_id that was
+# stamped into the /scrape payload, WITHOUT any lock: dict ops are GIL-atomic
+# and the cancel path never touches PROBE_LOCK (which a wedged probe can hold
+# for minutes — a cancel that waits on it is not a cancel).
+_ACTIVE_RUNS: dict[str, dict[str, Any]] = {}
+_ACTIVE_RUNS_LOCK = threading.Lock()
+
+
+def _register_run(rid: str, *, job_id: int = 0, scraper_name: str = "") -> None:
+    if not rid:
+        return
+    with _ACTIVE_RUNS_LOCK:
+        _ACTIVE_RUNS[rid] = {
+            "job_id": int(job_id or 0),
+            "scraper_name": scraper_name,
+            "pid": None,
+            "cancel": False,
+            "started": time.time(),
+        }
+
+
+def _unregister_run(rid: str) -> None:
+    with _ACTIVE_RUNS_LOCK:
+        _ACTIVE_RUNS.pop(rid, None)
+
+
+def _rids_for_job(job_id: int) -> list[str]:
+    with _ACTIVE_RUNS_LOCK:
+        return [
+            rid for rid, meta in _ACTIVE_RUNS.items()
+            if job_id and meta.get("job_id") == job_id
+        ]
+
+
+def request_cancel(rid: str = "", job_id: int = 0) -> dict[str, Any]:
+    """Cancel matching in-flight run(s): set the flag (stops the retry loop)
+    and SIGKILL the subprocess group (stops the current attempt). Returns a
+    small report; never raises, never blocks on a lock the run itself holds.
+    """
+    rids = [rid] if rid else []
+    if job_id:
+        rids.extend(r for r in _rids_for_job(job_id) if r not in rids)
+    killed: list[str] = []
+    flagged: list[str] = []
+    unknown: list[str] = []
+    for r in rids:
+        with _ACTIVE_RUNS_LOCK:
+            meta = _ACTIVE_RUNS.get(r)
+            if meta is None:
+                unknown.append(r)
+                continue
+            meta["cancel"] = True
+            pid = meta.get("pid")
+        flagged.append(r)
+        if pid:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+                killed.append(r)
+            except (ProcessLookupError, PermissionError, OSError):
+                # already gone / not a session leader — the flag still holds
+                pass
+    return {
+        "requested": rids,
+        "flagged": flagged,
+        "killed": killed,
+        "unknown": unknown,
+    }
+
+
+def _run_cancelled(rid: str) -> bool:
+    with _ACTIVE_RUNS_LOCK:
+        meta = _ACTIVE_RUNS.get(rid)
+    return bool(meta and meta.get("cancel"))
+
+
+def active_runs_snapshot() -> list[dict[str, Any]]:
+    """Read-only view for /health (rid aliases + ages, never the full cmd)."""
+    with _ACTIVE_RUNS_LOCK:
+        now = time.time()
+        return [
+            {
+                "rid": rid,
+                "job_id": meta.get("job_id") or None,
+                "scraper_name": meta.get("scraper_name") or "",
+                "age_s": round(now - (meta.get("started") or now), 1),
+                "cancelling": bool(meta.get("cancel")),
+            }
+            for rid, meta in sorted(_ACTIVE_RUNS.items())
+        ]
 
 # ── Chrome crash detection ──────────────────────────────────────────────
 # When a scraper dies because Chrome became unresponsive/closed (common on
@@ -188,17 +281,42 @@ def _post_run(result: Any, scraper_path: str, elapsed: float) -> dict[str, Any]:
 
 def run_scraper_script(
     scraper_path: str,
-    args: Optional[list[str]] = None,
+    args: list[str] | None = None,
     timeout: int = 3600,
-    env_overrides: Optional[dict[str, str]] = None,
+    env_overrides: dict[str, str] | None = None,
     max_retries: int = 3,
+    rid: str = "",
+    job_id: int = 0,
 ) -> dict[str, Any]:
     """Run a scraper script with Chrome-crash retry support.
 
     On Chrome/CDP death (not a code bug), restarts Chrome + retries with
     exponential backoff (10s → 20s → 40s). The scraper's own checkpoint/resume
     (B-core, if the template implements it) ensures retries don't redo work.
+
+    ``rid`` [wave-14] registers the run in ``_ACTIVE_RUNS`` so ``/cancel`` can
+    reach it (by rid, or by the django ``job_id``) — the flag breaks the retry
+    loop between attempts and the endpoint kills the current process group.
+    Registration wraps the impl so EVERY return path (success, code bug,
+    crash-exhausted, timeout, exception) unregisters.
     """
+    _register_run(rid, job_id=job_id, scraper_name=os.path.basename(scraper_path))
+    try:
+        return _run_scraper_script_impl(
+            scraper_path, args, timeout, env_overrides, max_retries, rid,
+        )
+    finally:
+        _unregister_run(rid)
+
+
+def _run_scraper_script_impl(
+    scraper_path: str,
+    args: list[str] | None = None,
+    timeout: int = 3600,
+    env_overrides: dict[str, str] | None = None,
+    max_retries: int = 3,
+    rid: str = "",
+) -> dict[str, Any]:
     cmd = ["python3", scraper_path]
     if args:
         cmd.extend(args)
@@ -217,6 +335,22 @@ def run_scraper_script(
         "PROJECT_ROOT": PROJECT_ROOT,
         "PYTHONUNBUFFERED": "1",
     }
+    # [wave-14 job-317] Safe-path + explicit import path. Python auto-prepends
+    # the SCRIPT'S DIRECTORY to sys.path, so a stray ``bisect.py`` (job-317's
+    # RCA scratch file) sitting in /tmp next to nothing in particular — or any
+    # leftover in a staged run dir — shadowed stdlib for every later scraper
+    # and the failure looked like a phantom ModuleAttributeError. With
+    # PYTHONSAFEPATH=1 the auto-prepend is gone; PYTHONPATH re-adds EXACTLY
+    # what drafts legitimately need: /app (``src.http_fetch`` imports) and the
+    # run dir (staged sibling modules). Inherited PYTHONPATH entries ride along.
+    env["PYTHONSAFEPATH"] = "1"
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (
+            PROJECT_ROOT,
+            os.path.dirname(scraper_path) or PROJECT_ROOT,
+            os.environ.get("PYTHONPATH", ""),
+        ) if p
+    )
     if env_overrides:
         env.update(env_overrides)
     _stealth = (env.get("STEALTH_BROWSER", "") or "").strip().lower()
@@ -230,6 +364,18 @@ def run_scraper_script(
     last_result_dict: dict[str, Any] = {}
 
     for attempt in range(1, max_retries + 1):
+        # [wave-14] A cancel that arrives between attempts must not relaunch.
+        if rid and _run_cancelled(rid):
+            logger.warning("Scraper run cancelled before attempt %d (rid=%s)", attempt, rid)
+            return {
+                "returncode": -1,
+                "stdout": last_result_dict.get("stdout", ""),
+                "stderr": f"Cancelled before attempt {attempt}",
+                "output_file": "",
+                "product_count": 0,
+                "duration": round(time.time() - start, 2),
+                "cancelled": True,
+            }
         attempt_start = time.time()
         logger.info("Scraper run attempt %d/%d: %s %s", attempt, max_retries,
                      os.path.basename(scraper_path), " ".join(args or []))
@@ -253,6 +399,20 @@ def run_scraper_script(
                 env=env,
                 start_new_session=True,
             )
+            # [wave-14] publish the pid so /cancel can killpg the CURRENT
+            # attempt; if a cancel landed during the spawn window, apply it
+            # here instead of racing the whole run.
+            with _ACTIVE_RUNS_LOCK:
+                if rid in _ACTIVE_RUNS:
+                    _ACTIVE_RUNS[rid]["pid"] = proc.pid
+                    _spawn_cancelled = _ACTIVE_RUNS[rid].get("cancel", False)
+                else:
+                    _spawn_cancelled = False
+            if _spawn_cancelled:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
             try:
                 stdout_s, stderr_s = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:

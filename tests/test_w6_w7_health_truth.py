@@ -267,6 +267,8 @@ class TestHealthGauges:
         assert set(out) == {
             "memory", "fd_count", "chrome_processes",
             "navigate_active_pids", "scrape_busy", "misc_queue", "restart_queue",
+            # [wave-14] /tmp/scrape_* leftovers gauge (stale run-dir sweep)
+            "stale_run_dirs",
         }
 
 

@@ -164,10 +164,77 @@ def _backpressure(
 # (dispatch on a saturated pool never ran). Warmed once in lifespan so the
 # boot window isn't no_data.
 _CDP_LIVENESS_CACHE: dict = {}
+# [wave-14 job-133] MCP SERVER liveness — a separate question from "the MCP
+# node process exists" (poll()) and "MCP Chrome's CDP answers" (mcp_cdp_alive):
+# does the MCP server actually SERVE? A process can be up while wedged (the
+# django agent sees tools/list hang → 0 tools → an agent phase burns its
+# budget). The liveness loop issues a real HTTP probe of the SSE endpoint and
+# publishes the verdict here; /health reads the cache and dispatches NOTHING.
+# state ∈ {"up", "down", "unknown"} — unknown means "never probed", which is
+# honest (it is NOT the same as down, and must not trip auto-restart logic).
+_MCP_HTTP_CACHE: dict = {"state": "unknown", "checked_at": 0.0, "error": ""}
+# [wave-14] periodic-hygiene gauge — how many browser tabs the shared MCP
+# Chrome is holding. Tab pileup is a slow memory leak the tab reaper bounds;
+# /health exposes the CURRENT count (updated by the reaper's cycle).
+_MCP_PAGE_COUNT: dict = {"count": None, "checked_at": 0.0}
+
+MCP_HTTP_PORT = int(os.environ.get("MCP_HTTP_PORT", "8111"))
+MCP_HTTP_PROBE_TIMEOUT_S = float(os.environ.get("MCP_HTTP_PROBE_TIMEOUT_S", "5"))
+
 # cloak binary info is static for the life of the container — computed once at
 # startup (off the loop; the import + binary_info() call are not µs-cheap and
 # used to run per /health request on the event loop).
 _CLOAK_INFO_CACHE: dict = {}
+
+# [wave-14] Pin the MCP server package. @latest made every container start a
+# silent upgrade experiment: a bad upstream release changed tool schemas /
+# defaults under a running fleet. Pin + env-override (ops can bump without a
+# rebuild), same doctrine as curl_cffi==0.16.2. 0.0.78 = the version every
+# container since the curl_cffi image has actually been running — the pin
+# freezes today's known-good, it does not bump.
+MCP_PACKAGE_SPEC = os.environ.get("MCP_PLAYWRIGHT_SPEC", "@playwright/mcp@0.0.78")
+
+# [wave-14] tab-reaper budget (http(s) tabs kept on the persistent MCP Chrome)
+# and stale run-dir age. Both generous by design — the reaper is a leak BOUND,
+# not a working-set manager; it only ever closes excess beyond these.
+MCP_TAB_KEEP = int(os.environ.get("MCP_TAB_KEEP", "4"))
+RUN_DIR_MAX_AGE_S = float(os.environ.get("RUN_DIR_MAX_AGE_S", str(6 * 3600)))
+
+
+def _probe_mcp_http() -> None:
+    """One liveness-loop pass: does the MCP server actually SERVE over HTTP?
+
+    Synchronous (runs on MISC_EXECUTOR inside the 15s loop). An SSE endpoint
+    never "completes" a GET — it holds the connection and streams — so the
+    verdict is derived from httpx raising or not: ANY response (even a 405)
+    proves the HTTP server accepts and answers; a timeout/refusal does not.
+    Publishes ``{"state": up|down|unknown, "checked_at", "error"}``; never
+    raises (a probe bug must not kill the liveness loop).
+    """
+    try:
+        import httpx
+
+        try:
+            httpx.get(
+                f"http://127.0.0.1:{MCP_HTTP_PORT}/sse",
+                timeout=MCP_HTTP_PROBE_TIMEOUT_S,
+            )
+            _MCP_HTTP_CACHE.clear()
+            _MCP_HTTP_CACHE.update(
+                {"state": "up", "checked_at": time.time(), "error": ""}
+            )
+        except Exception as exc:
+            _MCP_HTTP_CACHE.clear()
+            _MCP_HTTP_CACHE.update(
+                {
+                    "state": "down",
+                    "checked_at": time.time(),
+                    "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                }
+            )
+    except Exception as exc:  # probe itself failed — keep last known state
+        logger.warning("mcp http probe: unavailable (%s)", exc)
+
 
 # Rolling /navigate outcome window (W6 ephemeral-path truth + W7 counters).
 # TIME-bounded, not count-bounded: at prod's 30-180s/page cadence a count of
@@ -349,6 +416,7 @@ def _health_gauges(deadline: float) -> dict:
         "chrome_processes": None,
         "navigate_active_pids": len(NAVIGATE_ACTIVE_PIDS),
         "scrape_busy": sum(1 for dl in SCRAPE_IN_FLIGHT.values() if dl > time.monotonic()),
+        "stale_run_dirs": None,
         "misc_queue": MISC_EXECUTOR._work_queue.qsize(),
         "restart_queue": RESTART_EXECUTOR._work_queue.qsize(),
     }
@@ -359,6 +427,10 @@ def _health_gauges(deadline: float) -> dict:
             gauges["fd_count"] = len(os.listdir("/proc/self/fd"))
         if time.monotonic() < deadline:
             gauges["chrome_processes"] = _count_chrome_processes()
+        if time.monotonic() < deadline:
+            gauges["stale_run_dirs"] = sum(
+                1 for n in os.listdir("/tmp") if n.startswith("scrape_")
+            )
     except (OSError, ValueError, TypeError, RuntimeError, AttributeError):
         # a gauge bug must degrade /health's numbers, never the endpoint itself
         logger.exception("health: gauge computation failed (gauges degraded to null)")
@@ -481,9 +553,34 @@ def _run_scrape_guarded(rid: str, **kwargs):
                 "product_count": 0,
                 "duration": 0,
             }
-        return run_scraper_script(**kwargs)
+        return run_scraper_script(rid=rid, **kwargs)
     finally:
         SCRAPE_IN_FLIGHT.pop(rid, None)
+
+
+MCP_LOG_PATH = "/tmp/mcp-stdout.log"
+MCP_LOG_MAX_BYTES = 10 * 1024 * 1024  # rotate past 10MB
+
+
+def _rotate_mcp_log() -> str:
+    """Append-mode target for the MCP server's stdout/stderr.
+
+    The old open(path, "w") TRUNCATED the log on every MCP restart — including
+    the restarts the liveness loop performs automatically — so the very log you
+    needed to diagnose why MCP died was destroyed by the recovery that noticed.
+    Append preserves history; this rotates the file aside (one generation) when
+    it grows past MCP_LOG_MAX_BYTES so a chatty server can't fill /tmp.
+    """
+    try:
+        if os.path.getsize(MCP_LOG_PATH) > MCP_LOG_MAX_BYTES:
+            rotated = MCP_LOG_PATH + ".1"
+            try:
+                os.replace(MCP_LOG_PATH, rotated)
+            except OSError:
+                pass
+    except OSError:
+        pass  # no log yet — first boot
+    return MCP_LOG_PATH
 
 
 async def _start_mcp_process() -> bool:
@@ -509,7 +606,7 @@ async def _start_mcp_process() -> bool:
         mcp_internal_port = os.environ.get("MCP_CDP_PORT", "19222")
         mcp_cmd = [
             "npx",
-            "@playwright/mcp",
+            MCP_PACKAGE_SPEC,
             "--cdp-endpoint",
             f"http://127.0.0.1:{mcp_internal_port}",
             "--port",
@@ -527,7 +624,7 @@ async def _start_mcp_process() -> bool:
             "--timeout-navigation", "45000",   # 45s for page.goto/waitForURL
         ]
         logger.info("Starting Playwright MCP: %s", " ".join(mcp_cmd))
-        mcp_log = open("/tmp/mcp-stdout.log", "w")
+        mcp_log = open(_rotate_mcp_log(), "a")
         mcp_process = subprocess.Popen(
             mcp_cmd,
             stdout=mcp_log,
@@ -569,6 +666,147 @@ async def _periodic_cleanup():
             await _cleanup_chrome_artifacts()
         except Exception:
             logger.exception("Periodic cleanup failed")
+        # [wave-14] MCP tab reaper — the memory-hygiene piece. Every abandoned
+        # agent tab (browser_tab_new without browser_tab_close, crashed SSE
+        # sessions) keeps a live Chrome renderer: ~50-150MB each. Left alone the
+        # persistent MCP Chrome's RSS climbs for the life of the container.
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                MISC_EXECUTOR, _reap_mcp_tabs_sync
+            )
+        except Exception:
+            logger.exception("Periodic MCP tab reap failed")
+        # [wave-14] stale run-dir sweep — /scrape's finally reaps its own dir,
+        # but a container OOM-kill / hard restart mid-run leaves /tmp/scrape_*
+        # behind forever (and /tmp is inside the container's writable layer).
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                MISC_EXECUTOR, _sweep_stale_run_dirs
+            )
+        except Exception:
+            logger.exception("Periodic stale run-dir sweep failed")
+
+
+def _mcp_client_connected() -> bool:
+    """True while any MCP client holds an ESTABLISHED connection to the MCP
+    server's HTTP port — i.e. a django agent phase may be mid-browse. Cheap
+    read of /proc/net/tcp{,6}; unparsable ⇒ True (fail CLOSED: never reap
+    under uncertainty)."""
+    try:
+        port_hex = f"{MCP_HTTP_PORT:04X}"
+        for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                with open(path) as fh:
+                    next(fh)  # header
+                    for line in fh:
+                        fields = line.split()
+                        if len(fields) < 4:
+                            continue
+                        local = fields[1]
+                        if local.rsplit(":", 1)[-1].upper() == port_hex and fields[3] == "01":
+                            return True
+            except OSError:
+                continue
+    except Exception:
+        return True
+    return False
+
+
+def _reap_mcp_tabs_sync(keep: int = 0) -> dict:
+    """Close excess http(s) tabs on the persistent MCP Chrome via its CDP HTTP
+    API (``/json/list`` + ``/json/close/{id}`` — no CDP websocket needed).
+
+    Policy: preserve list order (creation order — oldest first), never close
+    the FIRST tab (the MCP server's original tab), keep at most ``keep``
+    http(s) tabs. Skipped entirely while an MCP client is connected — a reaper
+    that closes the tab a navigation_explore is actively driving is worse than
+    the leak it fixes. Publishes the http(s) tab count to ``_MCP_PAGE_COUNT``
+    even when skipping, so /health's gauge stays fresh.
+    """
+    import json as _json
+    import urllib.request
+
+    if keep <= 0:
+        keep = MCP_TAB_KEEP
+    targets: list = []
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{MCP_CDP_PORT}/json/list", timeout=5
+        ) as resp:
+            targets = _json.loads(resp.read().decode("utf-8", "replace"))
+    except (OSError, ValueError) as exc:  # URLError/socket + JSON decode
+        _MCP_PAGE_COUNT.clear()
+        _MCP_PAGE_COUNT.update({"count": None, "checked_at": time.time()})
+        logger.debug("tab reaper: CDP /json/list unavailable (%s)", exc)
+        return {"skipped": "cdp_unavailable"}
+
+    pages = [
+        t for t in targets
+        if t.get("type") == "page"
+        and str(t.get("url", "")).startswith(("http://", "https://"))
+    ]
+    _MCP_PAGE_COUNT.clear()
+    _MCP_PAGE_COUNT.update({"count": len(pages), "checked_at": time.time()})
+
+    if len(pages) <= keep:
+        return {"kept": len(pages), "closed": 0}
+    if _mcp_client_connected():
+        # fail-closed: a live agent session beats tab hygiene; next cycle reaps.
+        logger.info(
+            "tab reaper: %d http tabs > keep=%d, but an MCP client is connected — skipping",
+            len(pages), keep,
+        )
+        return {"skipped": "mcp_client_connected", "kept": len(pages), "excess": len(pages) - keep}
+
+    closed = 0
+    for t in pages[keep:]:  # keep the OLDEST — newest excess is abandoned work
+        tid = t.get("id")
+        if not tid:
+            continue
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{MCP_CDP_PORT}/json/close/{tid}", timeout=5
+            ) as resp:
+                resp.read()
+            closed += 1
+        except OSError:
+            continue  # refused/gone — the count log below still reports the cycle
+    if closed:
+        logger.info("tab reaper: closed %d excess MCP tab(s) (had %d, keep %d)", closed, len(pages), keep)
+    return {"kept": min(len(pages), keep), "closed": closed}
+
+
+def _sweep_stale_run_dirs(max_age_s: float = 0.0) -> dict:
+    """Delete ``/tmp/scrape_*`` run dirs older than ``max_age_s`` (default 6h).
+
+    6h is far beyond any legitimate run (ScrapeRequest.timeout caps at 7200s)
+    and far short of "forever". Best-effort per-dir; returns a small report.
+    """
+    if max_age_s <= 0:
+        max_age_s = RUN_DIR_MAX_AGE_S
+    now = time.time()
+    swept = kept = 0
+    try:
+        names = os.listdir("/tmp")
+    except OSError:
+        return {"swept": 0, "kept": 0}
+    for name in names:
+        if not name.startswith("scrape_"):
+            continue
+        path = os.path.join("/tmp", name)
+        expired = False
+        try:
+            expired = now - os.path.getmtime(path) > max_age_s
+        except OSError as exc:
+            logger.debug("run-dir sweep: skipping %s (%s)", path, exc)
+        if expired:
+            shutil.rmtree(path, ignore_errors=True)
+            swept += 1
+        else:
+            kept += 1
+    if swept:
+        logger.info("run-dir sweep: removed %d stale /tmp/scrape_* dir(s), kept %d", swept, kept)
+    return {"swept": swept, "kept": kept}
 
 
 async def _periodic_cdp_liveness():
@@ -593,6 +831,23 @@ async def _periodic_cdp_liveness():
             # W6: publish for /health (which dispatches NOTHING).
             _CDP_LIVENESS_CACHE.clear()
             _CDP_LIVENESS_CACHE.update(liveness)
+
+            # [wave-14] Also answer "does the MCP node process actually SERVE?"
+            # (poll()==alive + CDP-alive can both hold while the SSE server is
+            # wedged — the django agent then sees tools/list hang → 0 tools).
+            # Publishes _MCP_HTTP_CACHE for /health; deliberately NOT wired to
+            # auto-restart yet: unknown-vs-down semantics are new and a wedged
+            # SSE server restarts fine, but let an operator watch the gauge for
+            # a cycle before it gains kill power.
+            if mcp_process is not None and mcp_process.poll() is None:
+                await asyncio.get_event_loop().run_in_executor(
+                    MISC_EXECUTOR, _probe_mcp_http
+                )
+            else:
+                _MCP_HTTP_CACHE.clear()
+                _MCP_HTTP_CACHE.update(
+                    {"state": "down", "checked_at": time.time(), "error": "process dead"}
+                )
 
             for label, alive, key in (
                 ("mcp", liveness.get("mcp_cdp_alive"), "mcp"),
@@ -879,6 +1134,19 @@ class ScrapeRequest(BaseModel):
     # work after the /scrape wait_for already returned — those orphans share the
     # single Scraper Chrome (port 9223) and wedge subsequent scrapers (run_execution).
     max_retries: int = Field(default=3, ge=1, le=5)
+    # [wave-14 job-133] django job correlation: registered alongside the rid so
+    # POST /cancel can reach a run by JOB id ("cancel everything for job 317")
+    # without the caller ever knowing the /tmp run-dir name. Old callers omit
+    # it (default 0 = no job alias).
+    job_id: int = 0
+
+
+class CancelRequest(BaseModel):
+    """[wave-14] Cancel in-flight /scrape run(s) — by run id (the /tmp run-dir
+    basename, as surfaced in /health's scraper_runs) or by the django job id
+    stamped into the /scrape payload. At least one of the two."""
+    rid: str = ""
+    job_id: int = 0
 
 
 class RenderRequest(BaseModel):
@@ -1087,6 +1355,7 @@ async def health():
     # Ephemeral-path truth: recent /navigate outcomes. no_data (quiet window)
     # falls through to the persistent-AND — only an actual bad window degrades.
     nav_recent = _nav_outcome_summary()
+    from .scraper_runner import active_runs_snapshot
     status = "ok" if (
         h["ready"] and cdp_ok and mcp_process_alive and nav_recent.get("state") != "degraded"
     ) else "degraded"
@@ -1101,6 +1370,13 @@ async def health():
             "scraper_chrome_state": browser_pool.scraper_chrome_state(),
             "mcp_pid": mcp_pid,
             "mcp_process_alive": mcp_process_alive,
+            # [wave-14] MCP SERVER serving state (cache from the 15s loop —
+            # this handler NEVER probes). unknown = never probed / boot window;
+            # it is deliberately NOT folded into `status` until the gauge has
+            # earned kill power in ops.
+            "mcp_http_state": dict(_MCP_HTTP_CACHE),
+            "mcp_page_count": dict(_MCP_PAGE_COUNT),
+            "scraper_runs": active_runs_snapshot(),
             "proxy_datacenter": "available" if dc_available else "not configured",
             "proxy_residential": "available" if res_available else "not configured",
             "cloak": _CLOAK_INFO_CACHE,
@@ -1447,12 +1723,15 @@ async def scrape(request: ScrapeRequest):
                 + request.timeout * max(1, request.max_retries)
                 + SCRAPE_PROTECTION_GRACE_S
             )
+            # [wave-14 job-133] the runner registers the subprocess under this
+            # rid (with job_id) so /cancel can reach it — see _ACTIVE_RUNS.
             result = await asyncio.wait_for(
                 loop.run_in_executor(
                     SCRAPE_EXECUTOR,
                     functools.partial(
                         _run_scrape_guarded,
                         rid=rid,
+                        job_id=request.job_id,
                         scraper_path=scraper_path,
                         args=request.args,
                         timeout=request.timeout,
@@ -1462,6 +1741,8 @@ async def scrape(request: ScrapeRequest):
                 ),
                 timeout=request.timeout + 120,
             )
+            if result.get("cancelled"):
+                logger.warning("Scrape rid=%s job=%s was cancelled", rid, request.job_id)
             return JSONResponse(content=result)
         except asyncio.TimeoutError:
             logger.error("Scraper timed out for %s (lock released)", scraper_path)
@@ -1497,6 +1778,43 @@ async def scrape(request: ScrapeRequest):
         # hold a file open; /tmp is ephemeral anyway.
         import shutil as _shutil
         _shutil.rmtree(run_dir, ignore_errors=True)
+
+
+@app.post("/cancel")
+async def cancel_scrape(request: CancelRequest):
+    """[wave-14] Cancel in-flight /scrape run(s) by rid or django job_id.
+
+    Deliberately LOCK-FREE: it never touches PROBE_LOCK or any lock a wedged
+    run might hold (dict ops in scraper_runner are GIL-atomic), so a cancel
+    request answers in microseconds even while the thing being cancelled is
+    stuck. Effects: the runner's retry loop breaks between attempts AND the
+    current attempt's process group gets SIGKILLed. Returns the per-rid report;
+    an empty result means nothing was in flight (which is its own useful
+    answer — the run already finished).
+    """
+    if not request.rid and not request.job_id:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "error": "Provide rid (run id from /health scraper_runs) and/or job_id",
+            },
+        )
+    from .scraper_runner import active_runs_snapshot, request_cancel
+
+    report = request_cancel(rid=request.rid, job_id=request.job_id)
+    logger.warning(
+        "CANCEL requested rid=%r job_id=%s → flagged=%s killed=%s unknown=%s",
+        request.rid,
+        request.job_id,
+        report.get("flagged"),
+        report.get("killed"),
+        report.get("unknown"),
+    )
+    return JSONResponse(
+        content={"success": bool(report.get("flagged")), **report,
+                 "active_runs": active_runs_snapshot()}
+    )
 
 
 # ── POST /navigate ───────────────────────────────────────────────────────
