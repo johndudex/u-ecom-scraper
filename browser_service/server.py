@@ -1909,7 +1909,13 @@ def _run_navigate_sync(
     on Chrome crash (caller maps to 503 + retry_after).
     """
     from .probe import _classify_block, _extract_page_data, _launch_page
-    from .scraper_runner import _is_chrome_death
+    from .scraper_runner import _is_chrome_death, _is_target_closed
+
+    def _is_browser_death(err: str) -> bool:
+        """Chrome/CDP death incl. the playwright ≥1.4x TargetClosedError shape
+        (F3 [job-140] — the legacy markers miss it and it always rides a
+        traceback; a dead target is a crash, not a generic page failure)."""
+        return _is_chrome_death(err) or _is_target_closed(err)
 
     ctx = None
     session_pids: set[int] = set()
@@ -1947,7 +1953,7 @@ def _run_navigate_sync(
             status_code = resp.status if resp else 0
         except Exception as exc:
             err_str = str(exc)
-            if _is_chrome_death(err_str):
+            if _is_browser_death(err_str):
                 raise _ChromeDeathError(err_str)
             raise
 
@@ -2014,7 +2020,7 @@ def _run_navigate_sync(
         raise
     except Exception as exc:
         err_str = str(exc)
-        if _is_chrome_death(err_str):
+        if _is_browser_death(err_str):
             raise _ChromeDeathError(err_str)
         raise
     finally:
@@ -2175,9 +2181,9 @@ async def navigate(request: NavigateRequest):
             except Exception as exc:
                 logger.exception("navigate: failed for %s", request.url[:200])
                 # If the exception looks like a Chrome death we missed, still 503
-                from .scraper_runner import _is_chrome_death
+                from .scraper_runner import _is_chrome_death, _is_target_closed
 
-                if _is_chrome_death(str(exc)):
+                if _is_chrome_death(str(exc)) or _is_target_closed(str(exc)):
                     _record_nav_outcome("crash")
                     _log_nav_outcome("crash", 503, request.url, (time.monotonic() - start) * 1000, "chrome_crash")
                     return _backpressure(

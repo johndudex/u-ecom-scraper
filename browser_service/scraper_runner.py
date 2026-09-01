@@ -172,6 +172,42 @@ def _has_traceback(stderr: str) -> bool:
     return bool(_PYTHON_TRACEBACK_RE.search(stderr or ""))
 
 
+# F3 [job-140]: Playwright's TargetClosedError. playwright ≥1.4x renamed the
+# crash surface: the exception is `TargetClosedError` and its message is
+# "Target page, context or browser has been closed" — which matches NO legacy
+# marker above ("Target page, has been closed" and "Browser has been closed"
+# both differ, and the lowercase "browser" variant loses the case-sensitive
+# match). It ALSO always rides a Python traceback (the draft failed to catch
+# it), so the `_has_traceback` veto suppressed the retry every time. Prod
+# job-140: discovery found 23 URLs, Chrome died mid-run, and the run was
+# recorded failed with ZERO retries — a fresh browser was exactly the remedy.
+# Same rationale as _is_cdp_connect_failure: these strings are unambiguous
+# browser-death messages, never site outages or logic bugs. (Matched
+# case-insensitively so the lowercase "browser" variant can't slip through;
+# the third text is the legacy "Browser has been closed" marker made
+# traceback-proof — it was chrome death before, just never retried when a
+# traceback rode along.)
+_TARGET_CLOSED_TEXTS = (
+    "targetclosederror",
+    "target page, context or browser has been closed",
+    "browser has been closed",
+)
+
+
+def _is_target_closed(stderr: str) -> bool:
+    """F3 [job-140]: a Playwright TargetClosedError — retried DESPITE traceback.
+
+    TargetClosedError always arrives inside a traceback (it is an exception the
+    draft didn't catch), so it can never pass the ``_has_traceback`` veto. The
+    exception name + canonical message identify a dead browser/tab, which a
+    Chrome restart + retry is the documented remedy for.
+    """
+    if not stderr:
+        return False
+    low = stderr.lower()
+    return any(text in low for text in _TARGET_CLOSED_TEXTS)
+
+
 # M2: restart cooldown — concurrent /scrapes share the one scraper Chrome with
 # no mutual exclusion; two failures in quick succession would restart it twice,
 # killing the other scrape's session mid-run. One restart per window is enough.
@@ -446,6 +482,7 @@ def _run_scraper_script_impl(
             chrome_crash = (
                 (_is_chrome_death(stderr) and not _has_traceback(stderr))
                 or _is_cdp_connect_failure(stderr)  # F2: retry despite traceback
+                or _is_target_closed(stderr)  # F3 [job-140]: retry despite traceback
             )
 
             if chrome_crash:
