@@ -131,7 +131,8 @@ class TestDeadlinePublication:
             def invoke(self, *a, **k):
                 return {"messages": ["done"]}
 
-        monkeypatch.setattr(g, "_async_execution_enabled", lambda: False)
+        # [wave-15 PR-2b] the gate now takes the phase name.
+        monkeypatch.setattr(g, "_async_execution_enabled", lambda phase="": False)
         try:
             g._invoke_agent_with_timeout(_Fast(), [], {}, "code_tester", 0, timeout=5)
             assert g.get_tool_deadline() is not None, (

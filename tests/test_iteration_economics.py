@@ -66,7 +66,8 @@ class TestWallClockTimeoutShape:
                 _th.Event().wait(timeout=1.0)
                 return {"messages": ["late"]}
 
-        monkeypatch.setattr(g, "_async_execution_enabled", lambda: False)
+        # [wave-15 PR-2b] the gate now takes the phase name.
+        monkeypatch.setattr(g, "_async_execution_enabled", lambda phase="": False)
         result = g._invoke_agent_with_timeout(
             _Stuck(), [], {}, "code_writer", 0, timeout=0
         )

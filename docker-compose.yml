@@ -107,10 +107,12 @@ services:
       LITELLM_BASE_URL: ${LITELLM_BASE_URL:-https://llm.johnjf.xyz/v1}
       LITELLM_API_KEY: ${LITELLM_API_KEY:-}
       LITELLM_ENABLED: ${LITELLM_ENABLED:-true}
-      # Phase 4 async cancellation — see settings.py note. Set true in .env for
-      # the litellm A/B arm (reasoning models + sync thread-join = abandoned
-      # threads holding 36K-token contexts at concurrency=2).
-      LLM_ASYNC_EXECUTION: ${LLM_ASYNC_EXECUTION:-false}
+      # [wave-15 PR-2b] Per-phase async invoke canary (default OFF — empty
+      # allowlist, every phase runs sync). Opt a phase in for a canary run:
+      # AGENT_ASYNC_PHASES=code_writer. The old all-phases switch
+      # (LLM_ASYNC_EXECUTION) no longer flows through compose — it stays in
+      # settings.py as an operator-only rollback lever.
+      AGENT_ASYNC_PHASES: ${AGENT_ASYNC_PHASES:-}
       PLAYWRIGHT_MCP_URL: http://browser_service:8111/sse
       BROWSER_SERVICE_URL: http://browser_service:8001
       FILE_MASTER_URL: http://file-master:8002

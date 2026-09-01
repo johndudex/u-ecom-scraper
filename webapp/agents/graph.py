@@ -1852,41 +1852,95 @@ def _tester_invoke_timeout() -> int:
     )
 
 
-def _async_execution_enabled() -> bool:
-    """Kill-switch for Phase 4 async cancellation (Per-Phase Execution Contract).
+# [wave-15 PR-2b/W15-C] Per-phase async allowlist. DEFAULT EMPTY — no phase
+# runs ainvoke-under-loop until the canary earns it: set
+# AGENT_ASYNC_PHASES="code_writer" (comma-separated) to opt a phase in, and
+# flip the default only after a local e2e shows a full code_writer phase
+# under async. LLM_ASYNC_EXECUTION remains the explicit ALL-phases override
+# (rollback lever); docker-compose no longer passes it, so only an operator
+# env can turn it on.
+_ASYNC_PHASES: frozenset = frozenset()
 
-    True → ``_invoke_agent_with_timeout`` runs ``agent.ainvoke`` under
-    ``asyncio.wait_for``: on timeout, ``CancelledError`` propagates into the
-    react loop and the async httpx client CLOSES the in-flight z.ai socket —
-    the work actually stops (vs the sync path's daemon-thread abandon-then-leak
-    that held the socket + ~180K-char context until the Celery time_limit
-    SIGKILLed the worker). This is the contract's real cancellation.
 
-    Default False: the async path is new; keep sync as the safe default until a
-    regression (lw.com/locumtenens/aya) verifies it. Phase 2 already removed the
-    sync ``headroom.compress`` call from the cancellation path (the P0
-    precondition), so a timeout during the LLM call cancels cleanly; a timeout
-    during a sync tool (run_in_executor) abandons that tool's executor thread
-    (bounded by the per-tool guards; same shape as today's thread abandon).
+def _async_phase_allowlist() -> set:
+    """Phases opted into the async invoke path: the shipped default
+    (``_ASYNC_PHASES``, empty) union the ``AGENT_ASYNC_PHASES`` entries."""
+    raw = (os.environ.get("AGENT_ASYNC_PHASES") or "").strip().lower()
+    env_phases = {p.strip() for p in raw.split(",") if p.strip()}
+    return set(_ASYNC_PHASES) | env_phases
+
+
+def _async_execution_enabled(phase: str = "") -> bool:
+    """Per-phase kill-switch for async cancellation (Per-Phase Execution Contract).
+
+    True (for THIS phase) → ``_invoke_agent_with_timeout`` runs
+    ``agent.ainvoke`` under ``asyncio.wait_for`` in a manually managed loop: on
+    timeout, ``CancelledError`` propagates into the react loop and the async
+    httpx client CLOSES the in-flight z.ai socket — the work actually stops
+    (vs the sync path's daemon-thread abandon-then-leak that held the socket +
+    ~180K-char context until the Celery time_limit SIGKILLed the worker). This
+    is the contract's real cancellation.
+
+    Resolution order: ``LLM_ASYNC_EXECUTION`` (explicit all-phases override,
+    default False) wins; otherwise THIS ``phase`` must be named in
+    ``AGENT_ASYNC_PHASES``. With neither set the answer is False for every
+    phase — the allowlist ships empty.
+
+    Cancellation bounds: a timeout during the LLM call cancels cleanly (async
+    httpx closes the socket); a timeout during a SYNC tool (run_in_executor)
+    cancels the awaiting task immediately, but that tool's executor thread
+    keeps running to completion and is only reaped at process exit (bounded by
+    the per-tool guards). The loop is closed WITHOUT
+    ``shutdown_default_executor`` so the thread is NOT joined — the phase
+    still ends on its deadline (see ``_shutdown_loop_no_executor_join``).
     """
     try:
         from django.conf import settings
 
-        return bool(getattr(settings, "LLM_ASYNC_EXECUTION", False))
+        if bool(getattr(settings, "LLM_ASYNC_EXECUTION", False)):
+            return True
     except Exception:
-        return False
+        pass
+    return bool(phase) and phase in _async_phase_allowlist()
+
+
+def _shutdown_loop_no_executor_join(loop) -> None:
+    """Close a loop the way ``asyncio.Runner`` does — MINUS the executor join.
+
+    Cancels leftover tasks, drains them, shuts down async generators (the
+    streaming path's ``_astream``), then closes. Deliberately skips
+    ``shutdown_default_executor``: joining it is exactly what made the async
+    wall clock soft (see ``_invoke_agent_async``).
+    """
+    import asyncio
+
+    try:
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True)
+            )
+        loop.run_until_complete(loop.shutdown_asyncgens())
+    finally:
+        try:
+            asyncio.set_event_loop(None)
+        except Exception:
+            pass
+        loop.close()
 
 
 def _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout):
     """Run ``agent.ainvoke`` under ``asyncio.wait_for`` in a fresh event loop.
 
     The graph runs synchronously today (graph.invoke from the Celery task), so
-    there is no running event loop when this node executes — ``asyncio.run`` is
-    safe. On timeout the ``wait_for`` cancels the ainvoke await; for an in-flight
-    LLM call the CancelledError reaches the async httpx client which closes the
-    z.ai socket (verified cancellable). Returns ``{"messages": []}`` on timeout
-    (callers treat as budget-exhausted), ``{"_error": ...}`` on other errors —
-    matching the sync path's contract.
+    there is no running event loop when this node executes — a fresh loop is
+    safe. On timeout the ``wait_for`` cancels the ainvoke await; for an
+    in-flight LLM call the CancelledError reaches the async httpx client which
+    closes the z.ai socket (verified cancellable). Returns ``{"messages": []}``
+    on timeout (callers treat as budget-exhausted), ``{"_error": ...}`` on
+    other errors — matching the sync path's contract.
     """
     import asyncio
     import time as _time
@@ -1898,8 +1952,20 @@ def _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout):
             agent.ainvoke({"messages": messages}, agent_cfg), timeout=timeout
         )
 
+    # [wave-15 PR-2b/W15-B] Manual loop management — NOT ``asyncio.run``:
+    # asyncio.run closes the loop with ``shutdown_default_executor()``, which
+    # JOINS the default executor's threads. A sync tool still in flight (a
+    # 600s run_scraper, a slow pre_model_hook) would hold the phase past its
+    # deadline — measured: 2s deadline + 6s tool → 6.01s wall (sync path:
+    # 2.00s). The old gate comment called that "the same shape as today's
+    # thread abandon" — it was not: the wall clock was soft. Skipping the
+    # executor join keeps the deadline honest; the abandoned tool's thread
+    # finishes in the background and is reaped at process exit, the same
+    # eventual bound as the sync path's leak.
+    loop = asyncio.new_event_loop()
     try:
-        return asyncio.run(_run())
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(_run())
     except asyncio.TimeoutError:
         logger.error(
             "_invoke_agent_with_timeout[%s]: ainvoke exceeded %ds wall-clock "
@@ -1933,17 +1999,28 @@ def _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout):
             phase, traceback.format_exc(limit=8),
         )
         return {"_error": str(exc)[:200], "_error_class": type(exc).__name__}
+    finally:
+        # Every path above (success, timeout, error): reap leftover tasks and
+        # async generators, then close the loop — never joining executor
+        # threads (that join was the soft wall clock).
+        try:
+            _shutdown_loop_no_executor_join(loop)
+        except Exception:
+            pass
+    return result
 
 
 def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, timeout: int = _AGENT_INVOKE_TIMEOUT):
     """Run the agent with a wall-clock timeout.
 
-    Two modes (kill-switch ``LLM_ASYNC_EXECUTION``, see
-    ``_async_execution_enabled``):
+    Two modes (per-phase gate, see ``_async_execution_enabled`` — default
+    every-phase-sync until ``AGENT_ASYNC_PHASES`` or the ``LLM_ASYNC_EXECUTION``
+    override says otherwise):
 
-    - **async** (default off): ``agent.ainvoke`` under ``asyncio.wait_for`` — on
-      timeout the in-flight z.ai call is genuinely CANCELLED (httpx closes the
-      socket), no abandoned thread leaks its context.
+    - **async**: ``agent.ainvoke`` under ``asyncio.wait_for`` in a manually
+      managed loop — on timeout the in-flight z.ai call is genuinely CANCELLED
+      (httpx closes the socket) and the deadline holds even with a sync tool
+      in flight.
     - **sync** (default): raw daemon thread + ``thread.join``; on timeout the
       thread is abandoned (leaks until the Celery ``time_limit`` reclaims the
       worker). Pre-Phase-4 behavior.
@@ -1958,7 +2035,7 @@ def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, t
     except Exception:
         pass
 
-    if _async_execution_enabled():
+    if _async_execution_enabled(phase):
         return _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout)
 
     import threading

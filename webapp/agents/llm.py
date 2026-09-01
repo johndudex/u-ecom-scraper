@@ -294,6 +294,22 @@ def _retry_classified_sync(fn, cfg: dict, *, model: Optional[str] = None, sleep=
             attempt, slept = _handle_retry(
                 "transient", exc, attempt, slept, cfg, sleep=sleep, model=model
             )
+        except RuntimeError as exc:
+            # [wave-15 PR-2b/W15-B] A bare RuntimeError("Event loop is
+            # closed") escapes both the openai and httpx hierarchies — it
+            # comes from a langchain-openai CACHED async httpx client whose
+            # keep-alive belongs to an already-closed loop (the same agent
+            # object invoked under two asyncio loops — the code_writer
+            # syntax-fix/CLI-contract-fix re-invoke pattern). It died with
+            # ZERO retries before reaching any arm. Classify as transport:
+            # the retries feed the breaker, which swaps to the fallback model
+            # (a fresh instance → a fresh client) when it trips. Generic
+            # RuntimeErrors are NOT masked.
+            if "event loop is closed" not in str(exc).lower():
+                raise
+            attempt, slept = _handle_retry(
+                "transient", exc, attempt, slept, cfg, sleep=sleep, model=model
+            )
         except _CALLER_BUG_ERRORS:
             raise  # caller/config bug — never retry
         except openai.APIError as exc:
@@ -320,6 +336,13 @@ async def _retry_classified_async(fn, cfg: dict, *, model: Optional[str] = None,
                 retry_after=_parse_retry_after(exc), model=model,
             )
         except _TRANSIENT_ERRORS as exc:
+            attempt, slept, delay = _next_retry("transient", exc, attempt, slept, cfg, model=model)
+        except RuntimeError as exc:
+            # [wave-15 PR-2b/W15-B] See the twin arm in _retry_classified_sync:
+            # a cross-loop cached httpx client surfaces here as a bare
+            # RuntimeError("Event loop is closed") — previously zero retries.
+            if "event loop is closed" not in str(exc).lower():
+                raise
             attempt, slept, delay = _next_retry("transient", exc, attempt, slept, cfg, model=model)
         except _CALLER_BUG_ERRORS:
             raise

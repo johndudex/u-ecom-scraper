@@ -266,10 +266,12 @@ LLM_RETRY_BACKOFF_CAP = config("LLM_RETRY_BACKOFF_CAP", default=30.0, cast=float
 LLM_TRUNCATION_MODE = config("LLM_TRUNCATION_MODE", default="deterministic")
 LLM_TRUNCATION_MAX_CHARS = config("LLM_TRUNCATION_MAX_CHARS", default=180000, cast=int)
 LLM_TRUNCATION_PER_MSG_CAP = config("LLM_TRUNCATION_PER_MSG_CAP", default=8000, cast=int)
-# Phase 4 async cancellation (Per-Phase Execution Contract). Default OFF: the
-# async path (agent.ainvoke under asyncio.wait_for → CancelledError closes the
-# z.ai socket) is new; keep the sync thread.join default until a regression
-# verifies it. Flip True to enable real per-phase cancellation.
+# Async cancellation (Per-Phase Execution Contract). Default OFF. Resolution
+# order in agents/graph.py:_async_execution_enabled: this all-phases override
+# wins, else the phase must be named in AGENT_ASYNC_PHASES (the wave-15
+# canary — e.g. AGENT_ASYNC_PHASES=code_writer; compose passes it through,
+# empty by default). This var is deliberately NOT in docker-compose anymore:
+# flipping it forces EVERY phase onto the async loop at once.
 LLM_ASYNC_EXECUTION = config("LLM_ASYNC_EXECUTION", default=False, cast=bool)
 # Phase 5 determinism A/B switch. When True, code-writer + product-analyzer use
 # temperature 0 (narrows the codegen distribution; z.ai doesn't reliably honor
