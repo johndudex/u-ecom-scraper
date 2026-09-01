@@ -175,18 +175,41 @@ class TestWiring:
         assert '"scraper.tasks.cleanup_stuck_jobs": "events"' in src
 
     def test_memory_geometry_two_children_fit_under_container(self):
-        """2 × per-child ceiling must sit below the 3g container limit — the
-        warm recycle fires BETWEEN tasks only and cannot stop a mid-task
-        double-child OOM (jobs 79/80 died 320 ms apart)."""
+        """2 × per-child ceiling must sit below the compose celery-worker
+        mem_limit — the warm recycle fires BETWEEN tasks only and cannot stop
+        a mid-task double-child OOM (jobs 79/80 died 320 ms apart).
+
+        [wave-15 1.4] The container budget is parsed from docker-compose.yml's
+        ``celery-worker: mem_limit`` (NOT the test process's own cgroup — the
+        suite also runs on hosts with unrelated limits), so retuning the
+        container without retuning the ceiling fails HERE instead of OOMing in
+        prod. Falls back to the historical 3 GiB when compose is absent (e.g.
+        sdist-only test runs).
+        """
         import os
+        import re
 
         import django.conf
 
         ceiling_kib = django.conf.settings.CELERY_WORKER_MAX_MEMORY_PER_CHILD
         gi_b = 1024 * 1024
-        assert ceiling_kib < (3 * gi_b) / 2, (
+
+        container_kib = 3 * gi_b  # historical compose geometry
+        compose_path = os.path.join(ROOT, "docker-compose.yml")
+        if os.path.exists(compose_path):
+            src = open(compose_path).read()
+            m = re.search(
+                r"^  celery-worker:.*?^    mem_limit:\s*(\d+)g",
+                src,
+                re.MULTILINE | re.DOTALL,
+            )
+            if m:
+                container_kib = int(m.group(1)) * gi_b
+
+        assert ceiling_kib < container_kib / 2, (
             f"per-child ceiling {ceiling_kib} KiB × 2 children no longer fits "
-            "the 3 GiB container — jobs 79/80's double-child OOM class returns"
+            f"the celery-worker container ({container_kib // gi_b} GiB) — "
+            "jobs 79/80's double-child OOM class returns"
         )
         # And it must still be big enough to be a real ceiling, not a no-op.
         assert ceiling_kib >= 1 * gi_b

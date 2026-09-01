@@ -81,10 +81,11 @@ def _patch_fm(stack, fake):
     stack.enter_context(patch.object(src, "artifacts", fake, create=True))
 
 
-def _fake_delay(*a, **k):
-    """dispatch does update(celery_task_id=task.id) — a MagicMock id breaks
-    the SQL. Return a stub with a real string id (mirrors test_api_create)."""
-    return type("T", (), {"id": "task-x"})()
+def _fake_apply_async(*a, **k):
+    """[wave-15 1.0] dispatch_scrape_job stamps the task id on the row BEFORE
+    apply_async, so the stub only needs to not blow up. Patch target is
+    run_scrape_task.apply_async (the keystone's publish call)."""
+    return type("T", (), {"id": k.get("task_id")})()
 
 
 _URL_A = "https://www.rmwilliams.com.au/comfort-craftsman-boot-chestnut-yearling-leather.html?lang=en_AU"
@@ -137,7 +138,7 @@ class TestItemUrlsPersisted:
         with ExitStack() as st, django_capture_on_commit_callbacks(execute=True):
             _patch_fm(st, fake)
             st.enter_context(
-                patch("scraper.tasks.run_scrape_task.delay", side_effect=_fake_delay)
+                patch("scraper.tasks.run_scrape_task.apply_async", side_effect=_fake_apply_async)
             )
             r = create_job(_req(u, raw, body))
         assert r.status_code == 202
@@ -152,7 +153,7 @@ class TestItemUrlsPersisted:
         """Intake parity: an FM outage logs a warning and returns 202 — the
         job must still be created and dispatched."""
         u, raw, key = partner
-        delay_p = patch("scraper.tasks.run_scrape_task.delay", side_effect=_fake_delay)
+        delay_p = patch("scraper.tasks.run_scrape_task.apply_async", side_effect=_fake_apply_async)
         fake = _fm_stub(write_json=Mock(side_effect=RuntimeError("FM down")))
         with ExitStack() as st, django_capture_on_commit_callbacks(execute=True):
             _patch_fm(st, fake)
@@ -178,7 +179,7 @@ class TestItemUrlsPersisted:
         with ExitStack() as st, django_capture_on_commit_callbacks(execute=True):
             _patch_fm(st, fake)
             st.enter_context(
-                patch("scraper.tasks.run_scrape_task.delay", side_effect=_fake_delay)
+                patch("scraper.tasks.run_scrape_task.apply_async", side_effect=_fake_apply_async)
             )
             r = create_job(_req(u, raw, body))
         assert r.status_code == 202

@@ -151,6 +151,10 @@ class ScrapeJob(models.Model):
     )
     graph_thread_id = models.CharField(max_length=100, blank=True, default="")
     celery_task_id = models.CharField(max_length=100, blank=True, default="")
+    # [wave-15 1.2] Redispatch attempts spent by the abandoned-PENDING sweep
+    # (tasks.redispatch_abandoned_pending). Claimed with F() increment so two
+    # racing sweeps can't both fire a republish; cap = PENDING_REDISPATCH_CAP.
+    redispatch_count = models.IntegerField(default=0)
 
     site_name = models.CharField(max_length=200, blank=True, default="")
     platform = models.CharField(max_length=100, blank=True, default="")

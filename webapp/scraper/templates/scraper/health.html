@@ -144,6 +144,7 @@ const SERVICE_ICONS = {
     celery_worker: '<svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3"/></svg>',
     celery_beat: '<svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path stroke-linecap="round" stroke-linejoin="round" d="M12 7v5l3 3M12 7h.01"/></svg>',
     browser_service: '<svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path stroke-linecap="round" stroke-linejoin="round" d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 014-10 15.3 15.3 0 01-4-10"/></svg>',
+    queue: '<svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 6h16M4 10h16M4 14h10M4 18h7"/></svg>',
 };
 
 function renderCard(name, data) {
@@ -164,6 +165,18 @@ function renderCard(name, data) {
             + checkIcon(c.xvfb) + ' Xvfb'
             + ' | ' + (pr.datacenter === 'available' ? up : off) + ' DC proxy'
             + ' | ' + (pr.residential === 'available' ? up : off) + ' Residential proxy'
+            + '</div>';
+    }
+    if (name === 'queue' && data.gauges) {
+        const g = data.gauges;
+        const fmt = s => (s === undefined ? '—' : Math.round(s / 60) + 'm');
+        extra += '<div class="hc-sub">'
+            + 'celery q: ' + (g.celery_queue_depth ?? '?')
+            + ' | events q: ' + (g.events_queue_depth ?? '?')
+            + ' | unacked: ' + (g.unacked_index ?? '?') + '<br>'
+            + 'oldest pending: ' + fmt(g.oldest_pending_age_s)
+            + ' | undispatched: ' + fmt(g.oldest_undispatched_age_s)
+            + ' | running silent: ' + fmt(g.oldest_running_silent_s)
             + '</div>';
     }
     return '<div class="health-card">'
@@ -199,7 +212,7 @@ function doRefresh() {
         .then(function(services) {
             var grid = document.getElementById('health-grid');
             var html = '';
-            var order = ['django', 'postgres', 'redis', 'celery_worker', 'celery_beat', 'browser_service'];
+            var order = ['django', 'postgres', 'redis', 'celery_worker', 'celery_beat', 'browser_service', 'queue'];
             order.forEach(function(name) {
                 if (services[name]) {
                     html += renderCard(name, services[name]);

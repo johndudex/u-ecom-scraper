@@ -104,12 +104,17 @@ class TestCreateHappy:
         cap = Capture()
         calls = {"n": 0}
 
-        def fake_delay(*a, **k):
+        seen_ids = []
+
+        def fake_apply(*a, **k):
+            # [wave-15 1.0] dispatch_scrape_job stamps the client-generated id
+            # BEFORE publishing, then hands it to apply_async(task_id=...).
             calls["n"] += 1
-            return type("T", (), {"id": "task-x"})
+            seen_ids.append(k.get("task_id"))
+            return type("T", (), {"id": k.get("task_id")})
 
         with patch("django.db.transaction.on_commit", side_effect=cap.capture):
-            with patch("scraper.tasks.run_scrape_task.delay", side_effect=fake_delay):
+            with patch("scraper.tasks.run_scrape_task.apply_async", side_effect=fake_apply):
                 r = create_job(_req(u, raw, VALID))
                 assert r.status_code == 202
                 assert calls["n"] == 0  # NEVER inline — only after commit
@@ -123,7 +128,9 @@ class TestCreateHappy:
         assert any("dispatch" in getattr(c, "__qualname__", "") for c in cap.callbacks)
         assert calls["n"] == 1
         job = models.ScrapeJob.objects.get(url=VALID["url"])
-        assert job.celery_task_id == "task-x"
+        # The id on the row IS the id that was published (stamp BEFORE publish).
+        assert seen_ids and job.celery_task_id == seen_ids[0]
+        assert job.celery_task_id  # a real uuid4-shaped stamp, never ""
 
 
 class TestCreateValidation:

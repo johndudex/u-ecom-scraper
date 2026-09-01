@@ -182,16 +182,19 @@ class TestProcessDeathHandler:
 
 class TestStampBelowGuard:
     def test_stamp_sits_below_the_duplicate_dispatch_guard(self):
-        """A skipped duplicate used to steal the stamp and overwrite the LIVE
-        task's id — the watchdog then inspected a task that runs nowhere and
-        revoked the healthy run (false corpse)."""
+        """[wave-15 1.1 superseded the placement pin] A skipped duplicate used
+        to steal the stamp and overwrite the LIVE task's id — the watchdog
+        then inspected a task that runs nowhere and revoked the healthy run
+        (false corpse). The read-then-judge guard is GONE: status + task id
+        are now written by ONE atomic claim UPDATE, so there is no
+        instance-level stamp left to steal."""
         src = open(os.path.join(ROOT, "webapp", "scraper", "tasks.py")).read()
-        i_guard = src.index("skipping duplicate dispatch")
-        i_stamp = src.index("job.celery_task_id = _task_id")
-        assert i_guard < i_stamp, (
-            "the celery_task_id stamp must be written only AFTER the "
-            "duplicate-dispatch guard returns"
-        )
+        # The atomic claim exists...
+        assert '_claim_values["celery_task_id"] = _task_id' in src
+        # ...and the steable instance-level stamp shape is gone.
+        assert "job.celery_task_id = _task_id" not in src
+        # The duplicate-dispatch log contract is kept verbatim.
+        assert "skipping duplicate dispatch" in src
 
     def test_stamp_comment_names_the_false_corpse_class(self):
         src = open(os.path.join(ROOT, "webapp", "scraper", "tasks.py")).read()

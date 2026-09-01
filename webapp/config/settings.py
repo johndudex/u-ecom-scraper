@@ -158,6 +158,14 @@ CELERY_BEAT_SCHEDULE = {
         "task": "scraper.tasks.cleanup_stuck_jobs",
         "schedule": 300.0,
     },
+    # [wave-15 1.2] Recover never-dispatched PENDING rows (keystone signature:
+    # celery_task_id=""). Env-gated OFF until every dispatch site stamps before
+    # publish — scheduled BEFORE schedule-next-site so a recovered row is
+    # visible to the same-site serializer in the same tick.
+    "redispatch-abandoned-pending": {
+        "task": "scraper.tasks.redispatch_abandoned_pending",
+        "schedule": 300.0,
+    },
     "schedule-next-site": {
         "task": "scraper.tasks.schedule_next_site",
         "schedule": 300.0,
@@ -185,7 +193,20 @@ CELERY_TASK_ROUTES = {
     "scraper.events.dispatcher.dispatch_pending_callbacks": "events",
     "scraper.events.reconciler.dispatch_pending_callbacks": "events",
     "scraper.tasks.cleanup_stuck_jobs": "events",
+    # [wave-15 1.2] Recovery/maintenance tasks ride the dedicated events pool:
+    # the sweep must not wait behind scraping tasks on the 2-slot scrape pool
+    # (redispatch_stuck_approved_interrupts was unrouted before — it worked
+    # only by luck of the scrape pool's queueing).
+    "scraper.tasks.redispatch_abandoned_pending": "events",
+    "scraper.tasks.redispatch_stuck_approved_interrupts": "events",
 }
+
+# [wave-15 1.2] Master switch for the abandoned-PENDING redispatch sweep.
+# DEFAULT OFF: the sweep's signature (PENDING ∧ celery_task_id="") is only
+# sound once every dispatch path stamps the task id BEFORE publishing
+# (dispatch_scrape_job). Flip on per-deploy after verifying the keystone is
+# live (prod rows never carried a stamp before wave-15).
+REDISPATCH_SWEEP_ENABLED = config("REDISPATCH_SWEEP_ENABLED", default=False, cast=bool)
 
 ZAI_API_KEY = config("ZAI_API_KEY", default="")
 ZAI_BASE_URL = config("ZAI_BASE_URL", default="https://api.z.ai/api/coding/paas/v4/")

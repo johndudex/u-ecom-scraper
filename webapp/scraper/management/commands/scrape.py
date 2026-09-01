@@ -9,7 +9,6 @@ Usage:
 from django.core.management.base import BaseCommand
 
 from scraper.models import ScrapeJob
-from scraper.tasks import run_scrape_task
 
 
 class Command(BaseCommand):
@@ -73,5 +72,10 @@ class Command(BaseCommand):
         )
 
         if not options["dry_run"]:
-            run_scrape_task.delay(job.id)
+            from scraper.tasks import dispatch_scrape_job
+
+            # [wave-15 1.0] keystone replaces the bare .delay, which never
+            # persisted the task id at all (watchdog liveness + sweep were
+            # blind to shell-dispatched jobs).
+            dispatch_scrape_job(job.id)
             self.stdout.write(self.style.SUCCESS(f"Enqueued task for job #{job.id}"))

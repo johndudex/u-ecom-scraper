@@ -276,11 +276,11 @@ def home(request):
             user=request.user,
         )
 
-        from .tasks import run_scrape_task
+        from .tasks import dispatch_scrape_job
 
-        task = run_scrape_task.delay(job.id, rescrape=rescrape)
-        job.celery_task_id = task.id
-        job.save(update_fields=["celery_task_id"])
+        # [wave-15 1.0] keystone: stamp BEFORE publish so "" strictly means
+        # "never dispatched" (redispatch sweep + /health stranded gauge).
+        dispatch_scrape_job(job.id, rescrape=rescrape)
         return redirect("job_detail", job_id=job.id)
 
     recent_jobs = _user_jobs(request)[:10]
@@ -685,11 +685,10 @@ def job_restart(request, job_id):
             user=request.user,
         )
 
-        from .tasks import run_scrape_task
+        from .tasks import dispatch_scrape_job
 
-        task = run_scrape_task.delay(new_job.id, rescrape=True, force_full=force_full)
-        new_job.celery_task_id = task.id
-        new_job.save(update_fields=["celery_task_id"])
+        # [wave-15 1.0] keystone: stamp BEFORE publish (see dispatch_scrape_job).
+        dispatch_scrape_job(new_job.id, rescrape=True, force_full=force_full)
         if is_ajax:
             return JsonResponse(
                 {
@@ -1627,11 +1626,10 @@ def site_scrape(request, site_id):
             {"urls": site.input_urls},
         )
 
-    from .tasks import run_scrape_task
+    from .tasks import dispatch_scrape_job
 
-    task = run_scrape_task.delay(job.id, rescrape=rescrape)
-    job.celery_task_id = task.id
-    job.save(update_fields=["celery_task_id"])
+    # [wave-15 1.0] keystone: stamp BEFORE publish (see dispatch_scrape_job).
+    dispatch_scrape_job(job.id, rescrape=rescrape)
     return redirect("job_detail", job_id=job.id)
 
 
@@ -2225,6 +2223,123 @@ def _check_file_master():
         return {"status": "down", "latency_ms": ms, "detail": str(exc)[:80]}
 
 
+# [wave-15 1.3] /health queue gauges. The stranded-PENDING floor itself is
+# tasks.PENDING_CLAIM_MINUTES (single source of truth — the same signature the
+# redispatch sweep recovers; the floor exists because the same-site serializer
+# legitimately parks PENDING rows for hours).
+# Event-queue depth that means callbacks aren't draining (events pool wedged).
+QUEUE_BACKLOG_THRESHOLD = 10
+# A RUNNING row with no SessionLog activity of ANY kind for this long (even
+# heartbeats/probes) is silent — normally the watchdog's territory; here it is
+# just a visible gauge, not a verdict.
+QUEUE_RUNNING_SILENCE_MINUTES = 90
+
+
+def _check_queue() -> dict:
+    """Queue-honesty gauges for /health (wave-15 1.3).
+
+    Complements the per-service checks with the queue's actual state: broker
+    depths, oldest queued row, and the two failure signatures that motivated
+    wave-15 — stranded PENDING (never dispatched) and silent RUNNING.
+    Returns status "up" unless an alert fires ("warn" keeps the dashboard
+    green-vs-amber distinction; nothing here is hard-down by itself).
+    """
+    from django.core.cache import cache
+    from scraper.models import SessionLog
+    from scraper.tasks import PENDING_CLAIM_MINUTES  # single source of truth
+
+    out: dict = {"status": "up", "latency_ms": 0, "alerts": [], "gauges": {}}
+    t0 = time.monotonic()
+    alerts: list = []
+    try:
+        import redis as redis_lib
+
+        r = redis_lib.from_url(getattr(settings, "REDIS_URL", "redis://redis:6379/0"))
+        pending_len = int(r.llen("celery") or 0)
+        events_len = int(r.llen("events") or 0)
+        # Kombu's unacked index: messages delivered to a worker but not yet
+        # acked. Inert under acks_late=False (wave-16 enablement) — collected
+        # so the baseline exists before that flip.
+        unacked = int(r.zcard("unacked_index") or 0)
+        out["gauges"].update(
+            celery_queue_depth=pending_len,
+            events_queue_depth=events_len,
+            unacked_index=unacked,
+        )
+        if events_len > QUEUE_BACKLOG_THRESHOLD:
+            alerts.append(f"events queue backlog: {events_len} > {QUEUE_BACKLOG_THRESHOLD}")
+
+        now = timezone.now()
+        oldest_pending = (
+            ScrapeJob.objects.filter(status=ScrapeJob.STATUS_PENDING)
+            .order_by("created_at")
+            .first()
+        )
+        if oldest_pending is not None:
+            age_s = int((now - oldest_pending.created_at).total_seconds())
+            out["gauges"]["oldest_pending_age_s"] = age_s
+            out["gauges"]["oldest_pending_job"] = oldest_pending.id
+            # Stranded = never dispatched (keystone signature) AND past the
+            # claim floor. A PENDING row WITH an id is queued normally.
+            stranded = (
+                ScrapeJob.objects.filter(
+                    status=ScrapeJob.STATUS_PENDING, celery_task_id=""
+                )
+                .order_by("created_at")
+                .first()
+            )
+            if stranded is not None:
+                strand_s = int((now - stranded.created_at).total_seconds())
+                out["gauges"]["oldest_undispatched_age_s"] = strand_s
+                out["gauges"]["oldest_undispatched_job"] = stranded.id
+                if strand_s > PENDING_CLAIM_MINUTES * 60:
+                    alerts.append(
+                        f"job {stranded.id} stranded PENDING undispatched "
+                        f"{strand_s // 60} min (sweep signature)"
+                    )
+
+        oldest_running = (
+            ScrapeJob.objects.filter(status=ScrapeJob.STATUS_RUNNING)
+            .order_by("created_at")
+            .first()
+        )
+        if oldest_running is not None:
+            last_log = (
+                SessionLog.objects.filter(job=oldest_running)
+                .order_by("-created_at")
+                .values_list("created_at", flat=True)
+                .first()
+            )
+            # Oldest row only (per-row silence would be an N+1); anchor on the
+            # last session log, falling back the way the watchdog does.
+            anchor = last_log or oldest_running.started_at or oldest_running.created_at
+            silent_s = int((now - anchor).total_seconds())
+            out["gauges"]["oldest_running_job"] = oldest_running.id
+            out["gauges"]["oldest_running_silent_s"] = silent_s
+            if silent_s > QUEUE_RUNNING_SILENCE_MINUTES * 60:
+                alerts.append(
+                    f"job {oldest_running.id} RUNNING silent {silent_s // 60} min"
+                )
+
+        # Unacked that persists across two consecutive polls means messages
+        # stuck mid-delivery, not an in-flight task (cache TTL = poll cadence).
+        if unacked:
+            prev = cache.get("health:unacked_seen")
+            if prev:
+                alerts.append(f"unacked_index stuck at {unacked} across polls")
+            cache.set("health:unacked_seen", unacked, timeout=310)
+
+        out["status"] = "warn" if alerts else "up"
+        out["alerts"] = alerts
+        out["detail"] = "; ".join(alerts) if alerts else "queue draining"
+    except Exception as exc:
+        out["status"] = "down"
+        out["detail"] = str(exc)[:200]
+    finally:
+        out["latency_ms"] = int((time.monotonic() - t0) * 1000)
+    return out
+
+
 @login_required
 def health_api(request):
     checks = {
@@ -2235,6 +2350,7 @@ def health_api(request):
         "celery_beat": _check_celery_beat,
         "browser_service": _check_browser_service,
         "file_master": _check_file_master,
+        "queue": _check_queue,
     }
     labels = {
         "django": "Django",
@@ -2244,6 +2360,7 @@ def health_api(request):
         "celery_beat": "Celery Beat",
         "browser_service": "Browser Service",
         "file_master": "File Master",
+        "queue": "Task Queue",
     }
     services = {}
     for name, check_fn in checks.items():
@@ -2720,11 +2837,10 @@ def intake_create_job(request):
                     exc,
                 )
 
-    from .tasks import run_scrape_task
+    from .tasks import dispatch_scrape_job
 
-    task = run_scrape_task.delay(job.id, rescrape=False)
-    job.celery_task_id = task.id
-    job.save(update_fields=["celery_task_id"])
+    # [wave-15 1.0] keystone: stamp BEFORE publish (see dispatch_scrape_job).
+    dispatch_scrape_job(job.id, rescrape=False)
 
     return JsonResponse(
         {

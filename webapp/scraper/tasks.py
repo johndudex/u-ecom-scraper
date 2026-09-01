@@ -18,10 +18,13 @@ import os
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from celery import shared_task
+from celery.exceptions import MaxRetriesExceededError
 from celery.signals import task_failure
 from django.conf import settings
+from django.db.models import F, Q
 from django.utils import timezone
 
 from .models import Approval, ScrapeJob, Step
@@ -224,6 +227,59 @@ except Exception:
     _RUN_TASK_SOFT_TIME_LIMIT, _RUN_TASK_TIME_LIMIT = 10800, 11160
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Dispatch keystone — the ONLY sanctioned way to publish run_scrape_task
+# ═══════════════════════════════════════════════════════════════════════════
+
+# [wave-15 1.2] How long a PENDING row with no task id may sit before the
+# redispatch sweep (and the /health stranded gauge, which imports this)
+# considers it abandoned. Floor chosen ABOVE the worst legitimate queue wait:
+# the same-site serializer legitimately holds a PENDING row up to the task
+# time limit (EXECUTION_MAX_TIMEOUT + retries ≈ 11160s ≈ 3.1h) while a sibling
+# runs, so a naive 15-min floor would "recover" healthy queued work into a
+# double dispatch.
+PENDING_CLAIM_MINUTES = 15
+# [wave-15 1.2] Redispatch attempts before a poison row is failed honestly
+# instead of looping forever (precedent: Approval.resume_attempts).
+PENDING_REDISPATCH_CAP = 2
+# [wave-15 R1] How long a claimed-but-never-started row may sit before the
+# stuck-job watchdog fails it on first sighting (see cleanup_stuck_jobs).
+PRE_GRAPH_FAIL_GRACE_SECONDS = 300
+
+
+def dispatch_scrape_job(job_id: int, **kwargs) -> str:
+    """Publish ``run_scrape_task`` with a client-generated task id, stamped on
+    the job row BEFORE the publish.
+
+    Every dispatch site (views.py ×4, api/writers.py, the scrape command, the
+    redispatch sweep) MUST go through this helper. Two properties it buys:
+
+    * ``celery_task_id=""`` strictly means "never dispatched". The old
+      publish-then-stamp order left "" also covering "queued, waiting for a
+      slot" — and permanently so if the web process died between publish and
+      save. The redispatch sweep (1.2) and /health stranded gauge (1.3)
+      discriminate on "", so they are only sound with this order.
+    * The task id the worker sees equals the id on the row, which is what
+      lets the entry claim's same-id arm (1.1) tell "a crashed worker
+      re-entering its own task" apart from "a second, different dispatch".
+
+    If the broker publish raises, the stamp is reverted so the row keeps the
+    recoverable "" signature, then the exception propagates to the caller.
+    """
+    task_id = str(uuid4())
+    ScrapeJob.objects.filter(pk=job_id).update(celery_task_id=task_id)
+    try:
+        run_scrape_task.apply_async(
+            args=(job_id,), kwargs=kwargs, task_id=task_id
+        )
+    except Exception:
+        ScrapeJob.objects.filter(pk=job_id, celery_task_id=task_id).update(
+            celery_task_id=""
+        )
+        raise
+    return task_id
+
+
 @shared_task(
     bind=True,
     max_retries=1,
@@ -238,23 +294,43 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False, force_full: bool 
     """
     job = ScrapeJob.objects.get(pk=job_id)
 
-    if job.status in (ScrapeJob.STATUS_RUNNING, ScrapeJob.STATUS_WAITING_APPROVAL):
+    # Record this task's id so external monitors (e.g. the regression monitor)
+    # can revoke+terminate it on a per-phase timeout — otherwise a DB-only
+    # "cancel" leaves the celery task running as a zombie, clogging the worker.
+    # [wave-15 1.1] Claim-by-rowcount replaces the old read-then-judge dedup
+    # guard: two workers racing the same dispatch both READ PENDING and both
+    # ran. The atomic UPDATE lets exactly one claimant win; a loser sees
+    # claimed=0 and returns. The same-id arm is what makes celery's own
+    # redelivery (self.retry republishes with the SAME task id; worker-level
+    # redelivery re-executes the same message) reclaim its own row instead of
+    # being dropped as a "duplicate". WAITING_APPROVAL rows are excluded:
+    # they are continued by resume_scrape_task, which owns their RUNNING
+    # write — and the stuck-approved watchdog + auto-approver manage that
+    # state deliberately.
+    # [wave-14 job-133] The claim sets celery_task_id atomically WITH the
+    # status, so a skipped duplicate can no longer steal the stamp from the
+    # live task — the watchdog used to inspect a task that runs nowhere,
+    # conclude "absent", and revoke the healthy run (false corpse).
+    _task_id = getattr(self.request, "id", "") or ""
+    _claim_pred = Q(status=ScrapeJob.STATUS_PENDING)
+    _claim_values = {"status": ScrapeJob.STATUS_RUNNING}
+    if _task_id:  # eager / always_eager test runs have no real task id
+        _claim_pred |= Q(status=ScrapeJob.STATUS_RUNNING, celery_task_id=_task_id)
+        _claim_values["celery_task_id"] = _task_id
+    claimed = (
+        ScrapeJob.objects.filter(pk=job_id)
+        .filter(_claim_pred)
+        .exclude(status=ScrapeJob.STATUS_WAITING_APPROVAL)
+        .update(**_claim_values)
+    )
+    if not claimed:
         logger.warning(
             "Job %d: skipping duplicate dispatch (status=%s)", job_id, job.status
         )
         return
-
-    # Record this task's id so external monitors (e.g. the regression monitor)
-    # can revoke+terminate it on a per-phase timeout — otherwise a DB-only
-    # "cancel" leaves the celery task running as a zombie, clogging the worker.
-    # [wave-14 job-133] This stamp sits BELOW the duplicate-dispatch guard: a
-    # skipped duplicate used to steal the stamp, overwriting the LIVE task's id
-    # with its own discarded id — the watchdog then inspected a task that runs
-    # nowhere, concluded "absent", and revoked the healthy run (false corpse).
-    _task_id = getattr(self.request, "id", "") or ""
-    if _task_id and job.celery_task_id != _task_id:
-        job.celery_task_id = _task_id
-        job.save(update_fields=["celery_task_id"])
+    # The claim UPDATE wrote behind the instance — refresh so the sibling
+    # check and _run_graph_job see the claimed row, not a stale PENDING one.
+    job.refresh_from_db(fields=["status", "celery_task_id"])
 
     # Same-site serialization: if another job is already RUNNING for this URL,
     # requeue with a delay (workspace/{slug}/ is shared → concurrent writes
@@ -271,11 +347,27 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False, force_full: bool 
             "Job %d: another job is already running for %s — requeueing in 60s",
             job_id, job.url[:60],
         )
-        raise self.retry(
-            exc=RuntimeError("same-site job already running"),
-            countdown=60,
-            max_retries=None,
-        )
+        try:
+            raise self.retry(
+                exc=RuntimeError("same-site job already running"),
+                countdown=60,
+                max_retries=None,
+            )
+        except MaxRetriesExceededError:
+            # max_retries=None means "use the decorator default" (=1 here),
+            # NOT unlimited: once the requeue budget is spent, self.retry
+            # RAISES instead of republishing. That raise escapes past
+            # _run_graph_job's try/except and is not a process-death excuse,
+            # so nothing else would finalize the row — it used to strand
+            # claimed-RUNNING forever, and (pre-1.1) PENDING-with-id forever,
+            # which also blocked _do_schedule_next_site's auto-scheduling.
+            _finalize_job_failed(
+                job_id,
+                "Same-site requeue exhausted: another job for this URL stayed "
+                "RUNNING through every 60s retry. Failed honestly by the "
+                "dispatch guard instead of stranding the row.",
+            )
+            return
 
     try:
         _run_graph_job(job, rescrape=rescrape, force_full=force_full)
@@ -1554,85 +1646,128 @@ def cleanup_stuck_jobs() -> None:
 
     failed = 0
     for job in stuck_jobs:
-        latest_activity_qs = (
-            SessionLog.objects
-            .filter(job=job)
-            .exclude(content__startswith="[HEARTBEAT]")
-            .exclude(content__startswith="[PROBE]")
-            .order_by("-created_at")
+        # [wave-15 R1] A row claimed by celery but killed BEFORE the graph
+        # started is provably pre-graph: RUNNING + started_at=None (stamped
+        # only when _run_graph_job begins) + zero SessionLog rows of any kind
+        # (probes and heartbeats included). The silence rule below reaches it
+        # only via the created_at fallback (~30+ min) and then mislabels it
+        # "worker process lost" from a liveness probe; fail it on first
+        # sighting past a short grace instead. The grace keeps a just-claimed
+        # job safe — it looks identical for its first seconds, but
+        # _run_graph_job stamps started_at within moments of the claim.
+        _pre_graph = (
+            job.started_at is None
+            and not SessionLog.objects.filter(job=job).exists()
+            and (
+                (timezone.now() - job.created_at).total_seconds()
+                > PRE_GRAPH_FAIL_GRACE_SECONDS
+            )
         )
-        if latest_activity_qs.exists():
-            last_activity = latest_activity_qs.first().created_at
-        else:
-            # started_at can be None (shell-dispatched/test rows); created_at
-            # is always set — fall back rather than crash the watchdog
-            last_activity = job.started_at or job.created_at
-
-        if last_activity >= threshold:
-            continue
-
-        idle_minutes = int((timezone.now() - last_activity).total_seconds() / 60)
-
-        # Liveness check BEFORE revoking ([jobs 79/80] class): silent ≠ dead.
-        _task_id = getattr(job, "celery_task_id", "") or ""
-        _liveness = _task_liveness(_task_id)
-        if _liveness == "active" and idle_minutes < ACTIVE_SILENCE_REVOKE_MINUTES:
-            logger.warning(
-                "Stuck job %d: silent %d min but celery task %s is ACTIVE — "
-                "not revoking (long quiet phase, not a corpse)",
-                job.id, idle_minutes, _task_id,
-            )
-            continue
-
-        # Actually terminate the Celery task, not just the DB row. Without this,
-        # the worker keeps running the hung graph (LLM-phase hangs, abandoned
-        # agent threads, an in-process 200-page discovery loop) while the DB row
-        # says failed — the worker slot stays occupied until the (separate)
-        # task time_limit backstop fires. terminate=True + SIGKILL reclaims it.
-        #
-        # ORDER: mark the job FAILED BEFORE revoking. Under acks_late (if enabled)
-        # the terminated task is redelivered, and the dispatch dedup guard skips
-        # redelivery while status==RUNNING — so marking FAILED first lets the
-        # redelivery resume from the langgraph checkpoint instead of being
-        # silently dropped (and the job stuck RUNNING forever). Harmless when
-        # acks_late is off (today's default).
-        if _liveness == "absent":
-            # Report the ACTUAL broker config instead of a hardcoded assumption.
-            try:
-                from celery import current_app as _celery_app
-
-                _acks_late = bool(_celery_app.conf.task_acks_late)
-            except Exception:
-                _acks_late = False
-            _redelivery = (
-                "acks_late=True — a broker redelivery may still re-run it"
-                if _acks_late
-                else "acks_late=False means no redelivery"
-            )
+        if _pre_graph:
+            _task_id = getattr(job, "celery_task_id", "") or ""
             error_msg = (
-                f"Worker process lost: celery task {_task_id} is not active on "
-                f"any worker (silent {idle_minutes} min; {_redelivery}). "
-                f"Failed by the stuck-job watchdog."
+                f"Job was claimed by celery task {_task_id} but never started "
+                f"the graph (no started_at and no session logs after "
+                f"{PRE_GRAPH_FAIL_GRACE_SECONDS}s grace): the worker process "
+                f"died between the dispatch claim and graph start. Failed by "
+                f"the stuck-job watchdog (pre-graph fast-fail)."
             )
-        elif _liveness == "active":
-            error_msg = (
-                f"No activity for {idle_minutes} min while the task still "
-                f"reports ACTIVE — treated as wedged (stalled agent phase or "
-                f"hung scrape); celery task revoked."
+            logger.error(
+                "Stuck job %d: pre-graph fast-fail (age %ds, task %s)",
+                job.id,
+                int((timezone.now() - job.created_at).total_seconds()),
+                _task_id,
+            )
+            _liveness = "pre-graph"
+            idle_minutes = int(
+                (timezone.now() - job.created_at).total_seconds() / 60
             )
         else:
-            error_msg = (
-                f"No activity for {idle_minutes} min — job appears hung "
-                f"(stalled agent phase or wedged scrape); celery task revoked."
+            latest_activity_qs = (
+                SessionLog.objects
+                .filter(job=job)
+                .exclude(content__startswith="[HEARTBEAT]")
+                .exclude(content__startswith="[PROBE]")
+                .order_by("-created_at")
             )
-        logger.error(
-            "Stuck job %d: liveness=%s, no activity for %d min (last: %s), "
-            "marking failed + revoking",
-            job.id,
-            _liveness,
-            idle_minutes,
-            last_activity.isoformat(timespec="seconds"),
-        )
+            if latest_activity_qs.exists():
+                last_activity = latest_activity_qs.first().created_at
+            else:
+                # started_at can be None (shell-dispatched/test rows);
+                # created_at is always set — fall back rather than crash the
+                # watchdog
+                last_activity = job.started_at or job.created_at
+
+            if last_activity >= threshold:
+                continue
+
+            idle_minutes = int(
+                (timezone.now() - last_activity).total_seconds() / 60
+            )
+
+            # Liveness check BEFORE revoking ([jobs 79/80] class): silent ≠ dead.
+            _task_id = getattr(job, "celery_task_id", "") or ""
+            _liveness = _task_liveness(_task_id)
+            if _liveness == "active" and idle_minutes < ACTIVE_SILENCE_REVOKE_MINUTES:
+                logger.warning(
+                    "Stuck job %d: silent %d min but celery task %s is ACTIVE — "
+                    "not revoking (long quiet phase, not a corpse)",
+                    job.id, idle_minutes, _task_id,
+                )
+                continue
+
+            # Actually terminate the Celery task, not just the DB row. Without
+            # this, the worker keeps running the hung graph (LLM-phase hangs,
+            # abandoned agent threads, an in-process 200-page discovery loop)
+            # while the DB row says failed — the worker slot stays occupied
+            # until the (separate) task time_limit backstop fires.
+            # terminate=True + SIGKILL reclaims it.
+            #
+            # ORDER: mark the job FAILED BEFORE revoking. Under acks_late (if
+            # enabled) the terminated task is redelivered, and the entry claim
+            # (1.1) skips redelivery while status==RUNNING — so marking FAILED
+            # first lets the redelivery resume from the langgraph checkpoint
+            # instead of being silently dropped (and the job stuck RUNNING
+            # forever). Harmless when acks_late is off (today's default).
+            if _liveness == "absent":
+                # Report the ACTUAL broker config instead of a hardcoded
+                # assumption.
+                try:
+                    from celery import current_app as _celery_app
+
+                    _acks_late = bool(_celery_app.conf.task_acks_late)
+                except Exception:
+                    _acks_late = False
+                _redelivery = (
+                    "acks_late=True — a broker redelivery may still re-run it"
+                    if _acks_late
+                    else "acks_late=False means no redelivery"
+                )
+                error_msg = (
+                    f"Worker process lost: celery task {_task_id} is not active "
+                    f"on any worker (silent {idle_minutes} min; {_redelivery}). "
+                    f"Failed by the stuck-job watchdog."
+                )
+            elif _liveness == "active":
+                error_msg = (
+                    f"No activity for {idle_minutes} min while the task still "
+                    f"reports ACTIVE — treated as wedged (stalled agent phase "
+                    f"or hung scrape); celery task revoked."
+                )
+            else:
+                error_msg = (
+                    f"No activity for {idle_minutes} min — job appears hung "
+                    f"(stalled agent phase or wedged scrape); celery task "
+                    f"revoked."
+                )
+            logger.error(
+                "Stuck job %d: liveness=%s, no activity for %d min (last: %s), "
+                "marking failed + revoking",
+                job.id,
+                _liveness,
+                idle_minutes,
+                last_activity.isoformat(timespec="seconds"),
+            )
         job.status = ScrapeJob.STATUS_FAILED
         job.error_message = error_msg
         job.completed_at = timezone.now()
@@ -1688,6 +1823,85 @@ def cleanup_stuck_jobs() -> None:
 
     if failed:
         logger.warning("Stuck-job watchdog: marked %d job(s) as failed", failed)
+
+
+@shared_task
+def redispatch_abandoned_pending() -> dict:
+    """Recover PENDING rows that were never dispatched — ONE row per sweep.
+
+    Signature (sound only with the 1.0 keystone, which stamps celery_task_id
+    BEFORE publishing): ``status=PENDING ∧ celery_task_id=""`` means "created
+    but the publish never happened or was rolled back". Without the keystone
+    "" also covers "queued, waiting for a same-site slot", so this task ships
+    env-gated OFF (REDISPATCH_SWEEP_ENABLED) — enabling it before every
+    dispatch site goes through dispatch_scrape_job() would double-dispatch
+    healthy queued rows.
+
+    Claims on the redispatch_count COUNTER, not the status: claiming by
+    flipping status to RUNNING here would make the republished task's own
+    entry claim (1.1) see RUNNING + no matching id and drop the recovery.
+    Cap 2 → honest FAILED, so a permanently poison row can't loop forever.
+    One row per sweep bounds the blast radius of a bad republish.
+    """
+    if not getattr(settings, "REDISPATCH_SWEEP_ENABLED", False):
+        return {"action": "disabled"}
+
+    cutoff = timezone.now() - timezone.timedelta(minutes=PENDING_CLAIM_MINUTES)
+    _signature = dict(
+        status=ScrapeJob.STATUS_PENDING,
+        celery_task_id="",
+        created_at__lt=cutoff,
+    )
+
+    exhausted = (
+        ScrapeJob.objects.filter(redispatch_count__gte=PENDING_REDISPATCH_CAP)
+        .filter(**_signature)
+        .order_by("created_at")
+        .first()
+    )
+    if exhausted is not None:
+        ScrapeJob.objects.filter(pk=exhausted.pk).update(
+            status=ScrapeJob.STATUS_FAILED,
+            error_message=(
+                "Abandoned in PENDING with no celery task id: the redispatch "
+                f"sweep re-published it {PENDING_REDISPATCH_CAP} times and it "
+                "never claimed a worker. Failed honestly instead of looping "
+                "forever."
+            ),
+            completed_at=timezone.now(),
+        )
+        logger.warning(
+            "Redispatch sweep: job %d exhausted %d redispatches — failed",
+            exhausted.pk, PENDING_REDISPATCH_CAP,
+        )
+        return {"action": "failed", "job_id": exhausted.pk}
+
+    candidate = (
+        ScrapeJob.objects.filter(redispatch_count__lt=PENDING_REDISPATCH_CAP)
+        .filter(**_signature)
+        .order_by("created_at")
+        .first()
+    )
+    if candidate is None:
+        return {"action": "idle"}
+
+    claimed = ScrapeJob.objects.filter(
+        pk=candidate.pk,
+        status=ScrapeJob.STATUS_PENDING,
+        celery_task_id="",
+        redispatch_count__lt=PENDING_REDISPATCH_CAP,
+    ).update(redispatch_count=F("redispatch_count") + 1)
+    if not claimed:
+        # A concurrent sweep (or the row's own dispatch) won the race.
+        return {"action": "contested"}
+
+    dispatch_scrape_job(candidate.pk, rescrape=False)
+    logger.warning(
+        "Redispatch sweep: republished abandoned PENDING job %d "
+        "(redispatch attempt %d)",
+        candidate.pk, candidate.redispatch_count + 1,
+    )
+    return {"action": "redispatched", "job_id": candidate.pk}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1765,9 +1979,7 @@ def _do_schedule_next_site() -> dict:
     new_site.status = "in_progress"
     new_site.save(update_fields=["status"])
 
-    celery_task = run_scrape_task.delay(job.id, rescrape=False)
-    job.celery_task_id = celery_task.id
-    job.save(update_fields=["celery_task_id"])
+    dispatch_scrape_job(job.id, rescrape=False)
 
     return {
         "action": "queued",

@@ -157,10 +157,10 @@ def create_job(request):
         )
 
     def _dispatch():
-        from ..tasks import run_scrape_task
+        from ..tasks import dispatch_scrape_job
 
-        task = run_scrape_task.delay(job.id, rescrape=False)
-        models.ScrapeJob.objects.filter(pk=job.pk).update(celery_task_id=task.id)
+        # [wave-15 1.0] keystone: stamp BEFORE publish (see dispatch_scrape_job).
+        dispatch_scrape_job(job.id, rescrape=False)
 
     def _persist_item_urls():
         """F1: url_list's input contract is scrapers/{slug}/input_urls.json —
