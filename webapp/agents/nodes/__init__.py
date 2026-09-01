@@ -10,7 +10,6 @@ from .human_approval import human_approval
 from .normalize_fields import normalize_fields
 from .parse_command import parse_command
 from .pre_execution_approval import pre_execution_approval
-from .retry_wrapper import create_agent_with_retry
 from .route_after_cleanup import route_after_cleanup
 from .route_after_testing import route_after_testing
 from .run_execution import run_execution
@@ -33,5 +32,4 @@ __all__ = [
     "route_after_testing",
     "route_after_cleanup",
     "human_approval",
-    "create_agent_with_retry",
 ]

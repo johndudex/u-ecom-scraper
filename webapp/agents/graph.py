@@ -5578,9 +5578,20 @@ def _invoke_cleanup(state: ScrapeState, config: RunnableConfig) -> dict[str, Any
         messages = build_cleanup_message(state)
         _log_agent_context(state, "cleanup", messages)
         agent = create_cleanup_agent(site_slug=slug)
-        result = agent.invoke(
-            {"messages": messages}, config=_agent_config(config, "cleanup")
-        )
+        # [wave-15 PR-2a] This was the last raw un-walled invoke on the happy
+        # path (skill_learner got the same treatment in QW-1): a hung cleanup
+        # LLM call produced no heartbeat and no SessionLog rows, so the job
+        # looked silent to the watchdog while the thread sat in a socket
+        # read. Bound like every other LLM phase — wall-clock cap, [INVOKE-
+        # TIMEOUT] row on expiry, heartbeat beats while it waits.
+        hb = _start_heartbeat(job_id, "cleanup")
+        try:
+            result = _invoke_agent_with_timeout(
+                agent, messages, _agent_config(config, "cleanup"),
+                "cleanup", job_id,
+            )
+        finally:
+            _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "cleanup", config)
 
         # Deterministic, failure-safe scraper promotion (the agent no longer cp's
