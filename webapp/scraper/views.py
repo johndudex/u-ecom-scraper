@@ -1650,9 +1650,18 @@ def site_rerun(request, site_id):
     _source = _fm_read_text(scraper_key) or ""
 
     if site.input_urls and slug:
+        # [wave-14 job-133] Same full-host seed filter as intake — the FM
+        # file is a seed contract, and a re-run must not resurrect a poison
+        # link that a later job's filter would drop.
+        try:
+            from src.seed_urls import filter_seed_urls
+
+            _seed_urls = filter_seed_urls(site.input_urls, site.url or "")
+        except Exception:
+            _seed_urls = site.input_urls
         artifacts.write_json(
             artifacts.scrapers_key(slug, "input_urls.json"),
-            {"urls": site.input_urls},
+            {"urls": _seed_urls},
         )
 
     BROWSER_METHODS = {
@@ -1676,6 +1685,26 @@ def site_rerun(request, site_id):
         for _sf in ("input_urls.json", "discovery_config.json"):
             _txt = _fm_read_text(f"scrapers/{site.slug}/{_sf}")
             if _txt is not None:
+                # [wave-14 job-133] the staged seed gets the same full-host
+                # filter as every other surface — staging reads the file
+                # verbatim, which would otherwise bypass intake entirely.
+                if _sf == "input_urls.json":
+                    try:
+                        import json as _json
+
+                        from src.seed_urls import filter_seed_payload
+
+                        _payload, _drops = filter_seed_payload(
+                            _json.loads(_txt), site.url or ""
+                        )
+                        if _drops:
+                            _txt = _json.dumps(_payload)
+                            logger.warning(
+                                "re-run staging for %s: filtered seed file — %s",
+                                site.slug, _drops,
+                            )
+                    except Exception:
+                        pass
                 _rerun_extra[_sf] = _txt
         scrape_json = {
             "scraper_source": _source,

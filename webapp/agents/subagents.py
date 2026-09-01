@@ -4353,7 +4353,7 @@ def build_cleanup_message(state: dict) -> list:
         f"**Save cleanup report to:** workspace/{slug}/cleanup_report.json\n\n"
         f"### Workflow\n"
         f"1. Use `run_bash` to copy files (NOT read_file — you don't need to read their contents):\n"
-        f"   - `cp workspace/{slug}/input_urls.json scrapers/{slug}/input_urls.json` (if it exists)\n"
+        f"   - `cp workspace/{slug}/input_urls.json scrapers/{slug}/input_urls.json` (if it exists; it must contain ONLY same-host item URLs — the pipeline already filters it, do not edit or widen it)\n"
         f"   - `cp workspace/{slug}/output_*.json scrapers/{slug}/` (if any exist)\n"
         f"   - `cp -r workspace/{slug}/analysis scrapers/{slug}/analysis` (if it exists)\n"
         f"   - Do NOT copy scraper_draft.py → scraper.py yourself; the pipeline promotes the scraper deterministically (and only on success).\n"

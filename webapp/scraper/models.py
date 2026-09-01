@@ -46,6 +46,24 @@ def _sync_input_urls_file(instance):
     urls = instance.input_urls or []
     if not urls or not instance.slug:
         return
+    # [wave-14 job-133] Seed hygiene: the FM file is a seed contract — filter
+    # it with the shared full-host rule before the shrink guard sees it, so a
+    # gap.com-family link saved onto the Site row can't ride into production.
+    try:
+        import logging
+
+        from src.seed_urls import dropped_summary, seed_report
+
+        urls, _dropped = seed_report(urls, getattr(instance, "url", "") or "")
+        if _dropped:
+            logging.getLogger("scraper.models").warning(
+                "input_urls sync for %s: dropped %s",
+                instance.slug, dropped_summary(_dropped),
+            )
+    except Exception:
+        pass
+    if not urls:
+        return
     try:
         from django.conf import settings
 

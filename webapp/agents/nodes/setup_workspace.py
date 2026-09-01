@@ -29,72 +29,28 @@ def _get_project_root() -> str:
     return os.getcwd()
 
 
-# Two-part TLDs where the registrable domain is name + BOTH parts (mirrors
-# run_execution._registrable — keep the two lists in sync).
-_TWO_PART_TLDS = frozenset({
-    "co.uk", "org.uk", "com.au", "co.nz", "co.za", "com.br", "co.jp",
-    "com.sg", "com.mx",
-})
-
-
-def _registrable(host: str) -> str:
-    """Registrable domain (last 2 labels, 3 for two-part TLDs) — 'www.' stripped."""
-    parts = [p for p in (host or "").lower().split(".") if p]
-    if len(parts) >= 2 and ".".join(parts[-2:]) in _TWO_PART_TLDS and len(parts) >= 3:
-        return ".".join(parts[-3:])
-    return ".".join(parts[-2:]) if len(parts) >= 2 else ".".join(parts)
-
-
 def _filter_seed_urls(urls: list, job_url: str) -> list[str]:
     """[A4] Sanitize the seed URL list before it reaches the scraper.
 
     Job 45 burned ~17 minutes of test cycles on a seed list polluted with
-    non-item URLs (pagination links, nav links, a different domain). The
-    scraper dutifully tried to extract product fields from all of them and the
-    tester failed the run. Drop, with a logged reason:
-    - non-http(s) or pathless entries ("https://site.com" with no path)
-    - URLs outside the job's registrable domain (off-site / CDN / tracker links)
-    - exact duplicates (first occurrence wins)
+    non-item URLs (pagination links, nav links, a different domain). Job-133
+    (athleta.gap.com) then showed the registrable-domain rule was too loose —
+    gap.com family links passed it and poisoned every downstream phase.
+
+    [wave-14 job-133] The rule now lives in ``src/seed_urls.py`` and is
+    FULL-HOST equality (www-stripped) — shared by every surface that writes,
+    redirects, or promotes an ``input_urls.json`` so the intake path, the FM
+    sync, the re-run view, and the run_scraper hygiene belt can never
+    disagree about what a legitimate seed is.
     """
-    from urllib.parse import urlparse
+    from src.seed_urls import dropped_summary, seed_report
 
-    try:
-        _job_host = urlparse(job_url or "").hostname or ""
-    except Exception:
-        _job_host = ""
-    job_dom = _registrable(_job_host)
-
-    kept: list[str] = []
-    seen: set[str] = set()
-    dropped: dict[str, int] = {}
-    for raw in urls or []:
-        u = str(raw or "").strip()
-        if not u:
-            continue
-        try:
-            p = urlparse(u)
-        except Exception:
-            dropped["unparseable"] = dropped.get("unparseable", 0) + 1
-            continue
-        if p.scheme not in ("http", "https") or not p.hostname:
-            dropped["not-http"] = dropped.get("not-http", 0) + 1
-            continue
-        if not p.path.strip("/") and not p.query:
-            dropped["no-path"] = dropped.get("no-path", 0) + 1
-            continue
-        if job_dom and _registrable(p.hostname) != job_dom:
-            dropped["off-domain"] = dropped.get("off-domain", 0) + 1
-            continue
-        if u in seen:
-            dropped["duplicate"] = dropped.get("duplicate", 0) + 1
-            continue
-        seen.add(u)
-        kept.append(u)
+    kept, dropped = seed_report(urls, job_url)
     if dropped:
         logger.warning(
             "setup_workspace: filtered seed URLs — kept %d, dropped %s",
             len(kept),
-            ", ".join(f"{k}={v}" for k, v in sorted(dropped.items())),
+            dropped_summary(dropped),
         )
     return kept
 

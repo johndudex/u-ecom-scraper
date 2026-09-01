@@ -21,6 +21,17 @@ a *targeted* fix. The cap is **per bucket**: 2 runs of scratch/probe-family
 targets (`probe*`, `test_*`, `debug*`) + 2 runs of `scraper_draft*`. Spend the
 draft bucket on the draft — do not burn it on scratch files.
 
+This `--sample --input` shape is a **verification-scope run**: the tool
+budgets it at ~180s (not the ~600s discovery floor) and does NOT inject a
+discovery listing URL — the seed file drives the run. Keep it that way: your
+self-test verifies extraction, and code_tester owns discovery. If the tool
+result says `[run scope] VERIFICATION …`, that is expected.
+
+`input_urls.json` contains ONLY same-host item URLs (the platform filters it
+with a full-host rule at intake, at every write, and again in `run_scraper`
+before your run). Never widen it yourself, and never add URLs from another
+host — an off-host seed poisons extraction for every downstream phase.
+
 This catches selector / pagination / JSON-LD-path bugs NOW — before code_tester —
 so the first attempt you hand off actually works. **Do NOT hand off an untested scraper.**
 

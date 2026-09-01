@@ -40,10 +40,20 @@ class TestGetStateRetry:
 
 
 class TestExceptPathHardening:
-    def test_close_old_connections_before_save(self):
+    def test_except_path_delegates_to_the_shared_finalizer(self):
+        """[wave-14 job-133] the task's except path no longer inlines the F4
+        sequence — it delegates to _finalize_job_failed, the SAME helper the
+        task_failure process-death handler uses (one finalize vocabulary, no
+        drift between the in-task and after-death paths)."""
         src = _tasks_src()
         i_except = src.index("except Exception as exc:\n        logger.exception(\"Scrape job %d failed")
-        block = src[i_except:i_except + 3000]
+        block = src[i_except:i_except + 600]
+        assert "_finalize_job_failed(" in block
+
+    def test_close_old_connections_before_save(self):
+        src = _tasks_src()
+        i_fn = src.index("def _finalize_job_failed(")
+        block = src[i_fn:i_fn + 3000]
         i_close = block.index("close_old_connections()")
         i_save = block.index('job.save(update_fields=["status", "error_message", "completed_at"])')
         assert i_close < i_save
@@ -55,9 +65,9 @@ class TestExceptPathHardening:
 
     def test_publish_and_site_updates_guarded(self):
         src = _tasks_src()
-        i_except = src.index("except Exception as exc:\n        logger.exception(\"Scrape job %d failed")
-        block = src[i_except:i_except + 4200]
-        assert "try:\n            _publish_job_status" in block
+        i_fn = src.index("def _finalize_job_failed(")
+        block = src[i_fn:i_fn + 3000]
+        assert "try:\n        _publish_job_status" in block
 
 
 class TestConnectionSettings:

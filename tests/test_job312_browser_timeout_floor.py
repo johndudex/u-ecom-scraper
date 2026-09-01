@@ -43,24 +43,53 @@ class TestBrowserTimeoutFloor:
             "(discovery + sample extraction in one subprocess) need ~350s+; "
             "the old 240s floor SIGKILLed healthy runs mid-flight (job 312)"
         )
-        assert "if needs_browser and timeout < BROWSER_RUN_TIMEOUT_FLOOR:" in src
-        assert "timeout = BROWSER_RUN_TIMEOUT_FLOOR" in src
+        # [wave-14 job-133] the floor SELECTS between the discovery floor and
+        # the verification floor; the apply-line uses the selected value.
+        assert "if needs_browser and timeout < _run_floor:" in src
+        assert "timeout = _run_floor" in src
+        assert (
+            "VERIFICATION_RUN_TIMEOUT_FLOOR\n            if _verification_scope\n            else BROWSER_RUN_TIMEOUT_FLOOR"
+            in src
+        ), "full-scope runs must keep the 600s discovery floor"
+
+    def test_verification_scope_is_seed_plus_sample(self):
+        """[wave-14 job-133] verification scope = explicit seed (--input /
+        --urls) AND --sample. --sample alone (a discovery run that samples)
+        or --input alone (seed-driven full run) is NOT verification scope —
+        both still get the 600s discovery floor."""
+        src = _src()
+        assert (
+            '_verification_scope = "--sample" in cmd_args and (\n'
+            '            "--input" in cmd_args or "--urls" in cmd_args\n'
+            "        )" in src
+        )
 
     def test_floor_applies_after_browser_detection(self):
         """The floor must sit AFTER needs_browser is decided (exec_mode sniff),
         so HTTP scrapers keep their tight budgets."""
         src = _src()
         i_sniff = src.find('_scraper_needs_browser(full_path)')
-        i_floor = src.find("if needs_browser and timeout < BROWSER_RUN_TIMEOUT_FLOOR:")
+        i_floor = src.find("if needs_browser and timeout < _run_floor:")
         assert -1 < i_sniff < i_floor, "floor must follow browser detection"
+
+    def test_floor_applies_after_args_parse(self):
+        """[wave-14 job-133] cmd_args must be parsed BEFORE the floor — the
+        floor cannot know what kind of run it is flooring otherwise."""
+        src = _src()
+        i_args = src.find("cmd_args = shlex.split(cli_args)")
+        i_scope = src.find("_verification_scope = ")
+        i_floor = src.find("if needs_browser and timeout < _run_floor:")
+        assert 0 < i_args < i_scope < i_floor, (
+            "parse → scope → floor must be the order in run_scraper"
+        )
 
     def test_http_path_has_no_floor(self):
         """The http branch must not inherit the 600s floor — HTTP scrapers
         (api/internal_api strategies) are fast and their budgets stay tight."""
         src = _src()
-        i_floor = src.find("if needs_browser and timeout < BROWSER_RUN_TIMEOUT_FLOOR:")
+        i_floor = src.find("if needs_browser and timeout < _run_floor:")
         http_branch = src[src.find("http-based, running locally"):]
-        assert "timeout = BROWSER_RUN_TIMEOUT_FLOOR" not in http_branch
+        assert "timeout = _run_floor" not in http_branch
         assert i_floor != -1
 
 

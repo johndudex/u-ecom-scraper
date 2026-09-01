@@ -34,6 +34,16 @@ SCRAPER_HTTP_TIMEOUT = int(os.environ.get("SCRAPER_HTTP_TIMEOUT", "7200"))
 # its wall clock must be derived from this floor, not hand-tuned beside it.
 BROWSER_RUN_TIMEOUT_FLOOR = int(os.environ.get("BROWSER_RUN_TIMEOUT_FLOOR", "600"))
 
+# [wave-14 job-133] Floor for VERIFICATION-SCOPE browser runs: an explicit
+# seed (--input/--urls) + --sample extracts from KNOWN URLs — no phase-1
+# discovery walk — so the 600s discovery floor is dead weight. Job-133's
+# writer burned a ~690s full-scope window on a 5-URL self-test; with the
+# cheap floor the same self-test budgets ~180s and the honesty guard stops
+# refusing runs that would actually fit the invoking agent's window.
+VERIFICATION_RUN_TIMEOUT_FLOOR = int(
+    os.environ.get("VERIFICATION_RUN_TIMEOUT_FLOOR", "180")
+)
+
 BROWSER_IMPORTS = {
     "seleniumbase",
     "undetected_chromedriver",
@@ -78,6 +88,56 @@ def _scraper_needs_browser(scraper_path: str) -> bool:
     except Exception:
         pass
     return False
+
+
+def _hygiene_input_seed(cmd_args: list, ws_dir: str, job_url: str) -> str:
+    """[wave-14 job-133] Rewrite the seed file a run is about to consume with
+    the shared full-host filter (``src/seed_urls.py``).
+
+    The upstream writers (intake, FM sync, the re-run view) filter their own
+    writes, but this is the LAST point before the subprocess reads the file —
+    the belt that catches a writer this module's callers missed (e.g. the
+    code-writer's navigation-derived seed, or a stale file left in the
+    workspace by a previous job on the same slug). Returns a human-readable
+    note for the log / tool result; "" when there was nothing to do.
+    """
+    seed_path = ""
+    for _i, _arg in enumerate(cmd_args):
+        if _arg == "--input" and _i + 1 < len(cmd_args):
+            _val = cmd_args[_i + 1]
+            seed_path = _val if os.path.isabs(_val) else os.path.join(ws_dir, _val)
+            break
+        if _arg == "--urls":
+            # Bug C redirects this to --input when a sibling seed exists; if
+            # it didn't, there is no seed file to filter.
+            return ""
+    if not seed_path:
+        seed_path = os.path.join(ws_dir, "input_urls.json")
+    if not seed_path or not os.path.isfile(seed_path):
+        return ""
+    try:
+        import json
+
+        from src.seed_urls import dropped_summary, filter_seed_payload
+
+        with open(seed_path, "r", encoding="utf-8") as _fh:
+            payload = json.load(_fh)
+        filtered, dropped = filter_seed_payload(payload, job_url)
+        if not dropped:
+            return ""
+        with open(seed_path, "w", encoding="utf-8") as _fh:
+            json.dump(filtered, _fh)
+        _kept = (
+            len(filtered.get("urls") or [])
+            if isinstance(filtered, dict)
+            else len(filtered)
+        )
+        return (
+            f"seed hygiene: rewrote {os.path.basename(seed_path)} — "
+            f"dropped {dropped_summary(dropped)}, kept {_kept}"
+        )
+    except Exception as exc:
+        return f"seed hygiene skipped (unreadable seed file: {exc})"
 
 
 def _format_result(result: dict) -> str:
@@ -194,6 +254,26 @@ def get_shell_tools(
         else:
             needs_browser = _scraper_needs_browser(full_path)
 
+        # Parse the CLI args EARLY: the verification-scope check below and the
+        # Bug C guard both need them, and the floor depends on the scope.
+        # (Previously parsed after the floor/guard blocks — the floor could
+        # not know what kind of run it was flooring.)
+        if extra_args and not cli_args:
+            logger.info("run_scraper: remapping extra_args=%s → cli_args", extra_args)
+            cmd_args = list(extra_args)
+        else:
+            cmd_args = shlex.split(cli_args) if cli_args else []
+
+        # [wave-14 job-133] VERIFICATION SCOPE: an explicit seed (--input /
+        # --urls) plus --sample means "extract from THESE known URLs" — no
+        # phase-1 discovery walk. Job-133's writer self-test (--input 5 URLs,
+        # --sample) was floored to the full 600s discovery budget and then
+        # refused by the honesty guard (690s needed > window). Seed-scoped
+        # runs get the cheap floor; discovery runs keep 600s.
+        _verification_scope = "--sample" in cmd_args and (
+            "--input" in cmd_args or "--urls" in cmd_args
+        )
+
         # Floor the timeout for browser-based scrapers. code_tester's LLM often
         # passes a tight timeout, but two-phase drafts run discovery AND sample
         # extraction in ONE process — pillowtalk: 124s discovery (5 pages) +
@@ -203,12 +283,18 @@ def get_shell_tools(
         # multi-page walk + samples with headroom; /scrape accepts up to 7200s
         # and the httpx margin (+60s) scales with it. The runner does NOT retry
         # timeouts, so the worst case is one bounded 660s wait. HTTP unaffected.
-        if needs_browser and timeout < BROWSER_RUN_TIMEOUT_FLOOR:
+        _run_floor = (
+            VERIFICATION_RUN_TIMEOUT_FLOOR
+            if _verification_scope
+            else BROWSER_RUN_TIMEOUT_FLOOR
+        )
+        if needs_browser and timeout < _run_floor:
             logger.info(
-                "run_scraper: flooring browser timeout %ds → %ds",
-                timeout, BROWSER_RUN_TIMEOUT_FLOOR,
+                "run_scraper: flooring browser timeout %ds → %ds%s",
+                timeout, _run_floor,
+                " (verification scope)" if _verification_scope else "",
             )
-            timeout = BROWSER_RUN_TIMEOUT_FLOOR
+            timeout = _run_floor
 
         # [job-81 N-B] Honesty guard: a blocking browser run that CANNOT finish
         # inside the invoking agent's remaining wall clock must not be launched
@@ -239,6 +325,14 @@ def get_shell_tools(
                         f"phase was NOT tested. Do not retry it in this "
                         f"invocation; record honestly in the report which phases "
                         f"ran and which were skipped."
+                        + (
+                            " If you only need to verify extraction against "
+                            "known URLs, a verification-scope run "
+                            "(--input input_urls.json --sample) is budgeted "
+                            f"at ~{VERIFICATION_RUN_TIMEOUT_FLOOR}s and may fit."
+                            if not _verification_scope
+                            else ""
+                        )
                     )
 
         # Write a heartbeat SessionLog entry so the watchdog sees activity
@@ -262,12 +356,6 @@ def get_shell_tools(
         except Exception:
             pass
 
-        if extra_args and not cli_args:
-            logger.info("run_scraper: remapping extra_args=%s → cli_args", extra_args)
-            cmd_args = list(extra_args)
-        else:
-            cmd_args = shlex.split(cli_args) if cli_args else []
-
         # Bug C guard (deterministic): if the caller passed --urls <single_url>
         # (the 1-item trap — always extracts exactly 1, fails the ≥3 ground-truth
         # gate, causes a false cascade), AND input_urls.json exists alongside the
@@ -290,6 +378,33 @@ def get_shell_tools(
                     "--input input_urls.json (prevents the 1-item trap)"
                 )
 
+        # Job identity fetched ONCE — the seed hygiene and the discovery
+        # injection below both read tool state.
+        _ts: dict = {}
+        try:
+            from agents.tools.context import get_state
+
+            _ts = get_state() or {}
+        except Exception:
+            _ts = {}
+
+        # [wave-14 job-133] SEED HYGIENE (belt): the seed file this run is
+        # about to consume is filtered with the same shared full-host rule as
+        # intake — no matter which surface wrote it (intake, FM sync, the
+        # re-run view, the writer's navigation-derived list, or a previous
+        # job's leftovers), a poison link cannot reach the subprocess. Runs
+        # BEFORE the extra_files staging in the browser branch, so the copy
+        # browser_service receives is the filtered one.
+        _seed_note = ""
+        if "--input" in cmd_args or "--urls" in cmd_args:
+            _seed_note = _hygiene_input_seed(
+                cmd_args,
+                os.path.dirname(full_path),
+                str(_ts.get("url") or ""),
+            )
+            if _seed_note:
+                logger.info("run_scraper: %s", _seed_note)
+
         # Discovery env overrides — computed ONCE for BOTH paths. (Previously
         # this block lived inside `if needs_browser:`, so the HTTP/local branch
         # below referenced an unassigned `env_overrides` → UnboundLocalError on
@@ -308,9 +423,15 @@ def get_shell_tools(
         # run (not just run_execution). Without this, code_tester falls into the
         # seed-file path (input_urls.json) → 1-5 items → route_after_testing
         # fails → cascade. The env var bypasses argparse stripping entirely.
+        #
+        # [wave-14 job-133] The injection is SCOPE-AWARE: a verification-scope
+        # run (explicit seed + --sample) must stay a seed verification —
+        # injecting a listing URL silently converts it into a full discovery
+        # walk, which is exactly how job-133's 5-URL self-test became a ~690s
+        # discovery charge. And whichever scope wins is REPORTED to the agent
+        # in the tool result instead of being an invisible side effect.
+        _scope_note = ""
         try:
-            from agents.tools.context import get_state
-            _ts = get_state() or {}
             _nav_ts = _ts.get("navigation_analysis") or {}
             _disc_ts = (_nav_ts.get("discovery") if isinstance(_nav_ts, dict) else None) or {}
             _listing_ts = (
@@ -325,11 +446,21 @@ def get_shell_tools(
                 _sc_ts = str(_ts.get("search_criteria") or "").strip()
                 if _sc_ts.startswith(("http://", "https://")):
                     _listing_ts = _sc_ts
-            if _listing_ts and _ts.get("input_mode") in ("navigation", "list_page", "search_term"):
+            if _verification_scope:
+                _scope_note = (
+                    "[run scope] VERIFICATION — the seed file drives this run; "
+                    "SCRAPER_LISTING_URL discovery injection suppressed"
+                )
+            elif _listing_ts and _ts.get("input_mode") in ("navigation", "list_page", "search_term"):
                 env_overrides = dict(env_overrides or {})
                 env_overrides["SCRAPER_LISTING_URL"] = _listing_ts
+                _scope_note = (
+                    f"[run scope] DISCOVERY — SCRAPER_LISTING_URL injected → {_listing_ts}"
+                )
         except Exception:
             pass
+        if _scope_note:
+            logger.info("run_scraper: %s", _scope_note)
 
         if needs_browser:
             logger.info("run_scraper: browser-based, dispatching to browser_service: %s", scraper_path)
@@ -419,6 +550,10 @@ def get_shell_tools(
                 output += f"\n[ran on browser_service, duration: {result.get('duration', '?')}s]"
                 if result.get("output_file"):
                     output += f"\n[output_file: {result['output_file']}]"
+                if _scope_note:
+                    output += f"\n{_scope_note}"
+                if _seed_note:
+                    output += f"\n[{_seed_note}]"
                 return output
             except httpx.ConnectError:
                 return f"Error: browser_service ({_get_browser_service_url()}) is unreachable"
@@ -443,11 +578,16 @@ def get_shell_tools(
                         cwd=cwd,
                         env=_run_env,
                     )
-                return _format_result({
+                _out = _format_result({
                     "returncode": result.returncode,
                     "stdout": result.stdout,
                     "stderr": result.stderr,
                 })
+                if _scope_note:
+                    _out += f"\n{_scope_note}"
+                if _seed_note:
+                    _out += f"\n[{_seed_note}]"
+                return _out
             except subprocess.TimeoutExpired:
                 return f"Scraper timed out after {timeout}s"
             except Exception as exc:

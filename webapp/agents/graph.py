@@ -4220,6 +4220,25 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 il = na.get("item_links") or {}
                 sample_urls = il.get("urls") or il.get("url_examples") or []
             if sample_urls:
+                # [wave-14 job-133] The writer's seed comes from navigation
+                # output — historically it has grabbed nav links from OTHER
+                # hosts (the lw.com class). Same full-host filter as intake,
+                # so the writer can never seed a poison URL that run_scraper's
+                # hygiene belt would just have to strip back out.
+                try:
+                    from src.seed_urls import dropped_summary, seed_report
+
+                    sample_urls, _sdrops = seed_report(
+                        sample_urls, state.get("url") or ""
+                    )
+                    if _sdrops:
+                        logger.warning(
+                            "_invoke_code_writer: filtered writer seed — dropped %s",
+                            dropped_summary(_sdrops),
+                        )
+                except Exception:
+                    pass
+            if sample_urls:
                 iu_path = os.path.join(_get_project_root(), "workspace", slug, "input_urls.json")
                 # Bug 1 fix: don't overwrite input_urls.json if it already has MORE
                 # URLs than the seed set. code_tester's discovery may have saved

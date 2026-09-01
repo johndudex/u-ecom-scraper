@@ -76,6 +76,13 @@ OUTPUT_FILE = os.path.join(SCRIPT_DIR, f"output_{TIMESTAMP}_{os.getpid()}.json")
 INPUT_FILE = os.path.join(SCRIPT_DIR, "input_urls.json")
 LOG_FILE = os.path.join(os.path.dirname(SCRIPT_DIR), "logs", f"{SITE_SLUG}.log")
 
+# --discover-only probe cap. Hardcoded 5 meant the orchestrator could not
+# tune the probe's walk depth: the graph's Phase-1 probe sets
+# SCRAPER_DISCOVERY_MAX_PAGES (job-316: cap the walk so the 180s probe bound
+# can reach a verdict on deep catalogues), but this template ignored it. The
+# env knob now wins; the old 5 stays the default for un-probed runs.
+_PROBE_MAX_PAGES = int(os.environ.get("SCRAPER_DISCOVERY_MAX_PAGES", "5"))
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # LOGGING
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -462,9 +469,11 @@ def main():
         except Exception:
             pass
         if _dcfg is None:
-            _dcfg = config_for_load_more(max_pages=5)
+            _dcfg = config_for_load_more(
+                max_pages=_PROBE_MAX_PAGES,
+            )
         else:
-            _dcfg.max_pages = 5  # cap for testing
+            _dcfg.max_pages = _PROBE_MAX_PAGES  # cap for testing
 
         def _extract_probe(p):
             try:
