@@ -95,7 +95,12 @@ def _run_cancelled(rid: str) -> bool:
 
 
 def active_runs_snapshot() -> list[dict[str, Any]]:
-    """Read-only view for /health (rid aliases + ages, never the full cmd)."""
+    """Read-only view for /health (rid aliases + ages, never the full cmd).
+
+    B1-4: also exposes the current attempt's ``pid`` — the orphan killer uses
+    it to protect a live run's process tree without blanket-skipping the whole
+    kill cycle for hours.
+    """
     with _ACTIVE_RUNS_LOCK:
         now = time.time()
         return [
@@ -103,6 +108,7 @@ def active_runs_snapshot() -> list[dict[str, Any]]:
                 "rid": rid,
                 "job_id": meta.get("job_id") or None,
                 "scraper_name": meta.get("scraper_name") or "",
+                "pid": meta.get("pid"),
                 "age_s": round(now - (meta.get("started") or now), 1),
                 "cancelling": bool(meta.get("cancel")),
             }

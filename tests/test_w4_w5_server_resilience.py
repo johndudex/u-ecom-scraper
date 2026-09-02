@@ -58,7 +58,10 @@ class TestExecutorSeparation:
         assert re.search(r"SCRAPE_EXECUTOR = ThreadPoolExecutor\(\s*max_workers=SCRAPE_MAX_CONCURRENT", src)
         assert "MISC_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix=\"misc\")" in src
         assert "RESTART_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix=\"restart\")" in src
-        assert "HEALTH_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix=\"health\")" in src
+        # [wave-16 B1] HEALTH_EXECUTOR removed — /health dispatches nothing
+        # (cached liveness) and the warm-up/liveness loop moved to MAINT.
+        assert "MAINT_EXECUTOR = ThreadPoolExecutor(" in src
+        assert "PROBE_EXECUTOR = ThreadPoolExecutor(" in src
 
     def test_no_endpoint_dispatches_on_the_default_executor(self):
         src = _src()
@@ -80,10 +83,12 @@ class TestExecutorSeparation:
 
     def test_health_slot_now_lives_in_the_boot_warmup(self):
         """W6 superseded the per-request HEALTH_EXECUTOR dispatch — /health
-        reads the cached snapshot. The executor's only remaining use is the
-        one-shot boot warm-up in lifespan."""
+        reads the cached snapshot. [wave-16 B1] the warm-up AND the 15s
+        liveness loop both live on MAINT_EXECUTOR via the beat-stamping
+        _maint_task wrapper; the health pool itself is gone."""
         src = _src()
-        assert "HEALTH_EXECUTOR, browser_pool.check_cdp_liveness" in src
+        assert 'MAINT_EXECUTOR,\n                _maint_task("cdp_liveness", browser_pool.check_cdp_liveness),' in src
+        assert "HEALTH_EXECUTOR" not in src, "the vestigial health pool must stay removed"
         health_fn = re.search(r"@app\.get\(\"/health\"\).*?(?=\n@app\.|\nclass )", src, re.S)
         assert health_fn and "run_in_executor" not in health_fn.group(0), (
             "/health must dispatch NOTHING (cached liveness)"
@@ -159,7 +164,10 @@ class TestW5CleanupOffLoop:
     def test_cleanup_body_runs_on_executor(self):
         src = _src()
         assert "def _cleanup_chrome_artifacts_sync():" in src
-        assert "run_in_executor(MISC_EXECUTOR, _cleanup_chrome_artifacts_sync)" in src
+        # [wave-16 B1] Cleanup moved from MISC_EXECUTOR (shared with the
+        # reapers/probe — H1 wedge) to the dedicated MAINT_EXECUTOR via the
+        # beat-stamping _maint_task wrapper.
+        assert "run_in_executor(\n                MAINT_EXECUTOR,\n                _maint_task(\"cleanup_chrome_artifacts\", _cleanup_chrome_artifacts_sync)," in src
 
     def test_profile_cache_sweep_is_time_budgeted(self):
         src = _src()

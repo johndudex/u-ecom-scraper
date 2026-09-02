@@ -1066,12 +1066,15 @@ def _finalize_job(job: ScrapeJob) -> None:
     the job to COMPLETED or FAILED.
 
     Skipped entirely for captcha_blocked and akamai_blocked jobs (already
-    finalized in check_accessibility).
+    finalized in check_accessibility) and for browser_unavailable jobs
+    [wave-16 B3] — already parked by the park node; _finalize_job's
+    COMPLETED/FAILED ladder must not overwrite a resumable park.
     """
     job.refresh_from_db()
     if job.status in (
         ScrapeJob.STATUS_CAPTCHA_BLOCKED,
         ScrapeJob.STATUS_AKAMAI_BLOCKED,
+        ScrapeJob.STATUS_BROWSER_UNAVAILABLE,
     ):
         logger.info("Job %d: %s, skipping _finalize_job", job.id, job.status)
         return
@@ -1825,6 +1828,80 @@ def cleanup_stuck_jobs() -> None:
         logger.warning("Stuck-job watchdog: marked %d job(s) as failed", failed)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# [wave-16 B3] Dependency-park resumer
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@shared_task
+def resume_browser_unavailable_jobs() -> dict:
+    """Re-dispatch jobs parked on browser_service unavailability, once it's back.
+
+    The park (check_accessibility → akamai/captcha precedent, but NON-terminal)
+    ends the graph with STATUS_BROWSER_UNAVAILABLE when browser_service itself
+    cannot serve — /health degraded or unreachable. This beat task is the other
+    half: poll /health, and while it reports "ok", flip parked rows back to
+    PENDING and dispatch them through dispatch_scrape_job (the same re-entry
+    path as a manual re-drive — check_tracker's skip flags resume from the
+    right phase instead of redoing analysis).
+
+    Deliberately CONSERVATIVE: one /health sample gates the whole tick, batch
+    capped (oldest first) so a large park queue doesn't stampede the worker
+    pool, and each flip is claimed by status rowcount so a concurrent tick (or
+    a manual cancel→failed of the same row) can't double-dispatch. A job that
+    parks again after resume just parks again — flapping self-corrects when
+    the gateway stays healthy long enough for a full run.
+    """
+    from django.conf import settings as _dj_settings
+
+    if not getattr(_dj_settings, "BROWSER_RESUME_ENABLED", True):
+        return {"resumed": 0, "reason": "disabled"}
+
+    from agents.tools.browser_http import browser_service_healthy
+
+    if not browser_service_healthy():
+        return {"resumed": 0, "reason": "browser_service unhealthy"}
+
+    from agents.tools.browser_http import BROWSER_RESUME_BATCH
+
+    parked = list(
+        ScrapeJob.objects.filter(
+            status=ScrapeJob.STATUS_BROWSER_UNAVAILABLE
+        ).values_list("id", flat=True).order_by("id")[:BROWSER_RESUME_BATCH]
+    )
+    if not parked:
+        return {"resumed": 0, "reason": "none parked"}
+
+    resumed = []
+    for job_id in parked:
+        # Claim-by-rowcount: only a still-parked row may flip. A row that
+        # changed underneath (manual cancel/re-drive) is skipped untouched.
+        claimed = ScrapeJob.objects.filter(
+            pk=job_id, status=ScrapeJob.STATUS_BROWSER_UNAVAILABLE
+        ).update(status=ScrapeJob.STATUS_PENDING)
+        if not claimed:
+            continue
+        try:
+            dispatch_scrape_job(job_id)
+            resumed.append(job_id)
+            logger.info(
+                "browser-park resumer: job %d re-dispatched (browser_service healthy)",
+                job_id,
+            )
+        except Exception as exc:
+            # The row is PENDING with a stamped task id only if publish
+            # succeeded; dispatch_scrape_job reverts the stamp on failure, so
+            # put the row back where the next tick can find it.
+            ScrapeJob.objects.filter(
+                pk=job_id, status=ScrapeJob.STATUS_PENDING
+            ).update(status=ScrapeJob.STATUS_BROWSER_UNAVAILABLE)
+            logger.warning(
+                "browser-park resumer: job %d dispatch failed (%s) — still parked",
+                job_id, exc,
+            )
+    return {"resumed": len(resumed), "jobs": resumed}
+
+
 @shared_task
 def redispatch_abandoned_pending() -> dict:
     """Recover PENDING rows that were never dispatched — ONE row per sweep.
@@ -1930,12 +2007,17 @@ def _do_schedule_next_site() -> dict:
         ScrapeJob.STATUS_RUNNING,
         ScrapeJob.STATUS_PENDING,
         ScrapeJob.STATUS_WAITING_APPROVAL,
+        # [wave-16 B3] Parked jobs are unfinished work the resumer will bring
+        # back — counting them holds the auto-scheduler so an outage doesn't
+        # manufacture a fresh parked job every 5-min tick.
+        ScrapeJob.STATUS_BROWSER_UNAVAILABLE,
     }
     active_count = ScrapeJob.objects.filter(status__in=active_statuses).count()
     if active_count:
         return {
             "action": "skipped",
-            "reason": f"{active_count} active job(s) (RUNNING/PENDING/WAITING_APPROVAL)",
+            "reason": f"{active_count} active job(s) "
+            "(RUNNING/PENDING/WAITING_APPROVAL/BROWSER_UNAVAILABLE)",
         }
 
     new_site = (

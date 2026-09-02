@@ -30,6 +30,52 @@ SCRAPER_CHROME_LAZY = os.environ.get("SCRAPER_CHROME_LAZY", "1") == "1"
 # Chrome already pins an explicit user-agent (below); without that override
 # headless advertises "HeadlessChrome" and gets flagged.
 MCP_HEADLESS = os.environ.get("CHROME_HEADLESS", "0") == "1"
+# B1-6: a promoted (resident) Scraper Chrome with no work for this long is
+# stopped again by the maintenance cycle — it relaunches lazily on the next
+# /scrape, so recycling is invisible to callers but releases its RSS floor.
+SCRAPER_RECYCLE_IDLE_S = float(os.environ.get("SCRAPER_RECYCLE_IDLE_S", "1800"))
+
+# B1-1: both resident Chromes used to spawn with stdout=PIPE and NO reader —
+# the 64KB pipe fills, Chrome blocks on its next log write (its CDP IO thread
+# among them) and the instance presents as "process alive, CDP dead": the prod
+# wedge signature (mcp_cdp_alive=false for 8+h while mcp_process=true). They
+# now drain to a rotated file — the pipe never exists, Chrome never blocks,
+# and the log stays inspectable. Same one-generation rotation shape as
+# server.py's MCP-node log.
+CHROME_LOG_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _chrome_log_path(label: str) -> str:
+    return f"/tmp/chrome-{label}-stdout.log"
+
+
+def _open_chrome_log(label: str):
+    """Open the append-mode drain file for a persistent Chrome's stdout,
+    rotating an oversized log aside first. Returns DEVNULL if /tmp refuses —
+    a logging outage must never block the launch itself."""
+    path = _chrome_log_path(label)
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > CHROME_LOG_MAX_BYTES:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+    try:
+        return open(path, "ab")
+    except OSError:
+        return subprocess.DEVNULL
+
+
+def _tail_chrome_log(label: str, n: int = 500) -> str:
+    """Last ``n`` chars of a Chrome's drain file (for exit-immediately errors)."""
+    path = _chrome_log_path(label)
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 2000))
+            return fh.read().decode("utf-8", "replace")[-n:]
+    except OSError:
+        return ""
 
 
 class BrowserPool:
@@ -176,6 +222,37 @@ class BrowserPool:
                 return False
             logger.info("ensure_scraper_chrome: Scraper Chrome launched (lazy start)")
             return True
+
+    def stop_scraper_chrome(self) -> None:
+        """Tear down the resident Scraper Chrome and return it to the lazy
+        state (B1-6 idle recycling — the maintenance cycle calls this once the
+        Chrome has sat idle past SCRAPER_RECYCLE_IDLE_S).
+
+        Resets ``_scraper_chrome_started`` so ``scraper_chrome_state()`` reads
+        ``lazy_idle`` again (not ``down``): /health stays green and the
+        liveness loop keeps skipping a deliberately-unstarted Chrome.
+        ``ensure_scraper_chrome()`` relaunches on the next /scrape, so
+        recycling is invisible to callers.
+        """
+        with self._restart_lock:
+            proc = self._scraper_chrome_proc
+            if proc and proc.poll() is None:
+                logger.info("stop_scraper_chrome: terminating PID %d", proc.pid)
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._kill_process_tree(proc)
+                except Exception:
+                    pass
+            self._scraper_chrome_proc = None
+            self._scraper_chrome_started = False
+            logger.info("Scraper Chrome stopped (returned to lazy_idle)")
+
+    def xvfb_alive(self) -> bool:
+        """True while the Xvfb process (if one was started) is still running."""
+        proc = self._xvfb_proc
+        return proc is not None and proc.poll() is None
 
     def check_cdp_liveness(self) -> dict:
         """Actually probe CDP endpoints via HTTP (process alive != CDP responsive).
@@ -380,28 +457,33 @@ class BrowserPool:
                 args.append("--headless=new")
             else:
                 args.append(f"--display={DISPLAY}")
-            self._mcp_chrome_proc = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                # headless: no --display flag above and NO DISPLAY in the env —
-                # a stray empty DISPLAY var pointing at no X server used to leak in
-                env={
-                    k: v
-                    for k, v in os.environ.items()
-                    if not (mcp_headless and k == "DISPLAY")
-                },
-                start_new_session=True,
-            )
+            # B1-1: drain stdout to a rotated file, never PIPE — an unread
+            # PIPE fills at 64KB and blocks Chrome's CDP thread (the wedge).
+            # The parent-side handle closes right after spawn: the child holds
+            # its own dup, and nothing here ever reads the handle.
+            _log_fh = _open_chrome_log("mcp")
+            try:
+                self._mcp_chrome_proc = subprocess.Popen(
+                    args,
+                    stdout=_log_fh,
+                    stderr=subprocess.STDOUT,
+                    # headless: no --display flag above and NO DISPLAY in the env —
+                    # a stray empty DISPLAY var pointing at no X server used to leak in
+                    env={
+                        k: v
+                        for k, v in os.environ.items()
+                        if not (mcp_headless and k == "DISPLAY")
+                    },
+                    start_new_session=True,
+                )
+            finally:
+                if _log_fh is not subprocess.DEVNULL:
+                    _log_fh.close()
             time.sleep(3)
             if self._mcp_chrome_proc.poll() is not None:
-                stdout = (
-                    self._mcp_chrome_proc.stdout.read().decode()[:500]
-                    if self._mcp_chrome_proc.stdout
-                    else ""
-                )
                 errors.append(
-                    f"MCP Chrome exited immediately with code {self._mcp_chrome_proc.returncode}: {stdout}"
+                    f"MCP Chrome exited immediately with code {self._mcp_chrome_proc.returncode}: "
+                    f"{_tail_chrome_log('mcp')}"
                 )
                 self._mcp_chrome_proc = None
             else:
@@ -453,22 +535,24 @@ class BrowserPool:
             ]
             if not DISPLAY:
                 args.append("--headless=new")
-            self._scraper_chrome_proc = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                env={**os.environ, "DISPLAY": DISPLAY},
-                start_new_session=True,
-            )
+            # B1-1: same pipe-wedge fix as the MCP Chrome — drain to file.
+            _log_fh = _open_chrome_log("scraper")
+            try:
+                self._scraper_chrome_proc = subprocess.Popen(
+                    args,
+                    stdout=_log_fh,
+                    stderr=subprocess.STDOUT,
+                    env={**os.environ, "DISPLAY": DISPLAY},
+                    start_new_session=True,
+                )
+            finally:
+                if _log_fh is not subprocess.DEVNULL:
+                    _log_fh.close()
             time.sleep(3)
             if self._scraper_chrome_proc.poll() is not None:
-                stdout = (
-                    self._scraper_chrome_proc.stdout.read().decode()[:500]
-                    if self._scraper_chrome_proc.stdout
-                    else ""
-                )
                 errors.append(
-                    f"Scraper Chrome exited immediately with code {self._scraper_chrome_proc.returncode}: {stdout}"
+                    f"Scraper Chrome exited immediately with code {self._scraper_chrome_proc.returncode}: "
+                    f"{_tail_chrome_log('scraper')}"
                 )
                 self._scraper_chrome_proc = None
             else:

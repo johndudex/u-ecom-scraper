@@ -526,6 +526,21 @@ def get_shell_tools(
                 # executed, CRASH verdict). error_class is the 404 bucket.
                 if _res.error_class == "not_found":
                     return "Scraper rejected by browser_service (source invalid)"
+                # [wave-16 B3] The gateway named an infra class on its 502/503
+                # body (or was unreachable after the full ladder). Tell the
+                # agent EXACTLY that, so the report blames infrastructure —
+                # not the strategy (a switch against a dead gateway lies) and
+                # not the code (a rewrite cannot fix a downed service).
+                if _res.unavailable:
+                    return (
+                        "BROWSER_SERVICE_UNAVAILABLE: the browser-service "
+                        "gateway itself cannot serve this run "
+                        f"({_res.error or _res.error_class}). This is an "
+                        "infrastructure outage, NOT a site or scraper problem "
+                        "— do not strategy-switch and do not rewrite the "
+                        "scraper; record the phase as not testable due to the "
+                        "outage."
+                    )
                 if not _res.ok:
                     return (
                         f"Scraper run failed ({_res.error_class}): {_res.error}"

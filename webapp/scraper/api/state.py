@@ -22,6 +22,10 @@ _STATE_MAP = {
     "pending": "inprogress",
     "running": "inprogress",
     "waiting_approval": "inprogress",
+    # [wave-16 B3] Dependency park is TRANSIENT (the beat resumer re-dispatches
+    # once browser_service /health recovers) — the honest projection is
+    # "inprogress", not the unknown-status fallback "failed".
+    "browser_unavailable": "inprogress",
     "completed": "scraper_ready",
     "failed": "failed",
     "cancelled": "failed",

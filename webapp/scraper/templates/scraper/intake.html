@@ -1824,6 +1824,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     if(status==='completed'){cls='pill pill-ok'; lbl='COMPLETED';}
     else if(status==='failed'||status==='cancelled'){cls='pill pill-cancelled'; lbl=lbl||'CANCELLED';}
     else if(status==='captcha_blocked'||status==='akamai_blocked'){cls='pill pill-cancelled'; lbl=lbl;}
+    else if(status==='browser_unavailable'){cls='pill pill-running'; lbl='PARKED — RESUMES WHEN BROWSER SERVICE RECOVERS';}
     else if(status==='pending'){cls='pill'; lbl='PENDING';}
     pill.className=cls; pill.innerHTML=icon+' '+lbl;
     if(isTerminal){

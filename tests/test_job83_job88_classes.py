@@ -319,8 +319,11 @@ class TestHttpNavigationZeroExit:
     def test_zero_discovery_guard_exits_three(self):
         src = self._template()
         i = src.index("if not discovered_urls and not args.discover_only:")
-        block = src[i : i + 1200]
+        # [wave-16 B3] widened: the guard now also prints the NAVIGATE_UNAVAILABLE
+        # infra marker before the exit, so the exit sits deeper in the block.
+        block = src[i : i + 1800]
         assert "DISCOVERY_ZERO" in block
+        assert "NAVIGATE_UNAVAILABLE:" in block
         assert "sys.exit(3)" in block
         assert "sys.exit(0)" not in block
 

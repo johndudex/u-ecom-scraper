@@ -304,11 +304,17 @@ def _navigate(url, actions=None, extract=None, retry=0):
                               an error item without burning the retry budget
 
     The `retry` arg is a backoff-exponent floor (callers may pre-bias it).
-    Returns None only after all MAX_RETRIES attempts are exhausted — EXCEPT a
-    429-exhaustion, which returns a terminal throttled dict
-    (``{"success": False, "throttled": True, "status": 429, ...}``) so discovery
-    can emit stop_reason="navigate_throttled": backpressure is INCONCLUSIVE
-    coverage (the run was refused, not beaten), never a strategy verdict.
+    Returns None only after all MAX_RETRIES attempts are exhausted — EXCEPT:
+      - a 429-exhaustion returns a terminal throttled dict
+        (``{"success": False, "throttled": True, "status": 429, ...}``), and
+      - an infrastructure exhaustion (browser-service 502/503 — the GATEWAY is
+        down, not the site) returns a terminal ``navigate_unavailable`` dict
+        carrying ``server_error_class`` + the server's error text (B3: prod
+        #210 burned 3 writer rounds patching retry code against a dead gateway
+        because the 502 body was discarded and logged at DEBUG).
+    so discovery can emit stop_reason="navigate_throttled" /
+    "navigate_unavailable": both are INCONCLUSIVE coverage (refused, not
+    beaten), never a strategy verdict.
     """
     payload = {
         "url": url,
@@ -326,6 +332,7 @@ def _navigate(url, actions=None, extract=None, retry=0):
     }
     endpoint = f"{BROWSER_SERVICE_URL}/navigate"
     last_throttled = False
+    last_unavailable: dict = {}
     for attempt in range(MAX_RETRIES):
         try:
             r = httpx.post(endpoint, json=payload, timeout=NAVIGATE_TIMEOUT + 30)
@@ -349,19 +356,42 @@ def _navigate(url, actions=None, extract=None, retry=0):
                 # Retry-After: header first (server emits it), then the JSON
                 # body's retry_after (older server builds) — neither → 5s.
                 retry_after = r.headers.get("Retry-After")
+                body: dict = {}
+                try:
+                    body = r.json() or {}
+                except ValueError:
+                    body = {}
                 if not retry_after:
-                    try:
-                        retry_after = (r.json() or {}).get("retry_after")
-                    except ValueError:
-                        retry_after = None
+                    retry_after = body.get("retry_after")
                 try:
                     retry_after = int(retry_after)
                 except (TypeError, ValueError):
                     retry_after = 5
-                logger.debug(
-                    "navigate: %d on %s, backing off %ds (attempt %d/%d)",
-                    r.status_code, url[:60], retry_after, attempt + 1, MAX_RETRIES,
-                )
+                if r.status_code in (502, 503):
+                    # B3: keep the server's own diagnosis — this is the
+                    # artifact that one-lines a gateway outage RCA.
+                    last_unavailable = {
+                        "status": r.status_code,
+                        "server_error_class": body.get("error_class") or "",
+                        "error": str(body.get("error") or r.text or "")[:300],
+                    }
+                    global _nav_unavailable_status, _nav_unavailable_class
+                    _nav_unavailable_status = r.status_code
+                    _nav_unavailable_class = last_unavailable["server_error_class"]
+                    # First and last attempts go to WARNING (the old DEBUG-only
+                    # log is why job #210's 71×502s were invisible in the draft).
+                    if attempt == 0 or attempt == MAX_RETRIES - 1:
+                        logger.warning(
+                            "navigate: BROWSER-SERVICE %d on %s (attempt %d/%d) error_class=%s error=%s",
+                            r.status_code, url[:60], attempt + 1, MAX_RETRIES,
+                            last_unavailable["server_error_class"] or "-",
+                            last_unavailable["error"][:160] or "-",
+                        )
+                else:
+                    logger.debug(
+                        "navigate: %d on %s, backing off %ds (attempt %d/%d)",
+                        r.status_code, url[:60], retry_after, attempt + 1, MAX_RETRIES,
+                    )
                 time.sleep(retry_after)
                 continue
         except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
@@ -374,11 +404,45 @@ def _navigate(url, actions=None, extract=None, retry=0):
         time.sleep(min(BACKOFF_BASE ** (attempt + retry), 30))
 
     logger.warning("navigate: exhausted %d retries on %s", MAX_RETRIES, url[:80])
+    if last_unavailable:
+        # Gateway down (502/503 persisted across the whole retry ladder):
+        # terminal marker dict so discovery records navigate_unavailable —
+        # an INFRASTRUCTURE verdict, never a site/strategy failure.
+        return {
+            "success": False,
+            "navigate_unavailable": True,
+            "url": url,
+            "html": "",
+            **last_unavailable,
+        }
     if last_throttled:
         # Throttle, not breakage: terminal marker dict so discovery records
         # navigate_throttled (INCONCLUSIVE) instead of navigate_error (FAIL).
         return {"success": False, "throttled": True, "status": 429, "url": url, "html": ""}
     return None
+
+
+def _nav_fail_reason(resp) -> str:
+    """Stop reason for a failed ``_navigate`` call (B3).
+
+    ``navigate_unavailable`` — browser-service itself refused/crashed (502/503
+    terminal dict): infrastructure, INCONCLUSIVE. ``navigate_throttled`` — 429
+    backpressure. ``navigate_error`` — everything else (block, 5xx from the
+    site, transport exhaustion): a real strategy-level FAIL.
+    """
+    if isinstance(resp, dict):
+        if resp.get("navigate_unavailable"):
+            return "navigate_unavailable"
+        if resp.get("throttled"):
+            return "navigate_throttled"
+    return "navigate_error"
+
+
+# B3: last browser-service outage detail seen by ``_navigate`` — read by main()
+# when discovery ends with zero URLs so the NAVIGATE_UNAVAILABLE stderr marker
+# carries the status/error_class the cascade should park on.
+_nav_unavailable_status = 0
+_nav_unavailable_class = ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -509,6 +573,10 @@ def _get_next_page_url(final_url: str, next_page_num: int, html: str = None) -> 
 # MUST outrank exhaustion reasons, otherwise the coverage gate false-PASSes a
 # blocked scraper. See docs/discovery-coverage-gate-contract.md §2.
 _STOP_REASON_PRIORITY = {
+    "navigate_unavailable": 6,  # INCONCLUSIVE-INFRA — browser-service itself is
+    #                         down (502/503 across the ladder). The GATEWAY
+    #                         failed, not the site: must outrank navigate_error
+    #                         so the cascade parks instead of "fixing" code.
     "navigate_error": 5,   # FAIL  — gave up due to 502/503/block (NOT exhaustion)
     "empty_first_page": 5,  # FAIL  — [job-58] zero URLs, no hard error = the
     #                         "200-but-blocked" signature (challenge/consent
@@ -658,13 +726,12 @@ def _discover_urls_via_search(
     resp = _navigate(search_url, actions=actions)
     if not resp or not resp.get("success"):
         blocked = bool(resp and resp.get("blocked"))
-        throttled = bool(resp and resp.get("throttled"))
+        fail_reason = _nav_fail_reason(resp)
         logger.error(
-            "Phase 1: search navigate failed for %s%s%s",
-            search_url, " (blocked)" if blocked else "",
-            " (throttled)" if throttled else "",
+            "Phase 1: search navigate failed for %s%s (stop_reason=%s)",
+            search_url, " (blocked)" if blocked else "", fail_reason,
         )
-        return [], "navigate_throttled" if throttled else "navigate_error"
+        return [], fail_reason
 
     final_url = resp.get("url") or search_url
     html = resp.get("html", "")
@@ -699,12 +766,12 @@ def _discover_urls_via_search(
             # H4 false-pass guard: _navigate exhausted retries on 429/502/503
             # (or hit a block). This is NOT exhaustion — surface it so the
             # coverage gate can FAIL the run instead of declaring success.
-            # A 429-exhaustion is navigate_throttled (INCONCLUSIVE): the run
-            # was refused by browser-service backpressure, not beaten by the site.
-            logger.warning("Phase 1: page %d navigate failed, stopping", current_page + 1)
-            stop_reason = (
-                "navigate_throttled" if (resp and resp.get("throttled"))
-                else "navigate_error"
+            # A 429-exhaustion is navigate_throttled and a gateway 502/503 is
+            # navigate_unavailable (both INCONCLUSIVE): the run was refused by
+            # browser-service, not beaten by the site.
+            stop_reason = _nav_fail_reason(resp)
+            logger.warning(
+                "Phase 1: page %d navigate failed, stopping (%s)", current_page + 1, stop_reason
             )
             break
 
@@ -916,13 +983,12 @@ def _discover_urls_via_category(
     resp = _navigate(category_url)
     if not resp or not resp.get("success"):
         blocked = bool(resp and resp.get("blocked"))
-        throttled = bool(resp and resp.get("throttled"))
+        fail_reason = _nav_fail_reason(resp)
         logger.error(
-            "Phase 1: category navigate failed for %s%s%s",
-            category_url, " (blocked)" if blocked else "",
-            " (throttled)" if throttled else "",
+            "Phase 1: category navigate failed for %s%s (stop_reason=%s)",
+            category_url, " (blocked)" if blocked else "", fail_reason,
         )
-        return [], "navigate_throttled" if throttled else "navigate_error"
+        return [], fail_reason
 
     final_url = resp.get("url") or category_url
     html = resp.get("html", "")
@@ -947,10 +1013,7 @@ def _discover_urls_via_category(
         logger.info("Phase 1: Category page %d", current_page + 1)
         resp = _navigate(next_url)
         if not resp or not resp.get("success"):
-            stop_reason = (
-                "navigate_throttled" if (resp and resp.get("throttled"))
-                else "navigate_error"
-            )
+            stop_reason = _nav_fail_reason(resp)
             break
 
         final_url = resp.get("url") or next_url
@@ -1141,6 +1204,15 @@ def _extract_item(item_url: str, src_url: str) -> dict:
     resp = _navigate(item_url)
     if not resp:
         return _error_item(item_url, src_url, "navigate failed after retries")
+    if resp.get("navigate_unavailable"):
+        # B3: the gateway, not the site — carry the server's diagnosis into
+        # the error item so a gateway-outage run is identifiable in output.
+        return _error_item(
+            item_url,
+            src_url,
+            "browser-service unavailable"
+            + (f" ({resp.get('server_error_class') or 'http ' + str(resp.get('status'))})" if resp.get("server_error_class") or resp.get("status") else ""),
+        )
     if resp.get("blocked"):
         return _error_item(item_url, src_url, "blocked (anti-bot wall)")
     if resp.get("status_code") == 404:
@@ -1382,6 +1454,17 @@ def main():
             "DISCOVERY_ZERO: no item URLs discovered under the given listing",
             file=sys.stderr,
         )
+        if aggregate_stop_reason == "navigate_unavailable":
+            # B3: the infra verdict must survive this exit — run_execution's
+            # diagnosed-failure branch reads stderr, and NAVIGATE_UNAVAILABLE
+            # (like DISCOVERY_ZERO) is a parseable marker, not prose. Without it
+            # a browser-service outage is indistinguishable from a site-shape
+            # failure and the cascade burns the whole strategy ladder on it.
+            print(
+                "NAVIGATE_UNAVAILABLE: browser-service unavailable during discovery"
+                f" (status={_nav_unavailable_status} error_class={_nav_unavailable_class})",
+                file=sys.stderr,
+            )
         sys.exit(3)
 
     # ── Phase 2: Extract data concurrently (--discover-only skips it) ────────

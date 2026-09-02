@@ -3491,6 +3491,49 @@ def _escalate_strategy(
 _EXECUTION_RECYCLE_MAX = 1
 
 
+def _park_browser_unavailable(state: ScrapeState) -> Command:
+    """[wave-16 B3] Dependency park — browser_service itself cannot serve.
+
+    Terminal like the captcha/akamai park (check_accessibility), but
+    NON-terminal on the job row: the status written is browser_unavailable
+    (resumable), the beat resumer (tasks.resume_browser_unavailable_jobs)
+    re-dispatches the row once /health recovers, and check_tracker's skip
+    flags make that re-run resume from the right phase. _finalize_job skips
+    browser_unavailable rows so its COMPLETED/FAILED ladder cannot overwrite
+    the park.
+    """
+    job_id = state.get("job_id", 0)
+    detail = str(
+        state.get("browser_unavailable_detail")
+        or state.get("error_message")
+        or ""
+    )
+    if not detail:
+        # route_after_testing's park arm arrives via a routing function, which
+        # cannot mutate state — recover the reason from the test report.
+        _cov = state.get("test_report")
+        _cov = _cov.get("discovery_coverage") if isinstance(_cov, dict) else {}
+        if isinstance(_cov, dict) and _cov.get("stop_reason") == "navigate_unavailable":
+            detail = "discovery ended navigate_unavailable (browser_service /navigate down)"
+    detail = detail or "browser_service unavailable"
+    from .tools.browser_http import park_job_for_browser_service
+
+    park_job_for_browser_service(
+        job_id,
+        f"browser_service unavailable — job parked, auto-resumes when it "
+        f"recovers. Detail: {detail}",
+    )
+    _notify_phase(job_id, "parked_browser_service", "done")
+    logger.warning(
+        "park_browser_unavailable: job %s parked (browser_service down): %s",
+        job_id, detail[:200],
+    )
+    return Command(
+        update={"error_message": f"browser_service unavailable: {detail}"[:2000]},
+        goto=END,
+    )
+
+
 def _route_after_execution(state: ScrapeState):
     """Execution-phase strategy recycle on zero-item discovery failure.
 
@@ -3531,6 +3574,25 @@ def _route_after_execution(state: ScrapeState):
 
     if status == "SUCCESS" and items > 0:
         return Command(goto="cleanup")
+    # [wave-16 B3] Dependency park — browser_service itself could not serve
+    # this run (pre-flight unhealthy, classified 502/503 with an infra
+    # error_class, or discovery ended navigate_unavailable — run_execution
+    # normalizes ALL of these into a navigate_unavailable coverage verdict).
+    # The strategy was never given a fair window, so park instead of the
+    # crash-cleanup or the strategy ladder — neither can fix a dead gateway.
+    # The park is non-terminal: the beat resumer re-dispatches once /health
+    # recovers. Runs that extracted items regardless are a real result
+    # (transient nav noise that recovered), not an outage — they never park.
+    # (route_after_testing's tester-side park uses the browser_unavailable_
+    # detail state flag instead — different node, different failure surface.)
+    if (not (status == "SUCCESS" and items > 0)) and (
+        stop_reason == "navigate_unavailable"
+    ):
+        logger.warning(
+            "_route_after_execution: browser_service unavailable (job %s, "
+            "stop_reason=%s) — parking for auto-resume", job_id, stop_reason,
+        )
+        return Command(goto="park_browser_unavailable")
     # [T2.10/wave-13] A FAILED execution is not automatically a code problem:
     # the http_navigation template exits 3 with DISCOVERY_ZERO when Phase 1
     # ran cleanly and saw no item URLs — run_execution tags EXACTLY that shape
@@ -5170,6 +5232,32 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             )
     except Exception as _te_exc:
         logger.warning("_invoke_code_tester: draft entry guard failed: %s", _te_exc)
+    # [wave-16 B3] Pre-flight: bounded wait for browser_service health BEFORE
+    # the agent invocation. A blip self-heals inside the window; a real outage
+    # skips the invocation (the tester's browser run could only die against a
+    # dead gateway) and stamps the park detail — route_after_testing sees the
+    # flag ABOVE its no-report arms and parks the job (non-terminal,
+    # beat-resumed). This node must not Command-route (D6 union trap), so the
+    # router owns the destination.
+    try:
+        from .tools.browser_http import PREFLIGHT_MAX_WAIT_S as _CT_PFW
+        from .tools.browser_http import wait_for_browser_service as _ct_preflight
+
+        if not _ct_preflight():
+            logger.error(
+                "_invoke_code_tester: browser_service unhealthy before testing "
+                "(waited %ds for /health) — skipping invocation, parking (job %s)",
+                int(_CT_PFW), job_id,
+            )
+            return {
+                "messages": [],
+                "browser_unavailable_detail": (
+                    f"browser_service unhealthy before testing "
+                    f"(waited {int(_CT_PFW)}s for /health)"
+                ),
+            }
+    except ImportError:
+        logger.warning("_invoke_code_tester: pre-flight import failed — proceeding")
     try:
         logger.info("_invoke_code_tester: starting (job %s)", job_id)
         # [A6/job-73 RC1] Stamp the test START. _freshness_floor raises the
@@ -5547,6 +5635,23 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 "_invoke_code_tester: discovery probe ZERO-YIELD FAILED the "
                 "test (job %s, stop_reason=%s, retry_count=%s)",
                 job_id, _zsr, _retry_z,
+            )
+        elif probe_yield is not None and not isinstance(report, dict):
+            # [wave-16 B4] Dead-invocation path: the tester died before writing
+            # a verdict (job-217: Z.AI 429 → report None) but the deterministic
+            # probe still produced a healthy yield. Annotating the verdict that
+            # does not exist crashed HERE ('NoneType' object does not support
+            # item assignment), and str(exc) on the job row masked the real
+            # death. The sibling branches' ``report = report or {}`` is WRONG
+            # for this arm — a synthesized non-empty dict would bypass
+            # route_after_testing's no-report arms and read as a judged run.
+            # Log the evidence; leave test_report unset so the unjudged-run
+            # routing owns the decision.
+            logger.warning(
+                "_invoke_code_tester: probe yield %s URLs but the tester died "
+                "before writing a verdict — leaving test_report unset for the "
+                "unjudged-run routing (job %s)",
+                probe_yield.get("discovered_urls"), job_id,
             )
         elif probe_yield is not None:
             # Probe succeeded with real yield: make the self-reported
@@ -6746,6 +6851,9 @@ def build_scrape_graph(
     workflow.add_node("store_job_listings", _invoke_store_job_listings)
     # Generic human-in-the-loop handler (reached from many gates)
     workflow.add_node("human_approval", human_approval)
+    # [wave-16 B3] Dependency park: browser_service itself cannot serve.
+    # Command-routed terminal node — no static out-edge (like route_after_execution).
+    workflow.add_node("park_browser_unavailable", _park_browser_unavailable)
 
     # ── Wire edges ──────────────────────────────────────────────────────
 

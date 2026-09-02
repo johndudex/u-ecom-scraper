@@ -89,6 +89,12 @@ class ScrapeResult:
     transient: bool = False     # last failure was the retryable class
     throttled: bool = False     # a 429 was observed (backpressure signal)
     attempts: int = 0
+    # [wave-16 B3] The server's OWN diagnosis, surfaced verbatim from its
+    # classified 502/503 body (error_class ∈ {chrome_crash, memory_pressure,
+    # resource, ...}) so a gateway outage RCA is one log line, not an
+    # archaeology dig. Empty when the body carried nothing (or no body).
+    server_error_class: str = ""
+    body_error: str = ""
 
     @property
     def error_class(self) -> str:
@@ -100,6 +106,24 @@ class ScrapeResult:
         if self.throttled:
             return "throttled"
         return "transient" if self.transient else "fatal"
+
+    @property
+    def unavailable(self) -> bool:
+        """[wave-16 B3] browser_service itself said it cannot serve.
+
+        True when its classified error body named an infra class, or when it
+        was unreachable outright after every attempt (status None). This — not
+        a site-side failure — is what should park a job, never strategy-switch
+        it: the strategy was never given a fair window.
+        """
+        if not self.ok and self.status is None:
+            return True
+        return self.server_error_class in _SERVER_INFRA_CLASSES
+
+
+# error_class values browser_service stamps on its classified 502/503 bodies —
+# all meaning "the gateway/infrastructure failed", never "the site won".
+_SERVER_INFRA_CLASSES = frozenset({"chrome_crash", "memory_pressure", "resource"})
 
 
 def _retry_after_seconds(resp: httpx.Response | None) -> float:
@@ -155,10 +179,17 @@ def _summarize_failure(result: ScrapeResult) -> str:
         )
     if result.status is None:
         return f"browser_service unreachable after {result.attempts} attempt(s)"
-    return (
+    base = (
         f"browser_service returned HTTP {result.status} after "
         f"{result.attempts} attempt(s)"
     )
+    # B3: append the server's own classification so the artifact says WHY
+    # (chrome_crash / memory_pressure / resource) instead of a bare status.
+    if result.server_error_class:
+        base += f" error_class={result.server_error_class}"
+    if result.body_error:
+        base += f": {result.body_error[:160]}"
+    return base
 
 
 def post_scrape_with_retry(
@@ -239,6 +270,17 @@ def post_scrape_with_retry(
             result.transient = True
             if resp.status_code == HTTP_THROTTLED:
                 result.throttled = True
+            # B3: capture the server's own diagnosis from its classified body
+            # (present on every 502/503 browser_service emits since B2). The
+            # LAST one wins — it describes the state that exhausted the ladder.
+            try:
+                _body = resp.json() or {}
+            except ValueError:
+                _body = {}
+            if _body.get("error_class"):
+                result.server_error_class = str(_body["error_class"])[:60]
+            if _body.get("error"):
+                result.body_error = str(_body["error"])[:300]
             if attempt < max_attempts and _sleep_for_retry(resp, deadline):
                 continue
             break
@@ -273,3 +315,88 @@ def cancel_scrape(job_id: int, rid: str = "") -> dict:
     except Exception as exc:
         logger.warning("cancel_scrape(job=%s): browser_service unreachable: %s", job_id, exc)
         return {"requested": False, "error": str(exc)[:200]}
+
+
+# ── [wave-16 B3] dependency health: probe, bounded pre-flight, park ────────
+# A browser_service outage used to be indistinguishable from a site failure:
+# the cascade strategy-switched (or the executor burned its ladder) against an
+# infrastructure that could not serve ANY strategy. Now callers can ask "is
+# the gateway healthy", wait briefly for it, and PARK the job when it is not —
+# a beat task resumes parked jobs once /health recovers.
+
+HEALTH_TIMEOUT_S = 6.0
+PREFLIGHT_MAX_WAIT_S = float(os.environ.get("BROWSER_SERVICE_PREFLIGHT_WAIT_S", "120"))
+PREFLIGHT_POLL_S = 10.0
+# [wave-16 B3] Beat-resumer batch (oldest parked first) per tick — small by
+# design: the scrape worker pool is 2 slots, so a stampede only queues anyway.
+BROWSER_RESUME_BATCH = int(os.environ.get("BROWSER_RESUME_BATCH", "3"))
+
+
+def browser_service_healthy() -> bool:
+    """True only when browser_service answers /health with status "ok".
+
+    A 503 (degraded), a transport error, or a non-JSON body are all False.
+    Deliberately strict: the callers use this to decide between proceeding
+    and parking, and a "maybe" must read as "no" — a job parked a few extra
+    minutes costs an idle slot, a job dispatched into a dead gateway burns a
+    full run.
+    """
+    try:
+        resp = httpx.get(
+            f"{BROWSER_SERVICE_URL}/health", timeout=HEALTH_TIMEOUT_S
+        )
+        if resp.status_code != 200:
+            return False
+        return bool((resp.json() or {}).get("status") == "ok")
+    except Exception:
+        return False
+
+
+def wait_for_browser_service(
+    max_wait_s: float | None = None, poll_s: float = PREFLIGHT_POLL_S
+) -> bool:
+    """Bounded pre-flight: poll /health until healthy or the window closes.
+
+    Used before the expensive phases (code_tester runs, execution). A short
+    transient blip self-heals inside the window and the phase proceeds
+    untouched; a real outage returns False so the caller can park the job
+    instead of feeding a dead gateway a full run.
+    """
+    deadline = time.monotonic() + max(0.0, float(
+        PREFLIGHT_MAX_WAIT_S if max_wait_s is None else max_wait_s
+    ))
+    while True:
+        if browser_service_healthy():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_s)
+
+
+def park_job_for_browser_service(job_id: int, reason: str) -> bool:
+    """Park a job on STATUS_BROWSER_UNAVAILABLE with the outage detail.
+
+    Mirrors the captcha/akamai park (check_accessibility) but NON-terminal:
+    completed_at is left unset and the beat resumer re-dispatches the row
+    (check_tracker's skip flags make that re-run resume from the right phase)
+    once browser_service /health recovers. Never raises — a park that fails
+    falls back to the job's normal failure handling.
+    """
+    try:
+        from scraper.models import ScrapeJob
+
+        updated = ScrapeJob.objects.filter(pk=job_id).update(
+            status=ScrapeJob.STATUS_BROWSER_UNAVAILABLE,
+            error_message=str(reason)[:2000],
+        )
+        if updated:
+            logger.warning(
+                "park_job_for_browser_service: job %s parked (browser_service "
+                "unavailable): %s", job_id, str(reason)[:200],
+            )
+        return bool(updated)
+    except Exception as exc:
+        logger.error(
+            "park_job_for_browser_service(job=%s) failed: %s", job_id, exc
+        )
+        return False

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import sys
 import types
 
@@ -188,7 +189,13 @@ class TestNavigateWiring:
         with open(os.path.join(ROOT, "browser_service", "server.py")) as fh:
             src = fh.read()
         assert "_is_chrome_death(err) or _is_target_closed(err)" in src
-        assert "_is_chrome_death(str(exc)) or _is_target_closed(str(exc))" in src
+        # [wave-16 B2] The /navigate arm classifies via the err_str union and
+        # extends it with the launch-stage heuristic — infra deaths stay
+        # 503-crash, site pages stay 502-fail, launch-stage gets a heal round.
+        assert re.search(r"_is_chrome_death\(\s*err_str\s*\)", src)
+        assert re.search(r"_is_target_closed\(\s*err_str\s*\)", src)
+        assert "launch_stage = _is_launch_stage_failure(err_str)" in src
+        assert "healable = infra_death or resource or launch_stage" in src
 
 
 class TestRestartCooldown:

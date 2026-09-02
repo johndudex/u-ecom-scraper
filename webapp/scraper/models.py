@@ -122,6 +122,11 @@ class ScrapeJob(models.Model):
     STATUS_CANCELLED = "cancelled"
     STATUS_CAPTCHA_BLOCKED = "captcha_blocked"
     STATUS_AKAMAI_BLOCKED = "akamai_blocked"
+    # [wave-16 B3] Dependency park: browser_service is down/degraded, so the
+    # job cannot make honest progress. NOT terminal — the beat resumer
+    # (tasks.resume_browser_unavailable_jobs) re-dispatches these rows once
+    # /health recovers. Deliberately NOT in _TERMINAL_JOB_STATUSES.
+    STATUS_BROWSER_UNAVAILABLE = "browser_unavailable"
 
     STATUS_CHOICES = [
         (STATUS_PENDING, "Pending"),
@@ -132,6 +137,7 @@ class ScrapeJob(models.Model):
         (STATUS_CANCELLED, "Cancelled"),
         (STATUS_CAPTCHA_BLOCKED, "Captcha Blocked"),
         (STATUS_AKAMAI_BLOCKED, "Akamai Blocked"),
+        (STATUS_BROWSER_UNAVAILABLE, "Browser Service Unavailable"),
     ]
 
     # 1000 per sync_api.yaml (was default 200) — catalog-only widen on Postgres

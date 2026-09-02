@@ -146,6 +146,10 @@
         .status-failed { background: rgba(248, 113, 113, 0.1); color: #F87171; }
         .status-cancelled { background: rgba(100, 116, 139, 0.1); color: #64748B; }
         .status-captcha_blocked { background: rgba(251, 191, 36, 0.1); color: #FBBF24; }
+        /* [wave-16 B3] Dependency park: amber like the parks, but pulsing —
+           the beat resumer auto-resumes it when browser_service recovers. */
+        .status-browser_unavailable { background: rgba(251, 191, 36, 0.1); color: #FBBF24; }
+        .status-browser_unavailable::before { animation: pulse-dot 2s ease-in-out infinite; }
         .status-new { background: rgba(100, 116, 139, 0.12); color: #94A3B8; }
         .status-in_progress, .status-scraping { background: rgba(96, 165, 250, 0.1); color: #60A5FA; }
         .status-in_progress::before, .status-scraping::before { animation: pulse-dot 2s ease-in-out infinite; }

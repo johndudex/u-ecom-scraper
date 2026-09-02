@@ -257,8 +257,9 @@ class TestW2ProcessGroups:
         assert "import signal" in src
         assert "def _kill_process_tree" in src
         assert "os.killpg(os.getpgid(proc.pid), signal.SIGKILL)" in src
-        # both wedged-process paths (mid-restart + shutdown) route through it
-        assert src.count("self._kill_process_tree(proc)") == 2
+        # all three wedged-process paths (W9 lazy-stop, generic stop, shutdown)
+        # route through it — [wave-16 B1] added the third with the lazy Chrome
+        assert src.count("self._kill_process_tree(proc)") == 3
         # the only per-PID kill left is _kill_process_tree's group-gone fallback
         helper = re.search(
             r"def _kill_process_tree.*?(?=\n    def |\Z)", src, re.DOTALL

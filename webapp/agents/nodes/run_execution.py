@@ -1301,7 +1301,11 @@ def _run_via_browser_service(
 ) -> dict[str, Any]:
     import httpx
 
-    from ..tools.browser_http import post_scrape_with_retry
+    from ..tools.browser_http import (
+        PREFLIGHT_MAX_WAIT_S,
+        post_scrape_with_retry,
+        wait_for_browser_service,
+    )
 
     # QW-0 Step emits (deferred like the heartbeat import below — graph
     # imports this node module).
@@ -1310,6 +1314,28 @@ def _run_via_browser_service(
     _exec_job_id = (state or {}).get("job_id", 0)
 
     service_url = _get_browser_service_url()
+
+    # [wave-16 B3] Pre-flight: bounded wait for browser_service /health before
+    # handing it a full run. A short blip self-heals inside the window; a real
+    # outage parks the job (non-terminal, beat-resumed) instead of feeding a
+    # dead gateway a full execution that reads as a strategy failure.
+    if not wait_for_browser_service():
+        _notify_phase(_exec_job_id, "execution", "failed")
+        return {
+            "execution_status": "FAILED",
+            "browser_unavailable_detail": (
+                f"browser_service unhealthy before execution "
+                f"(waited {int(PREFLIGHT_MAX_WAIT_S)}s for /health)"
+            ),
+            # [wave-16 B3] Normalized into the coverage verdict so
+            # _route_after_execution parks this with every other infra
+            # failure (it routes on stop_reason alone).
+            "discovery_coverage": {
+                "ran_phase1": False,
+                "discovered_urls": 0,
+                "stop_reason": "navigate_unavailable",
+            },
+        }
     stealth_env = _stealth_env(state) if state else {}
     # DETERMINISTIC DISCOVERY: inject SCRAPER_LISTING_URL into the browser_service
     # env_overrides so it reaches the scraper subprocess. M6: single source of
@@ -1398,6 +1424,26 @@ def _run_via_browser_service(
                 "error_message": "Scraper rejected by browser_service (source invalid)",
             }
 
+        # [wave-16 B3] The gateway itself named an infra class (chrome_crash /
+        # memory_pressure / resource) on its classified 502/503 body, or was
+        # unreachable outright after the full retry ladder. The strategy was
+        # never given a fair window — route to the dependency park, never the
+        # strategy ladder (a strategy switch against dead infra lies).
+        if _res.unavailable:
+            _notify_phase(_exec_job_id, "execution", "failed")
+            return {
+                "execution_status": "FAILED",
+                "browser_unavailable_detail": _res.error
+                or f"browser_service unavailable (error_class={_res.server_error_class})",
+                # Same normalization as the pre-flight arm above: infra
+                # failures read as navigate_unavailable coverage, which parks.
+                "discovery_coverage": {
+                    "ran_phase1": False,
+                    "discovered_urls": 0,
+                    "stop_reason": "navigate_unavailable",
+                },
+            }
+
         if not _res.ok:
             return {
                 "execution_status": "FAILED",
@@ -1415,27 +1461,45 @@ def _run_via_browser_service(
             # path: the template's rc=3 exit is a zero-discovery verdict, not
             # a crash — the listing fallback and the strategy recycle must
             # both see it.
-            if result.get("returncode") == 3 or "DISCOVERY_ZERO" in (
-                result.get("stderr") or ""
-            ):
+            # [wave-16 B3] The template prints NAVIGATE_UNAVAILABLE on stderr
+            # when discovery ended zero because browser_service /navigate was
+            # itself down — an infrastructure verdict, not a site one. Reclass
+            # the stop_reason and carry the detail so _route_after_execution
+            # parks the job instead of recycling the strategy ladder.
+            _stderr = result.get("stderr") or ""
+            _nav_unavailable = "NAVIGATE_UNAVAILABLE:" in _stderr
+            if result.get("returncode") == 3 or "DISCOVERY_ZERO" in _stderr:
                 logger.error(
-                    "run_execution: DISCOVERY_ZERO (browser_service, rc=%s) — "
+                    "run_execution: DISCOVERY_ZERO (browser_service, rc=%s%s) — "
                     "tagging zero-discovery for fallback/recycle",
                     result.get("returncode"),
+                    ", browser_service unavailable" if _nav_unavailable else "",
                 )
-                return {
+                _cov = {
+                    "ran_phase1": True,
+                    "discovered_urls": 0,
+                    "stop_reason": "empty_first_page",
+                    "zero_discovery_exit": True,
+                }
+                _failed = {
                     "execution_status": "FAILED",
                     "no_fresh_output": True,
-                    "discovery_coverage": {
-                        "ran_phase1": True,
-                        "discovered_urls": 0,
-                        "stop_reason": "empty_first_page",
-                        "zero_discovery_exit": True,
-                    },
+                    "discovery_coverage": _cov,
                     "error_message": (
                         f"Scraper exited with code {result['returncode']}. {stderr}"
                     ),
                 }
+                if _nav_unavailable:
+                    _marker = ""
+                    for _line in _stderr.splitlines():
+                        if _line.startswith("NAVIGATE_UNAVAILABLE:"):
+                            _marker = _line[len("NAVIGATE_UNAVAILABLE:"):].strip()
+                            break
+                    _cov["stop_reason"] = "navigate_unavailable"
+                    _failed["browser_unavailable_detail"] = (
+                        _marker or "browser_service unavailable during discovery"
+                    )
+                return _failed
             return {
                 "execution_status": "FAILED",
                 "error_message": f"Scraper exited with code {result['returncode']}. {stderr}",

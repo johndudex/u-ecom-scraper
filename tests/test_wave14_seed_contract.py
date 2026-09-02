@@ -217,6 +217,10 @@ class _FakeScrapeResult:
         self.error = ""
         self.error_class = ""
         self.transient = False
+        # [wave-16 B3] shell_tools reads the infra-outage contract off the
+        # result — a healthy dispatch is available with no server class.
+        self.unavailable = False
+        self.server_error_class = ""
         self.data = {"stdout": "ok", "stderr": "", "duration": 1}
 
 

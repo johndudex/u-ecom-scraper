@@ -77,7 +77,10 @@ def _src() -> str:
 
 def _grab(name: str) -> str:
     src = _src()
-    m = re.search(rf"^def {name}\(.*?(?=^def |^class |^@)", src, re.M | re.S)
+    # [wave-16 B1] the lookahead must ALSO stop at `async def` — server.py
+    # grew module-level statements (e.g. _SCRAPER_LAST_BUSY = [time.monotonic()])
+    # in the async-def gaps, and a grab that ran past them NameError'd at exec.
+    m = re.search(rf"^def {name}\(.*?(?=^(?:async )?def |^class |^@)", src, re.M | re.S)
     assert m, f"{name} not found in server.py"
     return m.group(0)
 
@@ -387,6 +390,9 @@ def _reap_fn(extra):
         "urllib": urllib,
         **extra,
     }
+    # [wave-16 B1] _reap_mcp_tabs_sync is now a thin wrapper delegating to the
+    # shared, port-parameterized _reap_tabs_sync — exec BOTH so calls resolve.
+    exec(compile(_grab("_reap_tabs_sync"), "<reap>", "exec"), ns)
     exec(compile(_grab("_reap_mcp_tabs_sync"), "<reap>", "exec"), ns)
     return ns
 
@@ -448,7 +454,11 @@ class TestTabReaper:
             report = ns["_reap_mcp_tabs_sync"]()
         finally:
             urllib.request.urlopen = orig
-        assert report["skipped"] == "mcp_client_connected"
+        # [wave-16 B1] the reaper is now generic (_reap_tabs_sync with a
+        # skip_when callable) — both guards (MCP-client-connected, scraper
+        # idle) report the same "guard_active" marker instead of a per-guard
+        # string.
+        assert report["skipped"] == "guard_active"
         assert fake.closed == []
         # the gauge is STILL refreshed even on skip
         assert ns["_MCP_PAGE_COUNT"]["count"] == 9
@@ -548,7 +558,11 @@ class TestHealthAndWatchdogSurfaces:
         src = _src()
         i_health = src.index("async def health(")
         block = src[i_health:i_health + 4000]
-        assert '"mcp_http_state": dict(_MCP_HTTP_CACHE)' in block
+        # [wave-16 B1] the handler snapshots the cache into a local (`mcp_http`)
+        # once — it also folds "down" into `status` (the probe earned kill
+        # power) — but the response key still reads ONLY from the snapshot.
+        assert "mcp_http = dict(_MCP_HTTP_CACHE)" in block
+        assert '"mcp_http_state": mcp_http' in block
         assert '"mcp_page_count": dict(_MCP_PAGE_COUNT)' in block
         assert '"scraper_runs": active_runs_snapshot()' in block
 
@@ -557,7 +571,9 @@ class TestHealthAndWatchdogSurfaces:
         assert '"stale_run_dirs"' in block
         i_gauge = block.index('"stale_run_dirs"')
         # the expensive part must sit under a monotonic deadline check
-        assert "time.monotonic() < deadline" in block[i_gauge:i_gauge + 400]
+        # (window widened for B1's added gauges between the init and the
+        # first deadline check)
+        assert "time.monotonic() < deadline" in block[i_gauge:i_gauge + 900]
 
     def test_watchdog_cancels_browser_service_runs(self):
         src = open(

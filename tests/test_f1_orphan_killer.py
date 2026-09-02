@@ -62,6 +62,11 @@ def _server_ns():
 
     ns = {
         "__name__": "t_f1",
+        # [wave-16 B1-4] _kill_orphan_chrome does a function-level relative
+        # import (from .scraper_runner import active_runs_snapshot) — give the
+        # exec'd code a package identity + a fake module so the import
+        # resolves instead of dying inside the fn's broad except.
+        "__package__": "fake_bs",
         "os": os,
         "time": _time,
         "logger": logger,
@@ -76,6 +81,16 @@ def _server_ns():
         "browser_pool": _FakePool(),
     }
     ns["browser_pool"].health = lambda: {"mcp_pid": 100, "scraper_pid": 200}
+
+    import sys as _sys
+
+    _fake_pkg = types.ModuleType("fake_bs")
+    _fake_pkg.__path__ = []
+    _fake_runner = types.ModuleType("fake_bs.scraper_runner")
+    _fake_runner.active_runs_snapshot = lambda: []
+    _sys.modules.setdefault("fake_bs", _fake_pkg)
+    _sys.modules.setdefault("fake_bs.scraper_runner", _fake_runner)
+
     exec(fn_src, ns)
     _NS = ns
     return ns
@@ -246,9 +261,19 @@ class TestNavigateGateW3:
 
 class TestKillGateWiring:
     def test_kill_gates_on_scrape_protection(self):
+        """[wave-16 B1-4] The gate is NARROWED, not blanket: a live /scrape
+        run protects only ITS OWN tree (and only against processes born after
+        it started) — the old whole-cycle suppression let orphans sit for
+        hours while memory flatlined."""
         src = pathlib.Path(os.path.join(ROOT, "browser_service/server.py")).read_text()
-        assert "if _scrape_protection_active():" in src
-        assert 'logger.info("kill_orphan_chrome: skipping (scrape in flight)")' in src
+        i = src.index("def _kill_orphan_chrome")
+        block = src[i:i + 6000]
+        # per-run tree protection machinery, not a blanket skip
+        assert "protected: set[int] = set()" in block
+        assert "oldest_run_start: Optional[int] = None" in block
+        assert "from .scraper_runner import active_runs_snapshot" in block
+        # zombie/dead runs protect nothing
+        assert '_proc_state(run_pid) in (None, "Z")' in block
 
     def test_kill_gates_on_navigate_protection_not_counter(self):
         """W3: the navigate gate must consult the liveness-based predicate."""

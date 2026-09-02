@@ -55,7 +55,8 @@ class TestTemplateThrottleContract:
     def test_retry_after_read_header_first_then_body(self):
         src = _template_src()
         i_header = src.index('r.headers.get("Retry-After")')
-        i_body = src.index('(r.json() or {}).get("retry_after")')
+        # [wave-16 B3] the body read parses json once into `body` first
+        i_body = src.index('body.get("retry_after")')
         assert i_header < i_body, (
             "server emits the header post-W4; older builds only the body — "
             "header must be consulted first"
@@ -64,12 +65,18 @@ class TestTemplateThrottleContract:
     def test_all_four_discovery_sites_emit_navigate_throttled(self):
         """search first-page + search pagination + category first-page +
         category pagination: every discovery break/return must distinguish
-        throttled from navigate_error."""
+        throttled from navigate_error. [wave-16 B3] the classification moved
+        into the shared _nav_fail_reason helper, which ALSO routes the new
+        browser-service-outage dicts to navigate_unavailable."""
         src = _template_src()
-        # first-page returns use the `throttled` local…
-        assert src.count('return [], "navigate_throttled" if throttled else "navigate_error"') == 2
-        # …pagination breaks read it off the response dict.
-        assert src.count('"navigate_throttled" if (resp and resp.get("throttled"))') == 2
+        # first-page returns + pagination breaks all classify via the helper
+        assert src.count("fail_reason = _nav_fail_reason(resp)") == 2
+        assert src.count("stop_reason = _nav_fail_reason(resp)") == 2
+        # the helper keeps 429 backpressure INCONCLUSIVE (throttled), and an
+        # outage terminal dict INCONCLUSIVE too (unavailable) — never a FAIL.
+        assert 'return "navigate_throttled"' in src
+        assert 'return "navigate_unavailable"' in src
+        assert 'return "navigate_error"' in src
 
 
 class TestClassifierThrottledBranch:

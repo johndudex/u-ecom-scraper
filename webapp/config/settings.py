@@ -174,6 +174,14 @@ CELERY_BEAT_SCHEDULE = {
         "task": "scraper.tasks.redispatch_stuck_approved_interrupts",
         "schedule": 300.0,
     },
+    # [wave-16 B3] Dependency-park resumer: poll browser_service /health and
+    # re-dispatch parked jobs once it recovers. 120s cadence × batch 3 — the
+    # 2-slot scrape pool can't absorb more anyway. Kill-switch:
+    # BROWSER_RESUME_ENABLED=0 (off by default would strand parked jobs).
+    "resume-browser-unavailable": {
+        "task": "scraper.tasks.resume_browser_unavailable_jobs",
+        "schedule": 120.0,
+    },
     # Partner event delivery (async_api.yaml): 30s sweep drives the < 1m
     # backoff legs + lost-task recovery; >= 1m legs self-schedule exact.
     "dispatch-pending-callbacks": {
@@ -199,6 +207,9 @@ CELERY_TASK_ROUTES = {
     # only by luck of the scrape pool's queueing).
     "scraper.tasks.redispatch_abandoned_pending": "events",
     "scraper.tasks.redispatch_stuck_approved_interrupts": "events",
+    # [wave-16 B3] The park resumer polices the scrape pool — same reasoning
+    # as the watchdog above, it must not queue behind the jobs it resuscitates.
+    "scraper.tasks.resume_browser_unavailable_jobs": "events",
 }
 
 # [wave-15 1.2] Master switch for the abandoned-PENDING redispatch sweep.
@@ -207,6 +218,12 @@ CELERY_TASK_ROUTES = {
 # (dispatch_scrape_job). Flip on per-deploy after verifying the keystone is
 # live (prod rows never carried a stamp before wave-15).
 REDISPATCH_SWEEP_ENABLED = config("REDISPATCH_SWEEP_ENABLED", default=False, cast=bool)
+
+# [wave-16 B3] Dependency-park resumer master switch. DEFAULT ON (unlike the
+# sweep above): the resumer only acts when browser_service /health reports
+# "ok", so it cannot do damage while the dependency is down — and leaving it
+# off by default would strand parked jobs behind a deploy step.
+BROWSER_RESUME_ENABLED = config("BROWSER_RESUME_ENABLED", default=True, cast=bool)
 
 ZAI_API_KEY = config("ZAI_API_KEY", default="")
 ZAI_BASE_URL = config("ZAI_BASE_URL", default="https://api.z.ai/api/coding/paas/v4/")

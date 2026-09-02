@@ -3,6 +3,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 from typing import Any, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -522,6 +523,14 @@ def _detect_spa(html: str, body_text: str) -> tuple[bool, str]:
 
 # ── Reusable browser helpers (shared by /probe and /navigate) ────────────
 
+# B1-3: graceful close used to be UNBOUNDED — browser.close()/pw.stop() are
+# IPC round-trips to the driver, and a wedged driver never answers. One hung
+# close holds its executor slot forever; three wedge all of /navigate (callers
+# then see 408s instead of 429s) or starve the maintenance pools. Past this
+# grace the whole driver tree is SIGKILLed instead — a browser being discarded
+# does not need a polite goodbye.
+PAGE_CLOSE_GRACE_S = float(os.environ.get("PAGE_CLOSE_GRACE_S", "10"))
+
 
 class _PageContext:
     """Ephemeral browser + page launched by :func:`_launch_page`.
@@ -538,19 +547,51 @@ class _PageContext:
         self.stealth_used = stealth_used
         self.method = method  # "playwright" | "cloak"
 
-    def close(self) -> None:
-        """Close the browser and stop the playwright driver. Idempotent."""
+    def _graceful_close(self) -> None:
+        """Best-effort polite teardown. Runs on the close-worker thread."""
         if self.browser is not None:
             try:
                 self.browser.close()
             except Exception:
                 pass
-            self.browser = None
         if self.pw is not None:
             try:
                 self.pw.stop()
             except Exception:
                 pass
+
+    def close(self) -> None:
+        """Close the browser and stop the playwright driver — BOUNDED, idempotent.
+
+        The graceful attempt runs on a worker thread with a hard join deadline;
+        past it the driver tree is SIGKILLed (see PAGE_CLOSE_GRACE_S) and close()
+        returns anyway, releasing the executor slot. The stuck worker is a
+        daemon whose handles are dead — it cannot leak a process tree (the
+        orphan killer backstops anything that escapes).
+        """
+        try:
+            if self.browser is not None or self.pw is not None:
+                worker = threading.Thread(
+                    target=self._graceful_close, name="page-context-close", daemon=True
+                )
+                worker.start()
+                worker.join(PAGE_CLOSE_GRACE_S)
+                if worker.is_alive():
+                    killed = 0
+                    for holder in (self.browser, self.pw):
+                        if holder is None:
+                            continue
+                        pid = _playwright_driver_pid(holder)
+                        if pid:
+                            killed += _hard_kill_tree(pid)
+                    logger.warning(
+                        "_PageContext.close: graceful close exceeded %.0fs — "
+                        "SIGKILLed %d process(es) under the driver tree",
+                        PAGE_CLOSE_GRACE_S,
+                        killed,
+                    )
+        finally:
+            self.browser = None
             self.pw = None
 
 
@@ -659,6 +700,33 @@ def _hard_kill_partial_launch(browser=None, pw=None) -> None:
         )
 
 
+# B1-7: resource-hygiene flags for ephemeral browsers. Cloak launches passed
+# NO flags at all: Chromium defaults its shared memory to /dev/shm, so every
+# cloak browser's tmpfs counted against the container cgroup AND against the
+# gauge that gates /navigate — part of the chronic "80% memory" plateau was
+# shm, not heap. breakpad off drops the crashpad handler overhead. Applied
+# where we control the arg list; for cloakbrowser.launch() the kwarg is
+# signature-checked first (guessing an unsupported kwarg would TypeError
+# every cloak launch).
+HYGIENE_ARGS = ["--disable-dev-shm-usage", "--disable-breakpad"]
+_CLOAK_ARGS_OK: Optional[bool] = None
+
+
+def _cloak_accepts_args(cloak_launch) -> bool:
+    """One-time capability probe of the installed cloakbrowser.launch."""
+    global _CLOAK_ARGS_OK
+    if _CLOAK_ARGS_OK is None:
+        try:
+            import inspect
+
+            _CLOAK_ARGS_OK = "args" in inspect.signature(cloak_launch).parameters
+        except (TypeError, ValueError):
+            _CLOAK_ARGS_OK = False
+        if not _CLOAK_ARGS_OK:
+            logger.info("cloakbrowser.launch does not accept args= — hygiene flags skipped")
+    return _CLOAK_ARGS_OK
+
+
 def _launch_page(
     method: str = "auto",
     proxy_tier: str = "none",
@@ -694,6 +762,8 @@ def _launch_page(
         from cloakbrowser import launch as cloak_launch
 
         launch_kwargs: dict[str, Any] = {"headless": True}
+        if _cloak_accepts_args(cloak_launch):
+            launch_kwargs["args"] = list(HYGIENE_ARGS)
         proxy = (
             config.build_proxy_url(proxy_tier, country=country)
             if proxy_tier != "none"
@@ -714,7 +784,7 @@ def _launch_page(
     # default: vanilla Playwright
     from playwright.sync_api import sync_playwright
 
-    launch_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+    launch_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-breakpad"]
     launch_kwargs = {"headless": True, "args": launch_args}
     proxy = (
         config.build_playwright_proxy(proxy_tier, country=country)

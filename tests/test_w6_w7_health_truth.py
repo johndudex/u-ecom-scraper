@@ -238,25 +238,41 @@ class TestOutcomeWindow:
 class TestHealthGauges:
     def test_memory_gauge_shape_never_raises(self):
         ns = {}
+        # [wave-16 B1] _read_memory_gauge delegates field parsing to the
+        # module-level _memory_stat_fields helper — exec it too.
+        _exec_src(_grab(SERVER_PATH, "_memory_stat_fields"), ns)
         _exec_src(_grab(SERVER_PATH, "_read_memory_gauge"), ns)
         out = ns["_read_memory_gauge"]()
-        assert set(out) == {"current", "limit", "ratio", "source"}
+        # [wave-16 B1-8] cgroup sources also carry the memory.stat
+        # decomposition under "stat" (absent from the meminfo fallback).
+        assert {"current", "limit", "ratio", "source"} <= set(out)
         assert out["source"] in ("cgroup_v2", "cgroup_v1", "meminfo", None)
+        if "stat" in out:
+            assert set(out["stat"]) <= {"anon", "file", "shmem", "sock"}
         if out["ratio"] is not None:
             assert out["ratio"] >= 0.0
 
     def test_gauges_degrade_to_null_under_deadline(self):
         ns = {"time": __import__("time"), "os": os}
-        for name in ("_health_gauges", "_read_memory_gauge", "_count_chrome_processes"):
+        # [wave-16 B1] _read_memory_gauge delegates field parsing to the
+        # module-level _memory_stat_fields helper — exec it too.
+        for name in (
+            "_health_gauges", "_memory_stat_fields",
+            "_read_memory_gauge", "_count_chrome_processes",
+        ):
             _exec_src(_grab(SERVER_PATH, name), ns)
+        _q = types.SimpleNamespace(qsize=lambda: 0)
         ns.update(
             NAVIGATE_ACTIVE_PIDS={},
             SCRAPE_IN_FLIGHT={},
-            MISC_EXECUTOR=types.SimpleNamespace(
-                _work_queue=types.SimpleNamespace(qsize=lambda: 0)
-            ),
-            RESTART_EXECUTOR=types.SimpleNamespace(
-                _work_queue=types.SimpleNamespace(qsize=lambda: 0)
+            MISC_EXECUTOR=types.SimpleNamespace(_work_queue=_q),
+            RESTART_EXECUTOR=types.SimpleNamespace(_work_queue=_q),
+            # [wave-16 B1] New dedicated pools + beat registry + pool handles
+            MAINT_EXECUTOR=types.SimpleNamespace(_work_queue=_q),
+            PROBE_EXECUTOR=types.SimpleNamespace(_work_queue=_q),
+            _MAINT_BEATS={},
+            browser_pool=types.SimpleNamespace(
+                xvfb_alive=lambda: False, health=lambda: {}
             ),
         )
         # A deadline in the past: everything expensive must stay null, but the
@@ -269,6 +285,9 @@ class TestHealthGauges:
             "navigate_active_pids", "scrape_busy", "misc_queue", "restart_queue",
             # [wave-14] /tmp/scrape_* leftovers gauge (stale run-dir sweep)
             "stale_run_dirs",
+            # [wave-16 B1] maintenance-pool visibility + per-chrome RSS
+            "maint_queue", "maint_beats_age_s", "probe_queue",
+            "mcp_chrome_rss_kb", "scraper_chrome_rss_kb", "xvfb_alive",
         }
 
 
@@ -277,8 +296,11 @@ class TestNavigateObservability:
         nav = re.search(r'@app\.post\("/navigate"\).*?(?=\n@app\.|\nclass |\Z)', _server_src(), re.S)
         assert nav
         body = nav.group(0)
-        # ok, 2× throttled, 2× crash, fail(timeout), resource|fail catch-all
-        assert body.count("_record_nav_outcome(") >= 7
+        # ok, 2× throttled, and [wave-16 B2] the healable arm consolidates
+        # crash/resource/timeout-fail into ONE call with a conditional label
+        # ("crash" if infra_death else "resource" if resource else "fail") —
+        # every terminal path still records, just fewer call sites.
+        assert body.count("_record_nav_outcome(") >= 5
         assert body.count("_log_nav_outcome(") >= 7
 
     def test_outcome_log_uses_host_only(self):

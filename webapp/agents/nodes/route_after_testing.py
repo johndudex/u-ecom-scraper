@@ -154,7 +154,7 @@ def classify_test_failure(
     """Classify a failed test into an action + reason.
 
     Returns (action, reason) where action ∈ {"strategy", "scraper", "mapping",
-    "refine", "retest", "absent"}:
+    "refine", "retest", "absent", "park_unhealthy"}:
     - "strategy": access/strategy-class failure → switch strategy (timeout, 0-item
       http/api run, blocked). The current strategy can't reach the content.
     - "scraper": a code bug (Python traceback, not a timeout) → fix the scraper.
@@ -165,6 +165,8 @@ def classify_test_failure(
       no code change. Neither the strategy nor the code was on trial.
     - "absent": [T1.4] the draft file itself never existed for this run — a
       draft re-generation, not a strategy verdict.
+    - "park_unhealthy": [wave-16 B3] browser_service itself was DOWN during the
+      run (stop_reason=navigate_unavailable) — the router picks retest vs park.
 
     ``state`` (optional trailing kwarg) only scopes the navigate_error coverage
     signal; every existing two-arg caller is unchanged.
@@ -228,6 +230,22 @@ def classify_test_failure(
                 "navigate throttled (browser-service backpressure) — re-test, "
                 "no strategy switch"
             ),
+        )
+
+    # [wave-16 B3] Discovery stopped because browser_service /navigate itself
+    # was down (stop_reason=navigate_unavailable) — an INFRA verdict, not a
+    # strategy or code one. Checked before the zero-item branches for the same
+    # reason as is_throttled: a downed gateway would otherwise read as
+    # "{strat} returned no items" and strategy-switch. The ROUTER decides
+    # between an immediate retest (gateway healthy again) and parking the job.
+    if (
+        isinstance(_cov_dc, dict)
+        and _cov_dc.get("stop_reason") == "navigate_unavailable"
+    ):
+        return (
+            "park_unhealthy",
+            "browser-service unavailable during discovery — park for "
+            "auto-resume, no strategy switch",
         )
 
     # Access/strategy-class: the strategy can't reach the content.
@@ -1097,6 +1115,20 @@ def route_after_testing(state: ScrapeState) -> str:
     retry_count = state.get("test_retry_count", 0)
     is_final_attempt = retry_count == FINAL_RETRY_SENTINEL
 
+    # [wave-16 B3] Pre-flight park: the tester never ran because browser_service
+    # was unhealthy at node entry (its pre-flight stamps this flag and skips
+    # the invocation). There is no draft verdict to judge — park (non-terminal,
+    # beat-resumed on recovery) rather than fall into the no-report retry arms
+    # and regenerate a draft against a dead gateway.
+    if state.get("browser_unavailable_detail"):
+        logger.warning(
+            "route_after_testing: browser_service unhealthy at tester entry "
+            "(%s) — parking job for auto-resume",
+            str(state.get("browser_unavailable_detail"))[:120],
+        )
+        _log_cascade(state, "park-browser-service", "tester pre-flight: gateway unhealthy")
+        return "park_browser_unavailable"
+
     # Route functions return only a node name (no state update possible), so
     # the exhausted-retries error is recorded by the CALLER (code_tester's
     # exhausted-retry return) — see _invoke_code_tester. This fn only routes.
@@ -1615,6 +1647,35 @@ def route_after_testing(state: ScrapeState) -> str:
             _absent_n,
         )
         return "human_approval"
+
+    # [wave-16 B3] PARK-UNHEALTHY arm — ABOVE the retry-exhausted gate (an
+    # infra verdict must not consume the fix budget, and a downed gateway can
+    # coincide with the final attempt). The classifier said the run ended
+    # because browser_service itself was down; whether to re-test now or park
+    # the job is a LIVE health question, so ask the gateway: healthy again →
+    # re-test the SAME draft (no strategy switch, no retry-budget burn); still
+    # down → park (non-terminal, beat-resumed on recovery). Deliberately not
+    # counted against the retest budget — that budget exists for site-side
+    # transients, and a flapping gateway could otherwise exhaust it into a
+    # misread code-fix.
+    if _action == "park_unhealthy":
+        from ..tools.browser_http import browser_service_healthy
+
+        if browser_service_healthy():
+            logger.warning(
+                "route_after_testing: %s — browser_service healthy again, "
+                "re-testing the same draft (no strategy switch)",
+                _reason,
+            )
+            _log_cascade(state, "retest-infra", _reason)
+            return "code_tester"
+        logger.warning(
+            "route_after_testing: %s — browser_service still down, parking "
+            "job for auto-resume",
+            _reason,
+        )
+        _log_cascade(state, "park-browser-service", _reason)
+        return "park_browser_unavailable"
 
     # Cap on the strategy/scraper cascade: the early-return branches below
     # previously bypassed MAX_TEST_RETRIES (only the LLM fallback enforced it).
