@@ -29,16 +29,36 @@ BROWSER_SERVICE_URL = os.environ.get(
 PROBE_TIMEOUT = int(os.environ.get("PROBE_TIMEOUT", "180"))
 CACHE_EXPIRY_HOURS = 4
 
+# The ladder: cheapest → strongest, HTTP-flavoured families first. T3.2 added
+# the fingerprint_* (curl_cffi TLS-impersonation, HTTP-flavoured — sub-5s, no
+# browser launch) and cloak_* (stealth browser) rungs to browser_service's
+# /probe-single, but THIS list — the only thing deciding which rungs a job's
+# accessibility gate actually sends — was never extended (prod 2026-09-02:
+# funko.com returned a real 200 page in 2.1s on fingerprint_chrome_none while
+# its job died captcha_blocked, because the gate had declared every method
+# blocked without ever sending a fingerprint or cloak rung). The uc_chrome_*
+# rungs are gone: they are deprecated aliases for cloak_* server-side, and the
+# honest name is now sent directly. All HTTP rungs precede all browser rungs —
+# a site passable without a browser must not pay for 30-90s browser launches
+# before a single cheap rung is tried.
 ESCALATION_STEPS = [
+    # HTTP-flavoured (curl_cffi fingerprint = browser TLS, no JS)
     ("direct_http", "none"),
-    ("playwright_none", "none"),
-    ("uc_chrome_none", "none"),
+    ("fingerprint_chrome_none", "none"),
+    ("fingerprint_safari184_none", "none"),
     ("direct_http_datacenter", "datacenter"),
-    ("playwright_datacenter", "datacenter"),
-    ("uc_chrome_datacenter", "datacenter"),
+    ("fingerprint_chrome_datacenter", "datacenter"),
+    ("fingerprint_safari184_datacenter", "datacenter"),
     ("direct_http_residential", "residential"),
+    ("fingerprint_chrome_residential", "residential"),
+    ("fingerprint_safari184_residential", "residential"),
+    # Browser-flavoured: vanilla playwright, then stealth cloak, per tier
+    ("playwright_none", "none"),
+    ("cloak_none", "none"),
+    ("playwright_datacenter", "datacenter"),
+    ("cloak_datacenter", "datacenter"),
     ("playwright_residential", "residential"),
-    ("uc_chrome_residential", "residential"),
+    ("cloak_residential", "residential"),
 ]
 
 HTTP_METHODS = {"direct_http", "direct_http_datacenter", "direct_http_residential"}
@@ -295,7 +315,7 @@ def run_probe_with_captcha_check(
 
     ``max_steps`` caps the number of probe attempts (default None = full
     ladder). The intake check-site view passes a small cap so a quick
-    "check site" doesn't grind through all 9 proxy tiers on an anti-bot
+    "check site" doesn't grind through the whole ladder on an anti-bot
     site; the real job's check_accessibility node leaves it uncapped.
 
     Returns a dict with:
@@ -517,7 +537,7 @@ def run_probe_with_captcha_check(
             continue
 
         # max_steps caps the number of attempts — used by the intake check-site
-        # view to bound latency (the full 9-step ladder is for the real job's
+        # view to bound latency (the full ESCALATION_STEPS ladder is for the real job's
         # check_accessibility node, which runs in Celery and can be slow).
         if max_steps is not None and attempts >= max_steps:
             logger.info(
