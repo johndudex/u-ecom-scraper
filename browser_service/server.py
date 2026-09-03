@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from .browser_pool import browser_pool
 from .config import get_proxy_config
-from .probe import run_probe, render_page
+from .probe import _launch_health_snapshot, run_probe, render_page
 from .scraper_runner import run_scraper_script
 
 logger = logging.getLogger(__name__)
@@ -934,7 +934,13 @@ def _maybe_recycle_scraper_chrome() -> None:
 def _repair_xvfb() -> bool:
     """Restart a dead Xvfb once per cleanup cycle (H10). Headed mode only —
     in a CHROME_HEADLESS deployment there is nothing to repair."""
-    from .browser_pool import MCP_HEADLESS
+    # [prod 2026-09-02/03 outage RCA] this import used to name MCP_HEADLESS
+    # only, while the body reads the bare DISPLAY global from browser_pool —
+    # every cleanup cycle the repair crashed NameError before doing anything,
+    # so a dead Xvfb sat unrepaired for ~9h while headed ephemeral launches
+    # (playwright_*/cloak_*) returned instant None and every liveness gauge
+    # stayed green (persistent Chromes answer CDP with a dead display).
+    from .browser_pool import DISPLAY, MCP_HEADLESS
 
     if MCP_HEADLESS or not DISPLAY:
         return False
@@ -1722,12 +1728,18 @@ async def health():
     # gauge (which catches a wedged SSE server that CDP misses) sat outside
     # the status computation. down → degraded; unknown stays non-fatal (boot).
     mcp_http = dict(_MCP_HTTP_CACHE)
+    # [poison RCA 2026-09-03] A poisoned executor thread (leaked sync-playwright
+    # dispatcher loop) fails every future browser launch on it and is cured by
+    # nothing except a service restart — it must degrade /health so the platform
+    # restarts us instead of handing out ~1ms Nones for days.
+    launch_health = _launch_health_snapshot()
     status = "ok" if (
         h["ready"]
         and cdp_ok
         and mcp_process_alive
         and mcp_http.get("state") != "down"
         and nav_recent.get("state") != "degraded"
+        and not launch_health.get("poison_guard")
     ) else "degraded"
     # /navigate slot accounting (independent of PROBE_LOCK / /scrape)
     nav_busy = min(_navigate_in_flight, NAVIGATE_MAX_CONCURRENT)
@@ -1752,6 +1764,10 @@ async def health():
             "proxy_residential": "available" if res_available else "not configured",
             "cloak": _CLOAK_INFO_CACHE,
             "navigate_recent": nav_recent,
+            # [poison RCA 2026-09-03] ephemeral-launch counters; poison_guard
+            # > 0 = an executor thread with a leaked sync-playwright loop
+            # (also degrades `status` — restart is the only cure).
+            "launch_health": _launch_health_snapshot(),
             "gauges": _health_gauges(deadline),
             "navigate_slots_busy": nav_busy,
             "navigate_slots_total": NAVIGATE_MAX_CONCURRENT,

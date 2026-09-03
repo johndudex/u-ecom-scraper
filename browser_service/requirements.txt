@@ -2,11 +2,20 @@ fastapi>=0.115,<1.0
 uvicorn[standard]>=0.32,<1.0
 seleniumbase>=4.30.0
 selenium>=4.20.0
-playwright>=1.45.0
+# PINNED (1.61.0, e2e-verified incl. the ephemeral-launch poison RCA of
+# 2026-09-03): playwright's sync API binds every handle to the creating
+# thread's greenlet, and the sync-guard/error shapes are internal. An
+# unpinned bump silently changes launch/cleanup semantics this service
+# depends on (same doctrine as curl_cffi below).
+playwright==1.61.0
 httpx>=0.27.0
 # PINNED (spike-verified 0.16.2): the fingerprint probe rung impersonates a
 # specific browser TLS/HTTP2 fingerprint via the "chrome"/"safari184" targets.
 # "chrome" is an alias for the newest fingerprint in the installed version, so
 # an unpinned bump would silently change the TLS fingerprint this rung relies on.
 curl_cffi==0.16.2
-cloakbrowser>=0.4.5
+# PINNED (0.5.2, e2e-verified): cloakbrowser wraps its own sync-playwright
+# context inside launch() — the exact machinery behind the ephemeral-launch
+# poison outage — and does a PyPI/GitHub update check at launch time whose
+# behavior drifts between releases. 0.5.10 was live on PyPI at pin time.
+cloakbrowser==0.5.2

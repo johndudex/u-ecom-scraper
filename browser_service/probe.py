@@ -531,6 +531,20 @@ def _detect_spa(html: str, body_text: str) -> tuple[bool, str]:
 # does not need a polite goodbye.
 PAGE_CLOSE_GRACE_S = float(os.environ.get("PAGE_CLOSE_GRACE_S", "10"))
 
+# Launch-path counters for /health (the poison outage's missing visibility:
+# the incident's ONLY signal was buried INFO log lines while every liveness
+# gauge stayed green). "poison_guard" counts sync-playwright guard errors —
+# a thread whose dispatcher loop leaked (cross-thread close, un-stopped
+# context) fails every future launch on it until the service restarts.
+# After the same-thread-close fix this must stay 0 forever; nonzero = active
+# poisoning, and /health degrades on it.
+_LAUNCH_HEALTH = {"ok": 0, "launch_failed": 0, "poison_guard": 0}
+_POISON_SIGNATURE = "inside the asyncio loop"
+
+
+def _launch_health_snapshot() -> dict:
+    return dict(_LAUNCH_HEALTH)
+
 
 class _PageContext:
     """Ephemeral browser + page launched by :func:`_launch_page`.
@@ -548,49 +562,80 @@ class _PageContext:
         self.method = method  # "playwright" | "cloak"
 
     def _graceful_close(self) -> None:
-        """Best-effort polite teardown. Runs on the close-worker thread."""
+        """Best-effort polite teardown. MUST run on the session thread.
+
+        Playwright sync objects are bound to the greenlet of the thread that
+        created them — calling browser.close()/pw.stop() from any other thread
+        raises greenlet.error (cannot switch to a different thread). This used
+        to run on a dedicated close-worker thread: the error was swallowed by
+        the bare excepts, the dispatcher greenlet stayed suspended inside its
+        run loop on the creating thread, and that thread's running-loop marker
+        never cleared — every later sync_playwright().start() on it died
+        instantly with "using Playwright Sync API inside the asyncio loop"
+        (prod 2026-09-02/03: both PROBE_EXECUTOR threads poisoned this way;
+        every browser rung of /probe, /render and /probe-single returned None
+        in ~1ms while all liveness gauges stayed green).
+        """
         if self.browser is not None:
             try:
                 self.browser.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "_PageContext.close: browser.close() failed: %s: %s",
+                    type(exc).__name__,
+                    str(exc)[:150],
+                )
         if self.pw is not None:
             try:
                 self.pw.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "_PageContext.close: pw.stop() failed: %s: %s — if this is "
+                    "greenlet.error, the session thread has a leaked dispatcher "
+                    "loop and is poisoned for future launches",
+                    type(exc).__name__,
+                    str(exc)[:150],
+                )
 
     def close(self) -> None:
         """Close the browser and stop the playwright driver — BOUNDED, idempotent.
 
-        The graceful attempt runs on a worker thread with a hard join deadline;
-        past it the driver tree is SIGKILLed (see PAGE_CLOSE_GRACE_S) and close()
-        returns anyway, releasing the executor slot. The stuck worker is a
-        daemon whose handles are dead — it cannot leak a process tree (the
-        orphan killer backstops anything that escapes).
+        The graceful teardown runs INLINE on the calling thread (see
+        :meth:`_graceful_close` for why it must). The bound comes from a
+        watchdog instead of a worker thread: if teardown exceeds
+        PAGE_CLOSE_GRACE_S, the driver tree is SIGKILLed, which unblocks the
+        inline close (dead transport → close()/stop() return) — the kill
+        replaces nothing, it just ends the hang.
         """
-        try:
-            if self.browser is not None or self.pw is not None:
-                worker = threading.Thread(
-                    target=self._graceful_close, name="page-context-close", daemon=True
-                )
-                worker.start()
-                worker.join(PAGE_CLOSE_GRACE_S)
-                if worker.is_alive():
-                    killed = 0
-                    for holder in (self.browser, self.pw):
-                        if holder is None:
-                            continue
-                        pid = _playwright_driver_pid(holder)
-                        if pid:
-                            killed += _hard_kill_tree(pid)
+        if self.browser is None and self.pw is None:
+            return
+        closed = threading.Event()
+
+        def _kill_watchdog() -> None:
+            if not closed.wait(PAGE_CLOSE_GRACE_S):
+                killed = 0
+                for holder in (self.browser, self.pw):
+                    if holder is None:
+                        continue
+                    pid = _playwright_driver_pid(holder)
+                    if pid:
+                        killed += _hard_kill_tree(pid)
+                if killed:
                     logger.warning(
                         "_PageContext.close: graceful close exceeded %.0fs — "
-                        "SIGKILLed %d process(es) under the driver tree",
+                        "SIGKILLed %d process(es) under the driver tree to unblock",
                         PAGE_CLOSE_GRACE_S,
                         killed,
                     )
+
+        watchdog = threading.Thread(
+            target=_kill_watchdog, name="page-context-close-watchdog", daemon=True
+        )
+        watchdog.start()
+        try:
+            self._graceful_close()
         finally:
+            closed.set()
             self.browser = None
             self.pw = None
 
@@ -674,6 +719,9 @@ def _hard_kill_partial_launch(browser=None, pw=None) -> None:
     where the driver may be unresponsive — a blocking close would hold a
     NAVIGATE executor slot (three such hangs wedge all three threads and
     callers see 408s instead of 429s). The tree is being discarded; kill it.
+    (The CALLER unwinds the sync context inline right after — see the
+    pw.stop() in _launch_page's except: killing the driver makes that stop
+    return immediately, so both goals are met.)
     """
     roots: list[tuple[str, int]] = []
     if pw is not None:
@@ -776,9 +824,19 @@ def _launch_page(
             browser = cloak_launch(**launch_kwargs)
             page = browser.new_page()
             page.set_default_timeout(timeout * 1000)
-        except Exception:
+        except Exception as exc:
+            _LAUNCH_HEALTH["launch_failed"] += 1
+            if _POISON_SIGNATURE in str(exc):
+                _LAUNCH_HEALTH["poison_guard"] += 1
+                logger.critical(
+                    "launch: sync-playwright guard fired on %s — this thread's "
+                    "dispatcher loop leaked and is poisoned; browser launches on "
+                    "it keep failing until the service restarts",
+                    threading.current_thread().name,
+                )
             _hard_kill_partial_launch(browser=browser)
             raise
+        _LAUNCH_HEALTH["ok"] += 1
         return _PageContext(page, browser, pw=None, stealth_used=True, method="cloak")
 
     # default: vanilla Playwright
@@ -800,9 +858,35 @@ def _launch_page(
         browser = pw.chromium.launch(**launch_kwargs)
         page = browser.new_page()
         page.set_default_timeout(timeout * 1000)
-    except Exception:
+    except Exception as exc:
+        _LAUNCH_HEALTH["launch_failed"] += 1
+        if _POISON_SIGNATURE in str(exc):
+            _LAUNCH_HEALTH["poison_guard"] += 1
+            logger.critical(
+                "launch: sync-playwright guard fired on %s — this thread's "
+                "dispatcher loop leaked and is poisoned; browser launches on "
+                "it keep failing until the service restarts",
+                threading.current_thread().name,
+            )
         _hard_kill_partial_launch(browser=browser, pw=pw)
+        # W1 kills the driver TREE; the sync CONTEXT must still be unwound
+        # inline (same thread — greenlet-safe) or its suspended dispatcher
+        # loop poisons this executor thread forever (the 09-02 prod outage:
+        # one real failed launch → every later launch on that thread died
+        # with the sync-API-inside-asyncio guard in ~1ms). With the driver
+        # dead, stop() cannot hang on protocol round-trips — the transport
+        # is already EOF.
+        if pw is not None:
+            try:
+                pw.stop()
+            except Exception as stop_exc:
+                logger.warning(
+                    "launch failure cleanup: pw.stop() failed: %s: %s",
+                    type(stop_exc).__name__,
+                    str(stop_exc)[:150],
+                )
         raise
+    _LAUNCH_HEALTH["ok"] += 1
     return _PageContext(page, browser, pw=pw, stealth_used=False, method="playwright")
 
 

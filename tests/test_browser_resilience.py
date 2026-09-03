@@ -27,6 +27,7 @@ import pathlib
 import re
 import signal
 import sys
+import threading
 import types
 
 import pytest
@@ -284,6 +285,196 @@ class TestW2Tini:
         # exported BEFORE the exec so tini's children inherit it
         assert src.index("ulimit -c 0") < src.index("exec tini -- uvicorn")
         assert src.index("export PYTHONPATH=/app") < src.index("exec tini -- uvicorn")
+
+
+# ── [poison RCA 2026-09-03] ephemeral-launch thread poisoning ───────────────
+# _PageContext.close() ran the graceful teardown on a dedicated worker thread.
+# Playwright sync objects are bound to the greenlet of their creating thread,
+# so browser.close()/pw.stop() from the worker raised greenlet.error, the bare
+# excepts swallowed it, and the dispatcher loop stayed suspended on the
+# creating thread — its running-loop marker never cleared. Every later
+# sync_playwright().start() on that executor thread raised "using Playwright
+# Sync API inside the asyncio loop" in ~1ms. Prod 09-02/03: one failed cloak
+# session + one successful one poisoned both PROBE_EXECUTOR threads; every
+# browser rung of /probe, /render and /probe-single returned None while every
+# liveness gauge stayed green for ~11h across two deployments, and a container
+# restart re-poisoned on the second browser session. Reproduced locally:
+# attempt 1 OK, attempts 2-3 instant-guard-error.
+
+
+class _RecordingBrowser(_FakeBrowser):
+    def __init__(self):
+        super().__init__()
+        self.calls: list[tuple[str, int]] = []
+
+    def close(self):
+        self.calls.append(("close", threading.get_ident()))
+        self.closed = True
+
+
+class _RecordingPw(_FakePw):
+    def __init__(self, browser):
+        super().__init__(browser)
+        self.calls: list[tuple[str, int]] = []
+
+    def stop(self):
+        self.calls.append(("stop", threading.get_ident()))
+
+
+class TestPoisonFix:
+    def _ctx(self, probe, monkeypatch):
+        browser = _RecordingBrowser()
+        pw = _RecordingPw(browser)
+        ctx = probe._PageContext(
+            page=None, browser=browser, pw=pw, stealth_used=False, method="playwright"
+        )
+        return ctx, browser, pw
+
+    def test_close_stops_pw_on_the_calling_thread(self, probe, monkeypatch):
+        """THE regression: teardown must run on the session thread. On a
+        different thread the greenlet switch is impossible and the loop leaks."""
+        ctx, browser, pw = self._ctx(probe, monkeypatch)
+        ctx.close()
+        assert ("stop", threading.get_ident()) in pw.calls
+        assert ("close", threading.get_ident()) in browser.calls
+
+    def test_close_spawns_no_close_worker(self, probe, monkeypatch):
+        """The old design's worker thread name must be gone from the process —
+        any playwright call from it is a poison incident by definition."""
+        seen_threads: list[str] = []
+        real_stop = _RecordingPw.stop
+
+        def spying_stop(pw_self):
+            seen_threads.extend(t.name for t in threading.enumerate())
+            real_stop(pw_self)
+
+        monkeypatch.setattr(_RecordingPw, "stop", spying_stop)
+        ctx, _b, _p = self._ctx(probe, monkeypatch)
+        ctx.close()
+        # exact name: the SIGKILL watchdog is deliberately named
+        # page-context-close-watchdog (it never touches playwright handles'
+        # greenlet — PID reads + kills only) and is fine.
+        assert not any(n == "page-context-close" for n in seen_threads), (
+            "a close worker thread appeared — cross-thread teardown poisons "
+            "the creating executor thread"
+        )
+
+    def test_watchdog_kills_driver_tree_when_graceful_close_hangs(self, probe, monkeypatch):
+        """The bounded-close property survives: a hang past PAGE_CLOSE_GRACE_S
+        gets the driver tree SIGKILLed (which unblocks the inline close)."""
+        monkeypatch.setattr(probe, "PAGE_CLOSE_GRACE_S", 0.2)
+        hang_open = threading.Event()
+        killed = threading.Event()
+
+        class _HangingBrowser(_RecordingBrowser):
+            def close(self):
+                self.calls.append(("close", threading.get_ident()))
+                killed.wait(5)  # released by the (stubbed) watchdog kill
+
+        browser = _HangingBrowser()
+        pw = _RecordingPw(browser)
+        ctx = probe._PageContext(
+            page=None, browser=browser, pw=pw, stealth_used=False, method="playwright"
+        )
+        monkeypatch.setattr(
+            probe, "_hard_kill_tree", lambda pid: killed.set() or 1
+        )
+        ctx.close()  # must return — the kill unblocks the hang
+        assert killed.is_set()
+        assert ("stop", threading.get_ident()) in pw.calls
+
+    def test_launch_failure_unwinds_pw_inline_after_the_kill(self, probe, monkeypatch):
+        """A launch that fails AFTER start() must also stop() the sync context
+        (same thread) — W1's kill alone leaves the dispatcher loop suspended
+        and poisons the thread (prod's original poisoning event)."""
+        pw = _RecordingPw(_FakeBrowserPageFails())
+        pw.chromium = types.SimpleNamespace(
+            launch=lambda **kw: (_ for _ in ()).throw(
+                RuntimeError("Resource temporarily unavailable")
+            )
+        )
+        _install_fake_module(
+            monkeypatch,
+            "playwright",
+        )
+        _install_fake_module(
+            monkeypatch,
+            "playwright.sync_api",
+            sync_playwright=lambda: types.SimpleNamespace(start=lambda: pw),
+        )
+        before = probe._LAUNCH_HEALTH["launch_failed"]
+        with pytest.raises(RuntimeError, match="temporarily unavailable"):
+            probe._launch_page(method="playwright", proxy_tier="none", timeout=5)
+        assert (FAKE_DRIVER_PID, signal.SIGKILL) in probe._KILLS  # W1 tree kill
+        assert ("stop", threading.get_ident()) in pw.calls  # inline unwind
+        assert probe._LAUNCH_HEALTH["launch_failed"] == before + 1
+
+    def test_poison_guard_error_is_counted_and_reraised(self, probe, monkeypatch):
+        """A thread already carrying a leaked loop fails at start() with the
+        guard error — it must be counted as poison (visible in /health) and
+        still propagate."""
+        _install_fake_module(monkeypatch, "playwright")
+
+        def _poisoned():
+            raise RuntimeError(
+                "It looks like you are using Playwright Sync API inside the "
+                "asyncio loop. Please use the Async API instead."
+            )
+
+        _install_fake_module(
+            monkeypatch,
+            "playwright.sync_api",
+            sync_playwright=lambda: types.SimpleNamespace(start=_poisoned),
+        )
+        before = probe._LAUNCH_HEALTH["poison_guard"]
+        with pytest.raises(RuntimeError, match="asyncio loop"):
+            probe._launch_page(method="playwright", proxy_tier="none", timeout=5)
+        assert probe._LAUNCH_HEALTH["poison_guard"] == before + 1
+
+    def test_poison_degrades_health_status_and_is_gauged(self):
+        """The outage's missing visibility: poison_guard must degrade /health
+        (restart is the only cure) and the counters must be gauged."""
+        src = pathlib.Path(
+            os.path.join(ROOT, "browser_service", "server.py")
+        ).read_text()
+        assert 'and not launch_health.get("poison_guard")' in src, (
+            "/health must degrade while a poisoned executor thread exists"
+        )
+        assert '"launch_health"' in src
+
+    def test_poison_vector_dependencies_are_pinned(self):
+        """playwright + cloakbrowser own the sync-context machinery at the
+        center of this outage — the unpinned >= specs that let prod drift
+        must not come back."""
+        req = pathlib.Path(
+            os.path.join(ROOT, "browser_service", "requirements.txt")
+        ).read_text()
+        assert "playwright==" in req
+        assert "cloakbrowser==" in req
+        assert "cloakbrowser>=" not in req
+
+
+class TestXvfbRepairImport:
+    def test_repair_xvfb_imports_both_names_it_reads(self):
+        """[prod 2026-09-02/03] _repair_xvfb imported only MCP_HEADLESS while
+        its body also reads the bare DISPLAY global — every 30-min cleanup
+        cycle crashed NameError before repairing anything, for the whole
+        poison-outage window. The import must cover every name the body
+        reads (server.py can't be imported in this image — no fastapi — so
+        this is a source contract)."""
+        src = pathlib.Path(
+            os.path.join(ROOT, "browser_service", "server.py")
+        ).read_text()
+        fn = re.search(
+            r"^def _repair_xvfb\(.*?(?=^def |^class |^@)", src, re.M | re.S
+        )
+        assert fn, "_repair_xvfb not found"
+        body = fn.group(0)
+        for name in re.findall(r"\b(DISPLAY|MCP_HEADLESS)\b", body):
+            assert f"import {name}" in body or f", {name}" in body, (
+                f"_repair_xvfb reads {name} without importing it — NameError "
+                "every cleanup cycle"
+            )
 
 
 if __name__ == "__main__":
