@@ -1779,6 +1779,53 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
 
     _notify_phase(job_id, "accessibility_check", "done")
 
+    # [wave-17 S4] Advisory listing probe. The ladder above measured the SAMPLE
+    # PDP; discovery-mode jobs also need to know whether the LISTING URL (the
+    # endpoint Phase-1 discovery actually fetches) accepts a transport. Purely
+    # advisory — any outcome here continues the job; it only arms the strategy
+    # with measured evidence instead of hope.
+    listing_probe: dict[str, Any] | None = None
+    _input_mode = (state.get("input_mode") or "").lower()
+    _criteria = str(state.get("search_criteria") or "").strip()
+    if (
+        _input_mode in ("navigation", "list_page", "search_term")
+        and _criteria.startswith(("http://", "https://"))
+    ):
+        try:
+            from urllib.parse import urlparse as _urlparse
+
+            from .tools.probe_tools import run_listing_probe_advisory
+
+            _probed_host = (_urlparse(url).hostname or "").lower()
+            _listing_host = (_urlparse(_criteria).hostname or "").lower()
+            if _probed_host and _listing_host and _probed_host == _listing_host:
+                logger.info(
+                    "check_accessibility: advisory listing probe on %s (job %s)",
+                    _criteria[:100], job_id,
+                )
+                listing_probe = run_listing_probe_advisory(
+                    _criteria, data, job_id=job_id
+                )
+                logger.info(
+                    "check_accessibility: listing probe verdict method=%s "
+                    "needs_browser=%s blocked=%s (job %s)",
+                    listing_probe.get("method_that_worked") or "NONE",
+                    listing_probe.get("needs_browser"),
+                    listing_probe.get("blocked"),
+                    job_id,
+                )
+            else:
+                logger.info(
+                    "check_accessibility: search_criteria is not same-host — "
+                    "listing probe skipped (job %s)", job_id,
+                )
+        except Exception as exc:
+            # Advisory by contract: a listing-probe bug must never end a job.
+            logger.warning(
+                "check_accessibility: listing probe failed (advisory, continuing): %s",
+                exc,
+            )
+
     method = data.get("method", "unknown")
     proxy_tier = data.get("proxy_tier", "none")
 
@@ -1806,6 +1853,9 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
         "probe_result": agent_probe_result,
         "probe_url": url,
     }
+    if listing_probe is not None:
+        agent_probe_result["listing_connectivity"] = listing_probe
+        probe_state["listing_connectivity"] = listing_probe
 
     from .tools.context import update_probe_result
 
@@ -3711,6 +3761,19 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
     if not anti_bot and method.startswith(STEALTH_METHOD_PREFIXES):
         anti_bot = True
 
+    # [wave-17 S4/S14] LISTING evidence (advisory listing probe, written by
+    # check_accessibility) + the measured access recipe. The main ladder
+    # probes the SAMPLE PDP; for discovery-mode jobs the endpoint phase 1
+    # actually needs is the listing — and prod-289 proved a PDP that fetches
+    # fine over plain HTTP says NOTHING about the listing (429/429/403/403 on
+    # every HTTP tier while the browser rung — never tried by that job —
+    # reaches it). From here on, both measurements travel with the strategy.
+    _probe_listing = probe.get("listing_connectivity") if isinstance(probe, dict) else None
+    if not isinstance(_probe_listing, dict):
+        _probe_listing = {}
+    _listing_method = str(_probe_listing.get("method_that_worked") or "")
+    _listing_needs_browser = bool(_probe_listing.get("needs_browser"))
+
     # Proxy tier from the method suffix (mirrors the prompt mapping).
     if "residential" in method:
         proxy_tier = "residential"
@@ -3736,6 +3799,34 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
         > _PROXY_TIER_LADDER.index(proxy_tier)
     ):
         proxy_tier = _prior_tier
+    # [wave-17 S4/S17] Per-class egress tiers. The S4 single-tier raise ("the
+    # listing's tier wins for BOTH phases") is wrong on crocs-class sites,
+    # where the two URL classes measure DIFFERENT working identities: listing
+    # opens only via cloak_residential while the PDP needs cloak_datacenter —
+    # raising the extraction tier to residential made every phase-2 fetch a
+    # perpetual 403 challenge (title fell back to the domain placeholder,
+    # price empty, measured live 2026-09-03). The recipe now carries BOTH
+    # measured tiers: proxy_tier = the PDP's (phase 2, the output-producing
+    # phase), discovery_proxy_tier = the listing's (phase 1). Sites where one
+    # tier serves both classes get equal values and behave exactly as before.
+    _discovery_tier = proxy_tier
+    for _t in ("residential", "datacenter"):
+        if _listing_method.endswith(f"_{_t}"):
+            _discovery_tier = _t
+            break
+
+    # [wave-17 S4/S14] LISTING evidence (advisory listing probe, written by
+    # check_accessibility) + the measured access recipe. The main ladder
+    # probes the SAMPLE PDP; for discovery-mode jobs the endpoint phase 1
+    # actually needs is the listing — and prod-289 proved a PDP that fetches
+    # fine over plain HTTP says NOTHING about the listing (429/429/403/403 on
+    # every HTTP tier while the browser rung — never tried by that job —
+    # reaches it). From here on, both measurements travel with the strategy.
+    _probe_listing = probe.get("listing_connectivity") if isinstance(probe, dict) else None
+    if not isinstance(_probe_listing, dict):
+        _probe_listing = {}
+    _listing_method = str(_probe_listing.get("method_that_worked") or "")
+    _listing_needs_browser = bool(_probe_listing.get("needs_browser"))
 
     meth = method.lower()
     # Listing-page JS-rendering signal (navigate_explore._verify_rendering, propagated
@@ -3951,6 +4042,20 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
                 f"outranks count={_api_count!r} descriptor"
             )
 
+    # [wave-17 S4] A browser-only LISTING upgrades the DISCOVERY transport:
+    # http_requests' phase 1 fetches listings over plain HTTP, which the
+    # listing probe just measured as blocked. http_navigation's phase 1 goes
+    # through browser_service /navigate (browser rung) — phase 2 rides the
+    # same recipe (proven: the recipe that opens the listing opens the PDPs).
+    # Upgrades only — never downgrades, never touches internal_api (API
+    # evidence outranks; the count gate already decided with content proof).
+    if _listing_needs_browser and strategy == "http_requests":
+        strategy = "http_navigation"
+        _strategy_source += (
+            "; listing probe measured every HTTP rung blocked on the listing "
+            "while a browser rung reached it — discovery rides the browser rung"
+        )
+
     # Discovery config: propagate the navigator's pagination detection so the
     # template uses the RIGHT config_for_* preset (load_more vs page_param vs
     # next_button) — deterministic, not code_writer's guess.
@@ -3986,12 +4091,58 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
     if not _browser_shaped and not method.startswith(STEALTH_METHOD_PREFIXES):
         proxy_tier = "none"
 
+    # [wave-17 S14] The MEASURED rung travels with the analysis: top-level
+    # method_that_worked (every downstream reader used to re-derive it from
+    # the nested connectivity dict or lose it entirely) plus an access_recipe
+    # — the stealth/tier identity the probe/listing probe actually proved —
+    # so code_writer seeds, template placeholders and run-time env staging
+    # all draw from ONE measured source instead of re-guessing.
+    #
+    # [wave-17 S22] A listing probe BLOCKED on every rung is anti-bot evidence
+    # in itself: every identity, stealth ones included, was refused with
+    # block-class statuses. One clean PDP snapshot (anti_bot.detected=False —
+    # the challenge is per-URL-class and the PDP happened to answer) cannot
+    # out-vote it. crocs 2026-09-04: PDP answered clean once → stealth="none"
+    # → the draft launched VANILLA Chromium against a Cloudflare listing the
+    # same session's product_analyzer watched challenge twice, and the run
+    # burned before it started. The rungs' own per-attempt `blocked` verdict
+    # is the signal (a plain 404 sets blocked=False — never folded in).
+    _listing_block_evidence = isinstance(_probe_listing, dict) and any(
+        bool(a.get("blocked"))
+        for a in (_probe_listing.get("attempts") or [])
+        if isinstance(a, dict)
+    )
+    anti_bot = bool(anti_bot or _listing_block_evidence)
+    _stealth_proven = method.startswith(STEALTH_METHOD_PREFIXES) or (
+        _listing_method.startswith(STEALTH_METHOD_PREFIXES)
+    )
+    _recipe_stealth = (
+        "cloak"
+        if (
+            _stealth_proven
+            or (_listing_needs_browser and _browser_shaped)
+            or (anti_bot and _browser_shaped)
+        )
+        else "none"
+    )
     analysis: dict[str, Any] = {
         "strategy": strategy,
         "scraping_mechanism": strategy,
         "scraping_method": strategy,
         "recommended_strategy": strategy,
         "proxy_tier": proxy_tier,
+        "method_that_worked": method or None,
+        "access_recipe": {
+            "stealth": _recipe_stealth,
+            "proxy_tier": proxy_tier,
+            "discovery_proxy_tier": _discovery_tier,
+            "needs_browser": _browser_shaped or _listing_needs_browser,
+            "listing_probe": bool(_probe_listing),
+            "evidence": (
+                f"pdp_method={method or 'none'}; listing_method="
+                f"{_listing_method or ('blocked' if _probe_listing else 'not_probed')}"
+            ),
+        },
         "connectivity": {"method_that_worked": method},
         "anti_bot": {"detected": anti_bot},
         "confidence_score": 0.9,
@@ -4005,6 +4156,8 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
             f"data_source={_data_source}){_strategy_source}"
         ),
     }
+    if _probe_listing:
+        analysis["listing_connectivity"] = _probe_listing
 
     # On retry, carry a critical_fix synthesized from the prior crash so code_writer
     # makes a targeted fix (the read-only analyzer that authored critical_fix is gone).

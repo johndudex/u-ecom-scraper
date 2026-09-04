@@ -1555,6 +1555,18 @@ class NavigateRequest(BaseModel):
     return_what: str = "all"  # "all" | "html" | "data" | "none"
     wait_until: str = "domcontentloaded"
     cookies: Optional[list[dict]] = None
+    # [wave-17 S15] Render-completeness controls. The old endpoint settled a
+    # FLAT 1.5s after domcontentloaded and returned whatever DOM existed at
+    # that instant — a 14s-hydration SPA snapshot empty (prod 291: extraction
+    # ran on pre-hydration shells the probe had proven fully hydrate). Now:
+    #   settle_ms — floor settle before the first render probe (default 1.5s).
+    #   wait_for  — CSS selector; if present, wait for it to ATTACH (precise,
+    #               cheaper than blind sleeps) as part of the gate.
+    # The gate then verifies actual content (JSON-LD Product/ItemList, anchor
+    # count, price markers) and escalates bounded backoff waits until it is
+    # satisfied or the settle budget is spent. See _render_settle().
+    settle_ms: Optional[int] = Field(default=None, ge=0, le=45000)
+    wait_for: Optional[str] = Field(default=None, max_length=500)
 
 
 MCP_CDP_PORT = int(os.environ.get("MCP_CDP_PORT", "9222"))
@@ -2228,6 +2240,164 @@ def _snapshot_chrome_pids() -> set[int]:
     return set()
 
 
+# ── [wave-17 S15] render-completeness gate ───────────────────────────────
+# A goto that returned + a flat 1.5s sleep is NOT "rendered". Slow-hydration
+# SPAs (balenciaga-class: ~14s to JSON-LD) snapshot as empty shells and every
+# downstream consumer reads "site has no data" from a page the site never
+# finished building. The gate measures actual content and buys bounded,
+# escalating waits until the page shows evidence of real content — or the
+# settle budget is spent, honestly reported either way.
+
+# In-page probe: µs-cheap, self-contained, never throws into the caller.
+_RENDER_PROBE_JS = """
+() => {
+  let jsonld_items = 0;
+  const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+  for (const s of scripts) {
+    try {
+      const txt = (s.textContent || '').trim();
+      if (!txt) continue;
+      const parsed = JSON.parse(txt);
+      const nodes = [];
+      for (const node of (Array.isArray(parsed) ? parsed : [parsed])) {
+        if (node && typeof node === 'object') {
+          if (Array.isArray(node['@graph'])) nodes.push(...node['@graph']);
+          else nodes.push(node);
+        }
+      }
+      for (const n of nodes) {
+        const t = n && n['@type'];
+        const types = Array.isArray(t) ? t : [t];
+        if (types.some(x => ['Product', 'ItemList', 'ProductGroup'].includes(x))) {
+          jsonld_items += 1;
+        }
+      }
+    } catch (e) {}
+  }
+  const anchors = document.querySelectorAll('a[href]').length;
+  const body_len = document.body ? document.body.innerHTML.length : 0;
+  const has_price = !!document.querySelector(
+    '[class*="price" i], [itemprop*="price" i], [data-price], [property="product:price:amount"]');
+  return {jsonld_items: jsonld_items, anchors: anchors, body_len: body_len, has_price: has_price};
+}
+"""
+
+# Content thresholds: a page shows "real content" when ANY of these hold.
+# (A PDP satisfies via JSON-LD; a listing via the anchor count; either via a
+# rendered price node. Challenge shells satisfy none — they are tiny and
+# link-free by design.)
+_RENDER_GATE_MIN_ANCHORS = 25
+_RENDER_GATE_MIN_BODY = 20_000
+# Backoff ladder AFTER the base settle when the gate is unsatisfied. Bounded —
+# total waits stay under _NAVIGATE_MAX_SETTLE_MS.
+_RENDER_GATE_BACKOFF_MS = (2500, 5000, 8000)
+_RENDER_GATE_MAX_BUDGET_MS = int(os.environ.get("NAVIGATE_MAX_SETTLE_MS", "30000"))
+
+
+def _render_gate_satisfied(probe: dict, wait_for_hit: bool) -> bool:
+    if wait_for_hit:
+        return True
+    if not isinstance(probe, dict):
+        return False
+    return bool(
+        probe.get("jsonld_items", 0) > 0
+        or probe.get("anchors", 0) >= _RENDER_GATE_MIN_ANCHORS
+        or probe.get("body_len", 0) >= _RENDER_GATE_MIN_BODY
+        or probe.get("has_price", False)
+    )
+
+
+def _render_probe(page) -> dict:
+    try:
+        result = page.evaluate(_RENDER_PROBE_JS)
+        return result if isinstance(result, dict) else {}
+    except Exception:
+        return {}
+
+
+def _render_settle(
+    page,
+    wait_for: Optional[str],
+    settle_ms: Optional[int],
+    nav_timeout_s: int,
+) -> dict:
+    """Settle + verify real content, escalating waits until satisfied.
+
+    Sequence: base settle (``settle_ms`` or 1.5s) → optional ``wait_for``
+    selector attach (the precise signal) → content probe → if unsatisfied,
+    bounded backoff waits (2.5s/5s/8s) with a re-probe after each. Total
+    waiting is capped at 25s — the endpoint wraps the whole call at
+    ``timeout + 30s`` and the goto may already have spent most of its own
+    share, so the gate's budget is the wrapper's slack minus extraction
+    room — and by ``_RENDER_GATE_MAX_BUDGET_MS``.
+
+    Returns ``{satisfied, waited_ms, steps, probe}`` — recorded verbatim in
+    the response so callers (and RCAs) can see exactly what was waited for
+    and what the page looked like at each check (prod-290's evidence gap).
+    """
+    budget_ms = min(_RENDER_GATE_MAX_BUDGET_MS, 25_000)
+    del nav_timeout_s  # budget is the wrapper slack, not a share of the goto timeout
+    try:
+        base_ms = max(0, min(int(settle_ms) if settle_ms is not None else 1500, budget_ms))
+    except (TypeError, ValueError):
+        base_ms = min(1500, budget_ms)
+    steps: list[str] = []
+    waited_ms = 0
+
+    def _spend(ms: int, label: str) -> None:
+        nonlocal waited_ms
+        if ms <= 0 or waited_ms + ms > budget_ms:
+            if ms > 0:
+                steps.append(f"{label}:skipped_budget")
+            return
+        try:
+            page.wait_for_timeout(ms)
+            waited_ms += ms
+            steps.append(f"{label}:{ms}")
+        except Exception as exc:
+            steps.append(f"{label}:error:{type(exc).__name__}")
+
+    _spend(base_ms, "base_settle")
+
+    # Precise signal first: a caller-supplied selector is worth more than any
+    # amount of blind sleeping.
+    wait_for_hit = False
+    if wait_for:
+        remaining = max(0, budget_ms - waited_ms)
+        t0 = time.monotonic()
+        try:
+            page.wait_for_selector(wait_for, state="attached", timeout=min(remaining, 10_000))
+            wait_for_hit = True
+            steps.append(f"wait_for:hit:{wait_for[:80]}")
+        except Exception:
+            steps.append(f"wait_for:miss:{wait_for[:80]}")
+        finally:
+            waited_ms += min(int((time.monotonic() - t0) * 1000), max(0, budget_ms - waited_ms))
+
+    probe = _render_probe(page)
+    satisfied = _render_gate_satisfied(probe, wait_for_hit)
+    for backoff in _RENDER_GATE_BACKOFF_MS:
+        if satisfied or waited_ms >= budget_ms:
+            break
+        _spend(backoff, "gate_backoff")
+        if wait_for and not wait_for_hit:
+            try:
+                page.wait_for_selector(wait_for, state="attached", timeout=500)
+                wait_for_hit = True
+                steps.append(f"wait_for:hit_late:{wait_for[:80]}")
+            except Exception:
+                pass
+        probe = _render_probe(page)
+        satisfied = _render_gate_satisfied(probe, wait_for_hit)
+
+    return {
+        "satisfied": satisfied,
+        "waited_ms": waited_ms,
+        "steps": steps,
+        "probe": probe,
+    }
+
+
 def _apply_navigate_action(page, action: "NavigateAction") -> None:
     """Apply one NavigateAction to the page. Raises on error (caller stops)."""
     t = action.type
@@ -2279,6 +2449,8 @@ def _run_navigate_sync(
     return_what: str,
     wait_until: str,
     cookies: Optional[list[dict]],
+    settle_ms: Optional[int] = None,
+    wait_for: Optional[str] = None,
 ) -> dict:
     """Synchronous navigate worker (runs in the thread executor).
 
@@ -2346,11 +2518,10 @@ def _run_navigate_sync(
                 )
                 break
 
-        # Settle for any late DOM/JS updates
-        try:
-            page.wait_for_timeout(1500)
-        except Exception:
-            pass
+        # [wave-17 S15] Settle + verify real content (escalating waits), then
+        # extract. Replaces the flat 1.5s sleep that snapshotted slow SPAs
+        # pre-hydration.
+        render_gate = _render_settle(page, wait_for, settle_ms, timeout)
 
         # Extract (always captures html internally for classification)
         extracted = _extract_page_data(page, extract, return_what, MAX_NAVIGATE_HTML)
@@ -2371,6 +2542,21 @@ def _run_navigate_sync(
 
         # Classify on the captured html (always present internally)
         blocked_type = _classify_block(extracted["html"], status_code)
+        # [wave-17 S15] Content-over-status: when the render gate verified REAL
+        # content in the DOM, a stale/host-ambiguous transport status must not
+        # label the page blocked. Proven live: crocs' residential fetch returns
+        # status_code=429 via page.goto while the DOM holds the true 892KB
+        # listing — classifying that as blocked sends callers to escalate
+        # proxies they don't need (and historically ended discovery with
+        # navigate_error on a page that was actually in hand).
+        status_note = ""
+        if blocked_type and render_gate.get("satisfied"):
+            status_note = (
+                f"blocked_type={blocked_type!r} from status={status_code} overridden — "
+                f"render gate verified content (probe={render_gate.get('probe')})"
+            )
+            logger.info("navigate: %s (host=%s)", status_note, _url_host(url))
+            blocked_type = None
 
         # Only include html in the response when the caller asked for it
         include_html = return_what in ("all", "html")
@@ -2382,9 +2568,12 @@ def _run_navigate_sync(
             "title": title,
             "html": extracted["html"] if include_html else "",
             "html_truncated": extracted["html_truncated"] if include_html else False,
+            "html_len": len(extracted["html"] or ""),
             "data": extracted["data"],
             "blocked": blocked_type is not None,
             "blocked_type": blocked_type,
+            "render_gate": render_gate,
+            **({"status_note": status_note} if status_note else {}),
             "method_used": ctx.method,
             "stealth_used": ctx.stealth_used,
             "cookies": final_cookies,
@@ -2624,6 +2813,8 @@ async def navigate(request: NavigateRequest):
                             request.return_what,
                             request.wait_until,
                             request.cookies,
+                            request.settle_ms,
+                            request.wait_for,
                         ),
                         timeout=request.timeout + 30,
                     )

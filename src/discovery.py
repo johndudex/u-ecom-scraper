@@ -541,13 +541,52 @@ def pdp_candidates(urls: list, min_score: int = 0) -> list:
     return kept
 
 
+def _status_page_usable(page: Any, settle_s: float) -> bool:
+    """True when the DOM behind a 4xx/5xx status carries a real page.
+
+    Bounded poll (the discovery-layer mirror of probe.py's challenge settle):
+    a challenge interstitial or a slow render needs a few seconds before the
+    anchors/body text exist; a held block never grows them. The 20s floor
+    covers the managed-challenge auto-clear window (~5-15s measured across
+    probe/navigate) — the cost is paid only by pages that never materialize,
+    i.e. the honest-failure path.
+    """
+    import time as _t
+
+    deadline = _t.monotonic() + max(settle_s, 20.0)
+    # Poll cap alongside the deadline: in production each iteration costs the
+    # 1s wait, so the deadline binds (~20-25s); the cap only matters where
+    # wait_for_timeout is instant (fakes, exotic runners) — without it the
+    # loop spins hot on wall clock for the full window.
+    for _poll in range(30):
+        if _t.monotonic() >= deadline:
+            break
+        try:
+            anchors = page.evaluate(
+                "() => document.querySelectorAll('a[href]').length"
+            ) or 0
+            text_len = page.evaluate(
+                "() => (document.body && document.body.innerText || '').length"
+            ) or 0
+            if int(anchors) >= 20 and int(text_len) >= 500:
+                return True
+        except Exception:
+            pass
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            break
+    return False
+
+
 def _discovery_goto(page: Any, url: str, cfg: DiscoveryConfig,
                     state: dict) -> bool:
     """Phase-1 page fetch used by the page_param / next_button primitives.
 
-    Returns True on success; False on navigate failure (HTTP 4xx/5xx, 429,
-    timeout, exception). On failure stamps ``NAVIGATE_ERROR`` (sticky — H4) so
-    the coverage gate FAILs rather than treating a gave-up run as exhaustive.
+    Returns True on success; False on navigate failure (HTTP 5xx with no
+    usable content, timeout, exception). On failure stamps ``NAVIGATE_ERROR``
+    (sticky — H4) so the coverage gate FAILs rather than treating a gave-up
+    run as exhaustive.
     """
     try:
         response = page.goto(url, timeout=cfg.navigate_timeout_ms)
@@ -556,10 +595,32 @@ def _discovery_goto(page: Any, url: str, cfg: DiscoveryConfig,
         _set_stop(state, StopReason.NAVIGATE_ERROR)
         return False
     status = getattr(response, "status", 0) or 0
+    if status >= 400:
+        # Observability first: a healthy page never logs here, so the draft
+        # log always carries the status of every non-healthy navigation. The
+        # crocs 2026-09-04 RCA turned on exactly this line being absent — the
+        # first goto's status was unlogged, and "initial render empty" could
+        # mean challenge, rate-limit-with-content, or slow hydration.
+        logger.info("discovery: HTTP %d on %s", status, url[:80])
     if status in (429, 502, 503) or status >= 500:
-        logger.warning("discovery: HTTP %d on %s (rate-limit/block?)", status, url[:80])
-        _set_stop(state, StopReason.NAVIGATE_ERROR)
-        return False
+        # [wave-17 S20] Content over status. Crocs' listing serves the FULL
+        # catalogue behind HTTP 429 (Cloudflare rate-limit header over a real
+        # 158KB DOM — measured live 2026-09-03); aborting on the status code
+        # alone stamped NAVIGATE_ERROR on a page discovery could have crawled.
+        # Settle past any challenge, then judge the CONTENT: a real page
+        # proceeds, a held block still fails honestly.
+        if _status_page_usable(page, cfg.page_settle_after_nav_s):
+            logger.info(
+                "discovery: HTTP %d with usable content on %s — proceeding "
+                "(content over status)", status, url[:80],
+            )
+        else:
+            logger.warning(
+                "discovery: HTTP %d on %s and the DOM never became usable "
+                "(rate-limit/block)", status, url[:80],
+            )
+            _set_stop(state, StopReason.NAVIGATE_ERROR)
+            return False
     try:
         page.wait_for_load_state("domcontentloaded")
         # Mirror the nav template's settle sleep — JS listings mount links after

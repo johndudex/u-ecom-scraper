@@ -270,6 +270,22 @@ def _needs_cloak(state: ScrapeState) -> bool:
         )
         if isinstance(method, str) and method.startswith(STEALTH_METHOD_PREFIXES):
             return True
+        # [wave-17 S4/S14] The LISTING's measured rung counts too: a site whose
+        # PDP is plain-HTTP but whose listing (what discovery fetches) only
+        # opens through a stealth browser rung needs cloak at runtime — the
+        # classic crocs-class shape the PDP-only signal structurally missed.
+        listing = probe.get("listing_connectivity") or {}
+        if isinstance(listing, dict):
+            lmethod = str(listing.get("method_that_worked") or "")
+            if lmethod.startswith(STEALTH_METHOD_PREFIXES):
+                return True
+    # scraper_analysis.access_recipe (S14) is the strategy's own record of the
+    # measured rung — honor it on resumes where probe_result may be sparse.
+    sa = state.get("scraper_analysis") or {}
+    if isinstance(sa, dict):
+        recipe = sa.get("access_recipe") or {}
+        if isinstance(recipe, dict) and str(recipe.get("stealth") or "") == "cloak":
+            return True
     pm = state.get("probe_method") or ""
     if isinstance(pm, str) and pm.startswith(STEALTH_METHOD_PREFIXES):
         return True
@@ -280,13 +296,18 @@ _PROXY_TIERS = ("residential", "datacenter")
 
 
 def _scraper_proxy_tier(state: ScrapeState) -> str:
-    """The probe's working proxy TIER, staged as SCRAPER_PROXY_TIER [wave-15 3.5].
+    """The PDP's working proxy TIER, staged as SCRAPER_PROXY_TIER [wave-15 3.5].
 
-    The generated templates read SCRAPER_PROXY_TIER, so a site whose probe
-    only succeeded on a proxied tier starts there instead of re-running the
-    whole ladder from "none" — identity parity: discovery and extraction
-    share ONE egress identity instead of flip-flopping mid-run (a tier
-    change mid-run re-rolls the bot-score dice per phase).
+    The generated templates read SCRAPER_PROXY_TIER for the EXTRACTION
+    browser, so a site whose probe only succeeded on a proxied tier starts
+    there instead of re-running the whole ladder from "none".
+
+    [wave-17 S17] This is deliberately the PDP-only tier now. It used to be
+    raised by the LISTING probe's tier (S4), which measured crocs-class sites
+    wrong: listing cloak_residential + PDP cloak_datacenter staged residential
+    for BOTH phases and every phase-2 fetch sat in a challenge forever. The
+    listing's tier travels separately, as SCRAPER_DISCOVERY_PROXY_TIER
+    (:func:`_discovery_proxy_tier`).
     """
     probe = state.get("probe_result") or {}
     method = state.get("probe_method") or ""
@@ -298,10 +319,47 @@ def _scraper_proxy_tier(state: ScrapeState) -> str:
             or ""
         )
     method = method if isinstance(method, str) else ""
+    # [wave-17 S4/S14] access_recipe FIRST — it is the strategy's own synthesis
+    # of the PDP measurement (+ prior escalation; _derive_strategy raises,
+    # never lowers). With S17 the listing tier lives on
+    # recipe.discovery_proxy_tier and no longer feeds this phase-2 value.
+    sa = state.get("scraper_analysis") or {}
+    if isinstance(sa, dict):
+        recipe = sa.get("access_recipe") or {}
+        if isinstance(recipe, dict):
+            rtier = str(recipe.get("proxy_tier") or "")
+            if rtier in _PROXY_TIERS:
+                return rtier
     for tier in _PROXY_TIERS:
         if method.endswith(f"_{tier}"):
             return tier
     return ""  # no signal → don't stage; templates default to "none"/ladder top
+
+
+def _discovery_proxy_tier(state: ScrapeState) -> str:
+    """The LISTING's working proxy TIER → SCRAPER_DISCOVERY_PROXY_TIER [S17].
+
+    Phase-1 discovery faces the listing URL, whose measured identity can
+    differ from the sample PDP's (crocs: listing cloak_residential, PDP
+    cloak_datacenter). Templates launch their discovery browsers with the
+    tier staged here, falling back to SCRAPER_PROXY_TIER when unset.
+    """
+    sa = state.get("scraper_analysis") or {}
+    if isinstance(sa, dict):
+        recipe = sa.get("access_recipe") or {}
+        if isinstance(recipe, dict):
+            rtier = str(recipe.get("discovery_proxy_tier") or "")
+            if rtier in _PROXY_TIERS:
+                return rtier
+    probe = state.get("probe_result") or {}
+    if isinstance(probe, dict):
+        listing = probe.get("listing_connectivity") or {}
+        if isinstance(listing, dict):
+            lmethod = str(listing.get("method_that_worked") or "")
+            for tier in _PROXY_TIERS:
+                if lmethod.endswith(f"_{tier}"):
+                    return tier
+    return ""
 
 
 def _stealth_env(state: ScrapeState) -> dict[str, str]:
@@ -309,6 +367,11 @@ def _stealth_env(state: ScrapeState) -> dict[str, str]:
     tier = _scraper_proxy_tier(state)
     if tier:
         env["SCRAPER_PROXY_TIER"] = tier
+    dtier = _discovery_proxy_tier(state)
+    if dtier and dtier != tier:
+        # Same-tier is the common case; staging the var then would only invite
+        # drift between the two values. Stage it when the classes differ.
+        env["SCRAPER_DISCOVERY_PROXY_TIER"] = dtier
     return env
 
 

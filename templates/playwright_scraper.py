@@ -101,6 +101,46 @@ logger = logging.getLogger(__name__)
 
 proxy_config = ProxyConfig.get_instance()
 
+# [wave-17 S17] Phase-1 discovery rides the LISTING's measured tier, which can
+# differ from the PDP's: crocs' listing opens via cloak_residential while its
+# PDP needs cloak_datacenter (measured live 2026-09-03 — the single-tier
+# recipe sent phase 2 out on the listing's residential tier and every PDP
+# fetch sat in a Cloudflare challenge). Staged from
+# access_recipe.discovery_proxy_tier via SCRAPER_DISCOVERY_PROXY_TIER;
+# single-identity sites fall back to the extraction tier and are unchanged.
+DISCOVERY_PROXY_TIER = (
+    os.environ.get("SCRAPER_DISCOVERY_PROXY_TIER", "").strip() or PROXY_TIER
+)
+_DISCOVERY_PROXY = build_playwright_proxy(
+    DISCOVERY_PROXY_TIER, proxy_config, country=detect_country(SITE_URL)
+)
+
+# Full coherent Chrome UA shared by EVERY launch site. The old Phase-1 sites
+# overrode the context with a TRUNCATED UA ("...AppleWebKit/537.36" — no
+# Chrome version, no Safari tail): on a managed-challenge site that UA is a
+# bot tell that out-ranks even a stealth browser + working proxy tier, and
+# discovery sat on the challenge interstitial forever (crocs empty_render ×3,
+# 2026-09-03). Phase 2 already used the full string and passed.
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+# [wave-17 S21] UA *coherence* beats UA *cosmetics*. When the runner launches
+# a stealth binary (STEALTH_BROWSER=cloak — scraper_runner's local-launch
+# path), that binary's NATIVE user agent is the one coherent with its own
+# fingerprint set; probe.py launches cloak exactly that way and never stamps
+# a UA. Forcing Chrome/120 on top pairs one browser's JS/TLS fingerprints with
+# another's UA string — the mismatch that turned crocs' listing from
+# "429 + real catalogue" into a held challenge (measured live 2026-09-04:
+# same binary, same datacenter tier; only the UA stamp differed). Vanilla
+# headless chromium still needs the explicit stamp to mask its
+# HeadlessChrome UA tell.
+_STEALTH_NATIVE = (
+    os.environ.get("STEALTH_BROWSER", "").strip().lower() == "cloak"
+)
+_LAUNCH_UA = None if _STEALTH_NATIVE else USER_AGENT
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS
@@ -225,6 +265,42 @@ EXTRACT_PRODUCT_URLS_JS = """
 """
 
 
+# [wave-17 S23] Challenge tripwire. An edge that refuses the fetch still
+# returns HTTP 200 — the interstitial ("Just a moment...", "Access Denied",
+# …) renders, and extraction happily reports it as a product with
+# status_code=200 and failed_products=0 (crocs job 328: the sample item WAS
+# the challenge page, reported as a clean extraction). Markers are generic
+# managed-challenge/consent phrases; the structural arm (no title AND no
+# substantive field) catches interstitials whose wording we have not seen.
+_CHALLENGE_TITLE_MARKERS = (
+    "just a moment",
+    "attention required",
+    "access denied",
+    "please verify",
+    "verify you are a human",
+    "request unsuccessful",
+    "unusual traffic",
+    "are you a robot",
+    "bot verification",
+)
+_CHALLENGE_RETRY_SETTLE_MS = 10_000
+_SUBSTANTIVE_FIELDS = (
+    "price", "availability", "currency", "description", "brand", "sku",
+    "location", "original_price",
+)
+
+
+def _looks_challenged(data: dict) -> bool:
+    title = str(data.get("title") or "").strip().lower()
+    if any(marker in title for marker in _CHALLENGE_TITLE_MARKERS):
+        return True
+    if not title and not any(
+        str(data.get(k) or "").strip() for k in _SUBSTANTIVE_FIELDS
+    ):
+        return True
+    return False
+
+
 def scrape_product(page, url: str, src_url: str, index: int) -> dict:
     try:
         page.goto(url, wait_until="networkidle", timeout=PAGE_LOAD_TIMEOUT)
@@ -243,6 +319,51 @@ def scrape_product(page, url: str, src_url: str, index: int) -> dict:
     page.wait_for_timeout(2000)
 
     data = page.evaluate(EXTRACT_PRODUCT_JS, src_url)
+
+    # [wave-17 S23] The interstitial rides in behind HTTP 200, so the only
+    # place it can be caught is at extraction level. One bounded reload —
+    # managed challenges auto-clear in ~5-15s (probe.py settles the same
+    # way) — then an honest failure item: every field emptied, status 403
+    # (block class, not the page's own 200), remarks naming the challenge.
+    # Emitting the challenge as a product (title "Just a moment...",
+    # failed_products=0 — crocs job 328) is the failure mode this closes.
+    if _looks_challenged(data):
+        challenged_title = str(data.get("title") or "").strip()
+        logger.warning(
+            f"challenge/empty extraction on {url} "
+            f"(title={challenged_title!r}) — reloading once"
+        )
+        page.wait_for_timeout(_CHALLENGE_RETRY_SETTLE_MS)
+        try:
+            # domcontentloaded, not networkidle: the challenge's beacon
+            # traffic never goes quiet and would burn the full timeout.
+            page.goto(url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+            page.wait_for_timeout(3000)
+            data = page.evaluate(EXTRACT_PRODUCT_JS, src_url)
+        except Exception as exc:  # keep the first read; fall through honestly
+            logger.warning(f"challenge retry failed on {url}: {exc}")
+        if _looks_challenged(data):
+            logger.warning(
+                f"challenge persisted on {url} — emitting an honest "
+                f"failure item instead of a product"
+            )
+            return {
+                "id": index,
+                "title": "",
+                "price": "",
+                "availability": "",
+                "original_price": "",
+                "currency": "",
+                "url": url,
+                "src_url": src_url,
+                "location": "",
+                "status_code": 403,
+                "scraped_at": datetime.now(timezone.utc).isoformat(),
+                "remarks": (
+                    "anti-bot challenge persisted after retry"
+                    + (f" (page title: {challenged_title})" if challenged_title else "")
+                ),
+            }
 
     return {
         "id": index,
@@ -436,9 +557,9 @@ def main():
         logger.info("Phase 1 discovery triggered (env/flag). Listing URL: %s", _listing)
         PRODUCT_LISTING_URL = _listing
         with sync_playwright() as p:
-            browser = get_browser(p)
+            browser = get_browser(p, proxy=_DISCOVERY_PROXY)
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                user_agent=_LAUNCH_UA,
                 viewport={"width": 1920, "height": 1080},
             )
             page = context.new_page()
@@ -461,9 +582,9 @@ def main():
     if not product_urls:
         logger.info("No input URLs found. Discovering products via browser...")
         with sync_playwright() as p:
-            browser = get_browser(p)
+            browser = get_browser(p, proxy=_DISCOVERY_PROXY)
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                user_agent=_LAUNCH_UA,
                 viewport={"width": 1920, "height": 1080},
             )
             page = context.new_page()
@@ -506,9 +627,9 @@ def main():
                 return []
 
         with sync_playwright() as p:
-            browser = get_browser(p)
+            browser = get_browser(p, proxy=_DISCOVERY_PROXY)
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                user_agent=_LAUNCH_UA,
                 viewport={"width": 1920, "height": 1080},
             )
             probe_page = context.new_page()
@@ -587,7 +708,7 @@ def main():
     with sync_playwright() as p:
         browser = get_browser(p, headless=args.headless, proxy=playwright_proxy)
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            user_agent=_LAUNCH_UA,
             viewport={"width": 1920, "height": 1080},
         )
         page = context.new_page()

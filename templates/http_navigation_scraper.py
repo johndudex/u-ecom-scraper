@@ -137,6 +137,20 @@ elif STEALTH.startswith("{") and STEALTH.endswith("}"):
 # (actions + load) at this; we give httpx a 30s cushion on top for transport.
 NAVIGATE_TIMEOUT = 120
 
+# Per-call settle floor (ms) forwarded to /navigate. The server's render gate
+# re-checks the page for REAL content (JSON-LD Product/ItemList, anchor count,
+# price nodes) after this settle and escalates bounded backoff waits (2.5s →
+# 5s → 8s) until satisfied — a slow-hydrating SPA is waited out instead of
+# being snapshotted as an empty shell (the balenciaga-class failure: extraction
+# ran at 3.9s on a page the probe needed ~14s to hydrate). [wave-17 S15]
+NAVIGATE_SETTLE_MS = "{NAVIGATE_SETTLE_MS}"
+_env_settle = os.environ.get("NAVIGATE_SETTLE_MS", "").strip()
+try:
+    NAVIGATE_SETTLE_MS = int(_env_settle or NAVIGATE_SETTLE_MS)
+except (TypeError, ValueError):
+    NAVIGATE_SETTLE_MS = 4000
+NAVIGATE_SETTLE_MS = max(0, min(NAVIGATE_SETTLE_MS, 45000))
+
 # Retry policy for transient failures (5xx, 429, timeouts, connect errors).
 MAX_RETRIES = 3
 BACKOFF_BASE = 2.0  # exponential: BACKOFF_BASE ** attempt, capped at 30s
@@ -144,12 +158,22 @@ BACKOFF_BASE = 2.0  # exponential: BACKOFF_BASE ** attempt, capped at 30s
 # Phase 2 concurrency. With the server's NAVIGATE_SEMAPHORE=3, one worker will
 # routinely receive HTTP 429 — _navigate absorbs it via retry_after backoff.
 # Do NOT raise above 4 without also raising the server semaphore.
-PHASE2_WORKERS = 4
+# [wave-17 S15b] 4 → 2: browser-backed extraction is now ALSO settle-gated
+# per page (up to ~25s on a slow hydrator), and prod showed 4 concurrent cloak
+# navigations starving hydration (items completing ~1s apart vs 14s sequential
+# — "hydrated-but-empty" fetches). 2 concurrent keeps the server semaphore
+# headroom for the longer per-page windows.
+PHASE2_WORKERS = 2
 # [T3.13c/job-76 myhouse] Lower bound on one real /navigate item fetch (a
 # browser navigation never returns faster). Feeds the phase2_instant_fail
 # detector — Phase 2 finishing in under half of items*floor/workers means
 # the network was never hit.
 PHASE2_MIN_FETCH_S = 0.5
+# [wave-17 S24] Settle before the ONE blocked-PDP refetch (_extract_item). A
+# managed challenge auto-clears in ~5-15s; a tripped per-IP rate band needs
+# minutes, which a single 90s window sometimes outlives and never doubles the
+# hits on an edge that has refused the item twice.
+BLOCKED_RETRY_SETTLE_S = 90
 
 # ── Phase 1: Navigation ─────────────────────────────────────────────────────
 SEARCH_URL_PATTERN = "{SEARCH_URL_PATTERN}"        # e.g. "https://site.com/search?q={query}"
@@ -289,7 +313,7 @@ def _effective_proxy_tier() -> str:
     return tier if tier in ("none", "datacenter", "residential") else "none"
 
 
-def _navigate(url, actions=None, extract=None, retry=0):
+def _navigate(url, actions=None, extract=None, retry=0, settle_ms=None):
     """POST /navigate with exponential backoff. Returns the response dict or None.
 
     Contract (see docs/browser-service-rework-plan.md Step 1):
@@ -329,6 +353,10 @@ def _navigate(url, actions=None, extract=None, retry=0):
         ),
         "timeout": NAVIGATE_TIMEOUT,
         "return_what": "all",
+        # Render-completeness floor; the server escalates beyond it while the
+        # page still lacks content (see NAVIGATE_SETTLE_MS above). None → the
+        # server's own default.
+        "settle_ms": NAVIGATE_SETTLE_MS if settle_ms is None else max(0, int(settle_ms)),
     }
     endpoint = f"{BROWSER_SERVICE_URL}/navigate"
     last_throttled = False
@@ -1194,14 +1222,93 @@ def _error_item(url: str, src_url: str, error: str) -> dict:
     }
 
 
+def _hreflang_alternates(html: str) -> dict:
+    """hreflang → absolute URL map from ``<link rel="alternate">`` (first wins)."""
+    alts: dict = {}
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for link in soup.find_all("link", rel=lambda v: v and "alternate" in v):
+            lang = (link.get("hreflang") or "").strip().lower()
+            href = (link.get("href") or "").strip()
+            if lang and href.startswith("http"):
+                alts.setdefault(lang, href)
+    except Exception:
+        pass
+    return alts
+
+
+def _locale_escalation_urls(html: str, item_url: str, max_candidates: int = 2) -> list:
+    """Locale alternates of this page worth one retry, best-first [wave-17 S15b].
+
+    Generic mechanism, no per-site knowledge: some storefronts render core
+    commerce fields (price/currency) ONLY on a locale-specific path — the
+    default-locale PDP carries the full DOM but a null price (balenciaga
+    prod-291: /en-en/ is price-less on every egress; /en-us/ renders price).
+    The page itself advertises its alternates via hreflang; prefer the one
+    matching the egress locale, then the explicit en-US, then x-default.
+    Same-host only; never re-returns the original URL.
+    """
+    try:
+        from urllib.parse import urlparse
+    except Exception:  # pragma: no cover
+        return []
+    alts = _hreflang_alternates(html)
+    if not alts:
+        return []
+    item_host = (urlparse(item_url).hostname or "").lower()
+    orig = item_url.split("?", 1)[0].split("#", 1)[0]
+    egress = ""
+    if _detect_country:
+        try:
+            egress = (_detect_country(SITE_URL) or "").strip().lower()
+        except Exception:
+            egress = ""
+    ordered_langs = []
+    if egress and egress != "us":
+        ordered_langs.append(f"en-{egress}")
+    ordered_langs += ["en-us", "x-default"]
+    urls: list = []
+    for lang in ordered_langs:
+        u = alts.get(lang)
+        if not u:
+            continue
+        if (urlparse(u).hostname or "").lower() != item_host:
+            continue
+        if u.split("?", 1)[0].split("#", 1)[0] == orig:
+            continue
+        if u not in urls:
+            urls.append(u)
+        if len(urls) >= max_candidates:
+            break
+    return urls
+
+
 def _extract_item(item_url: str, src_url: str) -> dict:
     """Phase 2: Extract structured data from a single item page.
 
     One POST /navigate call fetches the page (after any redirects). JSON-LD +
     CSS parsing happen locally on the returned HTML. Failures become error
     dicts so the job continues instead of aborting on one bad page.
+
+    [wave-17 S24] Phase 2 paces itself with DELAY_BETWEEN_REQUESTS (Phase 1
+    already did; the concurrent executor hid the burst) and gives a challenged
+    PDP ONE bounded settle-and-refetch — a managed interstitial that trips
+    mid-run clears in seconds-to-minutes, and the crocs 2026-09-04 execution
+    lost all 10 PDP fetches to a band that the discovery walk had just barely
+    held open. The retry is per-item and once: an identity the edge has
+    refused twice will not answer a third time either.
     """
+    if DELAY_BETWEEN_REQUESTS:
+        time.sleep(DELAY_BETWEEN_REQUESTS)
+
     resp = _navigate(item_url)
+    if resp and resp.get("blocked") and BLOCKED_RETRY_SETTLE_S > 0:
+        logger.warning(
+            "Phase 2: %s challenged — settling %ds and refetching once",
+            item_url[:80], BLOCKED_RETRY_SETTLE_S,
+        )
+        time.sleep(BLOCKED_RETRY_SETTLE_S)
+        resp = _navigate(item_url)
     if not resp:
         return _error_item(item_url, src_url, "navigate failed after retries")
     if resp.get("navigate_unavailable"):
@@ -1244,6 +1351,34 @@ def _extract_item(item_url: str, src_url: str) -> dict:
                 item["title"] = h1.get_text(strip=True)
         except Exception:
             pass
+
+    # [wave-17 S15b] Locale escalation: a price-less render of a PDP whose
+    # locale twins DO carry price is a locale problem, not a mapping problem.
+    # One bounded retry on the hreflang alternate matching the egress locale.
+    if not item.get("price"):
+        for alt_url in _locale_escalation_urls(html, item_url):
+            alt_resp = _navigate(alt_url)
+            if (
+                not alt_resp
+                or alt_resp.get("blocked")
+                or alt_resp.get("navigate_unavailable")
+                or not alt_resp.get("html")
+            ):
+                continue
+            alt_item: dict = dict(item)
+            try:
+                alt_blocks = extract_jsonld(alt_resp["html"])
+                if alt_blocks:
+                    _populate_from_jsonld(alt_item, alt_blocks)
+            except Exception:
+                pass
+            if alt_item.get("price"):
+                for k, v in alt_item.items():
+                    if v and not item.get(k):
+                        item[k] = v
+                item["locale_escalated_from"] = item_url
+                item["locale_escalated_url"] = alt_url
+                break
 
     return item
 

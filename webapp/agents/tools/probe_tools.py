@@ -625,6 +625,135 @@ def run_probe_with_captcha_check(
     }
 
 
+# [wave-17 S4] Advisory LISTING probe — the connectivity measurement the
+# pipeline used to skip entirely. The main ladder probes the SAMPLE PDP; for
+# navigation/list_page/search_term jobs the endpoint discovery actually needs
+# is the LISTING URL in search_criteria — and a PDP that fetches fine over
+# plain HTTP says nothing about the listing (prod-289 crocs: PDP direct_http
+# OK, listing 429/429/403/403 on every HTTP tier, browser rung never tried).
+# Bounded (≤3 /probe-single rungs), advisory (a failed probe NEVER ends the
+# job), and honest: it records which transport the listing itself accepts.
+LISTING_PROBE_MAX_RUNGS = 4
+
+
+def run_listing_probe_advisory(
+    listing_url: str, pdp_data: dict, job_id: int = 0
+) -> dict:
+    """Probe the listing/discovery URL with a SMALL, smart rung set.
+
+    Rungs, in order (stop at the first success):
+      1. the sample PDP's working HTTP rung, if any (same transport often
+         shared — cheapest possible answer "listing works over HTTP too");
+      2. ``cloak_none`` — the cheapest browser rung (what a stealth browser
+         does unproxied);
+      3. ``cloak_datacenter`` — datacenter egress (the tier the sample PDP
+         most often needs — a single recipe tier covering BOTH URL classes
+         is the outcome the downstream recipe derivation prefers);
+      4. ``cloak_residential`` — the browser rung at the strongest tier
+         (prod-289-class edges admit the browser only from residential IPs).
+
+    Returns ``{probed_url, advisory, method_that_worked, http_ok, browser_ok,
+    needs_browser, blocked, status_code, body_length, methods_tried,
+    attempts}``. ``needs_browser=True`` is the load-bearing flag: HTTP rungs
+    failed on the listing while a browser rung reached it — discovery must
+    ride the browser rung even though the PDP is cheap HTTP.
+    """
+    service_url = _get_browser_service_url()
+
+    from src.geo import detect_country as _detect_country
+
+    country = _detect_country(listing_url)
+
+    rungs: list[str] = []
+    pdp_http = str(pdp_data.get("http_method") or "").strip()
+    if pdp_http and pdp_http in HTTP_METHODS:
+        rungs.append(pdp_http)
+    rungs.append("cloak_none")
+    rungs.append("cloak_datacenter")
+    rungs.append("cloak_residential")
+    rungs = rungs[:LISTING_PROBE_MAX_RUNGS]
+
+    def _log(message: str) -> None:
+        if not job_id:
+            return
+        try:
+            from scraper.models import SessionLog
+
+            seq = SessionLog.objects.filter(job_id=job_id).count()
+            SessionLog.objects.create(
+                job_id=job_id,
+                role=SessionLog.ROLE_SYSTEM,
+                agent="check_accessibility",
+                content=f"[LISTING-PROBE] {message}",
+                seq=seq,
+            )
+        except Exception:
+            pass
+
+    attempts: list[dict] = []
+    winner: dict | None = None
+    winner_method = ""
+    for rung in rungs:
+        _log(f"trying {rung} for listing {listing_url[:80]}")
+        try:
+            resp = httpx.post(
+                f"{service_url}/probe-single",
+                json={
+                    "url": listing_url,
+                    "method": rung,
+                    "timeout": 60,
+                    "country": country,
+                },
+                timeout=75,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            attempts.append({"method": rung, "error": str(exc)[:200]})
+            _log(f"{rung} errored: {str(exc)[:100]}")
+            continue
+        ok = bool(data.get("success"))
+        attempts.append(
+            {
+                "method": rung,
+                "success": ok,
+                "status_code": data.get("status_code"),
+                "body_length": data.get("body_length"),
+                "blocked": bool(data.get("blocked")),
+            }
+        )
+        if ok:
+            winner = data
+            winner_method = rung
+            _log(f"{rung} SUCCEEDED on the listing ({data.get('body_length')} bytes)")
+            break
+        _log(f"{rung} failed on the listing")
+
+    http_ok = bool(winner_method) and winner_method in HTTP_METHODS
+    browser_ok = bool(winner_method) and winner_method not in HTTP_METHODS
+    result: dict = {
+        "probed_url": listing_url,
+        "advisory": True,
+        "method_that_worked": winner_method,
+        "http_ok": http_ok,
+        "browser_ok": browser_ok,
+        # Load-bearing: the listing is browser-only → discovery must ride the
+        # browser rung regardless of what the sample PDP accepts.
+        "needs_browser": browser_ok,
+        "blocked": not bool(winner_method),
+        "status_code": (winner or {}).get("status_code", 0),
+        "body_length": (winner or {}).get("body_length", 0),
+        "methods_tried": [a.get("method") for a in attempts],
+        "attempts": attempts,
+    }
+    if not winner_method:
+        _log(
+            "listing BLOCKED on all advisory rungs ("
+            + ", ".join(str(m) for m in result["methods_tried"]) + ")"
+        )
+    return result
+
+
 def get_probe_tools() -> list:
     @tool
     def probe_page(url: str, render_js: bool = True) -> str:

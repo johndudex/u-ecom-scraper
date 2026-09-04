@@ -3031,6 +3031,68 @@ def build_code_writer_message(state: dict) -> list:
     scraper_analysis_section = ""
     if scraper_analysis:
         proxy_tier = scraper_analysis.get("proxy_tier", "none")
+        # [wave-17 S14/S16] The MEASURED recipe — one authoritative identity
+        # block sourced from the probe + the advisory listing probe. Rendered
+        # into the seed whenever it carries browser/stealth evidence (the
+        # crocs class: PDP answered plain HTTP so anti_bot=false and the
+        # cloak playbook never fired, the listing was browser-only, and the
+        # writer shipped a plain-requests draft that never had a chance).
+        _recipe = scraper_analysis.get("access_recipe")
+        if not isinstance(_recipe, dict):
+            _recipe = {}
+        _probe_t14 = state.get("probe_result") if isinstance(
+            state.get("probe_result"), dict
+        ) else {}
+        _listing_t14 = (
+            _probe_t14.get("listing_connectivity")
+            or scraper_analysis.get("listing_connectivity")
+            or {}
+        )
+        if not isinstance(_listing_t14, dict):
+            _listing_t14 = {}
+        _recipe_lines = []
+        if _recipe or _listing_t14:
+            if _recipe:
+                _recipe_lines.append(
+                    f"- stealth for browser calls: `{_recipe.get('stealth', 'none')}`"
+                )
+                _recipe_lines.append(
+                    f"- proxy tier: `{_recipe.get('proxy_tier', proxy_tier)}`"
+                )
+                _dt = str(_recipe.get("discovery_proxy_tier") or "")
+                if _dt and _dt != str(_recipe.get("proxy_tier") or ""):
+                    _recipe_lines.append(
+                        f"- DISCOVERY proxy tier: `{_dt}` — Phase 1 (listing "
+                        "fetches) launches with THIS tier; the tier above is "
+                        "the item/PDP tier. Keep BOTH in the draft."
+                    )
+                _recipe_lines.append(
+                    f"- discovery needs a browser rung: `{bool(_recipe.get('needs_browser'))}`"
+                )
+            if _listing_t14.get("method_that_worked"):
+                _recipe_lines.append(
+                    f"- LISTING transport (measured): `{_listing_t14['method_that_worked']}`"
+                )
+            elif _listing_t14.get("probed_url"):
+                _recipe_lines.append(
+                    "- LISTING transport (measured): BLOCKED on all probe rungs "
+                    f"({', '.join(str(m) for m in _listing_t14.get('methods_tried', [])) or 'none ran'})"
+                )
+            if _recipe.get("evidence"):
+                _recipe_lines.append(f"- evidence: {_recipe['evidence']}")
+        recipe_section = ""
+        if _recipe_lines:
+            recipe_section = (
+                "\n### ACCESS RECIPE (measured — the transport contract)\n"
+                "These are MEASUREMENTS, not suggestions. Every page fetch in the "
+                "scraper must ride a rung that actually measured 200-with-content "
+                "for the URL class it fetches: discovery/listing fetches follow the "
+                "LISTING transport; item/PDP fetches follow the PDP transport. "
+                "Do NOT strip the recipe's stealth/proxy settings from the draft "
+                "even when a simpler path looks plausible — a recipe the probe "
+                "proved is the only one guaranteed to work.\n"
+                + "\n".join(_recipe_lines) + "\n"
+            )
         no_proxy = scraper_analysis.get("no_proxy_flag", proxy_tier == "none")
 
         proxy_instructions = ""
@@ -3056,12 +3118,38 @@ def build_code_writer_message(state: dict) -> list:
                 or ""
             )
             if _method_t35.startswith("direct_http"):
-                proxy_instructions = (
-                    "\n**PROXY: Do NOT use any proxy.** The probe VERIFIED that direct "
-                    "HTTP (no proxy) reaches this site. The scraper MUST accept "
-                    "`--no-proxy` flag and should default to NO proxy for this site. "
-                    "Do NOT import or use the proxy module.\n"
-                )
+                # [wave-17 S4] Recipe overrides the blanket "no proxy" text
+                # when the LISTING measurement disagreed with the PDP (the
+                # crocs class: PDP direct_http OK, listing browser+residential
+                # only). The old text made the writer strip the proxy ladder
+                # birkenstock-style while discovery faced a wall the probe had
+                # already measured.
+                _recipe_tier = str(_recipe.get("proxy_tier") or "")
+                _recipe_stealth = str(_recipe.get("stealth") or "")
+                if (
+                    _recipe_tier in ("residential", "datacenter")
+                    or _recipe_stealth == "cloak"
+                ):
+                    _id_bits = []
+                    if _recipe_stealth == "cloak":
+                        _id_bits.append('stealth "cloak"')
+                    if _recipe_tier in ("residential", "datacenter"):
+                        _id_bits.append(f"{_recipe_tier} proxy tier")
+                    proxy_instructions = (
+                        f"\n**PROXY/STEALTH (from the measured recipe):** The sample "
+                        f"PDP answered plain direct HTTP, but the LISTING (which "
+                        f"discovery fetches) required {'+'.join(_id_bits)}. Send the "
+                        f"recipe identity on every call for the URL class it was "
+                        f"measured on — do NOT downgrade discovery to bare direct "
+                        f"HTTP. The scraper MUST accept `--no-proxy`.\n"
+                    )
+                else:
+                    proxy_instructions = (
+                        "\n**PROXY: Do NOT use any proxy.** The probe VERIFIED that direct "
+                        "HTTP (no proxy) reaches this site. The scraper MUST accept "
+                        "`--no-proxy` flag and should default to NO proxy for this site. "
+                        "Do NOT import or use the proxy module.\n"
+                    )
             else:
                 _reached = _method_t35 or "an unknown probe method"
                 proxy_instructions = (
@@ -3174,6 +3262,7 @@ def build_code_writer_message(state: dict) -> list:
             f"{critical_fix_section}"
             f"**Strategy:** {mechanism}\n"
             f"**Proxy tier:** {proxy_tier}\n"
+            f"{recipe_section}"
             f"**Strategy justification:** {scraper_analysis.get('strategy_justification', '')}\n"
             f"{proxy_instructions}{approach_section}{verified_section}{extras_section}"
             f"{seleniumbase_section}"

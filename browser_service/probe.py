@@ -1254,6 +1254,79 @@ def _render_via_fingerprint(
     return ""
 
 
+def _safe_page_content(page, attempts: int = 3, wait_ms: int = 1500) -> str:
+    """``page.content()`` that survives an in-flight navigation.
+
+    Redirect chains (locale rewrites, consent walls, tracking hops) keep
+    navigating after ``goto(domcontentloaded)`` returns; a ``page.content()``
+    issued mid-commit raises "Unable to retrieve content because the page is
+    navigating" — and the probe rung treated that raise as a hard block,
+    recording pages that a patient fetch opens fine as blocked (prod crocs
+    listing: every cloak rung false-blocked this way). Waits out the commit
+    and re-reads, bounded; returns "" only when every attempt raised, so the
+    caller's blocked/empty classification still runs on real evidence.
+    """
+    for attempt in range(max(1, attempts)):
+        try:
+            page.wait_for_load_state("load", timeout=wait_ms)
+        except Exception:
+            pass  # load event is best-effort; content() below is the real read
+        try:
+            return page.content()
+        except Exception as exc:
+            logger.info(
+                "page.content() race (attempt %d/%d): %s",
+                attempt + 1, attempts, str(exc)[:120],
+            )
+            try:
+                page.wait_for_timeout(wait_ms)
+            except Exception:
+                pass
+    return ""
+
+
+# Bounded challenge/hydration settle: ~9.5s of extra patience, spent only when
+# the page still looks blocked or empty (healthy pages return immediately).
+_CHALLENGE_SETTLE_STEPS_MS = (2500, 3000, 4000)
+
+
+def _settle_past_challenge(page) -> str:
+    """Read page HTML once it stops looking like a challenge/empty shell.
+
+    Anti-bot interstitials (Cloudflare managed challenge) and JS hydration
+    often resolve seconds after domcontentloaded; a flat 2s snapshot reads the
+    challenge page and the rung reports the site blocked even though a patient
+    fetch opens it (prod crocs listing: cloak rungs flip-flopped
+    success/blocked across identical calls purely on challenge timing).
+    Polls bounded: returns as soon as content passes the blocked test with
+    real length; otherwise keeps the LAST read so a persistent challenge
+    still classifies as blocked — honestly, on settled evidence.
+    """
+    html = _safe_page_content(page)
+    for step_ms in _CHALLENGE_SETTLE_STEPS_MS:
+        if len(html) > 2000 and not is_blocked(html[:5000]):
+            return html
+        try:
+            page.wait_for_timeout(step_ms)
+        except Exception:
+            pass
+        html = _safe_page_content(page)
+    return html
+
+
+def _safe_title(page) -> str:
+    """``page.title()`` under the same navigation race (same raise class)."""
+    for _ in range(2):
+        try:
+            return page.title() or ""
+        except Exception:
+            try:
+                page.wait_for_timeout(800)
+            except Exception:
+                pass
+    return ""
+
+
 def _try_playwright(url: str, proxy_tier: str, timeout: int = 25, country: Optional[str] = None) -> Optional[dict]:
     ctx = None
     try:
@@ -1263,9 +1336,9 @@ def _try_playwright(url: str, proxy_tier: str, timeout: int = 25, country: Optio
         resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
         page.wait_for_timeout(2000)
 
-        html = page.content()
+        html = _settle_past_challenge(page)
         _capture_html_for_render(html)
-        title = page.title() or ""
+        title = _safe_title(page)
         blocked = is_blocked(html[:5000])
         jsonld = extract_jsonld(html)
         meta = extract_meta_tags(html)
@@ -1336,9 +1409,9 @@ def _try_cloak(url: str, proxy_tier: str, timeout: int = 40, country: Optional[s
         resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
         page.wait_for_timeout(2000)
 
-        html = page.content()
+        html = _settle_past_challenge(page)
         _capture_html_for_render(html)
-        title = page.title() or ""
+        title = _safe_title(page)
         blocked = is_blocked(html[:5000])
         jsonld = extract_jsonld(html)
         meta = extract_meta_tags(html)

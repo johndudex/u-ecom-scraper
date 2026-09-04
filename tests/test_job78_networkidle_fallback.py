@@ -78,6 +78,14 @@ def _load_scrape_product():
         "EXTRACT_PRODUCT_JS": "()",
         "PlaywrightTimeoutError": PlaywrightTimeoutError,
     }
+    # [wave-17 S23] The challenge tripwire's helpers live at module scope
+    # above scrape_product; the function body resolves them at call time, so
+    # they must join the namespace or every invocation NameErrors.
+    h = re.search(
+        r"^_CHALLENGE_TITLE_MARKERS = .*?(?=^def scrape_product\()", src, re.M | re.S
+    )
+    if h:
+        exec(h.group(0), ns)
     exec(m.group(0), ns)
     return ns["scrape_product"]
 
@@ -107,6 +115,51 @@ class TestNetworkidleTimeoutNonFatal:
         scrape = _load_scrape_product()
         page = FakePage(data={"title": "ok"})
         assert scrape(page, "https://x.com/p/1", "https://x.com/p/1", 1)["title"] == "ok"
+
+
+# ─── [wave-17 S23] a challenge interstitial is a failure, not a product ──────
+
+
+class TestChallengeInterstitialHonestFailure:
+    def test_challenge_page_becomes_honest_failure_item(self):
+        """crocs 328: the interstitial WAS the extraction — title "Just a
+        moment...", price/availability empty — and the draft reported it as a
+        product with status_code=200, failed_products=0. scrape_product must
+        retry once, then return an item whose data fields are all empty with
+        the block class in status_code and the challenge named in remarks."""
+        scrape = _load_scrape_product()
+
+        class ChallengePage(FakePage):
+            def goto(self, url, wait_until=None, timeout=None):
+                if self.goto_raiser is not None and not self.settles:
+                    raise self.goto_raiser
+                return type("R", (), {"status": 200})()
+
+        page = ChallengePage(data={"title": "Just a moment...", "sku": "10001"})
+        product = scrape(page, "https://x.com/p/1", "https://x.com/p/1", 1)
+        assert product["title"] == "" and product["price"] == ""
+        assert product["status_code"] == 403
+        assert "challenge" in product["remarks"]
+        assert "Just a moment" in product["remarks"]
+        assert page.settles.count(10_000), "the bounded retry must settle first"
+
+    def test_challenge_that_clears_on_retry_is_a_product(self):
+        """The bounded reload exists because managed challenges auto-clear in
+        ~5-15s — a retry that reads a real page must still emit the product."""
+        scrape = _load_scrape_product()
+
+        class ClearingPage(FakePage):
+            def goto(self, url, wait_until=None, timeout=None):
+                self.reads = getattr(self, "reads", 0) + 1
+                if self.reads > 1:
+                    self.data = {"title": "Kids' Classic Clog", "price": "$39.99"}
+                return type("R", (), {"status": 200})()
+
+        page = ClearingPage(data={"title": "Just a moment..."})
+        product = scrape(page, "https://x.com/p/1", "https://x.com/p/1", 1)
+        assert product["title"] == "Kids' Classic Clog"
+        assert product["price"] == "$39.99"
+        assert product["status_code"] == 200
 
 
 # ─── source pins: real import bound, warm-up guarded too ─────────────────────

@@ -416,6 +416,45 @@ def get_shell_tools(
             if is_anti_bot_detected():
                 env_overrides = {"STEALTH_BROWSER": "cloak"}
                 logger.info("run_scraper: anti-bot detected → STEALTH_BROWSER=cloak")
+            # [wave-17 S4/S14] LISTING/recipe evidence — the same identity
+            # staging run_execution does, for the tester's runs. Without this
+            # the test run faces the listing unstealthed at "none" even when
+            # the listing probe proved only a stealth browser rung opens it
+            # (the prod-289 shape: PDP direct_http, listing browser-only).
+            _sa = _ts.get("scraper_analysis") or {}
+            _recipe = (
+                _sa.get("access_recipe") if isinstance(_sa, dict) else None
+            ) or {}
+            if str(_recipe.get("stealth") or "") == "cloak" and not (
+                env_overrides or {}
+            ).get("STEALTH_BROWSER"):
+                env_overrides = dict(env_overrides or {})
+                env_overrides["STEALTH_BROWSER"] = "cloak"
+                logger.info(
+                    "run_scraper: access_recipe.stealth=cloak → STEALTH_BROWSER=cloak"
+                )
+            _rtier = str(_recipe.get("proxy_tier") or "")
+            if _rtier in ("residential", "datacenter"):
+                env_overrides = dict(env_overrides or {})
+                env_overrides["SCRAPER_PROXY_TIER"] = _rtier
+                logger.info(
+                    "run_scraper: access_recipe tier %s → SCRAPER_PROXY_TIER=%s",
+                    _rtier, _rtier,
+                )
+            # [wave-17 S17] The LISTING's measured tier for the tester's
+            # Phase-1 runs — discovery faces the listing URL, whose working
+            # identity can differ from the PDP's (crocs: residential vs
+            # datacenter). Same-tier is not staged (template falls back to
+            # SCRAPER_PROXY_TIER).
+            _dtier = str(_recipe.get("discovery_proxy_tier") or "")
+            if _dtier in ("residential", "datacenter") and _dtier != _rtier:
+                env_overrides = dict(env_overrides or {})
+                env_overrides["SCRAPER_DISCOVERY_PROXY_TIER"] = _dtier
+                logger.info(
+                    "run_scraper: access_recipe discovery tier %s → "
+                    "SCRAPER_DISCOVERY_PROXY_TIER=%s",
+                    _dtier, _dtier,
+                )
             # [wave-15 3.5] Tester parity: the test run stages the SAME proxy
             # tier execution will, so a draft whose items only arrive on a
             # proxied tier is tested under that identity — not passed on a
@@ -424,7 +463,9 @@ def get_shell_tools(
 
             _pm = str(get_probe_method() or "")
             for _tier in ("residential", "datacenter"):
-                if _pm.endswith(f"_{_tier}"):
+                if _pm.endswith(f"_{_tier}") and not (env_overrides or {}).get(
+                    "SCRAPER_PROXY_TIER"
+                ):
                     env_overrides = dict(env_overrides or {})
                     env_overrides["SCRAPER_PROXY_TIER"] = _tier
                     logger.info(
