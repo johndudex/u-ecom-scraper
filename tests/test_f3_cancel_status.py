@@ -62,12 +62,20 @@ class TestStatusLadder:
     """Static assertions on the finalize ladder ordering."""
 
     def test_cancelled_early_return_before_error_ladder(self):
+        # [wave-19 T1.5] the ladder moved into the pure _final_status_ladder;
+        # the ordering contract is unchanged: cancel outranks the error check.
         src = open(os.path.join(ROOT, "webapp/scraper/tasks.py")).read()
-        i_status = src.index("STATUS_CAPTCHA_BLOCKED,\n        ScrapeJob.STATUS_AKAMAI_BLOCKED,")
-        i_cancel_branch = src.index("_finalize_was_cancelled(final_state)")
-        i_error = src.index("elif job.error_message:")
-        assert i_status < i_cancel_branch < i_error, "cancel branch must precede error ladder"
-        # M3: CANCELLED in the early-return set
+        m = re.search(
+            r"^def _final_status_ladder\(.*?(?=^def |\Z)", src, re.M | re.S
+        )
+        assert m, "_final_status_ladder must exist"
+        fn = m.group(0)
+        i_cancel = fn.index("if was_cancelled:")
+        i_error = fn.index("if error_message:")
+        assert i_cancel < i_error, "cancel branch must precede error ladder"
+        # the call site still feeds cancel detection and keeps the M3
+        # already-terminal set (a view-level cancel is never resurrected)
+        assert "_finalize_was_cancelled(final_state)" in src
         assert "ScrapeJob.STATUS_CANCELLED,  # M3" in src
 
     def test_site_status_cancel_branch(self):
@@ -78,15 +86,20 @@ class TestStatusLadder:
     def test_never_executed_job_cannot_finalize_completed(self):
         """Job 304: cascade-FAIL landed on cleanup with empty execution_status
         and the catch-all blessed it COMPLETED with 0 products. The ladder must
-        FAIL a finalize that never executed (no status, no output)."""
+        FAIL a finalize that never executed (no status, no output).
+        [wave-19 T1.5: the ladder is the pure _final_status_ladder now]"""
         src = open(os.path.join(ROOT, "webapp/scraper/tasks.py")).read()
-        i_failed_branch = src.index('final_state.get("execution_status") == "FAILED"')
-        i_cond = src.index('elif not final_state.get("execution_status")')
-        i_completed = src.rindex("else:\n        job.status = ScrapeJob.STATUS_COMPLETED")
-        guard = src[i_cond:i_completed]
-        assert i_failed_branch < i_cond < i_completed
+        m = re.search(
+            r"^def _final_status_ladder\(.*?(?=^def |\Z)", src, re.M | re.S
+        )
+        assert m, "_final_status_ladder must exist"
+        fn = m.group(0)
+        i_failed = fn.index('final_state.get("execution_status") == "FAILED"')
+        i_cond = fn.index('if not final_state.get("execution_status") and not output_file:')
+        i_completed = fn.rindex("return ScrapeJob.STATUS_COMPLETED")
+        guard = fn[i_cond:i_completed]
+        assert i_failed < i_cond < i_completed
         # the guard requires BOTH empty execution_status AND empty output_file
-        assert "and not job.output_file" in guard
         assert "STATUS_FAILED" in guard
 
 

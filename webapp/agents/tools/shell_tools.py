@@ -7,6 +7,7 @@ browser_service via HTTP.  HTTP-based scrapers run locally as subprocesses.
 
 import logging
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -159,9 +160,34 @@ def _format_result(result: dict) -> str:
     return output
 
 
+def cross_workspace_paths(command: str, workspace_scope: str) -> list[str]:
+    """Path tokens in ``command`` that reach OTHER jobs' workspaces.
+
+    [wave-19 T1.8] 323/D2-twin: a tester ran free-form bash against the
+    project root and globbed SEVEN other sites' workspaces, cross-
+    contaminating its analysis with foreign artifacts. The filesystem tools
+    honor ``workspace_scope``; this is the same contract for the widest read
+    path, free-form bash.
+
+    Flagged: ``workspace/<other-slug>``, ``workspace/*`` (touches unknown
+    slugs), and ``workspace/..`` (escape). Clean: the job's own slug, any
+    command that never mentions ``workspace/``. With NO scope set, nothing is
+    ever flagged (ops/admin callers keep root access).
+    """
+    scope = (workspace_scope or "").strip()
+    if not scope:
+        return []
+    bad: list[str] = []
+    for token in re.findall(r"workspace/([^\s/\"';&|]+)", command or ""):
+        if token != scope:
+            bad.append(token)
+    return bad
+
+
 def get_shell_tools(
     project_root: Optional[str] = None,
     allowed_dirs: Optional[list[str]] = None,
+    workspace_scope: Optional[str] = None,
 ) -> list:
     cwd = _resolve_project_root(project_root)
 
@@ -186,6 +212,16 @@ def get_shell_tools(
                     "pre-installed in the execution environment. Browser-based scrapers "
                     "run on browser_service which has Chrome, SeleniumBase, and Playwright. "
                     "Use run_scraper instead of run_bash for scraper execution.")
+        # [wave-19 T1.8] This agent's reads are scoped to its OWN workspace.
+        # Other jobs' artifacts are not evidence for this site (323/D2-twin:
+        # a tester globbed 7 foreign workspaces and poisoned its analysis).
+        _cross = cross_workspace_paths(command, workspace_scope or "")
+        if _cross:
+            return (
+                f"Error: command touches other jobs' workspaces "
+                f"({', '.join(_cross[:3])}). Stay inside workspace/{workspace_scope}/ — "
+                "only THIS site's artifacts are evidence for THIS job."
+            )
         try:
             result = subprocess.run(
                 command,

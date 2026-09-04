@@ -1185,7 +1185,10 @@ def _get_tools_sync(agent_name: str, workspace_scope: str = "") -> list:
         try:
             from .tools.shell_tools import get_shell_tools as _gst
 
-            all_shell = _gst()
+            # [wave-19 T1.8] run_bash gets the same workspace scoping the
+            # filesystem tools already honor — free-form shell is the widest
+            # read path and must not reach other jobs' workspaces.
+            all_shell = _gst(workspace_scope=workspace_scope or None)
             if needs_scraper and not needs_bash:
                 all_shell = [t for t in all_shell if t.name == "run_scraper"]
             tools.extend(all_shell)
@@ -3320,6 +3323,7 @@ def build_code_writer_message(state: dict) -> list:
     if navigation_analysis:
         try:
             import json as _json_nf, os as _os_nf
+            from django.conf import settings
             _slug = state.get("site_slug", "")
             _nf_path = _os_nf.join(settings.PROJECT_ROOT, "workspace", _slug, "navigation_findings.json")
             if _os_nf.isfile(_nf_path):

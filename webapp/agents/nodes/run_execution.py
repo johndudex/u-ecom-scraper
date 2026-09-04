@@ -693,6 +693,35 @@ def run_execution(state: ScrapeState) -> dict:
                 ),
             }
 
+    # [wave-19 T1.1] Structural ladder gate: an HTTP-family nav draft with no
+    # proxy-aware fetch path (no src.http_fetch import, no proxies= kwarg, no
+    # shared-ladder call) executes unproxied and zeroes the moment the site
+    # throttles the direct egress IP (job 324 myhouse) — refuse before any
+    # launch, like the parse and sha walls above.
+    try:
+        from ..draft_safety import ladder_preservation_violation
+
+        _ladder_violation = ladder_preservation_violation(
+            scraper_path,
+            state.get("input_mode", ""),
+            (state.get("scraper_analysis") or {}).get("strategy", "")
+            if isinstance(state.get("scraper_analysis"), dict)
+            else "",
+        )
+    except Exception as _exc:
+        logger.warning("run_execution: ladder gate errored: %s", _exc)
+        _ladder_violation = None
+    if _ladder_violation:
+        logger.error("run_execution: %s", _ladder_violation)
+        return {
+            "execution_status": "FAILED",
+            "error_message": (
+                f"{_ladder_violation} Refusing unproxied execution — "
+                "regenerate the scraper so it fetches through the shared "
+                "proxy ladder."
+            ),
+        }
+
     # NOTE: the FINAL execution always extracts the FULL result set (--sample is
     # only for code_tester validation). "sample_only" still skips the approval
     # gates for unattended runs, but must NOT cap the extraction — users expect

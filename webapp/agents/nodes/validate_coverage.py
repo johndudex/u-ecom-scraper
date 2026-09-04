@@ -155,7 +155,13 @@ def validate_coverage(state: ScrapeState) -> Command:
                 product_retries,
             )
             return Command(
-                update={"product_analysis_retries": product_retries},
+                update={
+                    "product_analysis_retries": product_retries,
+                    # [wave-19 T1.5] this exit leaves the interrupt loop — any
+                    # error_message a previous interrupt arm left behind is
+                    # answered, not carried forward (323/D3 stale poison).
+                    "error_message": "",
+                },
                 goto="scraper_analyzer",
             )
         options = ["Retry content analysis", "Continue without analysis", "Cancel"]
@@ -174,6 +180,10 @@ def validate_coverage(state: ScrapeState) -> Command:
     state_update: dict[str, Any] = {
         "product_analysis": analysis,
         "content_analysis": analysis,
+        # [wave-19 T1.5] A non-interrupt exit is a recovery (or a clean pass):
+        # clear any error_message a previous interrupt arm left in state, or
+        # the finalizer ranks the stale note above this job's real output.
+        "error_message": "",
     }
 
     extracted_fields = _extract_covered_fields(analysis)

@@ -107,6 +107,11 @@ services:
       LITELLM_BASE_URL: ${LITELLM_BASE_URL:-https://llm.johnjf.xyz/v1}
       LITELLM_API_KEY: ${LITELLM_API_KEY:-}
       LITELLM_ENABLED: ${LITELLM_ENABLED:-true}
+      # [wave-19 T0.1] Arm the soft-block detector where src.http_fetch runs
+      # in-process (tester + run_execution HTTP runs). Code default stays 0
+      # (OFF) — 20000 bytes floors the "200-but-empty challenge page" shape
+      # so the shared ladder escalates instead of accepting a stub.
+      SCRAPER_SOFT_BLOCK_MIN_BYTES: "20000"
       # [wave-15 PR-2b] Per-phase async invoke canary (default OFF — empty
       # allowlist, every phase runs sync). Opt a phase in for a canary run:
       # AGENT_ASYNC_PHASES=code_writer. The old all-phases switch
@@ -321,6 +326,10 @@ services:
       PROXY_RESIDENTIAL_PORT: ${PROXY_RESIDENTIAL_PORT:-22225}
       PROXY_RESIDENTIAL_USER: ${PROXY_RESIDENTIAL_USER:-}
       PROXY_RESIDENTIAL_PASS: ${PROXY_RESIDENTIAL_PASS:-}
+      # [wave-19 T0.1] Secondary: browser_service only runs src.http_fetch in
+      # a few HTTP-flavoured paths, but keeping the floor identical here means
+      # a draft's fetch behaves the same in both containers.
+      SCRAPER_SOFT_BLOCK_MIN_BYTES: "20000"
     ports:
       - "8001:8001"
       - "8111:8111"

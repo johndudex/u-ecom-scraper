@@ -59,14 +59,37 @@ def _get_fetch_text():
     return _FETCH_TEXT
 
 
-def _http_get(url: str) -> tuple[str, int]:
+# [T1.3] The shared ladder's challenge signal. Guarded: the draft must keep
+# working when the browser-service image predates src.http_fetch.
+try:
+    from src.http_fetch import SoftBlock  # noqa: E402
+except ImportError:  # pragma: no cover
+    SoftBlock = None
+
+
+def _is_soft_block(obj) -> bool:
+    """True when ``obj`` is the shared ladder's challenge signal.
+
+    Guarded so a pre-src.http_fetch image (where no SoftBlock can ever
+    occur) degrades to plain False instead of raising.
+    """
+    return SoftBlock is not None and isinstance(obj, SoftBlock)
+
+
+def _http_get(url: str):
     """HTTP GET through the shared proxy ladder [wave-15 3.4].
 
     The bare httpx GET this used to be ran unproxied with no escalation —
     the SSR fallback path always egressed from the direct IP, burning it
     against Akamai-class reputation even on runs whose browser phase needed
-    a proxy. Returns (html, status_code); ("", 0) when every tier fails —
-    the same falsy contract as before. Falls back to the bare GET when the
+    a proxy.
+
+    Returns (html, status_code); ("", 0) when every tier fails — the same
+    falsy contract as before — OR the shared ladder's SoftBlock signal when
+    the site answered a tier with a challenge-served-as-200 [T1.3]. A
+    SoftBlock is falsy, so legacy ``if not html`` callers keep working, and
+    block-aware callers can tell a soft wall from a transport failure and
+    report the honest stop reason. Falls back to the bare GET when the
     image predates the shared module.
     """
     try:
@@ -79,6 +102,12 @@ def _http_get(url: str) -> tuple[str, int]:
         except Exception as exc:
             logger.warning("_http_get %s failed: %s", url[:60], exc)
             return "", 0
+    if _is_soft_block(result):
+        logger.warning(
+            "SOFT BLOCK (200, %s) on %s — reporting the challenge signal",
+            getattr(result, "reason", "?"), url[:60],
+        )
+        return result
     if not result:
         return "", 0
     return result
@@ -868,6 +897,17 @@ def _discover_urls_via_form_search(
 
     # Fetch the form page to extract hidden fields (CSRF) + select options
     form_html = _http_get(form_page_url)
+    if _is_soft_block(form_html):
+        # The block is DETECTED here but the job-58 reclass does NOT happen
+        # here: per-path reclass + _merge_stop_reason would fail a run whose
+        # primary path found items (T2.1 — the reclass lives ONCE in main()
+        # on the AGGREGATE list). navigate_error is the table-honest
+        # per-path label ("gave up due to 502/503/block", severity 5).
+        logger.error(
+            "Phase 1 (form-search): form page %s soft-blocked (%s)",
+            form_page_url[:80], getattr(form_html, "reason", "?"),
+        )
+        return [], "navigate_error"
     if not form_html:
         logger.error("Phase 1 (form-search): could not fetch form page %s", form_page_url)
         return [], "navigate_error"
@@ -928,7 +968,13 @@ def _discover_urls_via_form_search(
             if FORM_METHOD.upper() == "POST":
                 resp_html, status = _http_post(form_action_url, form_data)
             else:
-                resp_html, status = _http_get(form_action_url + "?" + "&".join(f"{k}={v}" for k, v in form_data.items()))
+                _got = _http_get(form_action_url + "?" + "&".join(f"{k}={v}" for k, v in form_data.items()))
+                if _is_soft_block(_got):
+                    # tuple contract: collapse the block for this legacy
+                    # unpacking site, loudly — the option page is a wall.
+                    logger.warning("Phase 1 (form-search): option '%s' page %d soft-blocked (%s)", opt_text[:30], page_num, getattr(_got, "reason", "?"))
+                    break
+                resp_html, status = _got
 
             if not resp_html or status >= 400:
                 logger.warning("Phase 1 (form-search): option '%s' page %d → status %d", opt_text[:30], page_num, status)
@@ -969,7 +1015,11 @@ def _discover_urls_via_form_search(
                 break  # most form-search results don't support simple page-param
             else:
                 # Follow the next link
-                next_html, next_status = _http_get(next_link)
+                _next_got = _http_get(next_link)
+                if _is_soft_block(_next_got):
+                    logger.warning("Phase 1 (form-search): next page soft-blocked (%s)", getattr(_next_got, "reason", "?"))
+                    break
+                next_html, next_status = _next_got
                 if not next_html or next_status >= 400:
                     break
                 next_urls = _extract_item_links(next_html)

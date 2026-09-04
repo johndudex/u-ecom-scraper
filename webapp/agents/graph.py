@@ -57,6 +57,7 @@ from .constants import (
     MAX_TEST_RETRIES,
     STEALTH_METHOD_PREFIXES,
 )
+from .tools.probe_tools import fingerprint_profile as _fingerprint_profile
 from .decisions import options_to_decisions
 from .nodes import (
     check_tracker,
@@ -1838,7 +1839,13 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
             "http_method": data.get("http_method"),
             "browser_method": data.get("browser_method"),
             "proxy_tier": proxy_tier,
+            # T0.4: keep the RAW measured verdict alongside the prompt-text
+            # alias, plus which fingerprint profile won — the recipe (and the
+            # Tier-2 fingerprint reroute) must not re-guess what the probe
+            # already knew.
+            "needs_browser": bool(data.get("needs_browser", True)),
             "js_rendering_needed": data.get("needs_browser", True),
+            "fingerprint_profile": _fingerprint_profile(method),
             "anti_bot_detected": bool(data.get("blocked", False)),
             "spa_detected": bool(data.get("spa_detected", False)),
             "spa_framework": data.get("spa_framework", ""),
@@ -2602,6 +2609,13 @@ def _sanitize_nav_domains(analysis: dict, job_url: str) -> dict:
         if isinstance(disc, dict):
             if _check(disc.get("listing_url"), "discovery.listing_url"):
                 disc["listing_url"] = ""
+        # [wave-19 T1.6] api_endpoint is an identity-bearing field too — a
+        # cross-domain API URL sends discovery AND field mapping at the wrong
+        # site (323/D1 class). Blank the URL; keep the measured evidence.
+        api = analysis.get("api_endpoint")
+        if isinstance(api, dict):
+            if _check(api.get("url"), "api_endpoint.url"):
+                api["url"] = ""
         il = analysis.get("item_links") or {}
         if isinstance(il, dict):
             examples = il.get("url_examples")
@@ -2624,6 +2638,51 @@ def _sanitize_nav_domains(analysis: dict, job_url: str) -> dict:
     except Exception as exc:
         logger.warning("F17 domain guard error (passing through): %s", exc)
         return analysis
+
+
+def _nav_result_contamination(result: Any, job_url: str) -> list[str]:
+    """[wave-19 T1.6] Assert a browser_traverse RESULT belongs to the job's
+    site — BEFORE any navigation_analysis is built from it.
+
+    323/D1: driven concurrently with another job on the shared Chrome, the
+    navigator handed back the OTHER site's pages; the pipeline built a nav
+    analysis (and measured listing tiers) against the wrong site. F17 blanks
+    the artifact afterwards — this checks the source, so the poison never
+    becomes an artifact.
+
+    Flags (a non-empty return means contaminated):
+      - ``goal_url`` off the job's registrable domain;
+      - ``api.url`` off-domain (identity-bearing for internal_api strategy);
+      - a MAJORITY of item_links off-domain (one stray affiliate/ad link is
+        noise — F17 still drops the examples downstream).
+
+    Returns a list of human-readable violations; [] means clean.
+    """
+    try:
+        from experimental.nav_traversal.traversal import _registrable
+    except Exception:
+        return []
+    job_reg = _registrable(job_url)
+    if not job_reg:
+        return []
+    bad: list[str] = []
+
+    def _off(url: str) -> bool:
+        return bool(url) and _registrable(url) not in ("", job_reg)
+
+    goal = str(getattr(result, "goal_url", "") or "")
+    if goal.startswith("http") and _off(goal):
+        bad.append(f"goal_url={goal[:60]}")
+    api = getattr(result, "api", None)
+    api_url = api.get("url") if isinstance(api, dict) else ""
+    if isinstance(api_url, str) and api_url.startswith("http") and _off(api_url):
+        bad.append(f"api.url={api_url[:60]}")
+    links = [u for u in (getattr(result, "item_links", []) or []) if isinstance(u, str)]
+    if links:
+        off_n = sum(1 for u in links if u.startswith("http") and _off(u))
+        if off_n * 2 > len(links):
+            bad.append(f"item_links ({off_n}/{len(links)} off-domain)")
+    return bad
 
 
 def _project_api_endpoint(api: Any) -> dict:
@@ -2718,6 +2777,50 @@ def _invoke_navigation_traverse(
                 logger.info(
                     "HTTP traverse also didn't reach goal — using best partial (job %s)",
                     job_id,
+                )
+
+        # [wave-19 T1.6] Same-domain assertion on the traversal RESULT — the
+        # 323/D1 wall. A concurrent drive on the shared Chrome can hand this
+        # job the OTHER site's pages; F17 blanks the artifact afterwards, but
+        # by then discovery is aimed at the wrong domain. Assert BEFORE the
+        # analysis exists: contaminated → ONE forced-homepage re-traverse;
+        # still contaminated → honest fail. Never build a nav analysis for
+        # the wrong site.
+        _bad = _nav_result_contamination(result, url)
+        if _bad:
+            logger.error(
+                "browser_traverse: CROSS-DOMAIN traversal result (job %s, url %s): %s "
+                "— ONE forced-homepage re-traverse",
+                job_id, url[:80], "; ".join(_bad),
+            )
+            _retry = browser_traverse(
+                url, content_type, query, trust_start_as_listing=False
+            )
+            _bad2 = _nav_result_contamination(_retry, url)
+            if not _bad2:
+                logger.warning(
+                    "browser_traverse: forced re-traverse is CLEAN — replacing the "
+                    "poisoned result (job %s)",
+                    job_id,
+                )
+                result = _retry
+            else:
+                logger.error(
+                    "browser_traverse: still cross-domain after re-traverse "
+                    "(job %s): %s — honest fail, no nav analysis will be built",
+                    job_id, "; ".join(_bad2),
+                )
+                _notify_phase(job_id, "browser_traverse", "failed")
+                return Command(
+                    goto="cleanup",
+                    update={
+                        "error_message": (
+                            "Navigator returned cross-domain traversal results twice "
+                            f"(job url {url[:80]}): {'; '.join(_bad2)}. Refusing to "
+                            "build a navigation analysis for the wrong site."
+                        )[:2000],
+                        "navigation_analysis": {},
+                    },
                 )
 
         # Extract item URL examples so product_analyzer + code_tester have
@@ -4152,6 +4255,11 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
             "proxy_tier": proxy_tier,
             "discovery_proxy_tier": _discovery_tier,
             "needs_browser": _browser_shaped or _listing_needs_browser,
+            # T0.4: the measured impersonation profile travels with the
+            # recipe — PDP rung first, listing rung as fallback. Tier-2's
+            # fingerprint reroute reads this instead of re-parsing rungs.
+            "fingerprint_profile": _fingerprint_profile(method)
+            or _fingerprint_profile(_listing_method),
             "listing_probe": bool(_probe_listing),
             "evidence": (
                 f"pdp_method={method or 'none'}; listing_method="
@@ -5103,21 +5211,64 @@ def _probe_retry_warranted(state: dict, probe_yield: dict | None) -> bool:
     return True
 
 
+def _state_at_next_tier(state: dict) -> tuple[dict | None, str, str]:
+    """[wave-19 T1.2] A COPY of ``state`` whose access recipe sits at the NEXT
+    configured proxy tier — the shipped ``_escalate_tier_axis`` semantics
+    (never downgrade, skip unconfigured tiers, no-op at residential) applied
+    to the recipe the probe's T0.2 ``_stealth_env`` staging reads.
+
+    Returns ``(None, "", previous_tier)`` when no higher tier is configured:
+    the ladder is exhausted and a re-run would manufacture the same
+    experiment twice.
+    """
+    analysis = state.get("scraper_analysis")
+    if not isinstance(analysis, dict):
+        analysis = {}
+    recipe = analysis.get("access_recipe")
+    previous = (
+        str(recipe.get("proxy_tier") or "none")
+        if isinstance(recipe, dict)
+        else "none"
+    )
+    escalated = _escalate_tier_axis({"proxy_tier": previous})
+    if not escalated:
+        return None, "", previous
+    next_tier = str(escalated.get("proxy_tier"))
+    new_state = dict(state)
+    new_analysis = dict(analysis)
+    new_recipe = dict(recipe) if isinstance(recipe, dict) else {}
+    # BOTH URL classes ride the escalated identity: a --discover-only probe
+    # is pure discovery, so the escalation IS the experiment being tested.
+    new_recipe["proxy_tier"] = next_tier
+    new_recipe["discovery_proxy_tier"] = next_tier
+    new_analysis["access_recipe"] = new_recipe
+    new_analysis["proxy_tier"] = next_tier
+    new_state["scraper_analysis"] = new_analysis
+    return new_state, next_tier, previous
+
+
 def _probe_phase1_discovery(
     slug: str, state: dict, job_id: int
 ) -> tuple[bool, str | None, dict | None]:
     """Probe the draft's Phase-1 discovery, retrying ONCE on the navigator's
-    listing when the primary candidate yields zero.
+    listing when the primary candidate yields zero, then ONCE at the next
+    configured proxy tier. [wave-19 T1.2]
 
     [job-76 myhouse] The list_page job URL is tried first (job-310 contract),
     but when that URL is an ITEM page the probe tests a listing that can only
     ever yield 0 — while the navigator's promoted listing works. One retry,
     only on a clean-exit zero, only with a distinct same-domain navigator
-    listing (see ``_probe_retry_warranted``). Both candidates dead → the
-    honest zero stands and the caller's zero-yield gate fires on real
-    evidence.
+    listing (see ``_probe_retry_warranted``).
+
+    [job-324 myhouse] A dead yield after the listing arms means the draft
+    cannot see the site AT ONE NETWORK IDENTITY — a throttled direct egress
+    IP is not evidence about the higher tiers. One tier-escalation re-run at
+    the same listing (recipe mutated → _stealth_env stages it); the attempt
+    is recorded on the coverage, and dead at BOTH identities sets the
+    FAIL-class ``all_tiers_blocked`` stop reason instead of a bare zero.
     """
     crashed, tb, probe_yield = _probe_phase1_discovery_once(slug, state, job_id)
+    _listing_used = ""
     if not crashed and _probe_retry_warranted(state, probe_yield):
         _primary, _alt = _probe_listing_candidates(state)
         logger.info(
@@ -5125,9 +5276,59 @@ def _probe_phase1_discovery(
             "retrying once with the navigator's listing %s",
             job_id, _alt[:80],
         )
+        _listing_used = _alt
         crashed, tb, probe_yield = _probe_phase1_discovery_once(
             slug, state, job_id, listing_override=_alt
         )
+    if (
+        not crashed
+        and isinstance(probe_yield, dict)
+        and _probe_yield_dead(probe_yield)
+    ):
+        _esc_state, _next_tier, _prev_tier = _state_at_next_tier(state)
+        if _esc_state is not None:
+            logger.info(
+                "_probe_phase1_discovery: dead at tier '%s' (job %s) — ONE "
+                "identity-escalation re-run at tier '%s'",
+                _prev_tier, job_id, _next_tier,
+            )
+            _esc_crashed, _esc_tb, _esc_yield = _probe_phase1_discovery_once(
+                slug, _esc_state, job_id, listing_override=_listing_used
+            )
+            _annotation = {
+                "attempted": True,
+                "tier": _next_tier,
+                "previous_tier": _prev_tier,
+            }
+            if _esc_crashed:
+                # A crash at the higher tier is the same code; the honest
+                # zero from the earlier run stands, annotated — the caller's
+                # zero-yield gate fires on real evidence either way.
+                _annotation["crashed"] = True
+            elif isinstance(_esc_yield, dict):
+                _annotation["still_dead"] = _probe_yield_dead(_esc_yield)
+                if not _annotation["still_dead"]:
+                    logger.info(
+                        "_probe_phase1_discovery: tier '%s' ESCALATION "
+                        "SUCCEEDED (job %s, discovered=%s)",
+                        _next_tier, job_id, _esc_yield.get("discovered_urls"),
+                    )
+                    _esc_cov = dict(_esc_yield.get("coverage") or {})
+                    _esc_cov["tier_escalation"] = _annotation
+                    _esc_yield["coverage"] = _esc_cov
+                    return _esc_crashed, _esc_tb, _esc_yield
+            else:
+                _annotation["inconclusive"] = True
+            if isinstance(probe_yield, dict):
+                _cov = dict(probe_yield.get("coverage") or {})
+                _cov["tier_escalation"] = _annotation
+                if _esc_crashed or (
+                    _annotation.get("still_dead") or _annotation.get("inconclusive")
+                ):
+                    # Dead (or unproven) at BOTH identities — say so.
+                    _cov["stop_reason"] = "all_tiers_blocked"
+                    probe_yield["stop_reason"] = "all_tiers_blocked"
+                probe_yield["coverage"] = _cov
     return crashed, tb, probe_yield
 
 
@@ -5186,7 +5387,18 @@ def _probe_phase1_discovery_once(
                     _probe_env_candidate = ""
             except Exception:
                 pass
-        _probe_env = {**os.environ, "SCRAPER_DISCOVERY_MAX_PAGES": _PROBE_DISCOVERY_PAGE_CAP}
+        # T0.2 (wave-19, job 324): the probe must test EXECUTION's identity —
+        # the gate used to run bare os.environ while the real run rides the
+        # recipe's proxy tiers, so a draft that would have succeeded under its
+        # measured recipe was condemned by a direct-only probe. Same-tier
+        # recipes stage nothing (_stealth_env's own rule) → legacy env unchanged.
+        from agents.nodes.run_execution import _stealth_env
+
+        _probe_env = {
+            **os.environ,
+            **_stealth_env(state),
+            "SCRAPER_DISCOVERY_MAX_PAGES": _PROBE_DISCOVERY_PAGE_CAP,
+        }
         if _probe_env_candidate:
             _probe_env["SCRAPER_LISTING_URL"] = _probe_env_candidate
         logger.info(
@@ -5235,6 +5447,7 @@ def _probe_phase1_discovery_once(
                         # The page cap rides along so browser drafts probe fast
                         # for the same reason local ones do.
                         **({"env_overrides": {
+                            **_stealth_env(state),
                             **({"SCRAPER_LISTING_URL": _probe_env_candidate}
                                if _probe_env_candidate else {}),
                             "SCRAPER_DISCOVERY_MAX_PAGES": _PROBE_DISCOVERY_PAGE_CAP,
@@ -5868,6 +6081,25 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 "_invoke_code_tester: CLI-contract check errored (job %s): %s",
                 job_id, _exc,
             )
+        # [wave-19 T1.1] L2 ladder gate — same force-FAIL lane: a nav-mode
+        # HTTP-family draft with no proxy-aware fetch path must not PASS
+        # testing (it would zero under egress throttling at execution,
+        # job 324 myhouse).
+        _violation_kind = "cli" if _cli_violation else None
+        if not _cli_violation:
+            try:
+                from .draft_safety import ladder_preservation_violation
+
+                _cli_violation = ladder_preservation_violation(
+                    _draft, state.get("input_mode", ""), _strategy_t
+                )
+                if _cli_violation:
+                    _violation_kind = "ladder"
+            except Exception as _exc:
+                logger.warning(
+                    "_invoke_code_tester: ladder gate errored (job %s): %s",
+                    job_id, _exc,
+                )
         if _cli_violation:
             report = report or {}
             report["overall_assessment"] = "FAIL"
@@ -5881,13 +6113,25 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     "description": _cli_violation,
                 },
             )
-            report["feedback_for_writer"] = (
-                "CLI CONTRACT VIOLATION (deterministic — testing cannot pass "
-                "while discovery is unwired):\n" + _cli_violation + "\n"
-                "Add the missing argparse declarations AND the "
-                "SCRAPER_LISTING_URL env gate in main(), exactly as your "
-                "template does. Use edit_file; do NOT rewrite the scraper."
-            )
+            if _violation_kind == "ladder":
+                report["feedback_for_writer"] = (
+                    "LADDER PRESERVATION VIOLATION (deterministic — testing "
+                    "cannot pass while the draft fetches unproxied):\n"
+                    + _cli_violation + "\n"
+                    "Wire your HTTP fetches through the shared ladder exactly "
+                    "as your template does (from src.http_fetch import "
+                    "create_fetch_json / create_fetch_text), or pass "
+                    "proxies=proxy_config.get_proxy_dict(tier) on your "
+                    "requests calls. Use edit_file; do NOT rewrite the scraper."
+                )
+            else:
+                report["feedback_for_writer"] = (
+                    "CLI CONTRACT VIOLATION (deterministic — testing cannot pass "
+                    "while discovery is unwired):\n" + _cli_violation + "\n"
+                    "Add the missing argparse declarations AND the "
+                    "SCRAPER_LISTING_URL env gate in main(), exactly as your "
+                    "template does. Use edit_file; do NOT rewrite the scraper."
+                )
             update["test_report"] = report
             # F19-pattern honest failure when the retry budget is spent.
             _retry_now = state.get("test_retry_count", 0)
@@ -6752,6 +6996,17 @@ def route_from_human_approval(state: ScrapeState) -> str:
     # because "Provide feedback for final retry" has decision="approve"
     # and would get its label overwritten to "Continue anyway".
     if reason == "testing_exhausted":
+        # [wave-19 T1.7] skip_approvals (intake) auto-approve is NOT a human
+        # choosing "Continue anyway" — falling through to field_confirmation
+        # executes the draft the tester just failed (job 323: 3 failed cycles,
+        # auto-approved into execution). Mirror the jobs-79/80 writer arm:
+        # honest cleanup when nobody is here to make the call.
+        if state.get("skip_approvals", False):
+            logger.error(
+                "route_from_human_approval: testing_exhausted + skip_approvals "
+                "→ cleanup (honest failure, no human approved execution)"
+            )
+            return "cleanup"
         feedback = state.get("human_feedback", "")
         if label == "Provide feedback for final retry":
             if not feedback:

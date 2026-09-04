@@ -111,6 +111,14 @@ class TestRetryWarranted:
 
 class TestProbeWrapper:
     @pytest.fixture()
+    def tiers_up(self, monkeypatch):
+        """[wave-19 T1.2] Every named tier counts as configured, so the
+        tier-escalation arm after the candidate chain is deterministic."""
+        import webapp.agents.graph as graph
+
+        monkeypatch.setattr(graph, "_tier_configured", lambda tier: bool(tier))
+
+    @pytest.fixture()
     def fake_once(self, monkeypatch):
         import webapp.agents.graph as graph
 
@@ -154,21 +162,48 @@ class TestProbeWrapper:
         assert len(fake_once.calls) == 1
         assert crashed is True and tb == "Traceback ..." and probe_yield is None
 
-    def test_both_candidates_dead_is_an_honest_zero(self, fake_once):
+    def test_both_candidates_dead_is_an_honest_zero(self, fake_once, tiers_up):
+        """[wave-19 T1.2] After BOTH candidates die the ladder gets ONE more
+        experiment (next identity); still dead ⇒ the honest zero stands,
+        now labelled all_tiers_blocked instead of a bare zero."""
         fake_once.script = [
+            (False, None, {"discovered_urls": 0, "stop_reason": ""}),
             (False, None, {"discovered_urls": 0, "stop_reason": ""}),
             (False, None, {"discovered_urls": 0, "stop_reason": ""}),
         ]
         crashed, tb, probe_yield = self._run(_state())
-        assert len(fake_once.calls) == 2
+        assert len(fake_once.calls) == 3
         assert crashed is False
         assert probe_yield["discovered_urls"] == 0
+        assert probe_yield["stop_reason"] == "all_tiers_blocked"
 
-    def test_no_alt_means_single_attempt(self, fake_once):
-        fake_once.script = [(False, None, {"discovered_urls": 0, "stop_reason": ""})]
+    def test_no_alt_means_candidate_chain_is_single_attempt(self, fake_once, tiers_up):
+        """No navigator listing ⇒ no listing retry — but the wave-19 T1.2
+        identity escalation still gets its ONE run (the job-324 shape:
+        PDP-as-listing, dead at tier none, datacenter never tried)."""
+        fake_once.script = [
+            (False, None, {"discovered_urls": 0, "stop_reason": ""}),
+            (False, None, {"discovered_urls": 0, "stop_reason": ""}),
+        ]
         _crashed, _tb, probe_yield = self._run(_state(nav_listing=""))
-        assert len(fake_once.calls) == 1
+        assert len(fake_once.calls) == 2
         assert probe_yield["discovered_urls"] == 0
+        assert probe_yield["stop_reason"] == "all_tiers_blocked"
+
+    def test_no_tiers_configured_means_candidate_chain_only(self, fake_once, monkeypatch):
+        """Ladder exhausted (residential recipe / nothing configured) ⇒ the
+        pre-wave-19 bound: the candidate chain is the whole experiment."""
+        import webapp.agents.graph as graph
+
+        monkeypatch.setattr(graph, "_tier_configured", lambda tier: False)
+        fake_once.script = [
+            (False, None, {"discovered_urls": 0, "stop_reason": ""}),
+            (False, None, {"discovered_urls": 0, "stop_reason": ""}),
+        ]
+        _crashed, _tb, probe_yield = self._run(_state())
+        assert len(fake_once.calls) == 2
+        assert probe_yield["discovered_urls"] == 0
+        assert probe_yield.get("stop_reason") != "all_tiers_blocked"
 
 
 # ─── end-to-end through the real `once` (local subprocess path) ──────────────

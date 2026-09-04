@@ -107,6 +107,10 @@ def _extracted_item_count(report: dict) -> int:
 # ``target: "strategy"`` verdict into ``scraper`` (job 83).
 _COVERAGE_FAIL_STOP_REASONS = {
     "navigate_error", "dedup_flat", "empty_first_page", "empty_render",
+    # [wave-19 T1.2] The probe's identity escalation re-ran the discovery at
+    # the next configured proxy tier and it STILL yielded nothing — every
+    # network identity this deployment can wear is blocked.
+    "all_tiers_blocked",
 }
 
 

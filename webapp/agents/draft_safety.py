@@ -24,6 +24,26 @@ MAX_EXTRACTED_DRAFT_BYTES = 400_000
 
 DRAFT_FILENAME = "scraper_draft.py"
 
+# [wave-19 T1.1] Strategies whose drafts fetch with a real browser — the
+# HTTP ladder does not apply to them, so the gate exempts them outright.
+# (http_navigation is deliberately NOT exempt: its template carries the
+# shared ladder for SSR/form-search fallbacks.)
+LADDER_EXEMPT_STRATEGIES = frozenset({
+    "playwright", "stealth_browser", "seleniumbase_uc", "undetected_chromedriver",
+})
+
+# [wave-19 T1.1] Calls that prove a draft carries the proxy-aware fetch
+# machinery. ``DIRECT_ONLY_TIERS`` is deliberately absent — job 324's draft
+# defined it and never consumed it (a dead marker, not wiring).
+_LADDER_CALLEES = frozenset({
+    "create_fetch_page",
+    "create_fetch_text",
+    "create_fetch_json",
+    "create_fetch_html",
+    "get_escalation_tier",
+    "get_proxy_dict",
+})
+
 
 def draft_path_for(root: str, slug: str) -> str:
     return os.path.join(root, "workspace", slug, DRAFT_FILENAME)
@@ -82,6 +102,78 @@ def extract_fenced_python(text: str) -> str | None:
         if best is None or len(code) > len(best):
             best = code
     return best
+
+
+def ladder_preservation_violation(
+    scraper_path: str, input_mode: str, strategy: str = ""
+) -> str | None:
+    """AST check: a nav-mode HTTP-family draft must keep a proxy-aware fetch
+    path. [wave-19 T1.1 — the wall against the 324 draft class]
+
+    Job 324 (myhouse): the writer shipped an api-family draft whose custom
+    ``_http_get`` checked ``proxy_config.is_banned()`` but had NO ``proxies=``
+    kwarg and NO shared-ladder import — structurally unproxied. It tested
+    green (the probe URL answered direct that hour) and execution zeroed the
+    moment the site throttled the direct egress IP.
+
+    Satisfied by ANY of:
+      L1  ``import src.http_fetch`` / ``from src.http_fetch import ...``
+      L2  any call carrying a ``proxies=`` keyword
+      L3  a shared-ladder call (``create_fetch_*`` / ``get_escalation_tier``
+          / ``get_proxy_dict``)
+
+    Absent all three → a violation description for the writer fix directive
+    and the run_execution refusal. Never blocks an unparseable draft (the
+    syntax fixer owns those) or a missing file, and browser-only strategies
+    are exempt (their fetching rides a real browser).
+    """
+    from .constants import NAV_INPUT_MODES
+
+    im = (input_mode or "").strip().lower()
+    if im not in NAV_INPUT_MODES:
+        return None
+    if not scraper_path or not os.path.isfile(scraper_path):
+        return None
+    if (strategy or "").strip().lower() in LADDER_EXEMPT_STRATEGIES:
+        return None
+    try:
+        with open(scraper_path, "r", encoding="utf-8", errors="replace") as fh:
+            tree = ast.parse(fh.read(), filename=scraper_path)
+    except Exception:
+        return None  # unparseable → the syntax fixer owns it
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "") == "src.http_fetch":
+            return None  # L1
+        if isinstance(node, ast.Import):
+            if any(alias.name == "src.http_fetch" for alias in node.names):
+                return None  # L1
+        if isinstance(node, ast.Call):
+            if any(kw.arg == "proxies" for kw in node.keywords):
+                return None  # L2
+            func = node.func
+            name = (
+                func.attr
+                if isinstance(func, ast.Attribute)
+                else getattr(func, "id", "")
+            )
+            if name in _LADDER_CALLEES:
+                return None  # L3
+
+    return (
+        "LADDER PRESERVATION VIOLATION "
+        f"(input_mode={im}, strategy={strategy or 'unknown'}): the draft has "
+        "no proxy-aware fetch path — no src.http_fetch import, no proxies= "
+        "keyword on any HTTP call, and no shared-ladder call "
+        "(create_fetch_*/get_escalation_tier/get_proxy_dict). Need: fetch "
+        "through the shared ladder (from src.http_fetch import "
+        "create_fetch_json / create_fetch_text) exactly as your template "
+        "does, or pass proxies=proxy_config.get_proxy_dict(tier) on your "
+        "requests calls. A structurally unproxied draft tests green until "
+        "the site throttles the direct egress IP, then execution discovers "
+        "zero items (job 324 myhouse). DIRECT_ONLY_TIERS-style tier lists "
+        "are not wiring."
+    )
 
 
 def restore_job_draft(root: str, slug: str, job_id) -> str | None:

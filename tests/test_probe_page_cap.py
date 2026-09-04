@@ -132,8 +132,13 @@ class TestProbeWiring:
 
     def test_local_subprocess_env_carries_the_cap(self):
         src = self._src()
-        anchor = src.index("_probe_env = {**os.environ,")
-        window = src[anchor:anchor + 220]
+        # [wave-19 T0.2] the dict grew a _stealth_env() stage and went
+        # multi-line — the pin now asserts the full merge shape: parent env +
+        # stealth staging + the cap.
+        anchor = src.index("_probe_env = {")
+        window = src[anchor:anchor + 300]
+        assert "**os.environ" in window
+        assert "**_stealth_env(state)" in window
         assert '"SCRAPER_DISCOVERY_MAX_PAGES": _PROBE_DISCOVERY_PAGE_CAP' in window
 
     def test_browser_service_env_overrides_carry_the_cap(self):

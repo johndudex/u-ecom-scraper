@@ -27,7 +27,7 @@ from typing import Optional
 import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from src.proxy import ProxyConfig, should_warn_residential, warn_residential_usage
+from src.proxy import ProxyConfig  # noqa: F401  (tier ladder lives in src.http_fetch now)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION - Update these values
@@ -110,34 +110,31 @@ def save_urls_to_file(filepath: str, urls: list[str]) -> None:
 # API FUNCTIONS - CUSTOMIZE response parsing below
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def fetch_api(endpoint: str, params: Optional[dict] = None) -> Optional[dict]:
+def fetch_api(endpoint: str, params: Optional[dict] = None):
+    """Phase-1 API fetch — rides the SAME shared ladder as Phase 2 [T1.3].
+
+    The inline per-tier ladder this used to be had no challenge detection: a
+    200 challenge body raised JSONDecodeError PAST the
+    ``except requests.RequestException`` and crashed the run, and the ladder
+    itself was strippable by adaptation (job 324's draft shipped without it).
+    ``_get_fetch_json`` carries ``detect_soft_block`` + real tier escalation
+    on one persistent session. Returns the parsed payload, a SoftBlock
+    signal (challenge served as 200 — falsy on purpose), or None when every
+    tier failed. Falls back to a bare GET only when the image predates the
+    module.
+    """
     url = f"{API_BASE_URL}{endpoint}"
-    ssl_verify = proxy_config.config.get("strategy", {}).get("ssl_verify", False)
-    escalation = proxy_config.get_escalation_tier()
-
-    for tier in ["none", *escalation]:
-        if should_warn_residential(tier):
-            warn_residential_usage(url)
-
-        proxies = proxy_config.get_proxy_dict(tier) if tier != "none" else None
-        max_retries = proxy_config.get_max_retries(tier) if tier != "none" else MAX_RETRIES
-        cooldown = proxy_config.get_cooldown(tier) if tier != "none" else DELAY_BETWEEN_REQUESTS * 2
-
-        for attempt in range(max_retries):
-            try:
-                time.sleep(DELAY_BETWEEN_REQUESTS)
-                response = requests.get(url, params=params, headers=API_HEADERS, proxies=proxies, timeout=proxy_config.get_timeout(), verify=ssl_verify)
-                if response.status_code == 200:
-                    return response.json()
-                if proxy_config.is_banned(response.status_code, response.text):
-                    logger.warning(f"Ban detected ({response.status_code}) on tier '{tier}', escalating...")
-                    break
-                response.raise_for_status()
-            except requests.RequestException as e:
-                logger.error(f"API request failed (attempt {attempt + 1}/{max_retries}, tier={tier}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(cooldown)
-    return None
+    try:
+        return _get_fetch_json()(url, params=params)
+    except ImportError:
+        logger.warning("src.http_fetch unavailable — falling back to a bare GET")
+        try:
+            response = requests.get(url, params=params, headers=API_HEADERS, timeout=15)
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.error(f"API request failed: {e}")
+            return None
 
 
 # ── FIELD NORMALIZERS — inline on purpose, NOT a src import ──────────────────
@@ -247,6 +244,24 @@ def fetch_all_products_via_api() -> tuple[list[str], list[dict]]:
     cursor = None
     page = 1
 
+    # [T0.5] Why discovery stopped — emitted as metadata.discovery_coverage
+    # so the tester's coverage gate and the execution-time strategy+tier
+    # recycle can tell an anti-bot wall from a genuine catalog end.
+    # Vocabulary matches the FAIL-class set the gates know:
+    #   empty_first_page — a 200 challenge wall yielded zero items (job-58)
+    #   navigate_error   — the ladder was exhausted / transport failure
+    #   no_next_link     — normal exhaustion (short page / total / cursor end)
+    global _DISCOVERY_META
+    _DISCOVERY_META = {
+        "stop_reason": "no_next_link",
+        "ran_phase1": True,
+        "skipped_reason": "",
+        "discovered_urls": 0,
+        "pages_fetched": 0,
+        "soft_block_escalations": 0,
+        "max_pages_hit": False,
+    }
+
     while True:
         if PAGINATION_TYPE == "offset":
             params = {"limit": PAGE_SIZE, "offset": offset}
@@ -258,7 +273,30 @@ def fetch_all_products_via_api() -> tuple[list[str], list[dict]]:
             params = {"limit": PAGE_SIZE}
 
         logger.info(f"Fetching API page {page}: {API_PRODUCTS_ENDPOINT}")
-        data = fetch_api(API_PRODUCTS_ENDPOINT, params=params)
+        result = fetch_api(API_PRODUCTS_ENDPOINT, params=params)
+
+        # fetch_api contract [T1.3]: (payload, status) on success, SoftBlock
+        # on a challenge-served-as-200, None when every tier failed.
+        if isinstance(result, SoftBlock):
+            logger.error(
+                f"Discovery page {page}: challenge served as 200 "
+                f"({getattr(result, 'reason', '?')}) — every ladder tier "
+                f"returned a challenge"
+            )
+            _DISCOVERY_META["soft_block_escalations"] += 1
+            # A wall yielding zero items is the job-58 shape, not a
+            # catalog end — only page 1's wall sets the zero-URL reason.
+            if page == 1:
+                _DISCOVERY_META["stop_reason"] = "empty_first_page"
+            break
+        if not result:
+            logger.error(f"Discovery page {page}: every ladder tier failed")
+            if page == 1:
+                _DISCOVERY_META["stop_reason"] = "navigate_error"
+            break
+
+        data = result[0]
+        _DISCOVERY_META["pages_fetched"] = page
 
         if not data:
             break
@@ -293,12 +331,38 @@ def fetch_all_products_via_api() -> tuple[list[str], list[dict]]:
 
     urls = [p.get("url", "") or p.get("handle", "") for p in all_products]
     urls = [u for u in urls if u]
+    _DISCOVERY_META["discovered_urls"] = len(urls)
     return urls, all_products
 
 
 # [wave-15 3.4] Per-item fetch closure — ONE per process (the Session must
 # persist across items for cookie continuity, job-58).
 _FETCH_JSON = None
+
+# [T0.5] Phase-1 discovery outcome, filled by fetch_all_products_via_api and
+# emitted as metadata.discovery_coverage (the block the tester's coverage
+# gate and the execution-time recycle read).
+_DISCOVERY_META: dict = {
+    "stop_reason": "skipped",
+    "ran_phase1": False,
+    "skipped_reason": "seeded_input",
+    "discovered_urls": 0,
+    "pages_fetched": 0,
+    "soft_block_escalations": 0,
+    "max_pages_hit": False,
+}
+
+try:  # guarded: the browser-service image may predate src.http_fetch
+    from src.http_fetch import SoftBlock  # noqa: E402
+except ImportError:  # pragma: no cover
+    class SoftBlock:  # type: ignore[no-redef]
+        """Image predates the shared module — no signal can ever occur."""
+
+        def __init__(self, *a, **k):
+            self.reason = "unavailable"
+
+        def __bool__(self):
+            return False
 
 
 def _get_fetch_json():
@@ -401,6 +465,11 @@ def main():
         product_urls, raw_products = fetch_all_products_via_api()
         save_urls_to_file(INPUT_FILE, product_urls)
 
+    # [T0.5] Raw pre-cut count — --sample/--limit truncate product_urls below,
+    # and the coverage block must report what DISCOVERY found, not what
+    # survived the sampling.
+    discovered_urls_raw = len(product_urls)
+
     if args.sample:
         product_urls = product_urls[:5]
     if args.limit:
@@ -446,9 +515,19 @@ def main():
         },
         "products": results,
         "metadata": {
+            # job-76 myhouse: lets every consumer tell a discovery artifact
+            # (URL stubs, no fields) from an extraction result.
+            "phase": "extraction",
             "scraping_duration_seconds": round(time.time() - start_time, 2),
             "failed_products": failed,
             "rate_limit_delay": DELAY_BETWEEN_REQUESTS,
+            "discovered_urls": discovered_urls_raw,
+            # [T0.5] Always emitted so the gates read a uniform schema
+            # regardless of which path produced the output.
+            "discovery_coverage": {
+                **_DISCOVERY_META,
+                "found": len(results),
+            },
         },
     }
 

@@ -122,7 +122,14 @@ class TestZeroItemFinalizeGate:
     def test_finalize_ladder_pins_the_gate(self):
         with open(os.path.join(ROOT, "webapp", "scraper", "tasks.py")) as f:
             src = f.read()
-        assert "_output_file_has_zero_items(job.output_file)" in src, (
+        # [wave-19 T1.5] the ladder moved into the tested pure function
+        # `_final_status_ladder`; the finalize call site must still wire it
+        # and the zero-item gate must still live INSIDE the ladder.
+        assert "_final_status_ladder(" in src, (
+            "finalize must route its status decision through _final_status_ladder"
+        )
+        ladder = src[src.index("def _final_status_ladder("):]
+        assert "_output_file_has_zero_items(output_file)" in ladder, (
             "finalize ladder must gate COMPLETED on the zero-item check"
         )
         assert "Execution produced 0 items" in src

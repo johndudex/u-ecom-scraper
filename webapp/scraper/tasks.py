@@ -1003,6 +1003,68 @@ def _output_file_has_zero_items(output_file: str) -> bool:
     return True
 
 
+def _final_status_ladder(
+    final_state: dict,
+    *,
+    already_terminal: bool,
+    was_cancelled: bool,
+    error_message: str,
+    output_file: str,
+    diagnose_no_execution=None,
+) -> tuple[str, str]:
+    """The finalize status decision, as a pure function. [wave-19 T1.5]
+
+    Returns ``(status, diagnostic)``: ``status`` is "" when the caller must
+    leave the job untouched (``already_terminal``); ``diagnostic`` is a NEW
+    failure reason for an otherwise-empty error_message (never-executed /
+    zero-items arms), "" when the job's existing error_message already tells
+    the story.
+
+    The wave-19 ordering: the arms that PROVE the pipeline broke (explicit
+    FAILED status, never executed, zero-item output) outrank a carried
+    error_message — because by the time we get here the commonest
+    error_message is a STALE interrupt-era note (323/D3): validate_coverage's
+    missing-file interrupt set it, a later recovery answered it, execution
+    extracted real items, and the old ladder's ``elif job.error_message:``
+    killed the productive run anyway. A productive execution now outranks the
+    note; the caller scrubs the stale note on COMPLETED.
+    """
+    if already_terminal:
+        return "", ""
+    if was_cancelled:
+        # F3: a user Cancel ends the graph with no error_message and no FAILED
+        # execution_status — the old ladder blessed it COMPLETED with 0
+        # products (prod jobs 263/266/327).
+        return ScrapeJob.STATUS_CANCELLED, ""
+    if final_state.get("execution_status") == "FAILED":
+        return ScrapeJob.STATUS_FAILED, ""
+    if not final_state.get("execution_status") and not output_file:
+        # Job 304: the testing-cascade FAIL route lands on cleanup from a
+        # conditional edge (no state-update channel). Any job that reaches
+        # finalize without EVER executing did not succeed; say so.
+        if diagnose_no_execution is not None:
+            try:
+                return ScrapeJob.STATUS_FAILED, diagnose_no_execution()
+            except Exception:
+                pass
+        return ScrapeJob.STATUS_FAILED, "Pipeline never executed (no execution status, no output)"
+    if output_file and _output_file_has_zero_items(output_file):
+        # Jobs 309/310 (pillowtalk e2e): an execution that RUNS but extracts
+        # nothing is a failure of the job's purpose, not a success with an
+        # empty file.
+        return ScrapeJob.STATUS_FAILED, "Execution produced 0 items (output file contains no records)"
+    if error_message:
+        if final_state.get("execution_status") and output_file:
+            # Productive execution (ran, and its output held real records —
+            # the zero-items arm above already failed on empty) + a carried
+            # error: the error is interrupt-era residue, not a verdict. The
+            # job's purpose was served; the caller scrubs the note.
+            return ScrapeJob.STATUS_COMPLETED, ""
+        # No productive evidence contradicts it — the recorded error stands.
+        return ScrapeJob.STATUS_FAILED, ""
+    return ScrapeJob.STATUS_COMPLETED, ""
+
+
 def _publish_analysis_artifacts(job_id: int, site_slug: str, ws) -> None:
     """Copy the analysis artifacts from the LOCAL workspace to the File Master.
 
@@ -1303,54 +1365,38 @@ def _finalize_job(job: ScrapeJob) -> None:
             logger.warning("Job %d: input_urls re-sync guard failed: %s", job.id, exc)
 
     # ── Determine final status ──────────────────────────────────────────
-    if job.status in (
-        ScrapeJob.STATUS_CAPTCHA_BLOCKED,
-        ScrapeJob.STATUS_AKAMAI_BLOCKED,
-        ScrapeJob.STATUS_CANCELLED,  # M3: a view-level cancel must not be resurrected
-    ):
-        pass
-    elif _finalize_was_cancelled(final_state):
-        # F3: a user Cancel ends the graph with no error_message and no FAILED
-        # execution_status — the old ladder blessed it COMPLETED and flipped
-        # the Site complete with 0 products (prod jobs 263/266/327).
-        job.status = ScrapeJob.STATUS_CANCELLED
+    # The decision lives in _final_status_ladder (pure, tested); this site
+    # keeps only the side effects (writes, logs). [wave-19 T1.5]
+    _status, _diag = _final_status_ladder(
+        final_state,
+        already_terminal=job.status in (
+            ScrapeJob.STATUS_CAPTCHA_BLOCKED,
+            ScrapeJob.STATUS_AKAMAI_BLOCKED,
+            ScrapeJob.STATUS_CANCELLED,  # M3: a view-level cancel must not be resurrected
+        ),
+        was_cancelled=_finalize_was_cancelled(final_state),
+        error_message=job.error_message or "",
+        output_file=job.output_file or "",
+        diagnose_no_execution=lambda: _diagnose_no_execution(site_slug, job.id),
+    )
+    if _status:
+        job.status = _status
+    if _diag:
+        if not job.error_message:
+            job.error_message = _diag[:2000]
+        logger.warning(
+            "Job %d: finalised %s at finalize ladder: %s", job.id, _status, _diag,
+        )
+    if _status == ScrapeJob.STATUS_CANCELLED:
         logger.info("Job %d: finalised as CANCELLED (user cancelled)", job.id)
-    elif job.error_message:
-        job.status = ScrapeJob.STATUS_FAILED
-    elif final_state.get("execution_status") == "FAILED":
-        job.status = ScrapeJob.STATUS_FAILED
-    elif not final_state.get("execution_status") and not job.output_file:
-        # Job 304: the testing-cascade FAIL route lands on cleanup from a
-        # conditional edge (no state-update channel), leaving execution_status
-        # empty — and the old catch-all blessed that COMPLETED with 0 products.
-        # Any job that reaches finalize without EVER executing (no status, no
-        # output) did not succeed; say so.
-        job.status = ScrapeJob.STATUS_FAILED
-        if not job.error_message:
-            job.error_message = _diagnose_no_execution(site_slug, job.id)
-        logger.warning(
-            "Job %d: no execution_status and no output at finalize — marking FAILED "
-            "(pipeline never executed): %s", job.id, job.error_message,
+    if _status == ScrapeJob.STATUS_COMPLETED and job.error_message:
+        # [wave-19 T1.5] The stale interrupt-era note loses to a productive
+        # execution — scrub it so the record doesn't read COMPLETED+error.
+        logger.info(
+            "Job %d: clearing stale error_message at COMPLETED finalize: %r",
+            job.id, (job.error_message or "")[:120],
         )
-    elif job.output_file and _output_file_has_zero_items(job.output_file):
-        # Jobs 309/310 (pillowtalk e2e): an execution that RUNS but extracts
-        # nothing still lands here — execution_status set + output file
-        # present → the catch-all below blessed it COMPLETED. Job 309: the
-        # stale-rescue executed a draft the tester had failed (0 items). Job
-        # 310: a forced listing URL the draft's discovery couldn't parse
-        # (0 URLs → 0 items). A zero-record output is a failure of the job's
-        # purpose, not a success with an empty file — say so.
-        job.status = ScrapeJob.STATUS_FAILED
-        if not job.error_message:
-            job.error_message = (
-                "Execution produced 0 items (output file contains no records)"
-            )[:2000]
-        logger.warning(
-            "Job %d: output file has 0 items at finalize — marking FAILED",
-            job.id,
-        )
-    else:
-        job.status = ScrapeJob.STATUS_COMPLETED
+        job.error_message = ""
 
     # ── Enforce the requested schema (prune output + resolve for DB persist) ──
     # target_fields is authoritative; falls back to the Site's stored DB schema

@@ -49,18 +49,28 @@ so the first attempt you hand off actually works. **Do NOT hand off an untested 
 
 ## Proxy Integration
 
-For requests-based templates, proxy + fetch machinery is **already wired** — the
-template imports the shared module and you must keep that wiring:
+For requests-based templates, proxy + fetch machinery is wired **by the
+template's fetch helpers** — and it stays wired only while you keep them:
 
 ```python
 from src.http_fetch import create_fetch_page
 fetch_page = create_fetch_page(delay_s=DELAY_BETWEEN_REQUESTS, headers=HEADERS)
 ```
 
-NEVER hand-roll `from src.proxy import ProxyConfig` in a draft, and NEVER
-simplify `fetch_page` to a bare `session.get()`/`requests.get()` — see the
-hard rule below for why. Shared utility (used by the module, not by you):
-`src/proxy.py`, config `config/proxy.json`.
+If you author or replace ANY fetch helper (`_http_get`, `_fetch_html`,
+`_http_post`, …), the proxy ladder becomes YOURS to wire: every HTTP call
+must go through the shared ladder (`from src.http_fetch import
+create_fetch_json / create_fetch_text / create_fetch_page`) or pass
+`proxies=proxy_config.get_proxy_dict(tier)`. A hand-rolled `session.get()`
+with no proxy path tests green until the site throttles the direct egress IP,
+then execution zeroes — this exact draft class is now FORCE-FAILED at testing
+and refused at execution (job 324 myhouse: `_http_get` with a
+`proxy_config.is_banned()` check but no `proxies=` kwarg and no ladder import).
+
+NEVER hand-roll `from src.proxy import ProxyConfig` as the proxy mechanism in
+a draft, and NEVER simplify `fetch_page` to a bare `session.get()`/
+`requests.get()` — see the hard rule below for why. Shared utility (used by
+the module, not by you): `src/proxy.py`, config `config/proxy.json`.
 
 ## Template Fidelity — CRITICAL
 
@@ -205,7 +215,11 @@ from src.listing_discovery import discover_listing_urls_with_retry
 ### Other discovery helpers — DO NOT re-signature
 
 The template's other helpers (`_fetch_html`, `_http_get`, `_http_post`,
-checkpoint load/save, etc.) are **correct as written**. Three hard rules:
+checkpoint load/save, etc.) are **correct as written** — "correct" MEANS
+proxy-aware: each one fetches through the shared ladder or carries a
+`proxies=` path. If you must edit one, keep that property (see Proxy
+Integration above) — a helper that drops the proxy path is the job-324
+failure class. Three hard rules:
 
 1. **Never redefine or change a template function's signature.** If the template
    defines `_get_next_page_url(final_url, next_page_num, html)`, you MUST call it with

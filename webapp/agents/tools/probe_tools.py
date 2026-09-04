@@ -68,6 +68,33 @@ HTTP_METHODS = {"direct_http", "direct_http_datacenter", "direct_http_residentia
 # steps. Classify by prefix so the http/browser split (which drives the
 # "find a second working method of the OTHER type" pass) stays correct.
 _HTTP_METHOD_PREFIXES = ("direct_http", "fingerprint_")
+
+
+def _is_http_method(name: str) -> bool:
+    """[wave-19 T0.3] Prefix-derived HTTP classification.
+
+    ``HTTP_METHODS`` above predates the fingerprint_* rungs, so consulting it
+    mislabeled a fingerprint win as a browser win (needs_browser=True →
+    force-upgrades discovery to the S4 browser rung). HTTP-flavoured = any
+    direct_http* or fingerprint_* rung; everything else is a browser step.
+    """
+    name = str(name or "").strip()
+    return bool(name) and name.startswith(_HTTP_METHOD_PREFIXES)
+
+
+def fingerprint_profile(method_name: str) -> str:
+    """[wave-19 T0.4] The curl_cffi impersonation profile a fingerprint rung
+    used, parsed from the rung name (``fingerprint_chrome_none`` →
+    ``"chrome"``). Empty string for non-fingerprint methods — Tier-2's
+    fingerprint reroute keys on this, and the probe rung is the only place
+    the profile is ever recorded.
+    """
+    parts = str(method_name or "").strip().split("_")
+    if len(parts) >= 3 and parts[0] == "fingerprint":
+        return parts[1]
+    return ""
+
+
 BROWSER_METHODS = {
     "playwright_none",
     "playwright_datacenter",
@@ -666,7 +693,9 @@ def run_listing_probe_advisory(
 
     rungs: list[str] = []
     pdp_http = str(pdp_data.get("http_method") or "").strip()
-    if pdp_http and pdp_http in HTTP_METHODS:
+    # T0.3: fingerprint_* PDP wins seed too — same cheap HTTP transport is
+    # often shared with the listing, and it's the cheapest possible answer.
+    if _is_http_method(pdp_http):
         rungs.append(pdp_http)
     rungs.append("cloak_none")
     rungs.append("cloak_datacenter")
@@ -729,8 +758,10 @@ def run_listing_probe_advisory(
             break
         _log(f"{rung} failed on the listing")
 
-    http_ok = bool(winner_method) and winner_method in HTTP_METHODS
-    browser_ok = bool(winner_method) and winner_method not in HTTP_METHODS
+    # T0.3: prefix-derived — a fingerprint_* win is an HTTP win (TLS
+    # impersonation, no browser), not needs_browser=True.
+    http_ok = _is_http_method(winner_method)
+    browser_ok = bool(winner_method) and not http_ok
     result: dict = {
         "probed_url": listing_url,
         "advisory": True,
