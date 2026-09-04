@@ -169,11 +169,11 @@ PHASE2_WORKERS = 2
 # detector — Phase 2 finishing in under half of items*floor/workers means
 # the network was never hit.
 PHASE2_MIN_FETCH_S = 0.5
-# [wave-17 S24] Settle before the ONE blocked-PDP refetch (_extract_item). A
-# managed challenge auto-clears in ~5-15s; a tripped per-IP rate band needs
-# minutes, which a single 90s window sometimes outlives and never doubles the
-# hits on an edge that has refused the item twice.
-BLOCKED_RETRY_SETTLE_S = 90
+# NOTE: no blocked-PDP refetch arm here. The "S24" 90s settle-and-refetch was
+# removed — it was built on an overturned RCA (job 329 died of a SyntaxError
+# from an abandoned writer thread, not a rate band), and on a real per-IP band
+# a refetch just doubles hits on an edge that already refused the identity
+# twice. A challenged PDP fails honestly on first refusal (S23 doctrine).
 
 # ── Phase 1: Navigation ─────────────────────────────────────────────────────
 SEARCH_URL_PATTERN = "{SEARCH_URL_PATTERN}"        # e.g. "https://site.com/search?q={query}"
@@ -1290,25 +1290,13 @@ def _extract_item(item_url: str, src_url: str) -> dict:
     CSS parsing happen locally on the returned HTML. Failures become error
     dicts so the job continues instead of aborting on one bad page.
 
-    [wave-17 S24] Phase 2 paces itself with DELAY_BETWEEN_REQUESTS (Phase 1
-    already did; the concurrent executor hid the burst) and gives a challenged
-    PDP ONE bounded settle-and-refetch — a managed interstitial that trips
-    mid-run clears in seconds-to-minutes, and the crocs 2026-09-04 execution
-    lost all 10 PDP fetches to a band that the discovery walk had just barely
-    held open. The retry is per-item and once: an identity the edge has
-    refused twice will not answer a third time either.
+    Phase 2 paces itself with DELAY_BETWEEN_REQUESTS (Phase 1 already did;
+    the concurrent executor hid the burst).
     """
     if DELAY_BETWEEN_REQUESTS:
         time.sleep(DELAY_BETWEEN_REQUESTS)
 
     resp = _navigate(item_url)
-    if resp and resp.get("blocked") and BLOCKED_RETRY_SETTLE_S > 0:
-        logger.warning(
-            "Phase 2: %s challenged — settling %ds and refetching once",
-            item_url[:80], BLOCKED_RETRY_SETTLE_S,
-        )
-        time.sleep(BLOCKED_RETRY_SETTLE_S)
-        resp = _navigate(item_url)
     if not resp:
         return _error_item(item_url, src_url, "navigate failed after retries")
     if resp.get("navigate_unavailable"):
