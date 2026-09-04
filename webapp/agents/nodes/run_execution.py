@@ -94,6 +94,54 @@ def _accepted_cli_flags(scraper_path: str) -> set[str] | None:
         return None
 
 
+def _draft_parse_error(scraper_path: str) -> str | None:
+    """Return a formatted SyntaxError if the draft is not valid Python, else None.
+
+    [job-329 wall] The CLI-flag probe parses the same file inside ``except
+    Exception: return None`` — a draft corrupted mid-flight (abandoned writer
+    threads kept editing after the tester verdict) was laundered into "flags
+    undeterminable", launched, and died at compile time in 55s with zero HTTP
+    requests while the RCA chased a rate band. This reporter makes corruption
+    nameable BEFORE dispatch; run_execution refuses to launch on it.
+    """
+    import ast
+
+    try:
+        with open(scraper_path, "r", errors="ignore") as fh:
+            ast.parse(fh.read())
+    except SyntaxError as exc:
+        return f"scraper draft failed to compile: SyntaxError: {exc}"
+    except Exception:
+        return None  # unreadable/odd file: the flag probe's lenient path handles it
+    return None
+
+
+def _sha256_file(path: str) -> str | None:
+    import hashlib
+
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _stamp_tested_draft(
+    update: dict, slug: str, project_root: str | None = None
+) -> None:
+    """Pin ``update["tested_draft_sha256"]`` to the draft as the tester judged it.
+
+    [job-329 wall] The tester PASSED at 05:39:40; abandoned writer threads
+    edited the draft at 05:39:56/05:40:14/05:40:45; execution launched 19s
+    later on a file the tester never saw. Stamping the verdict-time hash lets
+    run_execution refuse any post-verdict drift. Missing draft → None (no
+    false wall; the compile gate owns that case)."""
+    root = project_root or _get_project_root()
+    update["tested_draft_sha256"] = _sha256_file(
+        os.path.join(root, "workspace", slug, "scraper_draft.py")
+    )
+
+
 def _filter_supported_args(
     args: list[str], accepted: set[str] | None
 ) -> list[str]:
@@ -611,6 +659,39 @@ def run_execution(state: ScrapeState) -> dict:
             "execution_status": "FAILED",
             "error_message": f"scraper_draft.py not found at {scraper_path}",
         }
+
+    # [job-329 wall] Refuse to dispatch a draft that is not valid Python —
+    # fail with the real SyntaxError before any launch, never as a 55s
+    # compile-death disguised as a zero-item run.
+    _parse_err = _draft_parse_error(scraper_path)
+    if _parse_err:
+        logger.error("run_execution: %s", _parse_err)
+        return {
+            "execution_status": "FAILED",
+            "error_message": _parse_err,
+        }
+
+    # [job-329 wall] Freeze: refuse to execute a draft that drifted after the
+    # tester verdict. What runs must be byte-identical to what was judged.
+    _tested_sha = state.get("tested_draft_sha256")
+    if _tested_sha:
+        _current_sha = _sha256_file(scraper_path)
+        if _current_sha != _tested_sha:
+            logger.error(
+                "run_execution: draft drift after tester verdict "
+                "(tested %s…, on-disk %s…) — refusing execution",
+                str(_tested_sha)[:12],
+                str(_current_sha)[:12],
+            )
+            return {
+                "execution_status": "FAILED",
+                "error_message": (
+                    "scraper draft was modified after the tester verdict "
+                    f"(tested sha {_tested_sha[:12]}…, on-disk sha "
+                    f"{str(_current_sha)[:12]}…) — refusing to execute an "
+                    "untested file"
+                ),
+            }
 
     # NOTE: the FINAL execution always extracts the FULL result set (--sample is
     # only for code_tester validation). "sample_only" still skips the approval

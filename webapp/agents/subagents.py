@@ -979,6 +979,7 @@ def _build_agent(agent_name: str, site_slug: str = "", use_create_agent: bool = 
             system_prompt += BROWSER_UNAVAILABLE_WARNING
 
     tools = _strip_v_prefix_from_tools(tools)
+    _install_invocation_cancellation()
     from django.conf import settings as _settings
 
     _model_setting = AGENT_MODEL_SETTINGS.get(prompt_stem)
@@ -1017,6 +1018,48 @@ def _build_agent(agent_name: str, site_slug: str = "", use_create_agent: bool = 
             llm, tools=tools, prompt=system_prompt, pre_model_hook=_truncate_messages
         )
     return agent
+
+
+def _install_invocation_cancellation() -> None:
+    """Monkey-patch ``BaseTool._run`` to refuse tools once the invocation is
+    cancelled.
+
+    [job-329] ``_invoke_agent_with_timeout`` abandons its thread at the
+    wall-clock deadline; the zombie kept issuing ``edit_file`` calls and
+    corrupted the draft 19s before execution launched. The thread cannot be
+    killed — but the shared tool-context latch (``tools.context``) can disarm
+    it: after ``mark_invocation_cancelled`` every tool call raises until the
+    next fresh ``set_tool_context``. Same global-patch idiom as
+    ``_strip_v_prefix_from_tools``. Idempotent.
+    """
+    from langchain_core.tools import BaseTool
+
+    if getattr(BaseTool, "_invocation_cancel_patch_applied", False):
+        return
+
+    from .tools.context import is_invocation_cancelled
+
+    def _guard(fn_name: str):
+        original = getattr(BaseTool, fn_name)
+
+        def _cancel_aware(self, *args, **kwargs):
+            if is_invocation_cancelled():
+                raise RuntimeError(
+                    "[invocation-cancelled] wall-clock deadline exceeded — tool "
+                    "refused so the abandoned agent cannot mutate artifacts "
+                    "(job-329)"
+                )
+            return original(self, *args, **kwargs)
+
+        return _cancel_aware
+
+    # StructuredTool overrides ``_run`` (which would shadow a base-class
+    # patch), so guard the base entries nothing overrides: ``invoke`` is what
+    # LangGraph's ToolNode calls; ``run`` is the legacy entry some callers
+    # still use.
+    BaseTool.invoke = _guard("invoke")
+    BaseTool.run = _guard("run")
+    BaseTool._invocation_cancel_patch_applied = True
 
 
 def _strip_v_prefix_from_tools(tools: list) -> list:

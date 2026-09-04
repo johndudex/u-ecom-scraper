@@ -369,3 +369,41 @@ Honest redesign (3-state, no behavior regression):
   trigger, reads this call's fresh result — safe), graph.py:2825 (log line —
   prints honest value), run_execution.py:658/749 (the gate). Blast radius
   confined; no other modules read the field (grep 2026-09-04).
+
+## Session-audit addendum (2026-09-05, 5-agent forensic audit)
+
+**Correction:** job 329 did NOT die of a rate band. `error_message`:
+`SyntaxError: expected ':'` at scraper_draft.py:1292 — execution ran 55s and
+issued zero HTTP requests. Chain: code_writer exceeded its 900s wall-clock
+twice → abandoned threads kept `edit_file`-ing the draft AFTER the tester
+verdict (05:39:56/05:40:14/05:40:45; execution launched 05:41:04) → corrupted
+draft → compile death. The "phase-2 burst tripped the band" RCA misread the
+tester's `--discover-only` output as execution output. Consequences:
+- The earlier "S24" hunk in http_navigation (phase-2 pacing + 90s refetch)
+  targets a failure that never occurred; it is untested and its 90s-refetch
+  arm is plausibly harmful on a real band. Fate (revert vs rework+tests) is
+  an open decision.
+- Band was the SOLE killer of only 1/7 crocs drives (326). Root classes: our
+  infra 4, pipeline code 2, self-inflicted traffic 1. Every S17-S23 fix HELD.
+
+**Three walls landed (TDD, tests/test_draft_corruption_gates.py):**
+1. Loud compile gate — `_draft_parse_error` + run_execution entry refusal: a
+   non-parsing draft fails the job with the real SyntaxError before any
+   dispatch (previously laundered to "flags undeterminable" and launched).
+2. Draft freeze — `_stamp_tested_draft` pins the verdict-time sha256 into
+   state at every `_invoke_code_tester` return; run_execution refuses any
+   post-verdict drift (what executes must be byte-identical to what was
+   judged). Legacy jobs without a hash are not blocked.
+3. Writer deadline guard — abandonment latches
+   `tools.context.mark_invocation_cancelled()` (sync AND async timeout
+   branches); a global `BaseTool.invoke`/`run` patch makes every subsequent
+   tool call of the zombie thread raise until the next fresh invocation.
+   Python cannot kill the thread; this disarms it. Residual risk: a zombie
+   still alive when the NEXT `set_tool_context` runs gets re-armed — the
+   freeze + compile gate backstop that case.
+
+**Campaign rules from the audit:** read `error_message` FIRST in every RCA;
+verify which phase produced an artifact via `metadata.phase` + log line;
+commit before driving (1,147 lines sat uncommitted — the 323/324 drift
+class); park crocs behind re-entry criteria; PR-B/PR-C carry 12 of the 13
+original defects and remain unstarted.

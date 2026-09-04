@@ -33,12 +33,18 @@ _ctx: dict = {
     "probe_method": "",
     "anti_bot": False,
     "tool_deadline": None,
+    "invocation_cancelled": False,
 }
 
 
 def set_tool_context(state: dict, agent_name: str = "") -> None:
     _ctx["state"] = state
     _ctx["agent_name"] = agent_name
+    # Fresh invocation re-arms the tool gate. A previous invocation's zombie
+    # thread (if still alive) gets re-armed too — a residual risk the
+    # draft-freeze + compile-gate walls in run_execution backstop; killing
+    # the thread is not possible in Python (job-329).
+    _ctx["invocation_cancelled"] = False
     probe = state.get("probe_result")
     if probe and isinstance(probe, dict):
         _ctx["probe_method"] = (
@@ -95,6 +101,29 @@ def clear_tool_context() -> None:
     _ctx["probe_method"] = ""
     _ctx["anti_bot"] = False
     _ctx["tool_deadline"] = None
+
+
+def mark_invocation_cancelled(phase: str = "") -> None:
+    """Latch the tool gate shut for the current invocation.
+
+    [job-329] ``_invoke_agent_with_timeout`` abandons its thread on wall-clock
+    deadline, but the zombie keeps looping LLM rounds whose ``edit_file`` calls
+    corrupted the draft AFTER the tester verdict. Python cannot kill the
+    thread — so abandonment latches this flag and the global BaseTool patch
+    makes every subsequent tool call raise until the next fresh invocation.
+    Deliberately NOT reset by ``clear_tool_context``: the node's finally runs
+    while the zombie lives.
+    """
+    _ctx["invocation_cancelled"] = True
+    logger.warning(
+        "tool context: %s invocation cancelled at wall-clock deadline — "
+        "tools will refuse until the next invocation",
+        phase or "current",
+    )
+
+
+def is_invocation_cancelled() -> bool:
+    return bool(_ctx["invocation_cancelled"])
 
 
 def set_tool_deadline(deadline: Optional[float]) -> None:

@@ -143,6 +143,10 @@ class ScrapeState(TypedDict, total=False):
     scraper_code: Annotated[str, _last_write_wins]
     input_urls: Annotated[list[str], _last_write_wins]
     test_report: Annotated[dict[str, Any], _last_write_wins]
+    # [job-329 wall] sha256 of scraper_draft.py as of the tester's verdict.
+    # run_execution refuses to launch a draft that drifted after this was
+    # stamped (abandoned writer threads edited the draft post-verdict on 329).
+    tested_draft_sha256: Annotated[str, _last_write_wins]
     cleanup_report: Annotated[dict[str, Any], _last_write_wins]
     learning_report: Annotated[dict[str, Any], _last_write_wins]
     nav_learning_report: Annotated[dict[str, Any], _last_write_wins]

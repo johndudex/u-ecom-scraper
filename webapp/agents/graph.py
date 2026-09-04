@@ -2030,6 +2030,13 @@ def _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout):
             f"[INVOKE-TIMEOUT] {phase} exceeded {timeout}s wall-clock — "
             f"invocation cancelled, phase did not complete",
         )
+        # [job-329 wall] async cancellation kills the LLM await, but a sync
+        # tool already in an executor thread cannot be interrupted — latch the
+        # tool-context cancel so its NEXT tool call refuses (same disarm the
+        # sync path applies to its abandoned thread).
+        from .tools.context import mark_invocation_cancelled
+
+        mark_invocation_cancelled(phase)
         # T0.3: the dead invocation must be DISTINGUISHABLE from a healthy
         # budget-exhausted return — both paths used to be bare {"messages": []}
         # and `_error` was read by nobody, so a wall-clock death was invisible
@@ -2117,6 +2124,14 @@ def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, t
             f"thread abandoned (leaks until the task time limit), phase did "
             f"not complete",
         )
+        # [job-329 wall] The abandoned thread cannot be killed, but it can be
+        # DISARMED: latch the tool-context cancel so the zombie's remaining
+        # LLM rounds get tool-refusal errors instead of mutating the draft
+        # after the tester verdict (329: three edit_file calls at
+        # 05:39:56-05:40:45, execution launched 05:41:04 on a SyntaxError).
+        from .tools.context import mark_invocation_cancelled
+
+        mark_invocation_cancelled(phase)
         # T0.3 (sync twin of the async-path marker): surface the dead invocation.
         return {"messages": [], "_error": f"wall-clock timeout after {timeout}s",
                 "_error_class": "WallClockTimeout"}
@@ -5890,6 +5905,11 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 "_invoke_code_tester: CLI contract violation → test FAIL "
                 "(job %s, retry_count=%s)", job_id, _retry_now,
             )
+        # [job-329 wall] Pin the draft the tester just judged, whatever the
+        # verdict — run_execution refuses any post-verdict drift against it.
+        from .nodes.run_execution import _stamp_tested_draft
+
+        _stamp_tested_draft(update, slug)
         return update
     except Exception:
         _notify_phase(job_id, "code_tester", "failed")

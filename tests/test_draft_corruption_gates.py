@@ -1,0 +1,301 @@
+"""[session-audit job-329] The draft-corruption walls.
+
+Job 329 (proven RCA, 2026-09-05 forensic audit): the code_writer exceeded its
+900s wall-clock twice and its ABANDONED threads kept ``edit_file``-ing
+``workspace/crocs-com/scraper_draft.py`` AFTER the tester verdict — the last
+edit landed 19s before ``run_execution`` launched. The corrupted draft died at
+Python compile time (55s, zero HTTP requests):
+
+    SyntaxError: expected ':'  (scraper_draft.py, line 1292)
+
+and the job was first RCA'd as a rate-band failure because the gate that
+should have caught it — ``run_execution._accepted_cli_flags`` — parses the
+very same file with ``ast.parse`` inside ``except Exception: return None``,
+laundering "this file is not Python" into "flags undeterminable" and launching
+a doomed subprocess. This module pins the walls that make that class impossible
+to miss again:
+
+- loud compile gate: ``_draft_parse_error`` reports corruption; run_execution
+  refuses to launch a non-parsing draft and fails the job with the real
+  SyntaxError in ``error_message`` — BEFORE any dispatch.
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+import pytest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "webapp"))
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+import django
+
+django.setup()
+
+# agents.nodes shadows the submodule name with the node FUNCTION, so import
+# the true module by path (its dict is what run_execution's globals resolve).
+import importlib
+
+rexec = importlib.import_module("agents.nodes.run_execution")
+
+# The exact corruption that killed job 329 (line 1292 of its draft).
+CORRUPT_DRAFT = (
+    "def _dom_price(soup) -> str:\n"
+    "    return ''\n"
+    "\n"
+    "\n"
+    "def _dom_category(soup) -> str joined_marker:\n"
+    "    return ''\n"
+)
+
+VALID_DRAFT = (
+    "import argparse\n"
+    "\n"
+    "parser = argparse.ArgumentParser()\n"
+    "parser.add_argument('--sample', action='store_true')\n"
+)
+
+
+def _seed_workspace(tmp_path, body: str, slug: str = "crocs-com"):
+    ws = tmp_path / "workspace" / slug
+    ws.mkdir(parents=True)
+    (ws / "scraper_draft.py").write_text(body)
+    return tmp_path
+
+
+class TestLoudCompileGate:
+    def test_parse_error_reporter_names_the_corruption(self, tmp_path):
+        """A corrupt draft yields a reporter string carrying SyntaxError and
+        the offending line number — the signal job 329's RCA never read."""
+        draft = _seed_workspace(tmp_path, CORRUPT_DRAFT) / "workspace" / "crocs-com" / "scraper_draft.py"
+        err = rexec._draft_parse_error(str(draft))
+        assert err is not None
+        assert "SyntaxError" in err
+        assert "line 5" in err
+
+    def test_parse_error_reporter_silent_on_valid_draft(self, tmp_path):
+        draft = _seed_workspace(tmp_path, VALID_DRAFT) / "workspace" / "crocs-com" / "scraper_draft.py"
+        assert rexec._draft_parse_error(str(draft)) is None
+
+    def test_run_execution_refuses_corrupt_draft_before_any_dispatch(self, tmp_path, monkeypatch):
+        """The 329 kill chain ends here: a non-parsing draft must produce an
+        honest FAILED with the SyntaxError in error_message, and the node must
+        exit before flag-probing or dispatching — a doomed subprocess is never
+        launched, so the failure cannot masquerade as a zero-item run."""
+        tmp = _seed_workspace(tmp_path, CORRUPT_DRAFT)
+        monkeypatch.setattr(rexec, "_get_project_root", lambda: str(tmp))
+        # _notify_phase is imported function-locally from ..graph — patch it there.
+        import agents.graph as ag
+        monkeypatch.setattr(ag, "_notify_phase", lambda *a, **k: None)
+        probes: list = []
+        monkeypatch.setattr(rexec, "_accepted_cli_flags", lambda p: probes.append(p))
+
+        import agents.tools.browser_http as bh
+
+        dispatches: list = []
+        monkeypatch.setattr(bh, "post_scrape_with_retry", lambda *a, **k: dispatches.append(a))
+
+        result = rexec.run_execution({"job_id": 0, "site_slug": "crocs-com"})
+
+        assert result["execution_status"] == "FAILED"
+        assert "SyntaxError" in result["error_message"]
+        assert probes == [], "gate must fire before the flag probe"
+        assert dispatches == [], "gate must fire before any dispatch"
+
+    def test_valid_draft_still_reaches_the_flag_probe(self, tmp_path, monkeypatch):
+        """The gate is a wall against corruption, not a new bottleneck: a
+        parsing draft passes the entry check and the node proceeds (proven by
+        the flag probe being reached)."""
+        tmp = _seed_workspace(tmp_path, VALID_DRAFT)
+        monkeypatch.setattr(rexec, "_get_project_root", lambda: str(tmp))
+        # _notify_phase is imported function-locally from ..graph — patch it there.
+        import agents.graph as ag
+        monkeypatch.setattr(ag, "_notify_phase", lambda *a, **k: None)
+        probes: list = []
+        monkeypatch.setattr(rexec, "_accepted_cli_flags", lambda p: probes.append(p) or set())
+
+        import agents.tools.browser_http as bh
+
+        monkeypatch.setattr(bh, "post_scrape_with_retry", lambda *a, **k: (_ for _ in ()).throw(AssertionError("dispatch not expected in this test")))
+
+        rexec.run_execution({"job_id": 0, "site_slug": "crocs-com"})
+        assert probes, "valid draft must pass the entry gate and reach flag probing"
+
+
+class TestDraftFreeze:
+    """Wall #2: what executes must be byte-identical to what the tester judged.
+
+    Job 329: the tester PASSED at 05:39:40; abandoned writer threads edited the
+    draft at 05:39:56/05:40:14/05:40:45; execution launched 05:41:04 on a file
+    the tester never saw. The freeze pins the verdict-time hash into state at
+    the tester and refuses execution on any drift."""
+
+    def _workspace(self, tmp_path, body=VALID_DRAFT):
+        tmp = _seed_workspace(tmp_path, body)
+        return tmp, tmp / "workspace" / "crocs-com" / "scraper_draft.py"
+
+    def _patch_node(self, monkeypatch, tmp):
+        monkeypatch.setattr(rexec, "_get_project_root", lambda: str(tmp))
+        import agents.graph as ag
+
+        monkeypatch.setattr(ag, "_notify_phase", lambda *a, **k: None)
+        probes: list = []
+        monkeypatch.setattr(rexec, "_accepted_cli_flags", lambda p: probes.append(p) or set())
+        import agents.tools.browser_http as bh
+
+        monkeypatch.setattr(bh, "post_scrape_with_retry", lambda *a, **k: (_ for _ in ()).throw(AssertionError("dispatch not expected")))
+        return probes
+
+    def test_modified_draft_refused_at_execution(self, tmp_path, monkeypatch):
+        tmp, _draft = self._workspace(tmp_path)
+        probes = self._patch_node(monkeypatch, tmp)
+        result = rexec.run_execution(
+            {"job_id": 0, "site_slug": "crocs-com", "tested_draft_sha256": "0" * 64}
+        )
+        assert result["execution_status"] == "FAILED"
+        assert "modified after" in result["error_message"]
+        assert "tested" in result["error_message"]
+        assert probes == [], "refusal must precede flag probing"
+
+    def test_matching_hash_passes_the_gate(self, tmp_path, monkeypatch):
+        import hashlib
+
+        tmp, draft = self._workspace(tmp_path)
+        probes = self._patch_node(monkeypatch, tmp)
+        good = hashlib.sha256(draft.read_bytes()).hexdigest()
+        rexec.run_execution(
+            {"job_id": 0, "site_slug": "crocs-com", "tested_draft_sha256": good}
+        )
+        assert probes, "byte-identical draft must sail through the freeze"
+
+    def test_legacy_job_without_hash_is_not_blocked(self, tmp_path, monkeypatch):
+        tmp, _ = self._workspace(tmp_path)
+        probes = self._patch_node(monkeypatch, tmp)
+        rexec.run_execution({"job_id": 0, "site_slug": "crocs-com"})
+        assert probes, "no recorded hash (legacy/resume path) must not block"
+
+    def test_stamp_helper_hashes_current_draft(self, tmp_path):
+        import hashlib
+
+        tmp, draft = self._workspace(tmp_path)
+        update: dict = {}
+        rexec._stamp_tested_draft(update, "crocs-com", project_root=str(tmp))
+        assert update["tested_draft_sha256"] == hashlib.sha256(draft.read_bytes()).hexdigest()
+
+    def test_stamp_helper_tolerates_missing_draft(self, tmp_path):
+        tmp = tmp_path  # no workspace seeded
+        update: dict = {}
+        rexec._stamp_tested_draft(update, "never-existed", project_root=str(tmp))
+        assert update["tested_draft_sha256"] is None
+
+    def test_tester_stamps_hash_at_verdict(self):
+        """Source contract: _invoke_code_tester stamps the freeze hash before
+        its single return, so EVERY verdict branch (pass/fail/recycled) pins
+        the draft it judged."""
+        with open(
+            os.path.join(ROOT, "webapp", "agents", "graph.py"), encoding="utf-8"
+        ) as fh:
+            src = fh.read()
+        fn_start = src.index("def _invoke_code_tester(")
+        fn_end = src.index("def _invoke_cleanup(")
+        body = src[fn_start:fn_end]
+        stamp_pos = body.index("_stamp_tested_draft(update")
+        ret_pos = body.rindex("return update")
+        assert stamp_pos < ret_pos, "hash must be stamped before the verdict return"
+
+
+class TestAbandonedWriterGuard:
+    """Wall #0 — the ROOT of the 329 chain: an abandoned wall-clock thread
+    must lose its tools.
+
+    ``_invoke_agent_with_timeout`` abandons the agent thread on deadline and
+    returns; the zombie keeps looping LLM rounds whose ``edit_file`` calls
+    landed on the draft AFTER the tester verdict (05:39:56/05:40:14/05:40:45
+    on job 329). The fix is cooperative: abandonment latches an
+    invocation-cancelled flag in the shared tool context, and a global
+    BaseTool patch makes every subsequent tool call raise until the next
+    fresh invocation resets it. The thread cannot be killed (Python), but it
+    can be disarmed."""
+
+    @pytest.fixture(autouse=True)
+    def _rearm_after_test(self):
+        """These tests latch the process-global cancel; the latch deliberately
+        survives clear_tool_context (that is the design), so each test must
+        leave a fresh (armed) context behind or every later tool-using test in
+        the same process hits '[invocation-cancelled]' refusals."""
+        yield
+        self._fresh_context()
+
+    def _fresh_context(self):
+        from agents.tools.context import set_tool_context
+
+        set_tool_context({}, agent_name="code_writer")
+
+    def test_cancel_latch_survives_clear_and_resets_on_next_invoke(self):
+        from agents.tools import context as tctx
+
+        self._fresh_context()
+        assert not tctx.is_invocation_cancelled()
+        tctx.mark_invocation_cancelled("code_writer")
+        assert tctx.is_invocation_cancelled()
+        # The node's finally clear_tool_context() runs while the zombie lives:
+        tctx.clear_tool_context()
+        assert tctx.is_invocation_cancelled(), (
+            "the latch must outlive the context clear or the zombie rearms"
+        )
+        # A fresh invocation re-arms:
+        self._fresh_context()
+        assert not tctx.is_invocation_cancelled()
+
+    def test_tool_run_refuses_once_cancelled(self):
+        from agents.subagents import _install_invocation_cancellation
+        from agents.tools import context as tctx
+        from langchain_core.tools import tool
+
+        _install_invocation_cancellation()
+        self._fresh_context()
+
+        @tool
+        def echo_tool(x: str) -> str:
+            """echoes x"""
+
+            return x
+
+        assert echo_tool.invoke({"x": "hi"}) == "hi"
+        tctx.mark_invocation_cancelled("code_writer")
+        with pytest.raises(Exception, match="cancelled"):
+            echo_tool.invoke({"x": "hi"})
+        # and a fresh invocation works again:
+        self._fresh_context()
+        assert echo_tool.invoke({"x": "hi"}) == "hi"
+
+    def test_wall_clock_abandon_latches_the_cancel(self, monkeypatch):
+        import threading
+        import time as _time
+
+        import agents.graph as ag
+        from agents.tools import context as tctx
+
+        self._fresh_context()
+
+        class SleepyAgent:
+            def invoke(self, messages, cfg=None):
+                _time.sleep(1.5)
+                return {"messages": ["late"]}
+
+        monkeypatch.setattr(ag, "_log_event_row", lambda *a, **k: None)
+        monkeypatch.setattr(ag, "_notify_phase", lambda *a, **k: None)
+
+        result = ag._invoke_agent_with_timeout(
+            SleepyAgent(), [], {}, "code_writer", 0, timeout=0.3
+        )
+
+        assert result.get("_error_class") == "WallClockTimeout"
+        assert tctx.is_invocation_cancelled(), (
+            "abandonment must latch the cancel — the zombie's next edit_file "
+            "must refuse"
+        )
+        assert not threading.current_thread().is_alive() or True
