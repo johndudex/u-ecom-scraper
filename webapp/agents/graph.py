@@ -5369,6 +5369,24 @@ def _probe_phase1_discovery(
         and isinstance(probe_yield, dict)
         and _probe_yield_dead(probe_yield)
     ):
+        # [wave-20 T2] A draft whose coverage says ``ran_phase1: False``
+        # never LOOKED (job 360 marimekko: its invented url_list mode gate
+        # returned on the seed file). Escalating a network identity against
+        # a fetch that never ran tests the SITE, not the CODE — and the
+        # miss stamps ``all_tiers_blocked`` over a code bug. Skip the
+        # escalation entirely and stamp the honest code verdict; decided
+        # BEFORE ``_state_at_next_tier`` is consulted.
+        _cov = probe_yield.get("coverage")
+        if isinstance(_cov, dict) and _cov.get("ran_phase1") is False:
+            logger.info(
+                "_probe_phase1_discovery: draft SKIPPED its own Phase 1 "
+                "(job %s) — no escalation against a fetch that never ran",
+                job_id,
+            )
+            probe_yield["stop_reason"] = "phase1_skipped"
+            _cov["stop_reason"] = "phase1_skipped"
+            probe_yield["coverage"] = _cov
+            return crashed, tb, probe_yield
         _esc_state, _next_tier, _prev_tier = _state_at_next_tier(state)
         if _esc_state is not None:
             logger.info(

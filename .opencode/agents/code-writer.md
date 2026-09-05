@@ -308,6 +308,15 @@ failure class. Three hard rules:
   logic + the provided field map.
 - Do NOT rewrite the template from scratch — adapt it.
 - Do NOT add features the template doesn't have unless the Field Map includes them.
+- Do NOT invent mode gates that skip discovery: the existence of
+  `input_urls.json` (a file the TESTER writes) never overrides the
+  invocation's `--fresh-discovery`/`--discover-only` flags. When a discovery
+  flag is passed, Phase 1 MUST run and re-discover. [jobs 359/360]
+- Do NOT paste JavaScript expressions from the analyzer into the scraper
+  verbatim — they are JS, not Python. Port them: parse
+  `<script type="application/ld+json">` with `json.loads` and plain
+  dict/list traversal, and never swallow parse exceptions
+  (`except: return []` hides the real failure from the tester). [job 359]
 
 ## Retry / Fix Mode
 

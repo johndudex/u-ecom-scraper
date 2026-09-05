@@ -2542,6 +2542,54 @@ def _summarize_test_report(state: dict) -> str:
             "\n**⚠️ REMEDIATION INSTRUCTION (apply this fix — do NOT rewrite "
             "from scratch):**\n" + _feedback
         )
+    # [wave-20 T3] Two gotchas from jobs 359/360, injected deterministically
+    # when the report's SHAPE names them — across every retry cycle the
+    # writer regenerated drafts carrying the same defect because its retry
+    # context never stated the rule it was breaking.
+    _cov_t3 = report.get("discovery_coverage")
+    if (
+        isinstance(_cov_t3, dict)
+        and str(_cov_t3.get("stop_reason") or "") == "phase1_skipped"
+    ):
+        lines.append(
+            "\n**⚠️ GOTCHA — DISCOVERY FLAGS OVERRIDE THE SEED FILE** "
+            "(the probe stamped phase1_skipped: the draft returned WITHOUT "
+            "running Phase 1). The mere existence of `input_urls.json` — a "
+            "file the TESTER writes — never licenses a url_list "
+            "short-circuit: when the invocation passes `--fresh-discovery` "
+            "or `--discover-only`, Phase 1 MUST run and re-discover. Delete "
+            "any mode gate that returns early because a seed file exists."
+        )
+    _rem_t3 = report.get("remediation")
+    _t3_crash = ""
+    if isinstance(report, dict):
+        _t3_crash = str(report.get("crash_error") or "")
+        if not _t3_crash and isinstance(report.get("script_checks"), dict):
+            _t3_crash = str(
+                report["script_checks"].get("crash_error")
+                or report["script_checks"].get("error_message")
+                or ""
+            )
+    try:
+        _t3_items = int((report.get("results") or {}).get("successful_extractions") or 0)
+    except (TypeError, ValueError):
+        _t3_items = 0
+    if (
+        isinstance(_rem_t3, dict)
+        and _rem_t3.get("target") == "scraper"
+        and _t3_items == 0
+        and not _t3_crash.strip()
+    ):
+        lines.append(
+            "\n**⚠️ GOTCHA — PORT BROWSER-JS TO PURE-PYTHON PARSING** (pages "
+            "fetched healthy — no crash — yet zero items extracted: the "
+            "parser is inert). Parse `<script type=\"application/ld+json\">` "
+            "blocks with `json.loads` and plain dict/list traversal. Do NOT "
+            "paste JavaScript expressions from the analyzer verbatim — they "
+            "are JS, not Python. NEVER swallow parse exceptions "
+            "(`except: return []` hides the real failure) — let them raise "
+            "so the tester sees them."
+        )
     # T2.6: retry writers kept breaking WORKING phases because the summary never
     # said what worked — a "price MISSING" report reads as "rewrite everything",
     # and the rewrite discarded the proven Phase-1 discovery (jobs 71/76/81).

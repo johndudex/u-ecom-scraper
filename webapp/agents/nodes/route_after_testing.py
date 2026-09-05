@@ -152,6 +152,44 @@ def _discovery_coverage_failure(report: dict, state: Optional[ScrapeState] = Non
     return None
 
 
+def _remediation_scraper_diagnosis(report: dict) -> Optional[str]:
+    """Concrete tester diagnosis naming the CODE as the fix target [wave-20 T1].
+
+    Jobs 359/360: the tester ran the draft, isolated the bug (inert JSON-LD
+    parse; a mode gate that ignores discovery flags) and wrote
+    ``remediation.target: "scraper"`` with a concrete field — and the
+    classifier overrode that expert diagnosis with the zero-item /
+    coverage-failure heuristics, strategy-switched, and the writer
+    regenerated near-identical drafts against the same context until a gate
+    killed the job. A diagnosis counts as concrete only when it carries a
+    ``field``, a ``fix``, or non-empty ``issues``; a bare
+    ``{"target": "scraper"}`` changes nothing (guards the heuristic's
+    "strategy never got a fair window" concern).
+    """
+    if not isinstance(report, dict):
+        return None
+    rem = report.get("remediation")
+    if not (isinstance(rem, dict) and rem.get("target") == "scraper"):
+        return None
+    field = str(rem.get("field") or "").strip()
+    if field:
+        return field
+    fix = str(rem.get("fix") or "").strip()
+    if fix:
+        return fix
+    issues = report.get("issues")
+    if isinstance(issues, list) and issues:
+        first = issues[0]
+        msg = (
+            (first.get("message") or first.get("description") or "")
+            if isinstance(first, dict)
+            else str(first)
+        )
+        if msg.strip():
+            return msg.strip()
+    return None
+
+
 def classify_test_failure(
     report: dict, strategy: str, state: Optional[ScrapeState] = None
 ) -> tuple[str, str]:
@@ -255,6 +293,29 @@ def classify_test_failure(
     # Access/strategy-class: the strategy can't reach the content.
     if is_timeout and strat in ("playwright", "stealth_browser", "seleniumbase_uc", ""):
         return ("strategy", f"playwright timed out ({crash[:80]})")
+    # [wave-20 T1] The tester RAN the draft and named the code as the fix
+    # target with a concrete diagnosis — that outranks the zero-item and
+    # discovery-coverage verdicts below (jobs 359/360), but NOT the
+    # unproven-run guards above (selector crash / absent draft / 429 /
+    # throttle / gateway-down). Placement note: this must also precede the
+    # ``_discovery_coverage_failure`` return further down — 360's cycle 2
+    # extracted 1 seed item, so its verdict came from the coverage branch.
+    _tester_diag = _remediation_scraper_diagnosis(report if isinstance(report, dict) else {})
+    if _tester_diag:
+        return ("scraper", f"tester diagnosis: {_tester_diag[:80]}")
+    # [wave-20 T2] The probe stamped ``phase1_skipped``: the draft skipped
+    # its own Phase 1 (an invented mode gate returned on the seed file, job
+    # 360 marimekko). That is a CODE verdict — targeted fix — never a
+    # strategy-switch. Deliberately NOT in ``_COVERAGE_FAIL_STOP_REASONS``:
+    # that set means the SITE blocks discovery; this one means the code
+    # never looked.
+    if isinstance(report, dict):
+        _skcov = report.get("discovery_coverage")
+        if (
+            isinstance(_skcov, dict)
+            and str(_skcov.get("stop_reason") or "") == "phase1_skipped"
+        ):
+            return ("scraper", "discovery: draft skipped Phase 1 (phase1_skipped)")
     if items == 0 and is_http_like and not is_traceback:
         return ("strategy", f"{strat} returned no items ({is_blocked and 'blocked' or 'empty'})")
     if items == 0 and is_blocked and not is_traceback:

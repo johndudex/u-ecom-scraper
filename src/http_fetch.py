@@ -105,9 +105,20 @@ def resolve_tiers(
 # list — that one is empty under prod defaults, so it never fires).
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Case-insensitive substrings that identify a challenge page (title, heading or
-# embedded challenge payload).
-CHALLENGE_MARKERS: tuple = (
+# Case-insensitive substrings that identify a challenge page. Split into two
+# classes [wave-20 T0, jobs 359/360 RCA]:
+#
+# STRONG — structural challenge phrases (a page that contains one of these IS
+# a challenge page, whatever its size). Firing on these is size-independent.
+#
+# WEAK — bare tokens that real pages routinely embed (SFCC/Akamai-fronted
+# sites put ``_abck`` telemetry and ``captcha`` help links in EVERY page).
+# A weak token alone must never classify a big real body as a challenge;
+# they only corroborate a body that is ALREADY under the min-bytes floor
+# (the tiny-wall shape). Arming ``SCRAPER_SOFT_BLOCK_MIN_BYTES`` on prod
+# (2026-09-05) armed these for the first time and burned the whole proxy
+# ladder against no-anti-bot sites.
+CHALLENGE_MARKERS_STRONG: tuple = (
     "attention required",
     "access denied",
     "verify you are human",
@@ -116,10 +127,14 @@ CHALLENGE_MARKERS: tuple = (
     "just a moment",
     "cf-chl",
     "cf_chl",
+)
+CHALLENGE_MARKERS_WEAK: tuple = (
     "captcha",
     "_abck",
     "akamai",
 )
+# Union kept for consumers that iterate the old name.
+CHALLENGE_MARKERS: tuple = CHALLENGE_MARKERS_STRONG + CHALLENGE_MARKERS_WEAK
 
 SOFT_BLOCK_MIN_BYTES_ENV = "SCRAPER_SOFT_BLOCK_MIN_BYTES"
 
@@ -170,7 +185,8 @@ def detect_soft_block(text: str) -> Optional[SoftBlock]:
     """Challenge-shape detector for an HTTP 200 body. ``None`` = looks real.
 
     Two shapes, either of which trips it:
-    - a generic challenge marker in the body;
+    - a STRONG challenge phrase anywhere in the body (size-independent), or a
+      WEAK token corroborating an already-tiny body [wave-20 T0];
     - a body smaller than the ``SCRAPER_SOFT_BLOCK_MIN_BYTES`` floor (the
       zero-item-anchor check, approximated: no real listing is that small).
     """
@@ -178,10 +194,13 @@ def detect_soft_block(text: str) -> Optional[SoftBlock]:
     if floor <= 0 or not text:
         return None
     lowered = text.lower()
-    hits = tuple(m for m in CHALLENGE_MARKERS if m in lowered)
+    hits = tuple(m for m in CHALLENGE_MARKERS_STRONG if m in lowered)
     if hits:
         return SoftBlock("challenge_marker", hits, len(text))
     if len(text) < floor:
+        weak = tuple(m for m in CHALLENGE_MARKERS_WEAK if m in lowered)
+        if weak:
+            return SoftBlock("challenge_marker", weak, len(text))
         return SoftBlock("under_min_bytes", (), len(text))
     return None
 
