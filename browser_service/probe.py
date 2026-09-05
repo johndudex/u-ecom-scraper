@@ -1031,7 +1031,12 @@ def _try_direct_http(url: str, timeout: int = 15, proxy_tier: str = "none", coun
                 "error": "Akamai Bot Manager detected",
             }
 
-        has_meaningful_content = len(html) > 2000 and not blocked
+        # [wave-21 T4] Success requires a 2xx: styled ~1MB 404 pages
+        # (michaelhill/marimekko, local e2e 335/336) used to pass this gate
+        # on size alone, poisoning the probe cache with a dead seed.
+        has_meaningful_content = (
+            200 <= resp.status_code < 300 and len(html) > 2000 and not blocked
+        )
         has_price_in_jsonld = any(has_price(block) for block in jsonld)
 
         spa_detected, spa_framework = _detect_spa(html, body_text)
@@ -1064,7 +1069,25 @@ def _try_direct_http(url: str, timeout: int = 15, proxy_tier: str = "none", coun
                 "spa_framework": spa_framework,
             }
 
-        return None
+        # [wave-21 T4] Fetched-but-rejected returns a dict (not None) so the
+        # escalation ladder can see the STATUS — a 404/5xx miss must reach
+        # probe_tools' terminal not_found verdict (wave-21 T5). None stays
+        # reserved for transport-level failure ("rung unavailable").
+        return {
+            "success": False,
+            "method": method_name,
+            "proxy_tier": proxy_tier,
+            "status_code": resp.status_code,
+            "title": title,
+            "body_length": len(html),
+            "body_text": body_text,
+            "needs_browser": True,
+            "blocked": False,
+            "jsonld": jsonld,
+            "meta": meta,
+            "selector_results": "Skipped — page blocked, empty or non-2xx",
+            "error": f"fetch rejected (status {resp.status_code})",
+        }
 
     except Exception as exc:
         logger.info("Direct HTTP (%s) failed: %s", proxy_tier, exc)
@@ -1151,7 +1174,10 @@ def _try_fingerprint(
     body_text = _extract_body_text(html)
 
     block_class = _classify_block(html, status_code)
-    has_content = len(html) > 2000 and block_class is None
+    # [wave-21 T4] 2xx gate — same rationale as _try_direct_http.
+    has_content = (
+        200 <= status_code < 300 and len(html) > 2000 and block_class is None
+    )
 
     if has_content:
         has_price_in_jsonld = any(has_price(block) for block in jsonld)
@@ -1195,7 +1221,9 @@ def _try_fingerprint(
         "body_length": len(html),
         "body_text": body_text,
         "needs_browser": True,
-        "blocked": True,
+        # [wave-21 T4] honest blocked: a 404/5xx rejection is a miss, not a
+        # block — only a classified challenge/block shape is.
+        "blocked": block_class is not None,
         # Deliberately NOT ``needs_akamai_bypass``: this is an early, cheap
         # rung — tripping the cloak bypass here would also stop the ladder
         # before the (untried) datacenter/residential tiers.
@@ -1350,7 +1378,10 @@ def _try_playwright(url: str, proxy_tier: str, timeout: int = 25, country: Optio
         except Exception:
             pass
 
-        has_content = len(html) > 2000 and not blocked
+        # [wave-21 T4] 2xx gate — same rationale as _try_direct_http.
+        has_content = (
+            200 <= status_code < 300 and len(html) > 2000 and not blocked
+        )
         if has_content:
             from src.page_analysis import run_selector_tests
 
@@ -1380,7 +1411,8 @@ def _try_playwright(url: str, proxy_tier: str, timeout: int = 25, country: Optio
             "body_length": len(html),
             "body_text": body_text,
             "needs_browser": True,
-            "blocked": True,
+            # [wave-21 T4] honest blocked — a 404/5xx miss is not a block.
+            "blocked": blocked,
             "needs_akamai_bypass": _detect_akamai(html, status_code),
             "jsonld": jsonld,
             "meta": meta,
@@ -1422,7 +1454,10 @@ def _try_cloak(url: str, proxy_tier: str, timeout: int = 40, country: Optional[s
         except Exception:
             pass
 
-        has_content = len(html) > 2000 and not blocked
+        # [wave-21 T4] 2xx gate — same rationale as _try_direct_http.
+        has_content = (
+            200 <= status_code < 300 and len(html) > 2000 and not blocked
+        )
         if has_content:
             from src.page_analysis import run_selector_tests
 
@@ -1451,7 +1486,8 @@ def _try_cloak(url: str, proxy_tier: str, timeout: int = 40, country: Optional[s
             "body_length": len(html),
             "body_text": body_text,
             "needs_browser": True,
-            "blocked": True,
+            # [wave-21 T4] honest blocked — a 404/5xx miss is not a block.
+            "blocked": blocked,
             "needs_stealth": True,
             "needs_akamai_bypass": _detect_akamai(html, status_code),
             "jsonld": jsonld,

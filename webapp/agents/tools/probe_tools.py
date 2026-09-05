@@ -19,8 +19,6 @@ from urllib.parse import urlparse
 import httpx
 from langchain_core.tools import tool
 
-from .guards import apply_guard, require_non_akamai_tool
-
 logger = logging.getLogger(__name__)
 
 BROWSER_SERVICE_URL = os.environ.get(
@@ -269,8 +267,9 @@ def _verify_captcha_free(data: dict) -> dict:
         body_text = title
 
     try:
-        from ..llm import get_small_llm
         from langchain_core.messages import HumanMessage
+
+        from ..llm import get_small_llm
 
         llm = get_small_llm(temperature=0.0)
 
@@ -373,6 +372,10 @@ def run_probe_with_captcha_check(
     http_method: str | None = None
     browser_method: str | None = None
     akamai_count = 0
+    # [wave-21 T5] set when a rung fails with 404/410 — terminal: no transport
+    # fixes a missing page, so the ladder stops instead of burning every
+    # remaining rung (and the domain captcha cache stays untouched).
+    not_found_status = 0
 
     def _log_probe_step(message: str) -> None:
         """Write probe progress as a SessionLog entry so the watchdog
@@ -409,7 +412,7 @@ def run_probe_with_captcha_check(
 
     def _try_single_step(step_name: str, proxy_tier: str) -> dict | None:
         """Try a single escalation step. Returns data on success, None on fail."""
-        nonlocal methods_tried, captcha_info, akamai_count
+        nonlocal methods_tried, captcha_info, akamai_count, not_found_status
 
         probe_payload: dict = {
             "url": url,
@@ -438,6 +441,26 @@ def run_probe_with_captcha_check(
             methods_tried.append(step_name)
 
             if not data.get("success"):
+                # [wave-21 T5] 404/410 is TERMINAL — local e2e 335/336: the
+                # seed PDP didn't exist and every remaining rung (fingerprint,
+                # playwright, cloak, both proxy tiers) burned against a page
+                # nothing can ever return, then the tail cached the whole
+                # DOMAIN as captcha'd.
+                _sc = int(data.get("status_code") or 0)
+                if _sc in (404, 410):
+                    not_found_status = _sc
+                    logger.info(
+                        "probe_page[accessibility]: %s returned HTTP %d — terminal "
+                        "not_found for %s",
+                        step_name,
+                        _sc,
+                        url[:80],
+                    )
+                    _log_probe_step(
+                        f"{step_name} returned HTTP {_sc} — page does not exist, "
+                        "stopping ladder"
+                    )
+                    return None
                 if data.get("needs_akamai_bypass"):
                     akamai_count += 1
                     logger.info(
@@ -583,6 +606,9 @@ def run_probe_with_captcha_check(
                     break  # Got both from cache skip or Akamai bypass
             else:
                 break  # Found second method
+        elif not_found_status:
+            # [wave-21 T5] terminal 404/410 — stop walking the ladder.
+            break
 
     # ── All done ──────────────────────────────────────────────────────
     if method_1:
@@ -604,6 +630,43 @@ def run_probe_with_captcha_check(
     )
     _log_probe_step(f"ALL methods failed. Tried: {', '.join(methods_tried)}")
 
+    if not_found_status:
+        # [wave-21 T5] Honest terminal verdict. Deliberately NOT the legacy
+        # captcha-shaped failure below, and deliberately NO domain cache
+        # write: a missing page says nothing about the domain's other pages
+        # (335/336 would have cached michaelhill/marimekko as captcha'd).
+        _log_probe_step(
+            f"URL not found (HTTP {not_found_status}) — page does not exist"
+        )
+        return {
+            "success": False,
+            "not_found": True,
+            "method": methods_tried[-1] if methods_tried else "none",
+            "http_method": None,
+            "browser_method": None,
+            "proxy_tier": "none",
+            "status_code": not_found_status,
+            "title": "",
+            "body_length": 0,
+            "needs_browser": True,
+            "blocked": False,
+            "captcha_detected": False,
+            "captcha_type": "",
+            "captcha_confidence": 0.0,
+            "captcha_reasoning": "URL not found — no captcha involved",
+            "methods_tried": methods_tried,
+            "_request_url": url,
+            "jsonld": [],
+            "meta": {},
+            "selector_results": {},
+            "akamai_detected": False,
+            "akamai_method_count": 0,
+            "error": (
+                f"URL not found (HTTP {not_found_status}) — page does not exist; "
+                "no proxy or browser can fix a missing page"
+            ),
+        }
+
     try:
         from scraper.models import ProbeCache
 
@@ -620,6 +683,7 @@ def run_probe_with_captcha_check(
 
     return {
         "success": False,
+        "not_found": False,
         "method": methods_tried[-1] if methods_tried else "none",
         "http_method": None,
         "browser_method": None,
@@ -887,7 +951,7 @@ def get_probe_tools() -> list:
             if not captcha_result.get("captcha_detected"):
                 _save_probe_cache(domain, data)
 
-            from .context import update_probe_result, get_probe_method
+            from .context import get_probe_method, update_probe_result
 
             update_probe_result(data)
             logger.info(

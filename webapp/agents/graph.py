@@ -2481,6 +2481,50 @@ def _invoke_site_analyzer(
     )
 
 
+def _live_sample_url_from_input_urls(
+    slug: str, dead_url: str, project_root: str | None = None
+) -> str:
+    """[wave-21 T7] Pick a replacement sample URL from the job's own
+    discovered ``input_urls.json``.
+
+    Prefers the dead URL's own host (the discovery harvest is same-domain by
+    construction), skips the dead URL itself, falls back to any other entry.
+    Returns ``""`` when nothing usable exists — the caller then proceeds
+    unchanged (and the T6 interrupt remains the honest outcome)."""
+    root = project_root
+    if not root:
+        try:
+            from django.conf import settings
+
+            root = str(getattr(settings, "PROJECT_ROOT", "") or "")
+        except Exception:
+            root = ""
+    path = os.path.join(root or os.getcwd(), "workspace", slug, "input_urls.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except Exception:
+        return ""
+    urls: list[str] = []
+    if isinstance(raw, list):
+        for entry in raw:
+            if isinstance(entry, str):
+                urls.append(entry.strip())
+            elif isinstance(entry, dict):
+                urls.append(str(entry.get("url") or "").strip())
+    urls = [u for u in urls if u and u != (dead_url or "").strip()]
+    if not urls:
+        return ""
+    from urllib.parse import urlparse
+
+    dead_host = urlparse(dead_url or "").netloc.lower()
+    if dead_host:
+        same_host = [u for u in urls if urlparse(u).netloc.lower() == dead_host]
+        if same_host:
+            return same_host[0]
+    return urls[0]
+
+
 def _invoke_product_analyzer(
     state: ScrapeState, config: RunnableConfig
 ) -> dict[str, Any] | Command:
@@ -2499,6 +2543,40 @@ def _invoke_product_analyzer(
             state.get("job_id", 0),
             _pa_remediation.get("fields"),
         )
+
+    # [wave-21 T7] Loop-breaker: a re-map against a DEAD seed re-analyzes the
+    # same missing page, reproduces the same guesswork mappings, and the
+    # writer regenerates the same draft — job 335's freeze. If the PREVIOUS
+    # analysis carries a dead-seed verdict (T6), swap the sample URL to a
+    # live one the job's own discovery already found.
+    _remap_state = state
+    if is_remap:
+        from .nodes.validate_coverage import _dead_seed_verdict
+
+        _prev_pa = state.get("product_analysis")
+        _dead = _dead_seed_verdict(_prev_pa) if isinstance(_prev_pa, dict) else ""
+        if _dead:
+            _swapped = _live_sample_url_from_input_urls(
+                str(state.get("site_slug") or ""),
+                str(state.get("sample_url") or ""),
+            )
+            if _swapped:
+                logger.info(
+                    "_invoke_product_analyzer: re-map seed swap (job %s) — previous "
+                    "analysis reported %s; analyzing %s instead of dead %s",
+                    state.get("job_id", 0),
+                    _dead,
+                    _swapped[:80],
+                    str(state.get("sample_url") or "")[:80],
+                )
+                _remap_state = {**state, "sample_url": _swapped}
+            else:
+                logger.warning(
+                    "_invoke_product_analyzer: re-map seed swap wanted (job %s, %s) "
+                    "but input_urls.json offered no alternative URL",
+                    state.get("job_id", 0),
+                    _dead,
+                )
 
     def _on_success(analysis: dict, st: ScrapeState):
         # Anti-bot ⇒ playwright (cloak). KEPT: code_writer otherwise picks the
@@ -2524,6 +2602,9 @@ def _invoke_product_analyzer(
                     "messages": [],
                     "product_analysis": analysis,
                     "remap_count": remap_count,
+                    # [wave-21 T7] persist the (possibly swapped) sample URL so
+                    # downstream cycles don't re-analyze the dead seed
+                    "sample_url": st.get("sample_url"),
                 },
             )
         # F13: happy path routes via Command (the static product_analyzer →
@@ -2536,7 +2617,7 @@ def _invoke_product_analyzer(
         )
 
     return _run_budgeted_agent(
-        state,
+        _remap_state,
         config,
         phase="product_analyzer",
         display_name="product-analyzer",

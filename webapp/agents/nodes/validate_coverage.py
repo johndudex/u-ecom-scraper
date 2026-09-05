@@ -99,6 +99,29 @@ def _proven_dead_fields(analysis: dict) -> list[str]:
     )
 
 
+def _dead_seed_verdict(analysis: dict) -> str:
+    """The analyzer's own dead-seed self-report, if any (wave-21 T6).
+
+    product_analyzer writes ``verdict: "TARGET_URL_DEAD"`` (or a BLOCKER
+    critical_finding saying the target URL is dead) when the sample page
+    doesn't exist — local e2e 336 (marimekko). Mappings built off a missing
+    page are guesses no matter how many fields they cover, and the
+    live-render check that could prove them dead cannot run on a page that
+    isn't there."""
+    verdict = str(analysis.get("verdict") or "").strip().upper()
+    if verdict == "TARGET_URL_DEAD":
+        return verdict
+    cf = analysis.get("critical_finding")
+    if isinstance(cf, dict):
+        finding = str(cf.get("finding") or "")
+        if (
+            str(cf.get("severity") or "").strip().upper() == "BLOCKER"
+            and "DEAD" in finding.upper()
+        ):
+            return "TARGET_URL_DEAD (critical_finding)"
+    return ""
+
+
 def validate_coverage(state: ScrapeState) -> Command:
     """Read analysis and check field coverage.
 
@@ -173,6 +196,52 @@ def validate_coverage(state: ScrapeState) -> Command:
                 "interrupt_options": options,
                 "interrupt_decisions": options_to_decisions(options),
                 "product_analysis_retries": product_retries,
+            },
+            goto="human_approval",
+        )
+
+    # [wave-21 T6] Dead-seed self-report outranks coverage credit: the
+    # analyzer says the sample page does not exist, so every mapping in this
+    # analysis is a guess (336 sailed through here at 100% coverage; 335
+    # froze two tester cycles later). Treated like the missing-analysis arm
+    # above — interrupt, never silently proceed — but the exhaustion path
+    # interrupts TOO (skipping to scraper_analyzer on a dead seed is exactly
+    # the loop 335 died in).
+    dead_reason = _dead_seed_verdict(analysis)
+    if dead_reason:
+        product_retries = state.get("product_analysis_retries", 0) + 1
+        if product_retries >= MAX_VALIDATE_RETRIES:
+            options = ["Continue anyway", "Abort"]
+            return Command(
+                update={
+                    "product_analysis_retries": product_retries,
+                    "error_message": "",
+                    "interrupt_reason": "dead_seed_exhausted",
+                    "interrupt_message": (
+                        f"Content analysis STILL reports the sample URL is DEAD "
+                        f"({dead_reason}) after {product_retries} attempt(s). "
+                        f"Field mappings built off a missing page are guesses. "
+                        f"Continue with the guesswork analysis, or abort?"
+                    ),
+                    "interrupt_options": options,
+                    "interrupt_decisions": options_to_decisions(options),
+                },
+                goto="human_approval",
+            )
+        options = ["Retry content analysis", "Continue without analysis", "Cancel"]
+        return Command(
+            update={
+                "product_analysis_retries": product_retries,
+                "error_message": "",
+                "interrupt_reason": "dead_seed",
+                "interrupt_message": (
+                    f"Content analysis reports the sample URL is DEAD ({dead_reason}) "
+                    f"— the analyzer could not reach the page its field mappings "
+                    f"were built from. Retry the analysis (needs a live sample "
+                    f"URL), continue without analysis, or cancel."
+                ),
+                "interrupt_options": options,
+                "interrupt_decisions": options_to_decisions(options),
             },
             goto="human_approval",
         )
