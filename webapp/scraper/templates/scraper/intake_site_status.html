@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<!--
+  PROD STATUS — every job ever run, rolled up to one row per (site, product_url).
+  Live replacement for the hand-generated prod_job_status_by_site_product.csv:
+  the summary tiles answer "how big is the backlog", the table answers
+  "what actually happened to each product", and "Download CSV" reproduces the
+  operator's CSV byte-for-byte in column layout. Filters (status / q) apply to
+  both the table and the CSV export. Superuser-only (spans every account).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prod status — site × product</title>
+<style>
+  :root { --line:#e2e8f0; --muted:#64748b; --ink:#0f172a; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; color:var(--ink); background:#f8fafc; }
+  header { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 20px; background:#fff; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; }
+  header .sub { color:var(--muted); font-size:12.5px; margin-top:2px; }
+  .btn { display:inline-block; padding:6px 12px; border:1px solid var(--line); border-radius:6px; background:#fff; color:var(--ink); text-decoration:none; font-size:13px; }
+  .btn:hover { background:#f1f5f9; }
+  .tiles { display:flex; flex-wrap:wrap; gap:10px; padding:16px 20px; }
+  .tile { background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px 14px; min-width:110px; }
+  .tile .num { font-size:22px; font-weight:650; }
+  .tile .lbl { font-size:11.5px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+  .tile.completed .num { color:#15803d; }
+  .tile.failed .num { color:#b91c1c; }
+  .tile.running .num { color:#1d4ed8; }
+  .tile.never_succeeded .num { color:#b45309; }
+  form.filters { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:0 20px 14px; }
+  form.filters select, form.filters input { padding:6px 8px; border:1px solid var(--line); border-radius:6px; font-size:13px; background:#fff; }
+  .tablewrap { padding:0 20px 40px; overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; background:#fff; border:1px solid var(--line); border-radius:8px; font-size:13px; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { background:#f1f5f9; font-size:11.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); position:sticky; top:0; }
+  tbody tr:hover { background:#f8fafc; }
+  td.url { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; word-break:break-all; max-width:420px; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11.5px; font-weight:600; }
+  .badge.first-try { background:#dcfce7; color:#15803d; }
+  .status { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11.5px; font-weight:600; background:#e2e8f0; }
+  .status.st-completed { background:#dcfce7; color:#15803d; }
+  .status.st-failed { background:#fee2e2; color:#b91c1c; }
+  .status.st-running { background:#dbeafe; color:#1d4ed8; }
+  .status.st-pending { background:#fef9c3; color:#a16207; }
+  .status.st-waiting_approval { background:#f3e8ff; color:#7e22ce; }
+  .status.st-cancelled, .status.st-captcha_blocked, .status.st-akamai_blocked, .status.st-browser_unavailable { background:#ffedd5; color:#c2410c; }
+  .muted { color:var(--muted); }
+  a.jl { color:#1d4ed8; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Prod status — every job, one row per site × product</h1>
+    <div class="sub">Final status = latest attempt. Live replacement for prod_job_status_by_site_product.csv.</div>
+  </div>
+  <a class="btn" href="{% url 'intake' %}">&larr; Back to Intake</a>
+</header>
+
+<section class="tiles" aria-label="Summary">
+  <div class="tile"><div class="num" data-summary="products">{{ summary.products }}</div><div class="lbl">products</div></div>
+  <div class="tile"><div class="num" data-summary="sites">{{ summary.sites }}</div><div class="lbl">sites</div></div>
+  <div class="tile completed"><div class="num" data-summary="completed">{{ summary.completed }}</div><div class="lbl">completed</div></div>
+  <div class="tile failed"><div class="num" data-summary="failed">{{ summary.failed }}</div><div class="lbl">failed</div></div>
+  <div class="tile running"><div class="num" data-summary="running">{{ summary.running }}</div><div class="lbl">running</div></div>
+  <div class="tile"><div class="num" data-summary="pending">{{ summary.pending }}</div><div class="lbl">pending</div></div>
+  <div class="tile"><div class="num" data-summary="waiting_approval">{{ summary.waiting_approval }}</div><div class="lbl">waiting approval</div></div>
+  <div class="tile"><div class="num" data-summary="first_try">{{ summary.first_try }}</div><div class="lbl">first-try</div></div>
+  <div class="tile never_succeeded"><div class="num" data-summary="never_succeeded">{{ summary.never_succeeded }}</div><div class="lbl">never succeeded</div></div>
+</section>
+
+<form class="filters" method="get">
+  <label>Status
+    <select name="status">
+      <option value="">any</option>
+      {% for s in status_choices %}
+      <option value="{{ s }}" {% if s == sel_status %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Search
+    <input type="text" name="q" value="{{ sel_q }}" placeholder="site or product URL" size="28">
+  </label>
+  <button class="btn" type="submit">Apply</button>
+  <a class="btn" href="{% url 'intake_site_status' %}">Reset</a>
+  <a class="btn" href="?{% if request.GET.urlencode %}{{ request.GET.urlencode }}&amp;{% endif %}format=csv">Download CSV</a>
+</form>
+
+<div class="tablewrap">
+<table>
+  <thead>
+    <tr>
+      <th>Site</th>
+      <th>Product URL</th>
+      <th>Listing / search</th>
+      <th>Final status</th>
+      <th>Attempts</th>
+      <th>First try</th>
+      <th>Succeeded job</th>
+      <th>Last activity</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.site_name }}</td>
+      <td class="url">{{ r.product_url }}</td>
+      <td class="url">{{ r.listing }}</td>
+      <td><span class="status st-{{ r.final_status }}">{{ r.final_status }}</span></td>
+      <td>{{ r.attempts }}</td>
+      <td>{% if r.first_try %}<span class="badge first-try">first-try</span>{% else %}<span class="muted">&mdash;</span>{% endif %}</td>
+      <td>{% if r.success_job_url %}<a class="jl" href="{{ r.success_job_url }}">view job</a>{% else %}<span class="muted">&mdash;</span>{% endif %}</td>
+      <td class="muted">{{ r.last_activity|date:"Y-m-d H:i" }}</td>
+    </tr>
+    {% empty %}
+    <tr><td colspan="8" class="muted">No jobs recorded yet.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+</body>
+</html>
