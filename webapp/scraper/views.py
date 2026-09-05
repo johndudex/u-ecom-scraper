@@ -23,6 +23,7 @@ from django.http import (
 )
 from django.shortcuts import get_object_or_404, redirect, render, reverse
 from django.utils import timezone
+from django.views.decorators.cache import never_cache
 
 from .forms import SiteForm
 from .models import Approval, JobListing, ProbeCache, ScrapeJob, SessionLog, Site
@@ -2858,6 +2859,7 @@ def intake_create_job(request):
 
 
 @login_required
+@never_cache  # job statuses change while you watch — an HTTP cache must never serve a stale library
 def intake_jobs(request):
     """AJAX: recent ScrapeJobs for the Jobs & Saved library view.
 

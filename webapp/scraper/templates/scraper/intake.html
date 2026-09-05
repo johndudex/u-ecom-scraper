@@ -2311,6 +2311,14 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
   function showLibrary(tab){
     switchLibTab(tab || 'jobs');
     X('#saved-back-label').textContent = lastPrimaryScreen === 'sample-screen' ? 'Back to job' : 'Back to setup';
+    // Refetch on every open: the library renders from cached ALL_JOBS, which
+    // goes stale while a job runs (status/records freeze) and never shows
+    // jobs dispatched from elsewhere.
+    refreshLibrary();
+    // The library is a real location: mark ?view=jobs|saved and drop the
+    // query (including any stale ?job=N deep-link) — a manual reload then
+    // lands back on Jobs & Saved instead of booting into the old job.
+    history.replaceState(null, '', location.pathname + '?view=' + (tab || 'jobs'));
     show('saved-screen');
   }
   X('#view-saved-link').addEventListener('click', function(e){ e.preventDefault(); showLibrary('saved'); });
@@ -2361,7 +2369,10 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     setRunning(true);
     subscribeToJob(data);
   }
-  loadDeepLinkedJob();
+  // Boot: a saved ?view=jobs|saved URL lands straight on the library; only
+  // otherwise fall back to the ?job=N deep-link loader.
+  var _libView = /(?:\?|&)view=(jobs|saved)/.exec(location.search);
+  if(_libView){ showLibrary(_libView[1]); } else { loadDeepLinkedJob(); }
 
   /* ---------- boot ---------- */
   refreshRunSampleGate();
