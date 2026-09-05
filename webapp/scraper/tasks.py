@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -479,6 +480,14 @@ def _run_graph_job(job: ScrapeJob, rescrape: bool = False, force_full: bool = Fa
     _emit_running_transition(job)
 
     config = service.get_config(job.id)
+    # [wave-22 A3] task-scoped job budget: every phase wall clock clamps to
+    # what is left of this deadline (graph._effective_timeout). Stamped HERE
+    # — per task, not per job — so an approval-resumed job (a NEW task)
+    # gets a fresh clock by construction instead of insta-failing on a
+    # created_at-based one.
+    config["configurable"]["task_deadline"] = (
+        time.time() + _RUN_TASK_SOFT_TIME_LIMIT
+    )
     initial_state = _build_initial_state(job)
     if rescrape:
         initial_state["rescrape"] = True
@@ -562,6 +571,12 @@ def resume_scrape_task(self, job_id: int, human_response: Any) -> None:
     service = LangGraphService()
     graph = service.build_graph()
     config = service.get_config(job.id)
+    # [wave-22 A3] FRESH task-scoped deadline on resume — this is a new task
+    # with its own soft limit; reusing the original run's clock would resume
+    # the job with ~0s of budget.
+    config["configurable"]["task_deadline"] = (
+        time.time() + _RUN_TASK_SOFT_TIME_LIMIT
+    )
 
     # ── Attach RedisLogHandler for system log streaming ────────────────
     from .log_handler import RedisLogHandler

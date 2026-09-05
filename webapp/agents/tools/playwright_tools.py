@@ -7,12 +7,22 @@ BaseTool instances.
 The MCP server connects to browser_service's no-proxy Chrome instance via CDP
 (`http://browser_service:9222`).
 
-A pooled ``ClientSession`` is reused across tool calls to avoid the expensive
-SSE handshake (open + initialize) on every call. The session is lazily
-created on first use and torn down when the running event loop changes
-(e.g. a new Celery task) or when a tool call fails. Layered timeouts — a
-per-call wall clock via ``asyncio.wait_for`` plus the SSE transport's
-``sse_read_timeout`` — bound how long a single call can hang.
+Every tool call dials a ONE-SHOT SSE session (``sse_client`` +
+``ClientSession`` inside a per-call ``AsyncExitStack``, entered and exited in
+the same event loop — the ``_list_tools`` pattern). A pooled session was tried
+and deleted [wave-22 A4]: sync tool dispatch runs ``asyncio.run`` per call, so
+every call found the session bound to a dead loop, tore it down across loops
+(anyio cancel-scope hazards), and rebuilt it anyway — the handshake was never
+actually saved, while the pool's global lock added cross-loop failure modes.
+Tab continuity between navigate and snapshot is a browser-side property (the
+MCP server drives Chrome via ``--cdp-endpoint``); it never lived in our SSE
+session.
+
+Layered timeouts bound every await: a 30s connect cap on the SSE handshake,
+a 90s ``sse_read_timeout`` on the transport, a per-call budget (120s default,
+240s for network captures) clamped to what remains of the invoking agent's
+wall clock (``get_tool_deadline``), and one retry on a fresh session after a
+wall-clock timeout.
 
 The module tracks browser availability in ``playwright_status`` so that
 agent factories can make informed decisions when the MCP server is
@@ -34,21 +44,31 @@ DEFAULT_MCP_URL = "http://localhost:8111/sse"
 _MAX_TOOL_OUTPUT_CHARS = 30000
 
 # --- MCP timeout constants ---------------------------------------------
-# SSE read timeout for the pooled session. The mcp library's default is 300s,
-# which is the root cause of the 20-minute stalls: a stalled SSE response
-# would hang for the full 5 minutes before timing out. 90s is plenty for any
-# legitimate Playwright MCP operation; the wall-clock cap below is the
-# backstop.
+# SSE read timeout for the one-shot session. The mcp library's default is
+# 300s, which is the root cause of the 20-minute stalls: a stalled SSE
+# response would hang for the full 5 minutes before timing out. 90s is
+# plenty for any legitimate Playwright MCP operation; the per-call budget
+# below is the backstop.
 _MCP_SSE_READ_TIMEOUT = 90.0
 
 # tools/list is a tiny request — fail fast if the server is slow to enumerate.
 # This runs once at tool-registration time (not per tool call).
 _MCP_LIST_TOOLS_TIMEOUT = 20.0
 
-# Belt-and-suspenders wall-clock cap on a single call_tool invocation. The
-# SSE read timeout above should fire first for stalled responses; this catches
-# any case where the call hangs without an SSE-level timeout.
+# Cap on the SSE connect handshake (transport open + initialize). This await
+# was historically unbounded — a hung MCP server stalled the connect for the
+# full transport timeout. 30s is generous for a local connection.
+_MCP_CONNECT_TIMEOUT = 30.0
+
+# Default wall-clock budget for a single call_tool invocation. The SSE read
+# timeout above should fire first for stalled responses; this catches any
+# case where the call hangs without an SSE-level wait.
 _MCP_WALL_CLOCK_TIMEOUT = 120.0
+
+# Network captures can legitimately stream for minutes on slow listings —
+# a larger class budget, still clamped to the agent's remaining wall clock.
+_NETWORK_CALL_BUDGET = 240.0
+_LONG_CALL_TOOLS = {"browser_network_requests"}
 
 # Per-category retry delays. Each category lists the delays applied BEFORE
 # each retry (so a 2-tuple means "up to 2 retries"). An empty tuple means
@@ -80,14 +100,10 @@ _PREFIX = "playwright_"
 _MCP_NEGATIVE_CACHE_TTL = 10.0
 _cached_tools_at: float = 0.0
 
-# --- Pooled MCP session state -------------------------------------------
-# A single ClientSession is reused across tool calls to skip the SSE
-# handshake on every call. Lazily created on first use; torn down when the
-# running event loop changes (new Celery task) or when a call fails.
-_session: Any = None  # ClientSession
-_session_stack: AsyncExitStack | None = None
-_session_loop: Any = None  # asyncio.AbstractEventLoop for stale detection
-_session_lock: asyncio.Lock | None = None
+# --- Per-call session (no pool) ------------------------------------------
+# Sessions are one-shot per tool call. There is deliberately NO module-level
+# session state: the pool's reuse/stale dance was pure overhead under the
+# asyncio.run-per-call dispatch and a cross-loop hazard under the async one.
 
 playwright_status: dict[str, Any] = {
     "available": False,
@@ -181,105 +197,30 @@ def _classify_error(exc: Exception) -> str:
     return "unknown"
 
 
-async def _get_session(mcp_url: str) -> Any:
-    """Lazily create or reuse the pooled MCP ``ClientSession``.
+def _effective_tool_budget(tool_name: str, now: float | None = None) -> float:
+    """Wall clock this tool call may consume, in seconds.
 
-    - If a session exists AND its event loop is the running loop → reuse it.
-    - If a session exists BUT the loop changed (new Celery task) → close it
-      and create a new one.
-    - If no session → open ``sse_client`` + ``ClientSession`` + ``initialize()``.
-
-    A module-level ``asyncio.Lock`` prevents two concurrent callers from
-    both creating a session. The lock is created lazily because the event
-    loop may not exist at import time.
+    ``min(class budget, remaining invocation deadline)`` — the class budget is
+    120s (240s for network captures); ``get_tool_deadline()`` is stamped by
+    ``_invoke_agent_with_timeout`` for the running agent. ``None`` deadline
+    (no agent context, e.g. run_execution) leaves the class budget in force;
+    a spent deadline returns 0.0 so the caller refuses to dial.
     """
-    global _session, _session_stack, _session_loop, _session_lock
+    budget = (
+        _NETWORK_CALL_BUDGET if tool_name in _LONG_CALL_TOOLS else _MCP_WALL_CLOCK_TIMEOUT
+    )
+    try:
+        from agents.tools.context import get_tool_deadline
 
-    if _session_lock is None:
-        _session_lock = asyncio.Lock()
-
-    async with _session_lock:
-        running_loop = asyncio.get_running_loop()
-
-        # Reuse path: same session, same loop.
-        if _session is not None and _session_loop is running_loop:
-            return _session
-
-        # Stale-session path: loop changed (new Celery task). Tear down
-        # before creating a fresh one.
-        if _session is not None:
-            await _close_session()
-
-        from mcp import ClientSession
-        from mcp.client.sse import sse_client
-
-        stack = AsyncExitStack()
-        try:
-            read_stream, write_stream = await stack.enter_async_context(
-                sse_client(mcp_url, sse_read_timeout=_MCP_SSE_READ_TIMEOUT)
-            )
-            session = await stack.enter_async_context(
-                ClientSession(read_stream, write_stream)
-            )
-            await asyncio.wait_for(session.initialize(), timeout=20)
-        except Exception:
-            # Clean up any partially-initialized state before re-raising.
-            try:
-                await stack.aclose()
-            except Exception as close_exc:
-                logger.warning(
-                    "Error closing partial MCP session stack: %s", close_exc
-                )
-            raise
-
-        _session = session
-        _session_stack = stack
-        _session_loop = running_loop
-        logger.debug("Created pooled MCP session to %s", mcp_url)
-        return session
-
-
-async def _close_session() -> None:
-    """Tear down the pooled MCP session (best-effort).
-
-    Does NOT acquire the session lock — callers that need exclusive access
-    (e.g. ``_get_session``) must hold it. ``_call_mcp_tool`` calls this
-    directly on failure, accepting the small race window in exchange for
-    simplicity: the next ``_get_session`` will recreate the session under
-    the lock.
-
-    **Cross-loop safety**: when the session was created on a now-dead event
-    loop (common with the ``asyncio.run``-per-call pattern in sync tool
-    dispatch), ``stack.aclose()`` triggers anyio's cross-task cancel-scope
-    error (``RuntimeError: generator didn't stop after athrow()``) and can
-    hang indefinitely. In that case we skip ``aclose`` — the dead loop's
-    ``shutdown_asyncgens`` already finalized the underlying SSE/httpx
-    connections. For same-loop sessions we ``aclose`` with a 10s timeout so
-    a half-dead connection can't block cleanup.
-    """
-    global _session, _session_stack, _session_loop
-    _session = None
-    old_loop = _session_loop
-    _session_loop = None
-    stack = _session_stack
-    _session_stack = None
-    if stack is not None:
-        try:
-            try:
-                running_loop = asyncio.get_running_loop()
-            except RuntimeError:
-                running_loop = None
-            if old_loop is not None and old_loop is not running_loop:
-                logger.debug(
-                    "_close_session: discarding stale session (loop mismatch) "
-                    "— dead loop already cleaned up connections"
-                )
-            else:
-                await asyncio.wait_for(stack.aclose(), timeout=10)
-        except asyncio.TimeoutError:
-            logger.warning("_close_session: aclose timed out after 10s — discarding")
-        except Exception as exc:
-            logger.warning("Error closing MCP session stack: %s", exc)
+        deadline = get_tool_deadline()
+    except Exception:
+        deadline = None
+    if deadline is None:
+        return budget
+    remaining = deadline - (time.time() if now is None else now)
+    if remaining <= 0:
+        return 0.0
+    return min(budget, remaining)
 
 
 def _format_tool_result(tool_name: str, result: Any) -> str:
@@ -349,62 +290,94 @@ async def _list_tools(mcp_url: str) -> list[Any]:
 
 
 async def _call_mcp_tool(mcp_url: str, tool_name: str, arguments: dict) -> str:
-    """Call an MCP tool via the pooled session with layered timeouts.
+    """Call an MCP tool over a ONE-SHOT session with layered timeouts.
 
-    Flow:
+    Each attempt holds ``sse_client`` + ``ClientSession`` in one per-call
+    ``AsyncExitStack`` entered and exited in the same loop, so teardown is
+    structural (the ``async with`` unwinds on every path — no global pool, no
+    cross-loop ``aclose``).
 
-    1. ``session = await _get_session(mcp_url)`` (lazy create / reuse).
-    2. ``await asyncio.wait_for(session.call_tool(...), timeout=120)``.
-    3. On ``asyncio.TimeoutError`` → ``_close_session()`` → return error.
-       No retry — a 120s hang means something is fundamentally wrong.
-    4. On any other exception → classify → ``_close_session()`` → retry
-       only if ``connection_refused`` (2 retries, 2s+5s) or
-       ``other_transient`` (1 retry, 2s). ``read_timeout`` and ``unknown``
-       fail immediately.
+    Flow per attempt:
 
-    Layered timeouts:
-
-    - ``sse_read_timeout=90`` on the SSE transport bounds a stalled
-      response at the protocol level (the root-cause fix for the 20-min
-      stalls; the library default was 300s).
-    - ``_MCP_WALL_CLOCK_TIMEOUT=120`` is the asyncio belt-and-suspenders
-      cap. The SSE timeout should fire first; this backstops any case
-      where the call hangs without an SSE-level wait.
+    1. Budget check — ``_effective_tool_budget`` clamps the class budget
+       (120s, 240s for network captures) to the invoking agent's remaining
+       wall clock. 0 remaining → refuse without dialing.
+    2. ``wait_for(enter_async_context(sse_client(...)), 30)`` — the connect
+       handshake is bounded (it was the one unbounded await on this path).
+    3. ``ClientSession`` + ``initialize()`` (20s) + ``call_tool`` (budget).
+    4. On ``asyncio.TimeoutError`` → the stack unwinds the half-open session
+       → ONE retry on a fresh session, then an honest error (the old code
+       gave timeouts zero retries — a single SSE stall killed the call).
+    5. On any other exception → classify → the stack has already unwound →
+       retry per ``_MCP_RETRY_DELAYS`` (``connection_refused`` 2, others
+       fewer/none). ``read_timeout`` and ``unknown`` fail immediately.
     """
     attempt = 0
+    timeout_retried = False
     while True:
-        try:
-            session = await _get_session(mcp_url)
-            result = await asyncio.wait_for(
-                session.call_tool(tool_name, arguments=arguments),
-                timeout=_MCP_WALL_CLOCK_TIMEOUT,
-            )
-            return _format_tool_result(tool_name, result)
-        except asyncio.TimeoutError:
-            # Wall-clock timeout fired — either the SSE read timeout didn't
-            # catch it or the call hung without an SSE-level wait. Tear down
-            # the session: the underlying connection is suspect. No retry.
-            logger.error(
-                "Playwright MCP tool '%s' timed out after %.0fs — closing session",
+        budget = _effective_tool_budget(tool_name)
+        if budget <= 0:
+            logger.warning(
+                "Playwright MCP tool '%s' skipped — no wall clock left before "
+                "the agent deadline",
                 tool_name,
-                _MCP_WALL_CLOCK_TIMEOUT,
             )
-            await _close_session()
+            return (
+                f"Error: Playwright MCP tool '{tool_name}' skipped — no wall "
+                f"clock left before the agent deadline. Do not retry it in "
+                f"this invocation."
+            )
+        try:
+            from mcp import ClientSession
+            from mcp.client.sse import sse_client
+
+            async with AsyncExitStack() as stack:
+                read_stream, write_stream = await asyncio.wait_for(
+                    stack.enter_async_context(
+                        sse_client(mcp_url, sse_read_timeout=_MCP_SSE_READ_TIMEOUT)
+                    ),
+                    timeout=_MCP_CONNECT_TIMEOUT,
+                )
+                session = await stack.enter_async_context(
+                    ClientSession(read_stream, write_stream)
+                )
+                await asyncio.wait_for(session.initialize(), timeout=20)
+                result = await asyncio.wait_for(
+                    session.call_tool(tool_name, arguments=arguments),
+                    timeout=budget,
+                )
+                return _format_tool_result(tool_name, result)
+        except asyncio.TimeoutError:
+            # The stack unwound the half-open session above. One retry on a
+            # fresh session, then an honest error.
+            if not timeout_retried:
+                timeout_retried = True
+                logger.warning(
+                    "Playwright MCP tool '%s' timed out after %.0fs — "
+                    "retrying once on a fresh session",
+                    tool_name,
+                    budget,
+                )
+                await asyncio.sleep(2.0)
+                continue
+            logger.error(
+                "Playwright MCP tool '%s' timed out twice (%.0fs budget) — "
+                "giving up",
+                tool_name,
+                budget,
+            )
             return (
                 f"Error: Playwright MCP tool '{tool_name}' timed out after "
-                f"{_MCP_WALL_CLOCK_TIMEOUT:.0f}s"
+                f"{budget:.0f}s (retried once on a fresh session)"
             )
         except Exception as exc:
             category = _classify_error(exc)
-            # Always close the session on error — the connection may be bad,
-            # and _get_session on the next attempt will create a fresh one.
-            await _close_session()
             retry_delays = _MCP_RETRY_DELAYS.get(category, ())
             if attempt < len(retry_delays):
                 delay = retry_delays[attempt]
                 logger.warning(
                     "Playwright MCP tool '%s' hit %s on attempt %d: %s — "
-                    "closing session, retrying in %.1fs",
+                    "retrying in %.1fs on a fresh session",
                     tool_name,
                     category,
                     attempt + 1,

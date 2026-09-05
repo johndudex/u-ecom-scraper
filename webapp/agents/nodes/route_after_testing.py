@@ -1197,6 +1197,20 @@ def route_after_testing(state: ScrapeState) -> str:
         _log_cascade(state, "park-browser-service", "tester pre-flight: gateway unhealthy")
         return "park_browser_unavailable"
 
+    # [wave-22 A5] Named fast-fail: the tester died on its invoke wall clock
+    # with no test_report.json on disk (stamped by the node — routing
+    # functions receive state, not a way to compute it). The no-report ladder
+    # below cannot rescue this: every rung re-burns a full window against the
+    # same wall. Terminal cleanup with the named detail (recoverable via
+    # re-drive), in BOTH skip_approvals modes.
+    if state.get("fast_fail_detail"):
+        _ff_detail = str(state.get("fast_fail_detail"))
+        logger.error(
+            "route_after_testing: fast-fail → cleanup (%s)", _ff_detail[:160]
+        )
+        _log_cascade(state, "fast-fail", _ff_detail[:120])
+        return "cleanup"
+
     # Route functions return only a node name (no state update possible), so
     # the exhausted-retries error is recorded by the CALLER (code_tester's
     # exhausted-retry return) — see _invoke_code_tester. This fn only routes.

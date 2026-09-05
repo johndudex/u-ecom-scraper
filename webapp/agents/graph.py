@@ -2074,6 +2074,96 @@ def _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout):
     return result
 
 
+# [wave-22 A3] Task-scoped job budget. Every phase wall clock is clamped to
+# what is actually LEFT of the celery task's soft limit, so a job that burned
+# hours in early phases cannot start another full 900s window and die at the
+# soft limit with a billiard exception instead of a named phase (371/372).
+JOB_BUDGET_FINALIZE_MARGIN = 360.0  # reserve = the soft→hard grace window
+JOB_BUDGET_FLOOR = 300.0            # a phase below this is named as a breach
+
+
+def _effective_timeout(
+    phase_timeout: float, job_deadline: float | None, now: float
+) -> tuple[float, str | None]:
+    """Clamp a phase wall clock to the task-scoped budget. Pure (clock
+    injected) so the math is unit-testable.
+
+    Returns ``(effective_timeout, breach_reason)``. ``breach_reason`` is None
+    when the phase fits, a named clamp when the phase was shortened, and an
+    exhaustion message (with a 0.0 timeout) when only the finalize margin
+    remains.
+    """
+    if not job_deadline:
+        return float(phase_timeout), None
+    remaining = float(job_deadline) - float(now) - JOB_BUDGET_FINALIZE_MARGIN
+    if remaining <= 0:
+        return 0.0, (
+            f"job budget exhausted ({-remaining:.0f}s past the deadline minus "
+            f"finalize margin)"
+        )
+    effective = min(float(phase_timeout), remaining)
+    if effective < JOB_BUDGET_FLOOR < float(phase_timeout):
+        return effective, (
+            f"clamped to job budget: only {effective:.0f}s remain (floor "
+            f"{JOB_BUDGET_FLOOR:.0f}s) — the task is near its soft limit"
+        )
+    if effective < float(phase_timeout):
+        return effective, (
+            f"clamped to job budget: {effective:.0f}s of "
+            f"{float(phase_timeout):.0f}s requested"
+        )
+    return effective, None
+
+
+# [wave-22 A5] Phases allowed to fast-fail on wall-clock-death-with-no-artifact.
+# Deliberately NOT site_analyzer (downstream phases probe defensively) and NOT
+# navigation (its failures have a redo flow, no single artifact to miss).
+A5_FAST_FAIL_PHASES = frozenset({"product_analyzer"})
+
+
+def _fast_fail_detail(
+    phase: str,
+    artifact_name: str,
+    result: Any,
+    *,
+    output_exists: bool,
+) -> str:
+    """[wave-22 A5] Named fast-fail message for a wall-clock death with no
+    artifact to show for it. Empty string means "do not fast-fail".
+
+    A phase that exceeded its invoke wall clock AND produced no artifact
+    cannot be rescued by the retry ladder — every rung re-burns a full window
+    against the same wall (the 2.4h zombie limp of 365/370/371/372). The
+    message names the phase, the missing artifact, and the last tool the
+    agent got to run, so the terminal job row explains the death without a
+    log dig. Trimmed contract: callers gate this to code_tester and
+    product_analyzer only — code_writer's timeout arm deliberately keeps a
+    usable draft, and navigation failures have their own redo flow.
+    """
+    if output_exists or not isinstance(result, dict):
+        return ""
+    err = str(result.get("_error") or "")
+    _err_class = str(result.get("_error_class") or "")
+    # The class is authoritative when present; the message phrase is only a
+    # fallback for producers that set no class (an exception MESSAGE that
+    # happens to mention a wall clock must not trigger a fast-fail).
+    is_wall_clock = _err_class == "WallClockTimeout" or (
+        not _err_class and "wall-clock timeout" in err
+    )
+    if not is_wall_clock:
+        return ""
+    last_tool = ""
+    for _m in reversed(result.get("messages") or []):
+        if _m.__class__.__name__ == "ToolMessage":
+            last_tool = str(getattr(_m, "name", "") or "")
+            break
+    return (
+        f"{phase} hit its invoke wall clock and wrote no {artifact_name} "
+        f"(last tool: {last_tool or 'none'}) — failing fast instead of "
+        f"burning retry windows against the same wall; re-drive to retry"
+    )
+
+
 def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, timeout: int = _AGENT_INVOKE_TIMEOUT):
     """Run the agent with a wall-clock timeout.
 
@@ -2094,6 +2184,31 @@ def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, t
     """
     # [job-81 N-B] Publish the deadline so blocking tools (run_scraper's
     # browser dispatch) can refuse work that cannot finish before this fires.
+    # [wave-22 A3] the phase timeout is clamped to the TASK-scoped budget
+    # first (recomputed per invoke — no check-then-expire race), and the
+    # CLAMPED deadline is what tools see. The deadline rides the LangGraph
+    # config (stamped fresh by tasks.py at every task entry — run AND
+    # resume), so an approval-resumed job gets a fresh clock by construction.
+    try:
+        _jd = ((agent_cfg or {}).get("configurable") or {}).get("task_deadline")
+        timeout, _clamp_reason = _effective_timeout(timeout, _jd, time.time())
+        if _clamp_reason:
+            logger.warning(
+                "_invoke_agent_with_timeout[%s]: %s (job %s)",
+                phase, _clamp_reason, job_id,
+            )
+        # Refuse only when the CLAMP produced the zero (always carries a named
+        # reason). A caller-supplied literal 0 keeps the legacy contract:
+        # thread.join(0) fires the WallClockTimeout arm below (pinned by
+        # test_iteration_economics).
+        if timeout <= 0 and _clamp_reason:
+            logger.error(
+                "_invoke_agent_with_timeout[%s]: refusing to invoke — %s (job %s)",
+                phase, _clamp_reason, job_id,
+            )
+            return {"messages": [], "_error": _clamp_reason}
+    except Exception:
+        pass
     try:
         set_tool_deadline(time.time() + timeout)
     except Exception:
@@ -2263,6 +2378,29 @@ def _run_budgeted_agent(
         output_exists = os.path.isfile(
             os.path.join(root, "workspace", slug, artifact_name)
         )
+
+        # [wave-22 A5] Named fast-fail: a wall-clock death with no artifact
+        # (fresh FS check above, at decision time) cannot be rescued by the
+        # auto-extend re-invoke below — a dead thread gets no second window.
+        # Terminal cleanup with a NAMED, recoverable error instead of the
+        # interrupt ladder limping to SoftTimeLimitExceeded.
+        if not output_exists and phase in A5_FAST_FAIL_PHASES:
+            _ff_detail = _fast_fail_detail(
+                phase, artifact_name, result, output_exists=False
+            )
+            if _ff_detail:
+                logger.error(
+                    "_run_budgeted_agent[%s]: fast-fail (job %s): %s",
+                    phase, job_id, _ff_detail,
+                )
+                return Command(
+                    update={
+                        "messages": [],
+                        "error_message": _ff_detail,
+                        "execution_status": "FAILED",
+                    },
+                    goto="cleanup",
+                )
 
         if output_exists:
             _notify_phase(job_id, phase, "done")
@@ -5977,6 +6115,43 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             # state, so a dead/no-op attempt would silently route on the
             # LAST cycle's verdict even with the file-level mtime floor).
             update["test_report"] = None
+            # [wave-22 A5] Named fast-fail: a wall-clock death with no report
+            # on disk AT DECISION TIME cannot be rescued by the no-report
+            # ladder (every rung re-burns a full window against the same
+            # wall). Stamp the flag for route_after_testing, which acts on it
+            # ABOVE the no-report arms — this node must not Command-route
+            # (D6 union trap). The named error rides error_message so the
+            # terminal job row explains the death.
+            _ff_detail = _fast_fail_detail(
+                "code_tester",
+                "test_report.json",
+                _ct_res,
+                output_exists=os.path.isfile(_report_path) if _report_path else False,
+            )
+            if _ff_detail:
+                logger.error(
+                    "_invoke_code_tester: fast-fail stamp (job %s): %s",
+                    job_id, _ff_detail,
+                )
+                update["fast_fail_detail"] = _ff_detail
+                update["error_message"] = _ff_detail
+            # [wave-22 A2] count this attempt against the SAME retry budget
+            # every other arm uses. The only other increment (the writer
+            # node) is gated on a truthy test_report, so no-verdict cycles
+            # never advanced the counter: route_after_testing's
+            # retry-no-report arm re-ran writer→tester FOREVER while
+            # retry=0/2 (prod 371/372: 3h SoftTimeLimitExceeded deaths with
+            # the no-report arm logged 6-7 times). The writer increment is
+            # report-gated, this one is no-report-gated — exactly one of the
+            # two fires per cycle, no double counting.
+            _nr_retry = int(state.get("test_retry_count") or 0)
+            if _nr_retry != FINAL_RETRY_SENTINEL:
+                update["test_retry_count"] = _nr_retry + 1
+                logger.info(
+                    "_invoke_code_tester: no verdict for this attempt — "
+                    "test_retry_count → %d (job %s)",
+                    _nr_retry + 1, job_id,
+                )
         # [B2.6/wave-13] Parity: the escalation counter keys on "no verdict
         # for THIS attempt", not merely "the invocation object died". A
         # healthy invocation that wrote no on-disk report burned the same
