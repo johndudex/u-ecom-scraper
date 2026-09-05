@@ -1,3 +1,4 @@
+import csv
 import json
 import logging
 import os
@@ -2507,10 +2508,17 @@ def intake(request):
     for site in Site.objects.exclude(fields_extracted=[]):
         if site.url:
             known[site.url] = site.fields_extracted or []
+    from .models import MaintenanceLock
+
+    lock = MaintenanceLock.load()
     return render(
         request,
         "scraper/intake.html",
-        {"known_site_fields": json.dumps(known)},
+        {
+            "known_site_fields": json.dumps(known),
+            "is_superuser": request.user.is_superuser,
+            "maintenance": {"enabled": lock.enabled, "reason": lock.reason},
+        },
     )
 
 
@@ -2900,7 +2908,176 @@ def intake_jobs(request):
         }
         for j in jobs
     ]
-    return JsonResponse({"jobs": data})
+    return JsonResponse({"jobs": data, "maintenance": _maintenance_state()})
+
+
+def _maintenance_state() -> dict:
+    """The maintenance lock as a JSON-able dict — shared by the toggle
+    endpoint and the library API (the banner refreshes from the latter)."""
+    from .models import MaintenanceLock
+
+    row = MaintenanceLock.load()
+    return {"enabled": row.enabled, "reason": row.reason}
+
+
+@login_required
+def intake_maintenance(request):
+    """AJAX (superuser only): flip the maintenance lock.
+
+    ``enabled=1`` holds the system: dispatch_scrape_job stops publishing, so
+    new jobs stay PENDING forever-dispatched-signature rows. ``enabled=0``
+    lifts the lock AND drains everything that queued up, so no one has to
+    re-dispatch by hand. In-flight jobs are never touched — the point of the
+    lock is to let them drain before a merge+deploy window.
+    """
+    if not request.user.is_superuser:
+        return JsonResponse({"error": "superuser required"}, status=403)
+    if request.method != "POST" or request.headers.get("x-requested-with") != "XMLHttpRequest":
+        return JsonResponse({"error": "POST + AJAX required"}, status=400)
+
+    from .models import MaintenanceLock
+    from .tasks import resume_maintenance_held_jobs
+
+    enable = request.POST.get("enabled") == "1"
+    row = MaintenanceLock.load()
+    row.enabled = enable
+    row.reason = request.POST.get("reason", "").strip()[:200] if enable else ""
+    row.updated_by = request.user
+    row.save(update_fields=["enabled", "reason", "updated_at", "updated_by"])
+
+    resumed: list[int] = []
+    if not enable:
+        resumed = resume_maintenance_held_jobs()
+
+    logger.warning(
+        "Maintenance lock %s by %s%s",
+        "ENABLED" if enable else "lifted",
+        request.user.username,
+        f" (reason: {row.reason})" if row.reason else "",
+    )
+    state = _maintenance_state()
+    state["resumed_job_ids"] = resumed
+    return JsonResponse(state)
+
+
+def _site_status_rows():
+    """Roll up EVERY job into one row per (site, product_url).
+
+    This is the live version of the ``prod_job_status_by_site_product.csv``
+    the operator used to ask for by hand: final status of the LATEST attempt,
+    attempt count, succeeded-at-first-attempt, and a link to the succeeded
+    job. Ordering is stable (site, then product) so the CSV diffs cleanly
+    between runs.
+    """
+    jobs = ScrapeJob.objects.all().order_by("created_at", "id")
+    groups: dict = {}
+    for j in jobs:
+        purl = j.product_url or j.url
+        host = (urlparse(purl).hostname or "").removeprefix("www.")
+        site = (j.site_name or "").strip() or host
+        groups.setdefault((site, purl), []).append(j)
+
+    rows = []
+    in_flight = {
+        ScrapeJob.STATUS_RUNNING,
+        ScrapeJob.STATUS_PENDING,
+        ScrapeJob.STATUS_WAITING_APPROVAL,
+    }
+    for (site, purl), js in groups.items():
+        latest = js[-1]
+        completed = [j for j in js if j.status == ScrapeJob.STATUS_COMPLETED]
+        success = completed[-1] if completed else None
+        rows.append({
+            "site_name": site,
+            "site_url": f"https://{urlparse(purl).hostname or ''}",
+            "product_url": purl,
+            "listing": latest.search_criteria,
+            "final_status": latest.status,
+            "attempts": len(js),
+            "first_try": js[0].status == ScrapeJob.STATUS_COMPLETED,
+            "success_job_url": (
+                reverse("job_detail", args=[success.id]) if success else ""
+            ),
+            # In-flight products haven't failed yet — only a TERMINAL
+            # non-success state (failed/cancelled/blocked) counts.
+            "never_succeeded": success is None and latest.status not in in_flight,
+            "last_activity": (
+                latest.completed_at or latest.started_at or latest.created_at
+            ),
+        })
+    rows.sort(key=lambda r: (r["site_name"].lower(), r["product_url"]))
+    return rows
+
+
+@login_required
+def intake_site_status(request):
+    """Prod-status dashboard: per site+product roll-up of every job ever run
+    (all users). Superuser-only for the same reason /jobs/ is — the data
+    spans every account. ``?format=csv`` reproduces the operator's CSV;
+    ``?status=`` filters on final status; ``?q=`` substring-filters."""
+    if not request.user.is_superuser:
+        return JsonResponse({"error": "superuser required"}, status=403)
+
+    rows = _site_status_rows()
+
+    status = request.GET.get("status", "").strip()
+    if status:
+        rows = [r for r in rows if r["final_status"] == status]
+    q = request.GET.get("q", "").strip().lower()
+    if q:
+        rows = [
+            r for r in rows
+            if q in r["site_name"].lower() or q in r["product_url"].lower()
+        ]
+
+    if request.GET.get("format") == "csv":
+        response = HttpResponse(content_type="text/csv")
+        response["Content-Disposition"] = 'attachment; filename="prod_job_status_by_site_product.csv"'
+        writer = csv.writer(response)
+        writer.writerow([
+            "site_name", "site_url", "product_url", "listing_search_page_urls",
+            "final_status", "succeeded_at_first_attempt", "success_job_url",
+        ])
+        for r in rows:
+            writer.writerow([
+                r["site_name"], r["site_url"], r["product_url"], r["listing"],
+                r["final_status"], "true" if r["first_try"] else "false",
+                request.build_absolute_uri(r["success_job_url"]) if r["success_job_url"] else "",
+            ])
+        return response
+
+    # Summary over the UNFILTERED set — the tiles answer "how big is the
+    # backlog" even while the table is filtered.
+    all_rows = _site_status_rows()
+    summary = {
+        "products": len(all_rows),
+        "sites": len({r["site_name"] for r in all_rows}),
+        "first_try": sum(1 for r in all_rows if r["first_try"]),
+        "never_succeeded": sum(1 for r in all_rows if r["never_succeeded"]),
+    }
+    for s in (
+        ScrapeJob.STATUS_COMPLETED, ScrapeJob.STATUS_FAILED,
+        ScrapeJob.STATUS_RUNNING, ScrapeJob.STATUS_PENDING,
+        ScrapeJob.STATUS_WAITING_APPROVAL, ScrapeJob.STATUS_CANCELLED,
+    ):
+        summary[s] = sum(1 for r in all_rows if r["final_status"] == s)
+
+    return render(
+        request,
+        "scraper/intake_site_status.html",
+        {
+            "rows": rows,
+            "summary": summary,
+            "status_choices": [
+                ScrapeJob.STATUS_COMPLETED, ScrapeJob.STATUS_FAILED,
+                ScrapeJob.STATUS_RUNNING, ScrapeJob.STATUS_PENDING,
+                ScrapeJob.STATUS_WAITING_APPROVAL, ScrapeJob.STATUS_CANCELLED,
+            ],
+            "sel_status": status,
+            "sel_q": q,
+            "maintenance": _maintenance_state(),
+        },
+    )
 
 
 

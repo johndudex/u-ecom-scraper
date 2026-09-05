@@ -265,7 +265,21 @@ def dispatch_scrape_job(job_id: int, **kwargs) -> str:
 
     If the broker publish raises, the stamp is reverted so the row keeps the
     recoverable "" signature, then the exception propagates to the caller.
+
+    Maintenance lock: when the admin lock is ON, nothing is stamped and
+    nothing is published — the row keeps the pristine "never dispatched"
+    signature and simply waits. ``resume_maintenance_held_jobs`` drains
+    those rows when the lock is lifted. Returning "" is safe for every
+    caller: the return value has always been advisory.
     """
+    from .models import MaintenanceLock
+
+    if MaintenanceLock.is_enabled():
+        logger.warning(
+            "Job %d: maintenance lock is ON — staying PENDING (never dispatched)",
+            job_id,
+        )
+        return ""
     task_id = str(uuid4())
     ScrapeJob.objects.filter(pk=job_id).update(celery_task_id=task_id)
     try:
@@ -278,6 +292,27 @@ def dispatch_scrape_job(job_id: int, **kwargs) -> str:
         )
         raise
     return task_id
+
+
+def resume_maintenance_held_jobs() -> list[int]:
+    """Drain every row the maintenance lock held back: PENDING rows with the
+    pristine "never dispatched" signature. Called by the toggle view when an
+    admin lifts the lock, so queued work resumes without anyone re-clicking.
+    Rows already dispatched/running/terminal are untouched — the signature
+    "" is what makes "held" decidable. Returns the job ids drained."""
+    held = list(
+        ScrapeJob.objects.filter(
+            status=ScrapeJob.STATUS_PENDING, celery_task_id=""
+        ).order_by("created_at").values_list("id", flat=True)
+    )
+    for job_id in held:
+        dispatch_scrape_job(job_id, rescrape=False)
+    if held:
+        logger.warning(
+            "Maintenance lock lifted: resumed %d held job(s): %s",
+            len(held), held,
+        )
+    return held
 
 
 @shared_task(
@@ -1965,9 +2000,21 @@ def redispatch_abandoned_pending() -> dict:
     entry claim (1.1) see RUNNING + no matching id and drop the recovery.
     Cap 2 → honest FAILED, so a permanently poison row can't loop forever.
     One row per sweep bounds the blast radius of a bad republish.
+
+    Maintenance lock: checked BEFORE both active arms — including the
+    exhausted honest-fail arm. A row held in maintenance looks exactly like a
+    poison row (PENDING, no task id, older than the claim window,
+    redispatch_count possibly ≥ cap); failing it while the operator is just
+    holding the system would be the opposite of honest.
     """
+    # Env gate FIRST: a disabled sweep must stay a no-op with ZERO db access
+    # (wave-15 contract). The lock guard protects the ACTIVE arms below.
     if not getattr(settings, "REDISPATCH_SWEEP_ENABLED", False):
         return {"action": "disabled"}
+    from .models import MaintenanceLock
+
+    if MaintenanceLock.is_enabled():
+        return {"action": "maintenance_hold"}
 
     cutoff = timezone.now() - timezone.timedelta(minutes=PENDING_CLAIM_MINUTES)
     _signature = dict(

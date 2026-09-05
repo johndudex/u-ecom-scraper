@@ -788,3 +788,37 @@ class JobListing(models.Model):
     def __str__(self):
         return f"{self.title} @ {self.company} ({self.posted_date})"
 
+
+
+class MaintenanceLock(models.Model):
+    """Singleton (pk=1): when ``enabled``, ``dispatch_scrape_job`` refuses to
+    publish new scrape tasks — rows keep the "never dispatched" signature
+    (PENDING + celery_task_id="") until an admin lifts the lock, at which
+    point ``resume_maintenance_held_jobs`` drains everything that queued up.
+
+    DB-backed on purpose: the flag must survive Railway deploys (the whole
+    point is holding work across a deploy window). Enforced at the single
+    choke point every dispatch site already routes through [wave-15 1.0].
+    """
+    enabled = models.BooleanField(default=False)
+    reason = models.CharField(max_length=200, blank=True, default="")
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="maintenance_locks",
+    )
+
+    class Meta:
+        app_label = "scraper"
+        verbose_name = "Maintenance Lock"
+
+    def __str__(self):
+        return f"maintenance {'ON' if self.enabled else 'off'} ({self.reason or 'no reason'})"
+
+    @classmethod
+    def load(cls) -> "MaintenanceLock":
+        return cls.objects.get_or_create(pk=1)[0]
+
+    @classmethod
+    def is_enabled(cls) -> bool:
+        return cls.load().enabled

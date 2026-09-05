@@ -378,10 +378,19 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     jobsLibraryUrl: "{% url 'intake_jobs' %}",
     tokenListUrl: "{% url 'intake_token_list' %}",
     tokenCreateUrl: "{% url 'intake_token_create' %}",
+    maintenanceUrl: "{% url 'intake_maintenance' %}",
   };
 </script>
 </head>
 <body>
+
+<!-- [maintenance-lock] Shown while the admin hold is ON: dispatch is paused,
+     so new jobs stay Pending (they start automatically when it lifts). -->
+<div id="maintenance-banner" hidden role="status"
+     style="background:#7C2D12;color:#FED7AA;padding:10px 16px;font-size:13.5px;text-align:center;border-bottom:1px solid #EA580C;">
+  <strong>System under maintenance</strong> — new tasks will not be picked up until maintenance ends.
+  Your job stays <em>Pending</em> and starts automatically afterwards.<span id="maintenance-reason"></span>
+</div>
 
 <div class="topbar">
   <div class="topbar-inner">
@@ -401,6 +410,8 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       <span>Every job that's run, and every extractor you've saved for later.</span>
     </div>
     <div style="display:flex; gap:10px; align-items:center;">
+      {% if is_superuser %}<button class="btn btn-ghost btn-sm" id="maintenance-btn" type="button" title="Hold new jobs as Pending until you lift the hold (deploy window)">Maintenance</button>{% endif %}
+      {% if is_superuser %}<a class="btn btn-ghost btn-sm" id="status-link" href="/intake/status/" title="Every job rolled up per site × product — with CSV export">Prod Status</a>{% endif %}
       <button class="btn btn-ghost btn-sm" id="topbar-saved-link" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/></svg> Jobs &amp; Saved</button>
       <button class="btn btn-ghost btn-sm" id="api-tokens-btn" type="button" title="API keys &amp; streaming tokens"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:4px;"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>API</button>
       <button class="btn btn-primary btn-sm" id="restart" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg> New extraction</button>
@@ -2170,12 +2181,29 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       when: relativeWhen(job.created_at)
     };
   }
+  // [maintenance-lock] Apply the admin hold state to the banner + toggle button.
+  // Source of truth: intake_jobs' `maintenance` payload (refreshes with the
+  // library) and the toggle endpoint's response.
+  function _applyMaintenance(state){
+    state = state || {};
+    var on = !!state.enabled;
+    var banner = X('#maintenance-banner');
+    if(banner){
+      banner.hidden = !on;
+      var reason = X('#maintenance-reason');
+      if(reason) reason.textContent = state.reason ? (' — ' + state.reason) : '';
+    }
+    var btn = X('#maintenance-btn');
+    if(btn) btn.textContent = on ? 'Maintenance: ON' : 'Maintenance';
+  }
+
   function refreshLibrary(){
     if(!INTAKE_CONFIG.jobsLibraryUrl) return;
     fetch(INTAKE_CONFIG.jobsLibraryUrl).then(function(r){ return r.json(); }).then(function(d){
       var jobs = (d && d.jobs) || [];
       ALL_JOBS = jobs.slice();
       SAVED_EXTRACTORS = jobs.filter(function(j){ return j.is_saved; }).map(jobToSaved);
+      _applyMaintenance(d && d.maintenance);
       renderSavedList();
       renderJobsLib();
     }).catch(function(){ /* library will just stay empty */ });
@@ -2323,6 +2351,22 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
   }
   X('#view-saved-link').addEventListener('click', function(e){ e.preventDefault(); showLibrary('saved'); });
   X('#topbar-saved-link').addEventListener('click', function(){ showLibrary('jobs'); });
+  // [maintenance-lock] Superuser toggle: flip the hold, apply the returned
+  // state (lifting it also drains held jobs server-side — the response is
+  // just the new state for the banner).
+  X('#maintenance-btn').addEventListener('click', function(){
+    if(!INTAKE_CONFIG.maintenanceUrl) return;
+    var turningOff = !X('#maintenance-banner').hidden;
+    var fd = new FormData();
+    fd.append('enabled', turningOff ? '0' : '1');
+    fetch(INTAKE_CONFIG.maintenanceUrl, {
+      method: 'POST',
+      headers: {'X-Requested-With':'XMLHttpRequest','X-CSRFToken':INTAKE_CONFIG.csrfToken},
+      body: fd,
+    }).then(function(r){ return r.json(); }).then(function(d){
+      _applyMaintenance(d);
+    }).catch(function(){ /* leave the banner as it was */ });
+  });
   X('#saved-back').addEventListener('click', function(){ show(lastPrimaryScreen); });
 
   X('#restart').addEventListener('click', function(){
@@ -2375,6 +2419,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
   if(_libView){ showLibrary(_libView[1]); } else { loadDeepLinkedJob(); }
 
   /* ---------- boot ---------- */
+  _applyMaintenance({ enabled: {{ maintenance.enabled|yesno:"true,false" }}, reason: "{{ maintenance.reason|escapejs }}" });
   refreshRunSampleGate();
   updateScopeSampleNote();
   refreshLibrary();
