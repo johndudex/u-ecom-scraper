@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import secrets
 
-from django.core.management.base import BaseCommand, CommandError
 from django.contrib.auth.models import User
+from django.core.management.base import BaseCommand, CommandError
 
 from scraper.models import ApiKey
 

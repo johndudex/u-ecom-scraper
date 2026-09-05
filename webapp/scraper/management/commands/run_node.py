@@ -84,9 +84,9 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **opts):
-        from webapp.agents import graph
-        from scraper.models import ScrapeJob, Site, ProbeCache
+        from scraper.models import ProbeCache, ScrapeJob, Site
         from src.content_types import get_content_type
+        from webapp.agents import graph
 
         slug = opts["site_slug"]
         node = opts["node"]

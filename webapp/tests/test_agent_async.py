@@ -41,14 +41,13 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "webapp"))
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
-import django
+import django  # noqa: E402 — must follow env setup
 
 django.setup()
 
-import pytest
-
-import agents.graph as g
-from agents import llm as llm_mod
+import agents.graph as g  # noqa: E402 — must follow django.setup()
+import pytest  # noqa: E402
+from agents import llm as llm_mod  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

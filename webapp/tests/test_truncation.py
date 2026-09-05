@@ -5,10 +5,9 @@ seed (first HumanMessage) always retained AND never capped; pair-safe drop
 (no orphaned ToolMessage); kill-switch.
 """
 
-from django.test import TestCase, override_settings
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-
 from agents.subagents import _truncate_messages
+from django.test import TestCase, override_settings
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 
 def _run(messages):

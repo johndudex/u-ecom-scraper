@@ -1,6 +1,5 @@
 import logging
 import re
-from typing import Optional
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -67,7 +66,7 @@ COUNTRY_REMAP = {
 _LOCALE_PATH_RE = re.compile(r"^[a-z]{2}[-_](?P<country>[a-z]{2})$", re.IGNORECASE)
 
 
-def detect_country(url: str) -> Optional[str]:
+def detect_country(url: str) -> str | None:
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
     if hostname:

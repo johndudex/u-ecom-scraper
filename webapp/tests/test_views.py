@@ -1,11 +1,10 @@
 from unittest.mock import MagicMock, patch
 
-from model_bakery import baker
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import TestCase, Client
+from django.test import Client, TestCase
 from django.urls import reverse
-
+from model_bakery import baker
 from scraper.models import Approval, ScrapeJob
 
 User = get_user_model()
@@ -29,7 +28,7 @@ class TestHomeView(TestCase):
         dispatch = MagicMock()
         dispatch.delay.return_value.id = "test-task-id"
         with patch("scraper.tasks.run_scrape_task", dispatch):
-            resp = self.client.post(reverse("home"), {
+            self.client.post(reverse("home"), {
                 "url": "https://example.com",
                 "page_type": "product_navigation",
             })
@@ -99,14 +98,14 @@ class TestJobCancelView(TestCase):
         self.job = baker.make(ScrapeJob, url="https://example.com", status="running")
 
     def test_cancel_running(self):
-        resp = self.client.post(reverse("job_cancel", kwargs={"job_id": self.job.id}))
+        self.client.post(reverse("job_cancel", kwargs={"job_id": self.job.id}))
         self.job.refresh_from_db()
         self.assertEqual(self.job.status, ScrapeJob.STATUS_CANCELLED)
 
     def test_cancel_completed_noop(self):
         self.job.status = ScrapeJob.STATUS_COMPLETED
         self.job.save()
-        resp = self.client.post(reverse("job_cancel", kwargs={"job_id": self.job.id}))
+        self.client.post(reverse("job_cancel", kwargs={"job_id": self.job.id}))
         self.job.refresh_from_db()
         self.assertEqual(self.job.status, ScrapeJob.STATUS_COMPLETED)
 
@@ -120,14 +119,14 @@ class TestJobRestartView(TestCase):
 
     def test_restart_completed(self):
         count_before = ScrapeJob.objects.count()
-        resp = self.client.post(reverse("job_restart", kwargs={"job_id": self.job.id}))
+        self.client.post(reverse("job_restart", kwargs={"job_id": self.job.id}))
         self.assertEqual(ScrapeJob.objects.count(), count_before + 1)
 
     def test_restart_running_noop(self):
         self.job.status = ScrapeJob.STATUS_RUNNING
         self.job.save()
         count_before = ScrapeJob.objects.count()
-        resp = self.client.post(reverse("job_restart", kwargs={"job_id": self.job.id}))
+        self.client.post(reverse("job_restart", kwargs={"job_id": self.job.id}))
         self.assertEqual(ScrapeJob.objects.count(), count_before)
 
 
@@ -208,7 +207,7 @@ class TestApprovalDetailView(TestCase):
         # The real form submits name="choice" with a decision label
         # (approval_detail.html:49); the view maps anything not
         # Cancel/Abort/No/stop to approve (_build_resume_value).
-        resp = self.client.post(
+        self.client.post(
             reverse("approval_detail", kwargs={"approval_id": self.approval.id}),
             {"choice": "Approve"},
         )
@@ -216,7 +215,7 @@ class TestApprovalDetailView(TestCase):
         self.assertEqual(self.approval.status, Approval.STATUS_APPROVED)
 
     def test_reject(self):
-        resp = self.client.post(
+        self.client.post(
             reverse("approval_detail", kwargs={"approval_id": self.approval.id}),
             {"choice": "Cancel"},
         )

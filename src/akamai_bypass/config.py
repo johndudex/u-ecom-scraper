@@ -2,7 +2,6 @@ import logging
 import os
 import random
 from dataclasses import dataclass, field
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +43,7 @@ class AkamaiConfig:
     proxy: AkamaiProxyConfig = field(default_factory=AkamaiProxyConfig)
     behavior: BehaviorConfig = field(default_factory=BehaviorConfig)
     headless: bool = True
-    user_agent: Optional[str] = None
+    user_agent: str | None = None
     retry_count: int = 3
     retry_delay: float = 10.0
     cookie_dir: str = field(default_factory=lambda: COOKIE_DIR)

@@ -10,7 +10,6 @@ Run inside the Django container::
         python3 webapp/tests/test_e2e_graph.py
 """
 
-import json
 import logging
 import os
 import sys
@@ -70,8 +69,8 @@ def auto_approve(interrupt_value):
 
 
 def main():
-    from langgraph.types import Command
     from agents.graph import build_scrape_graph
+    from langgraph.types import Command
 
     graph = build_scrape_graph(checkpointer=None)
 

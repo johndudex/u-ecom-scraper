@@ -13,14 +13,13 @@ message forbids writes; its prompt is being aligned in the same change).
 """
 
 import logging
-from typing import Optional
 
 from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
 
 
-def get_skill_tools(skills_dir: Optional[str] = None) -> list:
+def get_skill_tools(skills_dir: str | None = None) -> list:
     """Return skill-related tools.
 
     Args:
@@ -31,7 +30,8 @@ def get_skill_tools(skills_dir: Optional[str] = None) -> list:
         List of LangChain BaseTool instances: [load_skill, list_skills].
     """
     # skills_dir is accepted-and-ignored: pre-FM callers passed a path.
-    from src.skills_store import list_skills as _store_list_skills, read_skill as _store_read_skill
+    from src.skills_store import list_skills as _store_list_skills
+    from src.skills_store import read_skill as _store_read_skill
 
     @tool
     def load_skill(skill_name: str) -> str:

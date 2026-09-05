@@ -1,8 +1,8 @@
-from django.conf import settings
-from django.db import models
-from pathlib import Path
 import re
 from urllib.parse import urlparse
+
+from django.conf import settings
+from django.db import models
 
 
 def _site_type_choices():
@@ -65,9 +65,7 @@ def _sync_input_urls_file(instance):
     if not urls:
         return
     try:
-        from django.conf import settings
 
-        import json
 
         import logging
 
@@ -614,8 +612,9 @@ class ProbeCache(models.Model):
 
     @property
     def is_expired(self):
-        from django.utils import timezone
         from datetime import timedelta
+
+        from django.utils import timezone
 
         return timezone.now() > self.cached_at + timedelta(hours=4)
 
@@ -698,8 +697,8 @@ class AgentPlayground(models.Model):
 # approvals that are genuinely actionable (i.e. on waiting_approval jobs).
 # Idempotent: only ever touches status=pending rows.  [goal: human-interaction]
 # ─────────────────────────────────────────────────────────────────────────────
-from django.db.models.signals import post_save
-from django.dispatch import receiver
+from django.db.models.signals import post_save  # noqa: E402
+from django.dispatch import receiver  # noqa: E402
 
 _TERMINAL_JOB_STATUSES = frozenset({
     ScrapeJob.STATUS_COMPLETED,
@@ -718,8 +717,9 @@ def _close_open_approvals_on_terminal_job(sender, instance: "ScrapeJob", **kwarg
     open_approvals = instance.approvals.filter(status=Approval.STATUS_PENDING)
     if not open_approvals.exists():
         return
-    from django.utils import timezone
     import logging as _logging
+
+    from django.utils import timezone
 
     count = open_approvals.count()
     open_approvals.update(

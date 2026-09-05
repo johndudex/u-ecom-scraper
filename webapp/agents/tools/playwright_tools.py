@@ -23,10 +23,9 @@ import asyncio
 import logging
 import time
 from contextlib import AsyncExitStack
-from typing import Any, Optional
+from typing import Any
 
-from langchain_core.tools import BaseTool
-from langchain_core.tools import StructuredTool
+from langchain_core.tools import BaseTool, StructuredTool
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +85,9 @@ _cached_tools_at: float = 0.0
 # handshake on every call. Lazily created on first use; torn down when the
 # running event loop changes (new Celery task) or when a call fails.
 _session: Any = None  # ClientSession
-_session_stack: Optional[AsyncExitStack] = None
+_session_stack: AsyncExitStack | None = None
 _session_loop: Any = None  # asyncio.AbstractEventLoop for stale detection
-_session_lock: Optional[asyncio.Lock] = None
+_session_lock: asyncio.Lock | None = None
 
 playwright_status: dict[str, Any] = {
     "available": False,
@@ -103,7 +102,7 @@ def get_playwright_status() -> dict[str, Any]:
     return dict(playwright_status)
 
 
-def _resolve_mcp_url(mcp_url: Optional[str] = None) -> str:
+def _resolve_mcp_url(mcp_url: str | None = None) -> str:
     if mcp_url:
         return mcp_url
     try:
@@ -425,7 +424,7 @@ async def _call_mcp_tool(mcp_url: str, tool_name: str, arguments: dict) -> str:
             return f"Error: Playwright MCP tool '{tool_name}' failed: {exc}"
 
 
-async def create_playwright_tools(mcp_url: Optional[str] = None) -> list[BaseTool]:
+async def create_playwright_tools(mcp_url: str | None = None) -> list[BaseTool]:
     resolved_url = _resolve_mcp_url(mcp_url)
     global playwright_status
 
@@ -467,7 +466,7 @@ async def create_playwright_tools(mcp_url: Optional[str] = None) -> list[BaseToo
     return tools
 
 
-def create_playwright_tools_sync(mcp_url: Optional[str] = None, fresh: bool = False) -> list[BaseTool]:
+def create_playwright_tools_sync(mcp_url: str | None = None, fresh: bool = False) -> list[BaseTool]:
     global _cached_tools, _cached_tools_at, playwright_status
 
     if _cached_tools is not None and not fresh:

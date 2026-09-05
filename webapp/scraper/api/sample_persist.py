@@ -58,7 +58,7 @@ def persist_partner_sample(job, slug: str, report: dict) -> bool:
         logger.info("partner sample: no workspace output for %s (slug=%s)", job.id, slug)
         return False
     try:
-        with open(src, "r", encoding="utf-8") as fh:
+        with open(src, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("partner sample: unreadable output for job %s: %s", job.id, exc)

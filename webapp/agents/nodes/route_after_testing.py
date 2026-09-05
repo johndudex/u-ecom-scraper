@@ -5,7 +5,6 @@
 
 import logging
 import re
-from typing import Optional
 
 from ..constants import (
     DEAD_STATUS_CODES,
@@ -114,7 +113,7 @@ _COVERAGE_FAIL_STOP_REASONS = {
 }
 
 
-def _discovery_coverage_failure(report: dict, state: Optional[ScrapeState] = None) -> Optional[str]:
+def _discovery_coverage_failure(report: dict, state: ScrapeState | None = None) -> str | None:
     """Return a short reason if discovery coverage is insufficient, else None.
 
     Reads ``test_report.discovery_coverage`` (code_tester copies it from the
@@ -152,7 +151,7 @@ def _discovery_coverage_failure(report: dict, state: Optional[ScrapeState] = Non
     return None
 
 
-def _remediation_scraper_diagnosis(report: dict) -> Optional[str]:
+def _remediation_scraper_diagnosis(report: dict) -> str | None:
     """Concrete tester diagnosis naming the CODE as the fix target [wave-20 T1].
 
     Jobs 359/360: the tester ran the draft, isolated the bug (inert JSON-LD
@@ -191,7 +190,7 @@ def _remediation_scraper_diagnosis(report: dict) -> Optional[str]:
 
 
 def classify_test_failure(
-    report: dict, strategy: str, state: Optional[ScrapeState] = None
+    report: dict, strategy: str, state: ScrapeState | None = None
 ) -> tuple[str, str]:
     """Classify a failed test into an action + reason.
 
@@ -555,7 +554,9 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
     try:
         from src.content_types import has_substantive_field
     except Exception:
-        has_substantive_field = lambda p: bool(p.get("title"))  # type: ignore
+
+        def has_substantive_field(p):  # type: ignore
+            return bool(p.get("title"))
 
     # FALLBACK: read the actual output JSON file (ground truth from the scraper run)
     if not sample_products:
@@ -663,7 +664,9 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
     # Read it directly + count real items with the content-type-agnostic
     # has_substantive_field predicate. This bypasses the LLM's summary.
     try:
-        import os as _os, glob as _glob, json as _json
+        import glob as _glob
+        import json as _json
+        import os as _os
         _slug = state.get("site_slug", "")
         if _slug:
             _root = _os.environ.get("PROJECT_ROOT", "/app")
@@ -683,7 +686,7 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
             # crash file while a 5-item Phase-2 file exists alongside it).
             for _out_path in _outputs[:5]:
                 try:
-                    with open(_out_path, "r") as _f:
+                    with open(_out_path) as _f:
                         _out = _json.load(_f)
                     if _is_discovery_output(_out):
                         continue  # discovery stubs are never extraction truth
@@ -856,7 +859,7 @@ _COUNT_TOKEN_RE = re.compile(
 )
 
 
-def _price_value(v) -> Optional[float]:
+def _price_value(v) -> float | None:
     if v is None or isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
@@ -920,7 +923,7 @@ def _items_from_output_file(slug: str, mtime_floor: float | None = None) -> list
         )
         if not path or not _os.path.isfile(path):
             return []
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             data = json.load(f)
     except Exception as exc:
         logger.debug("_items_from_output_file: read failed for %s: %s", slug, exc)
@@ -1099,7 +1102,7 @@ def deterministic_output_issues(slug: str, state: ScrapeState) -> list[dict]:
     return issues
 
 
-def _volume_gap(report: dict, state: ScrapeState) -> Optional[str]:
+def _volume_gap(report: dict, state: ScrapeState) -> str | None:
     """T2.1: discovered-vs-extracted gap, armed ONLY beyond sample scope.
 
     The tester's --sample run is 5-bounded: judging volume on it fails the run

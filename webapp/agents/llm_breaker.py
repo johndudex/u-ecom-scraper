@@ -28,7 +28,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +55,7 @@ def _now() -> float:
     return time.monotonic()
 
 
-def record_failure(model: Optional[str]) -> None:
+def record_failure(model: str | None) -> None:
     """Record a failed LLM call (timeout/connection/5xx). Trips the breaker at
     the configured threshold."""
     if not model:
@@ -78,7 +77,7 @@ def record_failure(model: Optional[str]) -> None:
             )
 
 
-def record_success(model: Optional[str]) -> None:
+def record_success(model: str | None) -> None:
     """Record a successful LLM call. Resets the consecutive-failure count."""
     if not model:
         return
@@ -92,7 +91,7 @@ def record_success(model: Optional[str]) -> None:
             entry["tripped_until"] = None
 
 
-def is_tripped(model: Optional[str]) -> bool:
+def is_tripped(model: str | None) -> bool:
     """True if the breaker for ``model`` is currently tripped (within cooldown)."""
     if not model:
         return False
@@ -115,8 +114,8 @@ def is_tripped(model: Optional[str]) -> bool:
 
 
 def effective_model(
-    primary: Optional[str], fallback: Optional[str] = None
-) -> Optional[str]:
+    primary: str | None, fallback: str | None = None
+) -> str | None:
     """Return the model to actually use: the fallback if ``primary`` is tripped,
     else ``primary`` itself. No-op (returns primary) when disabled or primary is
     already the fallback.
@@ -161,7 +160,7 @@ def status() -> dict[str, dict]:
 _CALLER_BUG_ERRORS = ("AuthenticationError", "BadRequestError", "PermissionDeniedError")
 
 
-def _extract_model(serialized: dict | None) -> Optional[str]:
+def _extract_model(serialized: dict | None) -> str | None:
     """Pull the model name out of a langchain LLM `serialized` payload."""
     if not isinstance(serialized, dict):
         return None
@@ -179,7 +178,7 @@ def _extract_model(serialized: dict | None) -> Optional[str]:
     return None
 
 
-from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.callbacks import BaseCallbackHandler  # noqa: E402
 
 
 class CircuitBreakerCallback(BaseCallbackHandler):

@@ -59,7 +59,6 @@ class Command(BaseCommand):
         would_fix = 0
         unrecoverable = 0
         still_unreliable = 0
-        batch = []
         scanned = 0
         for listing in qs.iterator(chunk_size=500):
             scanned += 1

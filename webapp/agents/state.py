@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import operator
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any
 
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict
@@ -23,8 +23,8 @@ class ScrapeState(TypedDict, total=False):
     # ── Input ──────────────────────────────────────────────────────────
     job_id: int
     url: str
-    sample_url: Optional[str]
-    product_url: Optional[str]
+    sample_url: str | None
+    product_url: str | None
     currency: str
     sample_only: bool
     rescrape: bool
@@ -153,14 +153,14 @@ class ScrapeState(TypedDict, total=False):
     navigation_analysis: Annotated[dict[str, Any], _last_write_wins]
 
     # ── Probe cache ────────────────────────────────────────────────────
-    probe_result: Annotated[Optional[dict[str, Any]], _last_write_wins]
+    probe_result: Annotated[dict[str, Any] | None, _last_write_wins]
     probe_url: Annotated[str, _last_write_wins]
 
     # ── Execution metadata ─────────────────────────────────────────────
     execution_status: Annotated[str, _last_write_wins]
     output_file: Annotated[str, _last_write_wins]
     # Per-job scraper artifact path (attributed; set by _invoke_cleanup).
-    scraper_path: Annotated[Optional[str], _last_write_wins]
+    scraper_path: Annotated[str | None, _last_write_wins]
     item_count: int
     product_count: int
     # discovery_coverage block read from the scraper output metadata during
@@ -176,7 +176,7 @@ class ScrapeState(TypedDict, total=False):
     interrupt_message: Annotated[str, _last_write_wins]
     interrupt_options: Annotated[list[str], _last_write_wins]
     interrupt_decisions: Annotated[list[dict[str, Any]], _last_write_wins]
-    human_response: Optional[dict[str, Any]]
+    human_response: dict[str, Any] | None
     human_feedback: Annotated[str, _last_write_wins]
 
     # ── Routing decisions (set by routing nodes, read by conditional edges) ─
@@ -186,10 +186,10 @@ class ScrapeState(TypedDict, total=False):
     # ── Dagster conversion (post-completion, non-blocking) ──────────────
     # Path to the generated {slug}_dagster.py file (set by dagster_converter
     # agent; read by the UI to show the download button). None if not generated.
-    dagster_path: Annotated[Optional[str], _last_write_wins]
+    dagster_path: Annotated[str | None, _last_write_wins]
 
     # ── Navigation ──────────────────────────────────────────────────────
-    navigation_findings: Annotated[Optional[dict[str, Any]], _last_write_wins]
+    navigation_findings: Annotated[dict[str, Any] | None, _last_write_wins]
     playwright_unavailable: bool
     # set when navigate_explore hands off to the LLM navigation_agent (form-driven
     # site the deterministic explorer couldn't drive); read by navigation_synthesize

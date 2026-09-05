@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Optional
 
 import httpx
 
@@ -126,7 +125,7 @@ def scrapers_output_glob(slug: str) -> str:
     return f"scrapers/{slug}/"
 
 
-def latest_output_key(slug: str) -> Optional[str]:
+def latest_output_key(slug: str) -> str | None:
     """Newest ``scrapers/{slug}/output_*.json`` key, or None."""
     keys = [k for k in list_keys(f"scrapers/{slug}/") if k.split("/")[-1].startswith("output_") and k.endswith(".json")]
     return sorted(keys)[-1] if keys else None

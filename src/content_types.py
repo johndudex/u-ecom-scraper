@@ -8,7 +8,7 @@ and templates to adapt behavior based on the content being scraped.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -287,7 +287,7 @@ INPUT_MODE_CHOICES = [
 ]
 
 
-def get_content_type(page_type: str) -> Optional[ContentTypeConfig]:
+def get_content_type(page_type: str) -> ContentTypeConfig | None:
     content_type_name, _ = PAGE_TYPE_MAP.get(page_type, (page_type, "url_list"))
     return CONTENT_TYPES.get(content_type_name)
 
@@ -501,7 +501,7 @@ def output_filter_fields(content_type: str) -> list[str]:
     return [f for f in cfg.core_field_names if f not in _ALWAYS_PRESENT_FIELDS]
 
 
-def get_content_type_for_site_type(site_type: str) -> Optional[ContentTypeConfig]:
+def get_content_type_for_site_type(site_type: str) -> ContentTypeConfig | None:
     for config in CONTENT_TYPES.values():
         if config.site_type == site_type:
             return config

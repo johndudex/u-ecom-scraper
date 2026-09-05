@@ -118,7 +118,10 @@ class TestFindingsMergeSettingsImport:
     def test_settings_is_imported_at_the_merge_site(self):
         src = open(os.path.join(ROOT, "webapp", "agents", "subagents.py")).read()
         i_use = src.index("settings.PROJECT_ROOT, \"workspace\", _slug")
-        i_block = src.rindex("import json as _json_nf, os as _os_nf", 0, i_use)
+        # (needle updated 2026-09-05: ruff I001 split the compound
+        # `import json as _json_nf, os as _os_nf` into two lines — the
+        # boundary anchor is the last of them)
+        i_block = src.rindex("import os as _os_nf", 0, i_use)
         block = src[i_block:i_use]
         assert "from django.conf import settings" in block, (
             "the findings-merge block must import settings before using it"

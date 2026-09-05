@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ def _walk_path(data: Any, path: str) -> Any:
 
 def _product_block(
     jsonld_blocks: list, jsonld_types: tuple[str, ...], allow_fallback: bool = True
-) -> Optional[dict]:
+) -> dict | None:
     """The JSON-LD block to walk paths against (content-type typed, else first).
 
     ``allow_fallback=False`` (the resolver path) requires an ACTUALLY TYPED
@@ -196,7 +196,7 @@ def _jsonld_types_for(page_type: str) -> tuple[str, ...]:
         return ()
 
 
-def _fetch_render(url: str, start_method: str) -> tuple[Optional[str], str]:
+def _fetch_render(url: str, start_method: str) -> tuple[str | None, str]:
     """ONE /render call. Returns (html, method_used); html None on failure."""
     try:
         import httpx

@@ -10,11 +10,10 @@ Usage::
 """
 
 import logging
-from typing import Optional
 
 from agents.tools.filesystem_tools import get_filesystem_tools as _get_fs_tools
-from agents.tools.probe_tools import get_probe_tools as _get_probe_tools
 from agents.tools.probe_tools import get_probe_html_tool as _get_probe_html_tool
+from agents.tools.probe_tools import get_probe_tools as _get_probe_tools
 from agents.tools.shell_tools import get_shell_tools as _get_bash_tools
 from agents.tools.skill_tools import get_skill_tools as _get_skill_tools
 from agents.tools.web_tools import get_web_tools as _get_web_tools
@@ -122,7 +121,7 @@ async def get_playwright_tools() -> list:
 
 async def get_tools_for_agent(
     agent_name: str,
-    project_root: Optional[str] = None,
+    project_root: str | None = None,
 ) -> list:
     """Return the exact set of tools a given agent is allowed to use.
 

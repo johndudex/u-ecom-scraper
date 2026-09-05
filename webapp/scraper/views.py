@@ -4,18 +4,15 @@ import logging
 import os
 import subprocess
 import time
-from datetime import timedelta
-from datetime import datetime, timedelta, timezone as dt_timezone
-from pathlib import Path
+from datetime import datetime, timedelta
+from datetime import timezone as dt_timezone
 from urllib.parse import urlparse
 
 import httpx
-
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.db.models import Q
 from django.http import (
-    FileResponse,
     Http404,
     HttpResponse,
     HttpResponseNotFound,
@@ -26,10 +23,10 @@ from django.shortcuts import get_object_or_404, redirect, render, reverse
 from django.utils import timezone
 from django.views.decorators.cache import never_cache
 
+from src.schema_validation import validate_user_schema
+
 from .forms import SiteForm
 from .models import Approval, JobListing, ProbeCache, ScrapeJob, SessionLog, Site
-
-from src.schema_validation import validate_user_schema
 
 logger = logging.getLogger(__name__)
 
@@ -582,7 +579,7 @@ def job_output_view(request, job_id, filename):
     except (json.JSONDecodeError, TypeError):
         raise Http404("Could not read file")
 
-    from src.content_types import get_output_key_label, count_items_in_output
+    from src.content_types import count_items_in_output, get_output_key_label
 
     _output_key, _item_label = get_output_key_label(job.page_type)
     products = data.get(_output_key, [])
@@ -1155,13 +1152,13 @@ def job_api(request, job_id):
             ],
             "logs": [
                 {
-                    "seq": l.seq,
-                    "role": l.role,
-                    "agent": l.agent,
-                    "content": l.content,
-                    "created_at": l.created_at.isoformat(),
+                    "seq": log.seq,
+                    "role": log.role,
+                    "agent": log.agent,
+                    "content": log.content,
+                    "created_at": log.created_at.isoformat(),
                 }
-                for l in job.session_logs.filter(seq__gt=since_seq).order_by("seq")
+                for log in job.session_logs.filter(seq__gt=since_seq).order_by("seq")
             ],
             "total_log_count": job.session_logs.count(),
             "output_preview": _job_output_preview(job),
@@ -1176,13 +1173,13 @@ def job_logs_api(request, job_id):
     since_seq = int(request.GET.get("since_seq", 0))
     logs = [
         {
-            "seq": l.seq,
-            "role": l.role,
-            "agent": l.agent,
-            "content": l.content,
-            "created_at": l.created_at.isoformat(),
+            "seq": log.seq,
+            "role": log.role,
+            "agent": log.agent,
+            "content": log.content,
+            "created_at": log.created_at.isoformat(),
         }
-        for l in job.session_logs.filter(seq__gt=since_seq).order_by("seq")[:100]
+        for log in job.session_logs.filter(seq__gt=since_seq).order_by("seq")[:100]
     ]
     return JsonResponse({"logs": logs, "total_log_count": job.session_logs.count()})
 
@@ -1765,7 +1762,7 @@ def site_rerun(request, site_id):
                         if f.startswith("output_") and f.endswith(".json")
                     )
                     if outs:
-                        with open(os.path.join(_td, outs[-1]), "r", encoding="utf-8") as f:
+                        with open(os.path.join(_td, outs[-1]), encoding="utf-8") as f:
                             _data = json.load(f)
                         if slug:
                             try:
@@ -2028,7 +2025,7 @@ def agent_playground_detail(request, playground_id):
         full_path = os.path.join(settings.PROJECT_ROOT, path)
         if os.path.isfile(full_path):
             try:
-                with open(full_path, "r", encoding="utf-8") as f:
+                with open(full_path, encoding="utf-8") as f:
                     content = f.read()
                 artifacts.append(
                     {
@@ -2139,8 +2136,8 @@ def _check_celery_worker():
 def _check_celery_beat():
     t0 = time.monotonic()
     try:
-        from django_celery_beat.models import PeriodicTask
         from django.utils import timezone as dj_tz
+        from django_celery_beat.models import PeriodicTask
 
         last_run = (
             PeriodicTask.objects.filter(enabled=True)
@@ -2247,6 +2244,7 @@ def _check_queue() -> dict:
     green-vs-amber distinction; nothing here is hard-down by itself).
     """
     from django.core.cache import cache
+
     from scraper.models import SessionLog
     from scraper.tasks import PENDING_CLAIM_MINUTES  # single source of truth
 
@@ -2541,8 +2539,9 @@ def intake_check_site(request):
     if not url:
         return JsonResponse({"error": "url required"}, status=400)
 
-    from .tasks import _generate_slug
     from urllib.parse import urlparse as _urlparse
+
+    from .tasks import _generate_slug
 
     slug = _generate_slug(url)
     host = (_urlparse(url).hostname or "").replace("www.", "")
@@ -2875,9 +2874,6 @@ def intake_jobs(request):
     on is_saved). Saved jobs are always included even if older.
     """
     recent = list(_user_jobs(request).order_by("-created_at")[:100])
-    saved_ids = set(
-        _user_jobs(request).filter(is_saved=True).values_list("id", flat=True)
-    )
     # merge any saved jobs that fell outside the recent-100 window
     extra = [j for j in _user_jobs(request).filter(is_saved=True).order_by("-created_at")
              if j.id not in {j.id for j in recent}]
@@ -3086,7 +3082,7 @@ def intake_site_status(request):
 # Baseline content (above the first `## Learned:`) is read-only here — it is
 # managed in git (the seed). All writes go through src.skills_store (flock'd).
 
-import re as _re_learned_split
+import re as _re_learned_split  # noqa: E402
 
 _LEARNED_SPLIT = _re_learned_split.compile(r"(?=^## Learned: )", _re_learned_split.MULTILINE)
 _LEARNED_META = _re_learned_split.compile(
@@ -3163,8 +3159,9 @@ def learnt_skill_update(request, skill_name):
     """Save an edited learned section (full-section replace, one section)."""
     if request.method != "POST":
         return redirect("learnt_skills")
-    from src.skills_store import replace_learned_section
     from django.contrib import messages
+
+    from src.skills_store import replace_learned_section
 
     title = request.POST.get("title", "").strip()
     body = (request.POST.get("body") or "").strip()
@@ -3186,8 +3183,9 @@ def learnt_skill_delete(request, skill_name):
     """Delete ONE learned section by title."""
     if request.method != "POST":
         return redirect("learnt_skills")
-    from src.skills_store import delete_learned_section
     from django.contrib import messages
+
+    from src.skills_store import delete_learned_section
 
     title = request.POST.get("title", "").strip()
     result = delete_learned_section(skill_name, title, actor=f"ui:{request.user.username}")
@@ -3232,7 +3230,7 @@ def _serve_doc_asset(request, filename: str):
     path = os.path.join(settings.PROJECT_ROOT, "docs", "assets", os.path.basename(filename))
     if not os.path.isfile(path):
         raise Http404(f"asset missing: {filename}")
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         return HttpResponse(fh.read(), content_type=mime)
 
 
@@ -3252,7 +3250,7 @@ def _serve_spec(request, which: str):
     path = os.path.join(_SPECS_DIR, fname)
     if not os.path.isfile(path):
         raise Http404(f"spec file missing: {fname}")
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         content = fh.read()
 
     fmt = request.GET.get("format", "")

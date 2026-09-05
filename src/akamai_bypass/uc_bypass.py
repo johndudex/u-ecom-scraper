@@ -1,6 +1,5 @@
 import logging
 import time
-from typing import Optional
 
 from seleniumbase import SB
 
@@ -11,11 +10,11 @@ logger = logging.getLogger(__name__)
 
 
 class UndetectedChromeBypass:
-    def __init__(self, config: Optional[AkamaiConfig] = None):
+    def __init__(self, config: AkamaiConfig | None = None):
         self.config = config or AkamaiConfig()
         self.cookie_mgr = CookieManager(self.config.cookie_dir)
 
-    def get_page(self, url: str) -> Optional[dict]:
+    def get_page(self, url: str) -> dict | None:
         domain = url.split("//")[-1].split("/")[0]
 
         sb_kwargs = {

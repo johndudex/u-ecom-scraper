@@ -76,7 +76,7 @@ def _load_analysis(slug: str) -> dict | None:
     if not os.path.isfile(path):
         return None
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             return json.load(fh)
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("normalize_fields: cannot load product_analysis: %s", exc)
@@ -137,7 +137,7 @@ def _deterministic_job_mapping(analysis: dict, content_type_config: dict) -> dic
     mapper produces so downstream nodes are unchanged.
     """
     try:
-        from src.job_fields import infer_field_map, apply_field_map
+        from src.job_fields import apply_field_map, infer_field_map
     except Exception as exc:
         logger.warning("normalize_fields: src.job_fields unavailable: %s", exc)
         return {}

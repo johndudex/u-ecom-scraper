@@ -1,6 +1,5 @@
 import logging
 import random
-from typing import Optional
 
 from curl_cffi import requests as curl_requests
 
@@ -13,10 +12,10 @@ logger = logging.getLogger(__name__)
 class TLSBypass:
     AKAMAI_COOKIE_URLS: dict[str, str] = {}
 
-    def __init__(self, cookie_manager: CookieManager, config: Optional[AkamaiConfig] = None):
+    def __init__(self, cookie_manager: CookieManager, config: AkamaiConfig | None = None):
         self.cookie_mgr = cookie_manager
         self.config = config or AkamaiConfig()
-        self.session: Optional[curl_requests.Session] = None
+        self.session: curl_requests.Session | None = None
 
     def _create_session(self) -> curl_requests.Session:
         imp = random.choice(["chrome131", "chrome124", "chrome120", "chrome116"])
@@ -45,7 +44,7 @@ class TLSBypass:
             return f"http://{p.username}:{p.password}@{p.server.replace('http://', '')}"
         return p.server
 
-    def acquire_cookies(self, domain: str) -> Optional[dict]:
+    def acquire_cookies(self, domain: str) -> dict | None:
         self.session = self._create_session()
         base_url = self.AKAMAI_COOKIE_URLS.get(domain, f"https://{domain}/")
 
@@ -85,7 +84,7 @@ class TLSBypass:
             logger.warning("TLS: cookie acquisition failed: %s", e)
             return None
 
-    def fetch_url(self, url: str, cookies: Optional[list[dict]] = None) -> Optional[dict]:
+    def fetch_url(self, url: str, cookies: list[dict] | None = None) -> dict | None:
         if not self.session:
             self.session = self._create_session()
 

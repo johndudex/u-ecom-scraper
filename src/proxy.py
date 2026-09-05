@@ -12,7 +12,6 @@ import json
 import logging
 import os
 import random
-import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -40,7 +39,7 @@ class ProxyConfig:
         if env_config:
             return env_config
         try:
-            with open(self.config_path, "r", encoding="utf-8") as f:
+            with open(self.config_path, encoding="utf-8") as f:
                 return json.load(f)
         except FileNotFoundError:
             logger.warning(f"Proxy config not found at {self.config_path}")
@@ -94,7 +93,7 @@ class ProxyConfig:
         ProxyConfig._instance = None
         logger.info("Proxy config reloaded from %s", self.config_path)
 
-    def get_proxy_dict(self, proxy_tier: str = "datacenter") -> Optional[dict]:
+    def get_proxy_dict(self, proxy_tier: str = "datacenter") -> dict | None:
         """Build requests-compatible proxy dict for a given tier."""
         tier_key = proxy_tier if proxy_tier in self.config else "datacenter"
         tier = self.config.get(tier_key, {})
@@ -165,7 +164,7 @@ def get_proxy_config(config_path: str = CONFIG_PATH) -> ProxyConfig:
     return ProxyConfig.get_instance(config_path)
 
 
-def build_proxy_url(tier: str, config: Optional[ProxyConfig] = None, country: Optional[str] = None) -> Optional[str]:
+def build_proxy_url(tier: str, config: ProxyConfig | None = None, country: str | None = None) -> str | None:
     """Build a proxy URL string for the given tier."""
     if config is None:
         config = get_proxy_config()
@@ -182,8 +181,8 @@ def build_proxy_url(tier: str, config: Optional[ProxyConfig] = None, country: Op
 
 
 def build_playwright_proxy(
-    tier: str, config: Optional[ProxyConfig] = None, country: Optional[str] = None
-) -> Optional[dict]:
+    tier: str, config: ProxyConfig | None = None, country: str | None = None
+) -> dict | None:
     """Build Playwright's ``launch(proxy=...)`` dict for the given tier.
 
     Playwright (like Chromium itself) ignores credentials embedded in the
@@ -216,7 +215,7 @@ def build_playwright_proxy(
     }
 
 
-def should_warn_residential(tier: str, config: Optional[ProxyConfig] = None) -> bool:
+def should_warn_residential(tier: str, config: ProxyConfig | None = None) -> bool:
     """Check if using residential proxy should trigger a warning."""
     if tier != "residential":
         return False
@@ -225,7 +224,7 @@ def should_warn_residential(tier: str, config: Optional[ProxyConfig] = None) -> 
     return config.is_residential_expensive()[0]
 
 
-def warn_residential_usage(url: str, config: Optional[ProxyConfig] = None) -> None:
+def warn_residential_usage(url: str, config: ProxyConfig | None = None) -> None:
     """Log a prominent warning about residential proxy usage."""
     if config is None:
         config = get_proxy_config()

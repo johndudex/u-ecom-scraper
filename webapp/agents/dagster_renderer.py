@@ -47,7 +47,8 @@ import ast
 import builtins
 import os
 import re
-from typing import Any, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 
 __all__ = [
     "DEFAULT_BASE_CLASS",
@@ -296,7 +297,7 @@ def _load_source(draft_path_or_text: str) -> str:
         raise _Reject("empty draft input")
     if "\n" not in draft_path_or_text and os.path.isfile(draft_path_or_text):
         try:
-            with open(draft_path_or_text, "r", encoding="utf-8", errors="replace") as fh:
+            with open(draft_path_or_text, encoding="utf-8", errors="replace") as fh:
                 return fh.read()
         except OSError as exc:
             raise _Reject(f"unreadable draft: {exc}") from exc
@@ -1207,8 +1208,8 @@ def _plan_imports(tree: ast.Module, plan: _Plan) -> tuple[list[str], set[str]]:
         bound.update({"datetime", "timezone"})
 
     all_lines = [*kept, *(line for line, _ in extras)]
-    plain = sorted(l for l in all_lines if l.startswith("import "))
-    dotted = sorted(l for l in all_lines if not l.startswith("import "))
+    plain = sorted(line for line in all_lines if line.startswith("import "))
+    dotted = sorted(line for line in all_lines if not line.startswith("import "))
     return [*plain, *dotted], bound
 
 

@@ -12,8 +12,7 @@ from unittest.mock import MagicMock, patch
 from django.test import Client, TestCase
 from django.urls import reverse
 from model_bakery import baker
-
-from scraper.models import ScrapeJob, Step
+from scraper.models import ScrapeJob
 from scraper.tasks import PIPELINE_PHASES, _seed_pipeline_steps
 
 

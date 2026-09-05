@@ -25,7 +25,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
 
 from .constants import DEAD_STATUS_CODES, FINAL_RETRY_SENTINEL
-from .llm import get_main_llm, get_llm
+from .llm import get_llm, get_main_llm
 from .prompts import load_agent_prompt
 
 logger = logging.getLogger(__name__)
@@ -2809,7 +2809,7 @@ def _checkpoint_discovery_section(state: dict) -> str:
     try:
         import json as _json
 
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             data = _json.load(fh)
     except Exception:
         return ""
@@ -3370,7 +3370,9 @@ def build_code_writer_message(state: dict) -> list:
     # code_writer has the actual product URLs to build the scraper around.
     if navigation_analysis:
         try:
-            import json as _json_nf, os as _os_nf
+            import json as _json_nf
+            import os as _os_nf
+
             from django.conf import settings
             _slug = state.get("site_slug", "")
             _nf_path = _os_nf.join(settings.PROJECT_ROOT, "workspace", _slug, "navigation_findings.json")
@@ -4612,7 +4614,6 @@ def build_dagster_converter_message(state: dict) -> list:
     """Build the message for the dagster_converter agent."""
     slug = state.get("site_slug", "unknown")
     url = state.get("url", "")
-    site_name = state.get("site_name", slug)
 
     # Find the existing scraper path (production first, workspace fallback)
     scraper_path = f"scrapers/{slug}/scraper.py"

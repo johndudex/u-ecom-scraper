@@ -95,7 +95,7 @@ def _find_items_array(text: str):
 
 def build_page_index(src_path: str, items_key: str | None = None) -> dict:
     """Scan the output file once; return the index dict (caller persists)."""
-    with open(src_path, "r", encoding="utf-8") as fh:
+    with open(src_path, encoding="utf-8") as fh:
         text = fh.read()
     key, bracket = _find_items_array(text)
     if items_key:
@@ -146,7 +146,8 @@ def read_output_page(job, page: int, page_size: int) -> dict:
     start = (page - 1) * page_size
     window = index["items"][start: start + page_size]
     try:
-        from .window_cache import _cache, window_fetch as _window_fetch
+        from .window_cache import _cache
+        from .window_cache import window_fetch as _window_fetch
 
         size = index.get("source_bytes") or 0
         text = _cache.get(job.output_file, size, _window_fetch)

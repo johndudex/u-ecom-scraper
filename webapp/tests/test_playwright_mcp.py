@@ -12,8 +12,6 @@ Run inside Docker (requires playwright-mcp + chrome services up)::
 import os
 import sys
 
-import pytest
-
 MCP_URL = os.environ.get(
     "PLAYWRIGHT_MCP_URL",
     "http://localhost:8111/sse",
@@ -26,6 +24,7 @@ class TestMCPConnection:
     def test_list_tools_connects(self):
         """SSE client can connect and list tools without error."""
         import asyncio
+
         from mcp import ClientSession
         from mcp.client.sse import sse_client
 
@@ -43,6 +42,7 @@ class TestMCPConnection:
     def test_tool_names_are_strings(self):
         """Every tool has a non-empty string name."""
         import asyncio
+
         from mcp import ClientSession
         from mcp.client.sse import sse_client
 
@@ -60,6 +60,7 @@ class TestMCPConnection:
     def test_call_tool_navigate(self):
         """Can call browser_navigate to a simple page and get content back."""
         import asyncio
+
         from mcp import ClientSession
         from mcp.client.sse import sse_client
 
@@ -81,6 +82,7 @@ class TestMCPConnection:
     def test_fresh_connection_per_call(self):
         """Each call opens a fresh SSE connection (no shared session)."""
         import asyncio
+
         from mcp import ClientSession
         from mcp.client.sse import sse_client
 

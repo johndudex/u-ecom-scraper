@@ -47,7 +47,7 @@ def _needs_browser_queue(scraper_path: str, scraping_method: str) -> bool:
     if scraping_method in BROWSER_METHODS:
         return True
     try:
-        with open(scraper_path, "r", encoding="utf-8") as fh:
+        with open(scraper_path, encoding="utf-8") as fh:
             head = fh.read(2000).lower()
         for indicator in (
             "seleniumbase",
@@ -71,7 +71,7 @@ def _build_field_summary_from_analysis(slug: str, root: str) -> str:
         return "No product analysis or input URLs available."
 
     try:
-        with open(analysis_path, "r", encoding="utf-8") as fh:
+        with open(analysis_path, encoding="utf-8") as fh:
             analysis = json.load(fh)
     except (json.JSONDecodeError, OSError) as exc:
         return f"Product analysis file could not be read: {exc}"
@@ -118,7 +118,7 @@ def _format_output_products(output_path: str, output_key: str = "products",
                             allowed: set[str] | None = None,
                             schema_nested: dict | None = None) -> str:
     try:
-        with open(output_path, "r", encoding="utf-8") as fh:
+        with open(output_path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (json.JSONDecodeError, OSError) as exc:
         return f"(output file could not be read: {exc})"
@@ -469,7 +469,7 @@ def _read_sibling_files(scraper_path: str) -> dict[str, str]:
         p = os.path.join(d, f)
         if os.path.isfile(p):
             try:
-                with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                with open(p, encoding="utf-8", errors="replace") as fh:
                     extra[f] = fh.read()
             except OSError:
                 pass
@@ -485,7 +485,7 @@ def _run_sample_via_queue(scraper_path: str, args: list[str]) -> str:
         )
         # Stateless /scrape: send the local scraper source (not a path).
         try:
-            with open(scraper_path, "r", encoding="utf-8", errors="replace") as _f:
+            with open(scraper_path, encoding="utf-8", errors="replace") as _f:
                 _source = _f.read()
         except OSError as exc:
             return f"[queue error] could not read scraper source: {exc}"

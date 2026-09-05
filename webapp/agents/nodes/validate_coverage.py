@@ -47,7 +47,7 @@ def _load_product_analysis(slug: str) -> dict | None:
     if not os.path.isfile(path):
         return None
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             return json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError) as exc:
         logger.warning("validate_coverage: cannot load analysis: %s", exc)

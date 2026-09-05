@@ -19,7 +19,6 @@ import ast
 import json
 
 import pytest
-
 from agents.tools import shell_tools as st
 from agents.tools.browser_http import ScrapeResult
 

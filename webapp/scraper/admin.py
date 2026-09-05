@@ -1,12 +1,13 @@
+import logging
+
 from django.contrib import admin
 from django.utils import timezone
-import logging
 
 logger = logging.getLogger(__name__)
 
-from .models import (
-    Approval,
+from .models import (  # noqa: E402
     AgentPlayground,
+    Approval,
     ContentType,
     ProbeCache,
     ScrapeJob,
@@ -269,7 +270,8 @@ class EventOutboxAdmin(admin.ModelAdmin):
 # ── Date-reliability recompute (a66e33f data repair) ────────────────────────
 from django.contrib import admin as _admin  # noqa: E402
 from django.http import HttpResponseRedirect  # noqa: E402
-from django.urls import path, reverse as _reverse  # noqa: E402
+from django.urls import path  # noqa: E402
+from django.urls import reverse as _reverse  # noqa: E402
 
 
 @_admin.site.admin_view
@@ -306,7 +308,6 @@ class JobListingAdmin(admin.ModelAdmin):
     date_hierarchy = "scraped_at"
 
     def get_urls(self):
-        from django.urls import path
 
         urls = super().get_urls()
         custom = [

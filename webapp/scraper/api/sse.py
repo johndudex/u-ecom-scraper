@@ -34,7 +34,7 @@ logger = logging.getLogger("scraper.api")
 # 2 gunicorn sync workers: 2 streams = zero remaining HTTP capacity, and
 # the healthcheck death-spiral restarts the service. 1 keeps a worker
 # alive; Railway can raise via env when the dedicated gateway ships.
-import os
+import os  # noqa: E402 — deliberate: env-tuned constant sits with its comment
 
 STREAM_BUDGET = int(os.environ.get("PARTNER_STREAM_BUDGET", "1"))
 # hard lifetime of one stream; tests shrink this to drain promptly.

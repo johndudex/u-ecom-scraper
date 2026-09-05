@@ -2,7 +2,6 @@ import asyncio
 import logging
 import random
 import time
-from typing import Optional
 
 from playwright.async_api import Browser, BrowserContext, Page
 
@@ -14,12 +13,12 @@ logger = logging.getLogger(__name__)
 
 
 class AkamaiBypass:
-    def __init__(self, config: Optional[AkamaiConfig] = None):
+    def __init__(self, config: AkamaiConfig | None = None):
         self.config = config or AkamaiConfig()
         self.cookie_mgr = CookieManager(self.config.cookie_dir)
-        self.browser: Optional[Browser] = None
-        self.context: Optional[BrowserContext] = None
-        self.page: Optional[Page] = None
+        self.browser: Browser | None = None
+        self.context: BrowserContext | None = None
+        self.page: Page | None = None
         self._playwright = None
 
     async def launch(self) -> None:
@@ -62,7 +61,7 @@ class AkamaiBypass:
         self.browser = None
         self._playwright = None
 
-    async def get_page(self, url: str) -> Optional[dict]:
+    async def get_page(self, url: str) -> dict | None:
         domain = _extract_domain(url)
         for attempt in range(self.config.retry_count):
             try:

@@ -54,7 +54,7 @@ def draft_parses(path: str) -> bool:
     if not path or not os.path.isfile(path):
         return False
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             ast.parse(fh.read(), filename=path)
         return True
     except Exception:
@@ -137,7 +137,7 @@ def ladder_preservation_violation(
     if (strategy or "").strip().lower() in LADDER_EXEMPT_STRATEGIES:
         return None
     try:
-        with open(scraper_path, "r", encoding="utf-8", errors="replace") as fh:
+        with open(scraper_path, encoding="utf-8", errors="replace") as fh:
             tree = ast.parse(fh.read(), filename=scraper_path)
     except Exception:
         return None  # unparseable → the syntax fixer owns it

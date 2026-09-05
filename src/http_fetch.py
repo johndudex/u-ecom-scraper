@@ -56,10 +56,10 @@ import logging
 import os
 import time
 from collections.abc import Callable
-from typing import Optional, Union
 
 import requests
 from bs4 import BeautifulSoup
+
 from src.proxy import ProxyConfig, should_warn_residential, warn_residential_usage
 
 try:  # optional dependency — absence degrades the ladder, never crashes
@@ -181,7 +181,7 @@ class SoftBlock:
         )
 
 
-def detect_soft_block(text: str) -> Optional[SoftBlock]:
+def detect_soft_block(text: str) -> SoftBlock | None:
     """Challenge-shape detector for an HTTP 200 body. ``None`` = looks real.
 
     Two shapes, either of which trips it:
@@ -206,7 +206,7 @@ def detect_soft_block(text: str) -> Optional[SoftBlock]:
 
 
 def _ladder_clients(
-    headers: Optional[dict],
+    headers: dict | None,
 ) -> tuple:
     """Shared per-run setup for the fetch factories (create_fetch_page/text/json).
 
@@ -245,7 +245,7 @@ def _ladder_clients(
     return proxy_config, ssl_verify, escalation, session, curl_session, fingerprint_enabled
 
 
-def create_fetch_page(delay_s: float = 2.0, headers: Optional[dict] = None) -> Callable:
+def create_fetch_page(delay_s: float = 2.0, headers: dict | None = None) -> Callable:
     """Build a ``fetch_page(url, min_tier=0)`` closure for one scraper run.
 
     The Session is per-factory (per-scraper-process): cookies round-trip
@@ -264,7 +264,7 @@ def create_fetch_page(delay_s: float = 2.0, headers: Optional[dict] = None) -> C
 
     def fetch_page(
         url: str, min_tier: int = 0
-    ) -> Optional[Union[tuple[BeautifulSoup, int], SoftBlock]]:
+    ) -> tuple[BeautifulSoup, int] | SoftBlock | None:
         floor = int(getattr(fetch_page, "min_tier_floor", 0))
         tiers = resolve_tiers(
             max(min_tier, floor), escalation, fingerprint_tier=fingerprint_enabled
@@ -348,7 +348,7 @@ def create_fetch_page(delay_s: float = 2.0, headers: Optional[dict] = None) -> C
     return fetch_page
 
 
-def create_fetch_text(delay_s: float = 2.0, headers: Optional[dict] = None) -> Callable:
+def create_fetch_text(delay_s: float = 2.0, headers: dict | None = None) -> Callable:
     """Build a ``fetch_text(url, params=None, min_tier=0)`` closure — the SAME
     session, proxy ladder and soft-block contract as :func:`create_fetch_page`,
     returning ``(text, status_code)`` instead of a parsed soup.
@@ -376,8 +376,8 @@ def create_fetch_text(delay_s: float = 2.0, headers: Optional[dict] = None) -> C
     ) = _ladder_clients(headers)
 
     def fetch_text(
-        url: str, params: Optional[dict] = None, min_tier: int = 0
-    ) -> Optional[Union[tuple[str, int], SoftBlock]]:
+        url: str, params: dict | None = None, min_tier: int = 0
+    ) -> tuple[str, int] | SoftBlock | None:
         floor = int(getattr(fetch_text, "min_tier_floor", 0))
         tiers = resolve_tiers(
             max(min_tier, floor), escalation, fingerprint_tier=fingerprint_enabled
@@ -455,7 +455,7 @@ def create_fetch_text(delay_s: float = 2.0, headers: Optional[dict] = None) -> C
     return fetch_text
 
 
-def create_fetch_json(delay_s: float = 2.0, headers: Optional[dict] = None) -> Callable:
+def create_fetch_json(delay_s: float = 2.0, headers: dict | None = None) -> Callable:
     """Build a ``fetch_json(url, params=None, min_tier=0)`` closure over
     :func:`create_fetch_text` — returns ``(parsed_json, status_code)``.
 
@@ -468,8 +468,8 @@ def create_fetch_json(delay_s: float = 2.0, headers: Optional[dict] = None) -> C
     fetch_text = create_fetch_text(delay_s=delay_s, headers=headers)
 
     def fetch_json(
-        url: str, params: Optional[dict] = None, min_tier: int = 0
-    ) -> Optional[Union[tuple[Union[dict, list], int], SoftBlock]]:
+        url: str, params: dict | None = None, min_tier: int = 0
+    ) -> tuple[dict | list, int] | SoftBlock | None:
         result = fetch_text(url, params=params, min_tier=min_tier)
         if not result:
             return result

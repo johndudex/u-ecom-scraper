@@ -30,9 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
 import time
-from typing import Optional
 
 import openai
 from django.conf import settings
@@ -215,7 +213,7 @@ def _provider_for(model: str) -> tuple[str, str, str]:
     )
 
 
-def _litellm_fallback(requested: str) -> Optional[str]:
+def _litellm_fallback(requested: str) -> str | None:
     """Breaker fallback for ``requested``.
 
     [T3.13g/wave-13] litellm models → ``LITELLM_FALLBACK_MODEL`` if set, else
@@ -242,7 +240,7 @@ def _litellm_fallback(requested: str) -> Optional[str]:
     return None
 
 
-def _provider_code(exc: BaseException) -> Optional[str]:
+def _provider_code(exc: BaseException) -> str | None:
     """Provider error code from an openai exception, if it carries one.
 
     Z.AI's 429s arrive as ``{"error": {"code": 1302, ...}}`` — the SDK surfaces
@@ -278,7 +276,7 @@ def _retry_budget(kind: str, cfg: dict) -> int:
     return cfg["ratelimit_max"] if kind == "rate_limit" else cfg["transient_max"]
 
 
-def _retry_classified_sync(fn, cfg: dict, *, model: Optional[str] = None, sleep=time.sleep):
+def _retry_classified_sync(fn, cfg: dict, *, model: str | None = None, sleep=time.sleep):
     """Run a sync LLM call with classified retry. Raises the last exception after
     the class's retry budget is exhausted."""
     attempt, slept = 0, 0.0
@@ -319,7 +317,7 @@ def _retry_classified_sync(fn, cfg: dict, *, model: Optional[str] = None, sleep=
             )
 
 
-async def _retry_classified_async(fn, cfg: dict, *, model: Optional[str] = None, asleep=asyncio.sleep):
+async def _retry_classified_async(fn, cfg: dict, *, model: str | None = None, asleep=asyncio.sleep):
     """Async counterpart of _retry_classified_sync.
 
     The sleep is awaited HERE, not inside a shared helper: handing
@@ -360,7 +358,7 @@ def _handle_retry(
     *,
     sleep=time.sleep,
     retry_after=None,
-    model: Optional[str] = None,
+    model: str | None = None,
 ) -> tuple[int, float]:
     """One sync retry step: sleep this failure's backoff and return
     ``(next attempt #, total sleep so far)``; on budget exhaustion emit the
@@ -377,7 +375,7 @@ def _next_retry(
     slept: float,
     cfg: dict,
     retry_after=None,
-    model: Optional[str] = None,
+    model: str | None = None,
 ) -> tuple[int, float, float]:
     """Resolve this failure into ``(next attempt #, updated sleep total, delay)``.
 
@@ -407,7 +405,7 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
     # to the server. ``effective_model`` looks up the configured string, so
     # recording under anything else makes record/lookup diverge silently (the
     # critique round's key-coherence finding). Set by ``get_llm``.
-    _breaker_name: Optional[str] = PrivateAttr(default=None)
+    _breaker_name: str | None = PrivateAttr(default=None)
     """``ChatOpenAI`` with classified, bounded, jittered per-call retry.
 
     Overrides of ``_generate``/``_agenerate`` (the methods langchain routes
@@ -431,7 +429,7 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
         # Bind the parent method OUTSIDE the lambda: zero-arg super() inside a
         # lambda doesn't get the __class__ closure cell (RuntimeError: super(): no
         # arguments). Explicit super() + a local binding is robust.
-        _super_generate = super(ClassifiedRetryChatOpenAI, self)._generate
+        _super_generate = super()._generate
         try:
             result = _retry_classified_sync(
                 lambda: _super_generate(messages, stop=stop, run_manager=run_manager, **kwargs),
@@ -448,7 +446,7 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[override]
         cfg = _retry_settings()
-        _super_agenerate = super(ClassifiedRetryChatOpenAI, self)._agenerate
+        _super_agenerate = super()._agenerate
 
         async def _call():
             return await _super_agenerate(messages, stop=stop, run_manager=run_manager, **kwargs)
@@ -470,7 +468,7 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
         # the FULL consumption — a stream that dies mid-flight raises from
         # iteration, not from the call — then replays the buffered chunks.
         cfg = _retry_settings()
-        _super_stream = super(ClassifiedRetryChatOpenAI, self)._stream
+        _super_stream = super()._stream
         try:
             chunks = _retry_classified_sync(
                 lambda: list(
@@ -488,7 +486,7 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
     async def _astream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
         # Async counterpart of ``_stream`` (LLM_ASYNC_EXECUTION path).
         cfg = _retry_settings()
-        _super_astream = super(ClassifiedRetryChatOpenAI, self)._astream
+        _super_astream = super()._astream
 
         async def _consume():
             return [
@@ -530,7 +528,7 @@ def _classified_retry_enabled() -> bool:
         return True
 
 
-def get_llm(model: Optional[str] = None, temperature: float = 0.3, timeout: Optional[int] = None) -> ChatOpenAI:
+def get_llm(model: str | None = None, temperature: float = 0.3, timeout: int | None = None) -> ChatOpenAI:
     """Create a ChatOpenAI instance configured for the Z.AI API (or the LiteLLM
     proxy for ``litellm/``-prefixed models — see ``_provider_for``).
 
@@ -600,7 +598,7 @@ def get_main_llm(temperature: float = 0.3) -> ChatOpenAI:
     )
 
 
-def get_small_llm(temperature: float = 0.3, timeout: Optional[int] = None) -> ChatOpenAI:
+def get_small_llm(temperature: float = 0.3, timeout: int | None = None) -> ChatOpenAI:
     """Return the small / fast model (glm-5-turbo) for quick decisions."""
     return get_llm(
         model=getattr(settings, "ZAI_SMALL_MODEL", "glm-5-turbo"),

@@ -7,7 +7,6 @@ and returns it as text or markdown.
 import logging
 
 import httpx
-
 from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)

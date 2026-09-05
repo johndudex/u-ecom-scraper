@@ -120,7 +120,7 @@ def navigate_skill_review(state: dict, config=None) -> dict[str, Any]:
         )
         if os.path.isfile(report_path):
             try:
-                with open(report_path, "r", encoding="utf-8") as f:
+                with open(report_path, encoding="utf-8") as f:
                     report = json.load(f)
                 logger.info(
                     "navigate_skill_review: success — nav_learning_report.json "

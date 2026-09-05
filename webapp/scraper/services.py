@@ -14,12 +14,11 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Optional
-
-from langchain_core.callbacks import BaseCallbackHandler
-from langgraph.graph.state import CompiledStateGraph
+from typing import Any
 
 from django.conf import settings
+from langchain_core.callbacks import BaseCallbackHandler
+from langgraph.graph.state import CompiledStateGraph
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +192,7 @@ class LangGraphService:
     # ── Graph construction ──────────────────────────────────────────────
 
     @staticmethod
-    def build_graph() -> "CompiledStateGraph":
+    def build_graph() -> CompiledStateGraph:
         """Build and compile the scrape graph with a PostgreSQL checkpointer.
 
         The checkpointer instance is obtained from ``agents.checkpointer`` and
@@ -486,7 +485,7 @@ class LangGraphService:
     }
 
     @staticmethod
-    def _node_to_phase(node_name: str) -> Optional[str]:
+    def _node_to_phase(node_name: str) -> str | None:
         """Map a LangGraph node name to a Step phase string."""
         return LangGraphService.NODE_PHASE_MAP.get(node_name)
 
@@ -498,9 +497,9 @@ class LangGraphService:
 
 def _upsert_step_from_event(job: Any, phase: str, status: str, notes: str = "") -> None:
     """Create or update a Step row for *job*."""
-    from scraper.models import Step
-
     from django.utils import timezone
+
+    from scraper.models import Step
 
     step, _created = Step.objects.get_or_create(
         job=job, phase=phase, defaults={"notes": notes}

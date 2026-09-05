@@ -41,23 +41,21 @@ import logging
 import os
 import re
 import time
-import functools
-from typing import Any, Optional
-from django.utils import timezone
+from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from django.utils import timezone
 from langchain_core.callbacks import BaseCallbackHandler, BaseCallbackManager
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
-from langchain_core.runnables import RunnableConfig
 
 from .constants import (
     FINAL_RETRY_SENTINEL,
     MAX_TEST_RETRIES,
     STEALTH_METHOD_PREFIXES,
 )
-from .tools.probe_tools import fingerprint_profile as _fingerprint_profile
 from .decisions import options_to_decisions
 from .nodes import (
     check_tracker,
@@ -65,7 +63,6 @@ from .nodes import (
     human_approval,
     normalize_fields,
     parse_command,
-    route_after_cleanup,
     route_after_testing,
     run_execution,
     setup_workspace,
@@ -83,30 +80,31 @@ from .subagents import (
     build_cleanup_message,
     build_code_tester_message,
     build_code_writer_message,
+    build_dagster_converter_message,
     # ═══ ARCHIVED NAVIGATION (replaced by browser_traverse) ═══
     # build_navigation_agent_message,
     # ═══ END ARCHIVED ═══
     build_product_analyzer_message,
     build_site_analyzer_message,
-    build_dagster_converter_message,
+    build_skill_learner_message,
     create_cleanup_agent,
     create_code_tester,
     create_code_writer,
+    create_dagster_converter,
     # ═══ ARCHIVED NAVIGATION (replaced by browser_traverse) ═══
     # create_navigation_agent,
     # ═══ END ARCHIVED ═══
     create_product_analyzer,
     create_site_analyzer,
     create_skill_learner,
-    build_skill_learner_message,
-    create_dagster_converter,
 )
 from .tools.context import (
-    set_tool_context,
     clear_tool_context,
+    get_tool_deadline,  # noqa: F401 — load-bearing re-export (blocking tools/tests read it off this module)
+    set_tool_context,
     set_tool_deadline,
-    get_tool_deadline,
 )
+from .tools.probe_tools import fingerprint_profile as _fingerprint_profile
 
 logger = logging.getLogger(__name__)
 
@@ -285,7 +283,7 @@ def _balanced_close(content: str, err: json.JSONDecodeError) -> str:
     return candidate
 
 
-def repair_json_text(content: str) -> tuple[Optional[str], str]:
+def repair_json_text(content: str) -> tuple[str | None, str]:
     """In-memory artifact repair (pure function — no filesystem access).
 
     Runs the pass ladder described on ``_fix_json_artifact`` and returns
@@ -298,7 +296,7 @@ def repair_json_text(content: str) -> tuple[Optional[str], str]:
         json.loads(content)
         return content, ""
     except json.JSONDecodeError as e:
-        err: Optional[json.JSONDecodeError] = e
+        err: json.JSONDecodeError | None = e
     # pass 0b: C1 — literal control chars, repaired losslessly
     try:
         parsed = json.loads(content, strict=False)
@@ -387,7 +385,7 @@ def _fix_json_artifact(slug: str, filename: str) -> None:
     if not os.path.isfile(path):
         return
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             content = f.read()
     except Exception:
         return
@@ -501,7 +499,7 @@ def _patch_scraper_output_filter(
     if not os.path.isfile(scraper_path):
         return
     try:
-        with open(scraper_path, "r", encoding="utf-8") as f:
+        with open(scraper_path, encoding="utf-8") as f:
             code = f.read()
         if "_OUTPUT_FILTER_APPLIED" in code or "_OUTPUT_PRICE_FILTER_APPLIED" in code:
             return
@@ -592,7 +590,7 @@ def _enforce_discovery_import(slug: str) -> None:
         draft_path = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
         if not os.path.isfile(draft_path):
             return
-        with open(draft_path, "r", encoding="utf-8") as f:
+        with open(draft_path, encoding="utf-8") as f:
             code = f.read()
 
         # Already compliant?
@@ -663,7 +661,7 @@ def _enforce_env_discovery_gate(slug: str) -> None:
         draft_path = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
         if not os.path.isfile(draft_path):
             return
-        with open(draft_path, "r", encoding="utf-8") as f:
+        with open(draft_path, encoding="utf-8") as f:
             code = f.read()
 
         # Already compliant?
@@ -726,7 +724,7 @@ def _warn_unaddressed_critical_fix(slug: str, scraper_analysis: dict) -> None:
     if not os.path.isfile(scraper_path):
         return
     try:
-        with open(scraper_path, "r", encoding="utf-8") as f:
+        with open(scraper_path, encoding="utf-8") as f:
             code = f.read()
         # Extract the FAILED selector from the crash message in `issue` — the
         # pattern is `selector 'X'` / `selector "X"` (Playwright/Selenium
@@ -805,7 +803,7 @@ def _load_test_report(slug: str, min_mtime: float | None = None) -> dict | None:
         except OSError:
             pass
     try:
-        with open(report_path, "r", encoding="utf-8") as f:
+        with open(report_path, encoding="utf-8") as f:
             data = json.loads(f.read())
         if isinstance(data, dict):
             return data
@@ -854,7 +852,7 @@ def _attach_discovery_coverage(report: dict, slug: str) -> dict:
             and str(cov.get("stop_reason") or "") == "navigate_error"
         ):
             try:
-                with open(output_file, "r", errors="ignore") as _pf:
+                with open(output_file, errors="ignore") as _pf:
                     _pdata = json.load(_pf)
                 if not (_pdata.get("products") or []):
                     logger.info(
@@ -1106,7 +1104,7 @@ PHASE_MAP: dict[str, str] = {
 }
 
 
-import threading
+import threading  # noqa: E402 — late import deliberate (import-order contract)
 
 
 class _HeartbeatHandle:
@@ -1368,7 +1366,7 @@ MAX_RETRY_SUMMARY_CHARS = 8000
 def _read_json_artifact(root: str, slug: str, filename: str) -> dict[str, Any]:
     path = os.path.join(root, "workspace", slug, filename)
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             return json.load(fh)
     except Exception:
         return {}
@@ -1395,8 +1393,10 @@ def _archive_existing_scraper(slug: str) -> str | None:
     if not slug:
         return None
     try:
+        from datetime import datetime
+        from datetime import timezone as dt_timezone
+
         import src.artifacts as artifacts
-        from datetime import datetime, timezone as dt_timezone
 
         prod_key = artifacts.scrapers_key(slug, "scraper.py")
         if not artifacts.exists(prod_key):
@@ -2161,8 +2161,8 @@ def _run_budgeted_agent(
     budget_exhausted_reason: str,
     budget_exhausted_options: list[str],
     budget_exhausted_message: str,
-    missing_artifact_reason: Optional[str] = None,
-    missing_retries_state_key: Optional[str] = None,
+    missing_artifact_reason: str | None = None,
+    missing_retries_state_key: str | None = None,
     missing_redo_label: str = "",
     missing_skip_label: str = "",
     missing_message: str = "",
@@ -2832,12 +2832,17 @@ def _invoke_navigation_traverse(
         url_examples: list[str] = list(getattr(result, "item_links", []) or [])[:20]
         if not url_examples and result.goal_url:
             try:
-                from experimental.nav_traversal.traversal import _default_fetch, extract_links
+                from experimental.nav_traversal.traversal import (
+                    _default_fetch,
+                    extract_links,
+                )
 
                 page_resp = _default_fetch(result.goal_url)
                 if page_resp.get("ok"):
                     links = extract_links(page_resp.get("text", ""), result.goal_url)
-                    url_examples = [l["href"] for l in links[:20] if l.get("href")]
+                    url_examples = [
+                        link["href"] for link in links[:20] if link.get("href")
+                    ]
             except Exception as exc:
                 logger.info(
                     "browser_traverse: url_examples extraction failed (%s)", exc
@@ -2936,21 +2941,20 @@ def _invoke_navigation_traverse(
         # whole pipeline leans on — surface it in the job log. This phase
         # previously emitted zero SessionLog rows, so neither RCA could be
         # reconstructed from the UI.
+        _reached = getattr(result, "reached", "?")
+        _goal_url = str(getattr(result, "goal_url", "") or "")[:120]
+        _listing_url = str(_disc_fb.get("listing_url") or "")[:120]
+        _mechanism = getattr(result, "mechanism", "") or "?"
+        _goal_method = getattr(result, "goal_method", "GET") or "GET"
+        _notes = str(getattr(result, "notes", "") or "")[:200]
         _log_event_row(
             job_id,
             "navigator",
-            "[NAV-SUMMARY] reached=%s working_url=%s listing_url=%s "
-            "listing_reached=%s mechanism=%s form_method=%s item_links=%d notes=%s"
-            % (
-                getattr(result, "reached", "?"),
-                str(getattr(result, "goal_url", "") or "")[:120],
-                str(_disc_fb.get("listing_url") or "")[:120],
-                _disc_fb.get("listing_reached"),
-                getattr(result, "mechanism", "") or "?",
-                getattr(result, "goal_method", "GET") or "GET",
-                len(url_examples or []),
-                str(getattr(result, "notes", "") or "")[:200],
-            ),
+            "[NAV-SUMMARY] "
+            f"reached={_reached} working_url={_goal_url} listing_url={_listing_url} "
+            f"listing_reached={_disc_fb.get('listing_reached')} "
+            f"mechanism={_mechanism} form_method={_goal_method} "
+            f"item_links={len(url_examples or [])} notes={_notes}",
         )
 
         analysis = {
@@ -4353,6 +4357,7 @@ def _fix_scraper_syntax(
     max_tries, return and let code_tester catch it (the prior behavior).
     """
     import ast
+
     from langchain_core.messages import HumanMessage
 
     scraper_path = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
@@ -4360,7 +4365,7 @@ def _fix_scraper_syntax(
         if not os.path.isfile(scraper_path):
             return
         try:
-            with open(scraper_path, "r", errors="ignore") as fh:
+            with open(scraper_path, errors="ignore") as fh:
                 ast.parse(fh.read())
             if attempt > 0:
                 logger.info(
@@ -4413,7 +4418,7 @@ def _contract_fix_message(
     )
     if template_path and os.path.isfile(template_path):
         try:
-            with open(template_path, "r", errors="ignore") as _tf:
+            with open(template_path, errors="ignore") as _tf:
                 _tsrc = _tf.read()
             if "global PRODUCT_LISTING_URL" in _tsrc:
                 gate_hint = (
@@ -4662,7 +4667,7 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 # seed set is richer (first run or navigation found more URLs).
                 try:
                     if os.path.isfile(iu_path):
-                        with open(iu_path, "r") as _ef:
+                        with open(iu_path) as _ef:
                             _loaded = _json.load(_ef)
                         # [job-88 selfridges] the writer sometimes seeds a BARE
                         # JSON array — `.get` on a list raised AttributeError
@@ -4740,7 +4745,7 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
             ):
                 _eow_draft = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
                 if draft_parses(_eow_draft):
-                    with open(_eow_draft, "r", encoding="utf-8", errors="replace") as _ef:
+                    with open(_eow_draft, encoding="utf-8", errors="replace") as _ef:
                         _template_code = _ef.read()
                     _eow_active = True
                     logger.info(
@@ -4840,7 +4845,7 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
             try:
                 import ast as _ast
 
-                with open(_draft_path, "r", encoding="utf-8", errors="replace") as _df:
+                with open(_draft_path, encoding="utf-8", errors="replace") as _df:
                     _ast.parse(_df.read(), filename=_draft_path)
             except Exception as _c_exc:
                 _draft_ok = False
@@ -5514,7 +5519,10 @@ def _probe_phase1_discovery_once(
         # ModuleNotFoundError-crashes every browser draft, which route_after_testing
         # reads as "playwright failed (no items)" → wrong strategy switch. Mirror
         # run_scraper's dispatch: browser draft → browser_service /scrape; else local.
-        from agents.tools.shell_tools import _scraper_needs_browser, _get_browser_service_url
+        from agents.tools.shell_tools import (
+            _get_browser_service_url,
+            _scraper_needs_browser,
+        )
 
         if _scraper_needs_browser(draft):
             import httpx
@@ -5522,7 +5530,7 @@ def _probe_phase1_discovery_once(
             try:
                 # Stateless /scrape: read the local draft source, POST it.
                 try:
-                    with open(draft, "r", encoding="utf-8", errors="replace") as _pf:
+                    with open(draft, encoding="utf-8", errors="replace") as _pf:
                         _draft_source = _pf.read()
                 except OSError:
                     _draft_source = ""
@@ -5532,7 +5540,7 @@ def _probe_phase1_discovery_once(
                     _sp = os.path.join(os.path.dirname(draft), _sf)
                     if os.path.isfile(_sp):
                         try:
-                            with open(_sp, "r", encoding="utf-8", errors="replace") as _fh:
+                            with open(_sp, encoding="utf-8", errors="replace") as _fh:
                                 _probe_extra[_sf] = _fh.read()
                         except OSError:
                             pass
@@ -6385,8 +6393,9 @@ def _invoke_skill_learner(state: ScrapeState, config: RunnableConfig) -> dict[st
 
         if slug:
             try:
-                import src.artifacts as artifacts
                 from django.conf import settings
+
+                import src.artifacts as artifacts
 
                 ws = os.path.join(settings.PROJECT_ROOT, "workspace", slug)
                 # Preserve learning + nav_learning reports to the File Master.
@@ -6477,7 +6486,6 @@ def _invoke_dagster_converter(
         logger.info("_invoke_dagster_converter: starting (job %s, slug %s)", job_id, slug)
 
         ws_dagster = os.path.join(root, "workspace", slug, f"{slug}_dagster.py")
-        scrapers_dagster = os.path.join(root, "scrapers", slug, f"{slug}_dagster.py")
 
         # T3.1: deterministic renderer first — 0 LLM calls on the happy path.
         # (job 302: the LLM converter burned 34 calls / 7m05s of wall hand-copying
@@ -6499,7 +6507,7 @@ def _invoke_dagster_converter(
                 _template = ""
                 _tpl_path = os.path.join(root, "templates", "dagster_template.py")
                 if os.path.isfile(_tpl_path):
-                    with open(_tpl_path, "r", encoding="utf-8", errors="replace") as _tf:
+                    with open(_tpl_path, encoding="utf-8", errors="replace") as _tf:
                         _template = _tf.read()
                 _report: dict[str, Any] = {}
                 _rendered = render_dagster_module(
@@ -6554,7 +6562,7 @@ def _invoke_dagster_converter(
             # "syntax OK"s but NameErrors at import time).
             try:
                 import ast
-                with open(ws_dagster, "r") as f:
+                with open(ws_dagster) as f:
                     _src = f.read()
                 _tree = ast.parse(_src)
                 # Collect names bound by imports/classdefs/assignments at module scope.
@@ -6672,7 +6680,7 @@ def _invoke_store_job_listings(
         import json as _json
         from datetime import datetime as _dt
 
-        with open(output_file, "r", encoding="utf-8") as f:
+        with open(output_file, encoding="utf-8") as f:
             data = _json.load(f)
 
         # Get the output key (usually "jobs")
@@ -6692,7 +6700,8 @@ def _invoke_store_job_listings(
         }
 
         # Resolve the Site FK
-        from scraper.models import JobListing, Site as SiteModel
+        from scraper.models import JobListing
+        from scraper.models import Site as SiteModel
         site_obj = None
         if slug:
             site_obj = SiteModel.objects.filter(slug=slug).first()
@@ -7330,7 +7339,7 @@ def route_from_human_approval(state: ScrapeState) -> str:
 
 
 def build_scrape_graph(
-    checkpointer: Optional[Any] = None,
+    checkpointer: Any | None = None,
 ) -> CompiledStateGraph:
     """Build and compile the full scraping StateGraph.
 

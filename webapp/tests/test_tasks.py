@@ -2,7 +2,6 @@ from unittest.mock import MagicMock, patch
 
 from django.test import TestCase
 from model_bakery import baker
-
 from scraper.models import ScrapeJob
 from scraper.tasks import _generate_slug, _graph_is_interrupted
 

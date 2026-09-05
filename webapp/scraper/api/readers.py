@@ -19,7 +19,8 @@ from django.http import JsonResponse
 
 from ..models import ScrapeJob, Site
 from . import errors
-from .state import partner_state, sample_ready as sample_ready_fn
+from .state import partner_state
+from .state import sample_ready as sample_ready_fn
 from .views import _api_get_job, api_view
 
 logger = logging.getLogger("scraper.api")

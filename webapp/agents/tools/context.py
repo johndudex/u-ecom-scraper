@@ -23,7 +23,6 @@ Usage in graph.py::
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +125,7 @@ def is_invocation_cancelled() -> bool:
     return bool(_ctx["invocation_cancelled"])
 
 
-def set_tool_deadline(deadline: Optional[float]) -> None:
+def set_tool_deadline(deadline: float | None) -> None:
     """Stamp the invoking agent's wall-clock deadline (epoch seconds).
 
     [job-81] Blocking tools (run_scraper's browser dispatch) compare their own
@@ -138,11 +137,11 @@ def set_tool_deadline(deadline: Optional[float]) -> None:
     _ctx["tool_deadline"] = deadline
 
 
-def get_tool_deadline() -> Optional[float]:
+def get_tool_deadline() -> float | None:
     return _ctx["tool_deadline"]
 
 
-def get_state() -> Optional[dict]:
+def get_state() -> dict | None:
     return _ctx["state"]
 
 

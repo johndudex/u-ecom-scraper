@@ -59,7 +59,6 @@ def _api_get_job(request, job_id):
     partner surface never renders an HTML 404 page.
     """
     from ..models import ScrapeJob
-
     from . import errors as _e
 
     job = ScrapeJob.objects.filter(pk=job_id, user=request.api_user).first()

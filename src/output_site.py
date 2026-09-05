@@ -10,7 +10,7 @@ normalizer is the reader-side belt-and-braces so ANY shape degrades to a dict.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlsplit
 
 
@@ -34,7 +34,7 @@ def normalize_site_block(value: Any, fallback_platform: str = "") -> dict:
     return {"platform": fallback_platform} if fallback_platform else {}
 
 
-def ground_truth_platform(out_data: Optional[dict], site_analysis: Optional[dict] = None) -> str:
+def ground_truth_platform(out_data: dict | None, site_analysis: dict | None = None) -> str:
     """Best platform for output-site backfill: site_analysis.site.platform first,
     then the analysis top level — the same precedence the pipeline already uses."""
     for source in (site_analysis or {},):

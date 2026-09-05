@@ -26,7 +26,6 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +92,7 @@ def _list_image_skills(include_image_only: bool = False) -> list[str]:
     return names
 
 
-def read_skill(name: str) -> Optional[str]:
+def read_skill(name: str) -> str | None:
     """Read one skill's SKILL.md. Returns None when not found anywhere.
 
     Per-key fallback semantics (the sharp edge — see plan):
@@ -141,7 +140,7 @@ def skill_exists(name: str) -> bool:
     return (_image_skills_dir() / _name / "SKILL.md").is_file()
 
 
-def _read_image_skill(name: str) -> Optional[str]:
+def _read_image_skill(name: str) -> str | None:
     p = _image_skills_dir() / name / "SKILL.md"
     try:
         return p.read_text(encoding="utf-8")
@@ -172,7 +171,7 @@ def _extract_frontmatter_field(text: str, field: str) -> str:
 # create_new_skill (learn_skill appends below the frontmatter and never
 # touches it — verified subagents.py:419 reads frontmatter only).
 
-_SNAPSHOT: Optional[dict[str, str]] = None
+_SNAPSHOT: dict[str, str] | None = None
 _SNAPSHOT_AT: float = 0.0
 
 
@@ -412,7 +411,7 @@ def _sha256_text(text: str) -> str:
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
-def _validate_name(name: str) -> Optional[str]:
+def _validate_name(name: str) -> str | None:
     raw = (name or "").strip()
     n = raw.lower()
     # Reject uppercase in the ORIGINAL (canonical skills are lowercase; we
@@ -439,7 +438,7 @@ def _normalize_match(current: str, title: str) -> bool:
     return False
 
 
-def _fm_read_or_fail(name: str) -> Optional[str]:
+def _fm_read_or_fail(name: str) -> str | None:
     """Read for WRITE paths — no image fallback (would mask a failed write)."""
     import src.artifacts as artifacts
 

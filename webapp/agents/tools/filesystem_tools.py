@@ -14,7 +14,6 @@ import json
 import logging
 import os
 import re
-from typing import Optional
 
 from langchain_core.tools import tool
 
@@ -49,7 +48,7 @@ def _strip_json_fence(content: str) -> str:
     return text
 
 
-def sanitize_json_content(content: str) -> tuple[str, bool, Optional[str]]:
+def sanitize_json_content(content: str) -> tuple[str, bool, str | None]:
     """Validate/normalize *content* destined for a .json path.
 
     Returns ``(canonical_content, is_valid, error)``:
@@ -88,7 +87,7 @@ def sanitize_json_content(content: str) -> tuple[str, bool, Optional[str]]:
         return content, False, error
 
 
-def _repair_json_text_in_memory(text: str) -> tuple[Optional[str], str]:
+def _repair_json_text_in_memory(text: str) -> tuple[str | None, str]:
     """Run the deterministic artifact-repair ladder on *text* without touching
     disk. Delegates to ``agents.graph.repair_json_text`` (imported lazily —
     importing graph at module scope would be circular and drag Django in).
@@ -105,7 +104,7 @@ def _repair_json_text_in_memory(text: str) -> tuple[Optional[str], str]:
         return None, ""
 
 
-def guard_json_bytes(raw: bytes) -> tuple[Optional[bytes], str]:
+def guard_json_bytes(raw: bytes) -> tuple[bytes | None, str]:
     """M4 copy-path guard: validate/repair .json bytes crossing a byte-copy
     boundary (workspace → File Master, or FM → workspace on re-hydration).
 
@@ -149,7 +148,7 @@ def guard_json_bytes(raw: bytes) -> tuple[Optional[bytes], str]:
     return None, f"unrepairable ({err.msg} at char {err.pos})"
 
 
-def _resolve_project_root(project_root: Optional[str] = None) -> str:
+def _resolve_project_root(project_root: str | None = None) -> str:
     """Return the effective project root directory."""
     if project_root:
         return os.path.abspath(project_root)
@@ -205,8 +204,8 @@ def _enforce_not_skills(path: str, root: str) -> str:
 
 
 def get_filesystem_tools(
-    project_root: Optional[str] = None,
-    workspace_scope: Optional[str] = None,
+    project_root: str | None = None,
+    workspace_scope: str | None = None,
 ) -> list:
     """Return all filesystem tools with sandboxing configured.
 
@@ -253,7 +252,7 @@ def get_filesystem_tools(
         except ValueError as e:
             return str(e)
         try:
-            with open(safe, "r", encoding="utf-8") as f:
+            with open(safe, encoding="utf-8") as f:
                 content = f.read()
         except FileNotFoundError:
             return f"File not found: {path}"
@@ -340,7 +339,7 @@ def get_filesystem_tools(
         except ValueError as e:
             return str(e)
         try:
-            with open(safe, "r", encoding="utf-8") as f:
+            with open(safe, encoding="utf-8") as f:
                 original = f.read()
         except FileNotFoundError:
             return f"File not found: {path}"
@@ -418,7 +417,7 @@ def get_filesystem_tools(
     def search_content(
         pattern: str,
         path: str = ".",
-        include: Optional[str] = None,
+        include: str | None = None,
     ) -> str:
         """Search file contents with a regular expression.
 
@@ -469,7 +468,7 @@ def get_filesystem_tools(
             for fpath in candidates:
                 rel = os.path.relpath(fpath, root)
                 try:
-                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    with open(fpath, encoding="utf-8", errors="ignore") as f:
                         for lineno, line in enumerate(f, 1):
                             if compiled.search(line):
                                 excerpt = line.rstrip()[:200]
@@ -503,7 +502,7 @@ def get_filesystem_tools(
         except ValueError as e:
             return str(e)
         try:
-            with open(safe, "r", encoding="utf-8", errors="replace") as f:
+            with open(safe, encoding="utf-8", errors="replace") as f:
                 src = f.read()
         except FileNotFoundError:
             return f"File not found: {path}"

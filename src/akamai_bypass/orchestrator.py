@@ -1,10 +1,9 @@
 import logging
-from typing import Optional
 
+from .bypass import AkamaiBypass
 from .config import AkamaiConfig
 from .cookie_manager import CookieManager
 from .tls_bypass import TLSBypass
-from .bypass import AkamaiBypass
 from .uc_bypass import UndetectedChromeBypass
 
 logger = logging.getLogger(__name__)
@@ -18,10 +17,10 @@ class AkamaiOrchestrator:
     Layer 3: SeleniumBase UC — undetected Chrome fallback
     """
 
-    def __init__(self, config: Optional[AkamaiConfig] = None):
+    def __init__(self, config: AkamaiConfig | None = None):
         self.config = config or AkamaiConfig()
 
-    async def probe(self, url: str) -> Optional[dict]:
+    async def probe(self, url: str) -> dict | None:
         domain = url.split("//")[-1].split("/")[0]
         logger.info("AkamaiOrchestrator: starting probe for %s", url)
 
@@ -55,7 +54,7 @@ class AkamaiOrchestrator:
         logger.warning("All Akamai bypass layers failed for %s", url[:100])
         return None
 
-    async def _run_playwright(self, url: str) -> Optional[dict]:
+    async def _run_playwright(self, url: str) -> dict | None:
         bypass = AkamaiBypass(self.config)
         try:
             result = await bypass.get_page(url)

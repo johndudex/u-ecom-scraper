@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -974,7 +973,7 @@ def _diagnose_no_execution(site_slug: str, job_id: int) -> str:
                 else:
                     if not _os.path.isfile(str(key)):
                         continue
-                    with open(str(key), "r", encoding="utf-8", errors="replace") as f:
+                    with open(str(key), encoding="utf-8", errors="replace") as f:
                         report = _json.load(f)
             except Exception:
                 continue
@@ -1022,7 +1021,7 @@ def _output_file_has_zero_items(output_file: str) -> bool:
             path = _os.path.join(_os.environ.get("PROJECT_ROOT", "/app"), path)
         if not _os.path.isfile(path):
             return False
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             data = _json.load(f)
     except Exception:
         return False
@@ -1239,7 +1238,7 @@ def _finalize_job(job: ScrapeJob) -> None:
             p = pathlib.Path(job.output_file)
             out_data = None
             if p.is_file():
-                with open(p, "r", encoding="utf-8") as fh:
+                with open(p, encoding="utf-8") as fh:
                     out_data = json.load(fh)
             if out_data:
                 # T0.5/H1: two templates emitted `site` as a bare host string —
@@ -1291,8 +1290,9 @@ def _finalize_job(job: ScrapeJob) -> None:
     # ── Publish outputs + analysis to the File Master; repoint job.output_file ──
     if site_slug:
         try:
-            import src.artifacts as artifacts
             from pathlib import Path as _P
+
+            import src.artifacts as artifacts
 
             ws = _P(settings.PROJECT_ROOT) / "workspace" / site_slug
             _matched_key = None
@@ -1440,8 +1440,8 @@ def _finalize_job(job: ScrapeJob) -> None:
     _allowed_fields: set[str] | None = None
     if job.status == ScrapeJob.STATUS_COMPLETED:
         try:
-            from src.content_types import resolve_allowed_fields, schema_field_names
             from scraper.models import Site as _Site
+            from src.content_types import resolve_allowed_fields, schema_field_names
 
             _site_for_schema = _Site.objects.filter(
                 url=job.url.rstrip("/")
@@ -1511,7 +1511,10 @@ def _finalize_job(job: ScrapeJob) -> None:
                 # as the integration point the older framework + future re-runs read).
                 if job.status == ScrapeJob.STATUS_COMPLETED and _schema_fields:
                     try:
-                        from src.content_types import get_content_type, get_output_key_label
+                        from src.content_types import (
+                            get_content_type,
+                            get_output_key_label,
+                        )
 
                         _ct = get_content_type(job.page_type)
                         _out_key, _ = get_output_key_label(job.page_type)
@@ -2328,8 +2331,8 @@ def _build_playground_messages(agent_name: str, state: dict, user_prompt: str) -
     context when provided.
     """
     from agents.subagents import (
-        build_code_writer_message,
         build_code_tester_message,
+        build_code_writer_message,
         build_product_analyzer_message,
         build_site_analyzer_message,
     )
@@ -2407,7 +2410,7 @@ def run_agent_task(self, playground_id: int) -> None:
         os.makedirs(ws_dir, exist_ok=True)
 
         # Set tool context for guards
-        from agents.tools.context import set_tool_context, clear_tool_context
+        from agents.tools.context import clear_tool_context, set_tool_context
 
         set_tool_context(state, agent_name=pg.agent_name)
 

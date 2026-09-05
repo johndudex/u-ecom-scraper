@@ -2,9 +2,8 @@
 from django.urls import path
 from django.views.decorators.csrf import csrf_exempt
 
-from . import readers
+from . import readers, writers
 from . import sse as sse_views
-from . import writers
 
 
 # csrf_exempt must sit on the OUTERMOST view Django resolves — the wrapped

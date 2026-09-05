@@ -24,9 +24,9 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta
-from typing import Any, Optional
+from typing import Any
 
-from src.content_types import JOB_FIELDS, FieldDef
+from src.content_types import JOB_FIELDS
 
 # Re-exported for templates/tests that import from here.
 __all__ = [
@@ -69,7 +69,7 @@ _DATE_FORMATS = [
 ]
 
 
-def parse_posted_date(date_str: str, now: Optional[datetime] = None) -> Optional[datetime]:
+def parse_posted_date(date_str: str, now: datetime | None = None) -> datetime | None:
     """Parse a posting date from many formats. Returns datetime or None.
 
     Handles ISO strings (with optional timezone offset), common US formats,
@@ -418,7 +418,7 @@ def infer_field_map(
     content_type_config: Any = None,
     *,
     prefer_jsonld: bool = True,
-) -> dict[str, Optional[str]]:
+) -> dict[str, str | None]:
     """Return ``{output_field: winning_candidate_or_None}``.
 
     For each output field, pick the candidate with the highest non-empty
@@ -431,7 +431,7 @@ def infer_field_map(
     sample = [_unwrap_jsonld(it, jsonld_types) for it in (sample_items or []) if isinstance(it, dict)]
     n = len(sample)
 
-    out: dict[str, Optional[str]] = {}
+    out: dict[str, str | None] = {}
     for field, candidates in JOB_ALIASES.items():
         if not candidates:
             out[field] = None
@@ -440,14 +440,14 @@ def infer_field_map(
             # Too few items for reliable coverage stats — pick the first
             # candidate that is actually present on any sample item (the
             # schema.org path is first, so it's preferred when present).
-            chosen: Optional[str] = None
+            chosen: str | None = None
             for cand in candidates:
                 if any(_present(_resolve_candidate(s, cand)) for s in sample):
                     chosen = cand
                     break
             out[field] = chosen
             continue
-        best: Optional[str] = None
+        best: str | None = None
         best_score = -1.0
         for idx, cand in enumerate(candidates):
             hits = 0
@@ -497,7 +497,7 @@ def _normalize_value(field: str, val: Any) -> str:
 
 def apply_field_map(
     raw_item: dict,
-    field_map: dict[str, Optional[str]],
+    field_map: dict[str, str | None],
     content_type_config: Any = None,
 ) -> dict[str, Any]:
     """Extract + normalize one item using an inferred ``field_map``.

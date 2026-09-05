@@ -1,0 +1,14 @@
+# Ruff policy: the repo previously shipped with NO ruff config, so the
+# documented lint command (`ruff check webapp/ src/`) rotted silently when
+# the container's ruff reached 0.16 — its default rule breadth (~1,369 hits)
+# outgrew the codebase. This file pins the set the project actually
+# enforces: pyflakes (F), core pycodestyle (E4/E7/E9), import sorting (I),
+# and typing modernization (UP — code style is Python 3.10+).
+#
+# Deliberately NOT selected: BLE001 (blind-except is the standing idiom at
+# agent/tool boundaries where any failure must not kill a job), S-bandit,
+# RUF012, SIM/PLR/TRY families. Enforcing those would fight the
+# architecture rather than hygiene; revisit per-rule if one earns its keep.
+
+[lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]

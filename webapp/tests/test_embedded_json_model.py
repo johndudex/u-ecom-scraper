@@ -90,7 +90,10 @@ def test_raw_html_hint_filter_uses_locator_token():
 def test_detector_picks_item_array_over_larger_taxonomy():
     """Real aya scenario: jobsData(10 real jobs) must beat expertises(110
     specialties). The 'largest record array' would wrongly pick the taxonomy."""
-    from agents.nodes.navigate_explore import _find_best_record_array, _raw_html_has_embedded_json
+    from agents.nodes.navigate_explore import (
+        _find_best_record_array,
+        _raw_html_has_embedded_json,
+    )
 
     jobs = [{"jobID": i, "facilityName": "f", "city": "c", "stateCode": 1,
              "expertiseText": "e", "professionText": "p", "weeklyPayLow": 1}
@@ -102,8 +105,9 @@ def test_detector_picks_item_array_over_larger_taxonomy():
     assert _raw_html_has_embedded_json(html) is True
 
     best = {"count": 0, "score": -1}
-    from agents.nodes.navigate_explore import _balanced_substr
     import re as _re
+
+    from agents.nodes.navigate_explore import _balanced_substr
     for m in _re.finditer(r"var\s+(\w+)\s*=\s*\[", html):
         sub = _balanced_substr(html, html.find("[", m.start()))
         try:

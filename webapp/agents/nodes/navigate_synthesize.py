@@ -19,8 +19,6 @@ from urllib.parse import urlparse
 
 from django.conf import settings
 
-from agents.graph import _log_agent_context, _persist_agent_logs
-
 logger = logging.getLogger(__name__)
 
 NAVIGATION_SYNTHESIZE_BUDGET = 15
@@ -119,7 +117,7 @@ def _load_findings(root: str, slug: str) -> dict:
     """Load navigation_findings.json for a slug (returns {} on failure)."""
     findings_path = os.path.join(root, "workspace", slug, "navigation_findings.json")
     try:
-        with open(findings_path, "r", encoding="utf-8") as f:
+        with open(findings_path, encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
@@ -256,7 +254,7 @@ def navigate_synthesize(state: dict, config=None) -> dict[str, Any]:
 
     # If findings have no data, skip LLM (it would hallucinate) — use fallback
     try:
-        with open(findings_path, "r", encoding="utf-8") as f:
+        with open(findings_path, encoding="utf-8") as f:
             raw_findings = json.load(f)
     except (json.JSONDecodeError, OSError):
         raw_findings = {}
@@ -325,7 +323,7 @@ def _fallback_synthesize(state: dict, root: str, slug: str) -> dict[str, Any]:
 
     findings_path = os.path.join(root, "workspace", slug, "navigation_findings.json")
     try:
-        with open(findings_path, "r", encoding="utf-8") as f:
+        with open(findings_path, encoding="utf-8") as f:
             findings = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         findings = {}
@@ -404,7 +402,8 @@ def _fallback_synthesize(state: dict, root: str, slug: str) -> dict[str, Any]:
     elif findings.get("search_attempted"):
         listing_url_for_search = listing_url if listing_url else ""
         if listing_url_for_search and search_criteria:
-            from urllib.parse import urlparse as _up, parse_qs as _pqs, urlencode as _ue
+            from urllib.parse import parse_qs as _pqs
+            from urllib.parse import urlparse as _up
 
             parsed = _up(listing_url_for_search)
             params = _pqs(parsed.query)

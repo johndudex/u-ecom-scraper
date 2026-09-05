@@ -111,8 +111,8 @@ def get_checkpointer():
         return _checkpointer
 
     from langgraph.checkpoint.postgres import PostgresSaver
-    from psycopg_pool import ConnectionPool
     from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+    from psycopg_pool import ConnectionPool
 
     conn_string = _build_conn_string()
     pool = ConnectionPool(

@@ -169,9 +169,9 @@ def create_job(request):
         with 0 URLs. Mirrors intake_create_job (views.py:2593-2607): best
         effort, an FM outage logs and never breaks create."""
         try:
-            from ..tasks import _generate_slug
-
             import src.artifacts as artifacts
+
+            from ..tasks import _generate_slug
 
             slug = _generate_slug(url)
             artifacts.write_json(
@@ -432,8 +432,7 @@ def download_job_output(request, job_id: int):
                 raise errors.ApiError(
                     404, "output_not_found", "No output for this job."
                 )
-            for chunk in r.iter_bytes():
-                yield chunk
+            yield from r.iter_bytes()
 
     from django.http import StreamingHttpResponse
 

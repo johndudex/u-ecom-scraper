@@ -1155,7 +1155,7 @@ def _read_site_analysis(root: str, slug: str) -> dict[str, Any]:
     """Read site_analysis.json for connectivity info."""
     path = os.path.join(root, "workspace", slug, "site_analysis.json")
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError) as exc:
         logger.warning("navigate_explore: cannot read site_analysis.json: %s", exc)
@@ -1219,7 +1219,7 @@ def _persist_explore_summary(job_id: int, findings: dict) -> None:
             summary += f"  Errors: {', '.join(str(e)[:80] for e in errors[:5])}\n"
         if prods:
             sample_urls = [p.get("href", "") for p in prods[:5]]
-            summary += f"  Sample product URLs:\n"
+            summary += "  Sample product URLs:\n"
             for u in sample_urls:
                 summary += f"    - {u}\n"
 
@@ -2979,7 +2979,6 @@ def _do_explore_via_browser(
                 min(len(search_urls), 6),
                 surl,
             )
-            prev_listing = findings.get("listing_page", {}).copy()
             findings["listing_page"] = {}
             _visit_and_extract(navigate, evaluate, surl, surl, findings)
             new_count = len(
@@ -3352,9 +3351,10 @@ def _fetch_via_probe_html(url: str) -> str:
     country = _detect_country(url)
 
     try:
-        from scraper.models import ProbeCache
-        from django.utils import timezone
         from datetime import timedelta
+
+        from django.utils import timezone
+        from scraper.models import ProbeCache
 
         domain = urlparse(url).hostname or ""
         entry = ProbeCache.objects.filter(domain=domain).first()
@@ -3489,7 +3489,6 @@ def navigate_explore(state: dict, config=None) -> dict[str, Any]:
     # and can navigate interactive sites). Fall back to probe_html only
     # when Playwright MCP is truly unavailable. Even for UC Chrome sites,
     # Playwright MCP Chrome has often proven to work for navigation.
-    use_playwright_first = True
 
     # Detect locale prefix from site_analysis product URL pattern
     effective_url = url

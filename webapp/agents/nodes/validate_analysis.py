@@ -34,7 +34,7 @@ def _load_analysis(slug: str) -> dict | None:
     root = _get_project_root()
     path = os.path.join(root, "workspace", slug, "site_analysis.json")
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             return json.load(fh)
     except (FileNotFoundError, json.JSONDecodeError) as exc:
         logger.warning("validate_analysis: cannot load analysis: %s", exc)

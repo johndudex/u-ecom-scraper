@@ -2,13 +2,12 @@ import json
 import logging
 import os
 import time
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
 class CookieManager:
-    def __init__(self, cookie_dir: Optional[str] = None):
+    def __init__(self, cookie_dir: str | None = None):
         self.cookie_dir = cookie_dir or "/app/data/akamai-cookies"
         os.makedirs(self.cookie_dir, exist_ok=True)
 
@@ -27,7 +26,7 @@ class CookieManager:
             json.dump(payload, f, indent=2)
         logger.info("Saved %d cookies for %s", len(cookies), domain)
 
-    def load_cookies(self, domain: str, max_age_hours: int = 4) -> Optional[list[dict]]:
+    def load_cookies(self, domain: str, max_age_hours: int = 4) -> list[dict] | None:
         path = self._cookie_file(domain)
         if not os.path.exists(path):
             return None

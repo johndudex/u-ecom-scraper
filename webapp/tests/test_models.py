@@ -1,6 +1,5 @@
-from model_bakery import baker
 from django.test import TestCase
-
+from model_bakery import baker
 from scraper.models import Approval, ScrapeJob, Step
 
 
@@ -86,7 +85,7 @@ class TestApprovalModel(TestCase):
 
     def test_ordering(self):
         job = baker.make(ScrapeJob)
-        a1 = baker.make(Approval, job=job)
+        baker.make(Approval, job=job)
         a2 = baker.make(Approval, job=job)
         approvals = list(Approval.objects.all())
         self.assertEqual(approvals[0].id, a2.id)
