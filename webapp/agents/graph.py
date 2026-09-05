@@ -4952,6 +4952,14 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
             _notify_phase(job_id, "code_writer", "failed")
             update["code_writer_error"] = _err_note
             update["code_writer_error_count"] = _err_count + 1
+            # [wave-22 A6] count the wall-clock death here TOO — the S-4
+            # counter only lived in the draft-exists arm, so a timeout that
+            # produced no draft was invisible to the budget telemetry (the
+            # most expensive failure class reported 0 timeouts).
+            if "wall-clock timeout" in _cw_err:
+                update["writer_wall_clock_timeouts"] = int(
+                    state.get("writer_wall_clock_timeouts") or 0
+                ) + 1
             update["messages"] = []
             if _err_count + 1 >= 2:
                 # Second consecutive no-draft — stop burning wall-clock.
@@ -6141,6 +6149,12 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         crashed, tb, probe_yield = _probe_phase1_discovery(slug, dict(state), job_id)
         if crashed:
             report = report or {}
+            # [wave-22 B4] keep the tester's own verdict readable downstream:
+            # the force-FAIL arms used to zero confidence_score outright, so
+            # routing could not tell "tester failed it" from "the probe
+            # overrode a passing verdict" (338 rode in at 0.97).
+            report["phase2_confidence"] = report.get("confidence_score")
+            report["discovery_unvalidated"] = True
             report["overall_assessment"] = "FAIL"
             report["confidence_score"] = 0.0
             report["ready_for_execution"] = False
@@ -6164,8 +6178,22 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 "`session.url` — capture the URL from the response instead)."
             )
             update["test_report"] = report
+            # [wave-22 B4] sibling-arm honesty: name the failure on the final
+            # attempt so the job row never dies with the generic
+            # "Pipeline ended before execution" fallback (338's headline).
+            _retry_c = state.get("test_retry_count", 0)
+            _is_last_c = (
+                _retry_c == FINAL_RETRY_SENTINEL or _retry_c >= MAX_TEST_RETRIES
+            )
+            if _is_last_c:
+                update["error_message"] = (
+                    "Phase-1 discovery crashed: " + (tb or "")
+                    + " — retries exhausted; refusing execution."
+                )
+                update["execution_status"] = "FAILED"
             logger.warning(
-                "_invoke_code_tester: discovery probe FAILED the test (job %s) → retry", job_id
+                "_invoke_code_tester: discovery probe FAILED the test (job %s, "
+                "retry_count=%s) → retry", job_id, _retry_c
             )
         elif (
             probe_yield is not None
@@ -6184,6 +6212,9 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             )
         elif probe_yield is not None and _probe_yield_dead(probe_yield):
             report = report or {}
+            # [wave-22 B4] preserve the tester's verdict before zeroing.
+            report["phase2_confidence"] = report.get("confidence_score")
+            report["discovery_unvalidated"] = True
             report["overall_assessment"] = "FAIL"
             report["confidence_score"] = 0.0
             report["ready_for_execution"] = False
@@ -6317,6 +6348,8 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 )
         if _cli_violation:
             report = report or {}
+            # [wave-22 B4] preserve the tester's verdict before zeroing.
+            report["phase2_confidence"] = report.get("confidence_score")
             report["overall_assessment"] = "FAIL"
             report["confidence_score"] = 0.0
             report["ready_for_execution"] = False

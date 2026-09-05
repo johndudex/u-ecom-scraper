@@ -132,12 +132,19 @@ class TestBudgetComposition:
 
     def test_task_defaults_were_raised_for_full_catalogue_runs(self):
         """[job-68 theiconic] The old 2h soft limit killed a heavy job at
-        exactly task-start + 7200s. The fallbacks in tasks.py must match the
-        new 3h / 3h6m defaults."""
+        exactly task-start + 7200s. [wave-22 A1] The knobs are real settings
+        now (the old getattr fallbacks in tasks.py were the ONLY values ever
+        in force because settings never defined the attributes); tasks.py
+        must read them verbatim with no independent fallback."""
+        from django.conf import settings
+
         with open(os.path.join(ROOT, "webapp", "scraper", "tasks.py")) as fh:
             src = fh.read()
-        assert '"CELERY_TASK_SOFT_TIME_LIMIT", 10800' in src
-        assert '"CELERY_TASK_TIME_LIMIT", 11160' in src
+        assert "settings.CELERY_TASK_SOFT_TIME_LIMIT" in src
+        assert "settings.CELERY_TASK_TIME_LIMIT" in src
+        # the silent-3h fallback must be gone, not merely shadowed
+        assert 'getattr(_settings, "CELERY_TASK_SOFT_TIME_LIMIT"' not in src
+        assert int(settings.CELERY_TASK_SOFT_TIME_LIMIT) >= 12660
 
 
 class TestMonitorWiring:

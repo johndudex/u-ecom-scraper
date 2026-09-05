@@ -153,6 +153,25 @@ CELERY_TASK_ACKS_LATE = config("CELERY_TASK_ACKS_LATE", default=False, cast=bool
 CELERY_TASK_REJECT_ON_WORKER_LOST = config(
     "CELERY_TASK_REJECT_ON_WORKER_LOST", default=False, cast=bool
 )
+# [wave-22 A1] Process-level deadline for run_scrape_task. tasks.py bakes
+# these into the @shared_task decorator at import time; before wave-22 the
+# attributes were never defined here, so the documented "tune via settings"
+# knob was silently dead and the 3h getattr default was the only value ever
+# in force (prod jobs 365/370/371/372 all died SoftTimeLimitExceeded at 3h).
+# Defaults clear the full legal pipeline: EXECUTION_MAX_TIMEOUT (9600) +
+# worst observed pre-exec (~2700: probe ladder + 3-4 LLM phases + tester)
+# + finalize grace (360) = 12660 < 12960; hard = soft + 360 finalize window.
+CELERY_TASK_SOFT_TIME_LIMIT = config(
+    "CELERY_TASK_SOFT_TIME_LIMIT", default=12960, cast=int
+)
+CELERY_TASK_TIME_LIMIT = config("CELERY_TASK_TIME_LIMIT", default=13320, cast=int)
+# [wave-22 D3] deploy identity — /api/version/ reads these so "what does prod
+# run" is one authenticated GET (Railway injects the commit SHA; celery.py
+# already consumes the same variable).
+RAILWAY_GIT_COMMIT_SHA = config("RAILWAY_GIT_COMMIT_SHA", default="")
+WAVE_TAG = config("WAVE_TAG", default="")
+WAVE_BRANCH = config("WAVE_BRANCH", default="")
+WAVE_BUILT_AT = config("WAVE_BUILT_AT", default="")
 CELERY_BEAT_SCHEDULE = {
     "cleanup-stuck-jobs": {
         "task": "scraper.tasks.cleanup_stuck_jobs",

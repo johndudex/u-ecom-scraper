@@ -76,7 +76,7 @@ When a product has `status_code` 200 and all fields populated but `title` matche
 - This is an anti-bot redirect or error page captured by the scraper.
 - Flag as WRONG_VALUE with severity high. The scraper architecture may be correct but the site blocked the session.
 
-If ALL sampled URLs are dead (all non-200), set `overall_assessment` to PASS with `confidence_score` 1.0 and note 'all sampled URLs are dead — cannot assess scraper quality, but no scraper errors detected'.
+If ALL sampled URLs are dead (all non-200), set `overall_assessment` to FAIL with `confidence_score` 0.0 and add a HIGH-severity `dead_sample` issue listing each dead URL and its status. A sample where nothing survived cannot prove the scraper works — passing on absence is how broken drafts reached execution. EXCEPTION: if the same testing phase carries live yield evidence elsewhere (the discovery probe found >0 item URLs, or an earlier attempt's output file holds real items), keep the report's existing assessment for the LIVE evidence and still add the HIGH-severity `dead_sample` issue plus a re-seed/remap request naming a replacement sample URL. In either case do NOT set `phases_tested.phase1_discovery` to true from dead-sample evidence alone.
 
 ## Optional Fields
 

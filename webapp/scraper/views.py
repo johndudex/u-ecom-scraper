@@ -2373,6 +2373,28 @@ def health_api(request):
 
 
 @login_required
+def version_api(request):
+    """[wave-22 D3] What does prod run — as a GET, not an archaeology dig.
+
+    The deploy path (tree-sync → aimleap fork → Railway) keeps no git remote
+    on this repo, and the prod images carry no .git, so answering "which
+    commit is live" used to take a forensic agent. Railway injects
+    RAILWAY_GIT_COMMIT_SHA (celery.py already consumes it); WAVE_TAG is set
+    per deploy for human-readable archaeology.
+    """
+    from django.conf import settings as dj_settings
+
+    return JsonResponse(
+        {
+            "git_sha": getattr(dj_settings, "RAILWAY_GIT_COMMIT_SHA", "") or "local-dev",
+            "wave": getattr(dj_settings, "WAVE_TAG", "") or "",
+            "branch": getattr(dj_settings, "WAVE_BRANCH", "") or "",
+            "built_at": getattr(dj_settings, "WAVE_BUILT_AT", "") or "",
+        }
+    )
+
+
+@login_required
 def health_dashboard(request):
     return render(request, "scraper/health.html")
 

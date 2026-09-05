@@ -1889,5 +1889,11 @@ def route_after_testing(state: ScrapeState) -> str:
         retry_count,
         assessment,
     )
+    # [wave-22 B5] the catch-all arm used to be the one route RCAs could
+    # never see — log it like every sibling arm.
+    _log_cascade(
+        state, "exhausted-human-approval",
+        f"retries exhausted, assessment={assessment} confidence={confidence:.2f}",
+    )
 
     return "human_approval"

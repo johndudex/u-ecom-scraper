@@ -211,19 +211,18 @@ def _on_task_process_death(
 # KEEPS RUNNING, so only a process-level kill reclaims it (and the worker slot).
 # soft_time_limit → SoftTimeLimitExceeded (task can catch + finalize the job);
 # time_limit → Celery SIGKILLs the worker (reclaims the abandoned thread + any
-# leaked resources). Defaults (3h / 3h6m) sit above a full-catalogue run:
-# graph phases + an EXECUTION_MAX_TIMEOUT-capped subprocess must fit inside
-# the soft limit for the job to finalize [job-68 theiconic died at exactly 2h
-# mid-code-tester under the old 2h default; job-315 citybeach needs ~110 min
-# total]. Tune via settings if a site needs more.
-try:
-    from django.conf import settings as _settings
-    _RUN_TASK_SOFT_TIME_LIMIT = int(
-        getattr(_settings, "CELERY_TASK_SOFT_TIME_LIMIT", 10800)
-    )
-    _RUN_TASK_TIME_LIMIT = int(getattr(_settings, "CELERY_TASK_TIME_LIMIT", 11160))
-except Exception:
-    _RUN_TASK_SOFT_TIME_LIMIT, _RUN_TASK_TIME_LIMIT = 10800, 11160
+# leaked resources). [wave-22 A1] The values are REAL settings now
+# (settings.py:CELERY_TASK_*_TIME_LIMIT, env-overridable) — previously the
+# getattr fallbacks here were the only values ever in force because settings
+# never defined the attributes (prod 365/370/371/372 died at the silent 3h
+# default). Defaults (3.6h / 3.7h) clear EXECUTION_MAX_TIMEOUT (9600s) plus
+# the worst observed pre-exec window plus finalize grace [job-68 theiconic
+# died at exactly 2h mid-code-tester under the old 2h default; job-315
+# citybeach needs ~110 min total].
+from django.conf import settings as _settings  # noqa: E402
+
+_RUN_TASK_SOFT_TIME_LIMIT = int(_settings.CELERY_TASK_SOFT_TIME_LIMIT)
+_RUN_TASK_TIME_LIMIT = int(_settings.CELERY_TASK_TIME_LIMIT)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -990,9 +989,32 @@ def _diagnose_no_execution(site_slug: str, job_id: int) -> str:
                     "never ran — the pipeline ended between approval and "
                     "execution (interrupt/resume gap), not a scraper failure"
                 )[:2000]
-            # A non-PASS report IS the exhausted-cascade case — keep the
-            # historical message for it.
-            break
+            # [wave-22 B5] A non-PASS report IS the exhausted-cascade case —
+            # but the pipeline already KNOWS why it failed; quote the latest
+            # report's verdict and its first HIGH-severity issue instead of
+            # the canned sentence (338's headline hid a full verdict that
+            # named the exact extraction defect).
+            _first_high = ""
+            for _issue in report.get("issues") or []:
+                if (
+                    isinstance(_issue, dict)
+                    and str(_issue.get("severity", "")).lower() == "high"
+                    and (_issue.get("message") or _issue.get("description"))
+                ):
+                    _first_high = str(
+                        _issue.get("message") or _issue.get("description")
+                    )
+                    break
+            # Keep the historical job-77 phrase as the prefix (downstream
+            # greps and the job-77 test pin it), then append the REAL verdict.
+            _verdict = (
+                "Pipeline ended before execution (testing cascade exhausted "
+                "without a passing run) — latest test verdict: "
+                f"{assessment or 'UNJUDGED'} (confidence={confidence:.2f})."
+            )
+            if _first_high:
+                _verdict += f" First high-severity issue: {_first_high}"
+            return _verdict[:2000]
     except Exception:
         pass
     return (

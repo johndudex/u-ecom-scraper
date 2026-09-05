@@ -112,6 +112,7 @@ urlpatterns = [
     path("learnt-skills/<slug:skill_name>/update/", views.learnt_skill_update, name="learnt_skill_update"),
     path("learnt-skills/<slug:skill_name>/delete/", views.learnt_skill_delete, name="learnt_skill_delete"),
     path("api/health/", views.health_api, name="health_api"),
+    path("api/version/", views.version_api, name="version_api"),
     path("jobs-dashboard/", views.jobs_dashboard, name="jobs_dashboard"),
     path("intake/", views.intake, name="intake"),
     path("intake/check-site/", views.intake_check_site, name="intake_check_site"),
