@@ -118,3 +118,46 @@ analyzer. Best-effort: even a live non-PDP page beats re-analyzing a 404.
 4. Negative-path proof: re-dispatch the dead seed URL locally and expect a
    FAST, clearly-worded failure at check_accessibility (not 3 freeze cycles).
 5. Only then: wave-20 + wave-21 PR → Railway → prod re-drive 359/360.
+
+## Validation results (2026-09-06, local Docker e2e)
+
+| Job | Site | Seed | Expected | Actual |
+|-----|------|------|----------|--------|
+| 337 | marimekko-com | DEAD (404, no variant suffix) | fast honest handling, no freeze cycle | **COMPLETED, 10 real priced products** |
+| 338 | michaelhill-com-au | LIVE (`/p/…18353730.html`) | happy-path COMPLETED | **FAILED** — writer/tester cascade exhausted (NOT wave-21) |
+
+### 337 (negative proof — landed)
+- T5 stopped the ladder at the FIRST rung: `[PROBE] URL not found (HTTP 404) —
+  page does not exist` → `ALL methods failed. Tried: direct_http` (1 rung vs
+  the pre-fix 15+ rung walk), and NO marimekko ProbeCache row was written
+  (all-failed captcha write correctly skipped; verified in scraper_probecache).
+- The listing probe (separate advisory path) still succeeded, so the job
+  continued; product_analyzer found the seed 404'd, SELF-HEALED to the live
+  variant URL (`…-cardigan-dark-blue-blue-095720-055`), and mapped from the
+  real 996 KB PDP (JSON-LD Product + ProductGroup).
+- Because the analyzer healed the seed before validate_coverage, T6/T7 were
+  not exercised live — they remain unit-tested only (correct: they are
+  backstops for when the analyzer CANNOT find a live page).
+- Output verified: 10 knitwear items, titles/prices/currency/availability,
+  canonical PDP URLs.
+
+### 338 (positive control — honest FAIL, not wave-21)
+- All four wave-21 gates behaved correctly (probe honest, ladder normal,
+  coverage 57% → auto-approved, remap never engaged).
+- Death cause: writer/tester cascade on a genuinely hard site (Nuxt3 CSR +
+  SFCC; listing serves ZERO anchors over HTTP). Mid-cascade the writer's own
+  edit introduced `NameError: _discovery_cfg` (used at draft line 850,
+  definition dropped); tester caught it and prescribed the exact fix; the
+  fix IS in the final draft (defined in main() before both call sites) but
+  the cascade was already exhausted (count=2) so it was never re-tested.
+  Headline error quotes the STALE crash.
+- Local run used skip_approvals → cascade exhaustion = FAIL. In prod this
+  parks at human_approval for review instead (route log says so explicitly).
+- Final exec did extract real products (titles/sku/brand/AUD) — remaining
+  gap: price/availability empty (payload price parse), exactly what the
+  tester's remediation targets.
+
+### Decision
+Wave-21 stands as shipped (b8d0304). Next: wave-20 + wave-21 PR → Railway,
+then prod re-drive 359/360. michaelhill re-drive belongs to the prod campaign
+(A LISTED never-succeeded site), where the human gate is armed.
