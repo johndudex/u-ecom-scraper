@@ -5247,6 +5247,90 @@ def _state_at_next_tier(state: dict) -> tuple[dict | None, str, str]:
     return new_state, next_tier, previous
 
 
+def _discovered_url_issues(urls, job_url: str) -> list[str]:
+    """[wave-19 T1.9] Discovered-URL hygiene: URLs that are NOT absolute
+    http(s) pointing at the job's own registrable domain.
+
+    The myhouse class (local e2e job 332): listing nodes carry
+    PROTOCOL-RELATIVE paths (``'//products/x'``) which survive
+    ``urljoin(SITE_URL, ...)`` as ``https://products/x`` — the path's first
+    segment silently becomes the netloc. Discovery then reports a healthy
+    count while every execution fetch dies on a nonexistent host. Judged the
+    same way the traverse contamination gate judges traversal results
+    (registrable-domain ownership). No job URL / no resolver → no ownership,
+    no flags (gate no-ops)."""
+    try:
+        from urllib.parse import urlsplit
+
+        from experimental.nav_traversal.traversal import _registrable
+    except Exception:
+        return []
+    job_reg = _registrable(job_url or "")
+    if not job_reg:
+        return []
+    bad: list[str] = []
+    for u in urls or []:
+        s = u if isinstance(u, str) else str(u)
+        parts = urlsplit(s.strip())
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            bad.append(s)
+            continue
+        if _registrable(s) != job_reg:
+            bad.append(s)
+    return bad
+
+
+def _discovery_yield_hygiene(probe_yield: dict, urls, job_url: str) -> dict:
+    """[wave-19 T1.9] A majority-malformed discovered-URL list DEADENS the
+    probe yield: ``discovered_urls -> 0`` with ``stop_reason =
+    'malformed_discovery_urls'`` so the deterministic zero-yield FAIL arm owns
+    it (precise writer feedback instead of a 10-fetch execution burn) and the
+    tier escalation still applies. Healthy majority / no url list / zero
+    yield → unchanged."""
+    if not isinstance(probe_yield, dict):
+        return probe_yield
+    try:
+        if int(probe_yield.get("discovered_urls") or 0) <= 0:
+            return probe_yield
+    except (TypeError, ValueError):
+        return probe_yield
+    if not urls:
+        return probe_yield  # url list unavailable — gate no-ops
+    bad = _discovered_url_issues(urls, job_url)
+    if len(bad) * 2 <= len(urls):
+        return probe_yield
+    dead = dict(probe_yield)
+    dead["discovered_urls"] = 0
+    dead["stop_reason"] = "malformed_discovery_urls"
+    cov = dict(dead.get("coverage") or {})
+    cov["hygiene"] = {
+        "malformed": len(bad),
+        "total": len(urls),
+        "examples": [str(b)[:120] for b in bad[:3]],
+    }
+    dead["coverage"] = cov
+    return dead
+
+
+def _read_probe_discovered_urls(workspace_dir: str, mtime_floor: float) -> list[str]:
+    """URLs the probe's ``--discover-only`` run just wrote to the draft's
+    ``input_urls.json`` (mtime-floored — a pre-probe seed file must never
+    yield a verdict). Missing/stale/unreadable → [] (gate no-ops)."""
+    import json as _json
+    import os as _os
+
+    path = _os.path.join(workspace_dir, "input_urls.json")
+    try:
+        if not _os.path.isfile(path) or _os.path.getmtime(path) < mtime_floor:
+            return []
+        with open(path, encoding="utf-8") as fh:
+            data = _json.load(fh)
+    except Exception:
+        return []
+    urls = data.get("urls") if isinstance(data, dict) else data
+    return urls if isinstance(urls, list) else []
+
+
 def _probe_phase1_discovery(
     slug: str, state: dict, job_id: int
 ) -> tuple[bool, str | None, dict | None]:
@@ -5545,6 +5629,30 @@ def _probe_phase1_discovery_once(
                     _disc_n, _sr or "?", os.path.basename(_probe_out),
                     _stdout.strip()[-200:],
                 )
+                # [wave-19 T1.9] Hygiene: the probe counts URLs, never their
+                # SHAPE. A majority-malformed list (myhouse '//products/x' →
+                # 'https://products/x') must deaden the yield HERE — not burn
+                # execution's fetches on a nonexistent host. The url list is
+                # the draft's own fresh input_urls.json (mtime-floored).
+                try:
+                    _hy_urls = _read_probe_discovered_urls(
+                        os.path.join(root, "workspace", slug),
+                        _probe_started - 5,
+                    )
+                    if _hy_urls:
+                        probe_yield = _discovery_yield_hygiene(
+                            probe_yield, _hy_urls, state.get("url") or ""
+                        )
+                        if probe_yield.get("stop_reason") == "malformed_discovery_urls":
+                            logger.error(
+                                "_probe_phase1_discovery: HYGIENE — majority of "
+                                "discovered URLs fail shape/domain checks (job %s, "
+                                "examples=%s) — yield deadened",
+                                job_id,
+                                (probe_yield.get("coverage", {}).get("hygiene", {}).get("examples") or [])[:2],
+                            )
+                except Exception:
+                    pass
             else:
                 logger.info(
                     "_probe_phase1_discovery: no fresh probe output — yield "

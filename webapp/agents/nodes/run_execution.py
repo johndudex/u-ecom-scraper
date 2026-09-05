@@ -1432,6 +1432,11 @@ def _run_in_process(
             target_fields=target_fields,
         )
         if _q:
+            # [wave-19 T1.9] same diagnosis as the subprocess path — the
+            # in-process run burns fetches on malformed hosts just the same.
+            _hy = _hygiene_diagnosis(output_file, listing_url_env)
+            if _hy:
+                _q += _hy
             return {
                 "execution_status": "FAILED",
                 "output_file": output_file,
@@ -1715,6 +1720,13 @@ def _run_via_browser_service(
             target_fields=list(state.get("target_fields") or []),
         )
         if _q:
+            # [wave-19 T1.9] Name the myhouse class when it fires: a collapsed
+            # extraction whose DISCOVERED URLs fail shape/domain hygiene is a
+            # URL-construction bug, not a selector bug — say so.
+            _hy = _hygiene_diagnosis(output_file, state.get("url") or "")
+            if _hy:
+                _q += _hy
+                logger.error("run_execution: %s", _hy.strip())
             _notify_phase(_exec_job_id, "execution", "failed")
             return {
                 "execution_status": "FAILED",
@@ -1861,6 +1873,37 @@ def prune_empty_records(output_file: str, target_fields: list[str] | None = None
                 return removed
             return 0
     return 0
+
+
+def _hygiene_diagnosis(output_file: str, anchor_url: str) -> str:
+    """[wave-19 T1.9] When the run's discovered-URL set (the draft's own fresh
+    ``input_urls.json``) fails shape/domain hygiene by a majority, return the
+    diagnostic sentence naming the myhouse class — protocol-relative payload
+    paths surviving urljoin as a bogus netloc ('https://products/x'). Empty
+    when the url list is missing or healthy (gate no-ops)."""
+    try:
+        from ..graph import _discovered_url_issues
+
+        seed_p = os.path.join(os.path.dirname(output_file or ""), "input_urls.json")
+        urls: list = []
+        if seed_p and os.path.isfile(seed_p):
+            with open(seed_p, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and isinstance(data.get("urls"), list):
+                urls = data["urls"]
+        if not urls:
+            return ""
+        bad = _discovered_url_issues(urls, anchor_url or "")
+        if len(bad) * 2 > len(urls):
+            return (
+                f" Discovery URL hygiene: {len(bad)}/{len(urls)} "
+                f"discovered URLs fail shape/domain checks "
+                f"(e.g. {bad[0][:100]!r}) — the draft's URL construction is "
+                f"malformed; fix the join, not the selectors."
+            )
+    except Exception:
+        pass
+    return ""
 
 
 def _extraction_quality_gate(

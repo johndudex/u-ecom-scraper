@@ -107,6 +107,8 @@ services:
       LITELLM_BASE_URL: ${LITELLM_BASE_URL:-https://llm.johnjf.xyz/v1}
       LITELLM_API_KEY: ${LITELLM_API_KEY:-}
       LITELLM_ENABLED: ${LITELLM_ENABLED:-true}
+      # canary 177-181 wall-clock lesson: per-invoke agent budget; .env sets 1800
+      AGENT_INVOKE_TIMEOUT: ${AGENT_INVOKE_TIMEOUT:-900}
       # [wave-19 T0.1] Arm the soft-block detector where src.http_fetch runs
       # in-process (tester + run_execution HTTP runs). Code default stays 0
       # (OFF) — 20000 bytes floors the "200-but-empty challenge page" shape

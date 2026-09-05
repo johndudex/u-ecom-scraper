@@ -108,6 +108,26 @@ from src.discovery import discover_item_urls, config_for_load_more
 3. **NEVER define `_click_load_more`, `_safe_eval`, `_get_next_page_url`, or
    any pagination loop inline.** If the template doesn't have the import,
    something is wrong — use the template as-is.
+
+### Discovered-URL construction — the protocol-relative trap (CRITICAL)
+
+Never trust a payload path value as a URL. Listing/API payloads routinely
+carry paths like `//products/x` (the myhouse Next.js `_next/data` shape) or
+`/products/x`. `urljoin(SITE_URL, '//products/x')` silently mints
+`https://products/x` — the path's first segment becomes the netloc, a host
+that does not exist. The harness now FAILS the draft on exactly this (the
+Phase-1 probe deadens a majority-malformed URL list, and the extraction
+quality gate names `Discovery URL hygiene:` in the error), so a URL-shape bug
+costs the whole job, not just one fetch:
+
+- Normalize before joining: a leading `//` is a REAL protocol-relative URL
+  only when the next segment is a plausible netloc (contains a dot,
+  e.g. `//cdn.shopify.com/a.js`). Otherwise strip it to `/...` and join
+  against the site root (`//products/x` → `{SITE_URL}/products/x`).
+- Before finishing, sanity-check your own discovery output: every discovered
+  URL must parse to absolute http(s) on the site's own host. Assert it in a
+  quick local run — a malformed-URL discovery is an honest FAIL, not a
+  "working scraper with a smaller catalogue".
 4. **KEEP the `main()` discovery gate verbatim, in place.** Every nav
    template's `main()` reads, BEFORE the checkpoint/seed-file gate:
    ```python

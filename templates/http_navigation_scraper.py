@@ -508,13 +508,22 @@ _nav_unavailable_class = ""
 
 
 def _make_absolute(href: str) -> str:
-    """Resolve a possibly-relative href against SITE_URL."""
+    """Resolve a possibly-relative href against SITE_URL.
+
+    [wave-19 T1.9] A leading '//' is protocol-relative ONLY when the next
+    segment is a plausible netloc (contains a dot — '//cdn.shopify.com/x').
+    Otherwise it is a MALFORMED site path ('//products/x' — the myhouse
+    listing-payload shape): treating it as a host yields 'https://products/x',
+    a URL no fetch can ever resolve."""
     if not href:
         return ""
     if href.startswith(("http://", "https://")):
         return href
     if href.startswith("//"):
-        return "https:" + href
+        rest = href[2:]
+        if "." in rest.split("/", 1)[0]:
+            return "https:" + href
+        return SITE_URL.rstrip("/") + "/" + rest
     if href.startswith("/"):
         return SITE_URL.rstrip("/") + href
     return SITE_URL.rstrip("/") + "/" + href
