@@ -1178,6 +1178,149 @@ def _log_cascade(state: ScrapeState, action: str, reason: str) -> None:
         pass
 
 
+def draft_file_fp(path: str) -> str:
+    """[wave-22 B2] sha1 of the draft on disk ("" when absent/unreadable).
+
+    Self-contained (no graph import — graph imports this module's node, so the
+    reverse would be circular). The tester node uses the same helper to stamp
+    ``last_tested_draft_fp``; the router uses it to compare, so both sides
+    hash identically by construction.
+    """
+    import hashlib
+
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha1(fh.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _terminal_after_retest_check(state: ScrapeState, dest: str) -> str:
+    """[wave-22 B2] Never terminate on a draft the tester never judged.
+
+    Prod shape (329): a leaked writer thread edited the draft AFTER the
+    tester's verdict; the cascade then terminated on a report describing a
+    draft that no longer exists. Before ANY terminal cleanup/human_approval,
+    if the current draft's fingerprint differs from the last JUDGED one, spend
+    ONE forced tester pass on what is actually on disk.
+
+    Guards (each returns ``dest`` unchanged):
+    - per-job cap 1 via ``forced_retest_count`` — the tester node consumes the
+      allowance when it enters with this exact mismatch signature, so a
+      forced pass that fails to produce a verdict cannot bounce here forever;
+    - ``tester_wall_clock_timeouts >= 2`` — twice against the same wall is a
+      wall, not a draft that needs testing (the ×2 arm stays authoritative);
+    - no prior judged fingerprint — nothing was ever tested (fresh job shapes
+      route through the no-report ladder instead);
+    - no readable draft — nothing on disk to test.
+    """
+    if dest not in ("cleanup", "human_approval"):
+        return dest
+    if int(state.get("forced_retest_count") or 0) >= 1:
+        return dest
+    if int(state.get("tester_wall_clock_timeouts") or 0) >= 2:
+        return dest
+    last_fp = str(state.get("last_tested_draft_fp") or "")
+    if not last_fp:
+        return dest
+    slug = str(state.get("site_slug") or "")
+    if not slug:
+        return dest
+    import os as _os
+
+    path = _os.path.join(
+        _os.environ.get("PROJECT_ROOT", "/app"),
+        "workspace", slug, "scraper_draft.py",
+    )
+    cur_fp = draft_file_fp(path)
+    if not cur_fp or cur_fp == last_fp:
+        return dest
+    logger.warning(
+        "route_after_testing: draft changed since last verdict (fp %s…→%s…) "
+        "→ ONE forced re-test before %s",
+        last_fp[:8], cur_fp[:8], dest,
+    )
+    _log_cascade(state, "forced-retest", "draft ≠ last tested draft")
+    return "code_tester"
+
+
+def _remediation_fingerprint(report) -> str:
+    """[wave-22 B3] Structural identity of a report's remediation ask.
+
+    NEVER hashes the free-text ``fix`` — writers paraphrase the same defect a
+    dozen ways and a text hash would call every cycle "new" (the ballooning
+    loop re-opened). Key = target + field + sorted issue-type set + exception
+    class. "" when the report carries nothing structural to attempt.
+    """
+    if not isinstance(report, dict):
+        return ""
+    rem = report.get("remediation")
+    if not isinstance(rem, dict):
+        return ""
+    target = str(rem.get("target") or "").strip()
+    field = str(rem.get("field") or "").strip()
+    types = sorted(
+        {
+            str(i.get("issue_type") or "").strip().upper()
+            for i in (report.get("issues") or [])
+            if isinstance(i, dict)
+        }
+        - {""}
+    )
+    crash = str(report.get("crash_error") or "")
+    _m = _TRACEBACK_RE.search(crash)
+    exc = _m.group(0).split(":")[0].strip() if _m else ""
+    if not (target or field or types or exc):
+        return ""
+    import hashlib
+    import json as _json
+
+    payload = _json.dumps(
+        {"target": target, "field": field, "issue_types": types, "exception": exc},
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _terminal_after_grace_check(state: ScrapeState, dest: str) -> str:
+    """[wave-22 B3] One grace fix cycle when the exhausted ladder would
+    terminate with a NEVER-attempted remediation sitting in the report.
+
+    Prod shape (359/360): the tester isolated the defect with
+    ``remediation.target`` + a concrete field, but the retry budget was gone —
+    the fix was never attempted. Grants ONE writer cycle for a structurally
+    NEW remediation only; the writer node appends each attempted fingerprint
+    to ``remediation_fps_seen`` and consumes the ``remediation_grace_used``
+    allowance when it enters on the grace signature, so a repeat diagnosis
+    (same structure, new prose) cannot re-open the ballooning loop.
+
+    Guards (each returns ``dest`` unchanged):
+    - FINAL_RETRY_SENTINEL — a human-approved final retry has its own
+      contract; the grace never overrides it;
+    - no structural fingerprint in the report — nothing concrete to attempt;
+    - fingerprint already attempted this job;
+    - per-job allowance spent (hard cap 1).
+    """
+    if dest not in ("cleanup", "human_approval"):
+        return dest
+    if state.get("test_retry_count") == FINAL_RETRY_SENTINEL:
+        return dest
+    if int(state.get("remediation_grace_used") or 0) >= 1:
+        return dest
+    fp = _remediation_fingerprint(state.get("test_report"))
+    if not fp:
+        return dest
+    if fp in (state.get("remediation_fps_seen") or []):
+        return dest
+    logger.warning(
+        "route_after_testing: exhausted ladder but report carries a "
+        "never-attempted remediation (fp %s…) → ONE grace code_writer cycle",
+        fp[:8],
+    )
+    _log_cascade(state, "remediation-grace", "new remediation, budget exhausted")
+    return "code_writer"
+
+
 def route_after_testing(state: ScrapeState) -> str:
     report = state.get("test_report")
     retry_count = state.get("test_retry_count", 0)
@@ -1235,7 +1378,7 @@ def route_after_testing(state: ScrapeState) -> str:
                 "route_after_testing: code_tester wall-clock ×2, no verdict "
                 "→ human_approval (draft unjudged)"
             )
-            return "human_approval"
+            return _terminal_after_retest_check(state, "human_approval")
         if is_final_attempt:
             # Output-file rescue: even with no test_report, the scraper may have
             # produced real output during testing. Under skip_approvals,
@@ -1250,7 +1393,7 @@ def route_after_testing(state: ScrapeState) -> str:
             logger.error(
                 "route_after_testing: FINAL attempt produced no test_report → cleanup"
             )
-            return "cleanup"
+            return _terminal_after_retest_check(state, "cleanup")
         if retry_count < MAX_TEST_RETRIES:
             logger.warning(
                 "route_after_testing: no test_report, retry %d/%d via scraper_analyzer",
@@ -1271,7 +1414,7 @@ def route_after_testing(state: ScrapeState) -> str:
             "route_after_testing: no test_report after %d retries → cleanup",
             retry_count,
         )
-        return "cleanup"
+        return _terminal_after_retest_check(state, "cleanup")
 
     assessment = report.get("overall_assessment", "FAIL")
     try:
@@ -1608,12 +1751,12 @@ def route_after_testing(state: ScrapeState) -> str:
                     "route_after_testing: CLI contract violation + retries "
                     "exhausted + skip_approvals → cleanup (honest failure)"
                 )
-                return "cleanup"
+                return _terminal_after_retest_check(state, "cleanup")
             logger.error(
                 "route_after_testing: CLI contract violation + retries "
                 "exhausted → human_approval"
             )
-            return "human_approval"
+            return _terminal_after_retest_check(state, "human_approval")
         logger.info(
             "route_after_testing: CLI contract violation → code_writer "
             "(targeted fix, retry %d/%d)",
@@ -1645,14 +1788,14 @@ def route_after_testing(state: ScrapeState) -> str:
                 assessment,
                 confidence,
             )
-            return "cleanup"
+            return _terminal_after_retest_check(state, "cleanup")
         logger.error(
             "route_after_testing: FINAL attempt FAILED (assessment=%s, confidence=%.2f) "
             "→ human_approval",
             assessment,
             confidence,
         )
-        return "human_approval"
+        return _terminal_after_retest_check(state, "human_approval")
 
     # ── Strategy cascade ────────────────────────────────────────────────
     # Classify WHY the test failed: access/strategy-class (switch strategy) vs
@@ -1722,13 +1865,13 @@ def route_after_testing(state: ScrapeState) -> str:
                 "skip_approvals → cleanup (honest failure: nothing to test)",
                 _absent_n,
             )
-            return "cleanup"
+            return _terminal_after_retest_check(state, "cleanup")
         logger.error(
             "route_after_testing: draft absent %d cycles in a row → "
             "human_approval (writer cannot deliver a draft)",
             _absent_n,
         )
-        return "human_approval"
+        return _terminal_after_retest_check(state, "human_approval")
 
     # [wave-16 B3] PARK-UNHEALTHY arm — ABOVE the retry-exhausted gate (an
     # infra verdict must not consume the fix budget, and a downed gateway can
@@ -1787,13 +1930,17 @@ def route_after_testing(state: ScrapeState) -> str:
                 "action=%s, reason=%s) → FAIL (skip_approvals job, no human to break the loop)",
                 retry_count, _action, _reason,
             )
-            return "cleanup"
+            return _terminal_after_retest_check(
+                state, _terminal_after_grace_check(state, "cleanup")
+            )
         logger.warning(
             "route_after_testing: retries exhausted in cascade (count=%d, "
             "action=%s, reason=%s) → human_approval",
             retry_count, _action, _reason,
         )
-        return "human_approval"
+        return _terminal_after_retest_check(
+            state, _terminal_after_grace_check(state, "human_approval")
+        )
 
     # [A1/QW-3] "retest": unproven coverage (429 / browser-service throttle /
     # transient render block). Re-test the SAME draft — code_tester →
@@ -1910,4 +2057,6 @@ def route_after_testing(state: ScrapeState) -> str:
         f"retries exhausted, assessment={assessment} confidence={confidence:.2f}",
     )
 
-    return "human_approval"
+    return _terminal_after_retest_check(
+        state, _terminal_after_grace_check(state, "human_approval")
+    )

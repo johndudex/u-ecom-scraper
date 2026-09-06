@@ -196,8 +196,14 @@ def _jsonld_types_for(page_type: str) -> tuple[str, ...]:
         return ()
 
 
-def _fetch_render(url: str, start_method: str) -> tuple[str | None, str]:
-    """ONE /render call. Returns (html, method_used); html None on failure."""
+def _fetch_render(url: str, start_method: str) -> tuple[str | None, str, bool | None]:
+    """ONE /render call. Returns (html, method_used, html_truncated).
+
+    ``html_truncated`` mirrors the /render flag; ``None`` when the response
+    predates it (deploy-order window: new celery against an old
+    browser_service) — callers must treat ``None`` as "fidelity unknown",
+    never as proof of either.
+    """
     try:
         import httpx
 
@@ -211,10 +217,13 @@ def _fetch_render(url: str, start_method: str) -> tuple[str | None, str]:
         resp.raise_for_status()
         data = resp.json()
         if data.get("success") and data.get("html"):
-            return data["html"], str(data.get("method") or "?")
-        return None, str(data.get("error") or "render failed")
+            flag = data.get("html_truncated", None)
+            return data["html"], str(data.get("method") or "?"), (
+                bool(flag) if flag is not None else None
+            )
+        return None, str(data.get("error") or "render failed"), None
     except Exception as exc:
-        return None, str(exc)[:200]
+        return None, str(exc)[:200], None
 
 
 def verify_field_mappings(
@@ -243,13 +252,34 @@ def verify_field_mappings(
     conn = probe.get("connectivity") if isinstance(probe.get("connectivity"), dict) else {}
     start_method = str(conn.get("method_that_worked") or "").strip()
 
-    html, method_used = _fetch_render(url, start_method)
+    html, method_used, html_truncated = _fetch_render(url, start_method)
     if not html:
         logger.warning(
             "field_verification: render failed for %s (%s) — fields left unverified",
             url[:80], method_used,
         )
         return analysis, {"error": method_used}
+
+    # [wave-22 C2] Render provenance. An "empty" verdict is only evidence the
+    # mapping is dead when the render was FULL-FIDELITY: the answered rung is
+    # the requested one (no escalation to a different access path) AND the
+    # HTML was not truncated (no silent cut). Anything less — degraded or
+    # unknown — blocks the T3.13e downgrade: the "empty" is recorded as
+    # "skipped" so presence credit survives, and the field is stamped with
+    # the provenance so downstream readers can see why.
+    rung_match = (not start_method) or (method_used == start_method)
+    if html_truncated is None:
+        provenance = "unknown"
+    elif html_truncated or not rung_match:
+        provenance = "degraded"
+    else:
+        provenance = "full"
+    if provenance != "full":
+        logger.warning(
+            "field_verification: render provenance %s (requested=%s answered=%s "
+            "truncated=%s) — 'empty' verdicts will NOT strip field coverage",
+            provenance, start_method or "<none>", method_used, html_truncated,
+        )
 
     try:
         from src.page_analysis import extract_jsonld
@@ -259,7 +289,13 @@ def verify_field_mappings(
         jsonld_blocks = []
     jsonld_types = _jsonld_types_for((state.get("page_type") or "product").lower())
 
-    summary = {"verified": 0, "empty": 0, "skipped": 0, "method": method_used}
+    summary = {
+        "verified": 0,
+        "empty": 0,
+        "skipped": 0,
+        "method": method_used,
+        "provenance": provenance,
+    }
     for name, info in fields.items():
         if not isinstance(info, dict):
             continue
@@ -267,6 +303,12 @@ def verify_field_mappings(
             verdict, sample = _resolve_via_render(info, html, jsonld_blocks, jsonld_types)
         except Exception:
             verdict, sample = "skipped", ""
+        # [wave-22 C2] The fail-closed gate: without positive full-fidelity
+        # proof, an "empty" cannot cost coverage — it downgrades to "skipped"
+        # (validate_coverage keeps presence credit for skipped fields).
+        info["render_provenance"] = provenance
+        if verdict == "empty" and provenance != "full":
+            verdict = "skipped"
         info["tested"] = verdict
         if sample:
             info["resolved_value"] = sample

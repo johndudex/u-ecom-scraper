@@ -129,7 +129,7 @@ class TestTerminalRouteLogging:
             os.path.join(ROOT, "webapp", "agents", "nodes", "route_after_testing.py")
         ) as fh:
             src = fh.read()
-        i_tail = src.rindex('return "human_approval"')
+        i_tail = src.rindex('_terminal_after_grace_check(state, "human_approval")')
         block = src[max(0, i_tail - 600): i_tail]
         assert "_log_cascade" in block, (
             "the final catch-all route arm returns without logging its "

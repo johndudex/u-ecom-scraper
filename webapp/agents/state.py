@@ -98,6 +98,21 @@ class ScrapeState(TypedDict, total=False):
     # unchanged (A6: an old output predates this ATTEMPT, not just this job).
     last_tested_draft_fp: str
     last_tested_at: float
+    # [wave-22 B2] forced re-tests consumed this job. route_after_testing
+    # grants ONE code_tester pass when the on-disk draft differs from
+    # last_tested_draft_fp at a terminal verdict; _invoke_code_tester consumes
+    # the allowance when it enters with that mismatch signature, so a forced
+    # pass that dies cannot bounce terminal→code_tester forever.
+    forced_retest_count: int
+    # [wave-22 B3] remediation identity (structural fingerprint of
+    # target+field+issue-type set+exception class — NEVER the free-text fix)
+    # of every remediation the writer has attempted, and the count of grace
+    # fix cycles consumed. The router grants ONE code_writer cycle when an
+    # exhausted ladder would terminate with a never-attempted remediation in
+    # the report; the writer appends its fingerprint on entry and consumes
+    # the allowance on the grace signature (exhausted entry + unseen fp).
+    remediation_fps_seen: list
+    remediation_grace_used: int
     # [S-4 cheap half] consecutive code_writer invocations that died on
     # wall-clock timeout while an existing draft was already on disk. ≥2 means
     # the loop is re-running a 900s writer against a draft it cannot improve —

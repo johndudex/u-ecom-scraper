@@ -4819,6 +4819,45 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     "_invoke_code_writer: FINAL retry cycle (job %s)",
                     job_id,
                 )
+        # [wave-22 B3] Remediation bookkeeping (the router may only route).
+        # EVERY entry with a structural remediation records its fingerprint as
+        # attempted — the router's grace arm fires only on fingerprints absent
+        # from this list, so a repeat diagnosis (same structure, new prose)
+        # never re-earns a cycle. And an entry with the GRACE signature
+        # (exhausted budget + unseen fingerprint + allowance unspent) consumes
+        # the job's ONE grace allowance — win or lose — so the cap holds even
+        # if this invocation never lands a draft.
+        try:
+            from .nodes.route_after_testing import (
+                _remediation_fingerprint as _rem_fp,
+            )
+
+            _b3_fp = _rem_fp(state.get("test_report"))
+            if _b3_fp:
+                _b3_seen = list(state.get("remediation_fps_seen") or [])
+                if _b3_fp not in _b3_seen:
+                    _b3_seen.append(_b3_fp)
+                update["remediation_fps_seen"] = _b3_seen
+                _b3_count = state.get("test_retry_count", 0)
+                _b3_exhausted = (
+                    _b3_count != FINAL_RETRY_SENTINEL
+                    and _b3_count >= MAX_TEST_RETRIES
+                )
+                if (
+                    _b3_exhausted
+                    and int(state.get("remediation_grace_used") or 0) < 1
+                    and _b3_fp not in (state.get("remediation_fps_seen") or [])
+                ):
+                    update["remediation_grace_used"] = (
+                        int(state.get("remediation_grace_used") or 0) + 1
+                    )
+                    logger.warning(
+                        "_invoke_code_writer: remediation grace cycle "
+                        "consumed (budget exhausted, never-attempted fix) — "
+                        "allowance spent (job %s)", job_id,
+                    )
+        except Exception as _b3_exc:
+            logger.debug("_invoke_code_writer: B3 bookkeeping failed: %s", _b3_exc)
         slug = state.get("site_slug", "")
         # Write sample URLs from nav_analysis to input_urls.json so the
         # scraper can use them in --sample mode (skip slow discovery).
@@ -6040,6 +6079,7 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
     # feeds route_after_testing's absent arm (reset on a parseable draft,
     # incremented on absence) because routing functions cannot mutate state.
     _te_absent = 0
+    _te_draft = ""
     try:
         from .draft_safety import draft_parses, restore_job_draft
 
@@ -6066,6 +6106,28 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             )
     except Exception as _te_exc:
         logger.warning("_invoke_code_tester: draft entry guard failed: %s", _te_exc)
+    # [wave-22 B2] Does this invocation ENTER with the forced-re-test
+    # signature — the on-disk draft differs from the last JUDGED one, the
+    # allowance is unspent, and the wall arm is not hot? If so, this pass
+    # spends the job's ONE forced re-test, win or lose: a forced pass that
+    # dies must not leave the router's allowance intact (it would re-bounce
+    # here on every terminal). Uses the router's own draft_file_fp so both
+    # sides hash identically by construction.
+    _b2_forced = False
+    try:
+        from .nodes.route_after_testing import draft_file_fp as _b2_fp
+
+        _b2_prev = str(state.get("last_tested_draft_fp") or "")
+        _b2_cur = _b2_fp(_te_draft) if _te_draft else ""
+        _b2_forced = bool(
+            _b2_prev
+            and _b2_cur
+            and _b2_cur != _b2_prev
+            and int(state.get("forced_retest_count") or 0) < 1
+            and int(state.get("tester_wall_clock_timeouts") or 0) < 2
+        )
+    except Exception as _b2_exc:
+        logger.debug("_invoke_code_tester: B2 signature check failed: %s", _b2_exc)
     # [wave-16 B3] Pre-flight: bounded wait for browser_service health BEFORE
     # the agent invocation. A blip self-heals inside the window; a real outage
     # skips the invocation (the tester's browser run could only die against a
@@ -6118,6 +6180,17 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "code-tester", config)
         update = {"messages": [], "draft_absent_count": _te_absent}
+        if _b2_forced:
+            # [wave-22 B2] This was the forced re-test — the allowance is now
+            # spent regardless of the verdict below, so route_after_testing's
+            # funnel cannot bounce terminal→code_tester more than once a job.
+            update["forced_retest_count"] = (
+                int(state.get("forced_retest_count") or 0) + 1
+            )
+            logger.info(
+                "_invoke_code_tester: forced re-test consumed (draft ≠ last "
+                "judged draft at entry) — allowance spent (job %s)", job_id,
+            )
         # [job-81 N-C] A dead invocation invalidates whatever verdict is on
         # disk: the report was written by a PREVIOUS cycle about a PREVIOUS
         # draft (job 81: the "cascade exhausted" routing consumed cycle-2's
