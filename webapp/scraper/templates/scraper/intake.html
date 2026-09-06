@@ -862,6 +862,12 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     </div>
     <div class="tab-panel" id="libtab-jobs" style="padding:18px 0 0;">
       <p class="lib-tab-desc">All the recent builder jobs — every extraction that's been run in this system, with its status and result.</p>
+      <div class="lib-filter-row">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lib-filter-ico"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+        <select id="job-user-filter" aria-label="filter jobs by user">
+          <option value="">All users</option>
+        </select>
+      </div>
       <div class="tablewrap">
         <table class="runs-table"><thead><tr><th>Job</th><th>Name</th><th>Site</th><th>Owner</th><th>When</th><th>Status</th><th>Records</th><th>Duration</th><th>Action</th></tr></thead><tbody id="jobs-lib-body"></tbody></table>
       </div>
@@ -2199,14 +2205,29 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
 
   function refreshLibrary(){
     if(!INTAKE_CONFIG.jobsLibraryUrl) return;
-    fetch(INTAKE_CONFIG.jobsLibraryUrl).then(function(r){ return r.json(); }).then(function(d){
+    var sel = X('#job-user-filter');
+    var url = INTAKE_CONFIG.jobsLibraryUrl;
+    if(sel && sel.value) url += (url.indexOf('?') > -1 ? '&' : '?') + 'user=' + encodeURIComponent(sel.value);
+    fetch(url).then(function(r){ return r.json(); }).then(function(d){
       var jobs = (d && d.jobs) || [];
       ALL_JOBS = jobs.slice();
       SAVED_EXTRACTORS = jobs.filter(function(j){ return j.is_saved; }).map(jobToSaved);
       _applyMaintenance(d && d.maintenance);
+      if(sel) _syncUserFilter(sel, (d && d.users) || []);
       renderSavedList();
       renderJobsLib();
     }).catch(function(){ /* library will just stay empty */ });
+  }
+
+  function _syncUserFilter(sel, users){
+    // Rebuild the roster from the response, keeping the active selection
+    // across refetches (dropping it if that owner no longer exists).
+    var cur = sel.value;
+    sel.innerHTML = '<option value="">All users</option>' + users.map(function(u){
+      return '<option value="'+escHtml(u.username)+'">'+escHtml(u.username)+' ('+u.job_count+')</option>';
+    }).join('');
+    sel.value = cur;
+    if(sel.value !== cur) sel.value = '';
   }
 
   function renderSavedList(){
@@ -2312,6 +2333,8 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
   }
   function getJobById(id){ return ALL_JOBS.filter(function(j){ return String(j.id) === String(id); })[0]; }
   wireRenameDelegation('jobs-lib-body', getJobById, renderJobsLib);
+  var _jobUserFilter = X('#job-user-filter');
+  if(_jobUserFilter) _jobUserFilter.addEventListener('change', function(){ refreshLibrary(); });
   X('#jobs-lib-body').addEventListener('click', function(e){
     var b = e.target.closest('[data-open-job]'); if(!b) return;
     var id = b.getAttribute('data-open-job');

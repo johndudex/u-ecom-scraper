@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 import httpx
 from django.conf import settings
 from django.contrib.auth.decorators import login_required
-from django.db.models import Q
+from django.db.models import Count, Q
 from django.http import (
     Http404,
     HttpResponse,
@@ -2892,12 +2892,19 @@ def intake_create_job(request):
 def intake_jobs(request):
     """AJAX: recent ScrapeJobs for the Jobs & Saved library view.
 
-    Returns a flat list (the client groups for the Saved tab by site and filters
-    on is_saved). Saved jobs are always included even if older.
+    The library is a SHARED team view: every user sees all jobs across the
+    team (this used to be own-jobs-only for non-admins). ``?user=<username>``
+    narrows the list to one owner. The response also carries a ``users``
+    roster (username + job_count) so the client can build the owner filter
+    without a second endpoint. Saved jobs are always included even if older.
     """
-    recent = list(_user_jobs(request).order_by("-created_at")[:100])
+    jobs_qs = ScrapeJob.objects.all()
+    sel_user = request.GET.get("user", "").strip()
+    if sel_user:
+        jobs_qs = jobs_qs.filter(user__username=sel_user)
+    recent = list(jobs_qs.order_by("-created_at")[:100])
     # merge any saved jobs that fell outside the recent-100 window
-    extra = [j for j in _user_jobs(request).filter(is_saved=True).order_by("-created_at")
+    extra = [j for j in jobs_qs.filter(is_saved=True).order_by("-created_at")
              if j.id not in {j.id for j in recent}]
     jobs = recent + extra[:50]
 
@@ -2920,13 +2927,24 @@ def intake_jobs(request):
             "target_fields": j.target_fields or [],
             "input_mode": j.input_mode,
             "site_name": j.site_name,
-            # Owner info: only meaningful when an admin is viewing everyone's jobs.
-            "owner_username": j.user.username if (is_admin and j.user_id) else None,
+            # Owner name is library-visible (it drives the Owner column and
+            # the user filter); email stays admin-only — other users'
+            # addresses are not the library's business.
+            "owner_username": j.user.username if j.user_id else None,
             "owner_email": j.user.email if (is_admin and j.user_id) else None,
         }
         for j in jobs
     ]
-    return JsonResponse({"jobs": data, "maintenance": _maintenance_state()})
+    users = [
+        {"username": r["user__username"], "job_count": r["n"]}
+        for r in (
+            ScrapeJob.objects.exclude(user=None)
+            .values("user__username")
+            .annotate(n=Count("id"))
+            .order_by("user__username")
+        )
+    ]
+    return JsonResponse({"jobs": data, "users": users, "maintenance": _maintenance_state()})
 
 
 def _maintenance_state() -> dict:
