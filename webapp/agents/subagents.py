@@ -1175,7 +1175,13 @@ def _get_tools_sync(agent_name: str, workspace_scope: str = "") -> list:
         try:
             from .tools.filesystem_tools import get_filesystem_tools as _gft
 
-            tools.extend(_gft(workspace_scope=workspace_scope or None))
+            # [wave-22 B1] the F821 draft gate is kwarg-scoped to code_writer:
+            # 8 agents share get_filesystem_tools and none of the others
+            # draft code.
+            tools.extend(_gft(
+                workspace_scope=workspace_scope or None,
+                syntax_gate=(agent_name == "code_writer"),
+            ))
         except Exception as exc:
             logger.error(
                 "Failed to load filesystem tools for '%s': %s", agent_name, exc

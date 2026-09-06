@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 
 from langchain_core.tools import tool
 
@@ -28,6 +29,56 @@ _JSON_WARN_NOTE = (
     "NOTE: content written but is not valid JSON (strict or lenient parse "
     "failed) — the repair pass will attempt salvage on read"
 )
+
+
+# [wave-22 B1] F821 draft gate. The writer's dominant failure mode (337 class)
+# is a module-level NameError that only surfaces at tester py_compile — one
+# full test cycle later. The gate runs REAL ruff (a vendored scope checker was
+# critiqued and rejected: hand-rolled checkers false-flagged templates) with
+# F821-ONLY selection: drafts legitimately carry unused imports (F401) and
+# locals (F841), and flagging those would reject healthy work.
+_F821_RUFF_TIMEOUT = 10  # seconds — a linter must never hang a tool call
+_F821_MAX_FINDINGS = 5
+_F821_NON_FIX_NOTE = (
+    "define the name before first use — a later def does not fix a "
+    "module-level call, and `X if X in dir()` is not a fix"
+)
+
+
+def _f821_rejections(path: str, content: str) -> str:
+    """Run ruff F821 over draft content; return "" (gate open) or rejection.
+
+    Falls OPEN on any checker malfunction (binary missing, timeout, crash):
+    a broken linter must never block a write — ``_fix_scraper_syntax`` at the
+    phase boundary stays the authoritative backstop.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "ruff", "check", "--isolated", "--select", "F821",
+                "--no-cache", "--stdin-filename", path, "-",
+            ],
+            input=content,
+            capture_output=True,
+            text=True,
+            timeout=_F821_RUFF_TIMEOUT,
+        )
+    except Exception as exc:
+        logger.warning("F821 gate: checker unavailable (%s) — gate falls open", exc)
+        return ""
+    findings = [
+        ln.strip() for ln in (proc.stdout or "").splitlines() if "F821" in ln
+    ]
+    if not findings:
+        return ""
+    shown = findings[:_F821_MAX_FINDINGS]
+    more = len(findings) - len(shown)
+    return (
+        "REJECTED — NOT applied; file unchanged. Undefined name(s): "
+        + "; ".join(shown)
+        + (f" (and {more} more)" if more > 0 else "")
+        + f". {_F821_NON_FIX_NOTE}."
+    )
 
 
 def _strip_json_fence(content: str) -> str:
@@ -206,6 +257,7 @@ def _enforce_not_skills(path: str, root: str) -> str:
 def get_filesystem_tools(
     project_root: str | None = None,
     workspace_scope: str | None = None,
+    syntax_gate: bool = False,
 ) -> list:
     """Return all filesystem tools with sandboxing configured.
 
@@ -215,6 +267,9 @@ def get_filesystem_tools(
         workspace_scope: If set, restrict search_files and search_content
             to only the ``workspace/{workspace_scope}/`` subdirectory.
             Read/write/edit still work on any path under project_root.
+        syntax_gate: [wave-22 B1] If True, write_file/edit_file run the F821
+            gate on .py files under workspace/ (code_writer only — 8 agents
+            share these tools and none of the others draft code).
 
     Returns:
         List of LangChain BaseTool instances.
@@ -297,6 +352,16 @@ def get_filesystem_tools(
             safe = _enforce_not_skills(path, root)
         except ValueError as e:
             return str(e)
+        # [wave-22 B1] F821 gate: draft-shaped .py writes must define every
+        # name they use. Runs BEFORE any bytes hit disk — a rejection leaves
+        # nothing behind.
+        if syntax_gate and safe.endswith(".py") and f"{os.sep}workspace{os.sep}" in safe:
+            rejection = _f821_rejections(safe, content)
+            if rejection:
+                logger.warning(
+                    "write guard: F821 gate rejected write to %s", safe
+                )
+                return rejection
         note = ""
         if safe.endswith(".json"):
             # F2 sanitize-on-write: never let an unparseable artifact reach disk
@@ -359,6 +424,15 @@ def get_filesystem_tools(
             )
 
         updated = original.replace(old_string, new_string, 1)
+        # [wave-22 B1] F821 gate on the EDITED content, before the write — a
+        # rejection means the file on disk is untouched.
+        if syntax_gate and safe.endswith(".py") and f"{os.sep}workspace{os.sep}" in safe:
+            rejection = _f821_rejections(safe, updated)
+            if rejection:
+                logger.warning(
+                    "write guard: F821 gate rejected edit to %s", safe
+                )
+                return rejection
         note = ""
         if safe.endswith(".json"):
             # Same guard as write_file, applied at the edit's write point: an
