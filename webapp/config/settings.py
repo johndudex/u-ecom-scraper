@@ -275,6 +275,15 @@ LITELLM_FALLBACK_MODEL = config("LITELLM_FALLBACK_MODEL", default="")
 # models generating ~500-line drafts can exceed 300s on a single call, and the
 # classified-retry layer would multiply that (3×300s) inside the 900s wall.
 CODE_WRITER_LLM_TIMEOUT = config("CODE_WRITER_LLM_TIMEOUT", default=600, cast=int)
+# [wave-23 W23-2] Draft-first forcing function: after this many code_writer
+# tool calls with no write to scraper_draft.py, tool results carry a
+# "[HARNESS NUDGE] write the draft NOW" line (0 disables).
+CODE_WRITER_DRAFT_NUDGE_CALLS = config("CODE_WRITER_DRAFT_NUDGE_CALLS", default=12, cast=int)
+# [wave-23 W23-1] Per-LLM-call no-chunk watchdog (seconds): a streaming call
+# yielding no chunks for this long is abandoned mid-call and retried as a
+# transient error (Z.AI keepalives defeat the httpx read timeout — prod 343/
+# 377 burned whole 1800s phases on invisible hangs). 0 disables the guard.
+LLM_NO_CHUNK_TIMEOUT = config("LLM_NO_CHUNK_TIMEOUT", default=240, cast=int)
 # Fallback model when the primary trips the per-model circuit breaker (Phase 1,
 # contract rollout). Defaults to the small model. The breaker bounds how long a
 # bad/stalling model receives traffic: after LLM_CIRCUIT_BREAKER_THRESHOLD
@@ -302,6 +311,11 @@ LLM_RETRY_BACKOFF_CAP = config("LLM_RETRY_BACKOFF_CAP", default=30.0, cast=float
 LLM_TRUNCATION_MODE = config("LLM_TRUNCATION_MODE", default="deterministic")
 LLM_TRUNCATION_MAX_CHARS = config("LLM_TRUNCATION_MAX_CHARS", default=180000, cast=int)
 LLM_TRUNCATION_PER_MSG_CAP = config("LLM_TRUNCATION_PER_MSG_CAP", default=8000, cast=int)
+# [wave-23 W23-3] Tool RESULT messages get a bigger in-context cap — an 8K
+# view of a 50K read_file page drove the 22-read paging spiral (prod 374:
+# "reads are being truncated to 8K chars each"). MAX_CHARS still bounds the
+# whole prompt.
+LLM_TRUNCATION_TOOL_MSG_CAP = config("LLM_TRUNCATION_TOOL_MSG_CAP", default=24000, cast=int)
 # Async cancellation (Per-Phase Execution Contract). Default OFF. Resolution
 # order in agents/graph.py:_async_execution_enabled: this all-phases override
 # wins, else the phase must be named in AGENT_ASYNC_PHASES (the wave-15

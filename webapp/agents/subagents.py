@@ -808,6 +808,25 @@ def _trunc_settings():
         return "deterministic", 180_000, 8000
 
 
+def _tool_msg_cap() -> int:
+    """Context cap for tool RESULT messages (lazy read). [wave-23 W23-3]
+
+    Tool results are the model's only view of read_file output — capping them
+    at the same 8K as chatter made a 50K tool page collapse to 8K in-context,
+    and the writer paged shared modules at ~8K strides (22 reads of two files
+    in one failed attempt, prod 374: "reads are being truncated to 8K chars
+    each"). 24000 keeps src/http_fetch.py (21K) whole in one view. The overall
+    LLM_TRUNCATION_MAX_CHARS budget still bounds the prompt, so this cannot
+    re-inflate context past the balloon guard.
+    """
+    try:
+        from django.conf import settings
+
+        return int(getattr(settings, "LLM_TRUNCATION_TOOL_MSG_CAP", 24_000))
+    except Exception:
+        return 24_000
+
+
 def _truncate_messages(input_dict: dict) -> dict:
     """Pre-model hook: deterministic context truncation that the LLM ACTUALLY sees.
 
@@ -820,9 +839,13 @@ def _truncate_messages(input_dict: dict) -> dict:
     mutating ``state["messages"]`` (so the react loop's accumulation is untouched).
 
     Behavior:
-    1. **Trim oversized NON-seed messages** to a head+tail preview (per-msg cap,
-       default 8000). The seed (first HumanMessage: task/strategy/field-map) is
-       NEVER trimmed — capping a 25–35k seed to 8k destroys the task spec.
+    1. **Trim oversized NON-seed messages** to a head+tail preview. Chatter
+       (assistant/etc.) caps at per-msg cap (default 8000); **tool RESULT
+       messages cap at LLM_TRUNCATION_TOOL_MSG_CAP (default 24000)** — they are
+       the model's only view of read_file output, and an 8K in-context view of
+       a 50K page is what drove the 22-read paging spiral [wave-23 W23-3]. The
+       seed (first HumanMessage: task/strategy/field-map) is NEVER trimmed —
+       capping a 25–35k seed to 8k destroys the task spec.
     2. **If still over budget**, keep system + seed + the most recent N messages,
        dropping oldest. ``_clen`` counts ``tool_calls`` too, so write_file/edit_file
        args (the ballooning driver) are measured honestly.
@@ -858,12 +881,15 @@ def _truncate_messages(input_dict: dict) -> dict:
         if m is seed:
             return m  # NEVER cap the seed (task/strategy/field-map)
         content = str(m.content) if hasattr(m, "content") else ""
-        if len(content) <= per_msg_cap:
+        # [wave-23 W23-3] tool RESULT messages get the bigger cap — see
+        # _tool_msg_cap. ToolMessages are identifiable by tool_call_id.
+        cap = _tool_msg_cap() if hasattr(m, "tool_call_id") else per_msg_cap
+        if len(content) <= cap:
             return m
-        half = per_msg_cap // 2
+        half = cap // 2
         new_content = (
             content[:half]
-            + f"\n\n…[deterministic-truncated {len(content)}→{per_msg_cap} chars]"
+            + f"\n\n…[deterministic-truncated {len(content)}→{cap} chars]"
             + content[-half:]
         )
         try:
@@ -1228,6 +1254,90 @@ def _get_tools_sync(agent_name: str, workspace_scope: str = "") -> list:
     return tools
 
 
+# ── Draft-first forcing function (wave-23 W23-2) ──────────────────────────
+# RC-3 of docs/plans/wave23-writer-convergence-plan.md: prod 374's fix rounds
+# made 99 tool calls with zero writes; local 343 spent 64 calls without one
+# byte of scraper_draft.py — while the winning pattern (job 341) wrote its
+# draft by call 15. Nothing deterministic intervened. This appends a nudge to
+# tool results once an invocation drifts past the call threshold with no
+# draft write; nothing is blocked (probes stay legal — 341 probed before it
+# drafted), the model just can't stay unaware it is drifting.
+
+_DRAFT_NUDGE_TEXT = (
+    "\n\n[HARNESS NUDGE] {calls} tool calls and NO scraper_draft.py yet. "
+    "STOP researching — write_file a first draft of scraper_draft.py NOW. "
+    "A minimal draft beats more exploration: code_tester, not you, finds "
+    "what's wrong with it."
+)
+
+
+def _draft_nudge_threshold() -> int:
+    try:
+        from django.conf import settings
+
+        return int(getattr(settings, "CODE_WRITER_DRAFT_NUDGE_CALLS", 12))
+    except Exception:
+        return 12
+
+
+def _is_draft_path(path) -> bool:
+    return isinstance(path, str) and path.replace("\\", "/").endswith(
+        "scraper_draft.py"
+    )
+
+
+def _tool_path_arg(args: tuple, kwargs: dict):
+    path = kwargs.get("path")
+    if path is None and args:
+        path = args[0]
+    return path if isinstance(path, str) else ""
+
+
+def apply_draft_nudge(tools: list, threshold: int | None = None) -> list:
+    """Wrap every tool so results carry a write-the-draft nudge after drift.
+
+    Counts calls per invocation (agents are built fresh per invoke, so the
+    closure state is invocation-local). A ``write_file`` whose path ends in
+    ``scraper_draft.py`` arms the done-flag and the nudge stops for the rest
+    of the invocation; scratch-probe writes do NOT count. threshold <= 0 is
+    the kill-switch (tools returned untouched).
+    """
+    import functools
+
+    if threshold is None:
+        threshold = _draft_nudge_threshold()
+    if threshold <= 0:
+        return tools
+    state = {"calls": 0, "drafted": False}
+
+    def _wrap(func, tool_name):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            state["calls"] += 1
+            if tool_name == "write_file" and _is_draft_path(
+                _tool_path_arg(args, kwargs)
+            ):
+                state["drafted"] = True
+            result = func(*args, **kwargs)
+            if (
+                not state["drafted"]
+                and state["calls"] >= threshold
+                and isinstance(result, str)
+            ):
+                result = result + _DRAFT_NUDGE_TEXT.format(calls=state["calls"])
+            return result
+
+        return wrapper
+
+    for i, t in enumerate(tools):
+        tool_name = getattr(t, "name", "")
+        if hasattr(t, "func") and t.func is not None:
+            t.func = _wrap(t.func, tool_name)
+            if getattr(t, "coroutine", None) is not None:
+                t.coroutine = _wrap(t.coroutine, tool_name)
+    return tools
+
+
 def _apply_guards(tools: list, agent_name: str) -> list:
     from .tools.guards import (
         apply_guard,
@@ -1291,6 +1401,8 @@ def _apply_guards(tools: list, agent_name: str) -> list:
         for i, t in enumerate(tools):
             if getattr(t, "name", "") == "run_scraper":
                 tools[i] = apply_guard(t, _make_guard(_cap_run_scraper))
+        # [wave-23 W23-2] Draft-first forcing function — see apply_draft_nudge.
+        tools = apply_draft_nudge(tools)
         return tools
 
     if agent_name not in guarded_agents:
@@ -4191,7 +4303,11 @@ def build_code_writer_message(state: dict) -> list:
         content = _nested + content
     # Reinforce template-fidelity for discovery/pagination (prevents execution-time
     # crashes that --sample testing can't see — e.g. session.url phantom attributes).
-    content = (
+    # [wave-23 W23-4] When the tester's own remediation targets discovery, the
+    # freeze below would directly contradict it (prod 374: the writer sat
+    # between the two orders for 33 min and produced zero writes in 99 calls)
+    # — so the block carries an explicit override in that case.
+    _fidelity = (
         "\n### Template fidelity — discovery & pagination\n"
         "Do NOT re-signature or redefine the template's discovery/pagination helpers "
         "(`_get_next_page_url`, `_discover_urls_via_*`, `_fetch_html`, checkpoint "
@@ -4204,7 +4320,27 @@ def build_code_writer_message(state: dict) -> list:
         "capture the current URL from the response (`final_url = str(resp.url)`) and pass "
         "the string. A scratch run exercises Phase 1 discovery end-to-end; a wrong call "
         "there crashes the job at execution even though --sample passed.\n"
-    ) + content
+    )
+    if "REMEDIATION INSTRUCTION" in content:
+        # Scope the discovery check to the remediation text itself — "discovery"
+        # appears all over the message body (objective, CLI contract) and would
+        # false-positive every fix cycle into an override.
+        _rem_start = content.find("REMEDIATION INSTRUCTION")
+        _rem_end = content.find("Read the full test report", _rem_start)
+        _rem_text = content[
+            _rem_start: _rem_end if _rem_end != -1 else _rem_start + 1500
+        ].lower()
+        if "discovery" in _rem_text:
+            _fidelity += (
+                "\n**OVERRIDE — discovery remediation:** the tester's REMEDIATION "
+                "INSTRUCTION above targets DISCOVERY. In that case replacing the "
+                "template's DISCOVERY-SOURCE functions (the `_discover_urls_via_*` "
+                "family, e.g. with a sitemap/API/GraphQL enumeration) IS allowed and "
+                "expected — keep their names and call signatures, and keep the "
+                "main() argparse + `SCRAPER_LISTING_URL` contract verbatim. Every "
+                "other fidelity rule above still applies.\n"
+            )
+    content = _fidelity + content
     return [HumanMessage(content=content)]
 
 

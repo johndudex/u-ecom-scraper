@@ -72,6 +72,93 @@ except Exception:  # pragma: no cover — httpx ships with langchain-openai
 
 _TRANSIENT_ERRORS = _TRANSIENT_ERRORS + _HTTPX_TRANSPORT_ERRORS
 
+# [wave-23 W23-1] The no-chunk hang class (writer-convergence plan RC-1): Z.AI's
+# SSE keepalive bytes keep resetting httpx's read timeout while yielding NO
+# chunks, so a dead generation sat invisible until the PHASE wall-clock reaper
+# abandoned the whole invocation (local 343 attempt 2: 1800s, zero model
+# output; prod 377: two consecutive 1800s writer phases → job dead). Neither
+# the breaker (counts only calls that RAISE) nor the retry ladder ever saw it.
+# The fix bounds the NO-CHUNK INTERVAL and raises a transient-class error, so
+# the existing classified ladder retries it and — exhausted — the breaker
+# counts it and the next get_llm swaps to the fallback model. Subclassing
+# httpx.ReadTimeout makes it transient WITHOUT touching classification.
+try:
+    import httpx as _httpx
+
+    class LLMNoChunkTimeout(_httpx.ReadTimeout):
+        """No chunk arrived within ``LLM_NO_CHUNK_TIMEOUT`` — transient class."""
+
+except Exception:  # pragma: no cover — httpx ships with langchain-openai
+
+    class LLMNoChunkTimeout(TimeoutError):  # type: ignore[no-redef]
+        """Fallback shape when httpx is unavailable (still timeout-flavored)."""
+
+
+def _no_chunk_timeout() -> float:
+    """No-chunk watchdog budget in seconds (lazy read; 0 disables the guard).
+
+    Default 240s: comfortably above healthy first-token latency for long
+    codegen prompts (measured silent-but-healthy turns ran 73-150s) and far
+    below the 1800s phase abandonment the watchdog replaces.
+    """
+    try:
+        return float(getattr(settings, "LLM_NO_CHUNK_TIMEOUT", 240))
+    except Exception:
+        return 240.0
+
+
+def _consume_with_no_chunk_deadline(stream_iter, timeout: float, poll: float = 0.5) -> list:
+    """Buffer ``stream_iter`` with a hard bound on the no-chunk interval.
+
+    WHY A WORKER THREAD: the blocking SSE read runs in the CALLER's frame — a
+    watchdog that only watches timestamps cannot unblock it, and httpx's read
+    timeout cannot fire while keepalive bytes arrive (that is the hang).
+    Consuming in a daemon worker lets the caller poll PROGRESS (chunk count)
+    and abandon the attempt when no new chunk lands within ``timeout``,
+    raising ``LLMNoChunkTimeout``. The abandoned worker leaks exactly like the
+    wall-clock reaper's abandoned invocation thread — bounded by the transient
+    retry budget (transient_max + 1 workers per call) and holding only its
+    socket. A monotone counter (not an Event) can't lose a progress signal to
+    a clear/set race between worker and waiter.
+    """
+    if timeout <= 0:
+        return list(stream_iter)  # kill-switch: exact pre-watchdog behavior
+    import threading
+
+    chunks: list = []
+    errors: list = []
+    counter = [0]
+    done = threading.Event()
+
+    def _worker():
+        try:
+            for chunk in stream_iter:
+                chunks.append(chunk)
+                counter[0] += 1
+        except BaseException as exc:  # re-raised on the waiter below
+            errors.append(exc)
+        finally:
+            done.set()
+
+    threading.Thread(
+        target=_worker, daemon=True, name="llm-no-chunk-watch"
+    ).start()
+    deadline = time.monotonic() + timeout
+    seen = 0
+    while True:
+        if done.wait(poll):
+            if errors:
+                raise errors[0]
+            return chunks
+        if counter[0] != seen:
+            seen = counter[0]
+            deadline = time.monotonic() + timeout
+        elif time.monotonic() >= deadline:
+            raise LLMNoChunkTimeout(
+                f"no chunk for {timeout:.0f}s (LLM_NO_CHUNK_TIMEOUT) — "
+                "abandoning stream attempt; classified retry handles it"
+            )
+
 
 def _retry_settings() -> dict:
     """Read retry config lazily (Django settings may not be ready at import).
@@ -471,8 +558,9 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
         _super_stream = super()._stream
         try:
             chunks = _retry_classified_sync(
-                lambda: list(
-                    _super_stream(messages, stop=stop, run_manager=run_manager, **kwargs)
+                lambda: _consume_with_no_chunk_deadline(
+                    _super_stream(messages, stop=stop, run_manager=run_manager, **kwargs),
+                    _no_chunk_timeout(),
                 ),
                 cfg,
                 model=self._breaker_key(),
@@ -489,12 +577,32 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
         _super_astream = super()._astream
 
         async def _consume():
-            return [
-                chunk
-                async for chunk in _super_astream(
-                    messages, stop=stop, run_manager=run_manager, **kwargs
-                )
-            ]
+            # Async twin of the sync no-chunk watchdog: per-chunk wait_for —
+            # unlike the sync lane, async cancellation is clean here (the
+            # pending __anext__ is actually cancelled on timeout).
+            timeout = _no_chunk_timeout()
+            if timeout <= 0:
+                return [
+                    chunk
+                    async for chunk in _super_astream(
+                        messages, stop=stop, run_manager=run_manager, **kwargs
+                    )
+                ]
+            chunks = []
+            aiter = _super_astream(
+                messages, stop=stop, run_manager=run_manager, **kwargs
+            ).__aiter__()
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(aiter.__anext__(), timeout=timeout)
+                except StopAsyncIteration:
+                    return chunks
+                except asyncio.TimeoutError as exc:
+                    raise LLMNoChunkTimeout(
+                        f"no chunk for {timeout:.0f}s (LLM_NO_CHUNK_TIMEOUT) — "
+                        "abandoning stream attempt; classified retry handles it"
+                    ) from exc
+                chunks.append(chunk)
 
         try:
             chunks = await _retry_classified_async(_consume, cfg, model=self._breaker_key())

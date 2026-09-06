@@ -5304,6 +5304,16 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     "_invoke_code_writer: draft is UNCHANGED from the last "
                     "tested version (no-op fix cycle %d, job %s)", _noop, job_id,
                 )
+                # [wave-23 W23-5.2] Job-visible record of the hash comparison —
+                # logger.warning alone goes to container stdout, which is NOT
+                # the job log (prod 374 RCA: the plateau was invisible in
+                # /jobs/<id>/logs/ and had to be inferred from absent writes).
+                _log_event_row(
+                    job_id, "code_writer",
+                    f"[NO-OP FIX CYCLE {_noop}] draft fingerprint "
+                    f"{_new_fp[:12]} is UNCHANGED from the last tested version "
+                    f"({_tested_fp[:12]}) — the fix loop produced no bytes",
+                )
                 if _noop_should_escalate(
                     _noop, int(state.get("test_retry_count", 0) or 0)
                 ):
