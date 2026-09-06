@@ -3,7 +3,8 @@
 The operator has been asking for a regenerated ``prod_job_status_by_site_product.csv``
 after every campaign; this pins the dashboard that replaces that ritual:
 
-- superuser-only (it aggregates EVERY user's jobs — same rule as /jobs/);
+- any logged-in user (opened up from superuser-only — read-only roll-up,
+  no cross-user mutation; ``@login_required`` is the only gate);
 - one row per (site, product_url): final status of the LATEST attempt,
   attempt count, succeeded-at-first-attempt, success job link;
 - summary tiles: products, sites, per-status counts, first-try rate,
@@ -11,7 +12,8 @@ after every campaign; this pins the dashboard that replaces that ritual:
 - ``?format=csv`` reproduces the exact CSV the operator was hand-building
   (same column names, same booleans);
 - ``?status=`` filters on final status;
-- /intake carries a superuser-only button linking here.
+- /intake carries a Prod Status button visible to every logged-in user
+  (the Maintenance button next to it stays superuser-only).
 """
 from __future__ import annotations
 
@@ -83,9 +85,9 @@ def mixed_history(db):
 
 
 class TestPermissions:
-    def test_regular_user_gets_403(self, regular_client):
+    def test_regular_user_gets_200(self, regular_client):
         r = regular_client.get(reverse("intake_site_status"))
-        assert r.status_code == 403
+        assert r.status_code == 200
 
     def test_anonymous_redirects_to_login(self, db, settings):
         # The local dev stack injects DebugAutoLoginMiddleware (env
@@ -172,18 +174,32 @@ class TestCsvExport:
 
 
 class TestIntakeWiring:
-    def test_intake_has_superuser_status_button(self):
+    def test_intake_has_status_button_for_all_logged_in_users(self):
         src = open(
             os.path.join(
                 ROOT, "webapp", "scraper", "templates", "scraper", "intake.html"
             )
         ).read()
         assert 'id="status-link"' in src, "topbar needs a Prod Status button"
-        m = re.search(
-            r"\{% if is_superuser %\}[\s\S]*?status-link[\s\S]*?\{% endif %\}", src
+        # NOT gated behind {% if is_superuser %} — every logged-in user sees
+        # it. The anchor and any conditional must not share a line.
+        line = next(ln for ln in src.splitlines() if "status-link" in ln)
+        assert "is_superuser" not in line, (
+            "the Prod Status button must not be superuser-gated"
         )
-        assert m, "the Prod Status button must be superuser-only"
-        assert "/intake/status/" in m.group(0)
+        assert "/intake/status/" in line
+
+    def test_maintenance_button_stays_superuser_only(self):
+        src = open(
+            os.path.join(
+                ROOT, "webapp", "scraper", "templates", "scraper", "intake.html"
+            )
+        ).read()
+        assert 'id="maintenance-btn"' in src, "topbar needs a Maintenance button"
+        m = re.search(
+            r"\{% if is_superuser %\}[\s\S]*?maintenance-btn[\s\S]*?\{% endif %\}", src
+        )
+        assert m, "the Maintenance button must stay superuser-only"
 
 
 # regular_user fixture shared with the maintenance test's pattern

@@ -3030,11 +3030,10 @@ def _site_status_rows():
 @login_required
 def intake_site_status(request):
     """Prod-status dashboard: per site+product roll-up of every job ever run
-    (all users). Superuser-only for the same reason /jobs/ is — the data
-    spans every account. ``?format=csv`` reproduces the operator's CSV;
-    ``?status=`` filters on final status; ``?q=`` substring-filters."""
-    if not request.user.is_superuser:
-        return JsonResponse({"error": "superuser required"}, status=403)
+    (all users). Open to any logged-in user — it's a read-only roll-up with
+    no mutation surface, so ``@login_required`` is the only gate.
+    ``?format=csv`` reproduces the operator's CSV; ``?status=`` filters on
+    final status; ``?q=`` substring-filters."""
 
     rows = _site_status_rows()
 
