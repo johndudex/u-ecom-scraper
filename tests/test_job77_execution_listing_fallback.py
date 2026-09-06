@@ -223,19 +223,26 @@ class TestArgsWithListingUrl:
 
 
 class TestProbeGateFloor:
-    def test_probe_output_read_carries_mtime_floor(self):
+    def test_probe_output_read_binds_by_identity(self):
+        """[wave-22 C1] Supersedes the old mtime-floor pin (job-77 RC4): the
+        zero-yield gate must read ONLY the output this probe attempt wrote —
+        now enforced by a pre-run FS snapshot (new-or-changed = owned), which
+        subsumes the floor's guarantee (the tester's older non-empty sample
+        predates the snapshot and can never be owned)."""
         src = open(os.path.join(ROOT, "webapp", "agents", "graph.py")).read()
-        # Close on the call's OWN closing paren (start-of-line paren), not the
-        # first ')' — the arg list nests os.path.join(...) calls.
-        m = re.search(
-            r"_probe_out = _find_newest_output\((.*?)\n\s*\)", src, re.S
+        i = src.index("def _probe_phase1_discovery_once")
+        j = src.index("\ndef ", i + 10)
+        body = src[i:j]
+        assert "_identity_snapshot(_ws)" in body, (
+            "the probe must snapshot the workspace BEFORE the run"
         )
-        assert m, "probe output read not found"
-        assert "mtime_floor=_probe_started - 5" in m.group(1), (
-            "the zero-yield gate MUST floor the output read to this probe's "
-            "start — without it the F16 count-ranking returns the tester's "
-            "older non-empty output, the freshness check then discards it, "
-            "and the gate never fires (job-77 RC4)"
+        assert "_probe_owned_files(" in body, (
+            "the zero-yield gate MUST select the probe's output by snapshot "
+            "identity — the tester's older non-empty output must be "
+            "unreadable to it (job-77 RC4, wave-22 C1)"
+        )
+        assert "_find_newest_output(" not in body, (
+            "the mtime-window pick is gone — it was the identity-theft vector"
         )
 
 

@@ -86,7 +86,18 @@ def listing_yield_failure(cov: dict | None) -> bool:
     """
     if not isinstance(cov, dict):
         return False
+    # [wave-22 C1] Nothing observed is not a verdict: an EMPTY coverage block
+    # means the run produced no discovery signal at all — unknowable must not
+    # arm a dead-listing FAIL.
+    if not cov:
+        return False
     sr = str(cov.get("stop_reason") or "")
+    # [wave-22 C1] A draft-declared bare "skipped" means the draft chose not
+    # to discover on this run — inconclusive, never dead. Deliberately
+    # narrow: wave-20 T2's ``phase1_skipped`` (the wrapper's code-bug verdict
+    # for a draft that skipped its own Phase 1) STAYS dead.
+    if sr == "skipped":
+        return False
     if sr == "empty_first_page":
         return True
     if sr in ("max_pages_hit", "navigate_error", "navigate_throttled"):

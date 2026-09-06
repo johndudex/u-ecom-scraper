@@ -5388,6 +5388,40 @@ def _probe_listing_candidates(state: dict) -> tuple[str, str]:
     return primary, _alt
 
 
+def _identity_snapshot(workspace_dir: str) -> dict[str, tuple[int, int]]:
+    """[wave-22 C1] path → (mtime_ns, size) for the files a probe run can
+    write (outputs, probe-persisted outputs, the draft's seed list).
+
+    mtime floors GUESS which file a subprocess wrote — a window the tester's
+    own sample or a sibling attempt can win. The snapshot makes ownership a
+    set identity: a file the probe wrote is one that is NEW or CHANGED since
+    the snapshot.
+    """
+    import glob as _glob
+
+    snap: dict[str, tuple[int, int]] = {}
+    for pattern in ("output_*.json", "probe_output_*.json", "input_urls.json"):
+        for p in _glob.glob(os.path.join(workspace_dir or "", pattern)):
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            snap[os.path.abspath(p)] = (st.st_mtime_ns, st.st_size)
+    return snap
+
+
+def _probe_owned_files(
+    snapshot: dict[str, tuple[int, int]], workspace_dir: str
+) -> list[str]:
+    """Paths that are NEW (absent from the snapshot) or CHANGED (stat pair
+    differs) since ``snapshot`` — the files THIS probe attempt wrote."""
+    owned: list[str] = []
+    for p, now in _identity_snapshot(workspace_dir).items():
+        if snapshot.get(p) != now:
+            owned.append(p)
+    return owned
+
+
 def _probe_yield_dead(probe_yield: dict) -> bool:
     """[job-85 supercheapauto] Is this probe yield a DEAD listing?
 
@@ -5396,7 +5430,13 @@ def _probe_yield_dead(probe_yield: dict) -> bool:
     with no usable yield — the same as a raw zero. The old
     ``discovered_urls == 0`` check armed nothing for that class, so the probe
     blessed a listing execution could never crawl.
+
+    [wave-22 C1] An INCONCLUSIVE stamp (blank coverage, no count) is never
+    dead — blank evidence must not arm the zero-yield FAIL or the retry/
+    escalation arms.
     """
+    if probe_yield.get("inconclusive"):
+        return False
     try:
         from src.listing_discovery import listing_yield_failure
 
@@ -5544,16 +5584,21 @@ def _discovery_yield_hygiene(probe_yield: dict, urls, job_url: str) -> dict:
     return dead
 
 
-def _read_probe_discovered_urls(workspace_dir: str, mtime_floor: float) -> list[str]:
+def _read_probe_discovered_urls(
+    workspace_dir: str, pre_snapshot: dict[str, tuple[int, int]]
+) -> list[str]:
     """URLs the probe's ``--discover-only`` run just wrote to the draft's
-    ``input_urls.json`` (mtime-floored — a pre-probe seed file must never
-    yield a verdict). Missing/stale/unreadable → [] (gate no-ops)."""
+    ``input_urls.json``, bound by IDENTITY to the pre-probe snapshot (the
+    seed file must be new or changed since it — a pre-probe seed list must
+    never yield a verdict, mtime freshness alone can be laundered).
+    Missing/stale/unreadable → [] (gate no-ops)."""
     import json as _json
     import os as _os
 
-    path = _os.path.join(workspace_dir, "input_urls.json")
+    path = _os.path.abspath(_os.path.join(workspace_dir, "input_urls.json"))
     try:
-        if not _os.path.isfile(path) or _os.path.getmtime(path) < mtime_floor:
+        now = _os.stat(path)
+        if pre_snapshot.get(path) == (now.st_mtime_ns, now.st_size):
             return []
         with open(path, encoding="utf-8") as fh:
             data = _json.load(fh)
@@ -5741,6 +5786,11 @@ def _probe_phase1_discovery_once(
         )
         probe_args = ["--discover-only", "--fresh-discovery"]
         _probe_started = time.time()
+        # [wave-22 C1] Identity binding: snapshot the workspace BEFORE the run
+        # so the output selection below is a set identity (new-or-changed),
+        # not an mtime window the tester's sample or a sibling attempt can win.
+        _ws = os.path.join(root, "workspace", slug)
+        _pre_snap = _identity_snapshot(_ws)
         # Browser scrapers (Playwright/Selenium) can ONLY run in browser_service —
         # celery-worker has neither installed. Running the draft directly here
         # ModuleNotFoundError-crashes every browser draft, which route_after_testing
@@ -5798,6 +5848,25 @@ def _probe_phase1_discovery_once(
                 stderr = result.get("stderr") or ""
                 # T2.1: stdout used to be discarded on both paths.
                 _stdout = result.get("stdout") or ""
+                # [wave-22 C1] The runner's contract: "output_content — full
+                # output JSON text (caller persists it)". Persist it to a
+                # probe_-PREFIXED file so the identity selection below can
+                # bind to THIS run; an output_*.json name would be re-selected
+                # by run_execution's _find_newest_output and leak a probe
+                # artifact into a real run's verdict.
+                _oc = result.get("output_content") or ""
+                if _oc:
+                    try:
+                        _oc_path = os.path.join(
+                            _ws, f"probe_output_{int(_probe_started * 1000)}.json"
+                        )
+                        with open(_oc_path, "w", encoding="utf-8") as _oc_fh:
+                            _oc_fh.write(_oc)
+                    except OSError as _oc_exc:
+                        logger.debug(
+                            "_probe_phase1_discovery: output_content persist "
+                            "failed: %s", _oc_exc,
+                        )
             except Exception as exc:
                 logger.warning(
                     "_probe_phase1_discovery: browser_service dispatch failed (%s) — inconclusive",
@@ -5845,54 +5914,77 @@ def _probe_phase1_discovery_once(
         # ``discovered_urls`` (int; some templates emit a list).
         probe_yield: dict | None = None
         try:
-            # [job-77 RC4] The floor is LOAD-BEARING here, not just a filter:
-            # without it the F16 substantive-count ranking picks the tester's
-            # older NON-EMPTY output over this probe's fresh 0-item one, the
-            # getmtime check below then (correctly) rejects the stale file as
-            # inconclusive — and the zero-yield gate is structurally blind in
-            # exactly the case it exists for (probe 0 next to a 5-item testing
-            # file). A floored call also bypasses the FM fallback and, with
-            # only this probe's files eligible, the count ranking reduces to
-            # max() over the wrapper's own attempts — correct for the
-            # retry-once-then-last-attempt-verdict contract.
-            _probe_out = _find_newest_output(
-                os.path.join(root, "workspace", slug),
-                os.path.join(root, "scrapers", slug),
-                slug=slug,
-                mtime_floor=_probe_started - 5,
-            )
+            # [wave-22 C1] The probe's output is the file that is NEW or
+            # CHANGED since the pre-run snapshot — a set identity, not the
+            # old mtime window (which the tester's own 5-item sample or a
+            # sibling attempt could win, condemning a healthy listing as
+            # dead). More than one candidate means the evidence is ambiguous:
+            # inconclusive, never a guess.
+            _owned = [
+                p
+                for p in _probe_owned_files(_pre_snap, _ws)
+                if os.path.basename(p).startswith(("output_", "probe_output_"))
+            ]
+            _probe_out = ""
+            if len(_owned) > 1:
+                logger.warning(
+                    "_probe_phase1_discovery: %d candidate outputs changed "
+                    "during the probe (%s) — ambiguous, yield inconclusive "
+                    "(job %s)",
+                    len(_owned),
+                    [os.path.basename(p) for p in _owned][:3],
+                    job_id,
+                )
+            elif _owned:
+                _probe_out = _owned[0]
             if _probe_out:
                 _cov = _read_discovery_coverage(_probe_out) or {}
-                _disc = _cov.get("discovered_urls")
-                if isinstance(_disc, list):
-                    _disc = len(_disc)
-                try:
-                    _disc_n = int(_disc or 0)
-                except (TypeError, ValueError):
-                    _disc_n = 0
-                _sr = str(_cov.get("stop_reason") or "")
-                probe_yield = {
-                    "discovered_urls": _disc_n,
-                    "stop_reason": _sr,
-                    "coverage": dict(_cov),
-                }
+                if not _cov or "discovered_urls" not in _cov:
+                    # [wave-22 C1] Blank coverage is an INCONCLUSIVE stamp,
+                    # never discovered_urls=0 — blank evidence must not arm
+                    # the zero-yield FAIL.
+                    probe_yield = {
+                        "discovered_urls": None,
+                        "stop_reason": "inconclusive_blank_coverage",
+                        "coverage": dict(_cov),
+                        "inconclusive": True,
+                    }
+                    logger.info(
+                        "_probe_phase1_discovery: blank coverage in %s — "
+                        "yield inconclusive (job %s)",
+                        os.path.basename(_probe_out), job_id,
+                    )
+                else:
+                    _disc = _cov.get("discovered_urls")
+                    if isinstance(_disc, list):
+                        _disc = len(_disc)
+                    try:
+                        _disc_n = int(_disc or 0)
+                    except (TypeError, ValueError):
+                        _disc_n = 0
+                    _sr = str(_cov.get("stop_reason") or "")
+                    probe_yield = {
+                        "discovered_urls": _disc_n,
+                        "stop_reason": _sr,
+                        "coverage": dict(_cov),
+                    }
                 logger.info(
                     "_probe_phase1_discovery: discovered=%s stop_reason=%s "
                     "(probe output %s, stdout tail: %r)",
-                    _disc_n, _sr or "?", os.path.basename(_probe_out),
+                    probe_yield.get("discovered_urls"),
+                    probe_yield.get("stop_reason") or "?",
+                    os.path.basename(_probe_out),
                     _stdout.strip()[-200:],
                 )
                 # [wave-19 T1.9] Hygiene: the probe counts URLs, never their
                 # SHAPE. A majority-malformed list (myhouse '//products/x' →
                 # 'https://products/x') must deaden the yield HERE — not burn
                 # execution's fetches on a nonexistent host. The url list is
-                # the draft's own fresh input_urls.json (mtime-floored).
+                # the draft's own fresh input_urls.json, identity-bound to
+                # the pre-run snapshot [wave-22 C1].
                 try:
-                    _hy_urls = _read_probe_discovered_urls(
-                        os.path.join(root, "workspace", slug),
-                        _probe_started - 5,
-                    )
-                    if _hy_urls:
+                    _hy_urls = _read_probe_discovered_urls(_ws, _pre_snap)
+                    if _hy_urls and probe_yield and not probe_yield.get("inconclusive"):
                         probe_yield = _discovery_yield_hygiene(
                             probe_yield, _hy_urls, state.get("url") or ""
                         )
