@@ -36,7 +36,6 @@ import pytest  # noqa: E402
 from django.contrib.auth.models import User  # noqa: E402
 from django.test import Client  # noqa: E402
 from django.urls import reverse  # noqa: E402
-
 from scraper.models import ScrapeJob  # noqa: E402
 
 CSV_HEADER = [
@@ -129,9 +128,9 @@ class TestAggregation:
         html = admin_client.get(reverse("intake_site_status")).content.decode()
         # a.com/p/1: first-try yes; a.com/p/2: first-try no, success link to
         # its completed job
-        row1 = re.search(r"<tr[\s\S]*?a\.com/p/1[\s\S]*?</tr>", html).group(0)
+        row1 = _row(html, "https://a.com/p/1")
         assert "first-try" in row1
-        row2 = re.search(r"<tr[\s\S]*?a\.com/p/2[\s\S]*?</tr>", html).group(0)
+        row2 = _row(html, "https://a.com/p/2")
         assert "/jobs/" in row2
 
 
@@ -171,6 +170,67 @@ class TestCsvExport:
         finals = {row[4] for row in rows[1:]}
         assert finals == {"completed"}
         assert len(rows) - 1 == 2
+
+
+def _row(html, needle):
+    """The single <tr> containing needle. A regex anchored on the document's
+    first <tr> bleeds NEIGHBOURING rows into the span (a failed row's Retry
+    form leaking into a later row's extraction) — split instead."""
+    for frag in html.split("<tr>"):
+        if needle in frag:
+            for row in frag.split("</tr>"):
+                if needle in row:
+                    return row
+    raise AssertionError(f"no table row containing {needle!r}")
+
+
+class TestSiteDedup:
+    def test_site_name_drift_does_not_split_rows(self, admin_client, mixed_history):
+        # The SAME product attempt recorded site_name "a.com" (domain
+        # fallback, older job) and "Site A" (human Site name, newer job).
+        # Grouping by per-job site_name used to emit TWO rows for one real
+        # product — the operator's "adairs twice" complaint. Grouping must
+        # key on the product_url's host; display name prefers the human one.
+        _job("https://a.com/p/5", ScrapeJob.STATUS_FAILED, "a.com", days_ago=2)
+        _job("https://a.com/p/5", ScrapeJob.STATUS_COMPLETED, "Site A", days_ago=1)
+        html = admin_client.get(reverse("intake_site_status")).content.decode()
+        assert html.count("https://a.com/p/5") == 1
+        row = _row(html, "https://a.com/p/5")
+        assert "<td>Site A</td>" in row, "human site name must win over the domain fallback"
+        assert "<td>a.com</td>" not in row
+        assert ">completed</span>" in row, "final status comes from the LATEST attempt"
+
+    def test_summary_sites_counts_real_sites_not_name_variants(
+        self, admin_client, mixed_history
+    ):
+        # 4 products across hosts a.com + b.com — name drift must not inflate
+        # the sites tile even when a site_name variant exists.
+        _job("https://a.com/p/5", ScrapeJob.STATUS_FAILED, "a.com", days_ago=2)
+        html = admin_client.get(reverse("intake_site_status")).content.decode()
+        assert 'data-summary="sites">2<' in html
+
+
+class TestRetryButton:
+    def test_retriable_rows_have_restart_form(self, admin_client, mixed_history):
+        html = admin_client.get(reverse("intake_site_status")).content.decode()
+        row = _row(html, "https://b.com/p/3")
+        assert "/jobs/" in row and "/restart/" in row, "failed row needs a Retry action"
+        assert "csrfmiddlewaretoken" in row, "retry must POST (prefetch-safe), not GET"
+        assert ">retry<" in row.lower()
+
+    def test_completed_and_inflight_rows_have_no_retry(self, admin_client, mixed_history):
+        html = admin_client.get(reverse("intake_site_status")).content.decode()
+        done = _row(html, "https://a.com/p/1")
+        assert "/restart/" not in done, "completed rows must not offer Retry"
+        inflight = _row(html, "https://b.com/p/4")
+        assert "/restart/" not in inflight, "in-flight rows must not offer Retry"
+
+
+class TestCanRetriedLabel:
+    def test_tile_label_says_can_be_retried(self, admin_client, mixed_history):
+        html = admin_client.get(reverse("intake_site_status")).content.decode().lower()
+        assert "can be retried" in html
+        assert "never succeeded" not in html
 
 
 class TestIntakeWiring:

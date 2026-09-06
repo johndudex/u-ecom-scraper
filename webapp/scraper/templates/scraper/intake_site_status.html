@@ -68,7 +68,7 @@
   <div class="tile"><div class="num" data-summary="pending">{{ summary.pending }}</div><div class="lbl">pending</div></div>
   <div class="tile"><div class="num" data-summary="waiting_approval">{{ summary.waiting_approval }}</div><div class="lbl">waiting approval</div></div>
   <div class="tile"><div class="num" data-summary="first_try">{{ summary.first_try }}</div><div class="lbl">first-try</div></div>
-  <div class="tile never_succeeded"><div class="num" data-summary="never_succeeded">{{ summary.never_succeeded }}</div><div class="lbl">never succeeded</div></div>
+  <div class="tile never_succeeded"><div class="num" data-summary="never_succeeded">{{ summary.never_succeeded }}</div><div class="lbl">can be retried</div></div>
 </section>
 
 <form class="filters" method="get">
@@ -100,6 +100,7 @@
       <th>First try</th>
       <th>Succeeded job</th>
       <th>Last activity</th>
+      <th>Retry</th>
     </tr>
   </thead>
   <tbody>
@@ -113,9 +114,18 @@
       <td>{% if r.first_try %}<span class="badge first-try">first-try</span>{% else %}<span class="muted">&mdash;</span>{% endif %}</td>
       <td>{% if r.success_job_url %}<a class="jl" href="{{ r.success_job_url }}">view job</a>{% else %}<span class="muted">&mdash;</span>{% endif %}</td>
       <td class="muted">{{ r.last_activity|date:"Y-m-d H:i" }}</td>
+      <td>
+        {% if r.never_succeeded %}
+        {# POST, never GET: /restart/ spawns a NEW job per call — a prefetched link must not fire one. #}
+        <form method="post" action="{% url 'job_restart' r.latest_job_id %}">
+          {% csrf_token %}
+          <button class="btn btn-sm" type="submit">Retry</button>
+        </form>
+        {% else %}<span class="muted">&mdash;</span>{% endif %}
+      </td>
     </tr>
     {% empty %}
-    <tr><td colspan="8" class="muted">No jobs recorded yet.</td></tr>
+    <tr><td colspan="9" class="muted">No jobs recorded yet.</td></tr>
     {% endfor %}
   </tbody>
 </table>

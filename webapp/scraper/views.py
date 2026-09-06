@@ -2979,21 +2979,26 @@ def intake_maintenance(request):
 
 
 def _site_status_rows():
-    """Roll up EVERY job into one row per (site, product_url).
+    """Roll up EVERY job into one row per (site-host, product_url).
 
     This is the live version of the ``prod_job_status_by_site_product.csv``
     the operator used to ask for by hand: final status of the LATEST attempt,
     attempt count, succeeded-at-first-attempt, and a link to the succeeded
     job. Ordering is stable (site, then product) so the CSV diffs cleanly
     between runs.
+
+    The group key is the product_url's HOST, not the per-job ``site_name``:
+    name drift ("Adairs" on the completed job vs the "adairs.com.au" domain
+    fallback on an older failed one) used to split one real product into two
+    rows and inflate the tiles. The display name prefers the most recent
+    human site name over the domain fallback.
     """
     jobs = ScrapeJob.objects.all().order_by("created_at", "id")
     groups: dict = {}
     for j in jobs:
         purl = j.product_url or j.url
         host = (urlparse(purl).hostname or "").removeprefix("www.")
-        site = (j.site_name or "").strip() or host
-        groups.setdefault((site, purl), []).append(j)
+        groups.setdefault((host, purl), []).append(j)
 
     rows = []
     in_flight = {
@@ -3001,12 +3006,18 @@ def _site_status_rows():
         ScrapeJob.STATUS_PENDING,
         ScrapeJob.STATUS_WAITING_APPROVAL,
     }
-    for (site, purl), js in groups.items():
+    for (host, purl), js in groups.items():
         latest = js[-1]
         completed = [j for j in js if j.status == ScrapeJob.STATUS_COMPLETED]
         success = completed[-1] if completed else None
+        names = [(j.site_name or "").strip() for j in js]
+        display = next(
+            (n for n in reversed(names) if n and n != host),
+            names[-1] or host,
+        )
         rows.append({
-            "site_name": site,
+            "site_name": display,
+            "host": host,
             "site_url": f"https://{urlparse(purl).hostname or ''}",
             "product_url": purl,
             "listing": latest.search_criteria,
@@ -3019,6 +3030,7 @@ def _site_status_rows():
             # In-flight products haven't failed yet — only a TERMINAL
             # non-success state (failed/cancelled/blocked) counts.
             "never_succeeded": success is None and latest.status not in in_flight,
+            "latest_job_id": latest.id,
             "last_activity": (
                 latest.completed_at or latest.started_at or latest.created_at
             ),
@@ -3068,7 +3080,8 @@ def intake_site_status(request):
     all_rows = _site_status_rows()
     summary = {
         "products": len(all_rows),
-        "sites": len({r["site_name"] for r in all_rows}),
+        # Real sites, not display-name variants — host-keyed like the rows.
+        "sites": len({r["host"] for r in all_rows}),
         "first_try": sum(1 for r in all_rows if r["first_try"]),
         "never_succeeded": sum(1 for r in all_rows if r["never_succeeded"]),
     }
