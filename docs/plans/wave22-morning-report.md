@@ -14,8 +14,8 @@ nothing merged — every step that touches prod waits for your click.
   `85a68ef` (W3) → `570c121` (W4) → `bc38a08` (W5).
 - Final counts: **2101 tests green** (root) + **182 webapp** + ruff clean
   (`webapp/ src/` wave-20 policy).
-- Local e2e drive: job **339** (michaelhill 338-shape) — **GREEN**:
-  COMPLETED, 9/9 real products priced (§4 + §4-addendum).
+- Local e2e drives: **3-for-3 GREEN** — job **339** michaelhill 9/9 priced,
+  **340** ego 10/10, **341** myhouse 10/10 (§4 + addenda).
 - **Nothing is deployed.** Waves 20/21/22 all still local. Deploy runbook §6.
 
 ## 1. What was failing (RCA synthesis)
@@ -158,6 +158,32 @@ needed.
 - B2's guarantee is per-job-1: in FAIL→regenerate flows the first
   regeneration re-test consumes the allowance (documented tradeoff; the 329
   PASS-then-edit shape — the one that mattered — is fully covered)
+
+## 4b-addendum: drives 2+3 — ego 340 & myhouse 341 (2026-09-06, both GREEN)
+
+User asked for two more drives on sites that failed on Railway. Both
+COMPLETED on the wave-22 stack, sequential:
+
+| | ego.co.uk (340) | myhouse.com.au (341) |
+|---|---|---|
+| Railway death | job 325: identical draft twice | jobs 324/372: no usable URLs + wall-clock kill |
+| Result | **COMPLETED 10/10, 36.4 min** | **COMPLETED 10/10, 48.1 min** |
+| Fields | 10/10 titled/priced(AUD→GBP)/currency/**availability in_stock** | 10/10 titled/priced(AUD)/currency/**availability in_stock** |
+| Tester | PASS 0.88 first try, 0 high/0 med | PASS (single cycle) |
+| B1 F821 gate | 0 rejections (clean drafts) | **2 rejections, different names each** — writer adapted, never repeated |
+| Retry loops | none (0 CASCADE, 1 execution) | none (0 CASCADE, 0 no-report) |
+| Discovery | 40 URLs, clean Tier-1 stop | 10 items off `sale-clearance` listing |
+
+**B1 live-fire (341):** rejected undefined `ProxyConfig`, then
+`DISCOVERY_STOP_DELAY_s`+`phase2_instant_fail` — two broken drafts never
+touched disk; two distinct names = adaptation, not a loop. On Railway this
+was the site-killing shape ("identical draft twice after failed tests").
+
+**Verdict: 3-for-3 local e2e on the wave-22 stack** (michaelhill 339 +
+ego 340 + myhouse 341), each green on the exact failure shape that killed
+it on Railway. Sync commit `e63e425` pushed to al-johnf/main (user-approved,
+incl. probe.py worktree = wave-21 T4/T5 + C2); PR merge = deploy trigger,
+user's click.
 
 ## 4-addendum: job 339 outcome — E2E GREEN
 
