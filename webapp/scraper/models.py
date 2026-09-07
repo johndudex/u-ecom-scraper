@@ -822,3 +822,36 @@ class MaintenanceLock(models.Model):
     @classmethod
     def is_enabled(cls) -> bool:
         return cls.load().enabled
+
+
+class MaintenanceLockEvent(models.Model):
+    """[wave-24 W24-8] Append-only audit row, one per maintenance-lock toggle.
+
+    The singleton can only remember its LATEST flip — on 2026-09-07 a lift
+    overwrote ``updated_by``/``reason`` before anyone captured who had enabled
+    the lock 34 minutes earlier. Every POST to /intake/maintenance/ appends one
+    of these BEFORE mutating the singleton, so authorship survives every
+    subsequent flip. Rows are never updated.
+    """
+    enabled = models.BooleanField()
+    reason = models.CharField(max_length=200, blank=True, default="")
+    # FK to the singleton purely for the admin inline history — there is
+    # exactly one lock (pk=1), so this is always that row.
+    lock = models.ForeignKey(
+        MaintenanceLock, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="events",
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="maintenance_lock_events",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        app_label = "scraper"
+        ordering = ["-created_at", "-id"]
+        verbose_name = "Maintenance Lock Event"
+
+    def __str__(self):
+        actor = self.updated_by.username if self.updated_by_id else "unknown"
+        return f"{'enable' if self.enabled else 'lift'} by {actor} at {self.created_at:%Y-%m-%d %H:%M}"

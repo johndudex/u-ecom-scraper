@@ -110,6 +110,22 @@ _COVERAGE_FAIL_STOP_REASONS = {
     # the next configured proxy tier and it STILL yielded nothing — every
     # network identity this deployment can wear is blocked.
     "all_tiers_blocked",
+    # [wave-24 W24-3] Browser-service backpressure (our own 429) is a
+    # coverage wall too — the router's _cov_reason consumers (ground-truth
+    # veto, anti-bot exemption) must see it consistently. classify's throttle
+    # guard still outranks this set, so the "retest" lane is unchanged.
+    "navigate_throttled",
+}
+
+# [wave-24 W24-3] Infra-class discovery walls: no writer cycle can fix these
+# (prod 393 burned three ~1800s writer turns against throttling/tier-blocks).
+# Explicitly OUT: ``navigate_unavailable`` (own park/resume lane — counting it
+# would FAIL jobs the gateway killed), ``dedup_flat`` / ``phase1_skipped`` /
+# ``malformed_discovery_urls`` (code bugs wearing a FAIL label), and
+# ``soft_block``/``captcha``/``sitemap_*`` (not stop_reasons at all).
+_ACCESS_WALL_STOP_REASONS = {
+    "navigate_throttled", "all_tiers_blocked", "empty_render",
+    "empty_first_page", "navigate_error",
 }
 
 
@@ -1424,6 +1440,26 @@ def route_after_testing(state: ScrapeState) -> str:
     issues = report.get("issues", [])
     high_severity = any(i.get("severity") == "high" for i in issues)
 
+    # [wave-24 W24-1] Un-proven verdict: the draft changed WHILE the tester
+    # ran (leaked writer thread under a live test — prod 395: zombie
+    # edit_file 2s into the tester's browser run), so the verdict describes a
+    # draft that no longer exists. A PASS here would ship code the tester
+    # never judged — spend ONE re-test on what is actually on disk. The
+    # allowance counter is consumed by the tester node on re-entry, so a
+    # repeating mutation cannot loop this arm. FAIL verdicts keep the normal
+    # ladder: the writer fixes the draft currently on disk.
+    if (
+        assessment == "PASS"
+        and state.get("draft_mutated_during_test")
+        and int(state.get("mutated_verdict_retests") or 0) < 1
+    ):
+        logger.warning(
+            "route_after_testing: PASS UNPROVEN — draft mutated while the "
+            "tester ran → one re-test on the on-disk draft"
+        )
+        _log_cascade(state, "mutated-verdict-retest", "draft changed during test")
+        return "code_tester"
+
     # A core field left at ~0% coverage is a field-mapping bug — force a retry
     # so the code-writer remaps it to a populated source.
     missing_core = _core_field_zero_coverage(report, state)
@@ -1680,6 +1716,45 @@ def route_after_testing(state: ScrapeState) -> str:
                 _override_min,
             )
             return "field_confirmation"
+
+    # [wave-24 W24-3] Access-wall ×2 early terminal: throttling / tier-blocks
+    # / render-walls are INFRA failures — no writer cycle can fix them (393:
+    # three ~1800s writer turns against our own browser-service 429 and a
+    # Radware challenge; ~3h of honest-but-avoidable burn per job). After two
+    # counted wall cycles, stop AHEAD of every code_writer bounce below —
+    # including the retest-budget-exhausted conversion that turns walls into
+    # writer cycles. The tester node counts the cycles (routing functions
+    # cannot mutate state); its one-reset escape on a concrete scraper-target
+    # diagnosis is what keeps a real late fix (395's Algolia re-tier) from
+    # being walled off. Sibling guards wrap the terminal like the exhausted
+    # arms; the ground-truth rescue still wins.
+    if int(state.get("access_wall_cycles") or 0) >= 2:
+        _rescue_min_aw = (
+            1 if (state.get("input_mode") or "") in ("url_list", "list_page") else 3
+        )
+        if _scraper_has_real_items(state, min_count=_rescue_min_aw):
+            logger.info(
+                "route_after_testing: access-wall ×2 but output has real items "
+                "→ field_confirmation (ground truth beats the wall)"
+            )
+            return "field_confirmation"
+        if bool(state.get("access_wall_all_throttled")):
+            # Every counted stop was OUR browser-service 429 — park the job
+            # (non-terminal, beat-resumed) instead of an honest-FAIL cleanup.
+            _aw_dest = "park_browser_unavailable"
+        elif state.get("skip_approvals", False):
+            _aw_dest = "cleanup"
+        else:
+            _aw_dest = "human_approval"
+        logger.error(
+            "route_after_testing: %d access-wall discovery cycles — writer "
+            "cycles cannot fix infra walls → %s",
+            int(state.get("access_wall_cycles") or 0), _aw_dest,
+        )
+        _log_cascade(state, "access-wall", "×2 access-wall discovery cycles")
+        return _terminal_after_retest_check(
+            state, _terminal_after_grace_check(state, _aw_dest)
+        )
 
     # T2.1 volume-gap bounce (bounded, contract-bounce shape): a big
     # discovered-vs-extracted gap on a beyond-sample run is a precisely-known
@@ -1979,7 +2054,13 @@ def route_after_testing(state: ScrapeState) -> str:
             retry_count + 1,
             MAX_TEST_RETRIES + 1,
         )
-        _log_cascade(state, "strategy-switch", _reason)
+        # [wave-24 W24-7] Neutral label: this row logs the DECISION to consult
+        # the strategy ladder, not an outcome — scraper_analyzer hasn't picked
+        # yet, and the anti-bot authority can force the SAME strategy back
+        # (394 logged "strategy-switch" for a cycle that re-picked playwright).
+        # The honest resolution row (strategy-switch vs code-fix (strategy
+        # rerun)) is logged by _decide_strategy once the pick exists.
+        _log_cascade(state, "strategy-ladder", _reason)
         return "scraper_analyzer"
     if _action == "scraper":
         logger.info(

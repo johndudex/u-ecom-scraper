@@ -212,7 +212,7 @@ function doRefresh() {
         .then(function(services) {
             var grid = document.getElementById('health-grid');
             var html = '';
-            var order = ['django', 'postgres', 'redis', 'celery_worker', 'celery_beat', 'browser_service', 'queue'];
+            var order = ['django', 'postgres', 'redis', 'celery_worker', 'celery_beat', 'browser_service', 'queue', 'maintenance_lock'];
             order.forEach(function(name) {
                 if (services[name]) {
                     html += renderCard(name, services[name]);

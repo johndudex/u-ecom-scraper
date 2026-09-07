@@ -109,16 +109,23 @@ class TestClassifierThrottledBranch:
         # routes to "retest" (same draft), never "strategy".
         assert action == "retest"
 
-    def test_throttled_is_not_a_coverage_fail(self):
-        """_COVERAGE_FAIL_STOP_REASONS must exclude navigate_throttled — a
-        throttled run is unproven, not a give-up."""
+    def test_throttled_is_coverage_fail_but_still_classifies_retest(self):
+        """[wave-24 W24-3 updated] navigate_throttled JOINED
+        _COVERAGE_FAIL_STOP_REASONS so the router's _cov_reason consumers
+        (ground-truth veto, PASS-downgrade) see throttling consistently —
+        but classify's throttle guard still outranks the coverage branch, so
+        a throttled run remains UNPROVEN coverage (retest), never a
+        strategy verdict or a give-up."""
         from webapp.agents.nodes.route_after_testing import (
             _COVERAGE_FAIL_STOP_REASONS,
             _discovery_coverage_failure,
+            classify_test_failure,
         )
 
-        assert "navigate_throttled" not in _COVERAGE_FAIL_STOP_REASONS
-        assert _discovery_coverage_failure(self._report()) is None
+        assert "navigate_throttled" in _COVERAGE_FAIL_STOP_REASONS
+        assert _discovery_coverage_failure(self._report()) is not None
+        action, _ = classify_test_failure(self._report(), "http_navigation")
+        assert action == "retest"
         assert (
             _discovery_coverage_failure(self._report("navigate_error")) is not None
         ), "hard navigate failures stay coverage-FAIL"

@@ -279,12 +279,14 @@ def run_probe(
 MAX_RENDER_HTML = 500_000
 
 _render_captured_html: str = ""
+_render_captured_truncated: bool = False
 
 
 def _capture_html_for_render(html: str) -> None:
     """Side-channel to capture HTML from probe functions during render_page."""
-    global _render_captured_html
-    if len(html) > MAX_RENDER_HTML:
+    global _render_captured_html, _render_captured_truncated
+    _render_captured_truncated = len(html) > MAX_RENDER_HTML
+    if _render_captured_truncated:
         html = html[:MAX_RENDER_HTML]
     _render_captured_html = html
 
@@ -304,8 +306,11 @@ def render_page(
     that need the full page DOM (e.g. navigation_explore for extracting
     category links, search forms, product cards).
 
-    Returns a dict with: ``success``, ``html``, ``status_code``, ``method``,
-    ``title``, ``proxy_tier``, ``error``.
+    Returns a dict with: ``success``, ``html``, ``html_truncated`` [wave-22 C2:
+    True when the returned HTML was cut to ``MAX_RENDER_HTML`` — the capture
+    path slices inside ``_capture_html_for_render``, the re-fetch path is cut
+    by this function's own slice], ``status_code``, ``method``, ``title``,
+    ``proxy_tier``, ``error``.
 
     ``proxy_tier`` optionally restricts the escalation to one tier (same
     meaning as :func:`run_probe`'s).
@@ -360,8 +365,9 @@ def render_page(
             continue
 
         logger.info("RENDER [%s]: trying %s", url[:80], step_name)
-        global _render_captured_html
+        global _render_captured_html, _render_captured_truncated
         _render_captured_html = ""
+        _render_captured_truncated = False
         result = _dispatch_step(step_name, url, timeout, country=country)
 
         if result and result.get("needs_akamai_bypass"):
@@ -371,10 +377,17 @@ def render_page(
         if result and result.get("success"):
             html = _render_captured_html
             if not html:
+                # [wave-22 C2] The re-fetch path returns UNTRUNCATED text —
+                # the slice below is where it gets cut, so the flag is the
+                # length check itself (the capture path records its own).
                 html = _refetch_html(url, step_name, step_proxy_tier, timeout, country)
+                html_truncated = len(html) > MAX_RENDER_HTML
+            else:
+                html_truncated = _render_captured_truncated
             return {
                 "success": True,
                 "html": html[:MAX_RENDER_HTML],
+                "html_truncated": html_truncated,
                 "status_code": result.get("status_code", 200),
                 "method": result.get("method", step_name),
                 "title": result.get("title", ""),

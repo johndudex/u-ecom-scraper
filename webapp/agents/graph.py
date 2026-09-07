@@ -845,6 +845,27 @@ def _attach_discovery_coverage(report: dict, slug: str) -> dict:
         # the real run's output. Pre-P0 (playwright closed-page bug) those
         # probes always wrote {found: 0, stop_reason: navigate_error}; picking
         # that up here downgraded healthy jobs via _COVERAGE_FAIL_STOP_REASONS.
+        # [wave-24 W24-2] The phase TAG is authoritative: any output marked
+        # metadata.phase == "discovery" is a --discover-only probe artifact —
+        # its zero-coverage must never ride into the run's verdict (394: a
+        # probe's empty_render block sailed past the old navigate_error-only
+        # guard and read as a false HIGH over a proven 240-URL run). The
+        # shape guard below stays for pre-tagging outputs.
+        try:
+            with open(output_file, errors="ignore") as _pf:
+                _pdata = json.load(_pf)
+        except Exception:
+            _pdata = None
+        if isinstance(_pdata, dict):
+            from .nodes.route_after_testing import _is_discovery_output
+
+            if _is_discovery_output(_pdata):
+                logger.info(
+                    "_attach_discovery_coverage: skipping --discover-only probe "
+                    "artifact %s (metadata.phase=discovery)",
+                    os.path.basename(output_file),
+                )
+                return report
         # A probe artifact is identifiable by empty products + a coverage block.
         if (
             isinstance(cov, dict)
@@ -2002,7 +2023,21 @@ def _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout):
     import asyncio
     import time as _time
 
+    from .tools.context import (
+        mark_invocation_cancelled,
+        new_invocation_id,
+        stamp_invocation,
+        unstamp_invocation,
+    )
+
     t0 = _time.monotonic()
+
+    # [wave-24 W24-1] Per-invocation disarm id, stamped on the event-loop
+    # thread: asyncio tasks copy the creating context, and the sync tools
+    # ainvoke dispatches run under that copied context — so a tool orphaned
+    # by the timeout cancel is disarmed by id, not by the re-armable global.
+    invocation_id = new_invocation_id()
+    _stamp_token = stamp_invocation(invocation_id)
 
     async def _run():
         return await asyncio.wait_for(
@@ -2041,9 +2076,7 @@ def _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout):
         # tool already in an executor thread cannot be interrupted — latch the
         # tool-context cancel so its NEXT tool call refuses (same disarm the
         # sync path applies to its abandoned thread).
-        from .tools.context import mark_invocation_cancelled
-
-        mark_invocation_cancelled(phase)
+        mark_invocation_cancelled(phase, invocation_id=invocation_id)
         # T0.3: the dead invocation must be DISTINGUISHABLE from a healthy
         # budget-exhausted return — both paths used to be bare {"messages": []}
         # and `_error` was read by nobody, so a wall-clock death was invisible
@@ -2064,6 +2097,7 @@ def _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout):
         )
         return {"_error": str(exc)[:200], "_error_class": type(exc).__name__}
     finally:
+        unstamp_invocation(_stamp_token)
         # Every path above (success, timeout, error): reap leftover tasks and
         # async generators, then close the loop — never joining executor
         # threads (that join was the soft wall clock).
@@ -2220,7 +2254,23 @@ def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, t
     import threading
 
     result_box = [None]
+
+    # [wave-24 W24-1] Mint the disarm id on the node thread and stamp it
+    # INSIDE the spawned thread's context. LangGraph dispatches the agent's
+    # sync tools through a ContextThreadPoolExecutor that copies the
+    # submitting thread's context, so every tool call this invocation makes
+    # carries the id — cancellation (below) then disarms exactly this
+    # invocation, and only this one, across any number of fresh phases.
+    from .tools.context import (
+        mark_invocation_cancelled,
+        new_invocation_id,
+        stamp_invocation,
+    )
+
+    invocation_id = new_invocation_id()
+
     def _run():
+        stamp_invocation(invocation_id)
         try:
             result_box[0] = agent.invoke({"messages": messages}, agent_cfg)
         except Exception as exc:
@@ -2251,9 +2301,10 @@ def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, t
         # LLM rounds get tool-refusal errors instead of mutating the draft
         # after the tester verdict (329: three edit_file calls at
         # 05:39:56-05:40:45, execution launched 05:41:04 on a SyntaxError).
-        from .tools.context import mark_invocation_cancelled
-
-        mark_invocation_cancelled(phase)
+        # [wave-24 W24-1] The latch is the per-invocation id — the legacy
+        # global flag alone was re-armed by the very next set_tool_context
+        # (prod 395: zombie edit_file 2s into the tester's run).
+        mark_invocation_cancelled(phase, invocation_id=invocation_id)
         # T0.3 (sync twin of the async-path marker): surface the dead invocation.
         return {"messages": [], "_error": f"wall-clock timeout after {timeout}s",
                 "_error_class": "WallClockTimeout"}
@@ -3751,6 +3802,35 @@ def _decide_strategy(state: ScrapeState) -> dict[str, Any]:
             logger.warning("_decide_strategy: could not write scraper_analysis.json: %s", exc)
 
         update: dict[str, Any] = {"messages": [], "scraper_analysis": analysis}
+        # [wave-24 W24-7] Cascade resolution honesty: route_after_testing's
+        # strategy arm logs the neutral "strategy-ladder" decision BEFORE the
+        # pick exists. Log the RESOLUTION here — "strategy-switch" only when
+        # the strategy actually changed; "code-fix (strategy rerun)" when the
+        # anti-bot authority or an exhausted ladder re-picked the same one
+        # (394's playwright "switch" that wasn't). strategy_rerun rides to
+        # the writer message builder, which swaps the template-rewrite hint
+        # for edit-over-write framing on rerun cycles.
+        _w24_rerun = bool(_prior_strategy) and (
+            str(analysis.get("strategy") or "") == str(_prior_strategy)
+        )
+        update["strategy_rerun"] = _w24_rerun
+        if _prior_strategy:
+            _log_event_row(
+                job_id,
+                "scraper_analyzer",
+                "[CASCADE] action={action} strategy={old}→{new} reason={why}".format(
+                    action=(
+                        "code-fix (strategy rerun)" if _w24_rerun else "strategy-switch"
+                    ),
+                    old=_prior_strategy,
+                    new=analysis.get("strategy") or "",
+                    why=(
+                        "scraper_analyzer re-picked the same strategy"
+                        if _w24_rerun
+                        else "scraper_analyzer picked a different strategy"
+                    ),
+                ),
+            )
         if _new_tried:
             update["strategies_tried"] = _new_tried  # append (Annotated[list, operator.add])
         _notify_phase(job_id, "scraper_analyzer", "done")
@@ -4775,6 +4855,23 @@ def _noop_should_escalate(noop_cycles: int, test_retry_count: int) -> bool:
     return test_retry_count >= MAX_TEST_RETRIES
 
 
+def _writer_hit_step_budget(result) -> bool:
+    """[wave-25 W25-c] True when the writer invocation ended on langgraph's
+    remaining_steps exhaustion — the prebuilt loop replies "Sorry, need more
+    steps to process this request." as a NORMAL final message (no exception),
+    which is why no error counter saw these deaths. Best-effort: any shape
+    that is not a message list is simply not a death."""
+    try:
+        messages = (result or {}).get("messages") or []
+        for message in reversed(messages):
+            content = getattr(message, "content", None)
+            if isinstance(content, str) and "need more steps" in content.lower():
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
     job_id = state.get("job_id", 0)
     _notify_phase(job_id, "code_writer", "running")
@@ -5014,7 +5111,36 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         except Exception as _eow_exc:
             logger.warning("_invoke_code_writer: edit-over-write check failed: %s", _eow_exc)
 
-        agent = create_code_writer(site_slug=slug, template_code=_template_code)
+        # [wave-24 W24-5] A writer invocation whose test_report carries a
+        # remediation is a CODE-FIX cycle: the draft exists and the ask is an
+        # edit. Stamp the fix-cycle signal BEFORE agent construction so the
+        # draft-first nudge stands down (it is a first-draft forcing
+        # function; 394 cycle-2 saw 32 bogus fires), and lift it when the
+        # invocation windows complete.
+        from .subagents import _writer_codefix_cycle, _writer_fix_cycle
+
+        _w24_tr = state.get("test_report")
+        _w24_fix = isinstance(_w24_tr, dict) and bool(
+            str(_w24_tr.get("feedback_for_writer") or "").strip()
+            or (
+                isinstance(_w24_tr.get("remediation"), dict)
+                and _w24_tr.get("remediation")
+            )
+        )
+        # [wave-24 W24-4] Narrower than _w24_fix: only a fix cycle whose base
+        # is the EXISTING draft (same template + parseable draft on disk) may
+        # intercept bare full rewrites — on a template change regeneration is
+        # the correct move and must never be bounced.
+        _w24_codefix = _w24_fix and _eow_active
+        _w24_nudge_token = _writer_fix_cycle.set(_w24_fix)
+        _w24_codefix_token = _writer_codefix_cycle.set(_w24_codefix)
+        try:
+            agent = create_code_writer(site_slug=slug, template_code=_template_code)
+        except BaseException:
+            _writer_fix_cycle.reset(_w24_nudge_token)
+            _writer_codefix_cycle.reset(_w24_codefix_token)
+            raise
+
         hb = _start_heartbeat(job_id, "code-writer")
         # F5: try/finally — an exception here previously leaked the timer chain.
         _cw_cfg = _agent_config(config, "code_writer")
@@ -5022,7 +5148,29 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
             result = _invoke_agent_with_timeout(agent, messages, _cw_cfg, "code_writer", job_id)
         finally:
             _stop_heartbeat(hb)
+            _writer_fix_cycle.reset(_w24_nudge_token)
+            _writer_codefix_cycle.reset(_w24_codefix_token)
         _persist_agent_logs(state, result, "code-writer", config)
+
+        # [wave-25 W25-c] Step-budget death accounting. langgraph's prebuilt
+        # loop ends the agent NORMALLY when remaining_steps hits 0, replying
+        # "Sorry, need more steps to process this request." — no exception, so
+        # no counter saw it (prod: 10 deaths across 5 recent jobs; job 404 had
+        # 3). Detect the apology and count it on a DEDICATED counter so the
+        # telemetry distinguishes "writer died of budget" from "writer no-op".
+        # Accounting only — a death with a usable draft still proceeds to
+        # testing (404 completed 10/10 despite 3 deaths).
+        if _writer_hit_step_budget(result):
+            update["writer_step_budget_deaths"] = (
+                int(state.get("writer_step_budget_deaths") or 0) + 1
+            )
+            logger.error(
+                "[WRITER-STEP-BUDGET] invocation ended on langgraph "
+                "remaining_steps exhaustion (death #%d, job %s) — the writer "
+                "ran out of steps, likely to repeated large reads; downstream "
+                "fix cycles should assume the draft may be STALE",
+                update["writer_step_budget_deaths"], job_id,
+            )
 
         # [B1.3/wave-13] Fence recovery: a writer that put the COMPLETE scraper
         # inside a ```python fence in its reply but never called write_file
@@ -5449,7 +5597,13 @@ def _identity_snapshot(workspace_dir: str) -> dict[str, tuple[int, int]]:
     import glob as _glob
 
     snap: dict[str, tuple[int, int]] = {}
-    for pattern in ("output_*.json", "probe_output_*.json", "input_urls.json"):
+    # [wave-24 W24-2] discovered_urls_checkpoint.json joins the identity set:
+    # a probe writes it (the templates checkpoint discovery), and owned-file
+    # identity must see it like input_urls.json.
+    for pattern in (
+        "output_*.json", "probe_output_*.json", "input_urls.json",
+        "discovered_urls_checkpoint.json",
+    ):
         for p in _glob.glob(os.path.join(workspace_dir or "", pattern)):
             try:
                 st = os.stat(p)
@@ -5677,7 +5831,10 @@ def _probe_phase1_discovery(
     is recorded on the coverage, and dead at BOTH identities sets the
     FAIL-class ``all_tiers_blocked`` stop reason instead of a bare zero.
     """
-    crashed, tb, probe_yield = _probe_phase1_discovery_once(slug, state, job_id)
+    # [wave-24 W24-2] The three probe invocations below run through the
+    # checkpoint-guarded wrapper: a probe that discovers 0 must not destroy
+    # the real run's banked discovery checkpoint.
+    crashed, tb, probe_yield = _probe_phase1_discovery_checked(slug, state, job_id)
     _listing_used = ""
     if not crashed and _probe_retry_warranted(state, probe_yield):
         _primary, _alt = _probe_listing_candidates(state)
@@ -5687,7 +5844,7 @@ def _probe_phase1_discovery(
             job_id, _alt[:80],
         )
         _listing_used = _alt
-        crashed, tb, probe_yield = _probe_phase1_discovery_once(
+        crashed, tb, probe_yield = _probe_phase1_discovery_checked(
             slug, state, job_id, listing_override=_alt
         )
     if (
@@ -5720,7 +5877,7 @@ def _probe_phase1_discovery(
                 "identity-escalation re-run at tier '%s'",
                 _prev_tier, job_id, _next_tier,
             )
-            _esc_crashed, _esc_tb, _esc_yield = _probe_phase1_discovery_once(
+            _esc_crashed, _esc_tb, _esc_yield = _probe_phase1_discovery_checked(
                 slug, _esc_state, job_id, listing_override=_listing_used
             )
             _annotation = {
@@ -5758,6 +5915,79 @@ def _probe_phase1_discovery(
                     probe_yield["stop_reason"] = "all_tiers_blocked"
                 probe_yield["coverage"] = _cov
     return crashed, tb, probe_yield
+
+
+def _read_discovery_checkpoint(ws: str) -> dict | None:
+    """[wave-24 W24-2] The workspace's discovery checkpoint, or None."""
+    try:
+        with open(
+            os.path.join(ws or "", "discovered_urls_checkpoint.json"), encoding="utf-8"
+        ) as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _checkpoint_url_count(data: dict | None) -> int:
+    """URLs banked in a checkpoint dict; -1 when absent (nothing to protect)."""
+    if not isinstance(data, dict):
+        return -1
+    urls = data.get("urls")
+    if isinstance(urls, list):
+        return len(urls)
+    try:
+        return int(data.get("count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _restore_zeroed_checkpoint(ws: str, pre: dict | None) -> None:
+    """[wave-24 W24-2] Undo a probe's 0-URL checkpoint overwrite.
+
+    The probe runs the draft with ``--discover-only``; a failing discovery
+    makes the template checkpoint 0 URLs OVER the real run's banked
+    checkpoint (394: 240-URL run → empty_render probe → checkpoint 0), and
+    the next crash-retry resumes from empty. Restore the pre-probe content
+    when the on-disk checkpoint now holds 0 URLs and the saved one held >0.
+    """
+    if _checkpoint_url_count(pre) <= 0:
+        return
+    if _checkpoint_url_count(_read_discovery_checkpoint(ws)) == 0:
+        try:
+            with open(
+                os.path.join(ws, "discovered_urls_checkpoint.json"), "w", encoding="utf-8"
+            ) as fh:
+                json.dump(pre, fh)
+            logger.info(
+                "_restore_zeroed_checkpoint: probe zeroed the discovery "
+                "checkpoint — pre-probe checkpoint (%d URLs) restored",
+                _checkpoint_url_count(pre),
+            )
+        except Exception as exc:
+            logger.debug("_restore_zeroed_checkpoint: restore failed: %s", exc)
+
+
+def _probe_phase1_discovery_checked(slug, state, job_id, root: str | None = None, **kw):
+    """[wave-24 W24-2] Checkpoint-guarded wrapper around the Phase-1 probe.
+
+    Whatever the probe does to ``discovered_urls_checkpoint.json``, a banked
+    >0-URL checkpoint from the real run survives it. ``root`` is injectable
+    for tests; production resolves it from settings like every sibling.
+    """
+    if root is None:
+        try:
+            from django.conf import settings
+
+            root = settings.PROJECT_ROOT
+        except Exception:
+            root = "."
+    ws = os.path.join(root, "workspace", slug)
+    _pre_ckpt = _read_discovery_checkpoint(ws)
+    try:
+        return _probe_phase1_discovery_once(slug, state, job_id, **kw)
+    finally:
+        _restore_zeroed_checkpoint(ws, _pre_ckpt)
 
 
 def _probe_phase1_discovery_once(
@@ -6064,6 +6294,107 @@ def _probe_phase1_discovery_once(
     return False, None, None
 
 
+def _draft_moved_during_test(entry_fp: str, exit_fp: str) -> bool:
+    """[wave-24 W24-1] True when the draft changed while the tester ran.
+
+    A verdict rendered on a draft that no longer exists is unproven — prod
+    395: the leaked writer's ``edit_file`` landed 2s into the tester's browser
+    run. Empty fingerprints (draft absent at either end) are NOT a mutation:
+    the absent-draft guard owns that case.
+    """
+    return bool(entry_fp and exit_fp and entry_fp != exit_fp)
+
+
+def _coverage_yield_count(cov: dict) -> int:
+    """Best-effort URL/item yield of a discovery_coverage block, across the
+    key vocabularies templates emit (``found`` / ``discovered_urls``)."""
+    if not isinstance(cov, dict):
+        return 0
+    for key in ("found", "discovered_urls"):
+        val = cov.get(key)
+        if isinstance(val, list):
+            return len(val)
+        try:
+            n = int(val or 0)
+        except (TypeError, ValueError):
+            continue
+        if n:
+            return n
+    return 0
+
+
+def _zero_yield_coverage_update(report: dict, probe_cov: dict) -> tuple[dict, str]:
+    """[wave-24 W24-2] Evidence-strength guard for the tester's zero-yield arm.
+
+    Returns ``(coverage_block_to_publish, writer_note)``. When THIS attempt's
+    own run already produced discovery coverage with a positive yield
+    (attached from its output by _attach_discovery_coverage), that is the
+    STRONGER evidence — keep it live and let the caller stash the probe's
+    zero under ``probe_discovery_coverage`` (394: a 240-URL run followed by
+    an empty_render probe must not read as a 0-URL failure). A run with no
+    or zero coverage publishes the probe block — today's behavior.
+    """
+    prior = report.get("discovery_coverage") if isinstance(report, dict) else None
+    prior_strong = _coverage_yield_count(prior) > 0
+    if prior_strong and isinstance(probe_cov, dict):
+        note = (
+            " NOTE: this attempt's own run reported a positive discovery "
+            f"yield ({_coverage_yield_count(prior)} URLs, stop_reason="
+            f"{prior.get('stop_reason')}) — the probe contradicts the run; "
+            "judge against both blocks (probe block: probe_discovery_coverage)."
+        )
+        return prior, note
+    return (probe_cov if isinstance(probe_cov, dict) else {}), ""
+
+
+def _access_wall_update(
+    state: ScrapeState,
+    stop_reason: str,
+    probe_zero_is_live_block: bool,
+    report: dict | None,
+) -> dict[str, Any]:
+    """[wave-24 W24-3] State fragment feeding the router's access-wall ×2
+    early terminal.
+
+    Access-class stop reasons (throttling, tier blocks, render walls) are
+    INFRA failures no writer cycle can fix, but routing functions cannot
+    mutate state — so the tester's zero-yield arm counts them here and lets
+    route_after_testing terminalize on the ×2. A stop only counts when the
+    probe's zero IS the live coverage block: a zero stashed under stronger
+    run evidence (W24-2) means the run proved its discovery works. Escape,
+    once per job (cap 1, mirroring ``remediation_grace_used``): a concrete
+    scraper-target diagnosis — the same bar the wave-20 T1 classifier applies
+    — resets the counter for one real fix window. ``target: "strategy"``
+    NEVER escapes (393 cycle-2 rode exactly such a diagnosis on a BS-429
+    into a second pointless writer cycle).
+    """
+    from .nodes.route_after_testing import (
+        _ACCESS_WALL_STOP_REASONS,
+        _remediation_scraper_diagnosis,
+    )
+
+    if stop_reason not in _ACCESS_WALL_STOP_REASONS or not probe_zero_is_live_block:
+        return {}
+    prior = int(state.get("access_wall_cycles") or 0)
+    escape_used = int(state.get("access_wall_escape_used") or 0)
+    diagnosis = _remediation_scraper_diagnosis(
+        report if isinstance(report, dict) else {}
+    )
+    if diagnosis and escape_used < 1:
+        return {
+            "access_wall_cycles": 0,
+            "access_wall_all_throttled": False,
+            "access_wall_escape_used": escape_used + 1,
+        }
+    return {
+        "access_wall_cycles": prior + 1,
+        "access_wall_all_throttled": (
+            (prior == 0 or bool(state.get("access_wall_all_throttled")))
+            and stop_reason == "navigate_throttled"
+        ),
+    }
+
+
 def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
     job_id = state.get("job_id", 0)
     retry_count = state.get("test_retry_count", 0)
@@ -6116,6 +6447,18 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             )
     except Exception as _te_exc:
         logger.warning("_invoke_code_tester: draft entry guard failed: %s", _te_exc)
+    # [wave-24 W24-1] Fingerprint the draft AT ENTRY (after the presence guard
+    # may have restored it — this is exactly what the tester will run). If the
+    # exit fingerprint differs, the draft moved under the live test and the
+    # verdict is stamped unproven (route_after_testing spends one re-test).
+    _w24_entry_fp = ""
+    try:
+        if _te_draft:
+            from .nodes.route_after_testing import draft_file_fp
+
+            _w24_entry_fp = draft_file_fp(_te_draft)
+    except Exception as _w24_exc:
+        logger.debug("_invoke_code_tester: entry fingerprint failed: %s", _w24_exc)
     # [wave-22 B2] Does this invocation ENTER with the forced-re-test
     # signature — the on-disk draft differs from the last JUDGED one, the
     # allowance is unspent, and the wall arm is not hot? If so, this pass
@@ -6190,6 +6533,13 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "code-tester", config)
         update = {"messages": [], "draft_absent_count": _te_absent}
+        if bool(state.get("draft_mutated_during_test")):
+            # [wave-24 W24-1] Entering with the un-proven flag set: consume the
+            # router's one-mutated-verdict re-test allowance so a repeating
+            # mutation cannot loop the retest arm.
+            update["mutated_verdict_retests"] = (
+                int(state.get("mutated_verdict_retests") or 0) + 1
+            )
         if _b2_forced:
             # [wave-22 B2] This was the forced re-test — the allowance is now
             # spent regardless of the verdict below, so route_after_testing's
@@ -6244,6 +6594,18 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         except Exception as _fp_exc:
             logger.debug("_invoke_code_tester: draft fingerprint failed: %s", _fp_exc)
         update["last_tested_draft_fp"] = _draft_fp
+        # [wave-24 W24-1] Verdict integrity: did the draft move UNDER this
+        # test? Always stamped (True or False) so a clean re-test clears the
+        # flag a previous mutated test left behind.
+        update["draft_mutated_during_test"] = _draft_moved_during_test(
+            _w24_entry_fp, _draft_fp
+        )
+        if update["draft_mutated_during_test"]:
+            logger.warning(
+                "_invoke_code_tester: draft MUTATED during the test (fp %s…→%s…) "
+                "— verdict stamped unproven (job %s)",
+                _w24_entry_fp[:8], _draft_fp[:8], job_id,
+            )
         update["last_tested_at"] = _test_started_at
         if _draft_fp:
             _prev_fp = str(state.get("last_tested_draft_fp") or "")
@@ -6578,14 +6940,20 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 "discovered_urls": 0,
                 "probe_scope": "discover_only",
             })
-            report["discovery_coverage"] = _zcov
+            # [wave-24 W24-2] Never publish the probe's zero OVER a stronger
+            # evidence block: when the run's own coverage shows a positive
+            # yield, it stays live and the probe's zero is stashed beside it.
+            _live_cov, _w24_probe_note = _zero_yield_coverage_update(report, _zcov)
+            if _live_cov is not _zcov:
+                report["probe_discovery_coverage"] = _zcov
+            report["discovery_coverage"] = _live_cov
             report.setdefault("phases_tested", {})["phase1_discovery"] = False
             _zmsg = (
                 "Phase-1 discovery probe: clean exit but no usable item URLs "
                 f"discovered under execution conditions (stop_reason={_zsr}). "
                 "The draft's discovery cannot see this site's items with the "
                 "current strategy."
-            )
+            ) + _w24_probe_note
             report.setdefault("issues", []).insert(
                 0,
                 {"severity": "high", "message": _zmsg, "description": _zmsg},
@@ -6598,6 +6966,11 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 "markup. Do NOT remove the shared discovery module wiring."
             )
             update["test_report"] = report
+            # [wave-24 W24-3] Access-wall accounting: count infra-class stops
+            # toward the router's ×2 early terminal — but only when the
+            # probe's zero IS the live block (a stashed zero under stronger
+            # run evidence is not a wall).
+            update.update(_access_wall_update(state, _zsr, _live_cov is _zcov, report))
             _retry_z = state.get("test_retry_count", 0)
             _is_last_z = (
                 _retry_z == FINAL_RETRY_SENTINEL or _retry_z >= MAX_TEST_RETRIES

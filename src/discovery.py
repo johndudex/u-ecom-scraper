@@ -54,15 +54,16 @@ helper serves Playwright templates and the browser_service runner. Mirrors the
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field, replace
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Callable, Optional, Protocol
+from typing import Any, Protocol
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from src.pagination_patterns import (
+    _OFFSET_PARAMS,
     DEFAULT_LOAD_MORE_SELECTORS,
     DEFAULT_NEXT_BUTTON_SELECTORS,
-    _OFFSET_PARAMS,
 )
 
 logger = logging.getLogger(__name__)
@@ -153,7 +154,7 @@ class PageLike(Protocol):
     """
 
     def evaluate(self, js: str, *args: Any) -> Any: ...
-    def query_selector(self, selector: str) -> Optional[Any]: ...
+    def query_selector(self, selector: str) -> Any | None: ...
     def goto(self, url: str, **kwargs: Any) -> Any: ...
     def wait_for_timeout(self, ms: int) -> None: ...
     def wait_for_load_state(self, state: str) -> None: ...
@@ -203,7 +204,7 @@ class DiscoveryConfig:
     """
 
     # ── bounds ──
-    max_pages: Optional[int] = 200       # hard cap on iterations; None = unlimited
+    max_pages: int | None = 200       # hard cap on iterations; None = unlimited
     max_no_progress: int = 3             # consecutive 0-new rounds before stopping
     min_initial_links: int = 5           # render-wait target before pagination starts
     initial_render_polls: int = 20       # max render-wait polls (~500ms each)
@@ -219,14 +220,14 @@ class DiscoveryConfig:
     scroll_wait_ms: int = 1200
 
     # ── page_param ──
-    page_param_name: Optional[str] = None   # e.g. "page", "offset"
-    items_per_page: Optional[int] = None    # page size (offset-style params only)
+    page_param_name: str | None = None   # e.g. "page", "offset"
+    items_per_page: int | None = None    # page size (offset-style params only)
 
     # ── next_button ──
-    next_button_selector: Optional[str] = None  # declared selector; semantic
+    next_button_selector: str | None = None  # declared selector; semantic
                                                 # fallbacks always also tried
     # ── navigation + render ──
-    site_url: Optional[str] = None         # base for resolving relative hrefs
+    site_url: str | None = None         # base for resolving relative hrefs
     navigate_timeout_ms: int = 30000
     page_settle_after_nav_s: float = 8.0   # mirrors nav template's post-goto sleep
     safe_eval_retries: int = 2             # Coveo "Execution context destroyed" retries
@@ -268,7 +269,7 @@ class DiscoveryResult:
     stop_reason: str = StopReason.NO_NEXT_LINK.value
     max_pages_hit: bool = False
     pages_visited: int = 0
-    param_used: Optional[str] = None
+    param_used: str | None = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -307,7 +308,7 @@ def click_load_more(page: Any, selectors: tuple[str, ...] = DEFAULT_LOAD_MORE_SE
 
 
 def build_page_param_url(current_url: str, param: str, page_num: int,
-                         items_per_page: Optional[int] = None) -> str:
+                         items_per_page: int | None = None) -> str:
     """Return ``current_url`` with ``param`` REPLACED (not appended).
 
     Offset-style params (``offset``/``start``/``skip``/``begin``/``from``) take
@@ -326,8 +327,8 @@ def build_page_param_url(current_url: str, param: str, page_num: int,
     return urlunparse(p._replace(query=urlencode(qs)))
 
 
-def find_next_button_url(page: Any, site_url: Optional[str] = None,
-                         declared_selector: Optional[str] = None) -> Optional[str]:
+def find_next_button_url(page: Any, site_url: str | None = None,
+                         declared_selector: str | None = None) -> str | None:
     """Return the href of the first visible next-button, or None.
 
     Tries a declared selector first, then the semantic fallbacks
@@ -780,7 +781,7 @@ def _strip_url_param(url: str, param: str) -> str:
 
 
 def _alias_param_url(current_url: str, alias: str, mode: str, page_num: int,
-                     page_size: int, dead_param: Optional[str] = None) -> str:
+                     page_size: int, dead_param: str | None = None) -> str:
     """Probe URL for one alias candidate.
 
     ``build_page_param_url`` owns the arithmetic — including the offset math for
@@ -980,8 +981,8 @@ def discover_item_urls(
     page: Any,
     start_url: str,
     extract_urls: Callable[[Any], list[str]],
-    cfg: Optional[DiscoveryConfig] = None,
-    on_progress: Optional[Callable[[int, int, list[str]], None]] = None,
+    cfg: DiscoveryConfig | None = None,
+    on_progress: Callable[[int, int, list[str]], None] | None = None,
 ) -> DiscoveryResult:
     """Drive a listing page through pagination and return all discovered item URLs.
 
@@ -1259,7 +1260,7 @@ def config_for_load_more(**overrides) -> DiscoveryConfig:
 
 
 def config_for_page_param(page_param_name: str,
-                          items_per_page: Optional[int] = None,
+                          items_per_page: int | None = None,
                           **overrides) -> DiscoveryConfig:
     """``?page=N`` (or ``?offset=N``) URL construction — deterministic, no DOM."""
     cfg = DiscoveryConfig(
@@ -1270,7 +1271,7 @@ def config_for_page_param(page_param_name: str,
     return _apply(cfg, overrides)
 
 
-def config_for_next_button(selector: Optional[str] = None,
+def config_for_next_button(selector: str | None = None,
                            **overrides) -> DiscoveryConfig:
     """Click/declared ``a.next``-style pager. Semantic fallbacks always on."""
     cfg = DiscoveryConfig(

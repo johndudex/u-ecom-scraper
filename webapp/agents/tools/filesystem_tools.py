@@ -39,9 +39,24 @@ _JSON_WARN_NOTE = (
 # locals (F841), and flagging those would reject healthy work.
 _F821_RUFF_TIMEOUT = 10  # seconds — a linter must never hang a tool call
 _F821_MAX_FINDINGS = 5
+# [wave-25 W25-a] Untargeted reads of large files return head+tail only —
+# the SNIPPED notice directs the agent to search_content + targeted windows.
+_LARGE_READ_HEAD = 20_000
+_LARGE_READ_TAIL = 20_000
 _F821_NON_FIX_NOTE = (
     "define the name before first use — a later def does not fix a "
     "module-level call, and `X if X in dir()` is not a fix"
+)
+# [wave-25 W25-d] Reject-turn economics: a rejected write leaves the file
+# unchanged and costs the whole turn. Prod job 404 died mid-fix right after a
+# rejection because the writer spent its remaining steps RE-READING the draft
+# instead of repairing. The rejection text is the one place the model is
+# guaranteed to read — put the repair contract there.
+_F821_REPAIR_CONTRACT = (
+    "After a rejection: re-issue the write immediately with the name "
+    "defined — do NOT re-read the draft and do not re-verify with other "
+    "tools; a rejected write costs the whole turn, and the steps you save "
+    "are the fix."
 )
 
 
@@ -77,7 +92,7 @@ def _f821_rejections(path: str, content: str) -> str:
         "REJECTED — NOT applied; file unchanged. Undefined name(s): "
         + "; ".join(shown)
         + (f" (and {more} more)" if more > 0 else "")
-        + f". {_F821_NON_FIX_NOTE}."
+        + f". {_F821_NON_FIX_NOTE}. {_F821_REPAIR_CONTRACT}"
     )
 
 
@@ -291,16 +306,16 @@ def get_filesystem_tools(
 
         Args:
             path: Absolute or relative path to the file within the project.
-            offset: Character position to start reading from. Use this to
-                page through files larger than 50K chars — each call returns
-                up to 50K chars starting at `offset`. A large file is fully
-                readable as: read_file(path) → read_file(path, offset=50000)
-                → read_file(path, offset=100000) → ...
+            offset: Character position to start reading from. Files larger
+                than 50K chars return ONLY head+tail (first/last 20K) on an
+                untargeted read — do NOT page through the whole file. Use
+                search_content to locate the exact section, then pass
+                offset=<position> for a targeted ~50K window around it.
 
         Returns:
             The file content as text, or an error message if the file
-            cannot be read. Files larger than 50K chars are returned in
-            50K pages — the truncation notice states the next offset.
+            cannot be read. Large files are returned head+tail with a
+            SNIPPED notice; targeted offset reads return a ~50K window.
         """
         try:
             safe = _enforce_root(path, root)
@@ -327,23 +342,50 @@ def get_filesystem_tools(
                 )
             content = content[offset:]
         if len(content) > MAX_READ_CHARS:
-            next_offset = offset + MAX_READ_CHARS
+            if offset:
+                # Targeted window (the caller named a position) — page as before.
+                next_offset = offset + MAX_READ_CHARS
+                return (
+                    content[:MAX_READ_CHARS]
+                    + f"\n\n... [TRUNCATED: file is {len(content):,} chars from "
+                    f"offset {offset:,}, showing chars {offset:,}-"
+                    f"{next_offset - 1:,}. Re-call read_file with "
+                    f"offset={next_offset:,} for the next portion.]"
+                )
+            # [wave-25 W25-a] Untargeted read of a large file: head+tail only.
+            # Sequential paging of an 80K+ draft/output burned ~100 read_file
+            # calls and ~2MB of tool-result context in prod job 404 before
+            # langgraph's step budget silently killed the invocation
+            # ("Sorry, need more steps"). Point at targeted tools instead.
+            snipped = len(content) - _LARGE_READ_HEAD - _LARGE_READ_TAIL
             return (
-                content[:MAX_READ_CHARS]
-                + f"\n\n... [TRUNCATED: file is {len(content):,} chars from "
-                f"offset {offset:,}, showing chars {offset:,}-"
-                f"{next_offset - 1:,}. Re-call read_file with "
-                f"offset={next_offset:,} for the next portion.]"
+                content[:_LARGE_READ_HEAD]
+                + (
+                    f"\n\n... [SNIPPED {snipped:,} of {len(content):,} chars — "
+                    "large file, head+tail only. Do NOT page through the "
+                    "whole file: use search_content to locate the exact "
+                    "section, then read_file(path, offset=<position>) for a "
+                    f"targeted window. This read showed chars 0-"
+                    f"{_LARGE_READ_HEAD - 1:,} and "
+                    f"{len(content) - _LARGE_READ_TAIL:,}-"
+                    f"{len(content) - 1:,}.]\n"
+                )
+                + content[-_LARGE_READ_TAIL:]
             )
         return content
 
     @tool
-    def write_file(path: str, content: str) -> str:
+    def write_file(path: str, content: str, full_rewrite_reason: str = "") -> str:
         """Write content to a file, creating parent directories if needed.
 
         Args:
             path: Absolute or relative path within the project.
             content: Text content to write.
+            full_rewrite_reason: Only for scraper_draft.py rewrites during a
+                fix cycle, when targeted edits genuinely cannot fix the issue:
+                a short explanation of WHY a from-scratch rewrite is required.
+                The harness's codefix write guard reads this to allow the write
+                through; this function itself ignores it.
 
         Returns:
             Success message with the resolved path, or an error message.

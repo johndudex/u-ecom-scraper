@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from contextvars import ContextVar
 
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
@@ -959,6 +960,36 @@ def _truncate_messages(input_dict: dict) -> dict:
     return {"llm_input_messages": kept}
 
 
+def _embed_template(system_prompt: str, template_code: str) -> str:
+    """Embed the selected template into the writer's system prompt.
+
+    The full template lives HERE (never summarized — the system prompt is
+    always present in full), so code_writer SEES the
+    `from src.discovery import ...` line and the `discover_item_urls(...)`
+    call and copies them instead of reimplementing.
+
+    [wave-24 W24-6] The template ships ONLY in this prompt — templates/*.py
+    does not exist in the writer's container — so the embed carries an
+    explicit do-not-read note (393 cycle-1 burned four read_file attempts
+    on a nonexistent path before writing a line).
+    """
+    if not template_code:
+        return system_prompt
+    return system_prompt + (
+        "\n\n### Template (use VERBATIM — do not rewrite discovery/pagination)\n"
+        "The template below is the scraper skeleton. Fill in the site-specific "
+        "parts (EXTRACT_PRODUCT_URLS_JS selectors, field extraction). KEEP the "
+        "`from src.discovery import ...` line, the `discover_item_urls(...)` call, "
+        "the argparse, and the env-var gate UNCHANGED. Do NOT define "
+        "`_click_load_more`, `_get_next_page_url`, or any pagination loop inline.\n\n"
+        "```python\n"
+        + template_code
+        + "\n```\n"
+        "NOTE: the template above is embedded in this prompt — do NOT "
+        "read_file templates/*.py; that path does not exist in this container.\n"
+    )
+
+
 def _build_agent(agent_name: str, site_slug: str = "", use_create_agent: bool = False, template_code: str = "") -> object:
     prompt_stem = AGENT_PROMPT_MAP[agent_name]
     temperature = AGENT_TEMPERATURES[prompt_stem]
@@ -973,24 +1004,10 @@ def _build_agent(agent_name: str, site_slug: str = "", use_create_agent: bool = 
 
     system_prompt = _append_skill_descriptions(system_prompt)
 
-    # Bug 3a fix: actually inject template_code into the system prompt. This
-    # parameter was declared but NEVER used — code_writer had to read_file the
-    # template (extra round-trip) and could paraphrase/drop pieces. Now the full
-    # template is in the system prompt (never summarized), so code_writer SEES
-    # the `from src.discovery import ...` line and the `discover_item_urls(...)`
-    # call — and copies them instead of reimplementing.
-    if template_code:
-        system_prompt += (
-            "\n\n### Template (use VERBATIM — do not rewrite discovery/pagination)\n"
-            "The template below is the scraper skeleton. Fill in the site-specific "
-            "parts (EXTRACT_PRODUCT_URLS_JS selectors, field extraction). KEEP the "
-            "`from src.discovery import ...` line, the `discover_item_urls(...)` call, "
-            "the argparse, and the env-var gate UNCHANGED. Do NOT define "
-            "`_click_load_more`, `_get_next_page_url`, or any pagination loop inline.\n\n"
-            "```python\n"
-            + template_code
-            + "\n```\n"
-        )
+    # Bug 3a fix: inject template_code into the system prompt (see
+    # _embed_template — the full template, never summarized, plus the
+    # wave-24 W24-6 do-not-read note).
+    system_prompt = _embed_template(system_prompt, template_code)
 
     tools = _get_tools_sync(agent_name, workspace_scope=site_slug)
 
@@ -1270,6 +1287,16 @@ _DRAFT_NUDGE_TEXT = (
     "what's wrong with it."
 )
 
+# [wave-24 W24-5] Code-fix-cycle signal, stamped by graph.py's writer node for
+# invocations that carry a remediation (a prior tester verdict exists — the
+# ask is an EDIT to an existing draft, not a first draft). The nudge is a
+# FIRST-draft forcing function; on fix cycles it misfires (394 cycle-2: 32
+# fires across calls 12–48 while the draft existed and was being edited), so
+# apply_draft_nudge stands down entirely. Read at agent-build time.
+_writer_fix_cycle: ContextVar[bool] = ContextVar(
+    "wave24_writer_fix_cycle", default=False
+)
+
 
 def _draft_nudge_threshold() -> int:
     try:
@@ -1297,16 +1324,18 @@ def apply_draft_nudge(tools: list, threshold: int | None = None) -> list:
     """Wrap every tool so results carry a write-the-draft nudge after drift.
 
     Counts calls per invocation (agents are built fresh per invoke, so the
-    closure state is invocation-local). A ``write_file`` whose path ends in
+    closure state is invocation-local). A ``write_file`` — or an ``edit_file``
+    (an edit implies the draft exists; wave-24 W24-5) — whose path ends in
     ``scraper_draft.py`` arms the done-flag and the nudge stops for the rest
     of the invocation; scratch-probe writes do NOT count. threshold <= 0 is
-    the kill-switch (tools returned untouched).
+    the kill-switch (tools returned untouched), and so is a code-fix-cycle
+    invocation (W24-5: the nudge forces FIRST drafts only).
     """
     import functools
 
     if threshold is None:
         threshold = _draft_nudge_threshold()
-    if threshold <= 0:
+    if threshold <= 0 or _writer_fix_cycle.get():
         return tools
     state = {"calls": 0, "drafted": False}
 
@@ -1314,7 +1343,7 @@ def apply_draft_nudge(tools: list, threshold: int | None = None) -> list:
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             state["calls"] += 1
-            if tool_name == "write_file" and _is_draft_path(
+            if tool_name in ("write_file", "edit_file") and _is_draft_path(
                 _tool_path_arg(args, kwargs)
             ):
                 state["drafted"] = True
@@ -1335,6 +1364,156 @@ def apply_draft_nudge(tools: list, threshold: int | None = None) -> list:
             t.func = _wrap(t.func, tool_name)
             if getattr(t, "coroutine", None) is not None:
                 t.coroutine = _wrap(t.coroutine, tool_name)
+    return tools
+
+
+# [wave-25 W25-b] Read-spiral nudge. Prod RCA 2026-09-07: failed writers
+# averaged 64-100 read_file calls per job vs 2-11 for clean ones — sequential
+# 50K pages of a large draft/output burned both steps and context until
+# langgraph's remaining_steps=0 ended the invocation with the silent "Sorry,
+# need more steps" message (job 404: ~2MB of tool results, 3 deaths). The
+# anti-read nudge is the behavioral mirror of apply_draft_nudge: after N
+# reads in one invocation, every further read result carries the pressure to
+# switch to search_content + targeted offsets. Advisory ONLY — never blocks,
+# and nothing disarms it (the failure mode is re-reading DURING fix cycles,
+# after the draft exists). threshold <= 0 is the kill-switch.
+_ANTI_READ_NUDGE_TEXT = (
+    "\n\n[READ-BUDGET] {calls} read_file calls this invocation — every large "
+    "read burns steps AND context. Stop paging: use search_content to find "
+    "the exact section, then read_file(path, offset=<position>) for a "
+    "targeted window only, and apply your fix with edit_file/write_file."
+)
+
+
+def _anti_read_nudge_threshold() -> int:
+    try:
+        from django.conf import settings
+
+        return int(getattr(settings, "CODE_WRITER_READ_NUDGE_CALLS", 10))
+    except Exception:
+        return 10
+
+
+def apply_anti_read_nudge(tools: list, threshold: int | None = None) -> list:
+    """Wrap read_file so results carry an anti-paging nudge after N reads.
+
+    Counts read_file calls per invocation (closure state — agents are built
+    fresh per invoke). Advisory only: the result text is appended, the read
+    itself always executes. threshold <= 0 returns the tools untouched.
+    """
+    import functools
+
+    if threshold is None:
+        threshold = _anti_read_nudge_threshold()
+    if threshold <= 0:
+        return tools
+    state = {"reads": 0}
+
+    def _wrap(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            result = func(*args, **kwargs)
+            state["reads"] += 1
+            if (
+                state["reads"] >= threshold
+                and isinstance(result, str)
+                and "READ-BUDGET" not in result
+            ):
+                result = result + _ANTI_READ_NUDGE_TEXT.format(
+                    calls=state["reads"]
+                )
+            return result
+
+        return wrapper
+
+    for t in tools:
+        if getattr(t, "name", "") != "read_file":
+            continue
+        if hasattr(t, "func") and t.func is not None:
+            t.func = _wrap(t.func)
+            if getattr(t, "coroutine", None) is not None:
+                t.coroutine = _wrap(t.coroutine)
+    return tools
+
+
+# [wave-24 W24-4] Same signal family as _writer_fix_cycle, but narrower: a
+# code-FIX cycle whose remediation targets the existing draft (graph.py stamps
+# ``_w24_fix and _eow_active`` — remediation present AND same-template AND the
+# on-disk draft parses). On such cycles a bare full ``write_file`` of
+# scraper_draft.py is the failure mode, not the cure: prod 395 cycle-2 had an
+# explicit "do NOT rewrite from scratch" + preserve-list, yet the writer spent
+# 990s reading and then regenerated the file from the template header, burning
+# the whole window. Instruction-only constraints had no mechanical force — this
+# guard is the mechanical force. Read at agent-build time (the tool wrappers
+# are closures built in the node thread; per-call ContextVar reads in the
+# executor threads are not guaranteed to inherit it).
+_writer_codefix_cycle: ContextVar[bool] = ContextVar(
+    "wave24_writer_codefix_cycle", default=False
+)
+
+_REWRITE_NUDGE_TEXT = (
+    "\n\n[HARNESS GUARD — write blocked, NOT executed] This is a FIX cycle: "
+    "scraper_draft.py already exists and the tester verdict asks for targeted "
+    "edits, not a regeneration. Use edit_file on the existing draft and keep "
+    "everything outside the diagnosed defect (imports, helpers, working "
+    "methods). If a full rewrite is genuinely required, re-issue the write_file "
+    "with a non-empty full_rewrite_reason argument explaining WHY edits cannot "
+    "fix it. This block happens ONCE — your next write_file will go through."
+)
+
+
+def _apply_codefix_write_guard(tools: list) -> list:
+    """Intercept bare full rewrites of scraper_draft.py on code-fix cycles.
+
+    Wrap ONLY ``write_file``: a bare draft-path write is bounced ONCE with the
+    nudge text (the underlying function never runs — nothing hits disk); the
+    write is allowed when it carries a non-empty ``full_rewrite_reason`` (the
+    schema param added in filesystem_tools.py so the arg survives pydantic) or
+    on the second bare attempt (a stubborn writer must never end a window with
+    zero writes because of this guard). Like the W23-2 nudge state, the latch
+    is per agent instance, so one nudge spans the main + syntax + CLI fix
+    windows of a cycle. edit_file and non-draft paths pass through untouched;
+    off a code-fix cycle the tools are returned as-is.
+    """
+    import functools
+
+    if not _writer_codefix_cycle.get():
+        return tools
+    latch = {"nudged": False}
+
+    def _wrap(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            path = _tool_path_arg(args, kwargs)
+            if not _is_draft_path(path):
+                return func(*args, **kwargs)
+            if str(kwargs.get("full_rewrite_reason") or "").strip():
+                logger.warning(
+                    "code_writer full rewrite ALLOWED (full_rewrite_reason=%s)",
+                    str(kwargs["full_rewrite_reason"])[:200],
+                )
+                kwargs.pop("full_rewrite_reason", None)
+                return func(*args, **kwargs)
+            if not latch["nudged"]:
+                latch["nudged"] = True
+                logger.warning(
+                    "codefix write guard: bounced bare scraper_draft.py rewrite "
+                    "(edit_file or full_rewrite_reason expected)"
+                )
+                return _REWRITE_NUDGE_TEXT
+            logger.warning(
+                "codefix write guard: second bare rewrite — allowing through"
+            )
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    for i, t in enumerate(tools):
+        if getattr(t, "name", "") != "write_file" or not getattr(t, "func", None):
+            continue
+        t.func = _wrap(t.func)
+        if getattr(t, "coroutine", None) is not None:
+            t.coroutine = _wrap(t.coroutine)
     return tools
 
 
@@ -1403,6 +1582,13 @@ def _apply_guards(tools: list, agent_name: str) -> list:
                 tools[i] = apply_guard(t, _make_guard(_cap_run_scraper))
         # [wave-23 W23-2] Draft-first forcing function — see apply_draft_nudge.
         tools = apply_draft_nudge(tools)
+        # [wave-25 W25-b] Anti-read-spiral nudge — see apply_anti_read_nudge.
+        tools = apply_anti_read_nudge(tools)
+        # [wave-24 W24-4] Bare-rewrite interception on code-fix cycles — see
+        # _apply_codefix_write_guard. Applied AFTER the nudge so an allowed
+        # write still flows through the nudge's call counter (and a blocked
+        # one never reaches it).
+        tools = _apply_codefix_write_guard(tools)
         return tools
 
     if agent_name not in guarded_agents:
@@ -3231,6 +3417,18 @@ def build_code_writer_message(state: dict) -> list:
                 "Treat THAT draft as your base: apply ONLY the targeted edits the test "
                 "report asks for. Do NOT restart from the template — that discards prior "
                 "fixes and reintroduces past failures.\n"
+            )
+        elif state.get("strategy_rerun"):
+            # [wave-24 W24-7] A rerun cycle re-picked the SAME strategy (the
+            # anti-bot authority can force that) — the template-rewrite hint
+            # below would be the 394 lie: a full regeneration framed as a
+            # strategy switch. Edit-over-write framing instead.
+            template_hint = (
+                f"\n### EDIT MODE — DO NOT REGENERATE (strategy rerun)\nThe strategy "
+                f"ladder re-picked templates/{template_file} — this is NOT a strategy "
+                f"switch. A draft already exists at workspace/{slug}/scraper_draft.py: "
+                "treat THAT draft as your base and apply the targeted fixes the test "
+                "report asks for. Do NOT restart from the template.\n"
             )
         else:
             template_hint = (

@@ -104,6 +104,33 @@ class ScrapeState(TypedDict, total=False):
     # the allowance when it enters with that mismatch signature, so a forced
     # pass that dies cannot bounce terminal→code_tester forever.
     forced_retest_count: int
+    # [wave-24 W24-1] Draft changed WHILE the tester ran (leaked writer thread
+    # mutating under a live test — prod 395: zombie edit_file 2s into the
+    # tester's run). _invoke_code_tester stamps it by comparing entry/exit
+    # fingerprints; route_after_testing spends ONE re-test on what is actually
+    # on disk before accepting a PASS verdict.
+    draft_mutated_during_test: bool
+    # [wave-24 W24-1] Mutated-verdict re-tests consumed. The tester node
+    # increments when it enters with draft_mutated_during_test set, so the
+    # router's one-re-test arm cannot loop if the mutation repeats.
+    mutated_verdict_retests: int
+    # [wave-24 W24-3] Access-wall accounting for the router's ×2 early
+    # terminal. The tester's zero-yield arm counts discovery probes that died
+    # on infra-class stop reasons (throttle / tier-block / render-wall —
+    # walls no writer cycle can fix; prod 393 burned 3 writer turns on them).
+    # escape_used caps the one-reset escape granted on a concrete
+    # scraper-target diagnosis; all_throttled tracks whether every counted
+    # stop was our own browser-service 429 (terminal routes to the park lane
+    # instead of an honest-FAIL cleanup).
+    access_wall_cycles: int
+    access_wall_all_throttled: bool
+    access_wall_escape_used: int
+    # [wave-24 W24-7] True when the deterministic strategy node re-picked the
+    # SAME strategy it already had (the anti-bot authority can force that —
+    # 394's "strategy-switch" that wasn't). The writer message builder reads
+    # it to give the cycle edit-over-write framing instead of the
+    # template-rewrite hint.
+    strategy_rerun: bool
     # [wave-22 B3] remediation identity (structural fingerprint of
     # target+field+issue-type set+exception class — NEVER the free-text fix)
     # of every remediation the writer has attempted, and the count of grace

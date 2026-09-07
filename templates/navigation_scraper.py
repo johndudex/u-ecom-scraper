@@ -117,8 +117,28 @@ _CHECKPOINT_PATH = os.path.join(SCRIPT_DIR, "discovered_urls_checkpoint.json")
 
 
 def _write_checkpoint(urls: list[str]) -> None:
-    """Save discovered URLs so a crash-retry can resume from here."""
+    """Save discovered URLs so a crash-retry can resume from here.
+
+    [wave-24 W24-2] job-77 guard shape: never overwrite a banked checkpoint
+    with 0 URLs. A crash-retry that re-enters discovery and finds nothing
+    must not destroy the URLs a previous attempt already banked — the retry
+    would resume from empty forever.
+    """
     try:
+        if not urls:
+            try:
+                if os.path.isfile(_CHECKPOINT_PATH):
+                    with open(_CHECKPOINT_PATH, "r") as f:
+                        prev = json.load(f)
+                    if prev.get("urls"):
+                        logger.warning(
+                            "Checkpoint: refusing to overwrite %d banked URLs "
+                            "with 0 — keeping %s",
+                            len(prev["urls"]), _CHECKPOINT_PATH,
+                        )
+                        return
+            except Exception:
+                pass
         with open(_CHECKPOINT_PATH, "w") as f:
             json.dump({"urls": list(urls), "count": len(urls), "ts": time.time()}, f)
         logger.debug("Checkpoint: saved %d URLs to %s", len(urls), _CHECKPOINT_PATH)
@@ -713,11 +733,11 @@ def _error_item(url: str, src_url: str, error: str) -> dict:
 # there until that image is rebuilt, so the ~25 lines live in each python-side
 # template verbatim (playwright/UC normalize in-page via JS and don't need them).
 
-def _norm_price(value) -> Optional[str]:
+def _norm_price(value) -> Optional[float]:
     """Strip currency symbols/whitespace from a price.
 
-    "£1,234.56" → "1234.56", "1.234,56 €" → "1234.56", 24.99 (a JSON-LD
-    number) → "24.99". Returns None when no digits are present — an
+    "£1,234.56" → 1234.56 (a float), "1.234,56 €" → 1234.56, 24.99 (a
+    JSON-LD number) → 24.99. Returns None when no digits are present — an
     unparseable price is EMPTY, never zero (0 would read as a real product
     priced at nothing). The currency stays in its own ``currency`` field.
     """
@@ -736,7 +756,10 @@ def _norm_price(value) -> Optional[str]:
         # "1,234" (grouping) vs "1,5" (decimal comma): a comma followed by
         # exactly three digits is grouping, anything else is a decimal comma.
         cleaned = re.sub(r",(?=\d{3}(?:\D|$))", "", cleaned).replace(",", ".")
-    return cleaned
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
 
 
 def _norm_availability(value) -> Optional[str]:

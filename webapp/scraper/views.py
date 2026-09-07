@@ -2340,6 +2340,35 @@ def _check_queue() -> dict:
     return out
 
 
+def _check_maintenance_lock():
+    """[wave-24 W24-8] Lock state + last flip on the health dashboard — the
+    2026-09-07 lock sat enabled for 34 minutes with no way to see it here."""
+    from .models import MaintenanceLock, MaintenanceLockEvent
+
+    row = MaintenanceLock.load()
+    last = MaintenanceLockEvent.objects.order_by("-created_at", "-id").first()
+
+    def _who(entry):
+        return entry.updated_by.username if entry.updated_by_id else "unknown"
+
+    def _when(ts):
+        return timezone.localtime(ts).strftime("%Y-%m-%d %H:%M")
+
+    if row.enabled:
+        detail = f"ON — {row.reason or 'no reason'} (by {_who(row)} at {_when(row.updated_at)})"
+        status = "warn"
+    elif last:
+        detail = (
+            f"off (last: {'enable' if last.enabled else 'lift'} by {_who(last)} "
+            f"at {_when(last.created_at)})"
+        )
+        status = "up"
+    else:
+        detail = "off (no recorded events)"
+        status = "up"
+    return {"status": status, "latency_ms": 0, "detail": detail}
+
+
 @login_required
 def health_api(request):
     checks = {
@@ -2351,6 +2380,7 @@ def health_api(request):
         "browser_service": _check_browser_service,
         "file_master": _check_file_master,
         "queue": _check_queue,
+        "maintenance_lock": _check_maintenance_lock,
     }
     labels = {
         "django": "Django",
@@ -2361,6 +2391,7 @@ def health_api(request):
         "browser_service": "Browser Service",
         "file_master": "File Master",
         "queue": "Task Queue",
+        "maintenance_lock": "Maintenance Lock",
     }
     services = {}
     for name, check_fn in checks.items():
@@ -2950,10 +2981,27 @@ def intake_jobs(request):
 def _maintenance_state() -> dict:
     """The maintenance lock as a JSON-able dict — shared by the toggle
     endpoint and the library API (the banner refreshes from the latter)."""
-    from .models import MaintenanceLock
+    from .models import MaintenanceLock, MaintenanceLockEvent
 
     row = MaintenanceLock.load()
-    return {"enabled": row.enabled, "reason": row.reason}
+    # [wave-24 W24-8] The singleton only remembers its latest flip; the event
+    # trail remembers every flip. Surface the newest so "who did this" has an
+    # answer even after the singleton was overwritten.
+    last = MaintenanceLockEvent.objects.order_by("-created_at", "-id").first()
+    return {
+        "enabled": row.enabled,
+        "reason": row.reason,
+        "last_event": (
+            {
+                "enabled": last.enabled,
+                "reason": last.reason,
+                "by": last.updated_by.username if last.updated_by_id else "",
+                "at": last.created_at.isoformat(),
+            }
+            if last
+            else None
+        ),
+    }
 
 
 @login_required
@@ -2971,13 +3019,20 @@ def intake_maintenance(request):
     if request.method != "POST" or request.headers.get("x-requested-with") != "XMLHttpRequest":
         return JsonResponse({"error": "POST + AJAX required"}, status=400)
 
-    from .models import MaintenanceLock
+    from .models import MaintenanceLock, MaintenanceLockEvent
     from .tasks import resume_maintenance_held_jobs
 
     enable = request.POST.get("enabled") == "1"
-    row = MaintenanceLock.load()
+    new_reason = request.POST.get("reason", "").strip()[:200] if enable else ""
+    # [wave-24 W24-8] Append the audit row BEFORE mutating the singleton — if
+    # the save or the drain below throws, the record of who asked for this
+    # flip must already exist (2026-09-07: authorship lost to an overwrite).
+    row = MaintenanceLock.load()  # read-only fetch; mutation happens below
+    MaintenanceLockEvent.objects.create(
+        enabled=enable, reason=new_reason, updated_by=request.user, lock=row,
+    )
     row.enabled = enable
-    row.reason = request.POST.get("reason", "").strip()[:200] if enable else ""
+    row.reason = new_reason
     row.updated_by = request.user
     row.save(update_fields=["enabled", "reason", "updated_at", "updated_by"])
 

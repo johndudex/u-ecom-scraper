@@ -15,7 +15,7 @@ import select
 import signal
 import subprocess
 import time
-from typing import Any, Optional
+from typing import Any
 
 from ..constants import STEALTH_METHOD_PREFIXES
 from ..state import ScrapeState
@@ -73,7 +73,7 @@ def _accepted_cli_flags(scraper_path: str) -> set[str] | None:
     try:
         import ast
 
-        with open(scraper_path, "r", errors="ignore") as fh:
+        with open(scraper_path, errors="ignore") as fh:
             tree = ast.parse(fh.read())
         flags: set[str] = set()
         for node in ast.walk(tree):
@@ -107,7 +107,7 @@ def _draft_parse_error(scraper_path: str) -> str | None:
     import ast
 
     try:
-        with open(scraper_path, "r", errors="ignore") as fh:
+        with open(scraper_path, errors="ignore") as fh:
             ast.parse(fh.read())
     except SyntaxError as exc:
         return f"scraper draft failed to compile: SyntaxError: {exc}"
@@ -226,7 +226,11 @@ def cli_contract_violation(
     - search_term: any of the above, or
         M4  declares --query AND consumes args.query
     """
-    from ..constants import API_STRATEGIES, NAV_INPUT_MODES, SCRAPER_ENV_LISTING, STEALTH_METHOD_PREFIXES
+    from ..constants import (
+        API_STRATEGIES,
+        NAV_INPUT_MODES,
+        SCRAPER_ENV_LISTING,
+    )
 
     im = (input_mode or "").strip().lower()
     if im not in NAV_INPUT_MODES:
@@ -237,7 +241,7 @@ def cli_contract_violation(
     if accepted is None:
         return None  # unparseable → don't block; the syntax fixer owns it
     try:
-        with open(scraper_path, "r", errors="ignore") as fh:
+        with open(scraper_path, errors="ignore") as fh:
             src = _strip_comments(fh.read())
     except OSError:
         return None
@@ -552,7 +556,7 @@ def _execution_zero_discovery(result: dict) -> bool:
     try:
         import json as _json
 
-        with open(output_file, "r", encoding="utf-8", errors="replace") as f:
+        with open(output_file, encoding="utf-8", errors="replace") as f:
             data = _json.load(f)
     except Exception:
         return False
@@ -1132,7 +1136,7 @@ def _run_category_sources(state, scraper_path, base_args, site_folder, primary_r
                 cat_args = ["--category-url", cat_url]
                 # Stateless /scrape: read local source, POST it; parse output content directly.
                 try:
-                    with open(scraper_path, "r", encoding="utf-8", errors="replace") as _cf:
+                    with open(scraper_path, encoding="utf-8", errors="replace") as _cf:
                         _cat_source = _cf.read()
                 except OSError:
                     _cat_source = ""
@@ -1479,15 +1483,14 @@ def _run_via_browser_service(
 ) -> dict[str, Any]:
     import httpx
 
+    # QW-0 Step emits (deferred like the heartbeat import below — graph
+    # imports this node module).
+    from ..graph import _notify_phase
     from ..tools.browser_http import (
         PREFLIGHT_MAX_WAIT_S,
         post_scrape_with_retry,
         wait_for_browser_service,
     )
-
-    # QW-0 Step emits (deferred like the heartbeat import below — graph
-    # imports this node module).
-    from ..graph import _notify_phase
 
     _exec_job_id = (state or {}).get("job_id", 0)
 
@@ -1561,7 +1564,7 @@ def _run_via_browser_service(
         # draft (workspace/{slug}/) so downstream reads + _finalize_job's
         # workspace→scrapers promotion keep working unchanged.
         try:
-            with open(scraper_path, "r", encoding="utf-8", errors="replace") as _f:
+            with open(scraper_path, encoding="utf-8", errors="replace") as _f:
                 _source = _f.read()
         except OSError as exc:
             return {
@@ -1574,7 +1577,7 @@ def _run_via_browser_service(
             _sp = os.path.join(os.path.dirname(scraper_path), _sf)
             if os.path.isfile(_sp):
                 try:
-                    with open(_sp, "r", encoding="utf-8", errors="replace") as _fh:
+                    with open(_sp, encoding="utf-8", errors="replace") as _fh:
                         _extra[_sf] = _fh.read()
                 except OSError:
                     pass
@@ -1784,7 +1787,7 @@ def _substantive_item_count(path: str, fields: list[str] | None = None) -> int:
     soft failures still carry (337's rows all had titles).
     """
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         if not isinstance(data, dict):
             return 0
@@ -1831,7 +1834,7 @@ def prune_empty_records(output_file: str, target_fields: list[str] | None = None
     if not output_file or not _os.path.isfile(output_file):
         return 0
     try:
-        with open(output_file, "r", encoding="utf-8") as fh:
+        with open(output_file, encoding="utf-8") as fh:
             data = _json.load(fh)
     except Exception:
         return 0
@@ -1936,7 +1939,7 @@ def _extraction_quality_gate(
         good_fields = list(target_fields) if target_fields else None
         good = _substantive_item_count(output_file, good_fields) if output_file else 0
         failed = 0
-        with open(output_file, "r", encoding="utf-8") as fh:
+        with open(output_file, encoding="utf-8") as fh:
             data = json.load(fh)
         if isinstance(data, dict):
             meta = data.get("metadata") or {}
@@ -2060,7 +2063,7 @@ _PRICE_RESIDUE_RE = re.compile(
 )
 
 
-def _parse_price_string(v: str) -> Optional[float]:
+def _parse_price_string(v: str) -> float | None:
     """Parse a price-ish string the same way the framework's checker does —
     but ONLY when the string is nothing but a price. ``"From $10"`` /
     ``"Free"`` stay strings; ``"$17.00"`` → 17.0."""
@@ -2081,7 +2084,7 @@ def normalize_output_prices(output_file: str) -> int:
     scraper emitted formatted strings. Returns the number of fields rewritten
     (0 on any read/parse problem — never raises)."""
     try:
-        with open(output_file, "r", encoding="utf-8") as fh:
+        with open(output_file, encoding="utf-8") as fh:
             data = json.load(fh)
     except Exception:
         return 0
@@ -2170,8 +2173,9 @@ def _find_newest_output(
             return ""
         if slug:
             try:
-                import src.artifacts as artifacts
                 import tempfile
+
+                import src.artifacts as artifacts
 
                 fm_key = artifacts.latest_output_key(slug)
                 if fm_key:
@@ -2200,7 +2204,7 @@ def _count_products(output_path: str) -> int:
     if not output_path or not os.path.isfile(output_path):
         return 0
     try:
-        with open(output_path, "r", encoding="utf-8") as fh:
+        with open(output_path, encoding="utf-8") as fh:
             data = json.load(fh)
         if isinstance(data, dict):
             for key in ("products", "jobs", "articles", "results", "items", "threads", "pages"):
@@ -2212,7 +2216,7 @@ def _count_products(output_path: str) -> int:
         return 0
 
 
-def _read_discovery_coverage(output_path: str) -> Optional[dict[str, Any]]:
+def _read_discovery_coverage(output_path: str) -> dict[str, Any] | None:
     """Read the ``discovery_coverage`` block from a scraper output's metadata.
 
     Two-phase scrapers emit this block (see
@@ -2223,7 +2227,7 @@ def _read_discovery_coverage(output_path: str) -> Optional[dict[str, Any]]:
     if not output_path or not os.path.isfile(output_path):
         return None
     try:
-        with open(output_path, "r", encoding="utf-8") as fh:
+        with open(output_path, encoding="utf-8") as fh:
             data = json.load(fh)
         if isinstance(data, dict):
             metadata = data.get("metadata") or {}

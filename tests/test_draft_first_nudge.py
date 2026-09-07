@@ -153,5 +153,68 @@ class TestDefaultThresholdAndWiring:
         assert "HARNESS NUDGE" not in (guarded[0].func(path="x") or "")
 
 
+class TestW24DraftArmingAndFixCycle:
+    """[wave-24 W24-5] 394 cycle-2: 32 [HARNESS NUDGE] fires across calls
+    12–48 while the draft demonstrably existed and was being EDITED. Two
+    holes: the ``drafted`` flag armed only on ``write_file`` (an edit-only
+    fix cycle starts drafted=False and can never arm it), and fix-cycle
+    invocations — where a remediation is in play — should never carry the
+    first-draft forcing nudge at all."""
+
+    def test_edit_file_on_draft_arms_done_flag(self):
+        tools = [_FakeTool("read_file"), _FakeTool("edit_file")]
+        wrapped = sub.apply_draft_nudge(tools, threshold=2)
+        for _ in range(3):
+            wrapped[0].func(path="x")  # drift past the threshold
+        wrapped[1].func(
+            path="workspace/jomashop-com/scraper_draft.py", old_str="a", new_str="b"
+        )
+        out = wrapped[0].func(path="x")
+        assert "HARNESS NUDGE" not in out, "an edit to the draft proves it exists"
+
+    def test_edit_file_other_path_does_not_arm(self):
+        tools = [_FakeTool("edit_file"), _FakeTool("read_file")]
+        wrapped = sub.apply_draft_nudge(tools, threshold=1)
+        wrapped[0].func(path="workspace/site/probe_transport.py")
+        out = wrapped[1].func(path="x")
+        assert "HARNESS NUDGE" in out
+
+    def test_fix_cycle_skips_the_nudge_entirely(self):
+        tools = [_FakeTool("read_file")]
+        token = sub._writer_fix_cycle.set(True)
+        try:
+            wrapped = sub.apply_draft_nudge(tools, threshold=1)
+        finally:
+            sub._writer_fix_cycle.reset(token)
+        for _ in range(5):
+            out = wrapped[0].func(path="x")
+        assert "HARNESS NUDGE" not in out
+
+    def test_first_draft_cycle_still_nudges_without_flag(self):
+        tools = [_FakeTool("read_file")]
+        wrapped = sub.apply_draft_nudge(tools, threshold=1)
+        for _ in range(2):
+            out = wrapped[0].func(path="x")
+        assert "HARNESS NUDGE" in out
+
+    def test_node_stamps_and_resets_the_fix_cycle_flag(self):
+        """Source contract: the writer node derives the flag from the
+        test_report (feedback_for_writer / remediation) and stamps + resets
+        the ContextVar around agent construction and the invocation."""
+        graph_path = os.path.join(ROOT, "webapp", "agents", "graph.py")
+        with open(graph_path, encoding="utf-8") as fh:
+            src = fh.read()
+        body = src[
+            src.index("def _invoke_code_writer("):src.index("def _invoke_code_tester(")
+        ]
+        assert "_writer_fix_cycle.set(" in body
+        assert "_writer_fix_cycle.reset(" in body
+        assert "feedback_for_writer" in body
+        assert "_writer_fix_cycle.set" in body.split("create_code_writer(site_slug")[0], (
+            "the flag must be stamped BEFORE agent construction (the nudge "
+            "reads it at build time)"
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(__import__("pytest").main([__file__, "-v"]))

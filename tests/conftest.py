@@ -25,12 +25,21 @@ def _disarm_invocation_cancel():
     Re-arm on BOTH sides of every test: setup protects against pollution from
     earlier files, teardown protects later ones. Production semantics are
     untouched — this only constrains the pytest process.
+
+    [wave-24 W24-1] The latch gained a per-invocation cancelled-id set that
+    ``set_tool_context`` deliberately never resets — purge it too, via the
+    dedicated test-support reset.
     """
-    from agents.tools.context import is_invocation_cancelled, set_tool_context
+    from agents.tools.context import (
+        is_invocation_cancelled,
+        reset_invocation_latches,
+        set_tool_context,
+    )
 
     def _rearm():
         if is_invocation_cancelled():
             set_tool_context({}, agent_name="")
+        reset_invocation_latches()
 
     _rearm()
     yield

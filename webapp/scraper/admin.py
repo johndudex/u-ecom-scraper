@@ -9,6 +9,8 @@ from .models import (  # noqa: E402
     AgentPlayground,
     Approval,
     ContentType,
+    MaintenanceLock,
+    MaintenanceLockEvent,
     ProbeCache,
     ScrapeJob,
     SessionLog,
@@ -323,3 +325,24 @@ class JobListingAdmin(admin.ModelAdmin):
         extra_context = extra_context or {}
         extra_context["recompute_url"] = "recompute-dates/"
         return super().changelist_view(request, extra_context)
+
+
+# [wave-24 W24-8] The lock is a singleton with no history of its own; the
+# append-only MaintenanceLockEvent rows are the audit trail (2026-09-07: an
+# enabling superuser was unrecoverable after the lift overwrote the singleton).
+# Events are read-only here — they are only ever written by the toggle view.
+class MaintenanceLockEventInline(admin.TabularInline):
+    model = MaintenanceLockEvent
+    extra = 0
+    can_delete = False
+    readonly_fields = ("enabled", "reason", "lock", "updated_by", "created_at")
+    ordering = ("-created_at", "-id")
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(MaintenanceLock)
+class MaintenanceLockAdmin(admin.ModelAdmin):
+    list_display = ("enabled", "reason", "updated_by", "updated_at")
+    inlines = [MaintenanceLockEventInline]

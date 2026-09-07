@@ -5,6 +5,7 @@ generated scrapers.  Browser-based scrapers are dispatched to
 browser_service via HTTP.  HTTP-based scrapers run locally as subprocesses.
 """
 
+import json
 import logging
 import os
 import re
@@ -12,7 +13,6 @@ import shlex
 import subprocess
 import time
 from contextlib import contextmanager
-from typing import Optional
 
 import httpx
 from langchain_core.tools import tool
@@ -54,7 +54,7 @@ BROWSER_IMPORTS = {
 }
 
 
-def _resolve_project_root(project_root: Optional[str] = None) -> str:
+def _resolve_project_root(project_root: str | None = None) -> str:
     if project_root:
         return os.path.abspath(project_root)
     try:
@@ -79,9 +79,53 @@ def _get_browser_service_url() -> str:
     return BROWSER_SERVICE_URL
 
 
+def _probe_namespace_rename(cmd_args, output_name: str, output_content: str) -> str:
+    """[wave-24 W24-2 hook 4] Zero-yield ``--discover-only`` artifacts must
+    not occupy the ``output_*`` namespace downstream consumers glob.
+
+    394: the probe's 0-URL output became the newest ``output_*.json`` and its
+    zero rode into the verdict as a false HIGH. The deterministic probe
+    already persists its own capture under ``probe_output_*`` (wave-22 C1);
+    this extends the same namespace to the agent-tool persist path. Renames
+    ONLY a provable zero: the run was invoked with ``--discover-only`` AND
+    the artifact is tagged ``metadata.phase=discovery`` AND its measured
+    yield is 0. Anything unparsable, untagged, or unmeasured is left alone —
+    shape-based skipping is the consumer belt's job.
+    """
+    if "--discover-only" not in (cmd_args or []):
+        return output_name
+    try:
+        data = json.loads(output_content)
+    except (ValueError, TypeError):
+        return output_name
+    if not isinstance(data, dict):
+        return output_name
+    metadata = data.get("metadata")
+    if not isinstance(metadata, dict) or metadata.get("phase") != "discovery":
+        return output_name
+    coverage = metadata.get("discovery_coverage")
+    yield_val = (
+        coverage.get("discovered_urls")
+        if isinstance(coverage, dict)
+        else data.get("discovered_urls")
+    )
+    try:
+        measured = int(yield_val)
+    except (TypeError, ValueError):
+        return output_name
+    if measured > 0:
+        return output_name
+    logger.warning(
+        "run_scraper: zero-yield --discover-only artifact %s parked in "
+        "probe_output_ namespace (cannot outrank an earlier discovery pass)",
+        output_name,
+    )
+    return "probe_" + output_name
+
+
 def _scraper_needs_browser(scraper_path: str) -> bool:
     try:
-        with open(scraper_path, "r", encoding="utf-8") as fh:
+        with open(scraper_path, encoding="utf-8") as fh:
             head = fh.read().lower()
         for imp in BROWSER_IMPORTS:
             if f"import {imp}" in head or f"from {imp}" in head:
@@ -121,7 +165,7 @@ def _hygiene_input_seed(cmd_args: list, ws_dir: str, job_url: str) -> str:
 
         from src.seed_urls import dropped_summary, filter_seed_payload
 
-        with open(seed_path, "r", encoding="utf-8") as _fh:
+        with open(seed_path, encoding="utf-8") as _fh:
             payload = json.load(_fh)
         filtered, dropped = filter_seed_payload(payload, job_url)
         if not dropped:
@@ -185,9 +229,9 @@ def cross_workspace_paths(command: str, workspace_scope: str) -> list[str]:
 
 
 def get_shell_tools(
-    project_root: Optional[str] = None,
-    allowed_dirs: Optional[list[str]] = None,
-    workspace_scope: Optional[str] = None,
+    project_root: str | None = None,
+    allowed_dirs: list[str] | None = None,
+    workspace_scope: str | None = None,
 ) -> list:
     cwd = _resolve_project_root(project_root)
 
@@ -254,7 +298,7 @@ def get_shell_tools(
         scraper_path: str,
         cli_args: str = "",
         timeout: int = 300,
-        extra_args: Optional[list] = None,
+        extra_args: list | None = None,
     ) -> str:
         """Run a generated scraper and return its output.
 
@@ -562,7 +606,7 @@ def get_shell_tools(
                 # Stateless /scrape: send the scraper SOURCE (not a path). Read
                 # the local file the caller built (workspace/{slug}/scraper_draft.py).
                 try:
-                    with open(full_path, "r", encoding="utf-8", errors="replace") as _f:
+                    with open(full_path, encoding="utf-8", errors="replace") as _f:
                         _source = _f.read()
                 except OSError as exc:
                     return f"Error: could not read scraper source {full_path}: {exc}"
@@ -573,7 +617,7 @@ def get_shell_tools(
                     _sp = os.path.join(_ws_dir, _sf)
                     if os.path.isfile(_sp):
                         try:
-                            with open(_sp, "r", encoding="utf-8", errors="replace") as _fh:
+                            with open(_sp, encoding="utf-8", errors="replace") as _fh:
                                 _extra[_sf] = _fh.read()
                         except OSError:
                             pass
@@ -630,6 +674,11 @@ def get_shell_tools(
                 _output_content = result.get("output_content") or ""
                 _output_name = result.get("output_name") or ""
                 if _output_content and _output_name:
+                    # [wave-24 W24-2 hook 4] a zero-yield --discover-only
+                    # probe artifact never occupies the output_* namespace.
+                    _output_name = _probe_namespace_rename(
+                        cmd_args, _output_name, _output_content
+                    )
                     _scraper_dir = os.path.dirname(full_path) or cwd
                     _local_output = os.path.join(_scraper_dir, _output_name)
                     try:
@@ -677,6 +726,7 @@ def get_shell_tools(
                 # Inherit env + inject discovery env vars (same as browser path).
                 _run_env = dict(os.environ)
                 _run_env.update(env_overrides or {})
+                _run_start = time.time()
                 with _dispatch_alive(timeout):
                     result = subprocess.run(
                         cmd,
@@ -691,6 +741,21 @@ def get_shell_tools(
                     "stdout": result.stdout,
                     "stderr": result.stderr,
                 })
+                # [wave-25 T2] Mirror the browser_service branch: normalize
+                # formatted price strings in the output the scraper just wrote
+                # next to itself (local FS — no persist step needed), so the
+                # tester's read and the [A3] persist-time pass agree regardless
+                # of strategy. Stale outputs are excluded by the mtime floor.
+                _out_path, _norm_n = _normalize_local_output(
+                    cwd, mtime_floor=_run_start
+                )
+                if _out_path:
+                    _out += f"\n[output_file: {_out_path}]"
+                    if _norm_n:
+                        _out += (
+                            f"\n[normalized {_norm_n} price string(s) to numeric "
+                            "in the output]"
+                        )
                 if _scope_note:
                     _out += f"\n{_scope_note}"
                 if _seed_note:
@@ -702,6 +767,34 @@ def get_shell_tools(
                 return f"Error running scraper: {exc}"
 
     return [run_bash, run_scraper]
+
+
+def _normalize_local_output(
+    directory: str, mtime_floor: float | None = None
+) -> tuple[str, int]:
+    """[wave-25 T2] Normalize price strings in the output a locally-run scraper
+    just wrote next to itself.
+
+    The browser_service branch persists + normalizes the output before the
+    agent ever sees it ([A3]); the local http branch skipped both, so the
+    tester read raw ``"$17.00"`` strings, flagged WRONG_TYPE, and the writer
+    burned a fix cycle converting prices the harness converts for free at
+    persist time. Returns ``(output_path, rewritten_count)`` — ``("", 0)``
+    when no fresh (mtime >= floor) output exists. Never raises.
+    """
+    try:
+        from agents.nodes.run_execution import (
+            _find_newest_output,
+            normalize_output_prices,
+        )
+
+        path = _find_newest_output(directory, mtime_floor=mtime_floor)
+        if not path:
+            return "", 0
+        return path, normalize_output_prices(path)
+    except Exception as exc:
+        logger.debug("run_scraper: local output normalize skipped: %s", exc)
+        return "", 0
 
 
 @contextmanager
@@ -726,8 +819,8 @@ def _dispatch_alive(timeout: int | None = None):
     """
     _hb = None
     try:
-        from agents.tools.context import get_state
         from agents.graph import _start_heartbeat
+        from agents.tools.context import get_state
 
         _job_id = ((get_state() or {}).get("job_id") or 0)
         if _job_id:

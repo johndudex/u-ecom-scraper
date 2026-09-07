@@ -669,9 +669,29 @@ def main():
                 "discovery_coverage": _probe_coverage,
             },
         }
-        with open(OUTPUT_FILE, "w") as _of:
+        # [wave-24 W24-2] Never persist a weaker discovery result than an
+        # earlier pass in this process (394: the gate above ran full
+        # discovery → 240 URLs, then this probe hit empty_render → 0 and its
+        # output became the verdict's HIGH evidence before the full run
+        # wrote anything). A weaker probe parks in the probe_output_
+        # namespace, which no output_*.json consumer reads.
+        _write_path = OUTPUT_FILE
+        _earlier_yield = max(
+            int(LAST_DISCOVERY.get("discovered_urls") or 0), len(product_urls or [])
+        )
+        if _earlier_yield > 0 and not _probe_result.urls:
+            _write_path = os.path.join(
+                SCRIPT_DIR, f"probe_output_{TIMESTAMP}_{os.getpid()}.json"
+            )
+            logger.warning(
+                "discover-only: probe found 0 URLs but an earlier pass in this "
+                "process found %d — parking the probe artifact in %s instead "
+                "of clobbering the output_ namespace",
+                _earlier_yield, _write_path,
+            )
+        with open(_write_path, "w") as _of:
             json.dump(output, _of, indent=2)
-        logger.info("discover-only: wrote %d discovered URLs to %s", len(_probe_result.urls), OUTPUT_FILE)
+        logger.info("discover-only: wrote %d discovered URLs to %s", len(_probe_result.urls), _write_path)
         return
 
     if args.sample:

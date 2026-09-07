@@ -44,6 +44,11 @@ For each product in the output, check each field against `product_analysis.json 
 - **known_bad_values match** → WRONG_VALUE (check `known_bad_values` list)
 - **should_not_match patterns match** → WRONG_VALUE (the value looks like an error/anti-bot page)
 - **type mismatch** → WRONG_TYPE (e.g. string "0" instead of number 0 for price)
+- **Formatted price strings are NOT defects.** `"$17.00"` or `"1,234.56"`
+  in a price field parses cleanly and is normalized to a number
+  automatically at persist time — do NOT flag it WRONG_TYPE/WRONG_VALUE.
+  Flag only prices that are unparseable ("N/A", "See price at checkout")
+  or obviously wrong-scale (cents vs dollars).
 - **min_length violated** → PARTIAL (too short, may be truncated)
 - **format_hint not followed** → note in issues but don't fail on this alone
 - **Non-200 status_code** → exclude from quality assessment (dead URL)

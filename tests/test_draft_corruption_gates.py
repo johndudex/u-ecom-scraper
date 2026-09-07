@@ -299,3 +299,238 @@ class TestAbandonedWriterGuard:
             "must refuse"
         )
         assert not threading.current_thread().is_alive() or True
+
+
+class TestPerInvocationZombieDisarm:
+    """[wave-24 W24-1] The prod-395 regression: the wave-17 global latch is
+    SELF-RESETTING — every fresh ``set_tool_context`` re-arms
+    ``invocation_cancelled=False``, and a fresh invocation is exactly what a
+    zombie thread crosses (writer wall-clock death → tester phase starts →
+    the zombie's ``edit_file`` landed 2s into the tester's run).
+
+    The per-invocation latch: ``_invoke_agent_with_timeout`` mints an id on
+    the node thread and stamps it INSIDE the spawned invoke thread's context;
+    LangGraph's ToolNode dispatches sync tools through a
+    ``ContextThreadPoolExecutor`` that copies the SUBMITTING thread's
+    context, so every tool call this invocation makes executes with that id
+    visible. Cancellation records the id into a process-global set that no
+    fresh ``set_tool_context`` resets. The legacy global flag keeps its
+    semantics for unstamped callers (pinned by TestAbandonedWriterGuard)."""
+
+    def _echo_tool(self):
+        from agents.subagents import _install_invocation_cancellation
+        from langchain_core.tools import tool
+
+        @tool
+        def echo_tool(x: str) -> str:
+            """echoes x"""
+
+            return x
+
+        _install_invocation_cancellation()
+        return echo_tool
+
+    def test_prod395_regression_zombie_stays_disarmed_across_set_tool_context(
+        self, monkeypatch
+    ):
+        """The exact 395 shape through the REAL abandon path: the writer times
+        out, the tester phase calls ``set_tool_context``, and the zombie's
+        copied context must STILL refuse while the next invocation is armed."""
+        import threading
+        import time as _time
+        from contextvars import copy_context
+
+        import agents.graph as ag
+        from agents.tools import context as tctx
+
+        echo_tool = self._echo_tool()
+
+        captured: dict = {}
+
+        class SleepyAgent:
+            def invoke(self, messages, cfg=None):
+                # Runs INSIDE the zombie thread — its context carries the
+                # invocation stamp if _invoke_agent_with_timeout applied it.
+                captured["ctx"] = copy_context()
+                _time.sleep(1.5)
+                return {"messages": ["late"]}
+
+        monkeypatch.setattr(ag, "_log_event_row", lambda *a, **k: None)
+        monkeypatch.setattr(ag, "_notify_phase", lambda *a, **k: None)
+
+        result = ag._invoke_agent_with_timeout(
+            SleepyAgent(), [], {}, "code_writer", 0, timeout=0.3
+        )
+
+        assert result.get("_error_class") == "WallClockTimeout"
+        assert "ctx" in captured, "agent must have run inside a stamped thread"
+
+        # The tester phase starts — the prod-395 re-arm trigger:
+        tctx.set_tool_context({"url": "http://tester"}, agent_name="code_tester")
+        assert not tctx.is_invocation_cancelled(), "fresh phase must be armed"
+
+        # The zombie's NEXT tool call — dispatched through ITS copied context —
+        # must refuse even though the process-global flag was just reset:
+        with pytest.raises(Exception, match="cancelled"):
+            captured["ctx"].run(echo_tool.invoke, {"x": "hi"})
+
+        # A fresh stamped invocation (the tester's own agent thread) is armed:
+        fresh_box: dict = {}
+
+        def fresh_thread():
+            tctx.stamp_invocation(tctx.new_invocation_id())
+            fresh_box["ctx"] = copy_context()
+
+        t = threading.Thread(target=fresh_thread, daemon=True)
+        t.start()
+        t.join(5)
+        assert fresh_box["ctx"].run(echo_tool.invoke, {"x": "hi"}) == "hi"
+
+    def test_cancelled_stamp_propagates_through_langgraph_executor(self):
+        """The mechanism the latch leans on: the executor returned by
+        ``get_executor_for_config`` (what ToolNode uses) must copy the
+        submitting context's stamp, so a cancelled invocation refuses inside
+        the worker thread even with the LEGACY flag reset."""
+        from contextvars import copy_context as _ctx_copy  # noqa: F401
+
+        from agents.tools import context as tctx
+        from langchain_core.runnables.config import get_executor_for_config
+
+        echo_tool = self._echo_tool()
+
+        token = tctx.stamp_invocation(tctx.new_invocation_id())
+        tctx.mark_invocation_cancelled("code_writer")
+        tctx.set_tool_context({}, agent_name="code_tester")  # resets LEGACY flag only
+
+        assert tctx.is_invocation_cancelled(), (
+            "stamped view must stay disarmed across set_tool_context"
+        )
+
+        with get_executor_for_config({}) as executor:
+            with pytest.raises(Exception, match="cancelled"):
+                executor.submit(lambda: echo_tool.invoke({"x": "hi"})).result(10)
+
+        tctx.unstamp_invocation(token)
+        assert not tctx.is_invocation_cancelled()
+        assert echo_tool.invoke({"x": "hi"}) == "hi"
+
+    def test_cancelled_set_is_capped(self):
+        from agents.tools import context as tctx
+
+        tctx.reset_invocation_latches()
+        try:
+            total = tctx._CANCELLED_INVOCATIONS_CAP + 100
+            for i in range(total):
+                tctx.mark_invocation_cancelled("phase", invocation_id=f"id-{i}")
+            assert len(tctx._cancelled_invocations) <= tctx._CANCELLED_INVOCATIONS_CAP
+            newest = f"id-{total - 1}"
+            assert newest in tctx._cancelled_invocations, "newest must survive"
+        finally:
+            tctx.reset_invocation_latches()
+
+    def test_reset_invocation_latches_clears_everything(self):
+        from agents.tools import context as tctx
+
+        token = tctx.stamp_invocation(tctx.new_invocation_id())
+        tctx.mark_invocation_cancelled("phase")
+        assert tctx.is_invocation_cancelled()
+        tctx.reset_invocation_latches()
+        assert not tctx.is_invocation_cancelled()
+        assert not tctx._cancelled_invocations
+        assert tctx._current_invocation_id.get(None) is None
+        tctx.unstamp_invocation(token)  # token reset after None-set is tolerated
+
+
+class TestMidTestDraftMutation:
+    """[wave-24 W24-1 layer 2] Verdict integrity: a draft mutated WHILE the
+    tester ran (prod 395: zombie edit_file 2s into the tester's browser run)
+    makes the verdict a judgment of a moving target. The tester fingerprints
+    the draft at entry and exit and stamps ``draft_mutated_during_test``; the
+    router spends ONE code_tester pass on what is actually on disk before
+    accepting a PASS. (Layer 2 of the zombie defense — layer 1 disarms the
+    zombie itself; this wall catches every other mutation path.)"""
+
+    def _pass_state(self, **over):
+        state = {
+            "job_id": 0,
+            "test_report": {
+                "overall_assessment": "PASS",
+                "confidence_score": 0.9,
+                "issues": [],
+                "successful_extractions": 5,
+            },
+            "test_retry_count": 0,
+            "input_mode": "url_list",
+            "site_slug": "crocs-com",
+            "draft_mutated_during_test": True,
+            "mutated_verdict_retests": 0,
+        }
+        state.update(over)
+        return state
+
+    def test_mutated_pass_bounces_to_one_retest(self):
+        from agents.nodes.route_after_testing import route_after_testing
+
+        assert route_after_testing(self._pass_state()) == "code_tester"
+
+    def test_mutated_pass_accepted_once_allowance_spent(self):
+        from agents.nodes.route_after_testing import route_after_testing
+
+        assert (
+            route_after_testing(self._pass_state(mutated_verdict_retests=1))
+            == "field_confirmation"
+        )
+
+    def test_clean_pass_not_bounced(self):
+        from agents.nodes.route_after_testing import route_after_testing
+
+        state = self._pass_state(draft_mutated_during_test=False)
+        assert route_after_testing(state) == "field_confirmation"
+
+    def test_mutated_fail_keeps_fail_ladder(self):
+        """The un-proven wall guards PASS acceptance only — a FAIL verdict on
+        a mutated draft still routes through the normal fail ladder (the
+        writer fixes the draft currently on disk)."""
+        from agents.nodes.route_after_testing import route_after_testing
+
+        state = self._pass_state(
+            test_report={
+                "overall_assessment": "FAIL",
+                "confidence_score": 0.2,
+                "issues": [],
+            },
+        )
+        assert route_after_testing(state) != "code_tester"
+
+    def test_stamp_helper_semantics(self):
+        import agents.graph as ag
+
+        m = ag._draft_moved_during_test
+        assert m("", "") is False
+        assert m("aaa", "") is False
+        assert m("", "bbb") is False
+        assert m("aaa", "aaa") is False
+        assert m("aaa", "bbb") is True
+
+    def test_tester_stamps_mutation_flag_at_verdict(self):
+        """Source contract: _invoke_code_tester fingerprints the draft at
+        ENTRY (before the invoke) and stamps draft_mutated_during_test into
+        its update — so every verdict branch records whether the draft moved
+        under the test, and a re-entry consumes the router's allowance."""
+        with open(
+            os.path.join(ROOT, "webapp", "agents", "graph.py"), encoding="utf-8"
+        ) as fh:
+            src = fh.read()
+        fn_start = src.index("def _invoke_code_tester(")
+        fn_end = src.index("def _invoke_cleanup(")
+        body = src[fn_start:fn_end]
+        # Entry fingerprint precedes the agent invocation:
+        entry_pos = body.index("draft_file_fp(_te_draft)")
+        invoke_pos = body.index("_invoke_agent_with_timeout(")
+        assert entry_pos < invoke_pos, "entry fp must be taken before the invoke"
+        # The stamp lands in the update dict before the single return:
+        stamp_line = 'update["draft_mutated_during_test"] = _draft_moved_during_test('
+        stamp_pos = body.index(stamp_line)
+        assert stamp_pos < body.rindex("return update")
+        # Re-entry consumes the router's one-re-test allowance:
+        assert 'update["mutated_verdict_retests"]' in body

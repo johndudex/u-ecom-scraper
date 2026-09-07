@@ -335,10 +335,149 @@ class TestIntakeJobsExposesState:
         lock.save(update_fields=["enabled", "reason", "updated_at"])
         r = admin_client.get(reverse("intake_jobs"))
         assert r.status_code == 200
-        assert r.json()["maintenance"] == {
-            "enabled": True,
-            "reason": "deploy window",
-        }
+        assert r.json()["maintenance"]["enabled"] is True
+        assert r.json()["maintenance"]["reason"] == "deploy window"
+
+
+# ─── [wave-24 W24-8] append-only audit trail ────────────────────────────────
+#
+# 2026-09-07 ops incident: the lock was enabled 04:39–05:13 UTC by an unknown
+# superuser; the lift overwrote the singleton's updated_by/reason before
+# anyone captured them. MaintenanceLock is a singleton — it can only ever
+# remember its LATEST flip. Every toggle therefore appends a
+# MaintenanceLockEvent row BEFORE the singleton is mutated, so authorship
+# survives every subsequent flip.
+
+
+@pytest.fixture
+def clean_events(db):
+    from scraper.models import MaintenanceLockEvent
+
+    MaintenanceLockEvent.objects.all().delete()
+    return MaintenanceLockEvent
+
+
+class TestMaintenanceLockAuditTrail:
+    @pytest.mark.django_db
+    def test_toggle_appends_one_event_per_flip(
+        self, admin_client, superuser, lock, clean_events
+    ):
+        from django.urls import reverse
+
+        r1 = admin_client.post(
+            reverse("intake_maintenance"),
+            {"enabled": "1", "reason": "deploy window"},
+            headers={"x-requested-with": "XMLHttpRequest"},
+        )
+        assert r1.status_code == 200
+        r2 = admin_client.post(
+            reverse("intake_maintenance"),
+            {"enabled": "0"},
+            headers={"x-requested-with": "XMLHttpRequest"},
+        )
+        assert r2.status_code == 200
+
+        events = list(clean_events.objects.order_by("id"))
+        assert len(events) == 2
+        assert events[0].enabled is True
+        assert events[0].reason == "deploy window"
+        assert events[0].updated_by_id == superuser.id
+        assert events[1].enabled is False
+        assert events[1].reason == ""
+        assert events[1].created_at is not None
+
+    @pytest.mark.django_db
+    def test_event_authors_survive_subsequent_flips(
+        self, django_user_model, admin_client, lock, clean_events
+    ):
+        """The incident, replayed: A enables, B lifts — the singleton now
+        only remembers B, but BOTH events still name their own author."""
+        from django.urls import reverse
+
+        user_b = django_user_model.objects.create_superuser("later_super", password="x")
+        c_b = Client()
+        c_b.force_login(user_b)
+
+        admin_client.post(
+            reverse("intake_maintenance"),
+            {"enabled": "1", "reason": "enabling"},
+            headers={"x-requested-with": "XMLHttpRequest"},
+        )
+        c_b.post(
+            reverse("intake_maintenance"),
+            {"enabled": "0"},
+            headers={"x-requested-with": "XMLHttpRequest"},
+        )
+        enable_event, lift_event = list(clean_events.objects.order_by("id"))
+        assert enable_event.updated_by.username == "maint_admin"
+        assert lift_event.updated_by.username == "later_super"
+
+    @pytest.mark.django_db
+    def test_forbidden_or_malformed_toggle_writes_no_event(
+        self, regular_user, lock, clean_events
+    ):
+        from django.urls import reverse
+
+        c = Client()
+        c.force_login(regular_user)
+        r = c.post(
+            reverse("intake_maintenance"),
+            {"enabled": "1"},
+            headers={"x-requested-with": "XMLHttpRequest"},
+        )
+        assert r.status_code == 403
+        assert clean_events.objects.count() == 0
+
+    @pytest.mark.django_db
+    def test_maintenance_state_surfaces_last_event(
+        self, admin_client, superuser, lock, clean_events
+    ):
+        from django.urls import reverse
+
+        from scraper.views import _maintenance_state
+
+        assert _maintenance_state()["last_event"] is None  # no history yet
+
+        admin_client.post(
+            reverse("intake_maintenance"),
+            {"enabled": "1", "reason": "deploy window"},
+            headers={"x-requested-with": "XMLHttpRequest"},
+        )
+        state = _maintenance_state()
+        last = state["last_event"]
+        assert last["enabled"] is True
+        assert last["reason"] == "deploy window"
+        assert last["by"] == superuser.username
+        assert last["at"]  # ISO timestamp
+
+    @pytest.mark.django_db
+    def test_health_api_surfaces_lock_and_last_event(
+        self, admin_client, superuser, lock, clean_events
+    ):
+        from django.urls import reverse
+
+        admin_client.post(
+            reverse("intake_maintenance"),
+            {"enabled": "1", "reason": "merge wave-24"},
+            headers={"x-requested-with": "XMLHttpRequest"},
+        )
+        r = admin_client.get(reverse("health_api"))
+        assert r.status_code == 200
+        entry = r.json()["maintenance_lock"]
+        assert entry["label"] == "Maintenance Lock"
+        assert entry["status"] == "warn"  # lock is ON right now
+        assert "merge wave-24" in entry["detail"]
+
+    @pytest.mark.django_db
+    def test_admin_inline_shows_event_history(self, lock, clean_events):
+        from django.contrib import admin as dj_admin
+
+        from scraper.models import MaintenanceLock, MaintenanceLockEvent
+
+        model_admin = dj_admin.site._registry.get(MaintenanceLock)
+        assert model_admin is not None, "MaintenanceLock must be registered in admin"
+        inline_models = {inline.model for inline in model_admin.inlines}
+        assert MaintenanceLockEvent in inline_models
 
 
 if __name__ == "__main__":

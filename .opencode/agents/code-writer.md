@@ -291,7 +291,13 @@ failure class. Three hard rules:
    absent). Verify the orientation on your sample items before writing the
    mapping, and leave `previous_price` empty when no second value exists
    rather than duplicating the current price into it.
-3. **Rating-like fields carry the star VALUE, not a review count.** When the
+3. **Prices are NUMBERS.** `_norm_price` returns a **float** — run every
+   price-like field through it and never emit formatted strings
+   (`"$17.00"`, `"1,234.56"`). A string price reads as WRONG_TYPE to the
+   tester and burns a whole fix cycle to convert what `_norm_price` already
+   returns. Keep the currency symbol out of the value (it belongs in the
+   `currency` field).
+4. **Rating-like fields carry the star VALUE, not a review count.** When the
    Field Map anchors a rating field (`ratings`/`rating`/`average_rating`) at
    a count-shaped source (`numberOfReviews`, `reviewCount`,
    `reviews_count`), that map is WRONG — do not implement it as-is. Extract
