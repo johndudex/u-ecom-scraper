@@ -41,8 +41,10 @@ import logging
 import os
 import re
 import time
+from contextlib import contextmanager
 from typing import Any
 
+from django.core.cache import cache as django_cache
 from django.utils import timezone
 from langchain_core.callbacks import BaseCallbackHandler, BaseCallbackManager
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -3013,6 +3015,68 @@ def _project_api_endpoint(api: Any) -> dict:
     }
 
 
+_TRAVERSAL_LOCK_KEY = "mcp-browser-lock"
+_TRAVERSAL_LOCK_TTL = 1500  # crashed holder self-heals after 25 min
+_TRAVERSAL_LOCK_WAIT = 900  # a walker waits up to 15 min for its turn
+_TRAVERSAL_LOCK_POLL = 5.0
+
+
+@contextmanager
+def _mcp_browser_lock(
+    job_id: int,
+    wait_timeout: float = _TRAVERSAL_LOCK_WAIT,
+    poll_interval: float = _TRAVERSAL_LOCK_POLL,
+):
+    """Serialize MCP-browser walks across workers.
+
+    [jobs 349/350] browser_traverse drives the ONE shared Playwright MCP
+    Chrome. Two concurrent jobs (prefork workers 1 and 2) interleaved their
+    walks — job 349 (nike.in) observed the pages job 350 (karenmillen) was
+    browsing, and the wave-19 cross-domain guard honestly refused the
+    poisoned result. The cache-backed lock (`add` is SET-NX on Redis) gives
+    each walk exclusive access; the TTL means a crashed holder can't deadlock
+    the queue. On timeout the walker PROCEEDS (acquired=False) — availability
+    over deadlock, with a loud log; the cross-domain guard stays the honesty
+    backstop for a still-colliding walk.
+    """
+    deadline = time.monotonic() + wait_timeout
+    acquired = False
+    waited = 0.0
+    holder = None
+    while True:
+        if django_cache.add(_TRAVERSAL_LOCK_KEY, job_id, _TRAVERSAL_LOCK_TTL):
+            acquired = True
+            break
+        holder = django_cache.get(_TRAVERSAL_LOCK_KEY)
+        if waited >= 60.0 and waited % 60.0 < poll_interval:
+            logger.info(
+                "[TRAVERSAL-LOCK] job %s still waiting for the MCP browser "
+                "(held by job %s, waited %.0fs)",
+                job_id, holder, waited,
+            )
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(poll_interval)
+        waited += poll_interval
+    if acquired:
+        logger.info("[TRAVERSAL-LOCK] job %s acquired the MCP browser", job_id)
+    else:
+        logger.warning(
+            "[TRAVERSAL-LOCK] job %s PROCEEDING WITHOUT the MCP browser lock "
+            "(held by job %s, waited %.0fs) — walks may interleave; the "
+            "cross-domain guard is the backstop",
+            job_id, holder, waited,
+        )
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            django_cache.delete(_TRAVERSAL_LOCK_KEY)
+            logger.info(
+                "[TRAVERSAL-LOCK] job %s released the MCP browser", job_id
+            )
+
+
 def _invoke_navigation_traverse(
     state: ScrapeState, config: RunnableConfig
 ) -> dict[str, Any] | Command:
@@ -3036,10 +3100,14 @@ def _invoke_navigation_traverse(
         from experimental.nav_traversal.traversal import browser_traverse, traverse
 
         _input_mode = state.get("input_mode") or ""
-        result = browser_traverse(
-            url, content_type, query,
-            trust_start_as_listing=_input_mode in ("list_page", "search_term"),
-        )
+        # [jobs 349/350] the walk drives the ONE shared MCP Chrome — hold the
+        # cross-worker lock so concurrent jobs take turns instead of
+        # interleaving pages into each other's traversal results.
+        with _mcp_browser_lock(job_id):
+            result = browser_traverse(
+                url, content_type, query,
+                trust_start_as_listing=_input_mode in ("list_page", "search_term"),
+            )
 
         # MCP unavailable → fall back to the archived deterministic explorer +
         # synthesizer (imported lazily here so the fallback path is self-contained).
@@ -3052,7 +3120,9 @@ def _invoke_navigation_traverse(
             from .nodes.navigate_explore import navigate_explore
             from .nodes.navigate_synthesize import navigate_synthesize
 
-            explore_result = navigate_explore(dict(state), config)
+            explore_result = None
+            with _mcp_browser_lock(job_id):
+                explore_result = navigate_explore(dict(state), config)
             if isinstance(explore_result, dict):
                 state.update(explore_result)
             synth_result = navigate_synthesize(dict(state), config)
