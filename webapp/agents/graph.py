@@ -2985,7 +2985,18 @@ def _nav_result_contamination(result: Any, job_url: str) -> list[str]:
     api = getattr(result, "api", None)
     api_url = api.get("url") if isinstance(api, dict) else ""
     if isinstance(api_url, str) and api_url.startswith("http") and _off(api_url):
-        bad.append(f"api.url={api_url[:60]}")
+        # [wave-26/355] an off-domain api.url vetoes ONLY when the capture
+        # CLAIMS product data (count / items_per_page / sample_keys) — i.e.
+        # when it could become the extraction source (karenmillen's verbolia
+        # trap serves exactly that shape, and stays vetoed). A bare
+        # third-party widget endpoint (forevernew's truefitcorp ui-configs)
+        # carries no data evidence, and the strategy gate's shape check
+        # would reject it as a source anyway.
+        claims_data = bool(
+            api.get("count") or api.get("items_per_page") or api.get("sample_keys")
+        )
+        if claims_data:
+            bad.append(f"api.url={api_url[:60]}")
     links = [u for u in (getattr(result, "item_links", []) or []) if isinstance(u, str)]
     if links:
         off_n = sum(1 for u in links if u.startswith("http") and _off(u))

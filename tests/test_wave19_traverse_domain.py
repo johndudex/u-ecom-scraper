@@ -107,8 +107,15 @@ class TestNavResultContamination:
         assert len(bad) == 1 and "goal_url" in bad[0]
 
     def test_poisoned_api_url_flagged(self):
+        """[wave-26 contract refresh, job 355] an off-domain api.url vetoes
+        only when it CLAIMS data (count/sample_keys) — a bare widget
+        endpoint is no longer identity-bearing. The trap shape keeps the
+        veto; see tests/test_wave26_guard_thirdparty_api.py."""
         bad = self._fn()(
-            _result(goal_url="https://www.theiconic.com.au/x", api={"url": "https://api.myhouse.com.au/s"}),
+            _result(
+                goal_url="https://www.theiconic.com.au/x",
+                api={"url": "https://api.myhouse.com.au/s", "count": 40},
+            ),
             NAV_JOB_URL,
         )
         assert len(bad) == 1 and "api" in bad[0]
