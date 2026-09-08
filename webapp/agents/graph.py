@@ -476,6 +476,55 @@ def _enforce_anti_bot_strategy(analysis: dict, slug: str, filename: str) -> dict
     return analysis
 
 
+def _safe_splice_write(path: str, new_code: str) -> bool:
+    """[W26-6/prod-418] Write a post-generation splice ONLY if it compiles.
+
+    The enforcement hooks (_enforce_discovery_import, _patch_scraper_output_filter)
+    splice text into the writer's draft; a splice that lands inside a
+    parenthesized block ships a SyntaxError the next writer invocation must
+    burn a window repairing (418/420). Verify, then write; on failure leave
+    the file untouched and let the compile gate report the writer's OWN error.
+    """
+    try:
+        compile(new_code, path, "exec")
+    except SyntaxError as exc:
+        logger.warning(
+            "_safe_splice_write: %s rejected — spliced draft does not compile (%s); "
+            "file left unchanged",
+            path, exc,
+        )
+        return False
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_code)
+    return True
+
+
+def _insert_top_level_import(code: str, import_line: str) -> str:
+    """Insert ``import_line`` after the last TOP-LEVEL import statement.
+
+    AST-based (prod 418/420): ``rfind("\\nimport ")`` is paren-blind and can
+    land inside a parenthesized import block (``from x import (``), producing
+    a SyntaxError in the very artifact this hook protects. Falls back to
+    head-of-file when there are no imports or the source does not parse.
+    Callers must still compile-verify the result (_safe_splice_write).
+    """
+    import ast as _ast
+
+    try:
+        tree = _ast.parse(code)
+    except SyntaxError:
+        return import_line + "\n" + code
+    last_end = 0
+    for node in tree.body:
+        if isinstance(node, (_ast.Import, _ast.ImportFrom)):
+            last_end = max(last_end, getattr(node, "end_lineno", 0) or node.lineno)
+    if last_end <= 0:
+        return import_line + "\n" + code
+    lines = code.split("\n")
+    lines.insert(last_end, import_line)
+    return "\n".join(lines)
+
+
 def _patch_scraper_output_filter(
     slug: str, content_type: str = "", target_fields: list | None = None
 ) -> None:
@@ -562,12 +611,13 @@ def _patch_scraper_output_filter(
                 indent + line if line else line for line in filter_code.split("\n")
             )
             code = code[:line_start] + indented_filter + "\n" + code[line_start:]
-            with open(scraper_path, "w", encoding="utf-8") as f:
-                f.write(code)
-            logger.info(
-                "_patch_scraper_output_filter: inserted filter (%s) for content_type=%s",
-                label, content_type or "(unknown)",
-            )
+            # [W26-6] compile-verify before writing — a marker inside a
+            # bracket continuation would ship a SyntaxError.
+            if _safe_splice_write(scraper_path, code):
+                logger.info(
+                    "_patch_scraper_output_filter: inserted filter (%s) for content_type=%s",
+                    label, content_type or "(unknown)",
+                )
         else:
             logger.warning("_patch_scraper_output_filter: could not find output write location")
     except Exception as exc:
@@ -619,25 +669,13 @@ def _enforce_discovery_import(slug: str) -> None:
             "# _DISCOVERY_IMPORT_APPLIED (enforced — do not remove)"
         )
         if "from src.discovery import" not in code:
-            # Find insertion point: after last top-level import
-            last_import = max(
-                code.rfind("\nfrom src."),
-                code.rfind("\nfrom playwright"),
-                code.rfind("\nimport "),
-            )
-            if last_import > 0:
-                # Insert after the import line (find the newline after it)
-                line_end = code.find("\n", last_import + 1)
-                if line_end > 0:
-                    code = code[:line_end + 1] + import_line + "\n" + code[line_end + 1:]
-                else:
-                    code = import_line + "\n" + code
-            else:
-                code = import_line + "\n" + code
+            # [W26-6/prod-418] AST-based insertion after the last TOP-LEVEL
+            # import — the old rfind landed inside parenthesized import
+            # blocks and shipped a SyntaxError.
+            code = _insert_top_level_import(code, import_line)
             logger.info("_enforce_discovery_import: injected src.discovery import into %s", slug)
 
-        with open(draft_path, "w", encoding="utf-8") as f:
-            f.write(code)
+        _safe_splice_write(draft_path, code)
     except Exception as exc:
         logger.warning("_enforce_discovery_import: %s", exc)
 
@@ -4838,7 +4876,9 @@ def _select_template_file(state: ScrapeState) -> str:
     return select_template_file(state)
 
 
-def _noop_should_escalate(noop_cycles: int, test_retry_count: int) -> bool:
+def _noop_should_escalate(
+    noop_cycles: int, test_retry_count: int, step_death: bool = False
+) -> bool:
     """[A2/job-73 RC2] Should the no-op-fix gate escalate right now?
 
     A byte-identical draft escalates on the SECOND consecutive no-op. But
@@ -4850,6 +4890,12 @@ def _noop_should_escalate(noop_cycles: int, test_retry_count: int) -> bool:
     """
     if noop_cycles <= 0:
         return False
+    # [W26-5/prod-418] The writer died on langgraph's step budget AND the
+    # draft is byte-identical to the tested version — the next tester cycle
+    # re-tests identical code (A2's own "verdict stands" logic) against a
+    # writer that will hit the same wall. Escalate on the FIRST such cycle.
+    if step_death:
+        return True
     if noop_cycles >= 2:
         return True
     return test_retry_count >= MAX_TEST_RETRIES
@@ -5015,34 +5061,20 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     pass
             if sample_urls:
                 iu_path = os.path.join(_get_project_root(), "workspace", slug, "input_urls.json")
-                # Bug 1 fix: don't overwrite input_urls.json if it already has MORE
-                # URLs than the seed set. code_tester's discovery may have saved
-                # hundreds/thousands of URLs; overwriting with 5-20 seeds destroys
-                # them before run_execution can use them. Only overwrite when the
-                # seed set is richer (first run or navigation found more URLs).
-                try:
-                    if os.path.isfile(iu_path):
-                        with open(iu_path) as _ef:
-                            _loaded = _json.load(_ef)
-                        # [job-88 selfridges] the writer sometimes seeds a BARE
-                        # JSON array — `.get` on a list raised AttributeError
-                        # and the preserve check silently degraded to an
-                        # overwrite that destroyed the discovered URL set.
-                        _existing = (
-                            _loaded.get("urls", [])
-                            if isinstance(_loaded, dict)
-                            else _loaded if isinstance(_loaded, list) else []
-                        )
-                        if len(_existing) > len(sample_urls):
-                            logger.info(
-                                "_invoke_code_writer: preserving existing input_urls.json "
-                                "(%d URLs > %d seeds) — not overwriting",
-                                len(_existing), len(sample_urls),
-                            )
-                            sample_urls = []  # skip the write
-                except Exception:
-                    pass
-                if sample_urls:
+                # [W26-2/prod-419] Once input_urls.json exists it is part of
+                # the TESTED contract: the writer's own ground-truth seed
+                # (job 419's 1-URL PDP file, proven by a PASS verdict) must
+                # never be replaced by the navigator's raw link dump on a
+                # fix-cycle re-entry. The old count-only guard
+                # (len(existing) > len(seeds)) let 20 nav URLs overwrite that
+                # 1 good URL and poisoned every later test. Write only when
+                # absent — later cycles refine the DRAFT, not the seed.
+                if os.path.isfile(iu_path):
+                    logger.info(
+                        "_invoke_code_writer: input_urls.json already exists — "
+                        "preserving it (the seed is part of the tested contract)"
+                    )
+                else:
                     with open(iu_path, "w") as _f:
                         _json.dump({"urls": sample_urls}, _f, indent=2)
                     logger.info("_invoke_code_writer: wrote %d sample URLs to input_urls.json", len(sample_urls))
@@ -5462,14 +5494,31 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     f"{_new_fp[:12]} is UNCHANGED from the last tested version "
                     f"({_tested_fp[:12]}) — the fix loop produced no bytes",
                 )
+                # [W26-5/prod-418] The node bumps update["test_retry_count"]
+                # at entry (state still holds the PRE-cycle count) — pass the
+                # bumped value so the final-round rule fires on time.
                 if _noop_should_escalate(
-                    _noop, int(state.get("test_retry_count", 0) or 0)
+                    _noop,
+                    int(
+                        update.get("test_retry_count")
+                        or state.get("test_retry_count", 0)
+                        or 0
+                    ),
+                    step_death=_writer_hit_step_budget(result),
                 ):
                     _noop_note = (
                         "code_writer produced an identical draft twice after "
                         "failed tests — the fix loop is no longer making "
                         "progress on this strategy."
                     )
+                    if _writer_hit_step_budget(result):
+                        _noop_note = (
+                            "code_writer invocation ended on langgraph "
+                            "step-budget exhaustion without changing the "
+                            "tested draft — the next tester cycle would "
+                            "re-test identical code (escalating instead of "
+                            "burning the round)."
+                        )
                     _notify_phase(job_id, "code_writer", "failed")
                     if state.get("skip_approvals", False):
                         logger.error(
@@ -8340,6 +8389,10 @@ def build_scrape_graph(
             # (429 / throttle / transient render) — capped by
             # state.test_retest_count, maintained inside _invoke_code_tester.
             "code_tester": "code_tester",
+            # [W26-3/prod-410] terminal-cleanup invariant: an exhausted arm
+            # whose six vetoes are clean and whose output holds real items
+            # routes to execution instead of an honest-failure cleanup.
+            "run_execution": "run_execution",
             "human_approval": "human_approval",
             "cleanup": "cleanup",
         },

@@ -999,10 +999,14 @@ def _diagnose_no_execution(site_slug: str, job_id: int) -> str:
             except (TypeError, ValueError):
                 confidence = 0.0
             if assessment == "PASS":
+                # [W26-8/prod-410] the old text claimed an interrupt/resume
+                # gap — false for 410, where the ROUTER's exhausted-cascade
+                # arm chose cleanup. Point at the [CASCADE] rows instead.
                 return (
                     f"Tested PASS (confidence={confidence:.2f}) but execution "
-                    "never ran — the pipeline ended between approval and "
-                    "execution (interrupt/resume gap), not a scraper failure"
+                    "never ran — the router ended the job after testing "
+                    "(exhausted-cascade / evidence arm); see the [CASCADE] "
+                    "rows for the arm that fired"
                 )[:2000]
             # [wave-22 B5] A non-PASS report IS the exhausted-cascade case —
             # but the pipeline already KNOWS why it failed; quote the latest

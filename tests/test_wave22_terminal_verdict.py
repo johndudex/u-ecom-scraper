@@ -102,13 +102,18 @@ class TestDiagnoseQuotesTheVerdict:
 
 
 class TestExistingSemanticsUnchanged:
-    def test_pass_report_keeps_interrupt_gap_message(self, report_env):
+    def test_pass_report_points_at_cascade_rows(self, report_env):
+        """[W26-8 update] The PASS branch no longer claims an
+        "interrupt/resume gap" (prod 410's error string lied about the
+        mechanism — the ROUTER chose cleanup); it now points at the
+        [CASCADE] rows, which the W26-8 honesty tests pin."""
         _write_report(
             report_env,
             {"overall_assessment": "PASS", "confidence_score": 0.9},
         )
         msg = tasks._diagnose_no_execution("example-com", 74)
-        assert "interrupt/resume gap" in msg
+        assert "interrupt/resume gap" not in msg
+        assert "cascade" in msg or "router" in msg.lower()
 
     def test_no_report_keeps_generic_fallback(self, report_env):
         msg = tasks._diagnose_no_execution("example-com", 1)

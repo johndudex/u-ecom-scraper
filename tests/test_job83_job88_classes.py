@@ -428,9 +428,15 @@ class TestStealthProbeSuppressesReassessment:
 
 class TestWriterDeterministicGuards:
     def test_input_urls_preserve_tolerates_bare_array(self):
+        """[W26-2 update] input_urls.json is freeze-on-first-write: ANY
+        existing file (bare array, dict, anything) is preserved on
+        fix-cycle re-entry — the seed is part of the tested contract
+        (prod 419). Supersedes the old read-and-count guard this pin
+        originally described; the bare-array crash class it guarded
+        against is gone with the read itself."""
         src = _graph_src()
-        assert "isinstance(_loaded, dict)" in src
-        assert "_loaded if isinstance(_loaded, list) else []" in src
+        assert "if os.path.isfile(iu_path):" in src
+        assert "preserving it (the seed is part of the tested contract)" in src
         # the old unconditional .get chain is gone
         assert '_json.load(_ef).get("urls", [])' not in src
 

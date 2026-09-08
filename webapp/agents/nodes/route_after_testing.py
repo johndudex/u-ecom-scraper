@@ -473,7 +473,14 @@ def _freshness_floor(
                 last_at = float(state.get("last_tested_at") or 0.0)
             except (TypeError, ValueError):
                 last_at = 0.0
-            if fp and last_fp and fp == last_fp and last_at > floor:
+            if fp and last_fp and fp == last_fp and last_at > 0:
+                # [W26-10/prod-410] The live draft's content matches the one
+                # the tester tested, so THIS attempt's outputs (written during
+                # the test window) are ground truth regardless of any later
+                # mtime touch — a leaked writer thread re-stamping the file
+                # must not raise the floor past the tester's own run. A draft
+                # whose CONTENT actually changed is W24-1's
+                # draft_mutated_during_test latch, not the floor's business.
                 floor = last_at
             if relaxed_floor is not None and relaxed_floor > 0:
                 floor = min(floor, relaxed_floor)
@@ -1211,6 +1218,55 @@ def draft_file_fp(path: str) -> str:
         return ""
 
 
+def _exhausted_cleanup_redirect(
+    state: ScrapeState,
+    dest: str,
+    *,
+    cov_reason=None,
+    missing_core=None,
+    contract_bad=False,
+    count_regression=None,
+    volume_reason=None,
+    det_blockers=None,
+) -> str:
+    """[W26-3/prod-410] Terminal-cleanup invariant: an exhausted arm may not
+    end the job while a working scraper sits on disk.
+
+    When ALL SIX ground-truth vetoes are clean (the same axes the
+    GROUND-TRUTH PASS arm checks: discovery-coverage, empty-core,
+    CLI-contract, count-regression, volume-gap, deterministic blockers) AND
+    ``_scraper_has_real_items(min_count=1)`` holds, ``cleanup`` is a
+    contradiction — the job just proved it works. Route to execution
+    instead. Prod 410: tester PASS 0.82 + 1 real product + 48 URLs died in
+    the exhausted-cascade arm because the freshness floor (W26-10) blinded
+    every min_count>=1 rescue. This invariant is the belt behind those
+    rescues: vetoes clean ⇒ cleanup is unreachable.
+    """
+    if dest != "cleanup":
+        return dest
+    if (
+        not cov_reason
+        and not missing_core
+        and not contract_bad
+        and not count_regression
+        and not volume_reason
+        and not det_blockers
+        and _scraper_has_real_items(state, min_count=1)
+    ):
+        logger.warning(
+            "route_after_testing: exhausted arm tried cleanup but the six "
+            "vetoes are clean and the output holds real items — routing to "
+            "run_execution (terminal-cleanup invariant)"
+        )
+        _log_cascade(
+            state, "working-scraper-rescue",
+            "exhausted-arm cleanup vetoed: six vetoes clean + real items on "
+            "disk → run_execution",
+        )
+        return "run_execution"
+    return dest
+
+
 def _terminal_after_retest_check(state: ScrapeState, dest: str) -> str:
     """[wave-22 B2] Never terminate on a draft the tester never judged.
 
@@ -1826,10 +1882,28 @@ def route_after_testing(state: ScrapeState) -> str:
                     "route_after_testing: CLI contract violation + retries "
                     "exhausted + skip_approvals → cleanup (honest failure)"
                 )
-                return _terminal_after_retest_check(state, "cleanup")
+                # [W26-8] terminal exits leave a [CASCADE] trace (prod 410:
+                # the silent cleanup arm cost a forensic session)
+                _log_cascade(
+                    state, "contract-exhausted",
+                    "CLI contract violation + retries exhausted + "
+                    "skip_approvals → cleanup",
+                )
+                return _exhausted_cleanup_redirect(
+                    state, _terminal_after_retest_check(state, "cleanup"),
+                    cov_reason=_cov_reason, missing_core=missing_core,
+                    contract_bad=_contract_bad,
+                    count_regression=_count_regression,
+                    volume_reason=_volume_reason,
+                    det_blockers=_det_blockers,
+                )
             logger.error(
                 "route_after_testing: CLI contract violation + retries "
                 "exhausted → human_approval"
+            )
+            _log_cascade(
+                state, "contract-exhausted",
+                "CLI contract violation + retries exhausted → human_approval",
             )
             return _terminal_after_retest_check(state, "human_approval")
         logger.info(
@@ -1855,6 +1929,11 @@ def route_after_testing(state: ScrapeState) -> str:
                     "route_after_testing: FINAL attempt FAILED but output has real "
                     "items → field_confirmation (rescue, skip_approvals → run_execution)"
                 )
+                _log_cascade(
+                    state, "final-attempt-rescue",
+                    f"FINAL attempt FAILED but real items (min_count={_rescue_min}) "
+                    "→ field_confirmation",
+                )
                 return "field_confirmation"
             logger.error(
                 "route_after_testing: FINAL attempt FAILED (assessment=%s, "
@@ -1863,12 +1942,30 @@ def route_after_testing(state: ScrapeState) -> str:
                 assessment,
                 confidence,
             )
-            return _terminal_after_retest_check(state, "cleanup")
+            _log_cascade(
+                state, "final-attempt-cleanup",
+                f"FINAL attempt FAILED (assessment={assessment}, "
+                f"confidence={confidence:.2f}) + skip_approvals, no real items "
+                f"(min_count={_rescue_min}) → cleanup",
+            )
+            return _exhausted_cleanup_redirect(
+                state, _terminal_after_retest_check(state, "cleanup"),
+                cov_reason=_cov_reason, missing_core=missing_core,
+                contract_bad=_contract_bad,
+                count_regression=_count_regression,
+                volume_reason=_volume_reason,
+                det_blockers=_det_blockers,
+            )
         logger.error(
             "route_after_testing: FINAL attempt FAILED (assessment=%s, confidence=%.2f) "
             "→ human_approval",
             assessment,
             confidence,
+        )
+        _log_cascade(
+            state, "final-attempt",
+            f"FINAL attempt FAILED (assessment={assessment}, "
+            f"confidence={confidence:.2f}) → human_approval",
         )
         return _terminal_after_retest_check(state, "human_approval")
 
@@ -1904,7 +2001,20 @@ def route_after_testing(state: ScrapeState) -> str:
         # cloak problem — downgrading to "scraper" would swallow the switch and
         # silently rubber-stamp the under-coverage. (Only non-coverage strategy
         # failures on anti-bot sites get downgraded, as before.)
-        _action, _reason = "scraper", f"anti-bot site: fix browser+cloak run ({_reason})"
+        # [W26-8/prod-420] the downgrade must not rewrite the reason to blame
+        # the bot wall when the tester's own remediation.target says the draft
+        # is at fault — 420/419's cascade rows said "anti-bot site" for what
+        # the tester diagnosed as a scraper routing bug, inviting a cloak/
+        # proxy detour that could destroy a working draft.
+        _rem_down = report.get("remediation") if isinstance(report, dict) else None
+        _rem_target_down = (
+            str(_rem_down.get("target") or "") if isinstance(_rem_down, dict) else ""
+        )
+        _action = "scraper"
+        if _rem_target_down == "scraper":
+            _reason = f"tester remediation target=scraper ({_reason})"
+        else:
+            _reason = f"anti-bot site: strategy switch downgraded to scraper fix ({_reason})"
     # code_tester's LLM diagnosis can refine an ambiguous "refine" into mapping.
     remediation = report.get("remediation") if isinstance(report, dict) else None
     if _action == "refine" and isinstance(remediation, dict):
@@ -1986,6 +2096,11 @@ def route_after_testing(state: ScrapeState) -> str:
                 "action=%s) → field_confirmation (partial valid output)",
                 retry_count, _action,
             )
+            _log_cascade(
+                state, "cascade-exhausted-partial",
+                f"retries exhausted ({_action}) but partial valid output → "
+                "field_confirmation",
+            )
             return "field_confirmation"
         # For skip_approvals jobs (intake), human_approval auto-approves and
         # loops back to scraper_analyzer — creating an infinite retry cycle.
@@ -1999,19 +2114,44 @@ def route_after_testing(state: ScrapeState) -> str:
                     "output has real items → field_confirmation (rescue, skip_approvals → run_execution)",
                     retry_count, _reason,
                 )
+                _log_cascade(
+                    state, "cascade-exhausted-rescue",
+                    f"retries exhausted ({_reason}) but real items "
+                    f"(min_count={_rescue_min}) → field_confirmation",
+                )
                 return "field_confirmation"
             logger.error(
                 "route_after_testing: retries exhausted in cascade (count=%d, "
                 "action=%s, reason=%s) → FAIL (skip_approvals job, no human to break the loop)",
                 retry_count, _action, _reason,
             )
-            return _terminal_after_retest_check(
-                state, _terminal_after_grace_check(state, "cleanup")
+            # [W26-8/prod-410] this row is the one that was missing — the
+            # silent cleanup arm behind the "tested PASS but execution never
+            # ran" mystery.
+            _log_cascade(
+                state, "cascade-exhausted-cleanup",
+                f"retries exhausted ({_action}: {_reason}), no real items "
+                f"(min_count={_rescue_min}) → cleanup (skip_approvals)",
+            )
+            return _exhausted_cleanup_redirect(
+                state,
+                _terminal_after_retest_check(
+                    state, _terminal_after_grace_check(state, "cleanup")
+                ),
+                cov_reason=_cov_reason, missing_core=missing_core,
+                contract_bad=_contract_bad,
+                count_regression=_count_regression,
+                volume_reason=_volume_reason,
+                det_blockers=_det_blockers,
             )
         logger.warning(
             "route_after_testing: retries exhausted in cascade (count=%d, "
             "action=%s, reason=%s) → human_approval",
             retry_count, _action, _reason,
+        )
+        _log_cascade(
+            state, "cascade-exhausted",
+            f"retries exhausted ({_action}: {_reason}) → human_approval",
         )
         return _terminal_after_retest_check(
             state, _terminal_after_grace_check(state, "human_approval")

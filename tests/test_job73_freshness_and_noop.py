@@ -197,6 +197,37 @@ class TestEntryStampSemantics:
         }
         assert ns["_scraper_has_real_items"](state, min_count=1) is False
 
+    def test_post_test_mtime_touch_cannot_blind_current_attempt(
+        self, tmp_path, monkeypatch
+    ):
+        """[W26-10/prod-410] A post-test touch to the draft (leaked writer
+        thread; content unchanged so the fingerprint still matches the tested
+        draft) must not push the freshness floor past the current attempt's
+        own outputs. karenmillen prod 410: the tester PASSED with 1 real
+        product; a late draft mtime raised the floor above the tester's
+        output, the exhausted-arm rescue saw zero items → cleanup."""
+        ns = _load_scan()
+        monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
+        _ws(tmp_path, {"output_000001.json": GOOD_20})
+        import hashlib
+
+        draft = tmp_path / "workspace/acme-com/scraper_draft.py"
+        _mtime(draft, 1000)
+        fp = hashlib.sha1(draft.read_bytes()).hexdigest()
+        _mtime(tmp_path / "workspace/acme-com/output_000001.json", 1010)
+        state = {
+            "site_slug": "acme-com",
+            "input_mode": "list_page",
+            "content_type_config": {"content_type": "product", "output_key": "products"},
+            "test_report": {"sample_products": []},
+            "last_tested_draft_fp": fp,
+            "last_tested_at": 1005,  # node ENTRY — before the outputs
+        }
+        # Leaked thread touches the draft at T=2000: content unchanged (fp
+        # still matches), but mtime now exceeds both the stamp and the output.
+        _mtime(draft, 2000)
+        assert ns["_scraper_has_real_items"](state, min_count=1) is True
+
     def test_stamp_happens_before_the_tester_runs(self):
         """Source pin: the recorded ``last_tested_at`` value must be captured
         BEFORE the agent invoke in _invoke_code_tester (the job-73 defect was

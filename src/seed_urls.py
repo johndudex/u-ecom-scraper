@@ -49,6 +49,14 @@ def normalize_host(host: str | None) -> str:
     return str(host or "").strip().lower().removeprefix("www.")
 
 
+# [W26-2/prod-419] First path segments that are site chrome, never item
+# pages. Kept deliberately small and universal — this is a plausibility
+# belt, not a nav-model.
+_UTILITY_FIRST_SEGMENTS = frozenset(
+    {"help", "help-center", "helpcenter", "customer-service", "faq"}
+)
+
+
 def seed_report(urls: list, job_url: str) -> tuple[list[str], dict[str, int]]:
     """Filter ``urls`` down to same-host, item-plausible seeds.
 
@@ -58,8 +66,11 @@ def seed_report(urls: list, job_url: str) -> tuple[list[str], dict[str, int]]:
     - blank / non-string → ``blank``
     - unparseable → ``unparseable``
     - non-http(s) scheme or no hostname → ``not-http``
-    - pathless AND queryless (``https://site.com``) → ``no-path`` — a bare
-      homepage is not an item URL
+    - pathless (``https://site.com`` or ``https://site.com/?ptype=home``)
+      → ``no-path`` — a bare or query-only homepage is not an item URL
+      [W26-2: the query-only variant poisoned job 419's seed]
+    - first path segment in the utility set (``/help*``, ``/faq``, …)
+      → ``utility-page`` — same-host site chrome the host filter can't see
     - host (normalized) != job host (normalized) → ``off-host``. A blank
       ``job_url`` disables this rule (the seed list is then only
       sanity-filtered, never host-filtered).
@@ -94,8 +105,18 @@ def seed_report(urls: list, job_url: str) -> tuple[list[str], dict[str, int]]:
         if p.scheme not in ("http", "https") or not p.hostname:
             _drop("not-http")
             continue
-        if not p.path.strip("/") and not p.query:
+        # [W26-2/prod-419] A PATHLESS URL is never an item — including the
+        # query-only home (https://site.com/?ptype=homepage), whose query
+        # param let it past the old "pathless AND queryless" rule and into
+        # job 419's seed as the #1 poison entry. Generalized: any pathless
+        # URL drops, query or not.
+        if not p.path.strip("/"):
             _drop("no-path")
+            continue
+        # Same-host nav/utility junk is invisible to the host filter — drop
+        # well-known non-item first segments (job 419's /help-center).
+        if p.path.strip("/").split("/")[0].lower() in _UTILITY_FIRST_SEGMENTS:
+            _drop("utility-page")
             continue
         if job_host and normalize_host(p.hostname) != job_host:
             _drop("off-host")

@@ -1380,8 +1380,10 @@ def apply_draft_nudge(tools: list, threshold: int | None = None) -> list:
 _ANTI_READ_NUDGE_TEXT = (
     "\n\n[READ-BUDGET] {calls} read_file calls this invocation — every large "
     "read burns steps AND context. Stop paging: use search_content to find "
-    "the exact section, then read_file(path, offset=<position>) for a "
-    "targeted window only, and apply your fix with edit_file/write_file."
+    "the exact section, then read_file(path, line=<line number>) for a "
+    "targeted window — line= takes a LINE number (the unit search_content "
+    "hits report); offset= is a CHARACTER position, not a line number "
+    "[W26-4/prod-418]. Apply your fix with edit_file/write_file."
 )
 
 
@@ -4631,6 +4633,24 @@ def build_code_tester_message(state: dict) -> list:
                 )
     except Exception:
         pass  # fall back to the generic instruction above
+    # [W26-1/prod-420] Mode-aware Phase-2 prescription. A nav scraper's
+    # shipped contract is discovery→extraction; a seed-file-only run does
+    # not exercise it (the phase1-untested gate in route_after_testing
+    # rejects such a PASS after the fact). url_list keeps the fast seed run.
+    if input_mode in ("navigation", "list_page", "search_term"):
+        _phase2_instruction = (
+            "   - **Phase 2 (field extraction) rides the SAME discovery-driven "
+            "invocation prescribed in the Phase 1 step** — execution runs "
+            "discovery and then extracts from what it discovered. Optionally "
+            "add a fast field check afterwards with "
+            "`run_scraper(args=['--sample','--input','input_urls.json'])`.\n"
+        )
+    else:
+        _phase2_instruction = (
+            "   - **Phase 2 (field extraction):** "
+            "`run_scraper(args=['--sample','--input','input_urls.json'])` "
+            "— fast field check against known URLs.\n"
+        )
     # [job-88 selfridges] The volume assertion below must carry the SAME scope
     # waiver as the deterministic gate (_volume_gap bails for firstn/filter or
     # any scope_value). This job was firstn/10: its requests draft discovered 8
@@ -4662,13 +4682,24 @@ def build_code_tester_message(state: dict) -> list:
                 "not from a guessed category page\n"
                 "- Validate that discovered URLs are PRODUCT pages, not category pages\n"
             )
+        # [W26-1/prod-420] The old block here hardcoded
+        # `--sample --query "<search_criteria>"` — contradicting the
+        # pre-computed _tester_phase1_instruction (which renders ONLY the
+        # flags this draft declares, --query only for search_term). The
+        # tester followed the hardcoded line, argparse rejected it, and the
+        # cycle was mislabelled a scraper bug. Defer to the pre-computed
+        # args; never invent flags here.
         nav_validation += (
-            f"- `--sample --query \"{search_criteria}\"` — use these exact args so Phase 1 discovery runs.\n"
-            f"- Do NOT run with only `--sample` — the scraper will fall back to input_urls.json "
-            f"instead of discovering products via search\n"
-            f"- A FAIL is expected if Phase 1 discovers category/landing page URLs instead of product URLs\n"
-            f"- This is a navigation scraper — input_urls.json is NOT used. "
-            f"Products come from the scraper's own discovery.\n"
+            "- Run Phase 1 with the EXACT args prescribed in the Phase 1 step "
+            "below — they are derived from the draft's DECLARED CLI flags. Do "
+            "NOT invent flags the draft may not declare (e.g. a `--query` on a "
+            "non-search_term job, or a bare `--sample`): an argparse exit-2 on "
+            "an invented flag is a HARNESS artifact, not a scraper bug.\n"
+            "- Phase 2 extraction must be validated through the scraper's own "
+            "discovery (what execution runs), not only against a seed file.\n"
+            "- A FAIL is expected if Phase 1 discovers category/landing page URLs instead of product URLs\n"
+            "- This is a navigation scraper — input_urls.json is a seed hint, "
+            "NOT the source of truth. Products come from the scraper's own discovery.\n"
         )
 
         # Coverage-target context (Tier 2/3 inputs). The orchestrator stamps
@@ -4776,8 +4807,7 @@ def build_code_tester_message(state: dict) -> list:
         f"{nav_validation}"
         f"### Workflow\n"
         f"1. Run the scraper to validate BOTH phases:\n"
-        f"   - **Phase 2 (field extraction):** `run_scraper(args=['--sample','--input','input_urls.json'])` "
-        f"— fast field check against known URLs.\n"
+        f"{_phase2_instruction}"
         f"   - **Phase 1 (discovery) — for navigation/list_page/search_term jobs ONLY:** "
         f"run discovery EXACTLY as execution does, so a dropped CLI flag fails HERE instead "
         f"of in production:{_tester_phase1_instruction} "

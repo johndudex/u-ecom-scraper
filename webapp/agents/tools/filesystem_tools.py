@@ -301,21 +301,26 @@ def get_filesystem_tools(
             )
 
     @tool
-    def read_file(path: str, offset: int = 0) -> str:
+    def read_file(path: str, offset: int = 0, line: int = 0, num_lines: int = 0) -> str:
         """Read the content of a file and return it as a string.
 
         Args:
             path: Absolute or relative path to the file within the project.
-            offset: Character position to start reading from. Files larger
+            offset: CHARACTER position to start reading from. Files larger
                 than 50K chars return ONLY head+tail (first/last 20K) on an
                 untargeted read — do NOT page through the whole file. Use
                 search_content to locate the exact section, then pass
                 offset=<position> for a targeted ~50K window around it.
+            line: LINE number to start reading from (1-based) — this is the
+                unit search_content reports its hits in, so prefer this for
+                targeted reads of code files.
+            num_lines: How many lines to return with line= (default 400).
 
         Returns:
             The file content as text, or an error message if the file
             cannot be read. Large files are returned head+tail with a
-            SNIPPED notice; targeted offset reads return a ~50K window.
+            SNIPPED notice; targeted offset/line reads return a bounded
+            window.
         """
         try:
             safe = _enforce_root(path, root)
@@ -334,11 +339,54 @@ def get_filesystem_tools(
             return f"Error reading '{path}': {e}"
 
         MAX_READ_CHARS = 50_000
+
+        # [W26-4/prod-418] Line-based targeted read — the SAME unit
+        # search_content reports, so the writer can aim without converting.
+        if line:
+            if offset:
+                return (
+                    "Pass EITHER offset= (a CHARACTER position) OR line= "
+                    "(a LINE number, the unit search_content reports) — "
+                    "not both."
+                )
+            all_lines = content.split("\n")
+            total = len(all_lines)
+            if line < 1 or line > total:
+                return (
+                    f"line {line:,} out of range: file has {total:,} lines. "
+                    "line= takes a LINE number (1-based, the unit "
+                    "search_content hits report); offset= would be a "
+                    "CHARACTER position."
+                )
+            try:
+                count = int(num_lines) if num_lines else 400
+            except (TypeError, ValueError):
+                count = 400
+            count = max(1, min(count, 1200))
+            window = all_lines[line - 1: line - 1 + count]
+            end_line = line - 1 + len(window)
+            body = "\n".join(window)
+            if len(body) > MAX_READ_CHARS:
+                body = body[:MAX_READ_CHARS]
+                body += (
+                    f"\n\n... [window truncated at {MAX_READ_CHARS:,} chars — "
+                    f"re-call with line={end_line + 1} to continue]"
+                )
+            header = (
+                f"[read_file: requested line {line}, showing lines "
+                f"{line:,}-{end_line:,} of {total:,} — line= is a LINE "
+                "number; offset= is a CHARACTER position]\n"
+            )
+            return header + body
+
         if offset:
             if offset < 0 or offset >= len(content):
                 return (
                     f"offset {offset:,} out of range: file is "
-                    f"{len(content):,} chars"
+                    f"{len(content):,} chars. NOTE: offset is a CHARACTER "
+                    "position, NOT a line number — search_content hits "
+                    "report LINES, so call read_file(path, line=<that "
+                    "line number>) instead."
                 )
             content = content[offset:]
         if len(content) > MAX_READ_CHARS:
@@ -364,9 +412,10 @@ def get_filesystem_tools(
                     f"\n\n... [SNIPPED {snipped:,} of {len(content):,} chars — "
                     "large file, head+tail only. Do NOT page through the "
                     "whole file: use search_content to locate the exact "
-                    "section, then read_file(path, offset=<position>) for a "
-                    f"targeted window. This read showed chars 0-"
-                    f"{_LARGE_READ_HEAD - 1:,} and "
+                    "section, then read_file(path, line=<that line number>) "
+                    "for a targeted window (line= is a LINE number; "
+                    "offset= is a CHARACTER position). This read showed "
+                    f"chars 0-{_LARGE_READ_HEAD - 1:,} and "
                     f"{len(content) - _LARGE_READ_TAIL:,}-"
                     f"{len(content) - 1:,}.]\n"
                 )
