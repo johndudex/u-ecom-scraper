@@ -44,7 +44,6 @@ import time
 from contextlib import contextmanager
 from typing import Any
 
-from django.core.cache import cache as django_cache
 from django.utils import timezone
 from langchain_core.callbacks import BaseCallbackHandler, BaseCallbackManager
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -3015,10 +3014,32 @@ def _project_api_endpoint(api: Any) -> dict:
     }
 
 
-_TRAVERSAL_LOCK_KEY = "mcp-browser-lock"
+_TRAVERSAL_LOCK_KEY = "mcp-browser:lock"
 _TRAVERSAL_LOCK_TTL = 1500  # crashed holder self-heals after 25 min
 _TRAVERSAL_LOCK_WAIT = 900  # a walker waits up to 15 min for its turn
 _TRAVERSAL_LOCK_POLL = 5.0
+
+# compare-and-delete Lua: release ONLY if we still own the lock (a timed-out
+# walker whose TTL expired must not delete the live holder's key)
+_RELEASE_LOCK_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+end
+return 0
+"""
+
+
+def _traversal_redis():
+    """Redis client for the traversal lock. Deliberately NOT django.core.cache:
+    settings.py configures no CACHES, so that defaults to LocMemCache —
+    per-process, invisible across prefork workers (jobs 351/352 both
+    "acquired" simultaneously). Redis is shared (celery broker)."""
+    import redis
+    from django.conf import settings
+
+    return redis.Redis.from_url(
+        settings.REDIS_URL, socket_connect_timeout=5, socket_timeout=5
+    )
 
 
 @contextmanager
@@ -3033,25 +3054,26 @@ def _mcp_browser_lock(
     Chrome. Two concurrent jobs (prefork workers 1 and 2) interleaved their
     walks — job 349 (nike.in) observed the pages job 350 (karenmillen) was
     browsing, and the wave-19 cross-domain guard honestly refused the
-    poisoned result. The cache-backed lock (`add` is SET-NX on Redis) gives
-    each walk exclusive access; the TTL means a crashed holder can't deadlock
-    the queue. On timeout the walker PROCEEDS (acquired=False) — availability
-    over deadlock, with a loud log; the cross-domain guard stays the honesty
+    poisoned result. The lock (Redis SET NX EX) gives each walk exclusive
+    access; the TTL means a crashed holder can't deadlock the queue. On
+    timeout the walker PROCEEDS (acquired=False) — availability over
+    deadlock, with a loud log; the cross-domain guard stays the honesty
     backstop for a still-colliding walk.
     """
+    client = _traversal_redis()
     deadline = time.monotonic() + wait_timeout
     acquired = False
     waited = 0.0
     holder = None
     while True:
-        if django_cache.add(_TRAVERSAL_LOCK_KEY, job_id, _TRAVERSAL_LOCK_TTL):
+        if client.set(_TRAVERSAL_LOCK_KEY, str(job_id), nx=True, ex=_TRAVERSAL_LOCK_TTL):
             acquired = True
             break
-        holder = django_cache.get(_TRAVERSAL_LOCK_KEY)
+        holder = client.get(_TRAVERSAL_LOCK_KEY)
         if waited >= 60.0 and waited % 60.0 < poll_interval:
             logger.info(
                 "[TRAVERSAL-LOCK] job %s still waiting for the MCP browser "
-                "(held by job %s, waited %.0fs)",
+                "(held by %s, waited %.0fs)",
                 job_id, holder, waited,
             )
         if time.monotonic() >= deadline:
@@ -3063,7 +3085,7 @@ def _mcp_browser_lock(
     else:
         logger.warning(
             "[TRAVERSAL-LOCK] job %s PROCEEDING WITHOUT the MCP browser lock "
-            "(held by job %s, waited %.0fs) — walks may interleave; the "
+            "(held by %s, waited %.0fs) — walks may interleave; the "
             "cross-domain guard is the backstop",
             job_id, holder, waited,
         )
@@ -3071,7 +3093,9 @@ def _mcp_browser_lock(
         yield acquired
     finally:
         if acquired:
-            django_cache.delete(_TRAVERSAL_LOCK_KEY)
+            client.eval(
+                _RELEASE_LOCK_LUA, 1, _TRAVERSAL_LOCK_KEY, str(job_id)
+            )
             logger.info(
                 "[TRAVERSAL-LOCK] job %s released the MCP browser", job_id
             )
