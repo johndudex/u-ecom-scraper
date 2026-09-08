@@ -3062,7 +3062,14 @@ def _invoke_navigation_traverse(
                 if isinstance(_na, dict):
                     synth_result["navigation_analysis"] = _sanitize_nav_domains(_na, url)
             _notify_phase(job_id, "browser_traverse", "done")
-            return synth_result if isinstance(synth_result, dict) else {"messages": []}
+            # [wave-26/D6 hotfix, job 348] Command-routed node — the static
+            # edge to product_analyzer was UNIONED with the cross-domain
+            # Command(goto="cleanup") below and BOTH destinations ran. Every
+            # return here must carry its own goto (F13 precedent).
+            return Command(
+                goto="product_analyzer",
+                update=synth_result if isinstance(synth_result, dict) else {"messages": []},
+            )
 
         # browser_traverse didn't reach the goal (but MCP was available) —
         # fall back to the HTTP-first traverse() which handles form-driven
@@ -3315,11 +3322,17 @@ def _invoke_navigation_traverse(
             )
 
         _notify_phase(job_id, "browser_traverse", "done")
-        return {"navigation_analysis": analysis, "messages": []}
+        # [wave-26/D6 hotfix, job 348] self-routed (static edge removed).
+        return Command(
+            goto="product_analyzer",
+            update={"navigation_analysis": analysis, "messages": []},
+        )
     except Exception as exc:
         logger.exception("_invoke_navigation_traverse failed (job %s): %s", job_id, exc)
         _notify_phase(job_id, "browser_traverse", "failed")
-        return {"messages": []}
+        # [wave-26/D6 hotfix, job 348] self-routed (static edge removed) — a
+        # bare dict return would dead-end the graph now.
+        return Command(goto="product_analyzer", update={"messages": []})
 
 
 # ═══ ARCHIVED NAVIGATION (replaced by browser_traverse) ═══
@@ -8325,8 +8338,11 @@ def build_scrape_graph(
     # NO registered out-edges. The old conditional edge unioned with the
     # budget-exhaustion Command (both destinations ran — the D6 shadow branch).
 
-    # browser_traverse → product_analyzer (replaces the 3-node navigation pipeline).
-    workflow.add_edge("browser_traverse", "product_analyzer")
+    # browser_traverse → product_analyzer: Command-routed INSIDE the node
+    # (no static edge — [wave-26/D6 hotfix, job 348] the old edge unioned
+    # with the cross-domain Command(goto="cleanup") and BOTH destinations
+    # ran in one super-step; same lesson as F13 site_analyzer and the
+    # job-65 run_execution rewiring).
     # ═══ ARCHIVED NAVIGATION (replaced by browser_traverse) ═══
     # # navigation_explore → conditional (human_approval if Playwright down, else navigation_synthesize).
     # # navigate_explore may also return Command(goto="navigation_agent") when it detects a form-driven
