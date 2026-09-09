@@ -10,10 +10,35 @@
         <p class="text-xs text-ink-secondary mt-0.5 font-mono">{{ site.url }}</p>
     </div>
     <div class="flex items-center gap-2">
+        {% if site.is_archived %}
+        <form method="post" action="{% url 'site_unarchive' site.id %}">
+            {% csrf_token %}
+            <button type="submit" class="btn-secondary">Unarchive</button>
+        </form>
+        {% else %}
+        <form method="post" action="{% url 'site_archive' site.id %}">
+            {% csrf_token %}
+            <button type="submit" class="btn-secondary">Archive</button>
+        </form>
+        {% endif %}
+        {% if user.is_superuser %}
+        <form method="post" action="{% url 'site_delete' site.id %}"
+              onsubmit="return confirm('Permanently delete {{ site.slug|default:site.url }}? Jobs and artifacts are kept.');">
+            {% csrf_token %}
+            <input type="hidden" name="confirm" value="{{ site.slug }}">
+            <button type="submit" class="btn-secondary text-danger">Delete</button>
+        </form>
+        {% endif %}
         <a href="{% url 'site_edit' site_id=site.id %}" class="btn-secondary">Edit</a>
         <a href="{% url 'site_add' %}" class="nav-link">+ New</a>
     </div>
 </div>
+
+{% if site.is_archived %}
+<div class="panel border-danger/30 px-4 py-3 mb-4" style="background:rgba(248,113,113,0.06)">
+    <p class="text-sm text-danger">This site is archived — scrape and re-run are disabled. Unarchive to resume.</p>
+</div>
+{% endif %}
 
 <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
 

@@ -122,6 +122,9 @@ def _job_status_payload(job) -> dict:
         "content_type": job.page_type,
         "title": job.title or None,
         "site_name": job.site_name or None,
+        # [wave-27 W27-8] Chain-root job id when this job is a re-run
+        # (origin, not parent — one read answers "the original job id").
+        "rerun_of": job.origin_job_id,
         "platform": job.platform or None,
         "scraping_method": job.scraping_method or None,
         "current_phase": next((s["phase"] for s in reversed(steps) if s["status"] == "running"), None),

@@ -207,6 +207,20 @@ class ScrapeJob(models.Model):
     # search_term jobs: the search results page URL the user entered (distinct
     # from `search_criteria`, which holds the keywords). [intake-ui]
     search_url = models.URLField(max_length=1000, blank=True, default="")
+    # Per-field guidance from the user ({field_name: text}) — surfaced to
+    # product_analyzer / code_writer as advisory hints. [wave-27 W27-4]
+    field_notes = models.JSONField(default=dict, blank=True)
+    # Rerun lineage [wave-27 W27-8]: parent = the immediate source job;
+    # origin = the chain root (restart-of-restart chains read one row, not a
+    # walk). Set ONLY by job_restart — fresh-create paths stay unlinked.
+    parent_job = models.ForeignKey(
+        "self", null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="reruns",
+    )
+    origin_job = models.ForeignKey(
+        "self", null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="+",
+    )
 
     error_message = models.TextField(blank=True, default="")
     # Provenance for the event outbox: only created_via="api" (partner API)
@@ -444,6 +458,9 @@ class Site(models.Model):
     has_scraper = models.BooleanField(default=False)
     default_scraper_path = models.CharField(max_length=500, blank=True, default="")
     last_scraped_at = models.DateTimeField(null=True, blank=True)
+    # Archive = the supported removal path (hard delete stays superuser-only).
+    # Null = active; list views filter on it by default. [wave-27 W27-3]
+    archived_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -453,6 +470,10 @@ class Site(models.Model):
 
     def __str__(self):
         return f"{self.slug or self.url} ({self.status})"
+
+    @property
+    def is_archived(self) -> bool:
+        return self.archived_at is not None
 
     def save(self, **kwargs):
         self.url = _normalize_url(self.url)

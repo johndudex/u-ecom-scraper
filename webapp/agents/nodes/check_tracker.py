@@ -239,12 +239,25 @@ def _handle_new_site(url: str, slug: str, site_type: str = "shopping") -> Comman
     try:
         from scraper.models import Site
 
-        site = Site.objects.filter(url=url.rstrip("/")).first()
+        # Stored URLs may carry a trailing slash (Site.save normalizes only
+        # repeated slashes) — match both or the archived/existing row is
+        # missed and a duplicate Site gets created. [wave-27 W27-3]
+        _base = (url or "").rstrip("/")
+        site = Site.objects.filter(url__in=[_base, _base + "/"]).first()
         if site:
             if site_type and not site.site_type:
                 site.site_type = site_type
+            # [wave-27 W27-3] Explicit user intent beats a stale archive — a
+            # newly submitted job for an archived site un-archives it so no
+            # job is ever silently blocked by an old cleanup action.
+            if getattr(site, "archived_at", None) is not None:
+                site.archived_at = None
+                logger.info(
+                    "check_tracker: archived site '%s' auto-unarchived by new job",
+                    slug,
+                )
             site.status = "in_progress"
-            site.save(update_fields=["status", "site_type"])
+            site.save(update_fields=["status", "site_type", "archived_at"])
             logger.info(
                 "check_tracker: existing site '%s' updated to in_progress (was %s)",
                 slug,

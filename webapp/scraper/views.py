@@ -15,6 +15,7 @@ from django.db.models import Count, Q
 from django.http import (
     Http404,
     HttpResponse,
+    HttpResponseForbidden,
     HttpResponseNotFound,
     JsonResponse,
     StreamingHttpResponse,
@@ -682,6 +683,11 @@ def job_restart(request, job_id):
                 else job.dagster_enabled
             ),
             user=request.user,
+            # [wave-27 W27-8] Rerun lineage — parent = the immediate source,
+            # origin = the chain root (job_restart is the ONLY creator that
+            # sets these; fresh-create paths stay unlinked).
+            parent_job=job,
+            origin_job=job.origin_job or job,
         )
 
         from .tasks import dispatch_scrape_job
@@ -1534,8 +1540,38 @@ def probe_tester_cached_method(request):
 
 @login_required
 def site_list(request):
-    sites = Site.objects.all()
-    return render(request, "scraper/site_list.html", {"sites": sites})
+    # [wave-27 W27-3] Archived sites leave the default list; ?archived=1
+    # shows everything (archived rows carry a badge) so there is always a
+    # way back.
+    show_archived = request.GET.get("archived") == "1"
+    if show_archived:
+        sites = Site.objects.all()
+    else:
+        sites = Site.objects.filter(archived_at__isnull=True)
+    return render(
+        request,
+        "scraper/site_list.html",
+        {"sites": sites, "show_archived": show_archived},
+    )
+
+
+@login_required
+def site_archive(request, site_id):
+    """Archive (soft-remove) a Site. Login is enough — archive is reversible."""
+    site = get_object_or_404(Site, pk=site_id)
+    if request.method == "POST":
+        site.archived_at = timezone.now()
+        site.save(update_fields=["archived_at", "updated_at"])
+    return redirect("site_detail", site_id=site.id)
+
+
+@login_required
+def site_unarchive(request, site_id):
+    site = get_object_or_404(Site, pk=site_id)
+    if request.method == "POST":
+        site.archived_at = None
+        site.save(update_fields=["archived_at", "updated_at"])
+    return redirect("site_detail", site_id=site.id)
 
 
 @login_required
@@ -1600,6 +1636,11 @@ def site_scrape(request, site_id):
     if request.method != "POST":
         return redirect("site_detail", site_id=site.id)
 
+    # [wave-27 W27-3] Archived sites don't dispatch; the detail page's
+    # archived banner offers the one-click Unarchive.
+    if site.is_archived:
+        return redirect("site_detail", site_id=site.id)
+
     rescrape = request.POST.get("rescrape") == "on"
     full_extraction = request.POST.get("full_extraction") == "on"
 
@@ -1636,6 +1677,10 @@ def site_scrape(request, site_id):
 def site_rerun(request, site_id):
     site = get_object_or_404(Site, pk=site_id)
     if request.method != "POST":
+        return redirect("site_detail", site_id=site.id)
+
+    # [wave-27 W27-3] Archived sites don't re-execute their scraper.
+    if site.is_archived:
         return redirect("site_detail", site_id=site.id)
 
     if not site.has_scraper or not site.default_scraper_path:
@@ -1846,8 +1891,18 @@ def site_scraper_archive_download(request, site_id, filename):
 
 @login_required
 def site_delete(request, site_id):
+    """Hard delete, superuser-only + explicit confirm (wave-27 W27-2).
+
+    The Site row is the only thing deleted: ScrapeJob has no Site FK (the
+    audit trail survives) and File-Master artifacts under scrapers/<slug>/
+    are intentionally left in place — artifacts are never auto-destroyed.
+    """
     site = get_object_or_404(Site, pk=site_id)
     if request.method == "POST":
+        if not request.user.is_superuser:
+            return HttpResponseForbidden("Superuser required to delete a site")
+        if (request.POST.get("confirm") or "") != site.slug:
+            return redirect("site_detail", site_id=site.id)
         site.delete()
         return redirect("site_list")
     return redirect("site_detail", site_id=site.id)
@@ -2963,6 +3018,8 @@ def intake_jobs(request):
             # addresses are not the library's business.
             "owner_username": j.user.username if j.user_id else None,
             "owner_email": j.user.email if (is_admin and j.user_id) else None,
+            # [wave-27 W27-8] Chain-root id when this job is a re-run.
+            "rerun_of": j.origin_job_id,
         }
         for j in jobs
     ]

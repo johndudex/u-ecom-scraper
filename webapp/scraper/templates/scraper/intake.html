@@ -376,6 +376,9 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     validateSchemaUrl: "{% url 'intake_validate_schema' %}",
     discoverFieldsUrl: "{% url 'intake_discover_fields' %}",
     jobsLibraryUrl: "{% url 'intake_jobs' %}",
+    // Per-job update endpoint with a 0 placeholder — the un-save action
+    // string-replaces it with the real id. [wave-27 W27-3]
+    jobUpdateUrlTemplate: "{% url 'job_update' 0 %}",
     tokenListUrl: "{% url 'intake_token_list' %}",
     tokenCreateUrl: "{% url 'intake_token_create' %}",
     maintenanceUrl: "{% url 'intake_maintenance' %}",
@@ -2284,7 +2287,10 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
           +     '<span class="saved-when">saved '+escHtml(s.when)+'</span>'
           +   '</div>'
           + '</div>'
-          + '<button class="mini-btn" type="button" data-open="'+escHtml(s.id)+'">Open</button>'
+          + '<span style="display:flex;gap:6px;flex-shrink:0;">'
+          +   '<button class="mini-btn" type="button" data-open="'+escHtml(s.id)+'">Open</button>'
+          +   '<button class="mini-btn" type="button" data-unsave="'+escHtml(s.id)+'" title="Remove from Saved (the job itself is kept)">Remove from Saved</button>'
+          + '</span>'
         + '</div>';
       }).join('');
       return '<details class="domain-group" open>'
@@ -2304,6 +2310,22 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     var expanded = el.classList.toggle('expanded');
     t.textContent = expanded ? 'Show less' : ('Show all (' + t.dataset.fieldsCount + ')');
   });
+  // [wave-27 W27-3] "Remove from Saved" — un-saving IS the delete for the
+  // Saved tab (jobs are never hard-deleted; they're the audit trail). Posts
+  // the existing job_update endpoint with is_saved=0, then refetches.
+  X('#saved-list').addEventListener('click', function(e){
+    var b = e.target.closest('[data-unsave]'); if(!b) return;
+    var id = b.getAttribute('data-unsave');
+    var s = getSavedById(id);
+    if(!s || !confirm('Remove "'+s.name+'" from Saved? (The job itself is kept.)')) return;
+    fetch(INTAKE_CONFIG.jobUpdateUrlTemplate.replace('0', String(id)), {
+      method: 'POST',
+      headers: {'X-Requested-With':'XMLHttpRequest','X-CSRFToken':INTAKE_CONFIG.csrfToken},
+      body: new URLSearchParams({is_saved: '0'})
+    }).then(function(r){ return r.json(); }).then(function(){
+      refreshLibrary();
+    }).catch(function(){ /* leave the row in place on failure */ });
+  });
   function getSavedById(id){ return SAVED_EXTRACTORS.filter(function(s){ return String(s.id) === String(id); })[0]; }
   wireRenameDelegation('saved-list', getSavedById, renderSavedList);
 
@@ -2322,9 +2344,10 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       var when = relativeWhen(j.created_at);
       var name = j.title || ('Job #'+j.id);
       var owner = j.owner_username ? escHtml(j.owner_username) : '<span class="text-muted">—</span>';
+      var rerunOf = j.rerun_of ? '<span class="text-muted" title="Re-run of job #'+j.rerun_of+'" style="font-size:11px">↻ #'+j.rerun_of+'</span>' : '';
       return '<tr><td class="rmono">#'+j.id+'</td>'
         + '<td><span class="rename-wrap"><span class="rename-text">'+escHtml(name)+'</span>'
-        +   '<button class="rename-btn" type="button" data-id="'+j.id+'" title="Rename" aria-label="Rename job">'+icoEditSm()+'</button></span></td>'
+        +   '<button class="rename-btn" type="button" data-id="'+j.id+'" title="Rename" aria-label="Rename job">'+icoEditSm()+'</button></span> ' + rerunOf + '</td>'
         + '<td class="rmono">'+escHtml(siteOf(j))+'</td><td class="rmono">'+owner+'</td><td>'+escHtml(when)+'</td>'
         + '<td><span class="'+statusClass+'">'+escHtml(status)+'</span></td>'
         + '<td class="rmono">'+recs+'</td><td class="rmono">'+dur+'</td>'

@@ -41,6 +41,9 @@
                     </a>
                     <div class="flex items-center gap-2 mt-1 text-[11px] text-ink-muted font-mono">
                         <span>#{{ job.id }}</span>
+                        {% if job.origin_job_id %}
+                        <a href="{% url 'job_detail' job.origin_job_id %}" class="hover:text-accent transition-colors" title="Re-run lineage">↻ #{{ job.origin_job_id }}</a>
+                        {% endif %}
                         <span class="text-line-strong">·</span>
                         <span>{% if job.site_name %}{{ job.site_name }}{% else %}{{ job.url|truncatechars:30 }}{% endif %}</span>
                         <span class="text-line-strong">·</span>

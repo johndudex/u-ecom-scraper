@@ -21,6 +21,10 @@
                 {% if job.page_type %}
                 <span class="status-badge bg-accent/10 text-accent">{{ job.page_type_display }}</span>
                 {% endif %}
+                {% if job.origin_job %}
+                <a href="{% url 'job_detail' job.origin_job_id %}" class="text-xs text-ink-muted hover:text-accent transition-colors"
+                   title="Parent: job #{{ job.parent_job_id }}">Re-run of #{{ job.origin_job_id }}</a>
+                {% endif %}
             </div>
             <p class="text-ink-secondary text-sm mt-1 font-mono text-xs">{{ job.url }}</p>
             {% if job.product_url %}

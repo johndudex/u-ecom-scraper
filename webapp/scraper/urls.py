@@ -11,6 +11,8 @@ urlpatterns = [
     path("sites/<int:site_id>/", views.site_detail, name="site_detail"),
     path("sites/<int:site_id>/edit/", views.site_edit, name="site_edit"),
     path("sites/<int:site_id>/delete/", views.site_delete, name="site_delete"),
+    path("sites/<int:site_id>/archive/", views.site_archive, name="site_archive"),
+    path("sites/<int:site_id>/unarchive/", views.site_unarchive, name="site_unarchive"),
     path("sites/<int:site_id>/scrape/", views.site_scrape, name="site_scrape"),
     path("sites/<int:site_id>/rerun/", views.site_rerun, name="site_rerun"),
     path(

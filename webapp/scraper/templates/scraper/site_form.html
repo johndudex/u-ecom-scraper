@@ -19,8 +19,8 @@
     {% endif %}
 
     <div class="panel p-6">
-        <form method="post" action="{% url 'site_add' %}" enctype="multipart/form-data">
-            <input type="hidden" name="site_id" value="{{ site.id|default:'' }}">
+        <form method="post" action="{% if site.id %}{% url 'site_edit' site.id %}{% else %}{% url 'site_add' %}{% endif %}" enctype="multipart/form-data">
+            {% if site.id %}<input type="hidden" name="site_id" value="{{ site.id }}">{% endif %}
             {% csrf_token %}
 
             <div class="mb-5">

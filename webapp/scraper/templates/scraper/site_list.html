@@ -9,6 +9,13 @@
         <h2 class="text-2xl font-extrabold text-ink">Sites</h2>
         <p class="text-sm text-ink-secondary mt-0.5">Manage configured websites and their scrapers</p>
     </div>
+    <div class="flex items-center gap-2">
+        {% if show_archived %}
+        <a href="{% url 'site_list' %}" class="btn-secondary">← Active only</a>
+        {% else %}
+        <a href="{% url 'site_list' %}?archived=1" class="btn-secondary">Show archived</a>
+        {% endif %}
+    </div>
     <a href="{% url 'site_add' %}" class="btn-primary">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12 2.25c-5.385 0-9.75 4.365-9.75 9.75s4.365 9.75 9.75 9.75 9.75-4.365 9.75-9.75S17.385 2.25 12 2.25zM12.75 9a.75.75 0 00-1.5 0v2.25H9a.75.75 0 000 1.5h2.25V15a.75.75 0 001.5 0v-2.25H15a.75.75 0 000-1.5h-2.25V9z" clip-rule="evenodd"/></svg>
         Add Site
@@ -25,6 +32,9 @@
                     <p class="text-sm font-semibold text-ink group-hover:text-accent transition-colors">{{ site.name|default:site.slug }}</p>
                     {% if site.has_scraper %}
                     <span class="status-badge status-completed" style="font-size: 0.55rem; padding: 0.1rem 0.4rem;">Ready</span>
+                    {% endif %}
+                    {% if site.is_archived %}
+                    <span class="status-badge status-failed" style="font-size: 0.55rem; padding: 0.1rem 0.4rem;">Archived</span>
                     {% endif %}
                 </div>
                 <p class="text-xs text-ink-muted truncate font-mono">{{ site.url }}</p>
