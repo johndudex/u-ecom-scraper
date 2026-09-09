@@ -622,6 +622,13 @@ components:
           type: string
           enum: [url_list, navigation, list_page, search_term]
         search_criteria: { type: string, description: Query, for search modes. }
+        rerun_of:
+          type: ['integer', 'null']
+          description: |
+            Chain-root job id when the created job is a re-run (wave-27
+            lineage; null for API-created jobs today — re-runs are born
+            UI-side). Present so the event schema matches
+            JobStatus.rerun_of on the sync API.
         callback:
           $ref: '#/components/schemas/CallbackStatus'
       examples:
@@ -629,6 +636,7 @@ components:
           url: 'https://example-store.com/products/widget'
           content_type: product
           input_mode: url_list
+          rerun_of: null
           callback:
             url: 'https://partner.example/hooks/scraper'
             status: active

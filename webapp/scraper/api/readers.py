@@ -83,6 +83,8 @@ def validate_schema(request):
             ],
             "derived_fields": result.derived_fields,
             "detected_content_type": result.detected_content_type,
+            # W27-4: normalized fields incl. per-field descriptions.
+            "fields": (result.normalized or {}).get("fields", []),
         }
     )
 

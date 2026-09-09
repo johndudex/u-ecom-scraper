@@ -144,7 +144,19 @@ tags:
   - name: artifacts
     description: Retrieve job artifacts — sample records, the full scraped output, and the generated scraper code.
   - name: intake-helpers
-    description: Optional pure helpers mirroring the /intake UI's pre-submit checks. Recommended ONLY for validate-schema (see GET/POST notes); check-site is deliberately NOT exposed (cross-tenant data leak — see design rationale).
+    description: >-
+      Optional pure helpers mirroring the /intake UI's pre-submit checks.
+      Recommended ONLY for validate-schema (see its notes). check-site IS
+      exposed but deliberately metadata-only — `known_site` true is a bounded
+      cross-tenant signal (boolean + platform string; never fields or other
+      tenants' data — see design rationale).
+  - name: extractors
+    description: |
+      Reusable extractor configurations (the Site a job runs against), scoped
+      to the API key's OWN jobs (distinct Sites whose url matches one of the
+      key's ScrapeJobs). PATCH is a strict allowlist; archive/unarchive is the
+      removal path — there is NO DELETE by design (hard delete stays a
+      superuser UI action).
 
 paths:
   # ─────────────────────────────────────────────────────────────────────────
@@ -201,6 +213,181 @@ paths:
                     example: "product"
         "401": { $ref: "#/components/responses/Unauthorized" }
         "422": { $ref: "#/components/responses/ValidationError" }
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1b. EXTRACTORS (wave-27 W27-6) — reusable Site configurations, scoped to
+  #     the key's own jobs. No DELETE: archive is the removal path.
+  # ─────────────────────────────────────────────────────────────────────────
+  /api/v1/extractors:
+    get:
+      tags: [extractors]
+      operationId: listExtractors
+      summary: List extractor configurations visible to this key
+      description: |
+        Distinct Site rows whose `url` matches one of THIS key's ScrapeJobs
+        (trailing-slash tolerant). Most recently updated first. A site with
+        no jobs from this key — including other partners' sites — never
+        appears; there is no cross-tenant oracle.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, default: 1 }
+        - name: page_size
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: Paginated extractor summaries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [extractors, page, page_size, total_items, total_pages]
+                properties:
+                  extractors:
+                    type: array
+                    items: { $ref: "#/components/schemas/ExtractorSummary" }
+                  page: { type: integer }
+                  page_size: { type: integer }
+                  total_items: { type: integer }
+                  total_pages: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/v1/extractors/{slug}:
+    get:
+      tags: [extractors]
+      operationId: getExtractor
+      summary: Extractor detail (configuration + schema fields)
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: The extractor's full configuration.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ExtractorDetail" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [extractors]
+      operationId: patchExtractor
+      summary: Update an extractor's configuration (strict allowlist)
+      description: |
+        Only `name`, `site_type`, `sample_url`, `currency`, `input_urls`,
+        `field_notes` are accepted — anything else is 422 `validation_failed`
+        and nothing is applied. `field_notes` entries merge INTO the stored
+        schema's `fields[].description` by field name (fields not yet in the
+        schema are appended). Validation parity with the UI's SiteForm
+        cleaners (URL normalization, JSON-array input_urls, choice site_type).
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ExtractorPatch" }
+      responses:
+        "200":
+          description: Updated extractor detail.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ExtractorDetail" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+    delete:
+      tags: [extractors]
+      operationId: deleteExtractor
+      summary: "Not allowed (by design)"
+      description: |
+        Extractors have no partner DELETE: a hard delete is dangerous (the
+        Site row is the audit trail for every job and scraper artifact).
+        `POST /api/v1/extractors/{slug}/archive` is the removal path; hard
+        delete stays a superuser UI action. This operation always answers 405.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "405":
+          description: Deliberate — archive instead.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/extractors/{slug}/archive:
+    post:
+      tags: [extractors]
+      operationId: archiveExtractor
+      summary: Soft-remove an extractor (idempotent)
+      description: |
+        Sets `archived_at`. Archived extractors stay visible in the detail
+        response (with `archived_at` set) and their history is intact; new
+        jobs against them auto-unarchive the Site when submitted through the
+        UI (explicit submission beats a stale archive).
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Archive state after the call.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [slug, archived_at]
+                properties:
+                  slug: { type: string }
+                  archived_at: { type: [string, "null"], format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/extractors/{slug}/unarchive:
+    post:
+      tags: [extractors]
+      operationId: unarchiveExtractor
+      summary: Restore an archived extractor (idempotent)
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Archive state after the call (`archived_at` null).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [slug, archived_at]
+                properties:
+                  slug: { type: string }
+                  archived_at: { type: [string, "null"], format: date-time }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /api/v1/jobs:
     post:
       tags: [jobs]
@@ -1631,7 +1818,14 @@ components:
           items:
             type: string
           maxItems: 100
-          description: Field names to extract. AUTHORITATIVE for the output schema — the finalizer deterministically prunes output records to these plus bookkeeping fields (`url`, `src_url`, `scraped_at`, `status_code`; src/content_types.py:311). Omit to extract everything the analyzer finds.
+          description: |
+            Field names to extract, in your preferred order. AUTHORITATIVE for
+            the output schema — the finalizer deterministically prunes output
+            records to these plus bookkeeping fields (`url`, `src_url`,
+            `scraped_at`, `status_code`; src/content_types.py:312). ORDER
+            CONTRACT (wave-27): the output record's key order follows
+            `target_fields` order first, with bookkeeping keys appended.
+            Omit to extract everything the analyzer finds.
           examples:
             - ["title", "price", "availability", "currency"]
         schema_text:
@@ -1641,7 +1835,24 @@ components:
             `{fields: [...]}` dialect). If present it is validated (invalid →
             422) and the derived field names become the enforced
             `target_fields`; the raw text is stored for re-display.
-            Use `/api/v1/validate-schema` first to avoid a 422.
+            Use `/api/v1/validate-schema` first to avoid a 422. Per-field
+            `description` strings inside the schema become per-field extraction
+            instructions (see `field_instructions`).
+        field_instructions:
+          type: object
+          maxProperties: 100
+          additionalProperties:
+            type: string
+            maxLength: 300
+          description: |
+            Per-field extraction instructions (wave-27) — `{field_name:
+            instruction}`. Each value is capped at 300 chars (longer → 422);
+            at most 100 entries. Instructions are injected into the analysis
+            and code-generation prompts as a "Field guidance" section, and
+            ride the stored schema (`fields[].description`) so re-runs keep
+            them. Overrides a `description` of the same field in `schema_text`.
+          examples:
+            - {"price": "numeric only, no currency symbol", "availability": "use the buy-box status, not the wishlist button"}
         scope:
           $ref: "#/components/schemas/Scope"
           default: all
@@ -1841,6 +2052,15 @@ components:
         site_name:
           type: [string, "null"]
           description: Resolved site display name (e.g. "R.M.Williams").
+        rerun_of:
+          type: [integer, "null"]
+          description: |
+            Id of the CHAIN-ROOT job when this job is a re-run (wave-27
+            lineage: `rerun_of` = original job; the immediate parent stays
+            queryable via `parent_job` internally). Null for fresh jobs.
+            API-created jobs are always fresh today, but pollers should read
+            this field uniformly — UI-initiated re-runs of a partner's job
+            surface here.
         platform:
           type: [string, "null"]
           description: Detected platform (e.g. "Demandware/SFCC", "Shopify").
@@ -1926,6 +2146,9 @@ components:
           $ref: "#/components/schemas/ContentType"
         site_name:
           type: [string, "null"]
+        rerun_of:
+          type: [integer, "null"]
+          description: Chain-root job id when this job is a re-run (see JobStatus.rerun_of); null otherwise.
         item_count:
           type: [integer, "null"]
         created_at:
@@ -1962,10 +2185,11 @@ components:
       type: object
       description: |
         One extracted record. The four bookkeeping fields are always present
-        (BOOKKEEPING_FIELDS, src/content_types.py:311); every other key comes
+        (BOOKKEEPING_FIELDS, src/content_types.py:312); every other key comes
         from the requested `target_fields` (or everything found, when no
-        schema was requested). Values are strings unless the source provided
-        structured types — treat all values as display strings.
+        schema was requested). KEY ORDER (wave-27): `target_fields` order
+        first, bookkeeping appended. Values are strings unless the source
+        provided structured types — treat all values as display strings.
       additionalProperties: true
       properties:
         url:
@@ -2159,11 +2383,117 @@ components:
           items:
             type: string
           description: Flattened field names the schema requests (these become `target_fields` on create).
+        fields:
+          type: array
+          description: |
+            The normalized field list in schema order (wave-27). Bare shape is
+            `{name}`; when the schema carries a per-field `description`
+            (≤300 chars, longer → `DESCRIPTION_TOO_LONG` warning + truncation)
+            the entry grows to `{name, description}`. These descriptions ride
+            the job as extraction instructions.
+          items:
+            type: object
+            required: [name]
+            properties:
+              name:
+                type: string
+              description:
+                type: string
+                maxLength: 300
         detected_content_type:
           description: Content type inferred from the schema's field names; null when not recognizable.
           oneOf:
             - $ref: "#/components/schemas/ContentType"
             - type: "null"
+
+    ExtractorSummary:
+      type: object
+      required: [slug, url, has_scraper, product_count, archived_at]
+      properties:
+        slug:
+          type: string
+        name:
+          type: [string, "null"]
+        url:
+          type: string
+          format: uri
+        site_type:
+          description: One of shopping / articles / jobs / forum / general; null when unset.
+          oneOf:
+            - type: [string, "null"]
+        has_scraper:
+          type: boolean
+        product_count:
+          type: integer
+        last_scraped_at:
+          type: [string, "null"]
+          format: date-time
+        archived_at:
+          type: [string, "null"]
+          format: date-time
+          description: Non-null = soft-removed (archive); new UI jobs auto-restore.
+
+    ExtractorDetail:
+      type: object
+      required: [slug, url, has_scraper, product_count, archived_at, fields, input_urls_count]
+      allOf:
+        - $ref: "#/components/schemas/ExtractorSummary"
+        - type: object
+          properties:
+            platform:
+              type: [string, "null"]
+            scraping_method:
+              type: [string, "null"]
+            input_urls_count:
+              type: integer
+              description: Length of the stored input_urls array (count only — the array itself is create/read via jobs, not echoed here).
+            fields:
+              type: array
+              description: The stored output schema in field order; `description` = per-field extraction instructions (PATCH `field_notes` merges here).
+              items:
+                type: object
+                required: [name]
+                properties:
+                  name:
+                    type: string
+                  type:
+                    type: [string, "null"]
+                  description:
+                    type: [string, "null"]
+
+    ExtractorPatch:
+      type: object
+      description: STRICT allowlist — any other property is 422 validation_failed and nothing is applied.
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        site_type:
+          type: string
+          enum: [shopping, articles, jobs, forum, general]
+        sample_url:
+          type: string
+          format: uri
+        currency:
+          type: string
+          maxLength: 10
+        input_urls:
+          type: array
+          maxItems: 10000
+          items:
+            type: string
+            format: uri
+          description: Replaces the stored input_urls array.
+        field_notes:
+          type: object
+          maxProperties: 100
+          additionalProperties:
+            type: string
+            maxLength: 300
+          description: Per-field instructions merged into `fields[].description` by name (unknown field names are appended to the schema).
 
 # ───────────────────────────────────────────────────────────────────────────
 # CALLBACKS / WEBSOCKETS — NOT SPECIFIED HERE (by requirement).

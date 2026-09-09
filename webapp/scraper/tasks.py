@@ -843,6 +843,9 @@ def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
         "nested_schema": _nested_schema,
         # Intake-UI knobs (advisory; surfaced to product_analyzer / code_writer).
         "target_fields": list(job.target_fields or []),
+        # W27-4: per-field instructions — rendered as "### Field guidance" in
+        # the product_analyzer + code_writer prompts.
+        "field_notes": dict(getattr(job, "field_notes", None) or {}),
         "scope": job.scope or "",
         "scope_value": job.scope_value or "",
         "user_notes": job.notes or "",
@@ -876,10 +879,16 @@ def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-def _prune_output_to_schema(output_file: str, allowed: set[str], schema_nested: dict | None = None) -> bool:
+def _prune_output_to_schema(
+    output_file: str, allowed: set[str], schema_nested: dict | None = None,
+    order: list[str] | None = None,
+) -> bool:
     """Drop any per-record key not in ``allowed`` from the output JSON; when
     ``schema_nested`` (a nested tree from ``parse_nested_schema``) is present,
     also inner-prune nested objects/arrays to the schema's children.
+
+    ``order`` (W27-5) — the user's field order; keys emit in that order first
+    (bookkeeping appended). See ``prune_record_to_schema``.
 
     Operates on the first top-level key whose value is a list of dicts (the
     records — e.g. ``products``/``jobs``); top-level ``site``/``metadata`` are
@@ -906,13 +915,17 @@ def _prune_output_to_schema(output_file: str, allowed: set[str], schema_nested: 
     pruned = False
     for key, val in list(data.items()):
         if isinstance(val, list) and val and isinstance(val[0], dict):
-            before = [set(rec.keys()) for rec in val]
-            if schema_nested:
-                data[key] = [prune_record_to_schema(rec, allowed, schema_nested) for rec in val]
-            else:
-                data[key] = [{k: v for k, v in rec.items() if k in allowed} for rec in val]
+            before = [list(rec.keys()) for rec in val]
+            # W27-5: both branches route through prune_record_to_schema so the
+            # user's field order (order=) is honored on every prune path.
+            data[key] = [
+                prune_record_to_schema(rec, allowed, schema_nested, order=order)
+                for rec in val
+            ]
             # C5 fix: detect change across ALL records, not just the first.
-            if any(set(rec.keys()) != pre for rec, pre in zip(data[key], before)):
+            # W27-5: ordered comparison — a pure reorder is also a change
+            # worth rewriting (key-set equality would swallow it).
+            if any(list(rec.keys()) != pre for rec, pre in zip(data[key], before)):
                 pruned = True
             break  # only the records list
     if pruned:
@@ -1503,7 +1516,12 @@ def _finalize_job(job: ScrapeJob) -> None:
     if _allowed_fields and job.output_file:
         try:
             _nested = final_state.get("nested_schema") or None
-            _prune_output_to_schema(job.output_file, _allowed_fields, _nested)
+            # W27-5: the user's chip order (target_fields) becomes the record
+            # key order; bookkeeping keys append after.
+            _prune_output_to_schema(
+                job.output_file, _allowed_fields, _nested,
+                order=_schema_fields or None,
+            )
         except Exception as exc:
             logger.warning("Job %d: schema prune failed: %s", job.id, exc)
 
@@ -1555,14 +1573,19 @@ def _finalize_job(job: ScrapeJob) -> None:
                         from src.content_types import (
                             get_content_type,
                             get_output_key_label,
+                            merge_field_notes,
                         )
 
                         _ct = get_content_type(job.page_type)
                         _out_key, _ = get_output_key_label(job.page_type)
+                        # W27-4: per-field instructions ride into the stored
+                        # schema so re-runs (and check-site readers) keep them.
                         db_site.output_schema = {
                             "output_key": _out_key,
                             "content_type": (_ct.name if _ct else ""),
-                            "fields": [{"name": f} for f in _schema_fields],
+                            "fields": merge_field_notes(
+                                _schema_fields, getattr(job, "field_notes", None) or {}
+                            ),
                         }
                     except Exception as exc:
                         logger.warning("Job %d: Site.output_schema persist failed: %s", job.id, exc)

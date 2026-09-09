@@ -28,6 +28,8 @@ MAX_SCHEMA_BYTES = 262_144          # 256 KiB — schemas are small; fail fast
 MAX_PROPERTIES = 100
 MAX_PROPERTY_NAME_LEN = 64
 MAX_NESTING_DEPTH = 5
+MAX_DESCRIPTION_LEN = 300           # per-field instruction (W27-4); longer → warning + truncate
+MAX_FIELD_NOTES = 100               # {field: instruction} map size cap
 
 # Internal field-type vocabulary (mirrors src/content_types.py FieldDef.field_type)
 INTERNAL_FIELD_TYPES: tuple[str, ...] = ("text", "number", "datetime", "list", "url")
@@ -273,7 +275,31 @@ def _detect_shape(doc: dict[str, Any]) -> str:
 
 
 # ── per-dialect validators → return list[str] of derived names ──────────────
-def _validate_standard(doc: dict[str, Any], issues: list[SchemaIssue]) -> list[str]:
+def _check_description(
+    name: str, raw_desc: Any, issues: list[SchemaIssue], path: str = ""
+) -> str | None:
+    """Validate one field's ``description`` (the W27-4 per-field instruction).
+
+    Non-string / empty → ``None`` (silently ignored — instructions are optional
+    and must never block a schema). Longer than :data:`MAX_DESCRIPTION_LEN` →
+    ``DESCRIPTION_TOO_LONG`` warning + truncation (lenient by design).
+    """
+    if not isinstance(raw_desc, str) or not raw_desc.strip():
+        return None
+    desc = raw_desc.strip()
+    if len(desc) > MAX_DESCRIPTION_LEN:
+        issues.append(SchemaIssue(
+            "DESCRIPTION_TOO_LONG",
+            f"Field '{name}': description is {len(desc)} chars — trimmed to {MAX_DESCRIPTION_LEN}.",
+            severity="warning",
+            path=path,
+        ))
+        desc = desc[:MAX_DESCRIPTION_LEN]
+    return desc
+
+
+# ── per-dialect validators → return list[(name, description | None)] ────────
+def _validate_standard(doc: dict[str, Any], issues: list[SchemaIssue]) -> list[tuple[str, str | None]]:
     # Meta-validate the JSON Schema document itself (best-effort).
     if _HAS_JSONSCHEMA:
         try:
@@ -305,14 +331,19 @@ def _validate_standard(doc: dict[str, Any], issues: list[SchemaIssue]) -> list[s
     if _object_depth(doc) > MAX_NESTING_DEPTH:
         issues.append(SchemaIssue("NESTED_TOO_DEEP", f"Schema nests objects deeper than {MAX_NESTING_DEPTH} levels — flatten it."))
 
-    names: list[str] = []
+    names: list[tuple[str, str | None]] = []
     for key in props:
         _check_name(key, issues, path=f"/properties/{key}")
-        names.append(key)
+        node = props[key]
+        desc = (
+            _check_description(key, node.get("description"), issues, path=f"/properties/{key}")
+            if isinstance(node, dict) else None
+        )
+        names.append((key, desc))
     return names
 
 
-def _validate_internal(doc: dict[str, Any], issues: list[SchemaIssue]) -> list[str]:
+def _validate_internal(doc: dict[str, Any], issues: list[SchemaIssue]) -> list[tuple[str, str | None]]:
     fields = doc.get("fields")
     if not isinstance(fields, list) or not fields:
         issues.append(SchemaIssue("INTERNAL_NO_FIELDS", "Schema is missing a 'fields' list (or it is empty)."))
@@ -321,7 +352,7 @@ def _validate_internal(doc: dict[str, Any], issues: list[SchemaIssue]) -> list[s
         issues.append(SchemaIssue("TOO_MANY_PROPS", f"Schema defines {len(fields)} fields; the limit is {MAX_PROPERTIES}."))
         return []
 
-    names: list[str] = []
+    names: list[tuple[str, str | None]] = []
     for i, f in enumerate(fields):
         if not isinstance(f, dict):
             issues.append(SchemaIssue("INTERNAL_BAD_FIELD", f"Field at position {i} is not an object.", path=f"/fields/{i}"))
@@ -338,7 +369,7 @@ def _validate_internal(doc: dict[str, Any], issues: list[SchemaIssue]) -> list[s
                 f"Field '{name}': unsupported type '{t}'. Supported: {', '.join(INTERNAL_FIELD_TYPES)}.",
                 path=f"/fields/{i}",
             ))
-        names.append(name)
+        names.append((name, _check_description(name, f.get("description"), issues, path=f"/fields/{i}")))
     return names
 
 
@@ -349,10 +380,10 @@ def _validate_flat_map(doc: dict[str, Any], issues: list[SchemaIssue]) -> list[s
     if len(doc) > MAX_PROPERTIES:
         issues.append(SchemaIssue("TOO_MANY_PROPS", f"Schema defines {len(doc)} properties; the limit is {MAX_PROPERTIES}."))
         return []
-    names: list[str] = []
+    names: list[tuple[str, str | None]] = []
     for key in doc:
         _check_name(key, issues, path=f"/{key}")
-        names.append(key)
+        names.append((key, None))  # flat_map values are type strings, not instructions
     return names
 
 
@@ -363,14 +394,14 @@ def _names_from_array(doc: list[Any], issues: list[SchemaIssue]) -> list[str]:
     if len(doc) > MAX_PROPERTIES:
         issues.append(SchemaIssue("TOO_MANY_PROPS", f"Schema defines {len(doc)} entries; the limit is {MAX_PROPERTIES}."))
         return []
-    names: list[str] = []
+    names: list[tuple[str, str | None]] = []
     for i, item in enumerate(doc):
         if isinstance(item, str):
             _check_name(item, issues, path=f"/{i}")
-            names.append(item)
+            names.append((item, None))
         elif isinstance(item, dict) and isinstance(item.get("name"), str) and item["name"].strip():
             _check_name(item["name"], issues, path=f"/{i}")
-            names.append(item["name"])
+            names.append((item["name"], _check_description(item["name"], item.get("description"), issues, path=f"/{i}")))
         else:
             issues.append(SchemaIssue("BAD_PROP_NAME", f"Entry at position {i} is not a field name.", path=f"/{i}"))
     return names
@@ -422,28 +453,36 @@ def _object_depth(node: Any) -> int:
 
 
 # ── finalize: dedupe, detect content type, build normalized shape ────────────
-def _finalize(shape: str, names: list[str], issues: list[SchemaIssue]) -> SchemaValidationResult:
+def _finalize(
+    shape: str, names: list[tuple[str, str | None]], issues: list[SchemaIssue]
+) -> SchemaValidationResult:
     # Uniqueness (case-sensitive) — duplicates are an error.
     seen: set[str] = set()
-    deduped: list[str] = []
-    for n in names:
+    deduped: list[tuple[str, str | None]] = []
+    for n, desc in names:
         if n in seen:
             issues.append(SchemaIssue("DUP_PROP", f"Duplicate field '{n}'."))
             continue
         seen.add(n)
-        deduped.append(n)
+        deduped.append((n, desc))
 
     if not deduped and not [i for i in issues if i.severity == "error"]:
         issues.append(SchemaIssue("NO_FIELDS", "Schema must define at least one field."))
 
     has_errors = any(i.severity == "error" for i in issues)
-    detected = _detect_content_type(deduped) if deduped else None
+    deduped_names = [n for n, _ in deduped]
+    detected = _detect_content_type(deduped_names) if deduped_names else None
 
     normalized = None
     if not has_errors:
+        # W27-4: descriptions ride along when present; the bare shape stays
+        # exactly {"name": ...} so schema-less consumers see no change.
         normalized = {
             "content_type": detected,
-            "fields": [{"name": n} for n in deduped],
+            "fields": [
+                {"name": n} if not desc else {"name": n, "description": desc}
+                for n, desc in deduped
+            ],
         }
 
     return SchemaValidationResult(
@@ -451,9 +490,41 @@ def _finalize(shape: str, names: list[str], issues: list[SchemaIssue]) -> Schema
         issues=issues,
         shape=shape,
         normalized=normalized,
-        derived_fields=deduped,
+        derived_fields=deduped_names,
         detected_content_type=detected,
     )
+
+
+def extract_field_notes(raw: str | bytes | dict[str, Any] | None) -> dict[str, str]:
+    """Per-field instructions from a schema document: ``{field_name: description}``.
+
+    Reads the internal ``fields`` list or standard ``properties`` map. Never
+    raises — anything unparseable / description-less / non-string yields fewer
+    or no entries. This is the shared reader for intake + partner create flows.
+    """
+    try:
+        doc: Any = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+        if not isinstance(doc, dict):
+            return {}
+        pairs: list[tuple[Any, Any]] = []
+        fields = doc.get("fields")
+        if isinstance(fields, list):
+            pairs = [
+                (f.get("name"), f.get("description")) for f in fields if isinstance(f, dict)
+            ]
+        elif isinstance(doc.get("properties"), dict):
+            pairs = [
+                (k, v.get("description") if isinstance(v, dict) else None)
+                for k, v in doc["properties"].items()
+            ]
+        return {
+            name: desc.strip()
+            for name, desc in pairs
+            if isinstance(name, str) and name
+            and isinstance(desc, str) and desc.strip()
+        }
+    except Exception:
+        return {}
 
 
 def _detect_content_type(names: list[str]) -> str | None:

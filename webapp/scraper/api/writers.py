@@ -81,6 +81,7 @@ def create_job(request):
 
     schema_text = str(body.get("schema_text", "")).strip()
     target_fields = body.get("target_fields") or []
+    field_notes: dict = {}
     if schema_text:
         from src.schema_validation import validate_user_schema
 
@@ -92,6 +93,36 @@ def create_job(request):
             )
         if not target_fields:
             target_fields = result.derived_fields
+        # W27-4: schema descriptions are per-field instructions.
+        from src.schema_validation import extract_field_notes
+
+        field_notes = extract_field_notes(schema_text)
+
+    # W27-4: field_instructions — the API surface for per-field guidance.
+    # Strict (partner contract): wrong shapes/sizes are 422s, not silent drops.
+    field_instructions = body.get("field_instructions")
+    if field_instructions is not None:
+        if not isinstance(field_instructions, dict):
+            raise errors.ApiError(
+                422, "validation_failed",
+                "field_instructions must be an object mapping field names to instruction strings.",
+            )
+        if len(field_instructions) > 100:
+            raise errors.ApiError(
+                422, "validation_failed", "field_instructions: max 100 entries.",
+            )
+        for _k, _v in field_instructions.items():
+            if not isinstance(_k, str) or not isinstance(_v, str) or not _v.strip():
+                raise errors.ApiError(
+                    422, "validation_failed",
+                    "field_instructions: every key must be a field name and every value a non-empty instruction string.",
+                )
+            if len(_v) > 300:
+                raise errors.ApiError(
+                    422, "validation_failed",
+                    f"field_instructions['{_k}'] is {len(_v)} chars; the limit is 300.",
+                )
+        field_notes = {**field_notes, **{k: v.strip() for k, v in field_instructions.items()}}
 
     cb = None
     if callback_url:
@@ -127,6 +158,7 @@ def create_job(request):
             search_criteria=search_criteria,
             search_url=str(body.get("search_url", "")).strip(),
             target_fields=target_fields,
+            field_notes=field_notes,
             scope=scope,
             scope_value=str(body.get("scope_value", "")).strip(),
             notes=str(body.get("notes", "")).strip()[:4000],
@@ -151,6 +183,10 @@ def create_job(request):
                 "url": url,
                 "content_type": content_type,
                 "input_mode": input_mode,
+                # [W27-8 → async_api] lineage at creation. null for API-created
+                # jobs today (re-runs are born UI-side); the field keeps the
+                # event schema stable and matches JobStatus.rerun_of.
+                "rerun_of": job.origin_job_id,
                 "callback": ({"url": cb.url, "status": "active"} if cb else None),
             },
             dedupe_key="created",

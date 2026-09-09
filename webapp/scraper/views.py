@@ -668,6 +668,9 @@ def job_restart(request, job_id):
             search_criteria=_post_or_old("search_criteria", job.search_criteria),
             search_url=_post_or_old("search_url", job.search_url),
             target_fields=_tf,
+            # W27-4: instructions carry to the re-run so a redrive keeps the
+            # same field guidance (dashboard edits of notes ride via prompt/notes).
+            field_notes=job.field_notes or {},
             scope=_post_or_old("scope", job.scope),
             scope_value=_post_or_old("scope_value", job.scope_value),
             schema_text=_post_or_old("schema_text", job.schema_text or ""),
@@ -736,6 +739,12 @@ def job_update(request, job_id):
         job.target_fields = [f.strip() for f in tf.split(",") if f.strip()] if tf else []
         update_fields.append("target_fields")
 
+    if "field_notes_json" in request.POST:
+        # W27-4: the dashboard's per-field ✎ notes (chip order edits ride with
+        # target_fields above).
+        job.field_notes = _clean_field_notes(request.POST.get("field_notes_json"))
+        update_fields.append("field_notes")
+
     for fld in ("scope", "scope_value", "notes", "search_criteria", "search_url"):
         if fld in request.POST:
             setattr(job, fld, (request.POST.get(fld) or "").strip())
@@ -756,6 +765,7 @@ def job_update(request, job_id):
             "title": job.title,
             "is_saved": job.is_saved,
             "target_fields": job.target_fields,
+            "field_notes": job.field_notes,
             "scope": job.scope,
             "scope_value": job.scope_value,
             "notes": job.notes,
@@ -2704,6 +2714,33 @@ def _parse_url_lines(text: str) -> list[str]:
     return urls
 
 
+def _clean_field_notes(raw) -> dict:
+    """Sanitize a {field: instruction} map (W27-4) from JSON text or a dict.
+
+    Lenient by design (UI path): non-dict / bad JSON → {}; non-string values
+    dropped; values trimmed to src.schema_validation.MAX_DESCRIPTION_LEN; map
+    capped at MAX_FIELD_NOTES entries. The partner API enforces the same caps
+    STRICTLY (422) in scraper/api/writers.py.
+    """
+    from src.schema_validation import MAX_DESCRIPTION_LEN, MAX_FIELD_NOTES
+
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for k, v in raw.items():
+        if not isinstance(k, str) or not isinstance(v, str) or not v.strip():
+            continue
+        out[k.strip()[:MAX_DESCRIPTION_LEN]] = v.strip()[:MAX_DESCRIPTION_LEN]
+        if len(out) >= MAX_FIELD_NOTES:
+            break
+    return out
+
+
 @login_required
 def intake_validate_schema(request):
     """AJAX: validate a user-pasted/uploaded JSON schema and return derived fields.
@@ -2741,6 +2778,9 @@ def intake_validate_schema(request):
         ],
         "derived_fields": result.derived_fields,
         "detected_content_type": result.detected_content_type,
+        # W27-4: normalized fields incl. per-field descriptions (so the UI can
+        # show which fields carry instructions before the job is created).
+        "fields": (result.normalized or {}).get("fields", []),
     })
 
 
@@ -2903,6 +2943,7 @@ def intake_create_job(request):
     schema_raw = request.POST.get("schema_text", "")
     schema_upload = request.FILES.get("schema_file")
     schema_text = ""
+    field_notes: dict = {}
     if schema_raw or schema_upload:
         schema_text = schema_upload.read().decode("utf-8", errors="replace") if schema_upload else schema_raw
         result = validate_user_schema(schema_text)
@@ -2911,6 +2952,15 @@ def intake_create_job(request):
                 {"error": "Schema invalid", "issues": [i.message for i in result.errors]},
                 status=422,
             )
+        # W27-4: descriptions inside the schema are per-field instructions.
+        from src.schema_validation import extract_field_notes
+
+        field_notes = extract_field_notes(schema_text)
+
+    # The intake chip ✎ notes override / extend the schema's own descriptions.
+    _form_notes = _clean_field_notes(request.POST.get("field_notes_json", ""))
+    if _form_notes:
+        field_notes.update(_form_notes)
 
     job = ScrapeJob.objects.create(
         url=url,
@@ -2920,6 +2970,7 @@ def intake_create_job(request):
         search_criteria=search_criteria,
         search_url=search_url,
         target_fields=fields_list,
+        field_notes=field_notes,
         scope=scope,
         scope_value=scope_value,
         notes=notes,
@@ -3011,6 +3062,9 @@ def intake_jobs(request):
             "created_at": j.created_at.isoformat() if j.created_at else None,
             "is_saved": j.is_saved,
             "target_fields": j.target_fields or [],
+            # [wave-27 W27-4] per-field instructions — the dashboard cfg-panel
+            # restores these into the chips' ✎ map on populate.
+            "field_notes": j.field_notes or {},
             "input_mode": j.input_mode,
             "site_name": j.site_name,
             # Owner name is library-visible (it drives the Owner column and

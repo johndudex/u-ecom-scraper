@@ -924,6 +924,9 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
 
   /* ---------- field chips (shared across #chips + #cfg-chips via chipContainers) ---------- */
   var fieldsArr = [];
+  // [wave-27 W27-4] per-field instructions — keyed by field NAME (order-proof).
+  var fieldNotes = {};
+  function icoNote(){return '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>';}
   function renderFieldsAll(){
     chipContainers.forEach(function(el){
       if(!el) return;
@@ -932,8 +935,29 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
         var c = document.createElement('span');
         c.className = 'chip';
         c.dataset.name = name;
-        c.innerHTML = '<span>'+name+'</span><button aria-label="remove '+name+'">'+icoX()+'</button>';
-        c.querySelector('button').addEventListener('click', function(){ fieldsArr.splice(idx,1); renderFieldsAll(); });
+        c.innerHTML = '<span>'+name+'</span>'
+          + '<button aria-label="move '+name+' up" data-field-move="up" title="Move up">&#9650;</button>'
+          + '<button aria-label="move '+name+' down" data-field-move="down" title="Move down">&#9660;</button>'
+          + '<button aria-label="note '+name+'" data-field-note="'+idx+'" title="Field instructions" style="'+(fieldNotes[name] ? 'color:var(--accent,#4f7cff)' : '')+'">'+icoNote()+'</button>'
+          + '<button aria-label="remove '+name+'">'+icoX()+'</button>';
+        c.querySelector('[data-field-move=up]').addEventListener('click', function(){
+          if(idx>0){ fieldsArr.splice(idx-1,0,fieldsArr.splice(idx,1)[0]); renderFieldsAll(); }
+        });
+        c.querySelector('[data-field-move=down]').addEventListener('click', function(){
+          if(idx<fieldsArr.length-1){ fieldsArr.splice(idx+1,0,fieldsArr.splice(idx,1)[0]); renderFieldsAll(); }
+        });
+        // [wave-27 W27-4] ✎ — prompt for this field's extraction instruction.
+        c.querySelector('[data-field-note]').addEventListener('click', function(){
+          var cur = fieldNotes[name] || '';
+          var txt = prompt('Instructions for "'+name+'" (e.g. "numeric only, no currency symbol"):', cur);
+          if(txt === null) return;               // cancelled — keep as-is
+          txt = txt.trim().slice(0, 300);        // server cap: MAX_DESCRIPTION_LEN
+          if(txt){ fieldNotes[name] = txt; } else { delete fieldNotes[name]; }
+          renderFieldsAll();
+        });
+        c.querySelector('button[aria-label="remove '+name+'"]').addEventListener('click', function(){
+          fieldsArr.splice(idx,1); delete fieldNotes[name]; renderFieldsAll();
+        });
         el.appendChild(c);
       });
     });
@@ -1873,6 +1897,10 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
           clearChips();
           j.target_fields.forEach(function(f){ addChip(f); });
         }
+        // [wave-27 W27-4] restore this job's per-field instructions into the ✎ map.
+        fieldNotes = {};
+        if(j.field_notes && typeof j.field_notes === 'object'){ fieldNotes = j.field_notes; }
+        renderFieldsAll();
         // Re-hydrate the JSON schema (dashboard cfg-panel). Clear any stale schema
         // from a previous job first, then restore this job's schema if it had one.
         currentSchema = null;
@@ -2017,6 +2045,8 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     fd.append('nav_method', navMethod);
     fd.append('content_type', intakeState.contentType || '');
     fd.append('target_fields', fieldsArr.join(','));
+    // [wave-27 W27-4] per-field instructions ride with the chips.
+    if(Object.keys(fieldNotes).length) fd.append('field_notes_json', JSON.stringify(fieldNotes));
     if(currentSchema) fd.append('schema_text', currentSchema);  // re-validated server-side (defense against bypass)
     fd.append('scope', scope);
     fd.append('scope_value', X('#scope-input').value.trim());
@@ -2065,6 +2095,8 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     // picks up the user's field/nav edits (without this, the new job would
     // copy the OLD job's config and silently drop the edits).
     fd.append('target_fields', fieldsArr.join(','));
+    // [wave-27 W27-4] per-field instructions ride with the chips.
+    if(Object.keys(fieldNotes).length) fd.append('field_notes_json', JSON.stringify(fieldNotes));
     if(currentSchema) fd.append('schema_text', currentSchema);  // persist schema on the new (re-run) job
     // Carry the Dagster opt-in explicitly ('1'/'0') so the new job honours the
     // current checkbox rather than silently copying the old job's choice.
@@ -2124,6 +2156,10 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       onConfirmed: function(){
         var fd = new FormData();
         fd.append('target_fields', fieldsArr.join(','));
+        // [wave-27 W27-4] per-field instructions persist with the config save.
+        fd.append('field_notes_json', JSON.stringify(fieldNotes));
+    // [wave-27 W27-4] per-field instructions ride with the chips.
+    if(Object.keys(fieldNotes).length) fd.append('field_notes_json', JSON.stringify(fieldNotes));
         var scope = (document.querySelector('input[name=scope]:checked')||{}).value || 'all';
         fd.append('scope', scope);
         fd.append('scope_value', X('#scope-input').value.trim());

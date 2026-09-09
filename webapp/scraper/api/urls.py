@@ -2,7 +2,7 @@
 from django.urls import path
 from django.views.decorators.csrf import csrf_exempt
 
-from . import readers, writers
+from . import extractors, readers, writers
 from . import sse as sse_views
 
 
@@ -20,10 +20,22 @@ def _jobs_dispatch(request, **kwargs):
         return writers.create_job(request)
     return readers.list_jobs(request)
 
+@csrf_exempt
+def _extractor_slug_dispatch(request, slug: str):
+    return extractors.extractor_dispatch(request, slug=slug)
+
 
 urlpatterns = [
     path("check-site", readers.check_site, name="api_check_site"),
     path("validate-schema", readers.validate_schema, name="api_validate_schema"),
+    # [wave-27 W27-6] extractor resource — Sites scoped to the key's own jobs.
+    # archive/unarchive/list are api_view-wrapped (they carry their own
+    # csrf_exempt attribute); only the GET/PATCH slug dispatcher needs the
+    # outer wrapper.
+    path("extractors", extractors.list_extractors, name="api_extractors"),
+    path("extractors/<str:slug>/archive", extractors.archive_extractor, name="api_extractor_archive"),
+    path("extractors/<str:slug>/unarchive", extractors.unarchive_extractor, name="api_extractor_unarchive"),
+    path("extractors/<str:slug>", _extractor_slug_dispatch, name="api_extractor"),
     path("jobs", _jobs_dispatch, name="api_jobs"),
     path("jobs/<int:job_id>", readers.job_status, name="api_job_status"),
     path("jobs/<int:job_id>/cancel", writers.cancel_job, name="api_cancel_job"),

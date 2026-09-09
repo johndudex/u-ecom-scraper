@@ -371,13 +371,19 @@ def _prune_value(value, node):
     return value  # schema says nested but value is scalar → keep verbatim
 
 
-def prune_record_to_schema(record, allowed, schema_nested=None, bookkeeping=BOOKKEEPING_FIELDS):
+def prune_record_to_schema(
+    record, allowed, schema_nested=None, bookkeeping=BOOKKEEPING_FIELDS, order=None
+):
     """Prune one output record. ``allowed`` is the top-level authority (the flat
     ``target_fields`` ∪ bookkeeping set from ``resolve_allowed_fields`` — this is
     the C4 fix: target_fields drives top-level admission, so chip edits always
     win over a stale schema_text). ``schema_nested`` (optional tree from
     ``schema_validation.parse_nested_schema``) supplies the recursive shape —
     inner-prune only for keys present in BOTH ``allowed`` and the tree.
+
+    ``order`` (W27-5, optional) — the user's field order (``target_fields``).
+    When given, keys emit in that order first; remaining kept keys (bookkeeping)
+    follow in record order. ``None`` preserves today's record-emission order.
 
     ``allowed`` falsy/None → no prune (extract-everything / schema-less jobs).
     Record is NEVER dropped — only keys/branches filtered. No null-fill.
@@ -391,7 +397,28 @@ def prune_record_to_schema(record, allowed, schema_nested=None, bookkeeping=BOOK
             continue
         node = schema_nested.get(k) if schema_nested else None
         out[k] = _prune_value(v, node) if node is not None else v
+    if order:
+        _head = [k for k in order if k in out]
+        if _head:
+            _seen = set(_head)
+            out = {**{k: out[k] for k in _head},
+                   **{k: v for k, v in out.items() if k not in _seen}}
     return out
+
+
+def merge_field_notes(names, notes) -> list[dict]:
+    """Build the ``output_schema["fields"]`` list, carrying per-field
+    instructions (W27-4) from ``notes`` ({name: description}) where present.
+
+    Used by the finalizer when persisting Site.output_schema so a site's
+    stored schema keeps the user's per-field instructions across re-runs.
+    """
+    notes = notes if isinstance(notes, dict) else {}
+    return [
+        {"name": str(n), "description": str(notes[n])}
+        if n in notes and notes[n] else {"name": str(n)}
+        for n in names
+    ]
 
 
 def count_items_in_output(data: dict) -> int:

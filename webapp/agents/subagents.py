@@ -1975,6 +1975,30 @@ def _user_requirements_section(state: dict) -> str:
     )
 
 
+def _field_guidance_section(state: dict) -> str:
+    """Per-field user instructions (W27-4) for the product_analyzer +
+    code_writer prompts. Rendered only when the job carries field_notes;
+    bounded at intake (≤100 notes × 300 chars — see
+    src.schema_validation.MAX_DESCRIPTION_LEN / MAX_FIELD_NOTES).
+    """
+    notes = state.get("field_notes") or {}
+    if not isinstance(notes, dict) or not notes:
+        return ""
+    lines = [
+        f"- {name}: {notes[name]}"
+        for name in list(notes)[:100]
+        if isinstance(name, str) and isinstance(notes[name], str) and notes[name].strip()
+    ]
+    if not lines:
+        return ""
+    return (
+        "### Field guidance\n"
+        "The user gave specific instructions for these fields — follow them EXACTLY:\n"
+        + "\n".join(lines)
+        + "\n\n"
+    )
+
+
 def _render_nested_node(name: str, node: dict, indent: str) -> list[str]:
     """Render one nested-schema node as a shape line (+ recursive children)."""
     t = node.get("type", "text")
@@ -2373,6 +2397,9 @@ def build_product_analyzer_message(state: dict) -> list:
     _user_req = _user_requirements_section(state)
     if _user_req:
         content = _user_req + content
+    _fg = _field_guidance_section(state)
+    if _fg:
+        content = _fg + content
     return [HumanMessage(content=content)]
 
 
@@ -4541,6 +4568,9 @@ def build_code_writer_message(state: dict) -> list:
                 "other fidelity rule above still applies.\n"
             )
     content = _fidelity + content
+    _fg = _field_guidance_section(state)
+    if _fg:
+        content = _fg + content
     return [HumanMessage(content=content)]
 
 
