@@ -109,6 +109,29 @@ class TestReadPage:
         assert len(result["products"]) == 1
         assert result["products"][0]["id"] == 6
 
+    def test_envelope_matches_outputpage_spec(self, partner, db, tmp_path):
+        """wave-27 e2e finding: the live response lacked every OutputPage
+        required field except the pagination four — job_id, state,
+        output_key, output_filename, items. items mirrors the content-type
+        key (kept for back-compat); state maps completed→scraper_ready,
+        everything else→failed (sync_api.yaml OutputPage enum)."""
+        u, raw = partner
+        job = _job(u)  # completed
+        src = _write_full(tmp_path)
+        index = build_page_index(str(src), items_key="products")
+        result = self._read(job, 1, 3, {"index": index, "file": src.read_text()})
+        for key in ("job_id", "state", "output_key", "output_filename", "items"):
+            assert key in result, key
+        assert result["job_id"] == job.id
+        assert result["state"] == "scraper_ready"
+        assert result["output_key"] == "products"
+        assert result["output_filename"] == "output_2026-08-24_010101.json"
+        assert result["items"] == result["products"]
+        # failed job → state "failed"
+        job2 = _job(u, status="failed", slug="outtest-f")
+        result2 = self._read(job2, 1, 3, {"index": index, "file": src.read_text()})
+        assert result2["state"] == "failed"
+
     def test_422_out_of_range(self, partner, db, tmp_path):
         from scraper.api import errors as api_errors
 

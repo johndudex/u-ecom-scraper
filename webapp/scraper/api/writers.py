@@ -384,9 +384,13 @@ def get_job_sample(request, job_id: int):
     testing_done = Step.objects.filter(
         job=job, phase="testing", completed_at__isnull=False
     ).exists()
-    # m4 state-gate at the endpoint: live jobs only (a terminal job with a
-    # finalize-stamped testing step must not claim a sample)
-    if not gate(job, testing_done):
+    # m4 state-gate, wave-27 e2e correction: the gate's intent is "a job must
+    # not claim a sample it never produced" — FILE EXISTENCE is the precise
+    # test, so terminal jobs (completed/failed) now serve the artifact when
+    # it exists (spec: terminal failed does not imply no data). Live jobs
+    # still need testing stamped; anything else (pending forever, etc.) 404s
+    # and the file check below backstops every branch.
+    if not gate(job, testing_done) and job.status not in TERMINAL:
         raise errors.ApiError(404, "not_ready", "Sample is not available for this job.")
     slug = (job.site_folder or "").strip("/").split("/")[-1] if job.site_folder else ""
     if not slug:

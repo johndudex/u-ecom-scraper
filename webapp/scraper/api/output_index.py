@@ -157,9 +157,20 @@ def read_output_page(job, page: int, page_size: int) -> dict:
         # M10: fail-fast, never hang a worker on FM
         raise errors.ApiError(503, "internal_error", "Output store unavailable.") from exc
     items = [json.loads(text[e["offset"]: e["offset"] + e["length"]]) for e in window]
-    out = {"site": index.get("site")}
+    # OutputPage shape (sync_api.yaml): the required identity fields ride
+    # alongside the content-type key (kept for back-compat) — `items` is the
+    # spec-named record array and mirrors it. wave-27 e2e finding: the
+    # endpoint previously served only {site, <items_key>, metadata, page…}.
+    out = {
+        "job_id": job.id,
+        "state": "scraper_ready" if job.status == "completed" else "failed",
+        "output_key": index["items_key"],
+        "output_filename": (job.output_file or "").rsplit("/", 1)[-1],
+        "site": index.get("site"),
+    }
     out[index["items_key"]] = items
     out["metadata"] = index.get("metadata")
+    out["items"] = items
     out.update({"page": page, "page_size": page_size, "total_items": total, "total_pages": total_pages})
     return out
 

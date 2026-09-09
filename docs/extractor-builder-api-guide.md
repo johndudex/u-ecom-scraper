@@ -48,8 +48,8 @@ Job state model (sync spec): `inprogress` → `sample_ready` → `scraper_ready`
 | `GET /api/v1/jobs` | Paginated list (`page`, `page_size`) of this key's jobs — `{jobs: [JobSummary], page, page_size, total_items, total_pages}`. Rows carry `rerun_of`. |
 | `GET /api/v1/jobs/{id}` | Full status: `state`, `internal_status`, `current_phase`, `phases[]`, availability flags, `item_count`, `failure`, `callback`, timestamps, **`rerun_of`** (chain-root job id; null for fresh jobs). |
 | `POST /api/v1/jobs/{id}/cancel` | Cancel a pending/running/waiting-approval job → `{state:"failed", failure:{code:"cancelled"}}`. |
-| `GET /api/v1/jobs/{id}/sample` | Up-to-5 sample records once testing passed (`{job_id, records, record_count}`); 404 `not_ready` before. |
-| `GET /api/v1/jobs/{id}/output?page=&page_size=` | Paginated full output over the record array. Record keys follow `target_fields` order, bookkeeping appended (wave-27). |
+| `GET /api/v1/jobs/{id}/sample` | Up-to-5 sample records once testing passed (`{job_id, records, record_count}`); 404 `not_ready` before. Terminal jobs (completed or failed) still serve the sample when the artifact exists — terminal failure does not imply no data. |
+| `GET /api/v1/jobs/{id}/output?page=&page_size=` | Paginated full output — `OutputPage`: `items` (the record array; the content-type key, e.g. `products`, mirrors it for back-compat), `job_id`, `state`, `output_key`, `output_filename` + pagination. Record keys follow `target_fields` order, bookkeeping appended (wave-27). |
 | `GET /api/v1/jobs/{id}/output/download` | Raw file stream (`Content-Disposition: attachment`). |
 | `GET /api/v1/jobs/{id}/scraper-code?format=json\|raw` | Generated Python source (`{code, filename, size_bytes}` or `text/x-python`). |
 | `GET /api/v1/jobs/{id}/callback` | Callback registration health: `{status, url, disabled_reason, last_failure, delivered_count, pending_count, …}`. |

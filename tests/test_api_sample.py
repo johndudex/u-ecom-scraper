@@ -139,13 +139,30 @@ class TestSampleEndpoint:
 
     def test_404_terminal_failed(self, partner, db):
         """m4: terminal failed job with stamped testing step — REST must NOT
-        claim a sample (state-gate at the endpoint level)."""
+        claim a sample IT NEVER PRODUCED (no artifact → 404). The gate is
+        file existence, not status: a terminal job whose sample file exists
+        still serves it (spec: terminal failed does not imply no data)."""
         u, raw = partner
         job = _job(u, status="failed")
         models.Step.objects.create(job=job, phase="testing", status="done",
                                    completed_at=job.created_at)
         r = get_job_sample(self._req(u, raw, job.id), job.id)
         assert r.status_code == 404
+
+    def test_200_terminal_failed_with_file(self, partner, db):
+        """wave-27 e2e finding: a COMPLETED job's own sample file existed but
+        the endpoint 404'd because the gate keyed on live status. Terminal
+        jobs serve the sample when the artifact exists."""
+        u, raw = partner
+        for status in ("completed", "failed"):
+            job = _job(u, status=status, slug_site=f"s-{status}")
+            models.Step.objects.create(job=job, phase="testing", status="done",
+                                       completed_at=job.created_at)
+            with patch("scraper.api.writers._fm_read_json") as fr:
+                fr.return_value = {"records": [{"title": "Boot"}]}
+                r = get_job_sample(self._req(u, raw, job.id), job.id)
+            assert r.status_code == 200, status
+            assert json.loads(r.content)["record_count"] == 1
 
     def test_404_when_no_file_persisted(self, partner, db):
         u, raw = partner
