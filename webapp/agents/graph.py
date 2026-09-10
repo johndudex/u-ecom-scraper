@@ -54,6 +54,7 @@ from langgraph.types import Command
 
 from .constants import (
     FINAL_RETRY_SENTINEL,
+    FINGERPRINT_METHOD_PREFIXES,
     MAX_TEST_RETRIES,
     STEALTH_METHOD_PREFIXES,
 )
@@ -441,6 +442,14 @@ def _enforce_anti_bot_strategy(analysis: dict, slug: str, filename: str) -> dict
         (isinstance(anti_bot, dict) and anti_bot.get("detected"))
         or str(method).startswith(STEALTH_METHOD_PREFIXES)
     )
+    # [wave-28/job-524 revolve] A fingerprint_* method_that_worked MEASURES the
+    # working transport: plain-HTTP TLS was rejected, curl_cffi impersonation
+    # answered with real content. The rewrite below would replace that
+    # measured HTTP transport with a browser rung the probe never proved —
+    # and which (revolve) the navigator watched die on VerifyHuman.jsp.
+    # TLS-impersonated http_requests is a legitimate anti-bot strategy; leave it.
+    if str(method).startswith(FINGERPRINT_METHOD_PREFIXES):
+        return analysis
     if not detected:
         return analysis
     # Strategies that won't work behind bot protection → http_navigation (cloak).
@@ -4440,6 +4449,19 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
             _form_method = (_search.get("form_method") or "").upper()
         if _form_method == "POST":
             strategy = "http_requests"
+        elif method.startswith(FINGERPRINT_METHOD_PREFIXES):
+            # [wave-28/job-524 revolve] A fingerprint_* method_that_worked
+            # means the plain-HTTP rung was rejected and curl_cffi TLS
+            # impersonation answered — an HTTP transport, measured. The
+            # fingerprint rungs splice in BEFORE the playwright rungs in the
+            # probe ladder, so unlike the stealth case below this does NOT
+            # prove browsers are blocked, but it proves plain `requests` is:
+            # derive the HTTP strategy that rides src/http_fetch's ladder
+            # (whose final tier IS the fingerprint re-issue — the job-66
+            # birkenstock shape). Bare playwright here is at best unproven
+            # (revolve's navigator measured it dying on VerifyHuman.jsp) and
+            # burned the writer's whole budget twice.
+            strategy = "http_requests"
         elif method.startswith(STEALTH_METHOD_PREFIXES):
             # [job-83 woolworths] The probe's escalation ladder tries every
             # playwright tier BEFORE it reaches a working uc_chrome/cloak
@@ -4458,6 +4480,11 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
         # /navigate render surfaces the links.
         strategy = "http_navigation"
     elif meth == "direct_http" and not _is_form_only_discovery(state, state.get("url", "")):
+        strategy = "http_requests"
+    elif meth.startswith(FINGERPRINT_METHOD_PREFIXES):
+        # [wave-28/job-524] No rendering evidence (or CSR handled above): the
+        # browser-backed default is wrong for a fingerprint-proven site — the
+        # only measured-working transport is TLS-impersonated HTTP.
         strategy = "http_requests"
     else:
         # browser_none, uc_chrome_*, cloak_*, or form-only direct_http → browser-backed.
@@ -4587,7 +4614,10 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
     # sites keep the job-12 priceline semantics untouched — there the
     # reassessment carries a genuinely measured page verdict this heuristic
     # cascade never ran.
-    _override_suppressed = bool(method.startswith(STEALTH_METHOD_PREFIXES))
+    _override_suppressed = bool(
+        method.startswith(STEALTH_METHOD_PREFIXES)
+        or method.startswith(FINGERPRINT_METHOD_PREFIXES)
+    )
     _strategy_source = ""
     if (
         _rec_recommended in ("http_requests", "http_navigation", "playwright")
@@ -4607,11 +4637,23 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
             # 114/115 shipped doomed playwright drafts even after N13 because
             # the writer still read "recommend playwright" here). "ignored" +
             # "stealth-proven" stay (pinned by test_job83_job88_classes).
-            _strategy_source = (
-                f"; product-analyzer verdict[{_rec_key}]={_rec_recommended!r} "
-                f"ignored — stealth-proven probe disproved playwright and "
-                f"http_requests at every probe tier"
-            )
+            if method.startswith(FINGERPRINT_METHOD_PREFIXES):
+                # [wave-28] Fingerprint-honest wording: the playwright rungs
+                # may not have run (they splice in AFTER the fingerprint
+                # rungs), so we must not claim they were "disproved" — the
+                # measured fact is that plain-HTTP TLS was rejected and the
+                # impersonated client answered.
+                _strategy_source = (
+                    f"; product-analyzer verdict[{_rec_key}]={_rec_recommended!r} "
+                    f"ignored — stealth-proven probe measured TLS-impersonated "
+                    f"HTTP as the working transport"
+                )
+            else:
+                _strategy_source = (
+                    f"; product-analyzer verdict[{_rec_key}]={_rec_recommended!r} "
+                    f"ignored — stealth-proven probe disproved playwright and "
+                    f"http_requests at every probe tier"
+                )
         else:
             strategy = _rec_recommended
             _strategy_source = (
@@ -4665,7 +4707,16 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
         "playwright", "http_navigation", "stealth_browser",
         "seleniumbase_uc", "undetected_chromedriver",
     )
-    if not _browser_shaped and not method.startswith(STEALTH_METHOD_PREFIXES):
+    # Fingerprint-proven methods KEEP their tier like stealth ones: the ladder
+    # ran (and failed) every rung below `fingerprint_*_<tier>`, so a proxied
+    # fingerprint success is measured evidence the unproxied one is blocked —
+    # [wave-28] and http_fetch's fingerprint tier itself rides the residential
+    # exit, so the tier must survive into the draft's env staging.
+    if (
+        not _browser_shaped
+        and not method.startswith(STEALTH_METHOD_PREFIXES)
+        and not method.startswith(FINGERPRINT_METHOD_PREFIXES)
+    ):
         proxy_tier = "none"
 
     # [wave-17 S14] The MEASURED rung travels with the analysis: top-level

@@ -25,7 +25,11 @@ from contextvars import ContextVar
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
 
-from .constants import DEAD_STATUS_CODES, FINAL_RETRY_SENTINEL
+from .constants import (
+    DEAD_STATUS_CODES,
+    FINAL_RETRY_SENTINEL,
+    FINGERPRINT_METHOD_PREFIXES,
+)
 from .llm import get_llm, get_main_llm
 from .prompts import load_agent_prompt
 
@@ -3519,6 +3523,34 @@ def build_code_writer_message(state: dict) -> list:
                 )
             if _recipe.get("evidence"):
                 _recipe_lines.append(f"- evidence: {_recipe['evidence']}")
+            # [wave-28/job-524] Transport brief for fingerprint-proven sites.
+            # The 524 writer burned both 1800s attempts re-deriving transport
+            # (8+ src/ file reads + a scratch probe run) because the seed
+            # named a strategy but not the transport recipe it implies. State
+            # the measurement and the recipe explicitly; the writer starts
+            # the draft on turn one.
+            _fp_method = str(
+                (_probe_t14.get("connectivity") or {}).get("method_that_worked")
+                or scraper_analysis.get("method_that_worked")
+                or ""
+            )
+            if _fp_method.startswith(FINGERPRINT_METHOD_PREFIXES):
+                _fp_profile = str(_recipe.get("fingerprint_profile") or "")
+                _fp_note = f", profile={_fp_profile}" if _fp_profile else ""
+                _recipe_lines.append(
+                    f"- PDP transport (measured): `{_fp_method}` — "
+                    f"TLS-impersonated HTTP via curl_cffi{_fp_note}, NOT a browser"
+                )
+                _recipe_lines.append(
+                    "- Plain-HTTP rungs are BLOCKED on this site (the probe "
+                    "only got real content after escalating to the "
+                    "fingerprint tier). Build every page fetch on "
+                    "`src/http_fetch.py` (`create_fetch_page` / "
+                    "`create_fetch_json`) — the ladder's final tier IS the "
+                    "curl_cffi browser-TLS re-issue. Do NOT ship bare "
+                    "`requests`/httpx page fetches and do NOT use Playwright: "
+                    "a plain browser never measured 200-with-content here."
+                )
         recipe_section = ""
         if _recipe_lines:
             recipe_section = (

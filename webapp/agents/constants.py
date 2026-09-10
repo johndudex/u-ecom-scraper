@@ -54,6 +54,20 @@ SCRAPER_ENV_LISTING: str = "SCRAPER_LISTING_URL"
 # consumer is byte-identical under this tuple.
 STEALTH_METHOD_PREFIXES: tuple[str, ...] = ("uc_chrome", "cloak")
 
+# [wave-28/job-524 revolve] The curl_cffi TLS-impersonation probe family.
+# Deliberately NOT folded into STEALTH_METHOD_PREFIXES despite the T3.1
+# comment above anticipating it: the semantics are OPPOSITE. A stealth
+# prefix means "every browser rung ran and was blocked → derive the cloak
+# browser"; a fingerprint prefix means "plain-HTTP TLS was rejected, the
+# impersonated HTTP client answered" — the fingerprint rungs splice in right
+# after each direct_http rung (browser_service/probe.py), so the browser
+# rungs AFTER them never ran. The proven transport is HTTP (http_fetch's
+# fingerprint tier), not a browser. Consumers: _derive_strategy (strategy +
+# tier preservation + override suppression) and _enforce_anti_bot_strategy
+# (exemption). context.py/run_execution cloak checks intentionally EXCLUDE
+# this prefix (context.py T3.6 documents the same exclusion).
+FINGERPRINT_METHOD_PREFIXES: tuple[str, ...] = ("fingerprint",)
+
 NAV_INPUT_MODES: frozenset[str] = frozenset({"navigation", "list_page", "search_term"})
 # Matches _select_template_file's api family (graph.py) — "api" / "internal_api".
 API_STRATEGIES: frozenset[str] = frozenset({"api", "internal_api"})
