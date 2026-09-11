@@ -187,8 +187,10 @@ Site analysis complete
 Prioritize:
 - 0 calls: use pre-verified probe data if available
 - 1 call: probe_page on the provided URL (only if no pre-verified data)
-- 0-2 calls: optional load_skill for platform-specific detection
 - 1 call: write_file (your LAST action)
+
+Skill files are NOT available to you — detect platform from page content only
+(the task message enforces this; the skills blurb, when present, does not apply).
 
 ### WRITE EARLY
 

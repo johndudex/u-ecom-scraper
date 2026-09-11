@@ -164,6 +164,55 @@ def _extract_frontmatter_field(text: str, field: str) -> str:
     return ""
 
 
+# ─── C1: learned-section surfacing (wave-29) ────────────────────────────────
+# The read path above is frontmatter-only, so "## Learned:" content could
+# never surface automatically (~65.7K chars of curated learnings unread).
+# render_learned_sections gives deterministic consumers (the writer's
+# platform distillation) bounded access: 2 NEWEST whole sections, never a
+# mid-section split, hard-capped.
+
+
+def _split_learned_sections(text: str) -> list[str]:
+    """Whole ``## Learned:`` sections (header line through the line before
+    the next header or EOF), in file order (append-order == age order)."""
+    matches = list(_LEARNED_HEADER_RE.finditer(text))
+    sections: list[str] = []
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        sections.append(text[start:end].rstrip() + "\n")
+    return sections
+
+
+def render_learned_sections(
+    name: str, cap: int = 1500, newest: int = 2, _text: str | None = None
+) -> str:
+    """The ``newest`` newest learned sections, whole, ≤ ``cap`` chars total.
+
+    Selection walks newest→oldest and includes a section only if it fits
+    whole (a section that would bust the cap is SKIPPED, never truncated
+    mid-section — a half-lesson is worse than none). Returns "" when the
+    skill has no learned sections. ``_text`` injects the skill body for
+    tests; production reads via read_skill (FM → image fallback).
+    """
+    if _text is None:
+        _text = read_skill(name) or ""
+    if not _text:
+        return ""
+    sections = _split_learned_sections(_text)
+    if not sections:
+        return ""
+    chosen: list[str] = []
+    total = 0
+    for sec in reversed(sections[-newest:]):
+        if total + len(sec) <= cap:
+            chosen.append(sec)
+            total += len(sec)
+    if not chosen:
+        return ""
+    return "\n".join(reversed(chosen)).strip() + "\n"
+
+
 # ─── boot snapshot for the description scan ────────────────────────────────
 # _get_skill_descriptions runs on EVERY agent build (every node of every
 # job); a per-build FM round-trip per skill would multiply latency. Snapshot

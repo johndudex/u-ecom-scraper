@@ -745,8 +745,16 @@ def _get_skill_descriptions() -> str:
     )
 
 
-def _append_skill_descriptions(system_prompt: str) -> str:
-    """Append skill discovery section to the agent system prompt."""
+def _append_skill_descriptions(system_prompt: str, tool_names: set[str] | None = None) -> str:
+    """Append skill discovery section to the agent system prompt.
+
+    [wave-29 A3] When ``tool_names`` is given, the blurb is attached ONLY if
+    the assembled toolset actually contains ``load_skill`` — advertising the
+    tool to agents that lack it (code_tester, cleanup, dagster_converter) is
+    pure prompt noise that invites doomed load_skill attempts.
+    """
+    if tool_names is not None and "load_skill" not in tool_names:
+        return system_prompt
     skill_section = _get_skill_descriptions()
     if not skill_section:
         return system_prompt
@@ -1006,14 +1014,19 @@ def _build_agent(agent_name: str, site_slug: str = "", use_create_agent: bool = 
             f"You are the {prompt_stem} agent for the Universal Ecommerce Scraper."
         )
 
-    system_prompt = _append_skill_descriptions(system_prompt)
+    # [wave-29 A3] Assemble tools FIRST so the skills blurb can be gated on
+    # the agent's actual toolset (order matters: the old code appended the
+    # blurb unconditionally before any tools existed).
+    tools = _get_tools_sync(agent_name, workspace_scope=site_slug)
+
+    system_prompt = _append_skill_descriptions(
+        system_prompt, tool_names={t.name for t in tools}
+    )
 
     # Bug 3a fix: inject template_code into the system prompt (see
     # _embed_template — the full template, never summarized, plus the
     # wave-24 W24-6 do-not-read note).
     system_prompt = _embed_template(system_prompt, template_code)
-
-    tools = _get_tools_sync(agent_name, workspace_scope=site_slug)
 
     if not _has_playwright_tools(tools):
         from .tools import AGENT_TOOL_MAP as _atm
@@ -1255,6 +1268,25 @@ def _get_tools_sync(agent_name: str, workspace_scope: str = "") -> list:
             tools.extend(_gsk())
         except Exception as exc:
             logger.error("Failed to load skill tools for '%s': %s", agent_name, exc)
+
+    # [wave-29 A1] Write-side of the learn→reuse loop. AGENT_TOOL_MAP already
+    # requests learn_skill/create_new_skill for nav_skill_review (the sole
+    # skill writer — its prompt instructs it to call learn_skill), but only
+    # the production-dead async get_tools_for_agent ever wired them. Every
+    # nav_skill_review run since the FM migration was a no-op write-side
+    # (shared-data/skills/_audit.jsonl: zero production appends).
+    needs_skill_write = (
+        "learn_skill" in requested or "create_new_skill" in requested
+    )
+    if needs_skill_write:
+        try:
+            from .tools.skill_tools import get_skill_write_tools as _gswt
+
+            tools.extend(_gswt())
+        except Exception as exc:
+            logger.error(
+                "Failed to load skill write tools for '%s': %s", agent_name, exc
+            )
 
     logger.info(
         "Tools for agent '%s': %s",
@@ -3023,6 +3055,25 @@ def _summarize_test_report(state: dict) -> str:
     elif retry_count == FINAL_RETRY_SENTINEL:
         lines.append("\n*This is the FINAL retry attempt based on user feedback. "
                       "If this does not pass, the job will end.*")
+    # [wave-29 B5] Cross-job memory (the load-bearing surface): when this
+    # failure's structural fingerprint matches a prior job's FM entry, say
+    # so in the retry slot — the one injection point with proven behavioral
+    # effect (see the wave-20 T3 gotchas above for the pathology). The
+    # probe-disagreement stale-guard inside the renderer drops strategy
+    # words mechanically; memory is advisory.
+    try:
+        from src.writer_memory import load_memory, render_retry_fingerprint_lines
+
+        _wmem = load_memory(str(state.get("site_slug") or ""))
+        _probe_method = (
+            (state.get("probe_result") or {}).get("connectivity") or {}
+        ).get("method_that_worked")
+        for _mline in render_retry_fingerprint_lines(
+            report, _wmem, fresh_probe_method=_probe_method
+        ):
+            lines.append(f"\n**SITE MEMORY:** {_mline}")
+    except Exception as _wmem_exc:
+        logger.debug("writer memory B5 render skipped: %s", _wmem_exc)
     return "\n".join(lines)
 
 
@@ -3169,6 +3220,18 @@ def _checkpoint_discovery_section(state: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+# [wave-29 C1] platform → detection-skill mapping for learned-section
+# surfacing (matched as substring, case-insensitive, against site_analysis
+# platform values like "shopify", "Salesforce Commerce Cloud SFCC", ...).
+_PLATFORM_SKILLS = {
+    "shopify": "shopify-detection",
+    "sfcc": "sfcc-detection",
+    "algolia": "algolia-detection",
+    "amazon": "amazon-detection",
+    "kibo": "kibo-detection",
+}
+
+
 def _platform_distillation(state: dict) -> str:
     """T3.11: ≤2KB deterministic platform distillation for code_writer.
 
@@ -3229,6 +3292,28 @@ def _platform_distillation(state: dict) -> str:
     block = "\n".join(lines) + "\n"
     if len(block) > 2048:
         block = block[:2047] + "…\n"
+    # [wave-29 C1] Deterministic surfacing of the platform skill's curated
+    # learnings (fixes headline problem #1 — learned skills never reused).
+    # Read-only, race-free, and staleness-resistant: nav_skill_review's
+    # curation gate ("ZERO learnings is better than wrong ones") is what
+    # makes blind injection safe here. 2 newest whole sections, ≤1500 chars.
+    try:
+        from src.skills_store import render_learned_sections
+
+        _platform = str(site_analysis.get("platform") or "").lower()
+        _skill = next(
+            (s for key, s in _PLATFORM_SKILLS.items() if key in _platform), ""
+        )
+        if _skill:
+            _learned = render_learned_sections(_skill, cap=1500)
+            if _learned:
+                block += (
+                    f"\n### LEARNED SKILL NOTES (from `{_skill}`, newest first — "
+                    "curated by post-run review; apply when relevant)\n"
+                    + _learned
+                )
+    except Exception as _exc:
+        logger.debug("_platform_distillation: learned sections skipped: %s", _exc)
     return block
 
 
@@ -3272,6 +3357,23 @@ def build_code_writer_message(state: dict) -> list:
             )
     except Exception:
         pass
+    # [wave-29 B4] Per-site writer memory (FM scrapers/{slug}/analysis/
+    # writer_memory.json) — slim first-attempt block: the one-line
+    # outcome/strategy facts + open lessons. Hard cap 800 chars (every added
+    # char rides all writer turns; the 25KB ballooning precedent makes this
+    # cap load-bearing). Advisory: any failure here just means no block.
+    _writer_memory_block = ""
+    try:
+        from src.writer_memory import load_memory, render_first_attempt_block
+
+        _wmem_probe = (
+            (state.get("probe_result") or {}).get("connectivity") or {}
+        ).get("method_that_worked")
+        _writer_memory_block = render_first_attempt_block(
+            load_memory(slug), fresh_probe_method=_wmem_probe
+        )
+    except Exception:
+        _writer_memory_block = ""
     mechanism = scraper_analysis.get("strategy") or site_analysis.get(
         "scraping_mechanism", ""
     )
@@ -4524,6 +4626,8 @@ def build_code_writer_message(state: dict) -> list:
     _pa_raw = state.get("product_analysis") or {}
     if _prior_count_line:
         content = content + _prior_count_line
+    if _writer_memory_block:
+        content = content + "\n" + _writer_memory_block + "\n"
     pa_summary = _summarize_product_analysis(
         _pa_raw, allowed=_cw_allowed, scraper_analysis=scraper_analysis
     )

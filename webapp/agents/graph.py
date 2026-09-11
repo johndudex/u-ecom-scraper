@@ -1481,6 +1481,79 @@ def _archive_existing_scraper(slug: str) -> str | None:
         return None
 
 
+def _record_writer_memory(state: dict, *, outcome: str) -> None:
+    """[wave-29 B1/B2] Best-effort per-site writer-memory capture.
+
+    Failure entries land at the cleanup junction (next to
+    _archive_failure_evidence — both read the same workspace report the next
+    job's setup would otherwise wipe); success entries at the skill_learner
+    junction (SUCCESS-only guard already applied by the caller). Notes are
+    composed ONLY from deterministic report fields (crash class, exception
+    name, remediation target, item count) — never free LLM text — and
+    sanitize_note bans URLs mechanically. Memory is advisory: this helper
+    NEVER raises (a failed write must not fail a job).
+    """
+    try:
+        slug = str(state.get("site_slug") or "")
+        job_id = int(state.get("job_id") or 0)
+        if not slug or job_id <= 0:
+            return
+        import src.writer_memory as wmem
+
+        report: dict = {}
+        try:
+            report_path = os.path.join(
+                _get_project_root(), "workspace", slug, "test_report.json"
+            )
+            if os.path.isfile(report_path):
+                with open(report_path, encoding="utf-8") as _f:
+                    _loaded = json.load(_f)
+                if isinstance(_loaded, dict):
+                    report = _loaded
+        except Exception as exc:
+            logger.debug("_record_writer_memory: report read skipped: %s", exc)
+
+        strategy = str((state.get("scraper_analysis") or {}).get("strategy") or "")
+        item_count = state.get("product_count")
+        probe_method = str(
+            ((state.get("probe_result") or {}).get("connectivity") or {}).get(
+                "method_that_worked"
+            )
+            or ""
+        )
+        platform = str((state.get("site_analysis") or {}).get("platform") or "")
+
+        failure_class = wmem.derive_failure_class(report) if outcome != "success" else None
+        if outcome == "success":
+            note = f"completed with {item_count or 0} items via {strategy or 'unknown strategy'}"
+        else:
+            parts = wmem.fingerprint_parts(report)
+            exc = parts.get("exception") or ""
+            detail = exc or ", ".join(parts.get("issue_types") or []) or failure_class
+            target = parts.get("target") or ""
+            note = f"{failure_class}: {detail}" + (f" (target {target})" if target else "")
+        wmem.upsert_memory(
+            slug,
+            entry={
+                "job_id": job_id,
+                "outcome": outcome,
+                "strategy": strategy,
+                "item_count": item_count or 0,
+                "failure_class": failure_class,
+                "remediation_fp": wmem.structural_fingerprint(report),
+                "fp_parts": wmem.fingerprint_parts(report),
+                "probe_method": probe_method,
+                "note": note,
+            },
+            probe_fingerprint={"method": probe_method, "platform": platform},
+        )
+        logger.info(
+            "_record_writer_memory: %s entry for %s (job %s)", outcome, slug, job_id
+        )
+    except Exception as exc:
+        logger.warning("_record_writer_memory: skipped (%s)", exc)
+
+
 def _archive_failure_evidence(slug: str, job_id: int, execution_status: str) -> None:
     """[pillowtalk gap → jobs 71/76 RCA] Keep a FAILED job's test report.
 
@@ -1707,7 +1780,11 @@ def _summarize_tool_args(tool_name: str, args: dict) -> str:
     if tool_name == "search_content":
         return f"Search content: {str(args.get('pattern', ''))[:60]}"
     if "load_skill" in tool_name:
-        return f"Load skill: {str(args.get('name', ''))}"
+        # [wave-29 A2] The tool kwarg is skill_name (skill_tools.py) — the old
+        # args.get('name') left every ToolCallLog row blank, breaking the
+        # load_skill-usage baseline/metric (plan S0.1).
+        skill = args.get("skill_name") or args.get("name") or ""
+        return f"Load skill: {str(skill)}"
     if "list_skills" in tool_name:
         return "List available skills"
     if "web_fetch" in tool_name:
@@ -7391,6 +7468,9 @@ def _invoke_cleanup(state: ScrapeState, config: RunnableConfig) -> dict[str, Any
         # Keep the failed cycle's evidence (pillowtalk gap): the workspace is
         # wiped by the next job; a FAILED job must leave its test report.
         _archive_failure_evidence(slug, job_id, state.get("execution_status", ""))
+        # [wave-29 B1] cross-job writer memory — failure capture (best-effort).
+        if state.get("execution_status", "") != "SUCCESS":
+            _record_writer_memory(state, outcome="failure")
         _notify_phase(job_id, "cleanup", "done")
         out: dict[str, Any] = {"messages": []}
         if scraper_path:
@@ -7425,6 +7505,10 @@ def _invoke_skill_learner(state: ScrapeState, config: RunnableConfig) -> dict[st
         _notify_phase(job_id, "skill_learner", "skipped")
         return {"messages": []}
     _notify_phase(job_id, "skill_learner", "running")
+    # [wave-29 B2] cross-job writer memory — success capture (best-effort,
+    # deterministic fields only; the SUCCESS-only guard above is what keeps
+    # failed sites OUT of this path — their facts land via B1 at cleanup).
+    _record_writer_memory(state, outcome="success")
     set_tool_context(dict(state), agent_name="skill_learner")
     try:
         logger.info("_invoke_skill_learner: starting (job %s)", job_id)
