@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
@@ -1801,6 +1802,11 @@ def _extract_item_links(ev) -> list[str]:
     return out
 
 
+def _now() -> float:
+    """Wall-clock seam (monotonic) — tests substitute a scripted clock."""
+    return time.monotonic()
+
+
 def browser_traverse(
     start_url: str,
     content_type: str,
@@ -1810,6 +1816,9 @@ def browser_traverse(
     step_fn: Callable | None = None,
     max_actions: int = 12,
     trust_start_as_listing: bool = False,
+    heartbeat_fn: Callable[[dict], None] | None = None,
+    heartbeat_interval: float = 300.0,
+    max_seconds: float | None = None,
 ) -> TraversalResult:
     """Browser-driven navigation via MCP snapshot + LLM.
 
@@ -1819,7 +1828,20 @@ def browser_traverse(
       3. If listing → reached. Else execute the action (click ref / scroll).
     Bounded to ``max_actions`` steps. No custom JS for detection — the LLM judges
     from the semantic tree.
+
+    [wave-30 W30-8] Wall-clock observability: ``heartbeat_fn`` fires at most
+    every ``heartbeat_interval`` seconds (default 300 — the graph writes the
+    ``[NAV-TRAVERSE]`` SessionLog rows) and ``max_seconds`` (default from
+    ``NAV_TRAVERSE_MAX_TIMEOUT``, 3600) is a HARD stop checked at the top of
+    each step, so the walk never begins another 150s+ LLM turn past the
+    ceiling. A ceiling stop is an HONEST not-reached (notes name the ceiling,
+    never "budget exhausted").
     """
+    if max_seconds is None:
+        try:
+            max_seconds = float(os.environ.get("NAV_TRAVERSE_MAX_TIMEOUT") or 3600)
+        except (TypeError, ValueError):
+            max_seconds = 3600.0
     if mcp_tools is None:
         try:
             from agents.tools.playwright_tools import create_playwright_tools_sync
@@ -1865,7 +1887,38 @@ def browser_traverse(
     history: list[dict] = []
     path: list[str] = [start_url]
 
+    # [wave-30 W30-8] wall-clock heartbeat + hard ceiling.
+    _t0 = _now()
+    _last_beat = _t0
+    _stopped_reason = ""
+
+    def _beat(reason: str, step_num: int) -> None:
+        nonlocal _last_beat
+        if heartbeat_fn is None:
+            return
+        now = _now()
+        if now - _last_beat < heartbeat_interval:
+            return
+        _last_beat = now
+        try:
+            heartbeat_fn({
+                "step": step_num,
+                "elapsed_s": now - _t0,
+                "actions": len(history),
+                "reason": reason,
+            })
+        except Exception as beat_exc:
+            logger.debug("browser_traverse: heartbeat failed: %s", beat_exc)
+
     for step_num in range(max_actions):
+        if max_seconds and (_now() - _t0) >= max_seconds:
+            _stopped_reason = (
+                f"wall-clock ceiling {max_seconds:.0f}s reached after "
+                f"{len(history)} actions (NAV_TRAVERSE_MAX_TIMEOUT)"
+            )
+            logger.warning("browser_traverse: %s", _stopped_reason)
+            _beat("ceiling", step_num)
+            break
         try:
             # Use the compact _PAGE_STATE_JS evaluate (a ~1-2 KB JSON of clickables
             # + goal signals) instead of the accessibility SNAPSHOT. A heavy SPA's
@@ -1919,6 +1972,7 @@ def browser_traverse(
         history.append(result)
         logger.info("browser_traverse: step %d — is_listing=%s action=%s target=%s signals=%s",
                      step_num, result.get("is_listing"), result.get("action"), result.get("target"), signals)
+        _beat("step", step_num)
 
         # stuck detection: mark previous entry if same click target repeats
         if len(history) >= 2 and result.get("action") == "click" and result.get("target"):
@@ -2014,12 +2068,13 @@ def browser_traverse(
 
         desc = _do_action(result, nav, click_t, ev, wait, type_t)
         path.append(desc)
+        _beat("action", step_num)
 
     return TraversalResult(
         reached=False, goal_url=start_url, path=path,
         mechanism="unknown", api=None, signals={},
         visited=path, pruned=[],
-        notes=f"budget exhausted after {len(history)} actions",
+        notes=_stopped_reason or f"budget exhausted after {len(history)} actions",
         # CRITICAL: a nav failure must NOT be disguised as a discovered listing.
         # listing_reached=False tells run_execution to OMIT --listing-url (so the
         # scraper's DEFAULT_LISTING_URL drives discovery, not the sample detail URL

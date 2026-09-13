@@ -1080,6 +1080,48 @@ def _build_agent(agent_name: str, site_slug: str = "", use_create_agent: bool = 
     return agent
 
 
+_ZOMBIE_REFUSAL_LOG_CAP = 10
+
+
+def _log_zombie_refusal(tool_name: str) -> None:
+    """[wave-30 W30-7] One ``[ZOMBIE-REFUSED]`` SessionLog row per refused
+    call (first 10 per invocation).
+
+    The latch's raise is the behavior; this is the forensic record. Prod 569
+    RCA initially read the post-deadline silence as "the writer did nothing" —
+    nothing distinguished a clean finish from a disarmed zombie still burning
+    LLM rounds. Telemetry failures are swallowed: they must never change the
+    refusal.
+    """
+    try:
+        from .tools.context import get_agent_name, get_state, note_tool_refusal
+
+        count = note_tool_refusal(tool_name)
+        if count > _ZOMBIE_REFUSAL_LOG_CAP:
+            return
+        state = get_state() or {}
+        job_id = state.get("job_id")
+        if not job_id:
+            return
+        from scraper.models import SessionLog
+
+        seq = SessionLog.objects.filter(job_id=job_id).count()
+        SessionLog.objects.create(
+            job_id=job_id,
+            role=SessionLog.ROLE_SYSTEM,
+            agent=get_agent_name() or "unknown",
+            content=(
+                f"[ZOMBIE-REFUSED] {tool_name} refused by invocation latch "
+                f"(refusal {count} after this invocation's wall-clock "
+                "deadline) — the abandoned agent kept calling; the call "
+                "raised, artifacts untouched"
+            ),
+            seq=seq,
+        )
+    except Exception as _exc:
+        logger.debug("zombie-refusal telemetry skipped (tool %s): %s", tool_name, _exc)
+
+
 def _install_invocation_cancellation() -> None:
     """Monkey-patch ``BaseTool._run`` to refuse tools once the invocation is
     cancelled.
@@ -1104,6 +1146,7 @@ def _install_invocation_cancellation() -> None:
 
         def _cancel_aware(self, *args, **kwargs):
             if is_invocation_cancelled():
+                _log_zombie_refusal(getattr(self, "name", "") or "unknown")
                 raise RuntimeError(
                     "[invocation-cancelled] wall-clock deadline exceeded — tool "
                     "refused so the abandoned agent cannot mutate artifacts "

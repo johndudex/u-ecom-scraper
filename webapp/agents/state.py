@@ -145,6 +145,11 @@ class ScrapeState(TypedDict, total=False):
     # the loop is re-running a 900s writer against a draft it cannot improve —
     # escalate to human_approval instead of burning another cycle.
     writer_wall_clock_timeouts: int
+    # [wave-30 W30-2] the draft-finisher salvage invocation (the _wc >= 2
+    # skip_approvals arm) fires at most once per job — this flag routes the
+    # second arrival straight to the honest cleanup instead of another
+    # full-length window.
+    writer_finisher_attempted: bool
     # [job-65 phase 3a] Execution-phase strategy recycles. When the run reaches
     # EXECUTION and the draft's Phase 1 discovers 0 URLs with a FAIL-class
     # coverage stop_reason, route_after_execution sends the job back through

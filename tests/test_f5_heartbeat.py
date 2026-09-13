@@ -31,8 +31,10 @@ class TestF5CallSites:
         # The invariant under test is that EVERY site is finally-guarded.
         assert len(sites) >= 4, f"expected >= 4 call sites, found {len(sites)}"
         for i in sites:
-            window = "\n".join(lines[i:i + 10])
-            assert "finally:" in window, f"line {i+1}: no finally within 10 lines"
+            # 20 lines: the wave-30 draft-finisher site guards a 6-kwarg
+            # invoke, pushing its finally past the old 10-line window.
+            window = "\n".join(lines[i:i + 20])
+            assert "finally:" in window, f"line {i+1}: no finally within 20 lines"
             assert "_stop_heartbeat(hb)" in window, f"line {i+1}: stop not in finally"
 
     def test_no_bare_start_stop_pattern_remains(self):

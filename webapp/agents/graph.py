@@ -1072,12 +1072,31 @@ class _ToolCallLogger(BaseCallbackHandler):
     def __init__(self, job_id: int, agent_name: str) -> None:
         self.job_id = job_id
         self.agent_name = agent_name
+        # [wave-30 W30-1] Monotonic activity stamp, read by the writer's
+        # wall-clock waiter to distinguish "slow but working" from "stalled".
+        # None until the FIRST tool fires: a writer still inside its opening
+        # LLM turn has produced no observable work, so it must not buy an
+        # extension — construction time is not activity. A float write is
+        # atomic enough under the GIL; readers tolerate stale-by-one-call.
+        self.last_activity: float | None = None
+        # [wave-30 W30-6] In-memory trail of THIS invocation's real tool
+        # calls. Return-value persistence (_persist_agent_logs) never sees
+        # the calls of an abandoned invocation — it returns {"messages": []}
+        # (job 569: ~42 real writer calls logged as zero, which read as "the
+        # writer did nothing"). The abandon site in _invoke_agent_with_timeout
+        # persists this list once, post-join.
+        self.calls: list[dict] = []
+        self.trail_persisted = False
 
     def on_tool_start(self, serialized, input_str, **kwargs) -> None:  # type: ignore[override]
         try:
+            self.last_activity = time.monotonic()
             name = ""
             if isinstance(serialized, dict):
                 name = serialized.get("name") or ""
+            self.calls.append(
+                {"name": name or "unknown", "args": str(input_str or "")[:140]}
+            )
             from scraper.models import SessionLog
 
             seq = SessionLog.objects.filter(job_id=self.job_id).count()
@@ -2055,6 +2074,122 @@ def _tester_invoke_timeout() -> int:
     )
 
 
+# [wave-30 W30-1] Phases whose sync waiter may extend on fresh tool activity.
+# code_writer only — every other phase keeps the plain blocking join so their
+# behavior is bit-identical (job 81's tester window is sized to its mandated
+# browser runs; extension would blur that contract).
+_ACTIVITY_EXTENDABLE_PHASES = frozenset({"code_writer"})
+
+
+def _writer_invoke_timeout() -> int:
+    """[wave-30 W30-1] The code_writer's wall clock, per the tester idiom.
+
+    Prod 569: the writer passed no timeout → the module default
+    (AGENT_INVOKE_TIMEOUT, 1800 in prod) ≈ 11-12 turns at the measured
+    145-161 s/turn = exactly one draft cycle with zero slack; both
+    invocations died mid-fix and the consecutive-death counter failed a job
+    whose writer was productively working. The writer gets its own env knob,
+    floored at the module default (raising it via AGENT_INVOKE_TIMEOUT still
+    wins for every phase).
+    """
+    return max(_AGENT_INVOKE_TIMEOUT, _env_int("WRITER_INVOKE_TIMEOUT", 0))
+
+
+def _writer_max_timeout() -> int:
+    """[wave-30 W30-1] The activity-extension ceiling (env
+    ``WRITER_MAX_TIMEOUT``, default 2700).
+
+    Sized so a healthy-but-slow fix cycle (job 569's inv-2 needed ~300-600s
+    past the base window) fits, while a hostile job still cannot consume the
+    whole task budget (12600s usable) across writer + finisher + tester.
+    Verbatim env — a test harness setting 2 means 2.
+    """
+    return _env_int("WRITER_MAX_TIMEOUT", 2700)
+
+
+def _writer_activity_fresh_s() -> int:
+    """[wave-30 W30-1] Max tool-activity silence the writer's waiter tolerates
+    before declaring the invocation stalled (env
+    ``WRITER_ACTIVITY_FRESH_S``, default 600).
+
+    600, not 300: revolve prod showed single LLM turns up to 482s (job 569
+    inv-2, 06:23→06:31). A 300s freshness would have killed the extension
+    mid-turn. 600 still bounds a genuinely stuck writer to one silence
+    window past its last tool call.
+    """
+    return max(30, _env_int("WRITER_ACTIVITY_FRESH_S", 600))
+
+
+def _find_activity_logger(agent_cfg) -> _ToolCallLogger | None:
+    """Extract this invocation's ``_ToolCallLogger`` from the agent config.
+
+    ``callbacks`` may be a flat handler list (the ``_agent_config`` norm) or a
+    langchain ``BaseCallbackManager`` (NOT iterable — use ``.handlers``).
+    None when neither carries a logger: callers fall back to the plain join.
+    """
+    cbs = (agent_cfg or {}).get("callbacks")
+    if cbs is None:
+        return None
+    if not isinstance(cbs, (list, tuple)):
+        cbs = getattr(cbs, "handlers", None)
+    if not isinstance(cbs, (list, tuple)):
+        return None
+    for h in cbs:
+        # Duck-typed on the one attribute the extension reads, so test
+        # doubles (and any future logger split) don't need inheritance.
+        if isinstance(h, _ToolCallLogger) or (
+            hasattr(h, "last_activity")
+        ):
+            return h
+    return None
+
+
+def _join_with_activity_extension(
+    thread,
+    *,
+    base_timeout: float,
+    activity: _ToolCallLogger,
+    fresh_s: int,
+    max_timeout: float,
+    clock=time.monotonic,
+    job_deadline: float | None = None,
+    poll_s: float = 5.0,
+) -> float:
+    """[wave-30 W30-1] Poll-join with activity-aware extension (sync path).
+
+    Replaces the single blocking ``thread.join(timeout)`` for extendable
+    phases: while the thread runs, each poll extends the deadline when the
+    last tool-activity stamp is fresher than ``fresh_s`` — bounded by
+    ``max_timeout`` (the cap) and, when known, the task-scoped job deadline
+    minus the finalize margin (the clamp always wins). A never-stamped
+    logger holds the base window; a stale one dies on it. Returns the wall
+    seconds actually waited so the abandonment log tells the truth.
+
+    Extension semantics: a fresh stamp can push the deadline to
+    ``now + fresh_s`` but never SHRINK it and never past the cap — so one
+    legitimate fresh stamp at t=0 buys at most ``fresh_s`` of tail, never a
+    slide to the cap.
+    """
+    start = clock()
+    deadline = start + float(base_timeout)
+    cap = start + float(max_timeout)
+    while True:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            break
+        thread.join(timeout=min(remaining, poll_s))
+        if not thread.is_alive():
+            break
+        # Task-scoped budget wins over any extension: an extension may never
+        # push into the finalize margin (mirrors _effective_timeout).
+        if job_deadline and clock() + JOB_BUDGET_FINALIZE_MARGIN >= job_deadline:
+            break
+        last = getattr(activity, "last_activity", None)
+        if last is not None and (clock() - last) <= float(fresh_s):
+            deadline = max(deadline, min(cap, clock() + float(fresh_s)))
+    return clock() - start
+
+
 # [wave-15 PR-2b/W15-C] Per-phase async allowlist. DEFAULT EMPTY — no phase
 # runs ainvoke-under-loop until the canary earns it: set
 # AGENT_ASYNC_PHASES="code_writer" (comma-separated) to opt a phase in, and
@@ -2323,7 +2458,11 @@ def _fast_fail_detail(
     )
 
 
-def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, timeout: int = _AGENT_INVOKE_TIMEOUT):
+def _invoke_agent_with_timeout(
+    agent, messages, agent_cfg, phase: str, job_id,
+    timeout: int = _AGENT_INVOKE_TIMEOUT,
+    allow_activity_extension: bool = True,
+):
     """Run the agent with a wall-clock timeout.
 
     Two modes (per-phase gate, see ``_async_execution_enabled`` — default
@@ -2348,6 +2487,7 @@ def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, t
     # CLAMPED deadline is what tools see. The deadline rides the LangGraph
     # config (stamped fresh by tasks.py at every task entry — run AND
     # resume), so an approval-resumed job gets a fresh clock by construction.
+    _jd = None
     try:
         _jd = ((agent_cfg or {}).get("configurable") or {}).get("task_deadline")
         timeout, _clamp_reason = _effective_timeout(timeout, _jd, time.time())
@@ -2365,7 +2505,11 @@ def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, t
                 "_invoke_agent_with_timeout[%s]: refusing to invoke — %s (job %s)",
                 phase, _clamp_reason, job_id,
             )
-            return {"messages": [], "_error": _clamp_reason}
+            # [wave-30 W30-1] Named outcome: "never ran — out of job budget"
+            # is not "ran out of time mid-work" (WallClockTimeout), and the
+            # W30-2 finisher + terminal notes route on the difference.
+            return {"messages": [], "_error": _clamp_reason,
+                    "_error_class": "BudgetRefused"}
     except Exception:
         pass
     try:
@@ -2406,21 +2550,82 @@ def _invoke_agent_with_timeout(agent, messages, agent_cfg, phase: str, job_id, t
 
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
-    thread.join(timeout=timeout)
+    # [wave-30 W30-1] Extendable phases (code_writer) poll-join with the
+    # activity extension — prod 569's writer died mid-fix twice on a window
+    # sized to exactly one draft cycle while tools kept firing. Every other
+    # phase keeps the plain join (bit-identical legacy behavior).
+    _activity = (
+        _find_activity_logger(agent_cfg)
+        if phase in _ACTIVITY_EXTENDABLE_PHASES and allow_activity_extension
+        else None
+    )
+    if _activity is not None:
+        _waited = _join_with_activity_extension(
+            thread,
+            base_timeout=timeout,
+            activity=_activity,
+            fresh_s=_writer_activity_fresh_s(),
+            max_timeout=_writer_max_timeout(),
+            job_deadline=_jd,
+        )
+    else:
+        _waited = float(timeout)
+        thread.join(timeout=timeout)
     if thread.is_alive():
         logger.error(
-            "_invoke_agent_with_timeout[%s]: agent.invoke exceeded %ds wall-clock "
+            "_invoke_agent_with_timeout[%s]: agent.invoke exceeded %.0fs wall-clock "
             "— abandoning thread, returning empty (job %s)",
-            phase, timeout, job_id,
+            phase, _waited, job_id,
         )
         # [wave-14 job-133] SessionLog twin of the async-path row (postmortems
         # read the job log, not container stdout).
         _log_event_row(
             job_id, phase,
-            f"[INVOKE-TIMEOUT] {phase} exceeded {timeout}s wall-clock — "
+            f"[INVOKE-TIMEOUT] {phase} exceeded {_waited:.0f}s wall-clock — "
             f"thread abandoned (leaks until the task time limit), phase did "
             f"not complete",
         )
+        # [wave-30 W30-6] Persist the real-time trail: the abandoned result
+        # carries no messages, so the return-value path would log ZERO real
+        # calls (job 569). This is the only site that knows both the truth
+        # (the callback's list) and the certainty (the thread outlived its
+        # window). Once per logger; healthy paths untouched.
+        _trail_logger = _activity or _find_activity_logger(agent_cfg)
+        if (
+            job_id
+            and _trail_logger is not None
+            and not getattr(_trail_logger, "trail_persisted", True)
+        ):
+            _trail_logger.trail_persisted = True
+            try:
+                from scraper.models import ToolCallLog as _TCL
+
+                _tseq = _TCL.objects.filter(job_id=job_id).count()
+                for _tc in list(getattr(_trail_logger, "calls", None) or []):
+                    _TCL.objects.create(
+                        job_id=job_id,
+                        agent=getattr(_trail_logger, "agent_name", "") or phase,
+                        tool_name=str(_tc.get("name") or "unknown"),
+                        tool_call_id="",
+                        call_seq=_tseq,
+                        args_summary=str(_tc.get("args") or "")[:140],
+                        result_summary=(
+                            "real-time trail — invocation abandoned on "
+                            f"wall-clock timeout after {_waited:.0f}s"
+                        ),
+                    )
+                    _tseq += 1
+                if _trail_logger.calls:
+                    logger.info(
+                        "_invoke_agent_with_timeout[%s]: persisted %d real-time "
+                        "trail rows for the abandoned invocation (job %s)",
+                        phase, len(_trail_logger.calls), job_id,
+                    )
+            except Exception as _trail_exc:
+                logger.warning(
+                    "_invoke_agent_with_timeout[%s]: trail persist failed "
+                    "(job %s): %s", phase, job_id, _trail_exc,
+                )
         # [job-329 wall] The abandoned thread cannot be killed, but it can be
         # DISARMED: latch the tool-context cancel so the zombie's remaining
         # LLM rounds get tool-refusal errors instead of mutating the draft
@@ -3198,6 +3403,39 @@ def _mcp_browser_lock(
             )
 
 
+def _traverse_heartbeat_writer(job_id):
+    """[wave-30 W30-8] SessionLog heartbeat writer for the browser_traverse
+    walk.
+
+    Prod 569: the MCP walk ran silent for the better part of an hour —
+    nothing distinguished a healthy walk from a wedged one. The traversal
+    calls this at most every 300s with step/elapsed info; each call becomes
+    one ``[NAV-TRAVERSE]`` system row (agent-heartbeat idiom). Failures are
+    swallowed: telemetry must never break the walk.
+    """
+
+    def _write(info: dict) -> None:
+        try:
+            from scraper.models import SessionLog
+
+            seq = SessionLog.objects.filter(job_id=job_id).count()
+            SessionLog.objects.create(
+                job_id=job_id,
+                role=SessionLog.ROLE_SYSTEM,
+                agent="browser_traverse",
+                content=(
+                    f"[NAV-TRAVERSE] step {info.get('step', '?')} elapsed "
+                    f"{int(info.get('elapsed_s') or 0)}s actions="
+                    f"{info.get('actions', '?')} ({info.get('reason', 'step')})"
+                ),
+                seq=seq,
+            )
+        except Exception as exc:
+            logger.debug("traverse heartbeat write failed (job %s): %s", job_id, exc)
+
+    return _write
+
+
 def _invoke_navigation_traverse(
     state: ScrapeState, config: RunnableConfig
 ) -> dict[str, Any] | Command:
@@ -3228,6 +3466,11 @@ def _invoke_navigation_traverse(
             result = browser_traverse(
                 url, content_type, query,
                 trust_start_as_listing=_input_mode in ("list_page", "search_term"),
+                # [wave-30 W30-8] heartbeat rows every 300s + the
+                # NAV_TRAVERSE_MAX_TIMEOUT hard ceiling (resolved inside
+                # traversal.py) — the walk is otherwise invisible in
+                # SessionLog (prod 569).
+                heartbeat_fn=_traverse_heartbeat_writer(job_id) if job_id else None,
             )
 
         # MCP unavailable → fall back to the archived deterministic explorer +
@@ -5164,6 +5407,128 @@ def _writer_hit_step_budget(result) -> bool:
     return False
 
 
+def _run_draft_finisher(
+    state: ScrapeState, config: RunnableConfig, slug: str, job_id: Any
+) -> dict[str, Any] | None:
+    """[wave-30 W30-2] One bounded FINISH invocation before an honest fail.
+
+    Prod proof (job 569): the second 1800s wall-clock death landed 34s after
+    the writer's LAST accepted edit — 9/9 remediation edits were on disk,
+    ~300-600s short of self-validation — and the consecutive-death arm failed
+    the job with that salvageable draft still untested.
+
+    Caller guarantees the draft parses (the arm sits behind the deterministic
+    parse gate); re-verified defensively. The seed carries the CURRENT on-disk
+    draft as template_code plus the refreshed strategy and strategies_tried —
+    569's inv-2 edited an old-strategy draft because strategy switches never
+    rotate the draft file. Outcome contract (all failure modes → None, the
+    caller's honest cleanup; never raises):
+    - healthy return + draft still parses → the result dict (salvage);
+    - wall-clock death / BudgetRefused / empty return → None;
+    - unparseable draft after the finisher → None.
+    """
+    try:
+        from .draft_safety import draft_parses
+
+        draft_path = os.path.join(
+            _get_project_root(), "workspace", slug, "scraper_draft.py"
+        )
+        if not draft_parses(draft_path):
+            return None
+        with open(draft_path, encoding="utf-8", errors="replace") as _ff:
+            _draft_text = _ff.read()
+
+        # Refreshed strategy context: the deterministic analyzer may have
+        # switched strategy AFTER this draft was written (569's exact shape).
+        _sa = state.get("scraper_analysis") or {}
+        _strategy = str(
+            _sa.get("scraping_method") or _sa.get("strategy") or "unknown"
+        )
+        _tried = [
+            str(_t) for _t in (_sa.get("strategies_tried") or []) if str(_t).strip()
+        ]
+        _tried_note = ", ".join(_tried) if _tried else "(none recorded)"
+        _fb = str((state.get("test_report") or {}).get("feedback_for_writer") or "").strip()
+
+        seed = (
+            "[DRAFT-FINISHER] You are FINISHING an existing scraper, not "
+            "restarting. The previous invocation was cut off by its "
+            "wall-clock budget while working on this draft.\n\n"
+            f"- The draft is `workspace/{slug}/scraper_draft.py` (already "
+            "in your context as the base — edit it, do NOT rewrite from "
+            "scratch).\n"
+            f"- CURRENT strategy per the deterministic analyzer: {_strategy}\n"
+            f"- Strategies already tried and failed: {_tried_note}\n"
+            "- The analyzer may have switched strategy after this draft was "
+            "written — adapt the draft to the CURRENT strategy, or add a "
+            "comment justifying why the draft's strategy is still the right "
+            "one.\n"
+            f"- Last tester feedback: {_fb or '(none)'}\n\n"
+            "Land the remaining edits, then run check_syntax and ONE sample "
+            "run to confirm. Work efficiently — this is the final window."
+        )
+        agent = create_code_writer(site_slug=slug, template_code=_draft_text)
+        hb = _start_heartbeat(job_id, "code-writer-finisher")
+        try:
+            # Fixed window, NO activity extension: the job is already deep in
+            # budget; a fresh stamp must not buy more time (plan W30-2).
+            result = _invoke_agent_with_timeout(
+                agent,
+                [{"role": "user", "content": seed}],
+                _agent_config(config, "code_writer"),
+                "code_writer",
+                job_id,
+                timeout=_env_int("WRITER_FINISH_TIMEOUT", 1800),
+                allow_activity_extension=False,
+            )
+        finally:
+            _stop_heartbeat(hb)
+        _persist_agent_logs(state, result, "code-writer", config)
+
+        _res = result if isinstance(result, dict) else {}
+        if _res.get("_error") or not _res.get("messages"):
+            _log_event_row(
+                job_id, "code_writer",
+                f"[DRAFT-FINISHER] invocation did not complete "
+                f"({str(_res.get('_error') or 'no messages')[:160]}) — "
+                "proceeding to honest cleanup",
+            )
+            return None
+        if not draft_parses(draft_path):
+            _log_event_row(
+                job_id, "code_writer",
+                "[DRAFT-FINISHER] left an uncompilable draft — proceeding to "
+                "honest cleanup",
+            )
+            return None
+
+        _log_event_row(
+            job_id, "code_writer",
+            "[DRAFT-FINISHER] salvaged the mid-fix draft — handing it to the "
+            "normal test ladder",
+        )
+        # Snapshot like the main path: promotion happens at cleanup, which a
+        # wedged run never reaches; setup_workspace resumes from this key.
+        try:
+            import src.artifacts as _art
+
+            _art.write(
+                _art.scrapers_key(slug, "jobs", f"scraper-draft-{job_id}.py"),
+                open(draft_path, "rb").read(),
+            )
+        except Exception as _snap_exc:
+            logger.warning(
+                "_run_draft_finisher: draft FM snapshot failed (job %s): %s",
+                job_id, _snap_exc,
+            )
+        return result
+    except Exception as _exc:
+        logger.warning(
+            "_run_draft_finisher: finisher aborted (job %s): %s", job_id, _exc
+        )
+        return None
+
+
 def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
     job_id = state.get("job_id", 0)
     _notify_phase(job_id, "code_writer", "running")
@@ -5423,7 +5788,13 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         # F5: try/finally — an exception here previously leaked the timer chain.
         _cw_cfg = _agent_config(config, "code_writer")
         try:
-            result = _invoke_agent_with_timeout(agent, messages, _cw_cfg, "code_writer", job_id)
+            # [wave-30 W30-1] Writer-scoped window (env WRITER_INVOKE_TIMEOUT,
+            # floored at the module default) — the bare-default call is exactly
+            # what sized job 569's writer to one draft cycle with zero slack.
+            result = _invoke_agent_with_timeout(
+                agent, messages, _cw_cfg, "code_writer", job_id,
+                timeout=_writer_invoke_timeout(),
+            )
         finally:
             _stop_heartbeat(hb)
             _writer_fix_cycle.reset(_w24_nudge_token)
@@ -5631,37 +6002,76 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     )
                     _notify_phase(job_id, "code_writer", "failed")
                     if state.get("skip_approvals", False):
+                        # [wave-30 W30-2] One bounded FINISH attempt on the
+                        # parseable draft before the honest fail — job 569's
+                        # second death landed 34s after its last accepted
+                        # edit, with the draft one validation run from done.
+                        if state.get("writer_finisher_attempted"):
+                            logger.error(
+                                "_invoke_code_writer: draft-finisher already "
+                                "attempted this job → cleanup (honest failure, "
+                                "job %s)", job_id,
+                            )
+                            return Command(
+                                goto="cleanup",
+                                update={
+                                    **update,
+                                    "messages": [],
+                                    "error_message": _wc_note,
+                                },
+                            )
+                        update["writer_finisher_attempted"] = True
+                        _fin = _run_draft_finisher(state, config, slug, job_id)
+                        if _fin is not None:
+                            # Salvage: treat as a healthy writer cycle — the
+                            # normal usable-draft path below re-tests the
+                            # draft with a clean death counter.
+                            result = _fin
+                            _cw_dead = False
+                            _cw_err = ""
+                            update["writer_wall_clock_timeouts"] = 0
+                            logger.warning(
+                                "_invoke_code_writer: DRAFT-FINISHER salvaged "
+                                "the mid-fix draft (job %s)", job_id,
+                            )
+                            # fall through to the usable-draft path — no return
+                        else:
+                            logger.error(
+                                "_invoke_code_writer: draft-finisher refused "
+                                "or died → cleanup (honest failure, job %s)",
+                                job_id,
+                            )
+                            return Command(
+                                goto="cleanup",
+                                update={
+                                    **update,
+                                    "messages": [],
+                                    "error_message": _wc_note,
+                                },
+                            )
+                    else:
                         logger.error(
                             "_invoke_code_writer: repeated writer wall-clock "
-                            "deaths + skip_approvals → cleanup (honest failure, "
-                            "job %s)", job_id,
+                            "deaths → human_approval (job %s)", job_id,
                         )
                         return Command(
-                            goto="cleanup",
+                            goto="human_approval",
                             update={
                                 **update,
                                 "messages": [],
-                                "error_message": _wc_note,
+                                "interrupt_reason": "code_writer_wall_clock",
+                                "interrupt_message": _wc_note + (
+                                    " The existing draft can still be tested or the "
+                                    "strategy adjusted — retry or cancel."
+                                ),
+                                "interrupt_options": ["Retry code generation", "Cancel"],
+                                "interrupt_decisions": [
+                                    {"type": "approve", "label": "Retry code generation",
+                                     "allow_feedback": True},
+                                    {"type": "reject", "label": "Cancel", "allow_feedback": False},
+                                ],
                             },
                         )
-                    return Command(
-                        goto="human_approval",
-                        update={
-                            **update,
-                            "messages": [],
-                            "interrupt_reason": "code_writer_wall_clock",
-                            "interrupt_message": _wc_note + (
-                                " The existing draft can still be tested or the "
-                                "strategy adjusted — retry or cancel."
-                            ),
-                            "interrupt_options": ["Retry code generation", "Cancel"],
-                            "interrupt_decisions": [
-                                {"type": "approve", "label": "Retry code generation",
-                                 "allow_feedback": True},
-                                {"type": "reject", "label": "Cancel", "allow_feedback": False},
-                            ],
-                        },
-                    )
 
         if not _cw_dead:
             # Healthy run — reset the consecutive wall-clock-death counter.
@@ -6358,7 +6768,14 @@ def _probe_phase1_discovery_once(
             "_probe_phase1_discovery: running --discover-only (job %s, listing=%s)",
             job_id, (_probe_env_candidate or "<draft default>")[:80],
         )
-        probe_args = ["--discover-only", "--fresh-discovery"]
+        # [wave-30 W30-5] Flag parity with run_execution: the smoke tests the
+        # flag set execution will pass — --fresh-discovery only for Phase-1
+        # modes (the W30-4 predicate; one decision, two consumers).
+        from agents.nodes.run_execution import _wants_fresh_discovery
+
+        probe_args = ["--discover-only"]
+        if _wants_fresh_discovery(str(state.get("input_mode") or "")):
+            probe_args.append("--fresh-discovery")
         _probe_started = time.time()
         # [wave-22 C1] Identity binding: snapshot the workspace BEFORE the run
         # so the output selection below is a set identity (new-or-changed),

@@ -1207,6 +1207,27 @@ def _publish_analysis_artifacts(job_id: int, site_slug: str, ws) -> None:
             )
 
 
+def _close_open_steps(job: ScrapeJob) -> None:
+    """Close steps the graph left open when it finished.
+
+    [wave-30 W30-9] never-run ≠ done: a PENDING step at job end is a phase
+    that NEVER STARTED (resume skips, early death, skipped deterministic
+    nodes) — it finalizes SKIPPED, not DONE. RUNNING steps keep the existing
+    contract (their phase began, so DONE stands).
+    """
+    try:
+        for step_obj in job.steps.filter(status=Step.STATUS_PENDING):
+            step_obj.status = Step.STATUS_SKIPPED
+            step_obj.completed_at = timezone.now()
+            step_obj.save()
+        for step_obj in job.steps.filter(status=Step.STATUS_RUNNING):
+            step_obj.status = Step.STATUS_DONE
+            step_obj.completed_at = timezone.now()
+            step_obj.save()
+    except Exception as exc:
+        logger.warning("Failed to close steps for job %d: %s", job.id, exc)
+
+
 def _finalize_job(job: ScrapeJob) -> None:
     """Read the final graph checkpoint and persist results to the job.
 
@@ -1631,15 +1652,7 @@ def _finalize_job(job: ScrapeJob) -> None:
     # ── Close any running or pending steps (graph finished but some
     #    deterministic nodes like field_confirmation/execution never update
     #    their own step status). ────────────────────────────────────────────
-    try:
-        for step_obj in job.steps.filter(
-            status__in=(Step.STATUS_RUNNING, Step.STATUS_PENDING)
-        ):
-            step_obj.status = Step.STATUS_DONE
-            step_obj.completed_at = timezone.now()
-            step_obj.save()
-    except Exception as exc:
-        logger.warning("Failed to close steps for job %d: %s", job.id, exc)
+    _close_open_steps(job)
 
     job.completed_at = timezone.now()
     job.save(

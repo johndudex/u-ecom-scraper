@@ -121,7 +121,13 @@ class TestLoudCompileGate:
 
         monkeypatch.setattr(bh, "post_scrape_with_retry", lambda *a, **k: (_ for _ in ()).throw(AssertionError("dispatch not expected in this test")))
 
-        rexec.run_execution({"job_id": 0, "site_slug": "crocs-com"})
+        # wave-30 W30-4: --fresh-discovery (which used to make `args`
+        # non-empty unconditionally) is now gated to Phase-1 modes, and the
+        # CLI-contract probe below only runs `if args:`. scope=firstn keeps
+        # args non-empty without engaging any mode-specific gate.
+        rexec.run_execution(
+            {"job_id": 0, "site_slug": "crocs-com", "scope": "firstn", "scope_value": "5"}
+        )
         assert probes, "valid draft must pass the entry gate and reach flag probing"
 
 
@@ -167,14 +173,28 @@ class TestDraftFreeze:
         probes = self._patch_node(monkeypatch, tmp)
         good = hashlib.sha256(draft.read_bytes()).hexdigest()
         rexec.run_execution(
-            {"job_id": 0, "site_slug": "crocs-com", "tested_draft_sha256": good}
+            {
+                "job_id": 0,
+                "site_slug": "crocs-com",
+                "tested_draft_sha256": good,
+                # wave-30 W30-4: keep args non-empty (the probe is `if args:`)
+                "scope": "firstn",
+                "scope_value": "5",
+            }
         )
         assert probes, "byte-identical draft must sail through the freeze"
 
     def test_legacy_job_without_hash_is_not_blocked(self, tmp_path, monkeypatch):
         tmp, _ = self._workspace(tmp_path)
         probes = self._patch_node(monkeypatch, tmp)
-        rexec.run_execution({"job_id": 0, "site_slug": "crocs-com"})
+        rexec.run_execution(
+            {
+                "job_id": 0,
+                "site_slug": "crocs-com",
+                "scope": "firstn",  # wave-30 W30-4: keep args non-empty
+                "scope_value": "5",
+            }
+        )
         assert probes, "no recorded hash (legacy/resume path) must not block"
 
     def test_stamp_helper_hashes_current_draft(self, tmp_path):

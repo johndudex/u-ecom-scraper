@@ -270,12 +270,16 @@ class Step(models.Model):
     STATUS_RUNNING = "running"
     STATUS_DONE = "done"
     STATUS_FAILED = "failed"
+    # [wave-30 W30-9] never-run ≠ done: a phase that never started (resume
+    # skips, early death) finalizes SKIPPED, not DONE.
+    STATUS_SKIPPED = "skipped"
 
     STATUS_CHOICES = [
         (STATUS_PENDING, "Pending"),
         (STATUS_RUNNING, "Running"),
         (STATUS_DONE, "Done"),
         (STATUS_FAILED, "Failed"),
+        (STATUS_SKIPPED, "Skipped"),
     ]
 
     PHASE_CHOICES = [

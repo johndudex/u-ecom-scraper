@@ -67,6 +67,13 @@ _cancelled_invocations: OrderedDict[str, None] = OrderedDict()
 _CANCELLED_INVOCATIONS_CAP = 512
 _cancelled_lock = threading.Lock()
 
+# [wave-30 W30-7] Refusal telemetry: how many tool calls each latched
+# (abandoned) invocation attempted after its deadline. Keyed by invocation
+# id ("legacy" for unstamped callers), capped like the latch set itself —
+# a zombie looping LLM rounds can refuse hundreds of times and the map
+# must not grow with it.
+_refusal_counts: OrderedDict[str, int] = OrderedDict()
+
 # One-time runtime verification that context actually propagates through the
 # executor layer ToolNode uses (get_executor_for_config). If a langchain-core
 # upgrade ever swaps the context-propagating pool for a plain one, the
@@ -211,14 +218,38 @@ def is_invocation_cancelled() -> bool:
 
 def reset_invocation_latches() -> None:
     """[test support] Purge every latch: the cancelled-id set, the legacy
-    flag, and the calling context's stamp. Production code must NEVER call
-    this — it exists so a pytest process cannot leak a latch across tests
-    (tests/conftest.py); the cancelled-id set intentionally has no production
-    reset path."""
+    flag, the refusal counters, and the calling context's stamp. Production
+    code must NEVER call this — it exists so a pytest process cannot leak a
+    latch across tests (tests/conftest.py); the cancelled-id set intentionally
+    has no production reset path."""
     with _cancelled_lock:
         _cancelled_invocations.clear()
+        _refusal_counts.clear()
     _ctx["invocation_cancelled"] = False
     _current_invocation_id.set(None)
+
+
+def note_tool_refusal(tool_name: str = "") -> int:
+    """[wave-30 W30-7] Record one latch refusal for the current invocation.
+
+    Called from the BaseTool cancel guard right before it raises. Returns
+    the running count for this invocation so the caller can cap its
+    SessionLog forensics (first 10 only).
+    """
+    key = _current_invocation_id.get(None) or "legacy"
+    with _cancelled_lock:
+        _refusal_counts[key] = _refusal_counts.get(key, 0) + 1
+        _refusal_counts.move_to_end(key)
+        while len(_refusal_counts) > _CANCELLED_INVOCATIONS_CAP:
+            _refusal_counts.popitem(last=False)
+        return _refusal_counts[key]
+
+
+def get_invocation_refusal_count() -> int:
+    """Refusals so far for the current (or legacy) invocation."""
+    key = _current_invocation_id.get(None) or "legacy"
+    with _cancelled_lock:
+        return _refusal_counts.get(key, 0)
 
 
 def context_propagation_ok() -> bool | None:

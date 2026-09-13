@@ -522,6 +522,17 @@ def _distinct_same_domain_listing(state: ScrapeState, primary_listing: str) -> s
     return ""
 
 
+_PHASE1_MODES = frozenset({"navigation", "list_page", "search_term"})
+
+
+def _wants_fresh_discovery(input_mode: str) -> bool:
+    """[wave-30 W30-4] ``--fresh-discovery`` belongs only to jobs with a
+    Phase-1 discovery leg. url_list runs the user's URLs through the seed
+    path (never a discovery checkpoint, never Phase 1) — passing the flag
+    there only arms wrong-branch triggers (job 570)."""
+    return input_mode in _PHASE1_MODES
+
+
 def _args_with_listing_url(base_args: list, alt_url: str) -> list:
     """Swap the value after an existing ``--listing-url`` flag, or append the
     flag pair when the primary run carried none."""
@@ -839,7 +850,16 @@ def run_execution(state: ScrapeState) -> dict:
     # --fresh-discovery makes the scraper ignore any existing checkpoint and run
     # Phase 1 from scratch. The CLI-contract guard below drops this flag if the
     # generated scraper's argparse doesn't define it yet. [discovery-coverage-gate §4]
-    args.append("--fresh-discovery")
+    # [wave-30 W30-4] Phase-1 modes ONLY. A url_list job has no Phase-1 leg and
+    # never writes a discovery checkpoint, so the flag buys nothing there — and
+    # in the api family _force_fresh turns it into "ignore the user's URLs,
+    # crawl the API catalog instead" (job 570: a draft that promoted the flag
+    # to a Phase-1 trigger crashed at execution after a PASSing test cycle).
+    # Withholding the flag makes a wrong trigger clause unreachable at
+    # execution; the entry contract in src.listing_discovery guards Phase 1
+    # where it legitimately runs.
+    if _wants_fresh_discovery(input_mode):
+        args.append("--fresh-discovery")
 
     # DETERMINISTIC DISCOVERY (env-var): compute the listing URL for env-var
     # injection. This bypasses the argparse + _filter_supported_args chain —

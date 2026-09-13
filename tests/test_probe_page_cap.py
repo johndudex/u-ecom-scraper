@@ -48,6 +48,12 @@ def _fake_fetch(monkeypatch, pages: int, per_page: int = 2):
             return BeautifulSoup("<html><body></body></html>", "html.parser"), 200
         return _soup(page_no, per_page), 200
 
+    # [wave-30 W30-3] hygiene: carry the ladder attributes the entry contract
+    # expects (values identical to the getattr fallbacks — behavior unchanged,
+    # the stub just stops logging the missing-attribute warning).
+    fetch_page.min_tier_floor = 0
+    fetch_page.tiers_total = 1
+
     return fetch_page, calls
 
 

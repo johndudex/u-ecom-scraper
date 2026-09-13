@@ -36,6 +36,7 @@ anchors" and "served 300 anchors, none matching" indistinguishable.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -228,6 +229,49 @@ def jsonld_item_urls(soup, base_url: str) -> list[str]:
     return [urljoin(base_url, u) for u in urls]
 
 
+class DiscoveryContractError(ValueError):
+    """[wave-30 W30-3] fetch_page violates the Phase-1 discovery contract.
+
+    Job 570: a thread-local ``def fetch_page(url, **kwargs)`` wrapper sailed
+    through generation AND testing (url_list skips Phase 1 there) and crashed
+    with TypeError the first time this module called it positionally — a
+    0-product execution after a PASSing test cycle. The contract is now
+    enforced at the only place that owns the calling convention.
+    """
+
+
+def _assert_fetch_page_contract(fetch_page: Callable) -> dict:
+    """Entry contract for the Phase-1 discovery callable.
+
+    - Arity (FATAL): ``fetch_page(url, min_tier)`` must bind positionally —
+      a wrapper that cannot absorb the second positional argument would
+      crash mid-discovery. The actionable fix: pass the
+      ``src.http_fetch.create_fetch_page()`` closure DIRECTLY; a wrapper
+      (e.g. for thread-locality) must forward BOTH arguments positionally.
+    - Ladder attributes (WARNING): missing ``min_tier_floor`` /
+      ``tiers_total`` degrades the soft-block ladder to its defaults
+      (floor=0, one tier) — recorded, never fatal.
+    """
+    try:
+        inspect.signature(fetch_page).bind("https://contract.check/", 0)
+    except TypeError as exc:
+        raise DiscoveryContractError(
+            "fetch_page does not satisfy the Phase-1 discovery contract: it "
+            "must be callable as fetch_page(url, min_tier) with BOTH "
+            f"arguments positional ({exc}). Pass the "
+            "src.http_fetch.create_fetch_page() closure DIRECTLY — if you "
+            "wrap it (e.g. for thread-locality), forward BOTH arguments "
+            "positionally and copy the closure's min_tier_floor / "
+            "tiers_total attributes onto the wrapper."
+        ) from exc
+    missing = [
+        attr
+        for attr in ("min_tier_floor", "tiers_total")
+        if not hasattr(fetch_page, attr)
+    ]
+    return {"ladder_aware": not missing, "missing_ladder_attrs": missing}
+
+
 def discover_listing_urls(
     fetch_page: Callable,
     listing_urls: list,
@@ -275,6 +319,17 @@ def discover_listing_urls(
     pages_fetched = 0
     jsonld_fallback_pages = 0
 
+    # [wave-30 W30-3] Entry contract: arity is fatal (a wrapper that cannot
+    # take (url, min_tier) positionally would crash mid-discovery — job 570),
+    # missing ladder attributes degrade to defaults with a loud warning.
+    _ladder = _assert_fetch_page_contract(fetch_page)
+    ladder_aware = _ladder["ladder_aware"]
+    if not ladder_aware:
+        logger.warning(
+            "fetch_page is missing ladder attributes %s — soft-block "
+            "escalation degraded to defaults (floor=0, one tier)",
+            _ladder["missing_ladder_attrs"],
+        )
     floor = int(getattr(fetch_page, "min_tier_floor", 0))
     tiers_total = int(getattr(fetch_page, "tiers_total", 1))
 
@@ -393,7 +448,17 @@ def discover_listing_urls(
             # re-enter the block.
             if page_urls and min_tier > floor:
                 floor = min_tier
-                fetch_page.min_tier_floor = min_tier
+                # [wave-30 W30-3] setattr-guarded: a callable that carries
+                # tiers_total but rejects attribute writes (e.g. __slots__)
+                # must lose only the floor persistence, not the discovery run.
+                try:
+                    fetch_page.min_tier_floor = min_tier
+                except (AttributeError, TypeError):
+                    logger.warning(
+                        "fetch_page rejects min_tier_floor write-back — the "
+                        "unlocked proxy tier (%s) will not persist to Phase 2",
+                        min_tier,
+                    )
                 logger.info(
                     "Proxy tier index %s unblocked %s — locking it in as the "
                     "floor for all later fetches", min_tier, listing_url,
@@ -455,6 +520,7 @@ def discover_listing_urls(
         "soft_block_escalations": soft_block_escalations,
         "pages_fetched": pages_fetched,
         "jsonld_fallback_pages": jsonld_fallback_pages,
+        "ladder_aware": ladder_aware,
     }
     return all_urls, discovery_meta
 
@@ -476,6 +542,9 @@ def discover_listing_urls_with_retry(
     test phase's runs (birkenstock's tester run discovered 15 URLs 90s before
     the blocked execution run). Healthy runs never enter the retry path.
     """
+    # [wave-30 W30-3] Assert before the backoff: a contract violation must
+    # fail fast, not after retry_delay_s of sleeping.
+    _assert_fetch_page_contract(fetch_page)
     urls, meta = discover_listing_urls(fetch_page, listing_urls, extract_fn, **cfg)
     if urls or not retry_delay_s:
         return urls, meta
