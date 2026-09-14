@@ -36,7 +36,7 @@ Key management: `/intake/tokens/` (list), `/intake/tokens/create/` (raw key show
 { "code": "validation_failed", "message": "...", "details": { } }
 ```
 
-Statuses: 401 `unauthorized`, 403 `forbidden`, 404 `not_found`, 405 (`method_not_allowed` — the extractor DELETE answer), 409 (`duplicate_running_job`, `not_cancellable`, `callback_already_active`), 422 (`validation_failed`, `schema_invalid`, `invalid_callback_url`, `invalid_page`, `invalid_page_size`), 429 `rate_limited`, 500 `internal_error` (body carries a `trace_id`). (`webapp/scraper/api/errors.py`)
+Statuses: 401 `unauthorized`, 403 `forbidden`, 404 `not_found`, 405 (`method_not_allowed` — the extractor DELETE answer), 409 (`duplicate_running_job`, `site_already_processed`, `not_cancellable`, `callback_already_active`), 422 (`validation_failed`, `schema_invalid`, `invalid_callback_url`, `invalid_page`, `invalid_page_size`), 429 `rate_limited`, 500 `internal_error` (body carries a `trace_id`). (`webapp/scraper/api/errors.py`)
 
 ## 2. Partner API v1 — endpoints
 
@@ -44,7 +44,7 @@ Job state model (sync spec): `inprogress` → `sample_ready` → `scraper_ready`
 
 | Method & path | Purpose |
 |---|---|
-| `POST /api/v1/jobs` | Create + dispatch a job. **202** + `{job_id, state, created_at, status_url, sample_url, output_url, output_download_url, scraper_code_url}` + `Location` header. 409 if an identical-URL job is already pending/running for this key. Body gains **`field_instructions`** (wave-27). |
+| `POST /api/v1/jobs` | Create + dispatch a job. **202** + `{job_id, state, created_at, status_url, sample_url, output_url, output_download_url, scraper_code_url}` + `Location` header. 409 `duplicate_running_job` if an identical-URL job is already pending/running (never bypassable), 409 `site_already_processed` if the site already has a COMPLETED job (checked across all tenants — re-send the same body with `"force": true` to bypass). Body gains **`field_instructions`** (wave-27). |
 | `GET /api/v1/jobs` | Paginated list (`page`, `page_size`) of this key's jobs — `{jobs: [JobSummary], page, page_size, total_items, total_pages}`. Rows carry `rerun_of`. |
 | `GET /api/v1/jobs/{id}` | Full status: `state`, `internal_status`, `current_phase`, `phases[]`, availability flags, `item_count`, `failure`, `callback`, timestamps, **`rerun_of`** (chain-root job id; null for fresh jobs). |
 | `POST /api/v1/jobs/{id}/cancel` | Cancel a pending/running/waiting-approval job → `{state:"failed", failure:{code:"cancelled"}}`. |
@@ -81,6 +81,7 @@ Required: **`url`** (a sample *item* page, not the homepage) and **`input_mode`*
 | `notes` ≤4000 | free-text guidance to the analysis agents (advisory) |
 | `title` ≤200 | display name |
 | `dagster_enabled` | opt-in Dagster asset generation |
+| `force` (boolean) | bypass for the 409 `site_already_processed` guard (site already has a COMPLETED job). Never bypasses `duplicate_running_job`. Must be JSON `true` — the string `"false"` counts as not-forced. |
 | `callback_url` + `callback_secret` | optional webhook (async_api.yaml): HTTPS only, SSRF-guarded, secret 32–256 chars. Delivery is HMAC-signed: `X-Scraper-Signature: t=<unix>,v1=<hmac_sha256("<t>."+body, secret)>`, events `job.created` (now with `rerun_of`), `job.sample_ready`, `job.scraper_ready`, `job.failed`. |
 
 ## 3. Screen-backing endpoints (surface B) — what each screen actually calls
@@ -89,7 +90,7 @@ All `@login_required`; AJAX ones require `X-Requested-With: XMLHttpRequest`; POS
 
 | Screen | Endpoints |
 |---|---|
-| **New extraction** (`/intake/`) | `POST /intake/check-site`; `POST /intake/validate-schema` (response includes `fields` with descriptions); `POST /intake/discover-fields`; `POST /intake/create-job` (form: `url`, `nav_method`, `content_type`, `target_fields` (comma list — chip order), `field_notes_json` (chip ✎ notes; merged over schema descriptions), `scope`, `scope_value`, `notes`, `listing_urls`/`search_keywords`+`search_url`/`list_urls`, `schema_text`/`schema_file`, `dagster_enabled` → 200 `{job_id, …}`; 409 on duplicate live job). `GET /intake/jobs` → team job library JSON (rows carry `field_notes`, `rerun_of`). |
+| **New extraction** (`/intake/`) | `POST /intake/check-site`; `POST /intake/validate-schema` (response includes `fields` with descriptions); `POST /intake/discover-fields`; `POST /intake/create-job` (form: `url`, `nav_method`, `content_type`, `target_fields` (comma list — chip order), `field_notes_json` (chip ✎ notes; merged over schema descriptions), `scope`, `scope_value`, `notes`, `listing_urls`/`search_keywords`+`search_url`/`list_urls`, `schema_text`/`schema_file`, `dagster_enabled` → 200 `{job_id, …}`; 409 on duplicate live job; 409 `{"duplicate":true,"scope":"site",…}` when the site already has a COMPLETED job — the UI shows a modal, non-UI callers re-POST with `force=1`). `GET /intake/jobs` → team job library JSON (rows carry `field_notes`, `rerun_of`). |
 | **Jobs & Saved / Extractor list** | `GET /jobs/`; `GET /intake/jobs?user=` (saved = `is_saved:true`). Row actions: View / Cancel / Re-run / **Remove from Saved** (`POST /jobs/<id>/update/` with `is_saved=0`). Jobs table shows `↻ #origin` chips for re-runs. |
 | **Extractor detail** | `GET /sites/<id>/` (+ jobs, live `scraper.py`, outputs, version archive); `POST /sites/<id>/scrape/`; `POST /sites/<id>/rerun/`; `POST /sites/<id>/sync-urls/`; scraper-code / output / archive downloads. Detail page now has **Archive / Unarchive** buttons and a superuser-only Delete (typed `confirm=<slug>`). |
 | **Extractor list** | `GET /sites/` hides archived sites; `GET /sites/?archived=1` shows all with an Archived badge. |

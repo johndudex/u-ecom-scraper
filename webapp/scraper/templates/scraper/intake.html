@@ -2067,9 +2067,15 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
         fd.append('listing_urls', X('#nav-listing-text').value);
       }
     } else if(navMethod==='search'){ fd.append('search_keywords', X('#nav-search-kw').value); fd.append('search_url', X('#nav-search-url').value); }
+    submitBuild(fd);
+  }
+  /* [wave-31] POST + result handling, split out of runBuild so the
+     duplicate-site modal can re-submit the same form with force=1. */
+  function submitBuild(fd){
     var btn = X('#run-sample'); btn.disabled = true;
     postJSON(INTAKE_CONFIG.createJobUrl, fd).then(function(data){
       btn.disabled = false;
+      if(data.duplicate && data.scope === 'site'){ openDupModal(data, fd); return; }
       if(data.error){ showUrlError(data.error); return; }
       intakeState.job = data; intakeState.jobId = data.job_id; intakeState.terminal = false;
       if(data.job_id){ history.replaceState(null, '', location.pathname + '?job=' + data.job_id); }
@@ -2084,7 +2090,56 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       subscribeToJob(data);
     }).catch(function(err){ btn.disabled = false; showUrlError('Could not start the job (' + err + ').'); });
   }
+  var dupFd = null;
+  function openDupModal(data, fd){
+    dupFd = fd || null;
+    X('#dup-message').textContent = data.error || ((data.host || 'This site') + ' has already been scraped.');
+    var jobsEl = X('#dup-jobs'); jobsEl.innerHTML = '';
+    var prior = data.prior_jobs || [];
+    prior.forEach(function(j){
+      var row = document.createElement('div');
+      var label = '#' + j.job_id +
+        (j.title ? ' — ' + j.title : '') +
+        ' · ' + j.status +
+        (j.item_count ? ' · ' + j.item_count + ' items' : '') +
+        (j.created_at ? ' · ' + String(j.created_at).slice(0, 10) : '');
+      if(j.is_own){
+        var a = document.createElement('a');
+        a.href = j.job_url; a.textContent = label;
+        a.style.color = 'var(--accent,#22d3ee)';
+        row.appendChild(a);
+      } else {
+        // Teammates' job ids are plain text on purpose — the intake
+        // deep-link 404s for non-owners and the poller swallows it
+        // (wave-31 critique D1).
+        row.textContent = label + (j.owner_username ? ' (by ' + j.owner_username + ')' : '');
+      }
+      jobsEl.appendChild(row);
+    });
+    if(!prior.length) jobsEl.textContent = 'No prior job details available.';
+    var bits = [];
+    if(data.attempt_count) bits.push(data.attempt_count + ' total attempt' + (data.attempt_count === 1 ? '' : 's'));
+    if(data.has_scraper) bits.push('a finalized scraper already exists');
+    X('#dup-meta').textContent = bits.join(' · ');
+    X('#dup-modal').classList.remove('hidden');
+  }
+  function closeDupModal(){ X('#dup-modal').classList.add('hidden'); }
   X('#run-sample').addEventListener('click', runBuild);
+  /* [wave-31] The dup-modal markup sits AFTER this script block (same as
+     tokens/discover), but unlike those it shares this IIFE's closure — so
+     its listeners attach at DOMContentLoaded instead of a separate script. */
+  document.addEventListener('DOMContentLoaded', function(){
+    var dupModal = X('#dup-modal');
+    if(!dupModal) return;
+    X('#dup-close').addEventListener('click', closeDupModal);
+    X('#dup-cancel-btn').addEventListener('click', closeDupModal);
+    dupModal.addEventListener('click', function(e){ if(e.target === dupModal) closeDupModal(); });
+    document.addEventListener('keydown', function(e){ if(e.key === 'Escape' && !dupModal.classList.contains('hidden')) closeDupModal(); });
+    X('#dup-force-btn').addEventListener('click', function(){
+      closeDupModal();
+      if(dupFd){ dupFd.set('force', '1'); submitBuild(dupFd); dupFd = null; }
+    });
+  });
   X('#rerun-btn').addEventListener('click', function(){
     if(!intakeState.job || !intakeState.job.restart_url){ runBuild(); return; }
     var prompt = X('#rerun-prompt').value.trim();
@@ -2548,6 +2603,24 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
         <p style="margin:6px 0 2px 0;"><strong>SSE (temp token):</strong> same mint, then <code>GET /api/v1/jobs/{job_id}/events?token=…</code></p>
       </div>
       <p style="margin:8px 0 0 0;font-size:12px;color:var(--muted,#8b93a7);">Full reference: <a href="/docs/sync_api" style="color:var(--accent,#22d3ee);">REST spec</a> · <a href="/docs/async_api" style="color:var(--accent,#22d3ee);">events spec</a></p>
+    </div>
+  </div>
+</div>
+
+<!-- Duplicate-site modal (wave-31: site-level dedupe gate) -->
+<div class="modal-overlay hidden" id="dup-modal" role="dialog" aria-modal="true">
+  <div class="panel modal-panel" id="dup-modal-card" style="max-width:560px;">
+    <div class="modal-head">
+      <h3>Site already scraped</h3>
+      <button class="btn btn-ghost btn-sm" id="dup-close" type="button" aria-label="Close">✕</button>
+    </div>
+    <p id="dup-message" style="margin:0 0 10px 0;font-size:13.5px;"></p>
+    <p style="margin:0 0 6px 0;font-size:13px;font-weight:600;">Recent jobs on this site</p>
+    <div id="dup-jobs" style="font-size:13px;line-height:1.8;"></div>
+    <p id="dup-meta" class="hint" style="margin:8px 0 0 0;font-size:12px;color:var(--muted,#8b93a7);"></p>
+    <div class="rerun-actions" style="margin-top:14px;">
+      <button class="btn btn-primary btn-sm" id="dup-force-btn" type="button">Build anyway</button>
+      <button class="btn btn-ghost btn-sm" id="dup-cancel-btn" type="button">Cancel</button>
     </div>
   </div>
 </div>

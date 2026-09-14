@@ -230,3 +230,84 @@ class TestCreateCallback:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class TestSiteAlreadyProcessed:
+    """W31 tier-2 site gate — GLOBAL across tenants (product decision
+    2026-09-14): any completed job on this host refuses the create unless
+    the partner explicitly re-sends with force=true. force NEVER bypasses
+    the live duplicate_running_job 409 above."""
+
+    PRIOR_URL = "https://rmwilliams.com.au/a-different-boot.html"  # no www, same host
+
+    def _prior(self, status="completed", **kw):
+        return models.ScrapeJob.objects.create(
+            url=self.PRIOR_URL, status=status, input_mode="url_list",
+            page_type="product", **kw,
+        )
+
+    def test_409_site_already_processed(self, partner, db):
+        u, raw, key = partner
+        prior = self._prior()
+        r = create_job(_req(u, raw, VALID))
+        assert r.status_code == 409
+        body = json.loads(r.content)
+        assert body["code"] == "site_already_processed"
+        assert prior.id in body["details"]["prior_job_ids"]
+        assert body["details"]["status_url"] == f"/api/v1/jobs/{prior.id}"
+        assert body["details"]["latest_job_id"] == prior.id
+
+    def test_force_true_creates_202(self, partner, db):
+        u, raw, key = partner
+        self._prior()
+        r = create_job(_req(u, raw, {**VALID, "force": True}))
+        assert r.status_code == 202
+
+    def test_force_does_not_bypass_running_guard(self, partner, db):
+        u, raw, key = partner
+        models.ScrapeJob.objects.create(
+            url=VALID["url"], user=u, created_via="api", status="running",
+            input_mode="url_list", page_type="product",
+        )
+        r = create_job(_req(u, raw, {**VALID, "force": True}))
+        assert r.status_code == 409
+        assert json.loads(r.content)["code"] == "duplicate_running_job"
+
+    def test_global_other_tenants_completed_refuses(self, partner, db):
+        # Deliberate: one tenant's completed build blocks another's create
+        # (global dedupe — NOT key-scoped). Job ids are visible in the payload.
+        u, raw, key = partner
+        other = User.objects.create_user(username="_t_tenant2", password="x")
+        self._prior(user=other)
+        r = create_job(_req(u, raw, VALID))
+        assert r.status_code == 409
+        assert json.loads(r.content)["code"] == "site_already_processed"
+
+    def test_failed_prior_not_refused(self, partner, db):
+        u, raw, key = partner
+        self._prior(status="failed")
+        assert create_job(_req(u, raw, VALID)).status_code == 202
+
+    def test_waiting_approval_prior_not_refused(self, partner, db):
+        # The realistic prod park state — never counts as "processed".
+        u, raw, key = partner
+        self._prior(status="waiting_approval")
+        assert create_job(_req(u, raw, VALID)).status_code == 202
+
+    def test_default_is_refusal(self, partner, db):
+        u, raw, key = partner
+        self._prior()
+        body = {k: v for k, v in VALID.items()}
+        assert create_job(_req(u, raw, body)).status_code == 409
+
+    def test_force_string_false_is_refused(self, partner, db):
+        # Strict parse: the string "false" is not a force.
+        u, raw, key = partner
+        self._prior()
+        r = create_job(_req(u, raw, {**VALID, "force": "false"}))
+        assert r.status_code == 409
+        assert json.loads(r.content)["code"] == "site_already_processed"
+
+    def test_force_true_with_no_prior_creates(self, partner, db):
+        u, raw, key = partner
+        assert create_job(_req(u, raw, {**VALID, "force": True})).status_code == 202

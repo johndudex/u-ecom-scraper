@@ -14,6 +14,7 @@ from django.http import HttpResponse, JsonResponse
 from django.utils import timezone
 
 from .. import models
+from ..dedupe import site_processing_history
 from ..events import emit
 from . import errors
 from .ssrf import validate_callback_url
@@ -147,6 +148,31 @@ def create_job(request):
             409, "duplicate_running_job", f"A job for this URL is already running (Job #{existing.id}).",
             {"existing_job_id": existing.id},
         )
+
+    # W31 tier-2: site-level duplicate gate — GLOBAL across tenants
+    # (product decision 2026-09-14): any completed job on this host refuses
+    # the create unless the partner explicitly re-sends with force=true.
+    # force NEVER bypasses the live duplicate_running_job 409 above. Strict
+    # parse: only JSON true forces (a "false" string must not).
+    if body.get("force") is not True:
+        hist = site_processing_history(url)
+        if hist["processed"] and not hist["site_archived"]:
+            raise errors.ApiError(
+                409, "site_already_processed",
+                f"Site {hist['host']} was already scraped. "
+                "Re-send with \"force\": true to create a new job.",
+                {
+                    "site_slug": hist["site_slug"],
+                    "prior_job_ids": [j["job_id"] for j in hist["prior_jobs"]],
+                    "latest_job_id": (
+                        hist["prior_jobs"][0]["job_id"] if hist["prior_jobs"] else None
+                    ),
+                    "status_url": (
+                        f"/api/v1/jobs/{hist['prior_jobs'][0]['job_id']}"
+                        if hist["prior_jobs"] else ""
+                    ),
+                },
+            )
 
     scope = str(body.get("scope", "all")).strip() or "all"
     with transaction.atomic():

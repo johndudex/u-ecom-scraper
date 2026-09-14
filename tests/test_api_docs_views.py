@@ -283,6 +283,66 @@ class TestSpecFilesStructural:
             assert state in sync_src and state in async_src, state
 
 
+class TestSiteAlreadyProcessedDocs:
+    """W31: the 409 `site_already_processed` contract must be IN the specs,
+    not folklore (same rule as test_rate_limits_published). Covers the sync
+    spec (force flag + 409 + error-code enum + parity paragraph), the async
+    spec (a refused create emits no event), and the partner guide."""
+
+    def test_create_job_request_has_force_flag(self):
+        sync = yaml.safe_load(open(os.path.join(ROOT, "docs/specs/sync_api.yaml"), encoding="utf-8"))
+        props = sync["components"]["schemas"]["CreateJobRequest"]["properties"]
+        assert "force" in props, "CreateJobRequest.force missing"
+        assert props["force"]["type"] == "boolean"
+        desc = props["force"]["description"]
+        assert "site_already_processed" in desc, "force must name the 409 it bypasses"
+        assert "COMPLETED" in desc, "force only bypasses the site-level gate on completed priors"
+
+    def test_post_jobs_409_documents_site_already_processed(self):
+        sync = yaml.safe_load(open(os.path.join(ROOT, "docs/specs/sync_api.yaml"), encoding="utf-8"))
+        r409 = sync["paths"]["/api/v1/jobs"]["post"]["responses"]["409"]
+        assert "site_already_processed" in r409["description"]
+        content = r409["content"]["application/json"]
+        codes = []
+        if "example" in content:
+            codes.append(content["example"].get("code"))
+        for ex in (content.get("examples") or {}).values():
+            codes.append(ex.get("value", ex).get("code"))
+        assert "duplicate_running_job" in codes, "tier-1 example must survive"
+        assert "site_already_processed" in codes, "tier-2 example missing"
+        site_ex = [e for e in _iter_example_values(content) if e.get("code") == "site_already_processed"]
+        details = site_ex[0].get("details", {})
+        assert "prior_job_ids" in details and "status_url" in details
+
+    def test_error_code_enum_includes_site_already_processed(self):
+        sync = yaml.safe_load(open(os.path.join(ROOT, "docs/specs/sync_api.yaml"), encoding="utf-8"))
+        code_desc = sync["components"]["schemas"]["Error"]["properties"]["code"]["description"]
+        assert "site_already_processed" in code_desc
+
+    def test_parity_paragraph_covers_site_level_gate(self):
+        sync_src = open(os.path.join(ROOT, "docs/specs/sync_api.yaml"), encoding="utf-8").read()
+        assert "site-level duplicate guard" in sync_src
+        assert "COMPLETED" in sync_src.split("site-level duplicate guard")[1][:400]
+
+    def test_async_job_created_notes_refused_create_emits_no_event(self):
+        asyncs = yaml.safe_load(open(os.path.join(ROOT, "docs/specs/async_api.yaml"), encoding="utf-8"))
+        desc = asyncs["components"]["schemas"]["JobCreatedData"]["description"]
+        assert "site_already_processed" in desc
+        assert "no event" in desc
+
+    def test_partner_guide_documents_gate_and_force(self):
+        guide = open(os.path.join(ROOT, "docs/extractor-builder-api-guide.md"), encoding="utf-8").read()
+        assert "site_already_processed" in guide, "409 code list must include the new code"
+        assert '"force": true' in guide, "POST /jobs row must name the bypass flag"
+
+
+def _iter_example_values(content):
+    if "example" in content:
+        yield content["example"]
+    for ex in (content.get("examples") or {}).values():
+        yield ex.get("value", ex)
+
+
 if __name__ == "__main__":
     import pytest
 

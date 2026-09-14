@@ -607,7 +607,11 @@ components:
     # ── Event payloads ────────────────────────────────────────────────────
     JobCreatedData:
       type: object
-      description: Emitted once, when POST /api/v1/jobs returns 202.
+      description: |
+        Emitted once, when POST /api/v1/jobs returns 202. A create refused
+        with 409 (`duplicate_running_job` or `site_already_processed`) emits
+        no event — there is no job, so subscribers learn of the refusal only
+        from the synchronous response.
       required: [state, url, content_type, input_mode]
       properties:
         state: { $ref: '#/components/schemas/JobState' }

@@ -424,6 +424,11 @@ paths:
         scope of the run is governed by `scope`/`scope_value` and the input
         mode). A duplicate submission while a job for the same URL is pending
         or running returns 409 with the existing job's id (views.py:2537-2548).
+        The API additionally enforces the same site-level duplicate guard as
+        the UI: if any COMPLETED job already exists for the same host
+        (team-wide / across tenants), the create is refused with 409
+        `site_already_processed` unless the body sets `"force": true`.
+        Archived sites are exempt (archive = deliberate allow-re-scrape).
 
         Differences from the UI endpoint, on purpose: no
         `X-Requested-With: XMLHttpRequest` requirement and no CSRF token —
@@ -526,7 +531,16 @@ paths:
         "429":
           $ref: "#/components/responses/RateLimited"
         "409":
-          description: A job for this URL is already pending or running under this API key. The existing job's id is returned so the client can resume polling it.
+          description: |
+            Two refusal tiers. (1) `duplicate_running_job` — a job for this
+            URL is already pending or running; the existing job's id is
+            returned so the client can resume polling it. `force` never
+            bypasses this tier. (2) `site_already_processed` — the site-level
+            duplicate guard: at least one COMPLETED job already exists for
+            the same host (checked team-wide / across tenants; a re-scrape of
+            a finished site). Re-send the identical request with `"force":
+            true` to create the job anyway. Archived sites are exempt; failed
+            or parked prior attempts are context only and never gate.
           content:
             application/json:
               schema:
@@ -540,11 +554,24 @@ paths:
                           existing_job_id:
                             type: integer
                             description: The id of the already-running job (mirrors intake_create_job's 409 payload, views.py:2541-2548).
-              example:
-                code: "duplicate_running_job"
-                message: "A job for this URL is already running"
-                details:
-                  existing_job_id: 479
+              examples:
+                duplicateRunningJob:
+                  summary: A job for this URL is already pending/running (tier 1 — force never bypasses)
+                  value:
+                    code: "duplicate_running_job"
+                    message: "A job for this URL is already running"
+                    details:
+                      existing_job_id: 479
+                siteAlreadyProcessed:
+                  summary: The site was already scraped to completion (tier 2 — bypass with force)
+                  value:
+                    code: "site_already_processed"
+                    message: "Site rmwilliams.com.au was already scraped. Re-send with \"force\": true to create a new job."
+                    details:
+                      site_slug: "rmwilliams-com-au"
+                      prior_job_ids: [479]
+                      latest_job_id: 479
+                      status_url: "/api/v1/jobs/479"
         "422":
           description: "`schema_text` failed validation (gate re-run server-side exactly as in views.py:2560-2570). The per-issue list uses the same shape as /validate-schema."
           content:
@@ -1753,7 +1780,7 @@ components:
       properties:
         code:
           type: string
-          description: Stable machine-readable error code (`unauthorized`, `forbidden`, `not_found`, `not_ready`, `duplicate_running_job`, `validation_failed`, `schema_invalid`, `output_not_found`, `not_cancellable`, `invalid_page`, `invalid_page_size`, `invalid_created_since`, `invalid_callback_url`, `callback_already_active`, `rate_limited`, `internal_error`).
+          description: Stable machine-readable error code (`unauthorized`, `forbidden`, `not_found`, `not_ready`, `duplicate_running_job`, `site_already_processed`, `validation_failed`, `schema_invalid`, `output_not_found`, `not_cancellable`, `invalid_page`, `invalid_page_size`, `invalid_created_since`, `invalid_callback_url`, `callback_already_active`, `rate_limited`, `internal_error`).
           examples: ["not_found"]
         message:
           type: string
@@ -1874,6 +1901,19 @@ components:
             (`{slug}_dagster.py`, downloadable via `artifact_type=dagster_code`).
             Default `false` — the phase is skipped entirely and no Dagster step
             appears in the job's phase list.
+        force:
+          type: boolean
+          default: false
+          description: |
+            Bypass for the site-level duplicate guard ONLY. When a COMPLETED
+            job already exists for the same host (409 `site_already_processed`),
+            re-send the identical body with `true` to create the job anyway.
+            Never bypasses `duplicate_running_job` (a live job for the same
+            URL is refused regardless). Failed/parked prior attempts never
+            trigger the guard, and archived sites are exempt, so in those
+            cases `force` is a harmless no-op. Must be a JSON boolean — the
+            string `"false"` is still truthy-but-wrong and is treated as
+            not-forced (`is True` parse).
         title:
           type: string
           maxLength: 200

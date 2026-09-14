@@ -2926,9 +2926,47 @@ def intake_create_job(request):
             {
                 "error": f"A job for this URL is already running (Job #{existing.id})",
                 "job_id": existing.id,
+                # W31: scope lets the UI tell the two duplicate gates apart.
+                "duplicate": True,
+                "scope": "url",
             },
             status=409,
         )
+
+    # W31 tier-2: site-level duplicate gate — TEAM-WIDE (any teammate's
+    # completed job on this host triggers the modal; product decision
+    # 2026-09-14). Failed/parked attempts never gate. Archived sites are
+    # exempt (archive = deliberate allow-re-scrape). `force=1` is the modal's
+    # explicit click-through; it never bypasses the live-job 409 above.
+    if request.POST.get("force") != "1":
+        from .dedupe import site_processing_history
+
+        hist = site_processing_history(url)
+        if hist["processed"] and not hist["site_archived"]:
+            rows = [
+                dict(j, is_own=(j["owner_username"] == getattr(request.user, "username", None)))
+                for j in hist["prior_jobs"]
+            ]
+            msg = f"{hist['host']} has already been scraped"
+            if rows:
+                msg += (
+                    f" (Job #{rows[0]['job_id']}"
+                    + (f", {rows[0]['item_count']} items" if rows[0]["item_count"] else "")
+                    + f", {rows[0]['created_at'][:10]})"
+                )
+            return JsonResponse(
+                {
+                    "error": msg + ". Build anyway to scrape it again.",
+                    "duplicate": True,
+                    "scope": "site",
+                    "host": hist["host"],
+                    "site_slug": hist["site_slug"],
+                    "has_scraper": hist["has_scraper"],
+                    "attempt_count": hist["attempt_count"],
+                    "prior_jobs": rows,
+                },
+                status=409,
+            )
 
     fields_list = (
         [f.strip() for f in target_fields.split(",") if f.strip()]
