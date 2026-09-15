@@ -8,7 +8,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections import deque
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 import functools  # F1: run_in_executor takes no kwargs — bind via partial
@@ -141,6 +141,59 @@ def _probe_slot_try_acquire() -> bool:
 def _probe_slot_release() -> None:
     global _probe_slots_in_use
     _probe_slots_in_use = max(0, _probe_slots_in_use - 1)
+
+
+# ── [wave-33 E1] windowed rejection counters ─────────────────────────────────
+# /health's reject telemetry: per-kind monotonic timestamps in a 1h window.
+# A lifetime counter cannot distinguish "the storm self-cleared" from "still
+# rejecting" — the same lesson as the launch windows (T33-3). Kinds:
+#   memory_gate  — every _admit refusal (any surface)
+#   scrape_reject — /scrape refusals (busy-cap OR memory gate)
+#   probe_slots  — D2 probe-slot exhaustion
+_REJECT_EVENTS: dict = defaultdict(deque)
+_REJECT_LOCK = threading.Lock()
+_REJECT_WINDOW_S = 3600.0
+
+
+def _record_reject(kind: str) -> None:
+    now = time.monotonic()
+    with _REJECT_LOCK:
+        q = _REJECT_EVENTS[kind]
+        q.append(now)
+        while q and now - q[0] > _REJECT_WINDOW_S:
+            q.popleft()
+
+
+def _reject_counts() -> dict:
+    now = time.monotonic()
+    with _REJECT_LOCK:
+        return {
+            kind: sum(1 for ts in q if now - ts <= _REJECT_WINDOW_S)
+            for kind, q in _REJECT_EVENTS.items()
+        }
+
+
+def _effective_capacity() -> dict:
+    """[wave-33 E1] configured vs usable launch capacity per pool.
+
+    A3 swaps restore the configured size, but current-generation blacklisted
+    threads reduce what can actually launch — that gap IS the effective
+    capacity (the 09-14 storm ran pools at 5-6ms instant-fails with the pool
+    nominally intact).
+    """
+    snap = launch_poison_snapshot()
+    poisoned_by_pool: dict = {}
+    for thread_name in snap["poisoned_threads"]:
+        pool = _thread_pool_name(thread_name)
+        poisoned_by_pool[pool] = poisoned_by_pool.get(pool, 0) + 1
+    return {
+        pool: {
+            "configured": size,
+            "poisoned": poisoned_by_pool.get(pool, 0),
+            "effective": size - poisoned_by_pool.get(pool, 0),
+        }
+        for pool, size in _POOL_SPEC.items()
+    }
 
 # ── [wave-33 T33-3] poisoned-executor swap ────────────────────────────────
 # A sync-playwright guard event poisons a thread FOREVER (the 09-14/09-15 RCA:
@@ -1927,6 +1980,20 @@ async def _start_cdp_proxy(public_port: int, internal_port: int, label: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # [wave-33 E1] the boot line — the cheapest deploy-vs-crash discriminator.
+    # A container recycle (OOM kill, deploy, manual restart) is invisible in
+    # the log stream unless something stamps the process identity at startup;
+    # Railway injects the commit/deployment env into every service.
+    logger.warning(
+        "[BROWSER-BOOT] commit=%s deployment=%s service=%s health_strict=%s "
+        "boot=%s pid=%d",
+        os.environ.get("RAILWAY_GIT_COMMIT_SHA", "") or "local",
+        os.environ.get("RAILWAY_DEPLOYMENT_ID", "") or "-",
+        os.environ.get("RAILWAY_SERVICE_NAME", "") or "-",
+        os.environ.get("HEALTH_STRICT", "") or "unset",
+        time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        os.getpid(),
+    )
     logger.info("Starting browser_service...")
     startup_result = browser_pool.startup()
     if startup_result.get("errors"):
@@ -2163,6 +2230,9 @@ async def health():
             # [wave-33 T33-3] effective-capacity telemetry: every swap briefly
             # runs the retired + rebuilt pools concurrently (drain window).
             "executor_swaps": dict(_SWAP_COUNTS),
+            # [wave-33 E1] windowed rejections + per-pool usable capacity.
+            "rejects_1h": _reject_counts(),
+            "launch_capacity": _effective_capacity(),
             "gauges": _health_gauges(deadline),
             "navigate_slots_busy": nav_busy,
             "navigate_slots_total": NAVIGATE_MAX_CONCURRENT,
@@ -2426,6 +2496,7 @@ async def probe_single(request: SingleProbeRequest):
     call_id: Optional[str] = None
     if _is_browser_launch_method(method):
         if not _probe_slot_try_acquire():
+            _record_reject("probe_slots")  # [wave-33 E1] slot exhaustion/h
             return _backpressure(
                 429,
                 (
@@ -2576,6 +2647,7 @@ async def scrape(request: ScrapeRequest):
     scrape_busy = sum(1 for dl in SCRAPE_IN_FLIGHT.values() if dl > _now)
     _SCRAPER_LAST_BUSY[0] = _now  # B1-6: admission counts as scraper activity
     if scrape_busy >= SCRAPE_MAX_CONCURRENT + SCRAPE_MAX_QUEUE:
+        _record_reject("scrape_reject")  # [wave-33 E1] scrape rejects/h
         logger.warning(
             "/scrape rejected (busy=%d/%d) — backpressure",
             scrape_busy, SCRAPE_MAX_CONCURRENT,
@@ -2591,6 +2663,7 @@ async def scrape(request: ScrapeRequest):
     # pressure. post_scrape_with_retry callers already park-and-retry on 429.
     verdict = await _admit("scrape")
     if not verdict["admitted"]:
+        _record_reject("scrape_reject")  # [wave-33 E1] gate refusal = scrape reject
         return _backpressure(
             429,
             (
@@ -3259,6 +3332,7 @@ async def _admit(label: str, ratio: float | None = None) -> dict:
     if healed:
         mem_ratio = _cgroup_memory_ratio()
     if mem_ratio is not None and mem_ratio >= gate:
+        _record_reject("memory_gate")  # [wave-33 E1] gate trips/h
         logger.warning(
             "%s: memory gate tripped (ratio=%.2f >= %.2f) — refusing new browser launch",
             label,

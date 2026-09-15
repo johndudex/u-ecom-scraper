@@ -7737,6 +7737,14 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 "(waited %ds for /health) — skipping invocation, parking (job %s)",
                 int(_CT_PFW), job_id,
             )
+            # [wave-33 E1] the skip counter lives WEBAPP-side — browser-service
+            # never sees these, so its own telemetry would silently read zero.
+            try:
+                from .tools.browser_http import record_browser_tester_skip
+
+                record_browser_tester_skip("preflight_unhealthy")
+            except Exception:
+                pass
             return {
                 "messages": [],
                 "browser_unavailable_detail": (

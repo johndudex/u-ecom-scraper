@@ -42,7 +42,8 @@ def _grab(name: str, path: str = SERVER_PATH) -> str:
     src = open(path, encoding="utf-8").read()
     m = re.search(
         rf"^((?:async )?def {name}\(.*?)"
-        rf"(?=^(?:async )?def |^@|^class |^[A-Za-z_][A-Za-z0-9_]*\s*=\s|\Z)",
+        rf"(?=^(?:async )?def |^@|^class "
+        rf"|^[A-Za-z_][A-Za-z0-9_]*\s*[:=]\s|\Z)",
         src,
         re.M | re.S,
     )

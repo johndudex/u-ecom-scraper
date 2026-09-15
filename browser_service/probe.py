@@ -588,7 +588,7 @@ _POISON_SIGNATURE = "inside the asyncio loop"
 _POISONED_THREADS: set[tuple[str, int, str]] = set()  # (pool, generation, thread)
 _POOL_GENERATIONS: dict[str, int] = {}
 _POISON_EVENTS: deque = deque(maxlen=500)  # (ts, pool, thread, exc class)
-_LAUNCH_EVENTS: deque = deque(maxlen=2000)  # (ts, "ok"|"failed")
+_LAUNCH_EVENTS: deque = deque(maxlen=2000)  # (ts, "ok"|"failed", pool)
 _LAUNCH_WINDOW_DEFAULT_S = 900.0
 
 
@@ -636,7 +636,13 @@ def _note_launch_failed(exc: BaseException) -> None:
     STATE when the failure carries the sync-API-inside-asyncio signature."""
     with _LAUNCH_HEALTH_LOCK:
         _LAUNCH_HEALTH["launch_failed"] += 1
-        _LAUNCH_EVENTS.append((time.time(), "failed"))
+        _LAUNCH_EVENTS.append(
+            (
+                time.time(),
+                "failed",
+                _thread_pool_name(threading.current_thread().name),
+            )
+        )
     if _POISON_SIGNATURE in str(exc):
         _record_poison_event(exc=exc)
     else:
@@ -653,7 +659,9 @@ def _note_launch_ok() -> None:
     blacklist: a live dispatcher loop just launched a browser."""
     with _LAUNCH_HEALTH_LOCK:
         _LAUNCH_HEALTH["ok"] += 1
-        _LAUNCH_EVENTS.append((time.time(), "ok"))
+        _LAUNCH_EVENTS.append(
+            (time.time(), "ok", _thread_pool_name(threading.current_thread().name))
+        )
         name = threading.current_thread().name
         pool = _thread_pool_name(name)
         _POISONED_THREADS.discard((pool, _POOL_GENERATIONS.get(pool, 0), name))
@@ -692,12 +700,21 @@ def launch_poison_snapshot() -> dict:
 def launch_window_stats(window_s: float = _LAUNCH_WINDOW_DEFAULT_S) -> dict:
     """Windowed launch outcomes — the launch-capability signal /health's
     ``browsable`` is built from (T33-2). Lifetime counters cannot express
-    'the storm self-cleared'; a window can."""
+    'the storm self-cleared'; a window can. ``by_pool`` breaks the same
+    window out per executor pool (E1 launch-failure rate per pool)."""
     cutoff = time.time() - max(0.0, float(window_s))
     with _LAUNCH_HEALTH_LOCK:
-        ok = sum(1 for ts, kind in _LAUNCH_EVENTS if kind == "ok" and ts >= cutoff)
-        failed = sum(1 for ts, kind in _LAUNCH_EVENTS if kind == "failed" and ts >= cutoff)
-    return {"ok": ok, "failed": failed, "window_s": float(window_s)}
+        ok = sum(1 for ts, kind, _p in _LAUNCH_EVENTS if kind == "ok" and ts >= cutoff)
+        failed = sum(
+            1 for ts, kind, _p in _LAUNCH_EVENTS if kind == "failed" and ts >= cutoff
+        )
+        by_pool: dict = {}
+        for ts, kind, pool in _LAUNCH_EVENTS:
+            if ts < cutoff:
+                continue
+            slot = by_pool.setdefault(pool, {"ok": 0, "failed": 0})
+            slot[kind] += 1
+    return {"ok": ok, "failed": failed, "window_s": float(window_s), "by_pool": by_pool}
 
 
 class _PageContext:

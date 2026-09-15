@@ -2273,6 +2273,17 @@ def _check_celery_beat():
         return {"status": "down", "latency_ms": ms, "detail": str(exc)[:200]}
 
 
+def _browser_tester_skips_total() -> int:
+    """[wave-33 E1] webapp-side tester-skip counter (cache-backed lifetime)."""
+    try:
+        from agents.tools.browser_http import TESTER_SKIP_CACHE_KEY
+        from django.core.cache import cache
+
+        return int(cache.get(TESTER_SKIP_CACHE_KEY) or 0)
+    except Exception:
+        return 0
+
+
 def _check_browser_service():
     t0 = time.monotonic()
     try:
@@ -2322,6 +2333,9 @@ def _check_browser_service():
                     "residential": data.get("proxy_residential"),
                 },
                 "uptime_seconds": data.get("uptime_seconds"),
+                # [wave-33 E1] skips counted WEBAPP-side (the pre-flight park
+                # fires here, not in browser-service) — live count from cache.
+                "tester_skips_total": _browser_tester_skips_total(),
             }
             return result
         return {"status": "down", "latency_ms": ms, "detail": f"HTTP {resp.status_code}"}

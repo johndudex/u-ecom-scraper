@@ -316,6 +316,8 @@ def _admit_ns(mem_values, heal_result=True, gate=0.90):
         "GLOBAL_MEMORY_GATE_RATIO": gate,
         "_cgroup_memory_ratio": _mem,
         "_navigate_self_heal_if_zombie": _heal,
+        # [wave-33 E1] _admit's refuse arm now records the windowed counter
+        "_record_reject": lambda kind: None,
         "logger": logging.getLogger("t33c"),
         "asyncio": asyncio,
     }

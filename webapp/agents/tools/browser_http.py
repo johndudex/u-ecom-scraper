@@ -434,6 +434,34 @@ def browser_service_strict_ok() -> bool:
         return False
 
 
+# [wave-33 E1] tester-skip counter — WEBAPP-side by design: the skips happen
+# HERE (pre-flight park before an expensive phase), so a counter inside
+# browser-service would silently read zero. Lifetime count in the shared
+# cache (Redis in prod — visible from every worker + the dashboard).
+TESTER_SKIP_CACHE_KEY = "wave33:browser_tester_skips"
+
+
+def record_browser_tester_skip(reason: str = "") -> int:
+    """Count one tester skip. Never raises; returns the new total (0 on any
+    cache failure — telemetry must not break the park path)."""
+    try:
+        from django.core.cache import cache
+
+        cache.add(TESTER_SKIP_CACHE_KEY, 0, None)
+        return int(cache.incr(TESTER_SKIP_CACHE_KEY))
+    except Exception:
+        return 0
+
+
+def browser_tester_skips_total() -> int:
+    try:
+        from django.core.cache import cache
+
+        return int(cache.get(TESTER_SKIP_CACHE_KEY) or 0)
+    except Exception:
+        return 0
+
+
 def wait_for_browser_service(
     max_wait_s: float | None = None, poll_s: float = PREFLIGHT_POLL_S
 ) -> bool:
