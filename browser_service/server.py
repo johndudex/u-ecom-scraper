@@ -937,6 +937,39 @@ def _run_scrape_guarded(rid: str, **kwargs):
         SCRAPE_IN_FLIGHT.pop(rid, None)
 
 
+def _cancel_late_scrape(rid: str, job_id: int = 0) -> None:
+    """[wave-33 C2] Kill a /scrape run that outlived its caller's deadline.
+
+    Armed via ``loop.call_later(request.timeout + 30)`` at admission: the
+    caller's HTTP read gives up at ~request.timeout (post_scrape_with_retry's
+    per-attempt timeout), so everything the run does after that is consumed
+    by nobody — historically it kept a Chrome + SCRAPE_EXECUTOR slot for its
+    full retry ladder (the orphan-storm mechanism).
+
+    rid-ONLY on purpose: request_cancel fans job_id out to EVERY in-flight
+    rid of the job, and a same-job retry POST (a new rid from the caller's
+    ladder) must not be killed by the previous run's timer. A run that
+    already finished answers unknown — entries are unregistered at reap —
+    so the timer can never killpg a recycled PID.
+    """
+    try:
+        from .scraper_runner import request_cancel
+
+        report = request_cancel(rid=rid)
+        if report.get("flagged") or report.get("unknown"):
+            logger.warning(
+                "C2 caller-deadline cancel rid=%s job=%s → flagged=%s killed=%s "
+                "unknown=%s",
+                rid,
+                job_id,
+                report.get("flagged"),
+                report.get("killed"),
+                report.get("unknown"),
+            )
+    except Exception:
+        logger.exception("C2 caller-deadline cancel failed rid=%s", rid)
+
+
 MCP_LOG_PATH = "/tmp/mcp-stdout.log"
 MCP_LOG_MAX_BYTES = 10 * 1024 * 1024  # rotate past 10MB
 
@@ -2431,6 +2464,7 @@ async def scrape(request: ScrapeRequest):
     import uuid
     import shutil
     run_dir = os.path.join("/tmp", f"scrape_{uuid.uuid4().hex}")
+    cancel_handle = None  # [wave-33 C2] armed below, released in finally
     try:
         os.makedirs(run_dir, exist_ok=True)
         scraper_path = os.path.join(run_dir, request.scraper_name or "scraper.py")
@@ -2472,6 +2506,15 @@ async def scrape(request: ScrapeRequest):
             )
             # [wave-14 job-133] the runner registers the subprocess under this
             # rid (with job_id) so /cancel can reach it — see _ACTIVE_RUNS.
+            # [wave-33 C2] caller-deadline cancel: the caller's HTTP read is
+            # dead at ~request.timeout; kill the run 30s later instead of
+            # letting it hold a Chrome + executor slot (and its retry ladder)
+            # for the full wait_for slack. rid-only — a same-job retry POST
+            # gets its own rid and its own timer.
+            cancel_handle = loop.call_later(
+                request.timeout + 30,
+                functools.partial(_cancel_late_scrape, rid, request.job_id),
+            )
             result = await asyncio.wait_for(
                 loop.run_in_executor(
                     SCRAPE_EXECUTOR,
@@ -2493,6 +2536,10 @@ async def scrape(request: ScrapeRequest):
             return JSONResponse(content=result)
         except asyncio.TimeoutError:
             logger.error("Scraper timed out for %s (lock released)", scraper_path)
+            # [wave-33 C2] belt: the timer normally fired 90s ago (timeout+30
+            # vs the +120 wait_for bound); this covers a starved event loop
+            # where the timer never got a slot.
+            _cancel_late_scrape(rid, request.job_id)
             return JSONResponse(
                 status_code=504,
                 content={
@@ -2520,6 +2567,10 @@ async def scrape(request: ScrapeRequest):
             },
         )
     finally:
+        # [wave-33 C2] release the deadline timer — a no-op once fired, and
+        # guarded because staging can fail before the arming line runs.
+        if cancel_handle is not None:
+            cancel_handle.cancel()
         # Stateless: reap the staged /tmp dir (output content already captured
         # into the response). Best-effort — a racing subprocess on timeout may
         # hold a file open; /tmp is ephemeral anyway.

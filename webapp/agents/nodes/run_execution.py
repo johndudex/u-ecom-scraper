@@ -657,6 +657,26 @@ def _maybe_retry_execution_listing(
     return result
 
 
+def _cancel_job_scrapes(job_id: int) -> None:
+    """[wave-33 C2] Terminal-job containment: ask browser_service to cancel
+    any in-flight /scrape run(s) for this job.
+
+    Today only the RUNNING-status watchdog cancels (tasks.py
+    cleanup_stuck_jobs); a job whose dispatch failed client-side (transport
+    death, infra park, rc≠0) left its server-side run browsing for nobody
+    until the watchdog noticed. Fire-and-forget — never raises. job_id=0
+    (local/test runs) never hits the service.
+    """
+    if not job_id:
+        return
+    try:
+        from ..tools.browser_http import cancel_scrape
+
+        cancel_scrape(int(job_id))
+    except Exception as exc:
+        logger.warning("run_execution: scrape cancel failed: %s", exc)
+
+
 def run_execution(state: ScrapeState) -> dict:
     from ..graph import _notify_phase
 
@@ -1018,9 +1038,15 @@ def run_execution(state: ScrapeState) -> dict:
             )
 
         # [job-77 RC1] bounded listing fallback on a clean zero (see helper).
-        return _maybe_retry_execution_listing(
+        result = _maybe_retry_execution_listing(
             result, state, _listing_url_env or _working_url, _redispatch_browser
         )
+        # [wave-33 C2] the browser-service leg ended FAILED (transport death,
+        # infra park, rc≠0 — whatever the fallback/merge decided): cancel any
+        # in-flight server-side run for this job so it stops holding a Chrome.
+        if (result or {}).get("execution_status") == "FAILED":
+            _cancel_job_scrapes(job_id)
+        return result
 
     def _redispatch_inprocess(alt_url: str) -> dict:
         return _run_in_process(
