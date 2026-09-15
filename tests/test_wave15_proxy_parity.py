@@ -176,11 +176,13 @@ class TestServiceLadder:
         monkeypatch.setattr(mod, "fingerprint_step_enabled", lambda: False)
         monkeypatch.setattr(
             mod, "_dispatch_step",
-            lambda name, url, timeout, country=None: dispatch_by_name[name],
+            # [wave-33 T33-4 migration] run_probe plumbs launch_hook/should_stop
+            lambda name, url, timeout, country=None, launch_hook=None:
+                dispatch_by_name[name],
         )
         cloak_calls = []
 
-        def fake_cloak(url, tier, timeout=None, country=None):
+        def fake_cloak(url, tier, timeout=None, country=None, launch_hook=None):
             cloak_calls.append(tier)
             return cloak_results.get(tier)
 

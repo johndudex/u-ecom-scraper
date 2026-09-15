@@ -72,6 +72,11 @@ def _server_ns():
         "logger": logger,
         "subprocess": _subprocess,
         "Optional": _Optional,
+        # [wave-33 T33-4 migration] the _navigate_protection_active grab now
+        # swallows the module-level ephemeral-registry block that follows it
+        # (the sweep regex stops at the next def, not the next assignment),
+        # so module-level `_EPHEM_LOCK = threading.Lock()` executes here.
+        "threading": __import__("threading"),
         "PERSISTENT_CHROME_PIDS": set(),
         "SCRAPE_IN_FLIGHT": {},
         "SCRAPE_PROTECTION_GRACE_S": 600.0,

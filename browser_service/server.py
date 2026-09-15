@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from .browser_pool import browser_pool
 from .config import get_proxy_config
 from .probe import (
+    _hard_kill_tree,
     _launch_health_snapshot,
     _thread_pool_name,
     bump_launch_generation,
@@ -753,6 +754,111 @@ def _navigate_protection_active() -> bool:
     for pid in dead:
         NAVIGATE_ACTIVE_PIDS.pop(pid, None)
     return _navigate_in_flight > 0 or bool(NAVIGATE_ACTIVE_PIDS)
+
+
+# ── [wave-33 T33-4] per-call ephemeral browser registry ───────────────────
+# Caller-timeout arms (navigate 408, probe 504) used to return with NO worker
+# signal: the executor thread kept its browser RUNNING, and the orphan reaper
+# skipped its whole cycle while any navigate was live — up to 10 unreaped
+# browsers stacked on the persistent ones (the sole genuine-OOM producer;
+# prod restarts 09-14/09-15). Every browser-launching call now registers its
+# tree roots here as (pid, starttime); the timeout arm kills them (PID-reuse
+# guarded) and flags the call abandoned so the probe ladder stops launching
+# new browsers for a caller that is gone. The orphan reaper consumes the same
+# snapshot (T33-5).
+_EPHEMERAL_CALLS: dict[str, dict] = {}
+_EPHEM_LOCK = threading.Lock()
+
+
+def _ephemeral_register(call_id: str, label: str) -> None:
+    with _EPHEM_LOCK:
+        _EPHEMERAL_CALLS[call_id] = {
+            "label": label,
+            "abandoned": False,
+            "roots": {},
+            "created": time.monotonic(),
+        }
+
+
+def _ephemeral_track(call_id: str, pids) -> None:
+    """Record launched roots with their /proc starttime (the PID-reuse guard)."""
+    with _EPHEM_LOCK:
+        call = _EPHEMERAL_CALLS.get(call_id)
+        if call is None:
+            return
+        for pid in pids:
+            if not pid:
+                continue
+            pid = int(pid)
+            if pid > 0:
+                call["roots"][pid] = _proc_starttime(pid)
+
+
+def _ephemeral_release(call_id: str) -> None:
+    with _EPHEM_LOCK:
+        _EPHEMERAL_CALLS.pop(call_id, None)
+
+
+def _ephemeral_is_abandoned(call_id: str) -> bool:
+    with _EPHEM_LOCK:
+        call = _EPHEMERAL_CALLS.get(call_id)
+        return bool(call and call["abandoned"])
+
+
+def _kill_tracked_roots(roots: dict) -> int:
+    """SIGKILL each tracked tree whose starttime still matches.
+
+    A changed starttime means the PID was recycled onto an innocent process —
+    never kill it. A root tracked WITHOUT a readable starttime has
+    unverifiable identity — the timeout arm must not kill it (the orphan
+    killer owns it instead). Already-dead roots are skipped.
+    """
+    killed = 0
+    for pid, born in roots.items():
+        now_st = _proc_starttime(pid)
+        if now_st is None:
+            continue  # already gone
+        if born is None or now_st != born:
+            continue  # unverifiable at track time, or reused — spare
+        killed += _hard_kill_tree(pid)
+    return killed
+
+
+def _ephemeral_abandon(call_id: str) -> int:
+    """Flag the call abandoned (the ladder's stop-check) and kill its live
+    trees. Returns the number of processes signalled."""
+    with _EPHEM_LOCK:
+        call = _EPHEMERAL_CALLS.get(call_id)
+        if call is None:
+            return 0
+        call["abandoned"] = True
+        label = call["label"]
+        roots = dict(call["roots"])
+    killed = _kill_tracked_roots(roots)
+    if roots:
+        logger.warning(
+            "ephemeral call %s (%s) abandoned by caller — %d process(es) "
+            "signalled across %d tracked root(s)",
+            call_id,
+            label,
+            killed,
+            len(roots),
+        )
+    return killed
+
+
+def _ephemeral_snapshot() -> dict:
+    """Reaper/health view of live per-call browser roots."""
+    with _EPHEM_LOCK:
+        return {
+            cid: {
+                "label": c["label"],
+                "abandoned": c["abandoned"],
+                "roots": dict(c["roots"]),
+                "age_s": round(time.monotonic() - c["created"], 1),
+            }
+            for cid, c in _EPHEMERAL_CALLS.items()
+        }
 
 # ── /scrape in-flight registry (F1) ────────────────────────────────────────
 # A running scraper subprocess drives the SHARED scraper Chrome; the orphan
@@ -1987,41 +2093,60 @@ async def restart_cdp(request: RestartCdpRequest):
 
 @app.post("/probe")
 async def probe(request: ProbeRequest):
-    async with PROBE_LOCK:
-        try:
-            loop = asyncio.get_event_loop()
-            result = await asyncio.wait_for(
-                loop.run_in_executor(
-                    PROBE_EXECUTOR,
-                    lambda: run_probe(
-                        url=request.url,
-                        render_js=request.render_js,
-                        timeout=request.timeout,
-                        start_method=request.start_method,
-                        country=request.country,
-                        proxy_tier=request.proxy_tier,
+    # [wave-33 T33-4] the call's browser roots are registry-visible from the
+    # first launch: the 504 arm kills them (reuse-guarded) instead of letting
+    # the executor thread browse for a caller that is gone, and should_stop
+    # halts the ladder between rungs.
+    call_id = f"probe-{time.monotonic_ns()}"
+    _ephemeral_register(call_id, "probe")
+    try:
+        async with PROBE_LOCK:
+            try:
+                loop = asyncio.get_event_loop()
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        PROBE_EXECUTOR,
+                        lambda: run_probe(
+                            url=request.url,
+                            render_js=request.render_js,
+                            timeout=request.timeout,
+                            start_method=request.start_method,
+                            country=request.country,
+                            proxy_tier=request.proxy_tier,
+                            launch_hook=lambda ctx: _ephemeral_track(
+                                call_id, [ctx.root_pid]
+                            ),
+                            should_stop=lambda: _ephemeral_is_abandoned(call_id),
+                        ),
                     ),
-                ),
-                timeout=request.timeout + 60,
-            )
-            if result and result.get("needs_akamai_bypass"):
-                logger.info(
-                    "Akamai detected for %s, releasing probe lock and escalating",
-                    request.url[:100],
+                    timeout=request.timeout + 60,
                 )
-            return JSONResponse(content=result)
-        except asyncio.TimeoutError:
-            logger.error("Probe timed out for %s (lock released)", request.url[:200])
-            return JSONResponse(
-                status_code=504,
-                content={"success": False, "error": "Probe timed out"},
-            )
-        except Exception as exc:
-            logger.exception("Probe failed for %s", request.url[:200])
-            return JSONResponse(
-                status_code=500,
-                content={"success": False, "error": str(exc)[:500]},
-            )
+                if result and result.get("needs_akamai_bypass"):
+                    logger.info(
+                        "Akamai detected for %s, releasing probe lock and escalating",
+                        request.url[:100],
+                    )
+                return JSONResponse(content=result)
+            except asyncio.TimeoutError:
+                killed = _ephemeral_abandon(call_id)
+                logger.error(
+                    "Probe timed out for %s (lock released; abandoned-kill "
+                    "signalled %d)",
+                    request.url[:200],
+                    killed,
+                )
+                return JSONResponse(
+                    status_code=504,
+                    content={"success": False, "error": "Probe timed out"},
+                )
+            except Exception as exc:
+                logger.exception("Probe failed for %s", request.url[:200])
+                return JSONResponse(
+                    status_code=500,
+                    content={"success": False, "error": str(exc)[:500]},
+                )
+    finally:
+        _ephemeral_release(call_id)
 
 
 @app.post("/probe-single")
@@ -2609,11 +2734,16 @@ def _run_navigate_sync(
     cookies: Optional[list[dict]],
     settle_ms: Optional[int] = None,
     wait_for: Optional[str] = None,
+    call_id: Optional[str] = None,
 ) -> dict:
     """Synchronous navigate worker (runs in the thread executor).
 
     Returns a NavigateResponse-shaped dict. Raises :class:`_ChromeDeathError`
     on Chrome crash (caller maps to 503 + retry_after).
+
+    ``call_id`` [wave-33 T33-4]: when provided, launched browser roots are
+    tracked in the per-call ephemeral registry so the caller's timeout arm
+    can kill them (the worker itself outlives the HTTP response on timeout).
     """
     from .probe import _classify_block, _extract_page_data, _launch_page
     from .scraper_runner import _is_chrome_death, _is_target_closed
@@ -2646,6 +2776,14 @@ def _run_navigate_sync(
         session_pids = after - before
         if session_pids:
             _track_navigate_pids(session_pids)
+        # [wave-33 T33-4] registry visibility for the caller's timeout arm:
+        # the driver root kills the whole tree; session chrome PIDs are belt.
+        if call_id:
+            _ephemeral_track(
+                call_id,
+                ([ctx.root_pid] if getattr(ctx, "root_pid", None) else [])
+                + list(session_pids),
+            )
 
         # Set cookies on the browser context (before goto, for session continuity)
         if cookies:
@@ -2950,6 +3088,11 @@ async def navigate(request: NavigateRequest):
         )
 
     _navigate_in_flight += 1
+    # [wave-33 T33-4] per-call registry: the worker tracks its browser roots;
+    # the 408 arm below kills them (PID-reuse guarded) instead of leaving the
+    # executor thread browsing for a caller that is gone.
+    call_id = f"navigate-{time.monotonic_ns()}"
+    _ephemeral_register(call_id, "navigate")
     try:
         async with NAVIGATE_SEMAPHORE:
             loop = asyncio.get_event_loop()
@@ -2976,6 +3119,7 @@ async def navigate(request: NavigateRequest):
                             request.cookies,
                             request.settle_ms,
                             request.wait_for,
+                            call_id,
                         ),
                         timeout=request.timeout + 30,
                     )
@@ -2986,7 +3130,12 @@ async def navigate(request: NavigateRequest):
                         result["recovered_by_self_heal"] = True
                     return JSONResponse(content=result)
                 except asyncio.TimeoutError:
-                    logger.warning("navigate: timed out for %s", request.url[:200])
+                    killed = _ephemeral_abandon(call_id)
+                    logger.warning(
+                        "navigate: timed out for %s (abandoned-kill signalled %d)",
+                        request.url[:200],
+                        killed,
+                    )
                     _record_nav_outcome("fail")
                     _log_nav_outcome("fail", 408, request.url, (time.monotonic() - start) * 1000)
                     return JSONResponse(
@@ -3058,3 +3207,4 @@ async def navigate(request: NavigateRequest):
                     )
     finally:
         _navigate_in_flight -= 1
+        _ephemeral_release(call_id)

@@ -152,7 +152,10 @@ def _proxy_tier_configured(tier: str) -> bool:
     return bool(get_proxy_config().build_proxy_url(tier))
 
 
-def _dispatch_step(method_name: str, url: str, timeout: int, country: Optional[str] = None):
+def _dispatch_step(
+    method_name: str, url: str, timeout: int, country: Optional[str] = None,
+    launch_hook=None,
+):
     if method_name == "direct_http":
         return _try_direct_http(url, timeout=timeout, proxy_tier="none")
     if method_name.startswith("direct_http_"):
@@ -166,11 +169,16 @@ def _dispatch_step(method_name: str, url: str, timeout: int, country: Optional[s
         )
     if method_name.startswith("cloak_"):
         tier = method_name.replace("cloak_", "")
-        return _try_cloak(url, tier, timeout=min(timeout, 40), country=country)
+        return _try_cloak(
+            url, tier, timeout=min(timeout, 40), country=country, launch_hook=launch_hook
+        )
     if method_name.startswith("playwright_"):
         tier = method_name.replace("playwright_", "")
         pw_timeout = 35 if tier != "none" else 25
-        return _try_playwright(url, tier, timeout=min(timeout, pw_timeout), country=country)
+        return _try_playwright(
+            url, tier, timeout=min(timeout, pw_timeout), country=country,
+            launch_hook=launch_hook,
+        )
     return None
 
 
@@ -181,6 +189,8 @@ def run_probe(
     start_method: Optional[str] = None,
     country: Optional[str] = None,
     proxy_tier: Optional[str] = None,
+    launch_hook=None,
+    should_stop=None,
 ) -> dict[str, Any]:
     steps_log = []
     debug_path = "/tmp/probe_debug.json"
@@ -234,8 +244,17 @@ def run_probe(
             _log_step(f"{step_name}: skipped (proxy tier '{step_proxy_tier}' not configured)")
             continue
 
+        # [wave-33 T33-4] a caller that already timed out gets NO new
+        # browsers — kill-on-timeout only pays off if the ladder stops too.
+        if should_stop is not None and should_stop():
+            _log_step("caller abandoned (timed out) — not launching new browsers")
+            return _failure_result(
+                "caller_abandoned", "none",
+                "caller_abandoned — caller gone; ladder stopped",
+            )
+
         _log_step(f"{step_name}: trying...")
-        result = _dispatch_step(step_name, url, timeout, country=country)
+        result = _dispatch_step(step_name, url, timeout, country=country, launch_hook=launch_hook)
         if result:
             _log_step(
                 f"{step_name}: method={result.get('method')}, success={result.get('success')}, "
@@ -252,7 +271,8 @@ def run_probe(
             bypass_method = f"cloak_{step_proxy_tier}"
             _log_step(f"{step_name}: Akamai detected — trying {bypass_method} stealth bypass")
             cloak_res = _try_cloak(
-                url, step_proxy_tier, timeout=min(timeout, 40), country=country
+                url, step_proxy_tier, timeout=min(timeout, 40), country=country,
+                launch_hook=launch_hook,
             )
             if cloak_res and cloak_res.get("success"):
                 _log_step(f"{bypass_method}: SUCCEEDED (Akamai bypassed)")
@@ -686,14 +706,20 @@ class _PageContext:
     Holds everything the caller needs to drive the page and tear it down.
     """
 
-    __slots__ = ("page", "browser", "pw", "stealth_used", "method")
+    __slots__ = ("page", "browser", "pw", "stealth_used", "method", "root_pid")
 
-    def __init__(self, page, browser, pw, stealth_used: bool, method: str):
+    def __init__(
+        self, page, browser, pw, stealth_used: bool, method: str, root_pid=None
+    ):
         self.page = page
         self.browser = browser
         self.pw = pw  # sync_playwright() handle (Playwright only); None for cloak
         self.stealth_used = stealth_used
         self.method = method  # "playwright" | "cloak"
+        # [wave-33 T33-4] driver root PID (same attribution _hard_kill_partial_
+        # launch trusts) — the per-call registry kills THIS tree on caller
+        # timeout; None = unattributable (orphan killer owns it).
+        self.root_pid = root_pid
 
     def _graceful_close(self) -> None:
         """Best-effort polite teardown. MUST run on the session thread.
@@ -963,7 +989,14 @@ def _launch_page(
             _hard_kill_partial_launch(browser=browser)
             raise
         _note_launch_ok()
-        return _PageContext(page, browser, pw=None, stealth_used=True, method="cloak")
+        return _PageContext(
+            page,
+            browser,
+            pw=None,
+            stealth_used=True,
+            method="cloak",
+            root_pid=_playwright_driver_pid(browser) if browser is not None else None,
+        )
 
     # default: vanilla Playwright
     from playwright.sync_api import sync_playwright
@@ -1005,7 +1038,14 @@ def _launch_page(
                 )
         raise
     _note_launch_ok()
-    return _PageContext(page, browser, pw=pw, stealth_used=False, method="playwright")
+    return _PageContext(
+        page,
+        browser,
+        pw=pw,
+        stealth_used=False,
+        method="playwright",
+        root_pid=_playwright_driver_pid(pw) if pw is not None else None,
+    )
 
 
 def _extract_page_data(
@@ -1473,10 +1513,21 @@ def _safe_title(page) -> str:
     return ""
 
 
-def _try_playwright(url: str, proxy_tier: str, timeout: int = 25, country: Optional[str] = None) -> Optional[dict]:
+def _try_playwright(
+    url: str,
+    proxy_tier: str,
+    timeout: int = 25,
+    country: Optional[str] = None,
+    launch_hook=None,
+) -> Optional[dict]:
     ctx = None
     try:
         ctx = _launch_page(method="playwright", proxy_tier=proxy_tier, country=country, stealth="none", timeout=timeout)
+        if launch_hook is not None:
+            try:
+                launch_hook(ctx)
+            except Exception as hook_exc:
+                logger.warning("launch_hook failed: %s: %s", type(hook_exc).__name__, str(hook_exc)[:120])
         page = ctx.page
 
         resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
@@ -1546,7 +1597,13 @@ def _try_playwright(url: str, proxy_tier: str, timeout: int = 25, country: Optio
             ctx.close()
 
 
-def _try_cloak(url: str, proxy_tier: str, timeout: int = 40, country: Optional[str] = None) -> Optional[dict]:
+def _try_cloak(
+    url: str,
+    proxy_tier: str,
+    timeout: int = 40,
+    country: Optional[str] = None,
+    launch_hook=None,
+) -> Optional[dict]:
     """Probe with CloakBrowser — a stealth Chromium with C++-level fingerprint
     patches that defeats Akamai/anti-bot where vanilla Playwright and UC mode fail.
     Mirror of ``_try_playwright`` but drives cloak's stealth binary directly
@@ -1554,6 +1611,11 @@ def _try_cloak(url: str, proxy_tier: str, timeout: int = 40, country: Optional[s
     ctx = None
     try:
         ctx = _launch_page(method="cloak", proxy_tier=proxy_tier, country=country, stealth="cloak", timeout=timeout)
+        if launch_hook is not None:
+            try:
+                launch_hook(ctx)
+            except Exception as hook_exc:
+                logger.warning("launch_hook failed: %s: %s", type(hook_exc).__name__, str(hook_exc)[:120])
         page = ctx.page
 
         resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
