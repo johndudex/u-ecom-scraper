@@ -173,6 +173,49 @@ def _restore_from_archive(
     return False
 
 
+def _restore_job_draft_from_fm(state: dict, slug: str, workspace_dir: str) -> None:
+    """Restore THIS job's own draft archive when the workspace draft is gone.
+
+    [jobs-79/80] code_writer snapshots every draft it completes to
+    ``scrapers/{slug}/jobs/scraper-draft-{job_id}.py`` — promotion to
+    production only happens at cleanup, which a wedged run never reaches.
+    [wave-32 D3] When the latest archive does not parse (a broken snapshot
+    must not become the resume base), prefer the known-good ``-good`` freeze.
+    """
+    _draft_in_ws = os.path.join(workspace_dir, "scraper_draft.py")
+    if os.path.isfile(_draft_in_ws) or not state.get("job_id"):
+        return
+    try:
+        import src.artifacts as artifacts
+
+        from ..draft_safety import draft_good_key, payload_parses
+
+        _per_job_key = artifacts.scrapers_key(
+            slug, "jobs", f"scraper-draft-{state.get('job_id')}.py"
+        )
+        if not artifacts.exists(_per_job_key):
+            return
+        _payload = artifacts.read(_per_job_key)
+        if not payload_parses(_payload):
+            _good_key = draft_good_key(slug, state.get("job_id"))
+            if artifacts.exists(_good_key):
+                _good_payload = artifacts.read(_good_key)
+                if payload_parses(_good_payload):
+                    _payload = _good_payload
+                    logger.info(
+                        "setup_workspace: latest archive unparseable — using the "
+                        "known-good freeze (job %s)", state.get("job_id"),
+                    )
+        with open(_draft_in_ws, "wb") as _f:
+            _f.write(_payload)
+        logger.info(
+            "setup_workspace: restored scraper_draft.py from THIS job's FM "
+            "draft archive (job %s)", state.get("job_id"),
+        )
+    except Exception as exc:
+        logger.warning("setup_workspace: per-job draft restore failed: %s", exc)
+
+
 def setup_workspace(state: ScrapeState) -> dict[str, Any]:
     """Ensure ``workspace/{slug}/`` and ``logs/`` exist (LOCAL), publish any
     leftover outputs to the File Master, and re-hydrate skipped analysis
@@ -242,22 +285,7 @@ def setup_workspace(state: ScrapeState) -> dict[str, Any]:
     # code_writer snapshots every draft it completes to
     # scrapers/{slug}/jobs/scraper-draft-{job_id}.py. The key is per-job, so a
     # fresh user re-run (new job id) can never inherit a stale draft from it.
-    if not os.path.isfile(_draft_in_ws) and state.get("job_id"):
-        try:
-            import src.artifacts as artifacts
-
-            _per_job_key = artifacts.scrapers_key(
-                slug, "jobs", f"scraper-draft-{state.get('job_id')}.py"
-            )
-            if artifacts.exists(_per_job_key):
-                with open(_draft_in_ws, "wb") as _f:
-                    _f.write(artifacts.read(_per_job_key))
-                logger.info(
-                    "setup_workspace: restored scraper_draft.py from THIS job's FM "
-                    "draft archive (job %s)", state.get("job_id"),
-                )
-        except Exception as exc:
-            logger.warning("setup_workspace: per-job draft restore failed: %s", exc)
+    _restore_job_draft_from_fm(state, slug, workspace_dir)
 
     if state.get("skip_code_generation"):
         draft_in_ws = os.path.join(workspace_dir, "scraper_draft.py")

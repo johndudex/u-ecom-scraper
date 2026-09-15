@@ -67,6 +67,34 @@ _ABSENT_DRAFT_RE = re.compile(
 )
 
 
+def _remap_proven_dead(state: dict, fields: list) -> bool:
+    """[wave-32 C2] True when EVERY named failing field's mapping was PROVEN
+    dead on a full-fidelity render (field_verification wrote
+    ``tested="empty"`` under ``render_provenance="full"``). A stale verdict
+    (provenance not full — e.g. the write-time gate downgraded it or the
+    mapping is fresh) or an untested mapping keeps the remap alive: the
+    denial fires only when re-mapping demonstrably cannot create a source.
+    """
+    if not fields:
+        return False
+    analysis = state.get("content_analysis") or state.get("product_analysis") or {}
+    entries = analysis.get("fields") if isinstance(analysis, dict) else None
+    if not isinstance(entries, dict):
+        return False
+    checked = 0
+    for name in fields:
+        info = entries.get(name) if isinstance(entries, dict) else None
+        if not isinstance(info, dict):
+            return False
+        checked += 1
+        if not (
+            info.get("tested") == "empty"
+            and info.get("render_provenance") == "full"
+        ):
+            return False
+    return checked > 0
+
+
 def _extracted_item_count(report: dict) -> int:
     """Best-effort count of items the scraper actually extracted.
 
@@ -1330,7 +1358,14 @@ def _remediation_fingerprint(report) -> str:
     if not isinstance(rem, dict):
         return ""
     target = str(rem.get("target") or "").strip()
-    field = str(rem.get("field") or "").strip()
+    # [wave-32 C3] Multi-field verdicts carry ``fields`` (a list — the same
+    # shape the remap arm consumes); key them as the sorted comma-join so
+    # distinct sets stop colliding on field="" and wave-29 B5's retry lines
+    # match across cycles. Single-``field`` behavior is byte-identical.
+    field = (
+        str(rem.get("field") or "").strip()
+        or ",".join(sorted(str(f) for f in (rem.get("fields") or [])))
+    )
     types = sorted(
         {
             str(i.get("issue_type") or "").strip().upper()
@@ -2219,6 +2254,27 @@ def route_after_testing(state: ScrapeState) -> str:
         # didn't emit a remediation, default to the existing scraper_analyzer path.
         remediation = (report.get("remediation") or {}) if isinstance(report, dict) else {}
         remap_count = state.get("remap_count", 0) or 0
+        # [wave-32 C2] Evidence-based remap denial: when every named failing
+        # field is PROVEN dead on a full render, re-mapping cannot create a
+        # source — burn no remap cycle (and no writer window behind it).
+        # field_confirmation is the coverage-gap interrupt: it auto-acknowledges
+        # under skip_approvals and carries the same approval UX in prod.
+        if (
+            isinstance(remediation, dict)
+            and remediation.get("target") == "mapping"
+            and _remap_proven_dead(state, remediation.get("fields") or [])
+        ):
+            logger.warning(
+                "route_after_testing: mapping failure but every named field "
+                "%s is PROVEN dead (tested=empty, provenance=full) — "
+                "re-mapping cannot create a source → field_confirmation",
+                remediation.get("fields"),
+            )
+            _log_cascade(
+                state, "mapping-remap-denied",
+                f"proven-dead sources: {remediation.get('fields')}",
+            )
+            return "field_confirmation"
         if (
             isinstance(remediation, dict)
             and remediation.get("target") == "mapping"

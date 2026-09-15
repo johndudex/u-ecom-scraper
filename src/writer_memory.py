@@ -114,14 +114,20 @@ def fingerprint_parts(report: dict | None) -> dict:
     """Structural identity of a report's remediation ask: target + field +
     sorted issue-type set + exception class. Mirrors
     webapp/agents/nodes/route_after_testing.py:_remediation_fingerprint's
-    keying EXACTLY (hex must match; that module stays untouched)."""
+    keying EXACTLY (hex must match — keep the two in lockstep, see the
+    wave-32 C3 ``fields`` fallback in both)."""
     if not isinstance(report, dict):
         return {}
     rem = report.get("remediation")
     if not isinstance(rem, dict):
         return {}
     target = str(rem.get("target") or "").strip()
-    field = str(rem.get("field") or "").strip()
+    # [wave-32 C3] Mirror of route_after_testing's fields fallback — hex
+    # parity for multi-field verdicts is what lets B5 retry lines match.
+    field = (
+        str(rem.get("field") or "").strip()
+        or ",".join(sorted(str(f) for f in (rem.get("fields") or [])))
+    )
     types = sorted(
         {
             str(i.get("issue_type") or "").strip().upper()

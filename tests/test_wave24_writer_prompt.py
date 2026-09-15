@@ -42,12 +42,17 @@ class TestEmbeddedTemplateNote:
 
     def test_builder_wires_the_helper(self):
         """Source contract: _build_agent routes template_code through the
-        helper (the note must ride along with every embedded template)."""
+        embed dispatch (the note must ride along with every embedded
+        template). [wave-32 D5] The dispatch is now
+        draft_context.render_writer_embed — full mode still delegates to
+        _embed_template (pinned behaviorally in test_wave32_eow_diet), so
+        the note rides along with every embedded template either way."""
         path = os.path.join(ROOT_DIR, "webapp", "agents", "subagents.py")
         with open(path, encoding="utf-8") as fh:
             src = fh.read()
         body = src[src.index("def _build_agent("):src.index("def _install_invocation_cancellation(")]
-        assert "_embed_template(system_prompt, template_code)" in body
+        assert "render_writer_embed(" in body
+        assert "_resolve_embed_mode(embed_mode)" in body
         assert 'system_prompt += (\n            "\\n\\n### Template' not in body, (
-            "the inline embed block must be replaced by the helper call"
+            "the inline embed block must be replaced by the dispatch call"
         )

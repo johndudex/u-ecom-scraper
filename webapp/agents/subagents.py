@@ -782,8 +782,13 @@ def create_nav_skill_review(site_slug: str = "") -> object:
     return _build_agent("nav_skill_review", site_slug=site_slug)
 
 
-def create_code_writer(site_slug: str = "", template_code: str = "") -> object:
-    return _build_agent("code_writer", site_slug=site_slug, template_code=template_code)
+def create_code_writer(
+    site_slug: str = "", template_code: str = "", embed_mode: str = ""
+) -> object:
+    return _build_agent(
+        "code_writer", site_slug=site_slug, template_code=template_code,
+        embed_mode=embed_mode,
+    )
 
 
 def create_code_tester(site_slug: str = "") -> object:
@@ -1002,7 +1007,47 @@ def _embed_template(system_prompt: str, template_code: str) -> str:
     )
 
 
-def _build_agent(agent_name: str, site_slug: str = "", use_create_agent: bool = False, template_code: str = "") -> object:
+def _resolve_embed_mode(explicit: str = "") -> str:
+    """[wave-32 D5] Kill-switch for the writer's embed diet, read LAZILY at
+    call time so an override lands without a reload.
+
+    - an explicit ``full`` from the call site always wins;
+    - else ``settings.CODE_WRITER_EMBED_MODE`` decides: ``bounded`` forces
+      the diet (debug/e2e); ``auto``/``on`` honors the call site's request
+      (E2a's flip target); anything else — including ABSENT, the default —
+      is ``full`` and VETOES every bounded request, keeping behavior
+      byte-identical until wave-25e E2a flips it.
+    """
+    if explicit == "full":
+        return "full"
+    from django.conf import settings as _settings
+
+    _kill = str(getattr(_settings, "CODE_WRITER_EMBED_MODE", "") or "").strip().lower()
+    if _kill == "bounded":
+        return "bounded"
+    if _kill in ("auto", "on"):
+        return explicit or "full"
+    return "full"
+
+
+def _embed_head_tail_chars() -> tuple[int, int]:
+    """[wave-32 D5] Bounded slice sizes (settings-overridable, module
+    constants as defaults)."""
+    from django.conf import settings as _settings
+
+    from .draft_context import HEAD_CHARS as _h
+    from .draft_context import TAIL_CHARS as _t
+
+    return (
+        int(getattr(_settings, "CODE_WRITER_EMBED_HEAD", _h) or _h),
+        int(getattr(_settings, "CODE_WRITER_EMBED_TAIL", _t) or _t),
+    )
+
+
+def _build_agent(
+    agent_name: str, site_slug: str = "", use_create_agent: bool = False,
+    template_code: str = "", embed_mode: str = "",
+) -> object:
     prompt_stem = AGENT_PROMPT_MAP[agent_name]
     temperature = AGENT_TEMPERATURES[prompt_stem]
 
@@ -1025,8 +1070,18 @@ def _build_agent(agent_name: str, site_slug: str = "", use_create_agent: bool = 
 
     # Bug 3a fix: inject template_code into the system prompt (see
     # _embed_template — the full template, never summarized, plus the
-    # wave-24 W24-6 do-not-read note).
-    system_prompt = _embed_template(system_prompt, template_code)
+    # wave-24 W24-6 do-not-read note). [wave-32 D5] The embed routes through
+    # draft_context.render_writer_embed: full mode is byte-identical to the
+    # legacy output; bounded mode (dormant behind the CODE_WRITER_EMBED_MODE
+    # kill-switch) elides the middle of a huge edit-over-write base.
+    from .draft_context import render_writer_embed
+
+    _head, _tail = _embed_head_tail_chars()
+    system_prompt = render_writer_embed(
+        system_prompt, template_code,
+        mode=_resolve_embed_mode(embed_mode),
+        slug=site_slug, head=_head, tail=_tail,
+    )
 
     if not _has_playwright_tools(tools):
         from .tools import AGENT_TOOL_MAP as _atm

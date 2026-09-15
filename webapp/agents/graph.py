@@ -1035,16 +1035,23 @@ def _preserve_test_report(slug: str) -> None:
         logger.warning("_preserve_test_report: failed: %s", exc)
 
 
+# [wave-32 D1] The writer's budget is counted in TOOL ROUNDS, not raw
+# super-steps: langgraph's prebuilt loop burns ~3 super-steps per tool round
+# (pre_model_hook + model + tool), so the old hard-coded 120 was only ~40
+# rounds — 587's writer died on steps while its wall clock still had room.
+_WRITER_ROUNDS = 50
+
 AGENT_RECURSION_MAP: dict[str, int] = {
     "site_analyzer": 250,
     "product_analyzer": 200,
     # ARCHIVED: "navigation_agent": 200,
     "nav_skill_review": 60,
     "scraper_analyzer": 160,
-    "code_writer": 120,  # recursion limit — high enough to finish (read+write+test+fix
-                         # needs ~25 steps). The wall-clock cap (_invoke_agent_with_timeout
-                         # at 900s) is the real backstop; this just prevents the react loop
-                         # from iterating past GraphRecursionError.
+    "code_writer": _WRITER_ROUNDS * 3 + 2,
+    # ≈50 tool rounds (+2 margin). The REAL backstop is the wall clock
+    # (WRITER_INVOKE_TIMEOUT — 1800s base extending to the WRITER_MAX_TIMEOUT
+    # cap, never 900s) plus wave-32 C1's no-source termination; this number
+    # only stops GraphRecursionError from firing mid-round.
     "code_tester": 120,
     # T1.7: dagster_converter was absent → ran at the default AGENT_RECURSION_LIMIT
     # (150) — which is how job 302 burned 34 LLM calls. Capped BELOW default like
@@ -2123,6 +2130,17 @@ def _writer_max_timeout() -> int:
     return _env_int("WRITER_MAX_TIMEOUT", 2700)
 
 
+def _embed_full_max_chars() -> int:
+    """[wave-32 D5] Draft size above which the writer's embed is worth
+    eliding (settings ``CODE_WRITER_EMBED_FULL_MAX_CHARS``, default 40_000 —
+    the head+tail budget)."""
+    from django.conf import settings as _settings
+
+    return int(
+        getattr(_settings, "CODE_WRITER_EMBED_FULL_MAX_CHARS", 40_000) or 40_000
+    )
+
+
 def _writer_activity_fresh_s() -> int:
     """[wave-30 W30-1] Max tool-activity silence the writer's waiter tolerates
     before declaring the invocation stalled (env
@@ -2536,7 +2554,20 @@ def _invoke_agent_with_timeout(
     except Exception:
         pass
     try:
-        set_tool_deadline(time.time() + timeout)
+        # [wave-32 D2] The tool deadline must see the window the wall-clock
+        # join can actually grant: an extendable writer publishes the
+        # extension CAP, so run_scraper's honesty guard no longer refuses
+        # browser verification inside the 1800→2700s zone the join happily
+        # waits through. The condition MIRRORS the _activity gate below — a
+        # finisher window (allow_activity_extension=False) keeps the base
+        # deadline so its disarm latch stays sharp. Parent-side refresh is
+        # not viable: the ContextVar is copied at thread start.
+        _tool_window = (
+            max(float(timeout), float(_writer_max_timeout()))
+            if phase in _ACTIVITY_EXTENDABLE_PHASES and allow_activity_extension
+            else timeout
+        )
+        set_tool_deadline(time.time() + _tool_window)
     except Exception:
         pass
 
@@ -5439,6 +5470,49 @@ def _writer_hit_step_budget(result) -> bool:
     return False
 
 
+def _log_bloat_tripwire(job_id: int, state: ScrapeState, draft_path: str) -> bool:
+    """[wave-32 D4] Negative-progress tripwire — LOG-ONLY.
+
+    A fix cycle under a FAIL verdict that grew the draft >10% over the last
+    TESTED size while no field passes verification is bloat, not progress
+    (587: 107→124KB across remap cycles). Emits one SessionLog
+    ``[DRAFT-BLOAT]`` row so growth-without-convergence becomes visible on
+    real jobs; escalation is a follow-up once the row exists in the wild.
+    Returns True when the row fired (unit-test seam)."""
+    try:
+        _tr = state.get("test_report")
+        if not isinstance(_tr, dict) or not _tr.get("remediation"):
+            return False
+        if str(_tr.get("overall_assessment") or "").strip().upper() != "FAIL":
+            return False
+        _prev = int(state.get("last_tested_draft_bytes") or 0)
+        if _prev <= 0 or not os.path.isfile(draft_path):
+            return False
+        _now = os.path.getsize(draft_path)
+        if _now <= _prev * 1.1:
+            return False
+        _fv = _tr.get("field_verification") or {}
+        _any_pass = any(
+            str((v or {}).get("tested") or "").strip().lower()
+            in ("pass", "passed", "ok", "success")
+            for v in _fv.values()
+            if isinstance(v, dict)
+        )
+        if _any_pass:
+            return False
+        _pct = (_now * 100 // _prev) - 100
+        _log_event_row(
+            job_id, "code_writer",
+            f"[DRAFT-BLOAT] fix cycle grew the draft {_prev} → {_now} bytes "
+            f"(+{_pct}%) under a FAIL verdict with no field passing "
+            f"verification — negative progress, not convergence",
+        )
+        return True
+    except Exception as _bloat_exc:
+        logger.warning("_log_bloat_tripwire failed: %s", _bloat_exc)
+        return False
+
+
 def _run_draft_finisher(
     state: ScrapeState, config: RunnableConfig, slug: str, job_id: Any
 ) -> dict[str, Any] | None:
@@ -5499,7 +5573,14 @@ def _run_draft_finisher(
             "Land the remaining edits, then run check_syntax and ONE sample "
             "run to confirm. Work efficiently — this is the final window."
         )
-        agent = create_code_writer(site_slug=slug, template_code=_draft_text)
+        # [wave-32 D5] The finisher conditions on SIZE alone — it is
+        # definitionally a post-death window with no EOW state to consult.
+        agent = create_code_writer(
+            site_slug=slug, template_code=_draft_text,
+            embed_mode=(
+                "bounded" if len(_draft_text) >= _embed_full_max_chars() else "full"
+            ),
+        )
         hb = _start_heartbeat(job_id, "code-writer-finisher")
         try:
             # Fixed window, NO activity extension: the job is already deep in
@@ -5548,6 +5629,11 @@ def _run_draft_finisher(
                 _art.scrapers_key(slug, "jobs", f"scraper-draft-{job_id}.py"),
                 open(draft_path, "rb").read(),
             )
+            # [wave-32 D3] The finisher already re-verified the draft parses
+            # above — record the freeze twin alongside the main snapshot.
+            from .draft_safety import freeze_good_draft
+
+            freeze_good_draft(_get_project_root(), slug, job_id)
         except Exception as _snap_exc:
             logger.warning(
                 "_run_draft_finisher: draft FM snapshot failed (job %s): %s",
@@ -5810,7 +5896,20 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         _w24_nudge_token = _writer_fix_cycle.set(_w24_fix)
         _w24_codefix_token = _writer_codefix_cycle.set(_w24_codefix)
         try:
-            agent = create_code_writer(site_slug=slug, template_code=_template_code)
+            # [wave-32 D5] Embed diet: only a huge edit-over-write BASE is
+            # worth eliding — bounded iff the EOW base is live AND it
+            # exceeds the full-embed budget. The kill-switch (default
+            # "full") still vetoes at resolve time, so D5 ships dormant;
+            # fixers inherit the same agent object.
+            _embed_mode = (
+                "bounded"
+                if _eow_active and len(_template_code) >= _embed_full_max_chars()
+                else "full"
+            )
+            agent = create_code_writer(
+                site_slug=slug, template_code=_template_code,
+                embed_mode=_embed_mode,
+            )
         except BaseException:
             _writer_fix_cycle.reset(_w24_nudge_token)
             _writer_codefix_cycle.reset(_w24_codefix_token)
@@ -5903,6 +6002,12 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     _art.scrapers_key(slug, "jobs", f"scraper-draft-{job_id}.py"),
                     open(_cw_draft, "rb").read(),
                 )
+                # [wave-32 D3] Freeze the KNOWN-GOOD twin: only a parseable
+                # draft is recorded, so a later broken snapshot (587) can
+                # never destroy the last restorable copy.
+                from .draft_safety import freeze_good_draft
+
+                freeze_good_draft(_get_project_root(), slug, job_id)
         except Exception as _snap_exc:
             logger.warning(
                 "_invoke_code_writer: draft FM snapshot failed (job %s): %s", job_id, _snap_exc
@@ -6137,6 +6242,28 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         # uses it (catches the regression the prompt-level fix in subagents.py
         # is designed to prevent).
         _warn_unaddressed_critical_fix(slug, state.get("scraper_analysis") or {})
+
+        # [wave-32 D4] Negative-progress tripwire (log-only): flag bloat
+        # under a FAIL verdict BEFORE the syntax fixer may rewrite the file.
+        _log_bloat_tripwire(job_id, state, _draft_path)
+
+        # [wave-32 D3] A writer that left an unparseable draft must not send
+        # the syntax fixer after a destroyed base — restore the job's FM
+        # archive first; it prefers the known-good freeze when the latest
+        # snapshot is itself broken.
+        try:
+            from .draft_safety import draft_parses as _d3_dp
+            from .draft_safety import restore_job_draft as _d3_rjd
+
+            if not _d3_dp(_draft_path):
+                if _d3_rjd(_get_project_root(), slug, job_id) and _d3_dp(_draft_path):
+                    logger.warning(
+                        "_invoke_code_writer: unparseable draft at the syntax "
+                        "guard — restored the FM archive copy before fixing "
+                        "(job %s)", job_id,
+                    )
+        except Exception as _d3_exc:
+            logger.warning("_invoke_code_writer: archive restore check failed: %s", _d3_exc)
 
         # Syntax guard: code_writer has no shell tool to self-validate, so the
         # node parses the scraper and feeds any SyntaxError back for an
@@ -7486,6 +7613,14 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         except Exception as _fp_exc:
             logger.debug("_invoke_code_tester: draft fingerprint failed: %s", _fp_exc)
         update["last_tested_draft_fp"] = _draft_fp
+        # [wave-32 D4] Size baseline for the writer's [DRAFT-BLOAT] tripwire:
+        # growth is only meaningful against what the tester last JUDGED.
+        try:
+            update["last_tested_draft_bytes"] = (
+                os.path.getsize(_draft_for_fp) if _draft_for_fp else 0
+            )
+        except OSError:
+            update["last_tested_draft_bytes"] = 0
         # [wave-24 W24-1] Verdict integrity: did the draft move UNDER this
         # test? Always stamped (True or False) so a clean re-test clears the
         # flag a previous mutated test left behind.

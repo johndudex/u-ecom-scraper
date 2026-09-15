@@ -49,6 +49,52 @@ def draft_path_for(root: str, slug: str) -> str:
     return os.path.join(root, "workspace", slug, DRAFT_FILENAME)
 
 
+# [wave-32 D3] The per-job FM archive gains a KNOWN-GOOD twin:
+# ``scraper-draft-{job_id}-good.py`` freezes the last PARSEABLE draft, so a
+# later broken snapshot (587's SyntaxError draft) can never destroy the last
+# restorable copy. Both restore paths prefer it when the latest does not parse.
+GOOD_SUFFIX = "-good.py"
+
+
+def draft_good_key(slug: str, job_id) -> str:
+    """FM key of the job's known-good draft freeze."""
+    import src.artifacts as artifacts
+
+    return artifacts.scrapers_key(slug, "jobs", f"scraper-draft-{job_id}{GOOD_SUFFIX}")
+
+
+def payload_parses(payload: bytes) -> bool:
+    """Does this archived draft content parse as Python?"""
+    try:
+        ast.parse(bytes(payload).decode("utf-8", errors="replace"))
+        return True
+    except (SyntaxError, ValueError):
+        return False
+
+
+def freeze_good_draft(root: str, slug: str, job_id) -> bool:
+    """Snapshot the CURRENT workspace draft to the known-good FM key.
+
+    A freeze is by definition a parseable draft — an unparseable one is
+    refused (return False) and never overwrites an earlier good freeze.
+    """
+    if not slug or not job_id:
+        return False
+    target = draft_path_for(root, slug)
+    if not draft_parses(target):
+        return False
+    try:
+        import src.artifacts as artifacts
+
+        artifacts.write(draft_good_key(slug, job_id), open(target, "rb").read())
+        return True
+    except Exception as exc:
+        logger.warning(
+            "draft_safety: known-good freeze failed (job %s): %s", job_id, exc
+        )
+        return False
+
+
 def draft_parses(path: str) -> bool:
     """Is ``path`` an existing, parseable Python file? (the draft floor)"""
     if not path or not os.path.isfile(path):
@@ -196,6 +242,19 @@ def restore_job_draft(root: str, slug: str, job_id) -> str | None:
         if not artifacts.exists(per_job_key):
             return None
         payload = artifacts.read(per_job_key)
+        # [wave-32 D3] The latest archive may itself be a broken snapshot
+        # (587 snapshotted a SyntaxError draft). Prefer the known-good
+        # freeze when the latest content does not parse.
+        if not payload_parses(payload):
+            good_key = draft_good_key(slug, job_id)
+            if artifacts.exists(good_key):
+                good_payload = artifacts.read(good_key)
+                if payload_parses(good_payload):
+                    payload = good_payload
+                    logger.info(
+                        "draft_safety: latest archive unparseable — using the "
+                        "known-good freeze (job %s)", job_id,
+                    )
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "wb") as fh:
             fh.write(payload)
