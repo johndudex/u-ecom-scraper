@@ -331,6 +331,13 @@ MCP_PACKAGE_SPEC = os.environ.get("MCP_PLAYWRIGHT_SPEC", "@playwright/mcp@0.0.78
 # and stale run-dir age. Both generous by design — the reaper is a leak BOUND,
 # not a working-set manager; it only ever closes excess beyond these.
 MCP_TAB_KEEP = int(os.environ.get("MCP_TAB_KEEP", "4"))
+# [wave-33 D1] EMERGENCY cap on the MCP Chrome's http tab count — past this
+# the live-driver guard (skip_when=_mcp_client_connected) LOSES and the
+# reaper runs anyway. The guard alone once let tabs pile up unbounded while
+# any socket looked established (the slow memory leak that fed the OOM
+# storms); the one-shot SSE session design also means "connected" is not a
+# reliable driving signal. keep=4 is hygiene; 8 is the storm line.
+MCP_TAB_HARD_CAP = int(os.environ.get("MCP_TAB_HARD_CAP", "8"))
 RUN_DIR_MAX_AGE_S = float(os.environ.get("RUN_DIR_MAX_AGE_S", str(6 * 3600)))
 
 
@@ -1231,6 +1238,7 @@ def _reap_tabs_sync(
     label: str,
     skip_when=None,
     page_count_sink: Optional[dict] = None,
+    hard_cap: int = 0,
 ) -> dict:
     """Close excess http(s) tabs on a persistent Chrome via its CDP HTTP API
     (``/json/list`` + ``/json/close/{id}`` — no CDP websocket needed).
@@ -1246,6 +1254,11 @@ def _reap_tabs_sync(
     driving is worse than the leak it fixes (the MCP Chrome passes
     ``_mcp_client_connected``; the Scraper Chrome is only reaped when idle).
     ``page_count_sink`` receives ``{"count", "checked_at"}`` for /health.
+
+    [wave-33 D1] ``hard_cap`` > 0 is the EMERGENCY line: past it the guard
+    predicate loses and the reaper runs anyway (down to ``hard_cap``). The
+    guard alone let tabs pile up unbounded while any MCP socket looked
+    established — the pileup is the memory storm, not hygiene.
     """
     import json as _json
     import urllib.request
@@ -1274,16 +1287,28 @@ def _reap_tabs_sync(
 
     if len(pages) <= keep:
         return {"kept": len(pages), "closed": 0}
+    effective_keep = keep
+    emergency = False
     if skip_when is not None and skip_when():
-        # fail-closed: a live driver beats tab hygiene; the next cycle reaps.
-        logger.info(
-            "tab reaper(%s): %d http tabs > keep=%d, but the guard predicate held — skipping",
-            label, len(pages), keep,
+        if hard_cap <= 0 or len(pages) <= hard_cap:
+            # fail-closed: a live driver beats tab hygiene; the next cycle reaps.
+            logger.info(
+                "tab reaper(%s): %d http tabs > keep=%d, but the guard predicate held — skipping",
+                label, len(pages), keep,
+            )
+            return {"skipped": "guard_active", "kept": len(pages), "excess": len(pages) - keep}
+        # [wave-33 D1] EMERGENCY: past the hard cap the guard loses — the
+        # pileup IS the storm, and "connected" is not a driving signal.
+        effective_keep = hard_cap
+        emergency = True
+        logger.warning(
+            "tab reaper(%s): EMERGENCY tab cap — %d http tabs > hard_cap=%d "
+            "despite the live-driver guard; reaping to %d",
+            label, len(pages), hard_cap, hard_cap,
         )
-        return {"skipped": "guard_active", "kept": len(pages), "excess": len(pages) - keep}
 
     closed = 0
-    for t in pages[keep:]:  # keep the OLDEST — newest excess is abandoned work
+    for t in pages[effective_keep:]:  # keep the OLDEST — newest excess is abandoned work
         tid = t.get("id")
         if not tid:
             continue
@@ -1297,10 +1322,14 @@ def _reap_tabs_sync(
             continue  # refused/gone — the count log below still reports the cycle
     if closed:
         logger.info(
-            "tab reaper(%s): closed %d excess tab(s) (had %d, keep %d)",
-            label, closed, len(pages), keep,
+            "tab reaper(%s): closed %d excess tab(s) (had %d, keep %d%s)",
+            label, closed, len(pages), effective_keep,
+            ", EMERGENCY" if emergency else "",
         )
-    return {"kept": min(len(pages), keep), "closed": closed}
+    report = {"kept": min(len(pages), effective_keep), "closed": closed}
+    if emergency:
+        report["emergency"] = True
+    return report
 
 
 def _reap_mcp_tabs_sync(keep: int = 0) -> dict:
@@ -1310,6 +1339,7 @@ def _reap_mcp_tabs_sync(keep: int = 0) -> dict:
     return _reap_tabs_sync(
         MCP_CDP_PORT, keep, "mcp",
         skip_when=_mcp_client_connected, page_count_sink=_MCP_PAGE_COUNT,
+        hard_cap=MCP_TAB_HARD_CAP,
     )
 
 

@@ -383,6 +383,7 @@ def _reap_fn(extra):
     ns = {
         "MCP_CDP_PORT": 9222,
         "MCP_TAB_KEEP": 4,
+        "MCP_TAB_HARD_CAP": 8,
         "_MCP_PAGE_COUNT": {"count": None, "checked_at": 0.0},
         "_mcp_client_connected": lambda: False,
         "time": time,
@@ -443,7 +444,9 @@ class TestTabReaper:
         assert ns["_MCP_PAGE_COUNT"]["count"] == 3
 
     def test_skips_while_an_mcp_client_is_connected(self):
-        targets = [_tab(f"https://x.com/{i}", tid=f"t{i}") for i in range(9)]
+        # [wave-33 D1] 6 tabs: over keep=4 (guard exercises) but under the
+        # hard cap=8 (the emergency arm is tested in TestT33_9EmergencyTabCap).
+        targets = [_tab(f"https://x.com/{i}", tid=f"t{i}") for i in range(6)]
         fake = _FakeUrlopen(targets)
         ns = _reap_fn({"_mcp_client_connected": lambda: True, "_fake": fake})
         import urllib.request
@@ -461,7 +464,7 @@ class TestTabReaper:
         assert report["skipped"] == "guard_active"
         assert fake.closed == []
         # the gauge is STILL refreshed even on skip
-        assert ns["_MCP_PAGE_COUNT"]["count"] == 9
+        assert ns["_MCP_PAGE_COUNT"]["count"] == 6
 
     def test_cdp_unavailable_is_a_clean_skip(self):
         def _refuse(*a, **k):
@@ -489,6 +492,54 @@ class TestTabReaper:
         # the client-connected gate is fail-CLOSED (never reap under uncertainty)
         gate = _grab("_mcp_client_connected")
         assert "return True" in gate
+
+
+class TestT33_9EmergencyTabCap:
+    """[wave-33 D1] past MCP_TAB_HARD_CAP the live-driver guard LOSES — the
+    tab pileup is the memory storm, and "connected" is not a driving signal
+    (one-shot SSE sessions + hung sockets made the old skip unbounded)."""
+
+    def _reap(self, tab_count, connected, keep=4, hard_cap=8):
+        targets = [_tab(f"https://x.com/{i}", tid=f"t{i}") for i in range(tab_count)]
+        fake = _FakeUrlopen(targets)
+        ns = _reap_fn({
+            "_mcp_client_connected": (lambda: True) if connected else (lambda: False),
+            "MCP_TAB_HARD_CAP": hard_cap,
+            "_fake": fake,
+        })
+        import urllib.request
+
+        orig = urllib.request.urlopen
+        urllib.request.urlopen = fake
+        try:
+            report = ns["_reap_mcp_tabs_sync"]()
+        finally:
+            urllib.request.urlopen = orig
+        return report, fake.closed
+
+    def test_guard_held_below_cap(self):
+        report, closed = self._reap(6, connected=True)
+        assert report["skipped"] == "guard_active"
+        assert closed == []
+
+    def test_emergency_reaps_past_cap_despite_guard(self):
+        report, closed = self._reap(11, connected=True)
+        assert report["emergency"] is True
+        assert report["kept"] == 8
+        assert report["closed"] == 3
+        # keep the OLDEST (same policy as the normal arm) — newest excess dies
+        assert closed == ["t8", "t9", "t10"]
+
+    def test_normal_reap_unaffected_when_disconnected(self):
+        report, closed = self._reap(7, connected=False)
+        assert report == {"kept": 4, "closed": 3}
+        assert closed == ["t4", "t5", "t6"]
+
+    def test_hard_cap_env_and_wiring(self):
+        src = _src()
+        assert 'MCP_TAB_HARD_CAP = int(os.environ.get("MCP_TAB_HARD_CAP", "8"))' in src
+        wrapper = _grab("_reap_mcp_tabs_sync")
+        assert "hard_cap=MCP_TAB_HARD_CAP" in wrapper
 
 
 class TestStaleRunDirSweep:
