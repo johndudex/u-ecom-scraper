@@ -344,6 +344,9 @@ services:
       timeout: 10s
       start_period: 45s
     restart: unless-stopped
+    # [wave-33 E2] LOCAL-ONLY budget. Prod (Railway) runs this service at 6GB
+    # since 2026-09-15 — soak numbers in docs/plans/wave33-browser-oom-plan.md
+    # are PROD-ONLY and must not be compared against this 4g limit.
     mem_limit: 4g
     memswap_limit: 6g
 
