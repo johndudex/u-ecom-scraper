@@ -446,3 +446,110 @@ class TestT33_2CeleryConsumers:
         assert '"degraded_persistent"' in body, "sustained degraded must read degraded"
         assert body.count('"degraded"') >= 2, "ok/degraded mapping present"
         assert 'display = "down"' in body, "dead must read down, not degraded"
+
+
+# ── T33-3: poisoned-executor swap ───────────────────────────────────────────
+
+
+def _swap_ns():
+    """Namespace for exec'ing server.py's swap machinery: module globals
+    become dict entries; globals() inside the exec'd fns is this dict."""
+    swaps = []
+
+    class _FakeOld:
+        def __init__(self):
+            self.shutdown_called = False
+
+        def shutdown(self, wait=True, cancel_futures=False):
+            self.shutdown_called = True
+
+    old_nav, old_probe = _FakeOld(), _FakeOld()
+    ns = {
+        "NAVIGATE_EXECUTOR": old_nav,
+        "PROBE_EXECUTOR": old_probe,
+        "_POOL_SPEC": {"navigate": 3, "probe": 2},
+        "_SWAP_COOLDOWN_S": 600.0,
+        "_LAST_SWAP_TS": {},
+        "_SWAP_COUNTS": {},
+        "_SWAP_LOCK": threading.Lock(),
+        "ThreadPoolExecutor": __import__(
+            "concurrent.futures", fromlist=["ThreadPoolExecutor"]
+        ).ThreadPoolExecutor,
+        "time": time,
+        "threading": threading,
+        "logger": __import__("logging").getLogger("t33"),
+        "bump_launch_generation": lambda pool: swaps.append(pool) or 7,
+        "_thread_pool_name": lambda n: n.rsplit("_", 1)[0],
+    }
+    return ns, old_nav, old_probe, swaps
+
+
+def _exec_swap_fns(ns):
+    src = _read(SERVER_PATH)
+    for name in ("_swap_executor", "_maybe_swap_poisoned_pools"):
+        exec(compile(_grab(src, name), "<g>", "exec"), ns)
+    return ns["_swap_executor"], ns["_maybe_swap_poisoned_pools"]
+
+
+class TestT33_3ExecutorSwap:
+    def test_swap_rebuilds_pool_and_bumps_generation(self):
+        ns, old_nav, _old_probe, swaps = _swap_ns()
+        swap, _ = _exec_swap_fns(ns)
+        assert swap("navigate", "test") is True
+        assert ns["NAVIGATE_EXECUTOR"] is not old_nav, "pool rebuilt"
+        assert old_nav.shutdown_called, "old pool retired (drains in flight)"
+        assert swaps == ["navigate"], "generation bump clears the blacklist"
+        assert ns["_SWAP_COUNTS"] == {"navigate": 1}
+
+    def test_swap_cooldown_blocks_churn(self):
+        """A launch-failure storm must not churn pools every cycle."""
+        ns, _old, _oldp, swaps = _swap_ns()
+        swap, _ = _exec_swap_fns(ns)
+        assert swap("navigate", "first") is True
+        assert swap("navigate", "again") is False, "inside cooldown"
+        assert swaps == ["navigate"] and ns["_SWAP_COUNTS"] == {"navigate": 1}
+
+    def test_swap_only_rebuilds_launch_pools(self):
+        """Only navigate/probe run in-process sync-playwright loops; scrape
+        launches Chrome in subprocesses — there is nothing to swap."""
+        ns, _o, _p, swaps = _swap_ns()
+        swap, _ = _exec_swap_fns(ns)
+        assert swap("scrape", "n/a") is False
+        assert swaps == []
+
+    def test_swap_probe_pool_leaves_navigate_alone(self):
+        ns, old_nav, old_probe, swaps = _swap_ns()
+        swap, _ = _exec_swap_fns(ns)
+        assert swap("probe", "test") is True
+        assert ns["PROBE_EXECUTOR"] is not old_probe
+        assert ns["NAVIGATE_EXECUTOR"] is old_nav
+        assert swaps == ["probe"]
+
+    def test_maybe_swap_maps_thread_to_pool_and_swaps_one_per_cycle(self):
+        snap = {"poisoned_threads": ["navigate_0", "probe_1"]}
+        ns, _o, _p, swaps = _swap_ns()
+        ns["launch_poison_snapshot"] = lambda: snap
+        _, maybe = _exec_swap_fns(ns)
+        maybe()
+        assert swaps == ["navigate"], (
+            "one swap per cycle — the generation bump covers the pool; the "
+            "next cycle handles any other pool"
+        )
+
+    def test_maybe_swap_is_a_noop_when_clean(self):
+        ns, old_nav, _p, swaps = _swap_ns()
+        ns["launch_poison_snapshot"] = lambda: {"poisoned_threads": []}
+        _, maybe = _exec_swap_fns(ns)
+        maybe()
+        assert swaps == [] and ns["NAVIGATE_EXECUTOR"] is old_nav
+
+    def test_maintenance_loop_wires_the_swap(self):
+        """The 15s liveness loop must carry the cure — poison never self-
+        clears (RCA 2026-09-15) and restart_chrome does not touch executor
+        threads."""
+        src = _read(SERVER_PATH)
+        loop = re.search(
+            r"async def _periodic_cdp_liveness\(.*?(?=\nasync def |\ndef )", src, re.S
+        )
+        assert loop and "poison_swap" in loop.group(0)
+        assert '"executor_swaps"' in src, "swap counts must be gauged in /health"

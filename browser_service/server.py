@@ -6,6 +6,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +25,8 @@ from .browser_pool import browser_pool
 from .config import get_proxy_config
 from .probe import (
     _launch_health_snapshot,
+    _thread_pool_name,
+    bump_launch_generation,
     launch_poison_snapshot,
     launch_window_stats,
     run_probe,
@@ -111,6 +114,75 @@ RESTART_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="restart
 # within one cycle instead of silent.
 MAINT_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="maint")
 PROBE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="probe")
+
+# ── [wave-33 T33-3] poisoned-executor swap ────────────────────────────────
+# A sync-playwright guard event poisons a thread FOREVER (the 09-14/09-15 RCA:
+# 5-6ms instant-fails, zero successes for hours, restart_chrome cures nothing
+# — only the container recycle did). The in-process equivalent of that recycle:
+# retire → drain → rebuild the pool, then bump the probe-side generation so
+# replacement threads with recycled names are not born-guilty. Per-thread
+# routing inside a ThreadPoolExecutor is not implementable — the pool swap is.
+# Only pools that launch in-process browsers are swappable; /scrape spawns
+# Chrome in subprocesses and has nothing to poison.
+_POOL_SPEC = {"navigate": NAVIGATE_MAX_CONCURRENT, "probe": 2}
+_SWAP_COOLDOWN_S = float(os.environ.get("EXECUTOR_SWAP_COOLDOWN_S", "600"))
+_SWAP_LOCK = threading.Lock()
+_LAST_SWAP_TS: dict[str, float] = {}
+_SWAP_COUNTS: dict[str, int] = {}
+
+
+def _swap_executor(name: str, reason: str) -> bool:
+    """Rebuild a poisoned executor pool. Cooldown-gated (a launch-failure
+    storm must not churn pools); one rebuild restores full pool capacity.
+
+    Drain semantics: the old pool is shut down WITHOUT waiting — in-flight
+    and queued tasks keep running to completion on the retired object (they
+    are on threads that were never poisoned); new dispatch lands on the
+    rebuild because call sites read the module global at dispatch time.
+    """
+    if name not in _POOL_SPEC:
+        return False
+    with _SWAP_LOCK:
+        now = time.monotonic()
+        if now - _LAST_SWAP_TS.get(name, float("-inf")) < _SWAP_COOLDOWN_S:
+            logger.warning(
+                "executor swap for %s skipped — inside %.0fs cooldown (%s)",
+                name,
+                _SWAP_COOLDOWN_S,
+                reason,
+            )
+            return False
+        old = globals().get(f"{name.upper()}_EXECUTOR")
+        if old is None:  # defensive — spec and globals must agree
+            return False
+        rebuilt = ThreadPoolExecutor(
+            max_workers=_POOL_SPEC[name], thread_name_prefix=name
+        )
+        globals()[f"{name.upper()}_EXECUTOR"] = rebuilt
+        _LAST_SWAP_TS[name] = now
+        _SWAP_COUNTS[name] = _SWAP_COUNTS.get(name, 0) + 1
+    bump_launch_generation(name)  # recycled names must not stay blacklisted
+    old.shutdown(wait=False, cancel_futures=False)
+    logger.warning(
+        "executor swap: %s pool rebuilt (gen bumped, %d threads) — %s; "
+        "old pool draining",
+        name,
+        _POOL_SPEC[name],
+        reason,
+    )
+    return True
+
+
+def _maybe_swap_poisoned_pools() -> None:
+    """Maintenance hook: swap the pool owning any current-generation poisoned
+    thread. One swap per cycle — the generation bump covers the whole pool;
+    the next cycle (15s) handles any other pool."""
+    for thread_name in launch_poison_snapshot()["poisoned_threads"]:
+        pool = _thread_pool_name(thread_name)
+        if pool in _POOL_SPEC and _swap_executor(
+            pool, f"poisoned thread {thread_name}"
+        ):
+            break
 
 # B1-2 maintenance telemetry: submission stamps + completion heartbeats.
 _MAINT_SUBMITTED: dict[str, float] = {}
@@ -1132,6 +1204,16 @@ async def _periodic_cdp_liveness():
             _CDP_LIVENESS_CACHE.clear()
             _CDP_LIVENESS_CACHE.update(liveness)
 
+            # [wave-33 T33-3] The poison cure rides the liveness cadence: any
+            # current-generation poisoned executor thread gets its pool
+            # swapped here (cooldown-gated). Poison never self-clears and
+            # restart_chrome cannot reach executor threads (RCA 2026-09-15) —
+            # before this, the ONLY cure was a container recycle.
+            await asyncio.get_event_loop().run_in_executor(
+                MAINT_EXECUTOR,
+                _maint_task("poison_swap", _maybe_swap_poisoned_pools),
+            )
+
             # [wave-14] Also answer "does the MCP node process actually SERVE?"
             # (poll()==alive + CDP-alive can both hold while the SSE server is
             # wedged — the django agent then sees tools/list hang → 0 tools).
@@ -1866,6 +1948,9 @@ async def health():
             "launch_health": _launch_health_snapshot(),
             "launch_window": launch_recent,
             "poison": poison,
+            # [wave-33 T33-3] effective-capacity telemetry: every swap briefly
+            # runs the retired + rebuilt pools concurrently (drain window).
+            "executor_swaps": dict(_SWAP_COUNTS),
             "gauges": _health_gauges(deadline),
             "navigate_slots_busy": nav_busy,
             "navigate_slots_total": NAVIGATE_MAX_CONCURRENT,
