@@ -668,6 +668,9 @@ def get_shell_tools(
                             "args": cmd_args,
                             "timeout": timeout,
                             "env_overrides": env_overrides,
+                            # [wave-33 C3] short probe — no crash-retry ladder
+                            # (graph.py:7295 precedent); containment is C2/C3.
+                            "max_retries": 1,
                             # [wave-14 job-133] Correlate browser_service-side
                             # run dirs/logs with the DB job (rid registry,
                             # orphan cleanup). Old peers ignore unknown fields.

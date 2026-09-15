@@ -115,6 +115,175 @@ def active_runs_snapshot() -> list[dict[str, Any]]:
             for rid, meta in sorted(_ACTIVE_RUNS.items())
         ]
 
+
+# ── [wave-33 C3] rc≠0 containment: killpg + one-shot chrome sweep ──────────
+# The BFS-from-dead-parent orphan killer cannot reach the reparented cloak
+# Chromium (its parent died; it hangs off init). On any non-zero scraper
+# exit — especially returncode <= -9, where the group leader was SIGKILLed
+# and the grandchildren escaped — we killpg the group AND sweep: only chrome
+# processes BORN during this attempt, outside the protected set, die. Four
+# safety layers: the cmdline pattern, the /proc-starttime anchor, the
+# protected set (persistent ∪ registry-live ∪ sibling-run trees), and the
+# anchored kill itself.
+
+
+def _proc_children_local(pid: int) -> list[int]:
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children", "r") as fh:
+            return [int(p) for p in fh.read().split()]
+    except (OSError, ValueError):
+        return []
+
+
+def _descendants(pid: int) -> set[int]:
+    """BFS the /proc children tree of pid (root included when alive)."""
+    seen: set[int] = set()
+    frontier = [pid]
+    while frontier and len(seen) < 4096:
+        p = frontier.pop()
+        if p in seen:
+            continue
+        seen.add(p)
+        frontier.extend(_proc_children_local(p))
+    return seen
+
+
+def _proc_starttime_ticks(pid: int) -> int | None:
+    """Field 22 of /proc/<pid>/stat (ticks since boot), or None if gone.
+
+    Raw tick values are comparable BETWEEN processes without knowing boot
+    time or tick rate — enough to answer "was this process born during the
+    failed attempt".
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            data = fh.read()
+        # comm can contain spaces/parens — split after the LAST ')'
+        return int(data.rpartition(b")")[2].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _pgrep_chrome_pids() -> list[int]:
+    """PIDs whose cmdline matches chrome|chromium (pgrep -f; a /proc cmdline
+    walk is the fallback where pgrep is absent)."""
+    try:
+        out = subprocess.run(
+            ["pgrep", "-f", "chrome|chromium"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return [int(p) for p in out.stdout.split()]
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+        pass
+    found: list[int] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+                cmd = fh.read().replace(b"\x00", b" ").decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "chrome" in cmd or "chromium" in cmd:
+            found.append(int(entry))
+    return found
+
+
+def _persistent_chrome_pids() -> set[int]:
+    """Root pids of the persistent Chromes (MCP + Scraper) via browser_pool.
+
+    ImportError in a slim container propagates — the caller degrades.
+    """
+    from . import browser_pool
+
+    h = browser_pool.health()
+    return {h[k] for k in ("mcp_pid", "scraper_pid") if h.get(k)}
+
+
+def _registry_live_pids() -> set[int]:
+    """Trees protecting in-flight probe/navigate calls (server registry)."""
+    from .server import _ephemeral_protected_pids
+
+    return _ephemeral_protected_pids()
+
+
+def _protected_pids_for_sweep() -> set[int]:
+    """Everything the sweep must never kill: persistent Chrome trees ∪
+    sibling live-run trees ∪ registry-live ephemeral trees. Each source is
+    best-effort — a missing one degrades coverage, never raises."""
+    protected: set[int] = set()
+    try:
+        for root in _persistent_chrome_pids():
+            protected |= _descendants(root)
+    except Exception:
+        pass
+    try:
+        with _ACTIVE_RUNS_LOCK:
+            pids = [m.get("pid") for m in _ACTIVE_RUNS.values() if m.get("pid")]
+        for p in pids:
+            protected |= _descendants(p)
+    except Exception:
+        pass
+    try:
+        protected |= _registry_live_pids()
+    except Exception:
+        pass
+    return protected
+
+
+def _chrome_sweep(born_at_or_after: int | None, protected: set[int]) -> list[int]:
+    """One-shot chrome sweep for a failed attempt; returns the killed pids.
+
+    Anchored on /proc starttime ticks: only processes born at/after the
+    attempt's own birth tick and outside ``protected`` are SIGKILLed, so
+    persistent Chromes, sibling runs and in-flight probes/navigates survive
+    even when the pattern over-matches.
+    """
+    if born_at_or_after is None:
+        return []
+    killed: list[int] = []
+    for pid in _pgrep_chrome_pids():
+        if pid in protected:
+            continue
+        st = _proc_starttime_ticks(pid)
+        if st is None or st < born_at_or_after:
+            continue  # gone since the listing, or born before this run
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed.append(pid)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    return killed
+
+
+def _contain_failed_attempt(
+    proc: subprocess.Popen, child_start_ticks: int | None
+) -> list[int]:
+    """rc≠0 containment: killpg the attempt's group (reaches same-group
+    survivors of an already-dead leader) then one-shot sweep the ESCAPED
+    chrome (reparented cloak — invisible to tree walks). Returns the swept
+    pids for the log."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass  # group already gone
+    try:
+        killed = _chrome_sweep(child_start_ticks, _protected_pids_for_sweep())
+    except Exception:
+        logger.exception("C3 sweep errored — containment degraded")
+        killed = []
+    if killed:
+        logger.warning(
+            "C3 sweep: killed %d escaped chrome process(es) born during the "
+            "failed attempt: %s",
+            len(killed),
+            killed,
+        )
+    return killed
+
+
 # ── Chrome crash detection ──────────────────────────────────────────────
 # When a scraper dies because Chrome became unresponsive/closed (common on
 # long browser sessions — e.g. iterating 200+ specialties), the service can
@@ -450,6 +619,10 @@ def _run_scraper_script_impl(
                     _spawn_cancelled = _ACTIVE_RUNS[rid].get("cancel", False)
                 else:
                     _spawn_cancelled = False
+            # [wave-33 C3] sweep anchor = this attempt's own birth tick —
+            # everything it spawns (incl. the escaped cloak browser) is born
+            # at/after this; everything else predates it.
+            _child_ticks = _proc_starttime_ticks(proc.pid)
             if _spawn_cancelled:
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
@@ -466,6 +639,12 @@ def _run_scraper_script_impl(
                     except Exception:
                         pass
                 stdout_s, stderr_s = proc.communicate()  # reap
+                # [wave-33 C3] the cloak browser escapes the killpg — one-shot
+                # sweep before handing the Chrome back to the next caller.
+                try:
+                    _chrome_sweep(_child_ticks, _protected_pids_for_sweep())
+                except Exception:
+                    logger.exception("C3 sweep errored after timeout — containment degraded")
                 result = subprocess.CompletedProcess(
                     cmd, proc.returncode, stdout_s, stderr_s
                 )
@@ -482,6 +661,13 @@ def _run_scraper_script_impl(
             # Success.
             if result.returncode == 0:
                 return _post_run(result, scraper_path, round(time.time() - start, 2))
+
+            # [wave-33 C3] rc≠0 containment BEFORE the retry decision: the
+            # group may hold survivors and the cloak browser escapes it
+            # entirely — killpg + one-shot sweep (especially returncode <= -9:
+            # the group leader was SIGKILLed; the grandchildren reparented to
+            # init where no tree walk can reach them).
+            _contain_failed_attempt(proc, _child_ticks)
 
             # Non-zero exit — classify: Chrome crash (retryable) vs code bug.
             stderr = result.stderr or ""

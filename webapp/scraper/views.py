@@ -1814,6 +1814,8 @@ def site_rerun(request, site_id):
             "extra_files": _rerun_extra,
             "args": [],
             "timeout": 3600,
+            # [wave-33 C3] synchronous user-facing hold — no crash-retry ladder.
+            "max_retries": 1,
         }
         if getattr(site, "needs_akamai_bypass", False):
             scrape_json["env_overrides"] = {"STEALTH_BROWSER": "cloak"}

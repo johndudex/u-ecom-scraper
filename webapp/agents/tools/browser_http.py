@@ -190,6 +190,29 @@ def _attempt_timeout(
     return min(timeout, max(remaining, MIN_ATTEMPT_BUDGET_S))
 
 
+def bounded_scrape_attempts(
+    timeout: float, total_budget_s: float | None = None, payload_cap: int = 3
+) -> int:
+    """[wave-33 C3] /scrape payload attempts bound.
+
+    Chrome-crash retries stay load-bearing (F2/F3 recovery), but total
+    attempts are bounded by the caller's remaining budget:
+    ``min(payload_cap, max(2, floor(slack / timeout)))`` where
+    ``slack = budget − timeout`` (default budget ``timeout +
+    DEFAULT_BUDGET_SLACK_S``). The floor of 2 guarantees one crash
+    recovery; an explicit payload cap below it (short probes) is honored.
+    """
+    budget = (
+        total_budget_s if total_budget_s is not None else timeout + DEFAULT_BUDGET_SLACK_S
+    )
+    try:
+        slack = max(0.0, float(budget) - float(timeout))
+        fits = int(slack // float(timeout)) if timeout > 0 else 0
+    except (TypeError, ValueError):
+        fits = 0
+    return min(int(payload_cap), max(2, fits))
+
+
 def _summarize_failure(result: ScrapeResult) -> str:
     if result.throttled:
         return (

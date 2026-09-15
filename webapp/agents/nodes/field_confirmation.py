@@ -501,6 +501,8 @@ def _run_sample_via_queue(scraper_path: str, args: list[str]) -> str:
                 "extra_files": _read_sibling_files(scraper_path),
                 "args": args,
                 "timeout": 300,
+                # [wave-33 C3] short probe — no crash-retry ladder.
+                "max_retries": 1,
             },
             timeout=310,
         )

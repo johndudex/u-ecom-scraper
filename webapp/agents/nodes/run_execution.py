@@ -1534,6 +1534,7 @@ def _run_via_browser_service(
     from ..graph import _notify_phase
     from ..tools.browser_http import (
         PREFLIGHT_MAX_WAIT_S,
+        bounded_scrape_attempts,
         post_scrape_with_retry,
         wait_for_browser_service,
     )
@@ -1629,6 +1630,8 @@ def _run_via_browser_service(
                     pass
         # W8: bounded retry on 429/502/503/504 + transport errors — a bare
         # raise_for_status() turned backpressure into an execution failure.
+        # [wave-33 C3] crash-retries stay load-bearing but are budget-bounded
+        # (2 attempts for the 3600s execution: one F2/F3 crash recovery).
         _res = post_scrape_with_retry(
             f"{service_url}/scrape",
             {
@@ -1637,6 +1640,7 @@ def _run_via_browser_service(
                 "extra_files": _extra,
                 "args": args,
                 "timeout": timeout,
+                "max_retries": bounded_scrape_attempts(timeout),
                 "env_overrides": stealth_env,
             },
             timeout=timeout + 60,
