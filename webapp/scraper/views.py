@@ -1489,6 +1489,20 @@ def probe_tester(request):
         resp.raise_for_status()
         data = resp.json()
         return JsonResponse(data)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            # [wave-33 C1a] honest backpressure to the probe-tester UI.
+            return JsonResponse(
+                {
+                    "success": False,
+                    "throttled": True,
+                    "error": "browser-service busy (HTTP 429) — try again shortly",
+                },
+                status=429,
+            )
+        return JsonResponse(
+            {"success": False, "error": str(exc)[:500]}, status=502
+        )
     except httpx.ReadTimeout:
         return JsonResponse({"success": False, "error": "Probe timed out (120s)"})
     except Exception as exc:

@@ -3408,6 +3408,20 @@ def _fetch_via_probe_html(url: str) -> str:
         )
         return f"RENDER FAILED: {data.get('error', 'unknown')}"
     except Exception as exc:
+        # [wave-33 C1a] a 429 from browser-service is backpressure — the
+        # distinct BUSY token tells the browse loop to back off instead of
+        # treating the page as unrenderable.
+        from ..tools.browser_http import throttle_retry_after
+
+        _wait = throttle_retry_after(exc)
+        if _wait is not None:
+            logger.warning(
+                "navigate_explore: probe_html throttled (HTTP 429) — browser-service busy"
+            )
+            return (
+                "RENDER THROTTLED: browser-service busy (HTTP 429) — "
+                f"backpressure, not a site verdict; retry after ~{_wait:.0f}s"
+            )
         logger.error("navigate_explore: probe_html error: %s", exc)
         return f"RENDER FAILED: {exc}"
 

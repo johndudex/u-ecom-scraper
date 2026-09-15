@@ -142,6 +142,25 @@ def _retry_after_seconds(resp: httpx.Response | None) -> float:
         return DEFAULT_RETRY_AFTER_S
 
 
+def throttle_retry_after(exc: BaseException) -> float | None:
+    """[wave-33 C1a] browser-service said HTTP 429 — backpressure, not a
+    site verdict.
+
+    Returns the capped Retry-After seconds when *exc* is a 429 raised from a
+    browser-service call, else None. Callers PARK on this: a caller that
+    treats a 429 as a failed rung escalates its ladder into a saturated
+    service and multiplies launches instead of reducing them (the C1-gate
+    ordering constraint — tolerance ships before the gate).
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            if exc.response.status_code == HTTP_THROTTLED:
+                return _retry_after_seconds(exc.response)
+        except AttributeError:  # pragma: no cover - malformed fake in tests
+            pass
+    return None
+
+
 def _sleep_for_retry(resp: httpx.Response | None, deadline: float) -> bool:
     """Sleep toward the next attempt, capped by the budget. False = out of budget."""
     remaining = deadline - time.monotonic()

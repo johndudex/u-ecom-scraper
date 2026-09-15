@@ -145,8 +145,11 @@ class TestNavigateMemoryGate:
         assert "if NAVIGATE_MEMORY_GATE_RATIO > 0:" in src, "≤0 must disable the gate"
 
     def test_gate_falls_open_when_unreadable(self):
+        # [wave-33 C1b migration] the fall-open contract moved into the shared
+        # _admit helper (navigate delegates to it with its 0.85 ratio).
         src = _src()
-        assert "if mem_ratio is not None and mem_ratio >= NAVIGATE_MEMORY_GATE_RATIO:" in src
+        assert "if mem_ratio is None or mem_ratio < gate:" in src
+        assert 'await _admit("navigate", NAVIGATE_MEMORY_GATE_RATIO)' in src
 
     def test_memory_ratio_reader_handles_v2_v1_and_missing(self):
         fn = _exec_helper("_cgroup_memory_ratio")

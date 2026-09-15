@@ -220,6 +220,11 @@ def _maint_task(label: str, fn):
 # root cause of the prod 502 windows. Falls OPEN when the cgroup files are
 # unreadable (non-Linux cgroup v2 layouts); set ≤0 to disable.
 NAVIGATE_MEMORY_GATE_RATIO = float(os.environ.get("NAVIGATE_MEMORY_GATE_RATIO", "0.85"))
+# [wave-33 C1b] capacity admission for the OTHER browser-launching surfaces
+# (/probe-single browser rungs, /scrape). Looser than navigate's 0.85: a
+# timed-out probe caller is re-driven soon after, and /scrape is a bounded
+# pool — both deserve headroom before the ceiling.
+GLOBAL_MEMORY_GATE_RATIO = float(os.environ.get("GLOBAL_MEMORY_GATE_RATIO", "0.90"))
 
 
 def _cgroup_memory_ratio() -> float | None:
@@ -2173,6 +2178,25 @@ async def probe_single(request: SingleProbeRequest):
 
     method = request.method
     country = request.country or _detect_country(request.url)
+
+    # [wave-33 C1b] capacity admission for browser-launching rungs only —
+    # direct_http/fingerprint rungs are cheap diagnostics and stay exempt.
+    # Callers learned to park on 429 (C1a); refusing here must never cause
+    # MORE launches.
+    if _is_browser_launch_method(method):
+        verdict = await _admit(f"probe-single:{method}")
+        if not verdict["admitted"]:
+            return _backpressure(
+                429,
+                (
+                    f"memory pressure ({(verdict['mem_ratio'] or 0):.0%} of cgroup "
+                    "limit) — refusing browser launch"
+                ),
+                30,
+                error_class="memory_pressure",
+                mem_ratio=round(verdict["mem_ratio"], 3) if verdict["mem_ratio"] else None,
+            )
+
     method_map = {
         "direct_http": lambda: _try_direct_http(
             request.url, min(request.timeout, 15), "none"
@@ -2385,6 +2409,21 @@ async def scrape(request: ScrapeRequest):
             f"scrape concurrency limit reached ({scrape_busy}/{SCRAPE_MAX_CONCURRENT})",
             15,
             busy=scrape_busy,
+        )
+    # [wave-33 C1b] capacity admission: the run drives the Scraper Chrome —
+    # refusing before launch is cheaper than a half-launched browser under
+    # pressure. post_scrape_with_retry callers already park-and-retry on 429.
+    verdict = await _admit("scrape")
+    if not verdict["admitted"]:
+        return _backpressure(
+            429,
+            (
+                f"memory pressure ({(verdict['mem_ratio'] or 0):.0%} of cgroup "
+                "limit) — refusing scrape launch"
+            ),
+            30,
+            error_class="memory_pressure",
+            mem_ratio=round(verdict["mem_ratio"], 3) if verdict["mem_ratio"] else None,
         )
     # Stateless staging: write the caller-supplied source to a private /tmp dir
     # (one per call — no cross-call collision), run it, capture output CONTENT,
@@ -3001,6 +3040,54 @@ async def _navigate_self_heal_if_zombie(reason: str) -> bool:
     return bool(report["restarted"])
 
 
+async def _admit(label: str, ratio: float | None = None) -> dict:
+    """[wave-33 C1b] capacity admission for the browser-launching surfaces.
+
+    Generalizes the navigate memory gate with its full contract carried over:
+    refuse the fork BEFORE the launch when the cgroup is near its ceiling
+    (Errno 11 fork failures under pressure were the prod 502 root cause — a
+    rejected launch is far cheaper than a half-launched browser); before
+    refusing, one self-heal round for a CDP-dead zombie persistent Chrome
+    pinning the memory (#210), sharing the navigate heal cooldown so a
+    stampede of gated callers can't thrash restarts; falls OPEN when the
+    ratio can't be read (None).
+
+    Returns {"admitted": bool, "mem_ratio": float | None} — when refused the
+    caller answers 429 + Retry-After (callers learned to park on 429 in C1a).
+    """
+    gate = GLOBAL_MEMORY_GATE_RATIO if ratio is None else ratio
+    if gate <= 0:
+        return {"admitted": True, "mem_ratio": None}
+    mem_ratio = _cgroup_memory_ratio()
+    if mem_ratio is None or mem_ratio < gate:
+        return {"admitted": True, "mem_ratio": mem_ratio}
+    healed = await _navigate_self_heal_if_zombie(f"memory_gate:{label}")
+    if healed:
+        mem_ratio = _cgroup_memory_ratio()
+    if mem_ratio is not None and mem_ratio >= gate:
+        logger.warning(
+            "%s: memory gate tripped (ratio=%.2f >= %.2f) — refusing new browser launch",
+            label,
+            mem_ratio,
+            gate,
+        )
+        return {"admitted": False, "mem_ratio": mem_ratio}
+    return {"admitted": True, "mem_ratio": mem_ratio}
+
+
+def _is_browser_launch_method(method: Optional[str]) -> bool:
+    """[wave-33 C1b] /probe-single rungs that launch a browser.
+
+    direct_http_* / fingerprint_* are HTTP-flavoured (curl_cffi TLS
+    impersonation, no JS, no browser) — exempt from the memory gate; gating
+    them would refuse the CHEAPEST diagnostic rungs exactly when the box is
+    under pressure.
+    """
+    if not method:
+        return False
+    return not method.startswith(("direct_http", "fingerprint_"))
+
+
 @app.post("/navigate")
 async def navigate(request: NavigateRequest):
     """Launch an ephemeral browser, navigate, run actions, extract, tear down.
@@ -3056,39 +3143,26 @@ async def navigate(request: NavigateRequest):
         )
 
     start = time.monotonic()
-    # W4 memory gate: refuse the fork BEFORE the browser launch when the
-    # cgroup is already near its ceiling — Errno 11 fork failures under
-    # memory pressure were the root cause of the prod 502 windows, and a
-    # rejected launch is far cheaper than a half-launched browser. Falls
-    # open when the ratio can't be read (None).
+    # W4 memory gate (C1b: via the shared _admit helper — same contract):
+    # refuse the fork BEFORE the browser launch when the cgroup is already
+    # near its ceiling; one zombie self-heal round first; falls open when the
+    # ratio can't be read (None).
     if NAVIGATE_MEMORY_GATE_RATIO > 0:
-        mem_ratio = _cgroup_memory_ratio()
-        if mem_ratio is not None and mem_ratio >= NAVIGATE_MEMORY_GATE_RATIO:
-            # B2: before refusing, check whether a ZOMBIE persistent Chrome is
-            # pinning the memory (prod #210: mcp_cdp_alive=false for 8+h while
-            # its RSS held the floor and every launch 502'd). One self-heal
-            # round may free enough to admit the call; the cooldown keeps a
-            # stampede of gated callers from thrashing restarts.
-            healed = await _navigate_self_heal_if_zombie("memory_gate")
-            if healed:
-                mem_ratio = _cgroup_memory_ratio()
-            if mem_ratio is not None and mem_ratio >= NAVIGATE_MEMORY_GATE_RATIO:
-                logger.warning(
-                    "navigate: memory gate tripped (ratio=%.2f ≥ %.2f) for %s",
-                    mem_ratio, NAVIGATE_MEMORY_GATE_RATIO, request.url[:100],
-                )
-                _record_nav_outcome("throttled")
-                _log_nav_outcome("throttled", 429, request.url, (time.monotonic() - start) * 1000, "memory_pressure")
-                return _backpressure(
-                    429,
-                    (
-                        f"memory pressure ({mem_ratio:.0%} of cgroup limit) — "
-                        "refusing new browser launch"
-                    ),
-                    30,
-                    error_class="memory_pressure",
-                    mem_ratio=round(mem_ratio, 3),
-                )
+        verdict = await _admit("navigate", NAVIGATE_MEMORY_GATE_RATIO)
+        if not verdict["admitted"]:
+            mem_ratio = verdict["mem_ratio"]
+            _record_nav_outcome("throttled")
+            _log_nav_outcome("throttled", 429, request.url, (time.monotonic() - start) * 1000, "memory_pressure")
+            return _backpressure(
+                429,
+                (
+                    f"memory pressure ({mem_ratio:.0%} of cgroup limit) — "
+                    "refusing new browser launch"
+                ),
+                30,
+                error_class="memory_pressure",
+                mem_ratio=round(mem_ratio, 3),
+            )
 
     # Queue-full backpressure (active + queued)
     if _navigate_in_flight >= NAVIGATE_MAX_CONCURRENT + NAVIGATE_MAX_QUEUE:

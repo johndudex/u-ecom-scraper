@@ -2102,8 +2102,18 @@ def _fetch_rendered_jsonld(url: str) -> str:
         bs = "http://browser_service:8001"
     try:
         r = httpx.post(f"{bs}/render", json={"url": url, "timeout": 60}, timeout=75)
+        r.raise_for_status()
         data = r.json()
-    except Exception:
+    except Exception as exc:
+        # [wave-33 C1a] a 429 is browser-service backpressure — log the busy
+        # token and return no data; this says nothing about the page.
+        from .tools.browser_http import throttle_retry_after
+
+        if throttle_retry_after(exc) is not None:
+            logger.warning(
+                "_fetch_rendered_jsonld throttled (HTTP 429) — browser-service busy"
+            )
+            return ""
         return ""
     if not data.get("success"):
         return ""

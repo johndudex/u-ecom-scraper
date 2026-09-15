@@ -19,6 +19,8 @@ from urllib.parse import urlparse
 import httpx
 from langchain_core.tools import tool
 
+from .browser_http import throttle_retry_after
+
 logger = logging.getLogger(__name__)
 
 BROWSER_SERVICE_URL = os.environ.get(
@@ -376,6 +378,9 @@ def run_probe_with_captcha_check(
     # fixes a missing page, so the ladder stops instead of burning every
     # remaining rung (and the domain captcha cache stays untouched).
     not_found_status = 0
+    # [wave-33 C1a] set when browser-service answered 429 — the ladder parks
+    # (no rung escalation) and the tail returns a throttled verdict.
+    throttle_wait: float | None = None
 
     def _log_probe_step(message: str) -> None:
         """Write probe progress as a SessionLog entry so the watchdog
@@ -413,6 +418,7 @@ def run_probe_with_captcha_check(
     def _try_single_step(step_name: str, proxy_tier: str) -> dict | None:
         """Try a single escalation step. Returns data on success, None on fail."""
         nonlocal methods_tried, captcha_info, akamai_count, not_found_status
+        nonlocal throttle_wait
 
         probe_payload: dict = {
             "url": url,
@@ -540,6 +546,19 @@ def run_probe_with_captcha_check(
                         )
                         return _handle_success(ak_data, _bypass_method)
                     except Exception as ak_exc:
+                        _ak_wait = throttle_retry_after(ak_exc)
+                        if _ak_wait is not None:
+                            # [wave-33 C1a] busy service during the bypass is
+                            # NOT an Akamai verdict — park the ladder.
+                            throttle_wait = _ak_wait
+                            logger.warning(
+                                "probe_page[accessibility]: Akamai bypass throttled (HTTP 429) for %s — parking ladder",
+                                url[:80],
+                            )
+                            _log_probe_step(
+                                "browser-service busy (HTTP 429) — parking ladder"
+                            )
+                            return None
                         logger.warning(
                             "probe_page[accessibility]: Akamai bypass failed for %s: %s",
                             url[:80],
@@ -579,6 +598,19 @@ def run_probe_with_captcha_check(
             return _handle_success(data, step_name)
 
         except Exception as exc:
+            _wait = throttle_retry_after(exc)
+            if _wait is not None:
+                # [wave-33 C1a] browser-service said 429 — PARK. A saturated
+                # service must receive fewer launches, not a faster ladder.
+                throttle_wait = _wait
+                logger.warning(
+                    "probe_page[accessibility]: browser-service busy (HTTP 429) at %s for %s — parking ladder",
+                    step_name,
+                    url[:80],
+                )
+                _log_probe_step("browser-service busy (HTTP 429) — parking ladder")
+                methods_tried.append(step_name)
+                return None
             logger.warning(
                 "probe_page[accessibility]: %s error for %s: %s",
                 step_name,
@@ -624,6 +656,9 @@ def run_probe_with_captcha_check(
                 break  # Found second method
         elif not_found_status:
             # [wave-21 T5] terminal 404/410 — stop walking the ladder.
+            break
+        if throttle_wait is not None:
+            # [wave-33 C1a] parked after a 429 — no rung escalation.
             break
 
     # ── All done ──────────────────────────────────────────────────────
@@ -680,6 +715,47 @@ def run_probe_with_captcha_check(
             "error": (
                 f"URL not found (HTTP {not_found_status}) — page does not exist; "
                 "no proxy or browser can fix a missing page"
+            ),
+        }
+
+    if throttle_wait is not None and not method_1:
+        # [wave-33 C1a] Honest backpressure verdict: the site was never
+        # judged — browser-service is busy. Deliberately NO domain cache
+        # write (busy says nothing about the domain) and no akamai/captcha
+        # semantics; when a phase-1 method already succeeded the primary
+        # return above wins instead.
+        _log_probe_step(
+            "browser-service busy (HTTP 429) — parked; "
+            + (", ".join(methods_tried) or "no rungs") + " tried"
+        )
+        return {
+            "success": False,
+            "throttled": True,
+            "retry_after_s": round(throttle_wait, 1),
+            "method": methods_tried[-1] if methods_tried else "none",
+            "http_method": None,
+            "browser_method": None,
+            "proxy_tier": "none",
+            "status_code": 429,
+            "title": "",
+            "body_length": 0,
+            "needs_browser": True,
+            "blocked": False,
+            "captcha_detected": False,
+            "captcha_type": "",
+            "captcha_confidence": 0.0,
+            "captcha_reasoning": "browser-service busy — no site verdict",
+            "methods_tried": methods_tried,
+            "_request_url": url,
+            "jsonld": [],
+            "meta": {},
+            "selector_results": {},
+            "akamai_detected": False,
+            "akamai_method_count": 0,
+            "error": (
+                f"browser-service busy (HTTP 429) — throttled after "
+                f"{len(methods_tried)} rung(s); retry after ~{throttle_wait:.0f}s. "
+                "This is backpressure, not a site verdict."
             ),
         }
 
@@ -819,6 +895,7 @@ def run_listing_probe_advisory(
     attempts: list[dict] = []
     winner: dict | None = None
     winner_method = ""
+    throttled_after: float | None = None  # [wave-33 C1a]
     for rung in rungs:
         _log(f"trying {rung} for listing {listing_url[:80]}")
         try:
@@ -835,6 +912,15 @@ def run_listing_probe_advisory(
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:
+            _wait = throttle_retry_after(exc)
+            if _wait is not None:
+                # [wave-33 C1a] park: busy service, no more rungs.
+                throttled_after = _wait
+                attempts.append(
+                    {"method": rung, "throttled": True, "error": "browser-service busy (HTTP 429)"}
+                )
+                _log(f"{rung} throttled (HTTP 429) — browser-service busy, parking rungs")
+                break
             attempts.append({"method": rung, "error": str(exc)[:200]})
             _log(f"{rung} errored: {str(exc)[:100]}")
             continue
@@ -873,7 +959,12 @@ def run_listing_probe_advisory(
         "body_length": (winner or {}).get("body_length", 0),
         "methods_tried": [a.get("method") for a in attempts],
         "attempts": attempts,
+        # [wave-33 C1a] present-and-True only when a 429 parked the rungs.
+        "throttled": throttled_after is not None,
+        "retry_after_s": round(throttled_after, 1) if throttled_after else None,
     }
+    if throttled_after is not None and not winner_method:
+        _log("listing advisory PARKED on browser-service 429 — no site verdict")
     if not winner_method:
         _log(
             "listing BLOCKED on all advisory rungs ("
@@ -1027,6 +1118,26 @@ def get_probe_tools() -> list:
                     update_probe_result(ak_data)
                     return _format_probe_result(ak_data)
                 except Exception as ak_exc:
+                    _ak_wait = throttle_retry_after(ak_exc)
+                    if _ak_wait is not None:
+                        # [wave-33 C1a] busy service — the bypass was never
+                        # judged; do NOT cache the detecting rung's data as
+                        # if the bypass had run.
+                        logger.warning(
+                            "probe_page: akamai bypass throttled (HTTP 429) for %s",
+                            url[:100],
+                        )
+                        return _format_probe_result(
+                            {
+                                **data,
+                                "throttled": True,
+                                "retry_after_s": round(_ak_wait, 1),
+                                "error": (
+                                    "browser-service busy (HTTP 429) — Akamai "
+                                    "bypass not attempted; backpressure, not a site verdict"
+                                ),
+                            }
+                        )
                     logger.warning("probe_page: akamai escalation failed: %s", ak_exc)
                     return _format_probe_result(data)
 
@@ -1041,6 +1152,36 @@ def get_probe_tools() -> list:
                 f"HTTP status: 0\n"
                 f"Error: Browser service ({service_url}) is unreachable. "
                 f"Ensure browser_service container is running.\n"
+                f"\nAll methods failed — cannot test selectors."
+            )
+        except httpx.HTTPStatusError as exc:
+            _wait = throttle_retry_after(exc)
+            if _wait is not None:
+                # [wave-33 C1a] busy service — backpressure verdict, and the
+                # result is deliberately NOT cached as a domain fact.
+                logger.warning(
+                    "probe_page: browser-service busy (HTTP 429) for %s", url[:100]
+                )
+                return (
+                    f"PROBE RESULT for {url}\n"
+                    f"Method: throttled\n"
+                    f"Proxy tier: none\n"
+                    f"HTTP status: 429\n"
+                    f"Error: browser-service busy (HTTP 429) — backpressure, "
+                    f"not a site verdict; retry after ~{_wait:.0f}s.\n"
+                    f"\nAll methods failed — cannot test selectors."
+                )
+            logger.error(
+                "probe_page: browser-service HTTP %d for %s",
+                exc.response.status_code,
+                url[:100],
+            )
+            return (
+                f"PROBE RESULT for {url}\n"
+                f"Method: error\n"
+                f"Proxy tier: none\n"
+                f"HTTP status: {exc.response.status_code}\n"
+                f"Error: {exc}\n"
                 f"\nAll methods failed — cannot test selectors."
             )
         except httpx.TimeoutException:
@@ -1150,6 +1291,19 @@ def get_probe_html_tool() -> list:
         except httpx.ConnectError:
             logger.error("probe_html: browser_service unreachable at %s", service_url)
             return f"RENDER FAILED for {url}\nError: Browser service unreachable at {service_url}"
+        except httpx.HTTPStatusError as exc:
+            _wait = throttle_retry_after(exc)
+            if _wait is not None:
+                # [wave-33 C1a] distinct busy token — backpressure, not a
+                # render failure.
+                logger.warning("probe_html: browser-service busy (HTTP 429) for %s", url[:100])
+                return (
+                    f"RENDER THROTTLED for {url}\n"
+                    f"Error: browser-service busy (HTTP 429) — backpressure, "
+                    f"not a site verdict; retry after ~{_wait:.0f}s"
+                )
+            logger.error("probe_html: browser-service HTTP %d for %s", exc.response.status_code, url[:100])
+            return f"RENDER FAILED for {url}\nError: {exc}"
         except httpx.TimeoutException:
             logger.error("probe_html: timed out for %s", url[:100])
             return f"RENDER FAILED for {url}\nError: Timed out after {PROBE_TIMEOUT}s"
