@@ -273,13 +273,19 @@ class TestEndToEndThroughOnce:
 
 class TestOverrideIsDomainGuarded:
     def test_f17_guard_sits_after_the_candidate_selection(self):
+        # [wave-32 E1a amended] the override-aware selection moved into the
+        # F17 chain walk (_probe_listing_env_candidate): each candidate —
+        # override included — is domain-guarded, with fall-through instead
+        # of the old nuke-the-whole-env-on-drop.
         src_path = os.path.join(ROOT, "webapp", "agents", "graph.py")
         with open(src_path, encoding="utf-8") as fh:
             src = fh.read()
-        sel = src.find("listing_override or _primary or _alt")
+        sel = src.find("def _probe_listing_env_candidate(")
+        assert sel != -1, "override-aware F17 chain walk missing"
         guard = src.find("_registrable_of", sel)
-        assert sel != -1, "override-aware candidate selection missing"
-        assert guard != -1 and guard - sel < 4000, "F17 guard must still apply"
+        assert guard != -1 and guard - sel < 2000, "F17 guard must still apply"
+        # the probe env wiring goes through the walk
+        assert "_probe_listing_env_candidate(state, listing_override)" in src
 
 
 if __name__ == "__main__":

@@ -271,30 +271,55 @@ class TestProbeRungSettle:
 
 # ─── 2. render gate (server.py /navigate) ───────────────────────────────────
 
+# [wave-32 A5] satisfaction semantics + thresholds moved to the
+# dependency-free render_gate.py (loaded by file path); server.py keeps the
+# settle/backoff mechanics and imports the gate. The settle block exec'd
+# below still calls the gate, so the namespace gets the real functions.
+
+
+def _load_render_gate_mod():
+    spec = importlib.util.spec_from_file_location(
+        "rg_w17_pra", os.path.join(ROOT, "browser_service", "render_gate.py")
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
 
 class TestRenderGate:
     NS = _exec_ns(
         [
             "_RENDER_PROBE_JS",
-            "_RENDER_GATE_MIN_ANCHORS",
-            "_RENDER_GATE_MIN_BODY",
             "_RENDER_GATE_BACKOFF_MS",
             "_RENDER_GATE_MAX_BUDGET_MS",
-            "_render_gate_satisfied",
             "_render_probe",
             "_render_settle",
         ],
-        extra={"os": os, "time": __import__("time")},
+        extra={
+            "os": os,
+            "time": __import__("time"),
+            **{
+                name: getattr(_load_render_gate_mod(), name)
+                for name in ("render_gate_satisfied", "render_gate_arm")
+            },
+            # server.py imports the gate under its legacy underscore alias —
+            # the exec'd settle body calls the alias.
+            "_render_gate_satisfied": _load_render_gate_mod().render_gate_satisfied,
+        },
     )
 
     def test_satisfied_predicate_each_signal(self):
-        sat = self.NS["_render_gate_satisfied"]
+        sat = _load_render_gate_mod().render_gate_satisfied
         assert sat(_probe_of(anchors=0, body_len=0, jsonld=2), False)
         assert sat(_probe_of(anchors=30, body_len=100), False)
         assert sat(_probe_of(anchors=0, body_len=25_000), False)
         assert sat(_probe_of(anchors=0, body_len=1, price=True), False)
         assert sat({}, False) is False
-        assert sat(_probe_of(anchors=0, body_len=0), True), "wait_for hit wins"
+        # [wave-32 B1] content evidence is the only satisfier — a selector
+        # attach no longer wins on an empty probe (587: shell + wait_for).
+        assert sat(_probe_of(anchors=0, body_len=0), True) is False, (
+            "wait_for hit must NOT satisfy without content evidence"
+        )
 
     def test_probe_eval_failure_yields_empty_probe(self):
         class _P:

@@ -336,6 +336,48 @@ class TestSiteAlreadyProcessedDocs:
         assert '"force": true' in guide, "POST /jobs row must name the bypass flag"
 
 
+class TestHostMismatchDocs:
+    """W32-B3: the 422 `host_mismatch` contract must be IN the specs (same
+    rule as the W31 class above). The gate REFUSES cross-host listing URLs
+    at create time instead of letting F17 silently drop them at runtime —
+    job 587's starved-discovery writer wall started exactly there."""
+
+    def test_post_jobs_422_documents_host_mismatch(self):
+        sync = yaml.safe_load(open(os.path.join(ROOT, "docs/specs/sync_api.yaml"), encoding="utf-8"))
+        r422 = sync["paths"]["/api/v1/jobs"]["post"]["responses"]["422"]
+        assert "host_mismatch" in r422["description"]
+        assert "force" in r422["description"], "spec must say the gate has NO force escape"
+        content = r422["content"]["application/json"]
+        codes = []
+        for ex in _iter_example_values(content):
+            codes.append(ex.get("code"))
+        assert "schema_invalid" in codes, "pre-existing tier-1 example must survive"
+        assert "host_mismatch" in codes, "host-gate example missing"
+        hm = [e for e in _iter_example_values(content) if e.get("code") == "host_mismatch"]
+        assert "offending_urls" in hm[0].get("details", {})
+        # offending_urls is a first-class response field, not just example flavor
+        props = content["schema"]["allOf"][1]["properties"]["details"]["properties"]
+        assert "offending_urls" in props
+
+    def test_parity_paragraph_covers_host_gate(self):
+        sync_src = open(os.path.join(ROOT, "docs/specs/sync_api.yaml"), encoding="utf-8").read()
+        assert "Host gate" in sync_src
+        seg = sync_src.split("Host gate")[1][:700]
+        assert "422" in seg and "host_mismatch" in seg
+        assert "url_list" in seg, "gate scope (which input modes are gated) must be stated"
+
+    def test_error_code_enum_includes_host_mismatch(self):
+        sync = yaml.safe_load(open(os.path.join(ROOT, "docs/specs/sync_api.yaml"), encoding="utf-8"))
+        code_desc = sync["components"]["schemas"]["Error"]["properties"]["code"]["description"]
+        assert "host_mismatch" in code_desc
+
+    def test_partner_guide_documents_host_gate(self):
+        guide = open(os.path.join(ROOT, "docs/extractor-builder-api-guide.md"), encoding="utf-8").read()
+        assert "host_mismatch" in guide, "422 code list must include the new code"
+        assert "offending_urls" in guide, "POST /jobs row must name the details payload"
+        assert "no `force` escape" in guide, "guide must state there is no bypass"
+
+
 def _iter_example_values(content):
     if "example" in content:
         yield content["example"]

@@ -228,6 +228,48 @@ def cross_workspace_paths(command: str, workspace_scope: str) -> list[str]:
     return bad
 
 
+def _tester_listing_candidate(state: dict) -> tuple[str, str]:
+    """[wave-32 E1b] The tester's ``SCRAPER_LISTING_URL`` injection candidate,
+    F17-domain-guarded (mirrors run_execution's chain guard).
+
+    Returns ``(candidate, drop_note)``. The candidate is the navigator's
+    ``discovery.listing_url`` or — [rag-bone job 72] — the user's URL-shaped
+    ``search_criteria``; '' when there is nothing to inject OR when the
+    candidate sits off the job's registrable domain (F17 drops it at
+    execution, so injecting it would test a listing execution can never use
+    — 587's tester burned budget on exactly that). ``drop_note`` is ''
+    unless a candidate was dropped; it becomes the run-scope note so the
+    suppression is visible to the agent, not a silent side effect.
+    """
+    _nav = state.get("navigation_analysis") or {}
+    _disc = (_nav.get("discovery") if isinstance(_nav, dict) else None) or {}
+    cand = (_disc.get("listing_url") if isinstance(_disc, dict) else "") or ""
+    if not cand:
+        _sc = str(state.get("search_criteria") or "").strip()
+        if _sc.startswith(("http://", "https://")):
+            cand = _sc
+    if not cand:
+        return "", ""
+    try:
+        from agents.nodes.run_execution import _registrable_of
+
+        _job_reg = _registrable_of(state.get("url", ""))
+        _c_reg = _registrable_of(cand)
+        if _job_reg and _c_reg and _c_reg != _job_reg:
+            logger.warning(
+                "run_scraper: F17 dropped cross-domain SCRAPER_LISTING_URL "
+                "candidate %s (job domain %s)", cand[:70], _job_reg,
+            )
+            return "", (
+                f"[run scope] DISCOVERY suppressed — SCRAPER_LISTING_URL "
+                f"candidate {cand[:70]} is off the job's domain "
+                f"({_job_reg}, F17)"
+            )
+    except Exception:
+        pass
+    return cand, ""
+
+
 def get_shell_tools(
     project_root: str | None = None,
     allowed_dirs: list[str] | None = None,
@@ -569,25 +611,17 @@ def get_shell_tools(
         # in the tool result instead of being an invisible side effect.
         _scope_note = ""
         try:
-            _nav_ts = _ts.get("navigation_analysis") or {}
-            _disc_ts = (_nav_ts.get("discovery") if isinstance(_nav_ts, dict) else None) or {}
-            _listing_ts = (
-                (_disc_ts.get("listing_url") if isinstance(_disc_ts, dict) else "")
-                or ""
-            )
-            if not _listing_ts:
-                # [rag-bone job 72] the tester must not be the ONLY phase that
-                # knows about a listing asserted solely in search_criteria —
-                # the tester proved 25 URLs there while execution (which reads
-                # the full candidate chain) discovered 2 off the sample PDP.
-                _sc_ts = str(_ts.get("search_criteria") or "").strip()
-                if _sc_ts.startswith(("http://", "https://")):
-                    _listing_ts = _sc_ts
+            # [wave-32 E1b] the candidate is F17-domain-guarded — a cross-host
+            # listing (587's loveamika-on-marimekko shape) must not reach the
+            # tester's env when execution's F17 would drop it anyway.
+            _listing_ts, _f17_note = _tester_listing_candidate(_ts)
             if _verification_scope:
                 _scope_note = (
                     "[run scope] VERIFICATION — the seed file drives this run; "
                     "SCRAPER_LISTING_URL discovery injection suppressed"
                 )
+            elif _f17_note and _ts.get("input_mode") in ("navigation", "list_page", "search_term"):
+                _scope_note = _f17_note
             elif _listing_ts and _ts.get("input_mode") in ("navigation", "list_page", "search_term"):
                 env_overrides = dict(env_overrides or {})
                 env_overrides["SCRAPER_LISTING_URL"] = _listing_ts

@@ -430,6 +430,15 @@ paths:
         `site_already_processed` unless the body sets `"force": true`.
         Archived sites are exempt (archive = deliberate allow-re-scrape).
 
+        **Host gate (wave-32):** for `input_mode=list_page`/`search_term`,
+        every `listing_urls` entry must sit on the same registrable domain
+        as `url`; violations are refused with 422 `host_mismatch` BEFORE any
+        job is created (no `force` escape — see the 422 response).
+        `search_term` jobs have no URL fields to check and are never gated;
+        `url_list` is not gated either (item seeds don't pass through F17).
+        A job clean at creation stays clean: restart-time overrides recheck
+        only values explicitly posted in that request (UI-side).
+
         Differences from the UI endpoint, on purpose: no
         `X-Requested-With: XMLHttpRequest` requirement and no CSRF token —
         auth is the `X-API-Key` header, and this namespace is CSRF-exempt.
@@ -573,7 +582,24 @@ paths:
                       latest_job_id: 479
                       status_url: "/api/v1/jobs/479"
         "422":
-          description: "`schema_text` failed validation (gate re-run server-side exactly as in views.py:2560-2570). The per-issue list uses the same shape as /validate-schema."
+          description: |
+            Two validation tiers.
+
+            (1) `schema_invalid` — `schema_text` failed validation (gate
+            re-run server-side exactly as in views.py:2560-2570). The
+            per-issue list uses the same shape as /validate-schema.
+
+            (2) `host_mismatch` — wave-32 host gate: for `input_mode`
+            `list_page`/`search_term`, every URL in `listing_urls` must sit
+            on the same registrable domain as `url` (subdomains and `www.`
+            fold to the same registrable; two-part TLDs like `.co.uk` are
+            handled). Cross-host listing URLs would be silently dropped by
+            the pipeline's F17 seed filter — discovery starves and the job
+            burns its whole budget to a writer wall (job 587: a loveamika
+            listing on a marimekko job). Refused at the door instead; there
+            is no `force` escape (the pipeline drops these URLs regardless,
+            so declining is strictly honest — there is nothing to click
+            through). The intake UI gate mirrors this for the webapp form.
           content:
             application/json:
               schema:
@@ -588,15 +614,28 @@ paths:
                             type: array
                             items:
                               $ref: "#/components/schemas/SchemaIssue"
-              example:
-                code: "schema_invalid"
-                message: "Schema invalid"
-                details:
-                  issues:
-                    - code: "type_unsupported"
-                      message: "Property 'price' declares type 'decimal'; supported types are string|number|integer|boolean"
-                      severity: "error"
-                      path: "$.properties.price.type"
+                          offending_urls:
+                            type: array
+                            items: { type: string }
+                            description: host_mismatch only — every listing URL not on the job's registrable domain, sorted, deduplicated.
+              examples:
+                schemaInvalid:
+                  value:
+                    code: "schema_invalid"
+                    message: "Schema invalid"
+                    details:
+                      issues:
+                        - code: "type_unsupported"
+                          message: "Property 'price' declares type 'decimal'; supported types are string|number|integer|boolean"
+                          severity: "error"
+                          path: "$.properties.price.type"
+                hostMismatch:
+                  value:
+                    code: "host_mismatch"
+                    message: "listing_urls must be on marimekko.com — cross-host URLs would be silently dropped by the pipeline."
+                    details:
+                      offending_urls:
+                        - "https://www.loveamika.com/collections/all"
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -1780,7 +1819,7 @@ components:
       properties:
         code:
           type: string
-          description: Stable machine-readable error code (`unauthorized`, `forbidden`, `not_found`, `not_ready`, `duplicate_running_job`, `site_already_processed`, `validation_failed`, `schema_invalid`, `output_not_found`, `not_cancellable`, `invalid_page`, `invalid_page_size`, `invalid_created_since`, `invalid_callback_url`, `callback_already_active`, `rate_limited`, `internal_error`).
+          description: Stable machine-readable error code (`unauthorized`, `forbidden`, `not_found`, `not_ready`, `duplicate_running_job`, `site_already_processed`, `validation_failed`, `schema_invalid`, `host_mismatch`, `output_not_found`, `not_cancellable`, `invalid_page`, `invalid_page_size`, `invalid_created_since`, `invalid_callback_url`, `callback_already_active`, `rate_limited`, `internal_error`). `host_mismatch` = wave-32 host gate refused cross-host listing URLs at create time (POST /api/v1/jobs only; no `force` escape).
           examples: ["not_found"]
         message:
           type: string

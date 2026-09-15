@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from .browser_pool import browser_pool
 from .config import get_proxy_config
 from .probe import _launch_health_snapshot, run_probe, render_page
+from .render_gate import render_gate_arm, render_gate_note, render_gate_satisfied as _render_gate_satisfied
 from .scraper_runner import run_scraper_script
 
 logger = logging.getLogger(__name__)
@@ -2275,36 +2276,20 @@ _RENDER_PROBE_JS = """
     } catch (e) {}
   }
   const anchors = document.querySelectorAll('a[href]').length;
-  const body_len = document.body ? document.body.innerHTML.length : 0;
+  const body_len = document.body ? document.body.innerText.length : 0;
   const has_price = !!document.querySelector(
     '[class*="price" i], [itemprop*="price" i], [data-price], [property="product:price:amount"]');
   return {jsonld_items: jsonld_items, anchors: anchors, body_len: body_len, has_price: has_price};
 }
 """
 
-# Content thresholds: a page shows "real content" when ANY of these hold.
-# (A PDP satisfies via JSON-LD; a listing via the anchor count; either via a
-# rendered price node. Challenge shells satisfy none — they are tiny and
-# link-free by design.)
-_RENDER_GATE_MIN_ANCHORS = 25
-_RENDER_GATE_MIN_BODY = 20_000
+# Content thresholds + satisfaction semantics live in render_gate.py
+# [wave-32 A5] — dependency-free and unit-testable without fastapi. The
+# backoff ladder stays here: it is settle-budget, not satisfaction.
 # Backoff ladder AFTER the base settle when the gate is unsatisfied. Bounded —
 # total waits stay under _NAVIGATE_MAX_SETTLE_MS.
 _RENDER_GATE_BACKOFF_MS = (2500, 5000, 8000)
 _RENDER_GATE_MAX_BUDGET_MS = int(os.environ.get("NAVIGATE_MAX_SETTLE_MS", "30000"))
-
-
-def _render_gate_satisfied(probe: dict, wait_for_hit: bool) -> bool:
-    if wait_for_hit:
-        return True
-    if not isinstance(probe, dict):
-        return False
-    return bool(
-        probe.get("jsonld_items", 0) > 0
-        or probe.get("anchors", 0) >= _RENDER_GATE_MIN_ANCHORS
-        or probe.get("body_len", 0) >= _RENDER_GATE_MIN_BODY
-        or probe.get("has_price", False)
-    )
 
 
 def _render_probe(page) -> dict:
@@ -2392,6 +2377,9 @@ def _render_settle(
 
     return {
         "satisfied": satisfied,
+        # [wave-32 A5] name WHICH signal satisfied the gate — the override
+        # note and RCAs read this instead of guessing from the raw probe.
+        "satisfied_arm": render_gate_arm(probe, wait_for_hit),
         "waited_ms": waited_ms,
         "steps": steps,
         "probe": probe,
@@ -2551,9 +2539,12 @@ def _run_navigate_sync(
         # navigate_error on a page that was actually in hand).
         status_note = ""
         if blocked_type and render_gate.get("satisfied"):
-            status_note = (
-                f"blocked_type={blocked_type!r} from status={status_code} overridden — "
-                f"render gate verified content (probe={render_gate.get('probe')})"
+            # [wave-32 A5] the note names WHICH arm satisfied the gate and
+            # the probe counts (render_gate.py builds it).
+            status_note = render_gate_note(
+                blocked_type, status_code,
+                render_gate.get("satisfied_arm") or "unknown",
+                render_gate.get("probe"),
             )
             logger.info("navigate: %s (host=%s)", status_note, _url_host(url))
             blocked_type = None

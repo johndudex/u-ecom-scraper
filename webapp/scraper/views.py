@@ -2,6 +2,7 @@ import csv
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from datetime import datetime, timedelta
@@ -658,6 +659,41 @@ def job_restart(request, job_id):
             _tf = [f.strip() for f in _tf.split(",") if f.strip()]
         else:
             _tf = job.target_fields
+
+        # [wave-32 B3] Host gate on EXPLICITLY posted discovery config — the
+        # intake Re-run posts the edited form here, so this is the live hole
+        # a fresh cross-host search_criteria walks through past any
+        # intake-only gate. Inherited values (no POST key) are NOT
+        # re-checked: a job clean at creation stays clean.
+        if "search_criteria" in request.POST or "search_url" in request.POST:
+            from src.registrable import registrable_of
+
+            job_reg = registrable_of(job.url)
+            if job_reg:
+                _cand_text = " ".join(filter(None, (
+                    request.POST.get("search_criteria", ""),
+                    request.POST.get("search_url", ""),
+                )))
+                _offending = sorted({
+                    u for u in re.findall(r"https?://[^\s,]+", _cand_text)
+                    if registrable_of(u) and registrable_of(u) != job_reg
+                })
+                if _offending:
+                    return JsonResponse(
+                        {
+                            "error": (
+                                f"search_criteria/search_url must be on "
+                                f"{job_reg} — cross-host URLs would be "
+                                f"silently dropped by the pipeline: "
+                                f"{', '.join(u[:80] for u in _offending)}"
+                            ),
+                            "host_mismatch": {
+                                "job_host": job_reg,
+                                "offending_urls": _offending,
+                            },
+                        },
+                        status=422,
+                    )
 
         new_job = ScrapeJob.objects.create(
             url=job.url,
@@ -2916,6 +2952,41 @@ def intake_create_job(request):
     elif nav_method == "search":
         search_criteria = request.POST.get("search_keywords", "").strip()
         search_url = request.POST.get("search_url", "").strip()
+
+    # [wave-32 B3] Host gate — decline exactly what F17 would drop. 587:
+    # intake accepted a loveamika.com listing on a marimekko.com job; F17
+    # silently dropped every cross-host seed at runtime and discovery
+    # starved (2h22m to a writer wall). Comparator is the pipeline's own
+    # registrable-domain rule — subdomains + www are the SAME domain. No
+    # force escape: the pipeline would drop these anyway.
+    if nav_method in ("listing", "search"):
+        from src.registrable import registrable_of
+
+        job_reg = registrable_of(url)
+        if job_reg:
+            _candidates = re.findall(
+                r"https?://[^\s,]+", f"{search_criteria}\n{search_url}"
+            )
+            _offending = sorted({
+                u for u in _candidates
+                if registrable_of(u) and registrable_of(u) != job_reg
+            })
+            if _offending:
+                return JsonResponse(
+                    {
+                        "error": (
+                            f"Listing/search URLs must be on {job_reg} — "
+                            f"cross-host URLs would be silently dropped by "
+                            f"the pipeline: "
+                            f"{', '.join(u[:80] for u in _offending)}"
+                        ),
+                        "host_mismatch": {
+                            "job_host": job_reg,
+                            "offending_urls": _offending,
+                        },
+                    },
+                    status=422,
+                )
 
     existing = ScrapeJob.objects.filter(
         url=url, status__in=[ScrapeJob.STATUS_PENDING, ScrapeJob.STATUS_RUNNING],

@@ -36,7 +36,7 @@ Key management: `/intake/tokens/` (list), `/intake/tokens/create/` (raw key show
 { "code": "validation_failed", "message": "...", "details": { } }
 ```
 
-Statuses: 401 `unauthorized`, 403 `forbidden`, 404 `not_found`, 405 (`method_not_allowed` — the extractor DELETE answer), 409 (`duplicate_running_job`, `site_already_processed`, `not_cancellable`, `callback_already_active`), 422 (`validation_failed`, `schema_invalid`, `invalid_callback_url`, `invalid_page`, `invalid_page_size`), 429 `rate_limited`, 500 `internal_error` (body carries a `trace_id`). (`webapp/scraper/api/errors.py`)
+Statuses: 401 `unauthorized`, 403 `forbidden`, 404 `not_found`, 405 (`method_not_allowed` — the extractor DELETE answer), 409 (`duplicate_running_job`, `site_already_processed`, `not_cancellable`, `callback_already_active`), 422 (`validation_failed`, `schema_invalid`, `host_mismatch` (wave-32), `invalid_callback_url`, `invalid_page`, `invalid_page_size`), 429 `rate_limited`, 500 `internal_error` (body carries a `trace_id`). (`webapp/scraper/api/errors.py`)
 
 ## 2. Partner API v1 — endpoints
 
@@ -44,7 +44,7 @@ Job state model (sync spec): `inprogress` → `sample_ready` → `scraper_ready`
 
 | Method & path | Purpose |
 |---|---|
-| `POST /api/v1/jobs` | Create + dispatch a job. **202** + `{job_id, state, created_at, status_url, sample_url, output_url, output_download_url, scraper_code_url}` + `Location` header. 409 `duplicate_running_job` if an identical-URL job is already pending/running (never bypassable), 409 `site_already_processed` if the site already has a COMPLETED job (checked across all tenants — re-send the same body with `"force": true` to bypass). Body gains **`field_instructions`** (wave-27). |
+| `POST /api/v1/jobs` | Create + dispatch a job. **202** + `{job_id, state, created_at, status_url, sample_url, output_url, output_download_url, scraper_code_url}` + `Location` header. 409 `duplicate_running_job` if an identical-URL job is already pending/running (never bypassable), 409 `site_already_processed` if the site already has a COMPLETED job (checked across all tenants — re-send the same body with `"force": true` to bypass). **422 `host_mismatch`** (wave-32): for `list_page`/`search_term` every `listing_urls` entry must sit on the same registrable domain as `url` — cross-host URLs would be silently dropped by the pipeline's F17 seed filter, so the create is refused before any job exists (`details.offending_urls` lists them; **no `force` escape**). Body gains **`field_instructions`** (wave-27). |
 | `GET /api/v1/jobs` | Paginated list (`page`, `page_size`) of this key's jobs — `{jobs: [JobSummary], page, page_size, total_items, total_pages}`. Rows carry `rerun_of`. |
 | `GET /api/v1/jobs/{id}` | Full status: `state`, `internal_status`, `current_phase`, `phases[]`, availability flags, `item_count`, `failure`, `callback`, timestamps, **`rerun_of`** (chain-root job id; null for fresh jobs). |
 | `POST /api/v1/jobs/{id}/cancel` | Cancel a pending/running/waiting-approval job → `{state:"failed", failure:{code:"cancelled"}}`. |
@@ -70,7 +70,7 @@ Required: **`url`** (a sample *item* page, not the homepage) and **`input_mode`*
 | Field | Notes |
 |---|---|
 | `item_urls[]` | required for `url_list` (≤10 000, ≤1000 chars each; deduped; persisted to `scrapers/<slug>/input_urls.json`) |
-| `listing_urls[]` | required for `list_page` (≤50; newline-joined into search criteria) |
+| `listing_urls[]` | required for `list_page` (≤50; newline-joined into search criteria). **Host-gated** (wave-32): every entry must share the registrable domain of `url` (subdomains/`www.` fold together; two-part TLDs like `.co.uk` handled) — else 422 `host_mismatch` with `details.offending_urls`, no `force` escape (F17 would silently drop them at runtime). |
 | `search_keywords` | required for `search_term` (`search_criteria` accepted as legacy alias) |
 | `search_url` | optional for `search_term` — a known search-results page |
 | `content_type` | `product` (default) — registry also covers `article`, `job_posting`, `forum_thread`, `serp`, `page_content` |

@@ -495,26 +495,42 @@ def run_probe_with_captcha_check(
                         ak_data["_request_url"] = url
                         ak_data["proxy_tier"] = proxy_tier
                         methods_tried.append(_bypass_method)
-                        if ak_data.get("success"):
-                            captcha_result = _verify_captcha_free(ak_data)
-                            if captcha_result.get("captcha_detected"):
-                                captcha_info = captcha_result
-                                # [wave-15 3.1] This block (through the
-                                # return) used to sit OUTSIDE the if — every
-                                # successful bypass was discarded as a
-                                # captcha page and the "returned real
-                                # content" handler below was dead code, so
-                                # the ladder never accepted a bypass win.
-                                logger.info(
-                                    "probe_page[accessibility]: Akamai bypass returned captcha (%s) for %s",
-                                    captcha_result.get("captcha_type"),
-                                    url[:80],
-                                )
-                                _log_probe_step(
-                                    f"{step_name} Akamai bypass returned captcha: "
-                                    f"{captcha_result.get('captcha_type')}"
-                                )
-                                return None
+                        if not ak_data.get("success"):
+                            # [wave-32 B2] A bypass that comes back
+                            # success=false is a FAILED rung — it used to
+                            # fall through to _handle_success, which accepted
+                            # the failing response as the method that worked
+                            # and short-circuited the ladder before the
+                            # all-failed tail (making the akamai negative
+                            # cache write unreachable for exactly the
+                            # akamai case it exists for).
+                            logger.info(
+                                "probe_page[accessibility]: Akamai bypass blocked (success=false) for %s",
+                                url[:80],
+                            )
+                            _log_probe_step(
+                                f"{step_name} Akamai bypass BLOCKED — still no content"
+                            )
+                            return None
+                        captcha_result = _verify_captcha_free(ak_data)
+                        if captcha_result.get("captcha_detected"):
+                            captcha_info = captcha_result
+                            # [wave-15 3.1] This block (through the
+                            # return) used to sit OUTSIDE the if — every
+                            # successful bypass was discarded as a
+                            # captcha page and the "returned real
+                            # content" handler below was dead code, so
+                            # the ladder never accepted a bypass win.
+                            logger.info(
+                                "probe_page[accessibility]: Akamai bypass returned captcha (%s) for %s",
+                                captcha_result.get("captcha_type"),
+                                url[:80],
+                            )
+                            _log_probe_step(
+                                f"{step_name} Akamai bypass returned captcha: "
+                                f"{captcha_result.get('captcha_type')}"
+                            )
+                            return None
                         logger.info(
                             "probe_page[accessibility]: Akamai bypass returned real content for %s",
                             url[:80],
@@ -667,19 +683,36 @@ def run_probe_with_captcha_check(
             ),
         }
 
-    try:
-        from scraper.models import ProbeCache
+    if akamai_count > 0:
+        # [wave-32 B2] The missing negative-direction write: the domain
+        # DEMANDED a bypass and no rung satisfied it — record the requirement
+        # so the next job's cache read doesn't say "no bypass needed" (587:
+        # marimekko poisoned a second job). Field scope (C2): this write
+        # touches needs_akamai_bypass ONLY — a previously-learned good
+        # method on the domain must survive, and akamai-block is not captcha.
+        try:
+            from scraper.models import ProbeCache
 
-        ProbeCache.objects.update_or_create(
-            domain=domain,
-            defaults={
-                "method": methods_tried[-1] if methods_tried else "unknown",
-                "needs_akamai_bypass": False,
-                "captcha_detected": True,
-            },
-        )
-    except Exception:
-        pass
+            ProbeCache.objects.update_or_create(
+                domain=domain,
+                defaults={"needs_akamai_bypass": True},
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            from scraper.models import ProbeCache
+
+            ProbeCache.objects.update_or_create(
+                domain=domain,
+                defaults={
+                    "method": methods_tried[-1] if methods_tried else "unknown",
+                    "needs_akamai_bypass": False,
+                    "captcha_detected": True,
+                },
+            )
+        except Exception:
+            pass
 
     return {
         "success": False,

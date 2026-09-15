@@ -453,11 +453,18 @@ class TestJob72CriteriaFirstChain:
         assert "_env_candidate = _url_shaped_criteria(state) or _job_listing or \"\"" in src
 
     def test_tester_env_knows_the_criteria_listing_too(self):
-        src = open(os.path.join(
-            ROOT, "webapp", "agents", "tools", "shell_tools.py"
-        )).read()
-        assert "if not _listing_ts:" in src
-        assert '_sc_ts.startswith(("http://", "https://"))' in src
+        # [wave-32 E1b amended] the criteria fallback moved into the
+        # _tester_listing_candidate helper (which now also F17-guards the
+        # candidate); job 72's contract — a URL-shaped search_criteria is
+        # injectable when discovery.listing_url is absent — is unchanged.
+        from webapp.agents.tools import shell_tools
+
+        cand, note = shell_tools._tester_listing_candidate({
+            "url": "https://s.example.com/products/x",
+            "input_mode": "list_page",
+            "search_criteria": "https://s.example.com/collections/y",
+        })
+        assert cand == "https://s.example.com/collections/y" and note == ""
 
     def test_execution_primary_is_criteria_end_to_end(self):
         """Decision mirror of the env chain's precedence with the real state:

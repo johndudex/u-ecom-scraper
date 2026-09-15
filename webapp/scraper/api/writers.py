@@ -80,6 +80,27 @@ def create_job(request):
     if item_urls and (len(item_urls) > 10000 or any(len(u) > 1000 for u in item_urls)):
         raise errors.ApiError(422, "validation_failed", "item_urls: max 10000 items, 1000 chars each.")
 
+    # [wave-32 B3] Host gate — the pipeline's F17 seed filter silently drops
+    # cross-host listing URLs at runtime (587: a loveamika listing on a
+    # marimekko job starved discovery for 2h22m); decline them here instead.
+    # search_term has no URL fields in the API contract — nothing to check.
+    if input_mode in ("list_page", "search_term"):
+        from src.registrable import registrable_of
+
+        job_reg = registrable_of(url)
+        if job_reg:
+            _offending = sorted({
+                u for u in listing_urls_deduped
+                if registrable_of(u) and registrable_of(u) != job_reg
+            })
+            if _offending:
+                raise errors.ApiError(
+                    422, "host_mismatch",
+                    f"listing_urls must be on {job_reg} — cross-host URLs "
+                    "would be silently dropped by the pipeline.",
+                    {"offending_urls": _offending},
+                )
+
     schema_text = str(body.get("schema_text", "")).strip()
     target_fields = body.get("target_fields") or []
     field_notes: dict = {}

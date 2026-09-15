@@ -1791,9 +1791,25 @@ def _summarize_tool_args(tool_name: str, args: dict) -> str:
         content = str(args.get("content", ""))
         return f"Write {path} ({len(content)} chars)"
     if tool_name == "read_file":
-        return f"Read {str(args.get('path', ''))}"
+        # [wave-32 A4] Position matters: 587's read-spiral produced dozens of
+        # identical "Read workspace/..." rows — indistinguishable in the log.
+        path = str(args.get("path", ""))
+        try:
+            line = int(args.get("line") or 0)
+            offset = int(args.get("offset") or 0)
+            num = int(args.get("num_lines") or 0)
+        except (TypeError, ValueError):
+            line = offset = num = 0
+        if line:
+            return f"Read {path} line={line} num_lines={num or 400}"
+        if offset:
+            return f"Read {path} offset={offset}"
+        return f"Read {path}"
     if tool_name == "edit_file":
-        return f"Edit {str(args.get('path', ''))}"
+        # [wave-32 A4] A 60-char prefix of old_string proves WHICH edit site —
+        # the zombie edit_file-after-verdict (prod 395) was unattributable.
+        old = str(args.get("old_string", ""))
+        return f"Edit {str(args.get('path', ''))} old={old[:60]!r}"
     if tool_name == "search_files":
         return f"Search files: {str(args.get('pattern', ''))[:60]}"
     if tool_name == "search_content":
@@ -2341,8 +2357,15 @@ def _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout):
         # budget-exhausted return — both paths used to be bare {"messages": []}
         # and `_error` was read by nobody, so a wall-clock death was invisible
         # downstream (25% of code_writer's wall was these silent deaths).
-        return {"messages": [], "_error": f"wall-clock timeout after {timeout}s",
-                "_error_class": "WallClockTimeout"}
+        # [wave-32 A3] async twin: no _waited variable here — derive the real
+        # wait from t0 so the payload names BOTH windows (the literal phrase
+        # stays: all consumers are substring matches).
+        _waited = _time.monotonic() - t0
+        return {"messages": [],
+                "_error": (f"wall-clock timeout after {timeout:.0f}s base "
+                           f"(thread stopped at {_waited:.0f}s)"),
+                "_error_class": "WallClockTimeout",
+                "_waited_s": round(_waited, 1)}
     except Exception as exc:
         import traceback
 
@@ -2636,8 +2659,17 @@ def _invoke_agent_with_timeout(
         # (prod 395: zombie edit_file 2s into the tester's run).
         mark_invocation_cancelled(phase, invocation_id=invocation_id)
         # T0.3 (sync twin of the async-path marker): surface the dead invocation.
-        return {"messages": [], "_error": f"wall-clock timeout after {timeout}s",
-                "_error_class": "WallClockTimeout"}
+        # [wave-32 A3] Name BOTH windows: the base timeout the phase was given
+        # and the wall seconds actually waited — the W30-1 extension can push
+        # the real stop far past base (587's writer died at ~2700s while the
+        # payload said 1800s). The literal phrase stays a prefix: every
+        # consumer is a substring match. _waited_s carries the number so
+        # telemetry never has to parse the string.
+        return {"messages": [],
+                "_error": (f"wall-clock timeout after {timeout:.0f}s base "
+                           f"(thread stopped at {_waited:.0f}s)"),
+                "_error_class": "WallClockTimeout",
+                "_waited_s": round(_waited, 1)}
     return result_box[0] or {"messages": []}
 
 
@@ -6290,6 +6322,44 @@ def _probe_listing_candidates(state: dict) -> tuple[str, str]:
     return primary, _alt
 
 
+_NO_DISCOVERY_SOURCE_MARKER = "No --query, --category-url, or --listing-url provided"
+
+
+def _probe_listing_env_candidate(state: dict, listing_override: str = "") -> str:
+    """[wave-32 E1a] F17-walk the probe's ``SCRAPER_LISTING_URL`` chain.
+
+    run_execution's candidate chain (run_execution.py:815-826) domain-guards
+    EACH candidate and falls through to the next on a drop; the probe's C2
+    mirror must do the same. The old ``override or primary or alt`` + nuke-
+    the-whole-env-on-drop behavior (587) tested the draft's default discovery
+    instead of the same-domain candidate it had. '' only when nothing
+    survives; '' on the job's registrable means "cannot judge" — never gate.
+    """
+    primary, alt = _probe_listing_candidates(state)
+    try:
+        from agents.nodes.run_execution import _registrable_of
+
+        _job_reg = _registrable_of(state.get("url", ""))
+    except Exception:
+        _job_reg = ""
+    for _c in (listing_override, primary, alt):
+        if not (isinstance(_c, str) and _c.strip()):
+            continue
+        if _job_reg:
+            try:
+                _c_reg = _registrable_of(_c)
+            except Exception:
+                _c_reg = ""
+            if _c_reg and _c_reg != _job_reg:
+                logger.warning(
+                    "_probe_listing_env_candidate: F17 dropped cross-domain "
+                    "candidate %s (job domain %s)", _c[:70], _job_reg,
+                )
+                continue
+        return _c.strip()
+    return ""
+
+
 def _identity_snapshot(workspace_dir: str) -> dict[str, tuple[int, int]]:
     """[wave-22 C1] path → (mtime_ns, size) for the files a probe run can
     write (outputs, probe-persisted outputs, the draft's seed list).
@@ -6695,6 +6765,74 @@ def _probe_phase1_discovery_checked(slug, state, job_id, root: str | None = None
         _restore_zeroed_checkpoint(ws, _pre_ckpt)
 
 
+def _probe_cache_note(state: dict) -> str:
+    """[wave-32 A2] Read-only probe-cache state for the `[PROBE]` row.
+
+    Answers "was the domain's cached verdict in play, and how old is it"
+    (587 §6-Q5) WITHOUT the side effects the real reader has — no
+    last_used_at touch, no expiry delete: this is telemetry, not a cache use.
+    """
+    try:
+        from urllib.parse import urlparse
+
+        from django.utils import timezone as _tz
+        from scraper.models import ProbeCache
+
+        _host = urlparse(state.get("url") or "").hostname
+        if not _host:
+            return "miss(no-url)"
+        entry = ProbeCache.objects.filter(domain=_host).first()
+        if not entry:
+            return "miss"
+        _age = (_tz.now() - entry.cached_at).total_seconds()
+        return (
+            f"hit age_s={int(_age)} method={entry.method} "
+            f"akamai={entry.needs_akamai_bypass} captcha={entry.captcha_detected}"
+        )
+    except Exception:
+        return "?"
+
+
+def _probe_sessionlog_row(
+    job_id: int,
+    state: dict,
+    outcome: str,
+    rc,
+    stderr: str,
+    candidate: str,
+    owned_files,
+) -> None:
+    """[wave-32 A2] One SessionLog row per smoke probe run.
+
+    587's probe diagnosis lived only in container stdout; the job log — the
+    thing an RCA actually reads — showed nothing. Row carries rc, the stderr
+    tail, the resolved listing candidate, the owned-output detection count,
+    and the domain's probe-cache state (A2 covers D-A1/D-A3 + the cache
+    question; output-detection 0 vs >1 is recorded for D-A2's blind spot).
+    """
+    try:
+        _names = (
+            ",".join(os.path.basename(p) for p in owned_files[:3])
+            if owned_files
+            else "-"
+        )
+        _stderr_tail = (stderr or "").strip()[-200:].replace("\n", " | ")
+        _probe_cache_state = _probe_cache_note(state or {})
+        _log_event_row(
+            job_id,
+            "probe",
+            (
+                f"[PROBE] outcome={outcome} rc={rc if rc is not None else '-'} "
+                f"candidate={(candidate or '<draft default>')[:80]} "
+                f"owned_outputs={len(owned_files) if owned_files is not None else '-'} "
+                f"({_names}) cache={_probe_cache_state} "
+                f"stderr={_stderr_tail}"
+            ),
+        )
+    except Exception:
+        pass
+
+
 def _probe_phase1_discovery_once(
     slug: str, state: dict, job_id: int, listing_override: str = ""
 ) -> tuple[bool, str | None, dict | None]:
@@ -6734,22 +6872,9 @@ def _probe_phase1_discovery_once(
         # list_page the JOB URL outranks the navigator's promotion; F17
         # domain-guards everything). The retry passes listing_override to test
         # the navigator's promotion after the primary yielded zero (job-76).
-        _primary, _alt = _probe_listing_candidates(state)
-        _probe_env_candidate = listing_override or _primary or _alt
-        if _probe_env_candidate:
-            try:
-                from agents.nodes.run_execution import _registrable_of
-
-                _job_reg = _registrable_of(state.get("url", ""))
-                _cand_reg = _registrable_of(_probe_env_candidate)
-                if _job_reg and _cand_reg and _cand_reg != _job_reg:
-                    logger.warning(
-                        "_probe_phase1_discovery: F17 dropped cross-domain listing "
-                        "%s (job domain %s)", _probe_env_candidate[:70], _job_reg,
-                    )
-                    _probe_env_candidate = ""
-            except Exception:
-                pass
+        # [wave-32 E1a] the F17 guard walks the chain with fall-through — a
+        # dropped candidate must not null the whole env (587).
+        _probe_env_candidate = _probe_listing_env_candidate(state, listing_override)
         # T0.2 (wave-19, job 324): the probe must test EXECUTION's identity —
         # the gate used to run bare os.environ while the real run rides the
         # recipe's proxy tiers, so a draft that would have succeeded under its
@@ -6863,6 +6988,10 @@ def _probe_phase1_discovery_once(
                     "_probe_phase1_discovery: browser_service dispatch failed (%s) — inconclusive",
                     exc,
                 )
+                _probe_sessionlog_row(
+                    job_id, state, "dispatch_failed", None, str(exc)[:200],
+                    _probe_env_candidate, None,
+                )
                 return False, None, None
         else:
             proc = subprocess.run(
@@ -6881,6 +7010,9 @@ def _probe_phase1_discovery_once(
                 "_probe_phase1_discovery: CRASHED (job %s, rc=%s):\n%s",
                 job_id, rc, tail,
             )
+            _probe_sessionlog_row(
+                job_id, state, "crashed", rc, tail, _probe_env_candidate, None,
+            )
             return True, tail, None
         # argparse exit(2) carries NO Traceback — without this hook the probe
         # silently passed a draft whose CLI rejects the execution flags
@@ -6893,10 +7025,49 @@ def _probe_phase1_discovery_once(
                 "(job %s): %s",
                 job_id, tail,
             )
+            _probe_sessionlog_row(
+                job_id, state, "argparse_rejected", rc, tail,
+                _probe_env_candidate, None,
+            )
             return True, tail, None
-        logger.info(
-            "_probe_phase1_discovery: OK (job %s, rc=%s)", job_id, rc
-        )
+        # [wave-32 A1] `OK` is reserved for rc == 0. A nonzero exit without a
+        # crash signature (587: rc=1 "No --query, --category-url, or
+        # --listing-url provided") previously logged "OK" and dropped stderr —
+        # the probe had the diagnosis and threw it away. Return contract is
+        # unchanged (still inconclusive); only the evidence survives now.
+        if rc != 0:
+            _tail = (stderr or "").strip()[-800:]
+            logger.warning(
+                "_probe_phase1_discovery: exit=%s rc=%s (no crash signature) "
+                "(job %s): %s",
+                rc, rc, job_id, _tail,
+            )
+            # [wave-32 C1] The template's no-discovery-source exit IS a
+            # diagnosis, not an inconclusive shrug (587: rc=1 "No --query,
+            # --category-url, or --listing-url provided" kept the job burning
+            # retries on a draft whose discovery trigger never fired). Route
+            # into the crashed force-FAIL arm: crashed=True disables the
+            # listing/tier retries (correct — the missing CLI source is
+            # transport-independent) and the tail carries the marker into
+            # feedback_for_writer. Audit (critique f10): only the two
+            # two-phase templates emit the marker, both sys.exit(1); every
+            # other nonzero-no-traceback shape stays inconclusive.
+            if _NO_DISCOVERY_SOURCE_MARKER in (stderr or ""):
+                _probe_sessionlog_row(
+                    job_id, state, "no_discovery_source", rc, _tail,
+                    _probe_env_candidate, None,
+                )
+                return True, (
+                    f"draft exited rc={rc} with NO discovery source: "
+                    f"{_NO_DISCOVERY_SOURCE_MARKER}. The discovery trigger "
+                    "never reached main() — wire SCRAPER_LISTING_URL / "
+                    "--listing-url and the execution flags before touching "
+                    "selectors."
+                ), None
+        else:
+            logger.info(
+                "_probe_phase1_discovery: OK (job %s, rc=%s)", job_id, rc
+            )
         # [job-65 citybeach] Read THIS probe's yield from the output file it
         # just wrote (mtime floor — a pre-probe artifact must never yield a
         # verdict). Every two-phase template emits
@@ -6904,6 +7075,7 @@ def _probe_phase1_discovery_once(
         # --discover-only run ``found`` is 0 by construction, so the yield is
         # ``discovered_urls`` (int; some templates emit a list).
         probe_yield: dict | None = None
+        _owned: list = []
         try:
             # [wave-22 C1] The probe's output is the file that is NEW or
             # CHANGED since the pre-run snapshot — a set identity, not the
@@ -6996,10 +7168,18 @@ def _probe_phase1_discovery_once(
                 )
         except Exception as _pexc:
             logger.debug("_probe_phase1_discovery: coverage read skipped: %s", _pexc)
+        _probe_sessionlog_row(
+            job_id, state,
+            "no crash signature" if rc != 0 else "ok",
+            rc, stderr, _probe_env_candidate, _owned,
+        )
         return False, None, probe_yield
     except subprocess.TimeoutExpired:
         logger.info(
             "_probe_phase1_discovery: timed out (job %s) — inconclusive", job_id
+        )
+        _probe_sessionlog_row(
+            job_id, state, "timeout", None, "", _probe_env_candidate, None,
         )
     except Exception as exc:
         logger.warning("_probe_phase1_discovery: errored (job %s): %s", job_id, exc)
