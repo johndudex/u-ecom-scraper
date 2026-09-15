@@ -116,6 +116,32 @@ RESTART_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="restart
 MAINT_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="maint")
 PROBE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="probe")
 
+# ── [wave-33 D2] probe-slot admission ────────────────────────────────────────
+# /probe-single capacity via a SECOND slot counter, deliberately NOT
+# PROBE_LOCK: the lock serializes a single-rung listing probe behind a
+# multi-minute /probe ladder (or /render), and the caller reports the
+# lock-wait as a site verdict ("playwright failed" for a site it never
+# actually tried). Slots bound concurrent browser-launching rungs instead;
+# excess callers get the same 429 shape the C1a callers already park on.
+# HTTP-flavoured rungs (direct_http_*, fingerprint_*) stay exempt — cheap
+# diagnostics, no browser, nothing to gate. The counter is only ever touched
+# from the event loop between awaits, so no lock of its own.
+PROBE_MAX_CONCURRENT = int(os.environ.get("PROBE_MAX_CONCURRENT", "2"))
+_probe_slots_in_use = 0
+
+
+def _probe_slot_try_acquire() -> bool:
+    global _probe_slots_in_use
+    if _probe_slots_in_use >= PROBE_MAX_CONCURRENT:
+        return False
+    _probe_slots_in_use += 1
+    return True
+
+
+def _probe_slot_release() -> None:
+    global _probe_slots_in_use
+    _probe_slots_in_use = max(0, _probe_slots_in_use - 1)
+
 # ── [wave-33 T33-3] poisoned-executor swap ────────────────────────────────
 # A sync-playwright guard event poisons a thread FOREVER (the 09-14/09-15 RCA:
 # 5-6ms instant-fails, zero successes for hours, restart_chrome cures nothing
@@ -2141,6 +2167,9 @@ async def health():
             "navigate_slots_busy": nav_busy,
             "navigate_slots_total": NAVIGATE_MAX_CONCURRENT,
             "navigate_queued": nav_queued,
+            # [wave-33 D2]
+            "probe_slots_busy": min(_probe_slots_in_use, PROBE_MAX_CONCURRENT),
+            "probe_slots_total": PROBE_MAX_CONCURRENT,
             "uptime_seconds": time.time() - PROCESS_START,
             "health_elapsed_ms": round((time.monotonic() - t0) * 1000, 1),
         },
@@ -2313,35 +2342,70 @@ async def probe_single(request: SingleProbeRequest):
             country=country,
         ),
         "playwright_none": lambda: _try_playwright(
-            request.url, "none", min(request.timeout, 25)
+            request.url,
+            "none",
+            min(request.timeout, 25),
+            launch_hook=lambda ctx: _ephemeral_track(call_id, [ctx.root_pid]),
         ),
         "playwright_datacenter": lambda: _try_playwright(
-            request.url, "datacenter", min(request.timeout, 35), country=country
+            request.url,
+            "datacenter",
+            min(request.timeout, 35),
+            country=country,
+            launch_hook=lambda ctx: _ephemeral_track(call_id, [ctx.root_pid]),
         ),
         "playwright_residential": lambda: _try_playwright(
-            request.url, "residential", min(request.timeout, 35), country=country
+            request.url,
+            "residential",
+            min(request.timeout, 35),
+            country=country,
+            launch_hook=lambda ctx: _ephemeral_track(call_id, [ctx.root_pid]),
         ),
         "cloak_none": lambda: _try_cloak(
-            request.url, "none", min(request.timeout, 45), country=country
+            request.url,
+            "none",
+            min(request.timeout, 45),
+            country=country,
+            launch_hook=lambda ctx: _ephemeral_track(call_id, [ctx.root_pid]),
         ),
         "cloak_datacenter": lambda: _try_cloak(
-            request.url, "datacenter", min(request.timeout, 45), country=country
+            request.url,
+            "datacenter",
+            min(request.timeout, 45),
+            country=country,
+            launch_hook=lambda ctx: _ephemeral_track(call_id, [ctx.root_pid]),
         ),
         "cloak_residential": lambda: _try_cloak(
-            request.url, "residential", min(request.timeout, 45), country=country
+            request.url,
+            "residential",
+            min(request.timeout, 45),
+            country=country,
+            launch_hook=lambda ctx: _ephemeral_track(call_id, [ctx.root_pid]),
         ),
         # DEPRECATED aliases: ``uc_chrome`` was removed (consolidated onto cloak,
         # its documented successor). Kept so cached ProbeCache ``method`` values
         # naming ``uc_chrome_*`` still resolve on /probe-single instead of 400'ing.
         # The result payload reports ``cloak_*`` as the method that worked.
         "uc_chrome_none": lambda: _try_cloak(
-            request.url, "none", min(request.timeout, 45), country=country
+            request.url,
+            "none",
+            min(request.timeout, 45),
+            country=country,
+            launch_hook=lambda ctx: _ephemeral_track(call_id, [ctx.root_pid]),
         ),
         "uc_chrome_datacenter": lambda: _try_cloak(
-            request.url, "datacenter", min(request.timeout, 45), country=country
+            request.url,
+            "datacenter",
+            min(request.timeout, 45),
+            country=country,
+            launch_hook=lambda ctx: _ephemeral_track(call_id, [ctx.root_pid]),
         ),
         "uc_chrome_residential": lambda: _try_cloak(
-            request.url, "residential", min(request.timeout, 45), country=country
+            request.url,
+            "residential",
+            min(request.timeout, 45),
+            country=country,
+            launch_hook=lambda ctx: _ephemeral_track(call_id, [ctx.root_pid]),
         ),
     }
 
@@ -2354,10 +2418,33 @@ async def probe_single(request: SingleProbeRequest):
             },
         )
 
+    # [wave-33 D2] slot admission AFTER the 400 (an unknown method must not
+    # leak a slot), browser-launching rungs only. The call's roots register in
+    # the ephemeral registry (T33-4 deferral): the deadline arm below kills
+    # them instead of leaving the executor thread browsing for a caller that
+    # is gone, and the reaper sees any residue (T33-5).
+    call_id: Optional[str] = None
+    if _is_browser_launch_method(method):
+        if not _probe_slot_try_acquire():
+            return _backpressure(
+                429,
+                (
+                    f"all {PROBE_MAX_CONCURRENT} probe slots busy with concurrent "
+                    "browser probes — retry shortly"
+                ),
+                10,
+                error_class="probe_slots_busy",
+            )
+        call_id = f"probe-single-{time.monotonic_ns()}"
+        _ephemeral_register(call_id, f"probe-single:{method}")
+
     try:
         loop = asyncio.get_event_loop()
         start = time.monotonic()
-        result = await loop.run_in_executor(PROBE_EXECUTOR, method_map[method])
+        result = await asyncio.wait_for(
+            loop.run_in_executor(PROBE_EXECUTOR, method_map[method]),
+            timeout=request.timeout + 30,
+        )
         elapsed = round(time.monotonic() - start, 2)
 
         if result is None:
@@ -2382,6 +2469,28 @@ async def probe_single(request: SingleProbeRequest):
         result["elapsed"] = elapsed
         return JSONResponse(content=result)
 
+    except asyncio.TimeoutError:
+        # [wave-33 D2] request-derived deadline: the executor thread cannot be
+        # cancelled, so kill what it launched (reuse-guarded) and flag the call
+        # abandoned — the worker fails fast on a dead browser and the residue
+        # stays reaper-visible instead of browsing for nobody.
+        killed = _ephemeral_abandon(call_id) if call_id else 0
+        logger.error(
+            "Probe-single deadline for %s method=%s (> %ss; abandon-kill "
+            "signalled %d)",
+            request.url[:200],
+            method,
+            request.timeout + 30,
+            killed,
+        )
+        return JSONResponse(
+            status_code=504,
+            content={
+                "success": False,
+                "method": method,
+                "error": "Probe deadline exceeded",
+            },
+        )
     except Exception as exc:
         logger.exception(
             "Single probe failed for %s method=%s", request.url[:80], method
@@ -2395,6 +2504,10 @@ async def probe_single(request: SingleProbeRequest):
                 "elapsed": 0,
             },
         )
+    finally:
+        if call_id:
+            _ephemeral_release(call_id)
+            _probe_slot_release()
 
 
 @app.post("/render")
