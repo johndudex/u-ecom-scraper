@@ -5543,6 +5543,164 @@ def _log_bloat_tripwire(job_id: int, state: ScrapeState, draft_path: str) -> boo
         return False
 
 
+_PRESEED_MARK = "[FAILURE-REGION]"
+_PRESEED_DISCOVERY_NAMES = ("_extract_item_links", "_get_next_page_url")
+
+
+def _failure_region_block(state: ScrapeState, draft_path: str) -> str:
+    """[wave-25e E5] Deterministic failure-targeted draft region for the
+    writer pre-seed — no LLM call, empty string when nothing qualifies.
+
+    Triggers (the REAL remediation vocabulary; route_after_testing selects
+    between ``mapping`` and ``strategy``, subagents reads ``scraper``):
+    - ``target == "mapping"`` with ``fields`` → the function(s) whose body
+      mentions a failed field name, plus the ALL-CAPS constants they
+      reference (EXTRACT_*-class or whose value mentions the field);
+    - ``target == "strategy"``, or a ``discovery_coverage`` dict in the test
+      report (the key code_tester actually copies from scraper output) → the
+      ``discover_*`` / ``_extract_item_links`` / ``_get_next_page_url``
+      functions plus ``main()``'s CLI surface;
+    - ``target == "scraper"`` → nothing (transport-level; the region is the
+      whole file).
+
+    Capped at ``CODE_WRITER_PRESEED_MAX_CHARS`` (0 disables). Unparseable or
+    missing draft → "" (an unsupported state never raises here).
+    """
+    import ast as _ast
+
+    try:
+        from django.conf import settings as _settings
+
+        cap = int(getattr(_settings, "CODE_WRITER_PRESEED_MAX_CHARS", 12_000) or 0)
+    except Exception:
+        cap = 12_000
+    if cap <= 0:
+        return ""
+    tr = state.get("test_report")
+    if not isinstance(tr, dict):
+        return ""
+    rem = tr.get("remediation")
+    rem = rem if isinstance(rem, dict) else {}
+    target = str(rem.get("target") or "").strip()
+    fields = [str(f).strip() for f in (rem.get("fields") or []) if str(f).strip()]
+    if target == "scraper":
+        return ""
+    if target == "mapping" and fields:
+        arm = "mapping"
+    elif target == "strategy" or isinstance(tr.get("discovery_coverage"), dict):
+        arm = "discovery"
+    else:
+        return ""
+    try:
+        with open(draft_path, encoding="utf-8", errors="replace") as _fh:
+            code = _fh.read()
+        tree = _ast.parse(code)
+    except Exception:
+        return ""
+
+    def _seg(node) -> str:
+        try:
+            return _ast.get_source_segment(code, node) or ""
+        except Exception:
+            return ""
+
+    selected: list[tuple[str, str]] = []  # (label, segment)
+    if arm == "mapping":
+        want = list(fields)
+        consts: set[str] = set()
+        for node in tree.body:
+            if not isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                continue
+            seg = _seg(node)
+            if any(f in seg for f in want):
+                selected.append((
+                    f"{node.name} (lines {node.lineno}-{node.end_lineno}) — "
+                    f"failed fields: {', '.join(want)}",
+                    seg,
+                ))
+                for n in _ast.walk(node):
+                    if isinstance(n, _ast.Name) and n.id.isupper():
+                        consts.add(n.id)
+        for node in tree.body:
+            if not isinstance(node, (_ast.Assign, _ast.AnnAssign)):
+                continue
+            tgts = node.targets if isinstance(node, _ast.Assign) else [node.target]
+            seg = _seg(node)
+            for t in tgts:
+                if not (isinstance(t, _ast.Name) and t.id in consts):
+                    continue
+                if t.id.startswith("EXTRACT_") or any(f in seg for f in want):
+                    selected.append((f"{t.id} (lines {node.lineno}-{getattr(node, 'end_lineno', node.lineno)})", seg))
+    else:  # discovery
+        for node in tree.body:
+            if not isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                continue
+            if node.name.startswith("discover_") or node.name in _PRESEED_DISCOVERY_NAMES:
+                selected.append((f"{node.name} (lines {node.lineno}-{node.end_lineno})", _seg(node)))
+            elif node.name == "main":
+                selected.append((
+                    f"main() argparse/CLI surface (lines {node.lineno}-{node.end_lineno})",
+                    _seg(node),
+                ))
+    if not selected:
+        return ""
+    slug = str(state.get("site_slug") or "<site_slug>")
+    header = (
+        f"{_PRESEED_MARK} The failing logic lives in these region(s) of "
+        f"workspace/{slug}/scraper_draft.py — read_file(path, line=N) the "
+        "window before editing:\n"
+    )
+    parts: list[str] = [header]
+    used = len(header)
+    for label, seg in selected:
+        prefix = f"- {label}\n```python\n"
+        suffix = "\n```\n"
+        allowance = cap - used - len(prefix) - len(suffix) - 120
+        if allowance <= 200:
+            parts.append(
+                f"- (further regions omitted — pre-seed cap {cap:,} chars)\n"
+            )
+            break
+        if len(seg) <= allowance:
+            parts.append(prefix + seg + suffix)
+            used += len(prefix) + len(seg) + len(suffix)
+        else:
+            parts.append(
+                prefix + seg[:allowance]
+                + "\n… (region truncated to fit the pre-seed cap)\n" + suffix
+            )
+            used += cap  # conservative — loop ends next iteration anyway
+    return "".join(parts)
+
+
+def _preseed_failure_region(
+    state: ScrapeState, messages: list, draft_path: str
+) -> list:
+    """[wave-25e E5] Splice the failure-targeted region INTO the seed
+    (``messages[0]``) — the truncation-exempt per-cycle task spec.
+
+    An appended trailing message would read as a stray instruction after the
+    final tool result and would be re-added on every retry construction of
+    the same state; a marker-guarded splice into the seed is idempotent.
+    Constructs a NEW message object (state's messages are shared across
+    retry constructions — never mutated in place). Never raises.
+    """
+    try:
+        if not messages:
+            return messages
+        first = messages[0]
+        content = getattr(first, "content", "")
+        if not isinstance(content, str) or _PRESEED_MARK in content:
+            return messages
+        block = _failure_region_block(state, draft_path)
+        if not block:
+            return messages
+        spliced = content.rstrip() + "\n\n" + block
+        return [type(first)(content=spliced)] + list(messages[1:])
+    except Exception:
+        return messages
+
+
 def _run_draft_finisher(
     state: ScrapeState, config: RunnableConfig, slug: str, job_id: Any
 ) -> dict[str, Any] | None:
@@ -5589,16 +5747,32 @@ def _run_draft_finisher(
         # [wave-32 D5] The finisher conditions on SIZE alone — it is
         # definitionally a post-death window with no EOW state to consult.
         # [wave-25e E1] classify_embed(eow_active=None) IS that golden.
+        # Classify FIRST so the seed can be honest about what the embed
+        # actually carries [wave-25e E4].
         from .draft_context import classify_embed
 
         _embed_mode = classify_embed(
             _draft_text, eow_active=None,
             full_max_chars=_embed_full_max_chars(),
         )
+        if _embed_mode == "bounded":
+            _base_clause = (
+                f"- The draft is `workspace/{slug}/scraper_draft.py` (in "
+                "your context as head+tail+map only — the middle is NOT "
+                "included; re-read any region with read_file(line=) before "
+                "editing it — edit it, do NOT rewrite from scratch).\n"
+            )
+        else:
+            _base_clause = (
+                f"- The draft is `workspace/{slug}/scraper_draft.py` (already "
+                "in your context as the base — edit it, do NOT rewrite from "
+                "scratch).\n"
+            )
         seed = (
             "[DRAFT-FINISHER] You are FINISHING an existing scraper, not "
             "restarting. The previous invocation was cut off by its "
             "wall-clock budget while working on this draft.\n\n"
+            + _base_clause
             + f"- CURRENT strategy per the deterministic analyzer: {_strategy}\n"
             f"- Strategies already tried and failed: {_tried_note}\n"
             "- The analyzer may have switched strategy after this draft was "
@@ -5929,6 +6103,12 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         _w24_codefix = _w24_fix and _eow_active
         _w24_nudge_token = _writer_fix_cycle.set(_w24_fix)
         _w24_codefix_token = _writer_codefix_cycle.set(_w24_codefix)
+        # [wave-25e E5] On an EOW fix cycle the failure-targeted draft region
+        # rides the SEED (truncation-exempt task spec) — the writer opens on
+        # the exact failing functions instead of re-reading blind.
+        if _eow_active and _w24_fix:
+            _pre_draft = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
+            messages = _preseed_failure_region(state, messages, _pre_draft)
         try:
             # [wave-32 D5] Embed diet: only a huge edit-over-write BASE is
             # worth eliding — bounded iff the EOW base is live AND it

@@ -280,16 +280,22 @@ CODE_WRITER_LLM_TIMEOUT = config("CODE_WRITER_LLM_TIMEOUT", default=600, cast=in
 # "[HARNESS NUDGE] write the draft NOW" line (0 disables).
 CODE_WRITER_DRAFT_NUDGE_CALLS = config("CODE_WRITER_DRAFT_NUDGE_CALLS", default=12, cast=int)
 # [wave-32 D5] Writer embed diet (BOUNDED embed of a huge edit-over-write
-# base). DORMANT by default: CODE_WRITER_EMBED_MODE is read via getattr with
-# code-level default "full" — deliberately NOT declared here so the dormant
-# default lives in one place (subagents._resolve_embed_mode); wave-25e E2a
-# owns the flip. The three sizing knobs below gate when the diet applies
+# base). [wave-25e E2a] flipped the default to bounded (see below) — a
+# bounded request only applies when the D5 wiring makes it (EOW fix cycles
+# on huge drafts); the sizing knobs below gate when the diet applies
 # and how much survives the elision.
+# [wave-25e E2a] THE FLIP (was "full" pre-25e): bounded applies when the
+# D5 wiring requests it — EOW fix cycles on drafts >= CODE_WRITER_EMBED_FULL_MAX_CHARS.
+# First-cycle templates stay full (an explicit "full" request always wins
+# at the resolver); CODE_WRITER_EMBED_MODE=full env-restores pre-25e behavior.
+CODE_WRITER_EMBED_MODE = config("CODE_WRITER_EMBED_MODE", default="bounded")
 CODE_WRITER_EMBED_FULL_MAX_CHARS = config("CODE_WRITER_EMBED_FULL_MAX_CHARS", default=40_000, cast=int)
 CODE_WRITER_EMBED_HEAD = config("CODE_WRITER_EMBED_HEAD", default=20_000, cast=int)
 CODE_WRITER_EMBED_TAIL = config("CODE_WRITER_EMBED_TAIL", default=20_000, cast=int)
 # [wave-25e E1] bounded-embed ast map cap (the only new setting E1 adds).
 CODE_WRITER_EMBED_MAP_MAX_CHARS = config("CODE_WRITER_EMBED_MAP_MAX_CHARS", default=6_000, cast=int)
+# [wave-25e E5] failure-targeted region pre-seed cap (0 disables).
+CODE_WRITER_PRESEED_MAX_CHARS = config("CODE_WRITER_PRESEED_MAX_CHARS", default=12_000, cast=int)
 # [wave-23 W23-1] Per-LLM-call no-chunk watchdog (seconds): a streaming call
 # yielding no chunks for this long is abandoned mid-call and retried as a
 # transient error (Z.AI keepalives defeat the httpx read timeout — prod 343/
