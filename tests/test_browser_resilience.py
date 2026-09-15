@@ -432,15 +432,21 @@ class TestPoisonFix:
         assert probe._LAUNCH_HEALTH["poison_guard"] == before + 1
 
     def test_poison_degrades_health_status_and_is_gauged(self):
-        """The outage's missing visibility: poison_guard must degrade /health
-        (restart is the only cure) and the counters must be gauged."""
+        """The outage's missing visibility: poison must degrade /health and
+        the counters must be gauged. [wave-33 T33-1/T33-2 migration] poison is
+        now STATE (current-generation blacklisted threads), read via
+        launch_poison_snapshot(); the lifetime counter is telemetry only — it
+        latched /health 503 forever and nothing recycles the container."""
         src = pathlib.Path(
             os.path.join(ROOT, "browser_service", "server.py")
         ).read_text()
-        assert 'and not launch_health.get("poison_guard")' in src, (
-            "/health must degrade while a poisoned executor thread exists"
+        hsrc = re.search(r'@app\.get\("/health"\).*?(?=\n@app\.|\nclass )', src, re.S)
+        assert hsrc and "launch_poison_snapshot()" in hsrc.group(0), (
+            "/health must read poison STATE (generation-scoped), not the "
+            "lifetime counter"
         )
         assert '"launch_health"' in src
+        assert '"poison"' in src
 
     def test_poison_vector_dependencies_are_pinned(self):
         """playwright + cloakbrowser own the sync-context machinery at the

@@ -318,7 +318,23 @@ class TestResumeTask:
         from scraper.tasks import resume_browser_unavailable_jobs
 
         settings.BROWSER_RESUME_ENABLED = True
-        monkeypatch.setattr(f"{BH}.browser_service_healthy", lambda: False)
+        # [wave-33 T33-2] The resumer gate is now the dedicated strict check —
+        # it must NOT relax when pre-flights learn to accept degraded.
+        monkeypatch.setattr(f"{BH}.browser_service_strict_ok", lambda: False)
+        assert resume_browser_unavailable_jobs() == {
+            "resumed": 0, "reason": "browser_service unhealthy",
+        }
+
+    def test_degraded_browsable_gateway_still_resumes_nothing(self, settings, monkeypatch):
+        """The resumer keeps literal-"ok": degraded-but-browsable is good
+        enough for a pre-flight to PROCEED, not good enough to RESUME parked
+        jobs into (conservative by design — plan §A2)."""
+        import agents.tools.browser_http as bh
+        from scraper.tasks import resume_browser_unavailable_jobs
+
+        settings.BROWSER_RESUME_ENABLED = True
+        monkeypatch.setattr(f"{BH}.browser_service_healthy", lambda: True)
+        monkeypatch.setattr(f"{BH}.browser_service_strict_ok", lambda: False)
         assert resume_browser_unavailable_jobs() == {
             "resumed": 0, "reason": "browser_service unhealthy",
         }
@@ -331,7 +347,7 @@ class TestResumeTask:
         from scraper.models import ScrapeJob
 
         settings.BROWSER_RESUME_ENABLED = True
-        monkeypatch.setattr(f"{BH}.browser_service_healthy", lambda: True)
+        monkeypatch.setattr(f"{BH}.browser_service_strict_ok", lambda: True)
         monkeypatch.setattr(f"{BH}.BROWSER_RESUME_BATCH", 1)
         dispatched = []
         monkeypatch.setattr(st, "dispatch_scrape_job", lambda jid: dispatched.append(jid))

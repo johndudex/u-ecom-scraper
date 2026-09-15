@@ -2018,9 +2018,12 @@ def resume_browser_unavailable_jobs() -> dict:
     if not getattr(_dj_settings, "BROWSER_RESUME_ENABLED", True):
         return {"resumed": 0, "reason": "disabled"}
 
-    from agents.tools.browser_http import browser_service_healthy
+    from agents.tools.browser_http import browser_service_strict_ok
 
-    if not browser_service_healthy():
+    # [wave-33 T33-2] The RESUMER keeps the literal-"ok" gate: pre-flights may
+    # proceed against a degraded-but-browsable gateway, but resuming parked
+    # jobs into one is a choice, not a necessity — conservative by design.
+    if not browser_service_strict_ok():
         return {"resumed": 0, "reason": "browser_service unhealthy"}
 
     from agents.tools.browser_http import BROWSER_RESUME_BATCH

@@ -4,6 +4,8 @@ import os
 import signal
 import sys
 import threading
+import time
+from collections import deque
 from typing import Any, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -546,17 +548,136 @@ PAGE_CLOSE_GRACE_S = float(os.environ.get("PAGE_CLOSE_GRACE_S", "10"))
 
 # Launch-path counters for /health (the poison outage's missing visibility:
 # the incident's ONLY signal was buried INFO log lines while every liveness
-# gauge stayed green). "poison_guard" counts sync-playwright guard errors —
-# a thread whose dispatcher loop leaked (cross-thread close, un-stopped
-# context) fails every future launch on it until the service restarts.
-# After the same-thread-close fix this must stay 0 forever; nonzero = active
-# poisoning, and /health degrades on it.
+# gauge stayed green).
+#
+# [wave-33 T33-1] Poison is STATE, not a lifetime count. The old /health rule
+# "degrade while lifetime poison_guard > 0" latched the service unhealthy
+# forever (nothing in the stack recycles an unhealthy container) — and a
+# memory-pressure launch failure whose error text merely CONTAINS the guard
+# signature counted the same as a truly poisoned thread. Now:
+#   - a guard event blacklists the THREAD at the CURRENT pool generation
+#     (server.py's executor swap bumps the generation per pool — recycled
+#     thread names must not be born-guilty);
+#   - a successful launch on the thread clears its blacklist (a "poisoned"
+#     thread that launches again was never truly poisoned — the 09-14 storm
+#     self-cleared without a restart, which lifetime-latching cannot express);
+#   - lifetime counters + a windowed event log remain as telemetry only.
 _LAUNCH_HEALTH = {"ok": 0, "launch_failed": 0, "poison_guard": 0}
+_LAUNCH_HEALTH_LOCK = threading.Lock()
 _POISON_SIGNATURE = "inside the asyncio loop"
+_POISONED_THREADS: set[tuple[str, int, str]] = set()  # (pool, generation, thread)
+_POOL_GENERATIONS: dict[str, int] = {}
+_POISON_EVENTS: deque = deque(maxlen=500)  # (ts, pool, thread, exc class)
+_LAUNCH_EVENTS: deque = deque(maxlen=2000)  # (ts, "ok"|"failed")
+_LAUNCH_WINDOW_DEFAULT_S = 900.0
+
+
+def _thread_pool_name(thread_name: str) -> str:
+    """'navigate_0' → 'navigate'; non-numbered names → themselves."""
+    head, _, tail = thread_name.rpartition("_")
+    return head if tail.isdigit() and head else thread_name
 
 
 def _launch_health_snapshot() -> dict:
-    return dict(_LAUNCH_HEALTH)
+    with _LAUNCH_HEALTH_LOCK:
+        return dict(_LAUNCH_HEALTH)
+
+
+def _record_poison_event(
+    thread_name: Optional[str] = None, exc: Optional[BaseException] = None
+) -> None:
+    """Record a poison-guard event: blacklist STATE + windowed telemetry.
+
+    Module-level seam (plan §Injectability) so tests can inject events
+    without driving a real launch. The critical log lives here too — state
+    and its signal must not drift apart.
+    """
+    name = thread_name or threading.current_thread().name
+    pool = _thread_pool_name(name)
+    with _LAUNCH_HEALTH_LOCK:
+        gen = _POOL_GENERATIONS.setdefault(pool, 0)
+        _LAUNCH_HEALTH["poison_guard"] += 1
+        _POISONED_THREADS.add((pool, gen, name))
+        _POISON_EVENTS.append(
+            (time.time(), pool, name, type(exc).__name__ if exc is not None else "")
+        )
+    logger.critical(
+        "launch: sync-playwright guard fired on %s (pool=%s gen=%d) — thread "
+        "blacklisted for browser launches until a successful launch on it or "
+        "an executor swap",
+        name,
+        pool,
+        gen,
+    )
+
+
+def _note_launch_failed(exc: BaseException) -> None:
+    """Bookkeep a failed launch: windowed event + lifetime counter + poison
+    STATE when the failure carries the sync-API-inside-asyncio signature."""
+    with _LAUNCH_HEALTH_LOCK:
+        _LAUNCH_HEALTH["launch_failed"] += 1
+        _LAUNCH_EVENTS.append((time.time(), "failed"))
+    if _POISON_SIGNATURE in str(exc):
+        _record_poison_event(exc=exc)
+    else:
+        logger.warning(
+            "launch failed on %s: %s: %s",
+            threading.current_thread().name,
+            type(exc).__name__,
+            str(exc)[:150],
+        )
+
+
+def _note_launch_ok() -> None:
+    """Bookkeep a successful launch — and clear this thread's poison
+    blacklist: a live dispatcher loop just launched a browser."""
+    with _LAUNCH_HEALTH_LOCK:
+        _LAUNCH_HEALTH["ok"] += 1
+        _LAUNCH_EVENTS.append((time.time(), "ok"))
+        name = threading.current_thread().name
+        pool = _thread_pool_name(name)
+        _POISONED_THREADS.discard((pool, _POOL_GENERATIONS.get(pool, 0), name))
+
+
+def bump_launch_generation(pool: str) -> int:
+    """[T33-3 handshake] server.py calls this after rebuilding a poisoned
+    executor pool: replacement threads own recycled names, so the blacklist
+    must not carry over. Returns the new generation."""
+    with _LAUNCH_HEALTH_LOCK:
+        _POOL_GENERATIONS[pool] = _POOL_GENERATIONS.get(pool, 0) + 1
+        return _POOL_GENERATIONS[pool]
+
+
+def launch_poison_snapshot() -> dict:
+    """Current-generation poison STATE + windowed telemetry for /health."""
+    now = time.time()
+    with _LAUNCH_HEALTH_LOCK:
+        gens = dict(_POOL_GENERATIONS)
+        poisoned = sorted(
+            name
+            for pool, gen, name in _POISONED_THREADS
+            if gen == gens.get(pool, 0)
+        )
+        events_1h = sum(
+            1 for ts, _p, _n, _e in _POISON_EVENTS if now - ts <= 3600.0
+        )
+        return {
+            "poisoned_threads": poisoned,
+            "generations": gens,
+            "poison_events_1h": events_1h,
+            "poison_guard_lifetime": _LAUNCH_HEALTH["poison_guard"],
+        }
+
+
+def launch_window_stats(window_s: float = _LAUNCH_WINDOW_DEFAULT_S) -> dict:
+    """Windowed launch outcomes — the launch-capability signal /health's
+    ``browsable`` is built from (T33-2). Lifetime counters cannot express
+    'the storm self-cleared'; a window can."""
+    cutoff = time.time() - max(0.0, float(window_s))
+    with _LAUNCH_HEALTH_LOCK:
+        ok = sum(1 for ts, kind in _LAUNCH_EVENTS if kind == "ok" and ts >= cutoff)
+        failed = sum(1 for ts, kind in _LAUNCH_EVENTS if kind == "failed" and ts >= cutoff)
+    return {"ok": ok, "failed": failed, "window_s": float(window_s)}
 
 
 class _PageContext:
@@ -838,18 +959,10 @@ def _launch_page(
             page = browser.new_page()
             page.set_default_timeout(timeout * 1000)
         except Exception as exc:
-            _LAUNCH_HEALTH["launch_failed"] += 1
-            if _POISON_SIGNATURE in str(exc):
-                _LAUNCH_HEALTH["poison_guard"] += 1
-                logger.critical(
-                    "launch: sync-playwright guard fired on %s — this thread's "
-                    "dispatcher loop leaked and is poisoned; browser launches on "
-                    "it keep failing until the service restarts",
-                    threading.current_thread().name,
-                )
+            _note_launch_failed(exc)
             _hard_kill_partial_launch(browser=browser)
             raise
-        _LAUNCH_HEALTH["ok"] += 1
+        _note_launch_ok()
         return _PageContext(page, browser, pw=None, stealth_used=True, method="cloak")
 
     # default: vanilla Playwright
@@ -872,15 +985,7 @@ def _launch_page(
         page = browser.new_page()
         page.set_default_timeout(timeout * 1000)
     except Exception as exc:
-        _LAUNCH_HEALTH["launch_failed"] += 1
-        if _POISON_SIGNATURE in str(exc):
-            _LAUNCH_HEALTH["poison_guard"] += 1
-            logger.critical(
-                "launch: sync-playwright guard fired on %s — this thread's "
-                "dispatcher loop leaked and is poisoned; browser launches on "
-                "it keep failing until the service restarts",
-                threading.current_thread().name,
-            )
+        _note_launch_failed(exc)
         _hard_kill_partial_launch(browser=browser, pw=pw)
         # W1 kills the driver TREE; the sync CONTEXT must still be unwound
         # inline (same thread — greenlet-safe) or its suspended dispatcher
@@ -899,7 +1004,7 @@ def _launch_page(
                     str(stop_exc)[:150],
                 )
         raise
-    _LAUNCH_HEALTH["ok"] += 1
+    _note_launch_ok()
     return _PageContext(page, browser, pw=pw, stealth_used=False, method="playwright")
 
 

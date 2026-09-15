@@ -88,11 +88,22 @@ class TestHealthDispatchesNothing:
 
 class TestLazyAwareAnd:
     def test_and_semantics_in_health(self):
-        src = _health_fn_src()
-        assert 'bool(liveness.get("mcp_cdp_alive")) and (' in src, (
+        """[wave-33 T33-2 migration] The strict AND + lazy escape moved into
+        the pure _compute_health_status: a dead leg (mcp_cdp/scraper_cdp/
+        ready/mcp_process/mcp_http) is `dead` — 503 — and a deliberately
+        unstarted lazy Scraper Chrome is NOT a failure (else SCRAPER_CHROME_
+        LAZY=1 = 503 from boot = compose healthcheck blocks dependents)."""
+        m = re.search(
+            r"def _compute_health_status\(.*?(?=\n@app\.|\nclass |\Z)",
+            _server_src(),
+            re.S,
+        )
+        assert m, "_compute_health_status not found"
+        fn = m.group(0)
+        assert "not mcp_cdp_alive" in fn and "not ready" in fn, (
             "was OR — one alive Chrome masked a dead one (the cross-confirmed finding)"
         )
-        assert "browser_pool.scraper_not_required()" in src, (
+        assert "scraper_cdp_alive or scraper_not_required" in fn, (
             "strict AND without the lazy escape hatch = 503 from boot = compose "
             "healthcheck blocks django/celery dependents"
         )

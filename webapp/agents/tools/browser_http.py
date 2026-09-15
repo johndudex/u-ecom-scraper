@@ -330,16 +330,56 @@ PREFLIGHT_POLL_S = 10.0
 # [wave-16 B3] Beat-resumer batch (oldest parked first) per tick — small by
 # design: the scrape worker pool is 2 slots, so a stampede only queues anyway.
 BROWSER_RESUME_BATCH = int(os.environ.get("BROWSER_RESUME_BATCH", "3"))
+# [wave-33 T33-2] Absent/unset = the safe default (accept degraded). Setting
+# it restores the wave-16 literal-"ok" semantics everywhere
+# browser_service_healthy() is used — resolved at import; the browser-service
+# boot line logs the resolved value for deploy-day visibility.
+HEALTH_STRICT = os.environ.get("HEALTH_STRICT", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 def browser_service_healthy() -> bool:
-    """True only when browser_service answers /health with status "ok".
+    """[wave-33 T33-2] True when browser_service answers 200 AND is browsable.
 
-    A 503 (degraded), a transport error, or a non-JSON body are all False.
-    Deliberately strict: the callers use this to decide between proceeding
-    and parking, and a "maybe" must read as "no" — a job parked a few extra
-    minutes costs an idle slot, a job dispatched into a dead gateway burns a
-    full run.
+    ``ok`` is always healthy. ``degraded`` (200) is accepted ONLY when the
+    body carries ``browsable: true`` — launch capability, not Chrome
+    aliveness: a service whose pools are poisoned or whose recent launches
+    all failed must NOT receive testers (they would die in ~1ms launch
+    errors — park-into-failure, worse than parking). Anything else — 503
+    (dead / degraded_persistent), a transport error, a non-JSON body, a body
+    without a browsable verdict — reads as "no": a maybe is a no.
+
+    Set HEALTH_STRICT=1 to restore the wave-16 literal-"ok" gate (the
+    pre-wave-33 behavior) without a code change.
+    """
+    try:
+        resp = httpx.get(
+            f"{BROWSER_SERVICE_URL}/health", timeout=HEALTH_TIMEOUT_S
+        )
+        if resp.status_code != 200:
+            return False
+        body = resp.json() or {}
+        status = body.get("status")
+        if status == "ok":
+            return True
+        if HEALTH_STRICT:
+            return False
+        return status == "degraded" and body.get("browsable") is True
+    except Exception:
+        return False
+
+
+def browser_service_strict_ok() -> bool:
+    """Literal-"ok" gate — the conservative consumers keep wave-16 semantics.
+
+    The beat park-RESUMER uses this: resuming parked jobs into a merely
+    browsable gateway re-runs full scrapes against a service that may still
+    be sick; a few extra parked minutes cost idle slots, a resumed-into-death
+    run burns the site's quota. Deliberately unchanged by T33-2.
     """
     try:
         resp = httpx.get(

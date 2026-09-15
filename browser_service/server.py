@@ -22,7 +22,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from .browser_pool import browser_pool
 from .config import get_proxy_config
-from .probe import _launch_health_snapshot, run_probe, render_page
+from .probe import (
+    _launch_health_snapshot,
+    launch_poison_snapshot,
+    launch_window_stats,
+    run_probe,
+    render_page,
+)
 from .render_gate import render_gate_arm, render_gate_note, render_gate_satisfied as _render_gate_satisfied
 from .scraper_runner import run_scraper_script
 
@@ -1708,6 +1714,82 @@ def _cloak_info() -> dict:
         return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+# ── [wave-33 T33-2] four-state /health ────────────────────────────────────
+# The old computation latched: ANY lifetime poison_guard event → 503 forever,
+# and nothing in the stack recycles an unhealthy container — the 09-14 prod
+# latch ran 8h with zero restarts while celery's literal-"ok" check turned
+# every /health poll into a skipped tester (166 skips / 12 dead jobs). The
+# states now distinguish "sick but serving" (200, celery proceeds) from
+# "cannot serve" (503, celery parks):
+#   ok                  200 — healthy
+#   degraded            200 — bounded transient (nav-outcome window) or poison
+#                             STATE in a pool that still has live threads;
+#                             `browsable` says whether launches still work
+#   degraded_persistent 503 — a degraded condition held continuously past
+#                             2× the nav window + 5 min (re-arms the park
+#                             behavior instead of green-200-forever)
+#   dead                503 — immediately: ready=false, MCP/scraper CDP dead,
+#                             mcp_process dead, mcp_http down (B1-8 kill power
+#                             retained verbatim)
+# `browsable` = launch capability (poison state + windowed launch outcomes +
+# MCP alive + scraper CDP-or-lazy), NOT Chrome aliveness.
+_DEGRADED_PERSIST_AFTER_S = 2 * NAV_WINDOW_S + 300.0
+_HEALTH_DEGRADED_SINCE: list = [None]  # mutable cell the handler persists
+
+
+def _compute_health_status(
+    *,
+    ready: bool,
+    scraper_cdp_alive: bool,
+    scraper_not_required: bool,
+    mcp_cdp_alive: bool,
+    mcp_process_alive: bool,
+    mcp_http_state: str,
+    nav_state: str,
+    poison: dict,
+    launch_recent: dict,
+    degraded_since: Optional[float],
+    now: float,
+    persist_after_s: float,
+) -> dict:
+    """Pure four-state computation — unit-testable without FastAPI.
+
+    Returns {"status", "browsable", "degraded_since"}; the caller persists
+    ``degraded_since`` across calls so the persistent threshold measures the
+    CONTINUOUS hold of a degraded condition.
+    """
+    scraper_ok = bool(scraper_cdp_alive or scraper_not_required)
+    dead = (
+        not ready
+        or not mcp_process_alive
+        or not mcp_cdp_alive
+        or not scraper_ok
+        or mcp_http_state == "down"
+    )
+    if dead:
+        # dead already blocks serving; the persistent clock re-arms fresh on
+        # recovery so a post-incident transient can't instantly re-latch.
+        return {"status": "dead", "browsable": False, "degraded_since": None}
+
+    poison_active = bool(poison.get("poisoned_threads"))
+    launched = launch_recent.get("ok", 0) + launch_recent.get("failed", 0)
+    # A quiet window is not a failure; a window where every launch failed is.
+    launch_capable = (not poison_active) and (launch_recent.get("ok", 0) > 0 or launched == 0)
+    browsable = bool(launch_capable and mcp_process_alive and scraper_ok)
+
+    degraded = poison_active or nav_state == "degraded" or not browsable
+    if not degraded:
+        return {"status": "ok", "browsable": browsable, "degraded_since": None}
+    since = degraded_since if degraded_since is not None else now
+    if now - since > persist_after_s:
+        return {
+            "status": "degraded_persistent",
+            "browsable": browsable,
+            "degraded_since": since,
+        }
+    return {"status": "degraded", "browsable": browsable, "degraded_since": since}
+
+
 @app.get("/health")
 async def health():
     # W6: this handler dispatches NOTHING and blocks on nothing slow — every
@@ -1724,42 +1806,43 @@ async def health():
     # Check MCP process is alive (not just Chrome CDP port).
     mcp_pid = mcp_process.pid if mcp_process and mcp_process.poll() is None else None
     mcp_process_alive = mcp_pid is not None
-    # W6 lazy-aware AND (was OR): both CDP endpoints must respond, EXCEPT a
-    # deliberately-unstarted lazy Scraper Chrome is not a failure. Without the
-    # lazy escape hatch, SCRAPER_CHROME_LAZY=1 + strict AND = 503 from boot →
-    # the compose healthcheck fails → dependents never start.
-    scraper_ok = bool(liveness.get("scraper_cdp_alive"))
-    cdp_ok = bool(liveness.get("mcp_cdp_alive")) and (
-        scraper_ok or browser_pool.scraper_not_required()
-    )
     # Ephemeral-path truth: recent /navigate outcomes. no_data (quiet window)
-    # falls through to the persistent-AND — only an actual bad window degrades.
+    # falls through — only an actual bad window degrades.
     nav_recent = _nav_outcome_summary()
     from .scraper_runner import active_runs_snapshot
-    # B1-8: the MCP SSE-server serving state now has kill power. The prod
-    # wedge was exactly "mcp_process alive + CDP dead for 8+h" while this
-    # gauge (which catches a wedged SSE server that CDP misses) sat outside
-    # the status computation. down → degraded; unknown stays non-fatal (boot).
+    # B1-8: the MCP SSE-server serving state has kill power ("down" → dead).
+    # unknown stays non-fatal (boot window).
     mcp_http = dict(_MCP_HTTP_CACHE)
-    # [poison RCA 2026-09-03] A poisoned executor thread (leaked sync-playwright
-    # dispatcher loop) fails every future browser launch on it and is cured by
-    # nothing except a service restart — it must degrade /health so the platform
-    # restarts us instead of handing out ~1ms Nones for days.
-    launch_health = _launch_health_snapshot()
-    status = "ok" if (
-        h["ready"]
-        and cdp_ok
-        and mcp_process_alive
-        and mcp_http.get("state") != "down"
-        and nav_recent.get("state") != "degraded"
-        and not launch_health.get("poison_guard")
-    ) else "degraded"
+    # [wave-33 T33-1/T33-2] Poison is STATE: current-generation blacklisted
+    # threads (clearable by a successful launch or an executor swap), plus
+    # windowed launch outcomes for launch capability. The LIFETIME counter
+    # stays in the payload as telemetry only — it must never gate status
+    # again (that latch was the 8h prod outage).
+    poison = launch_poison_snapshot()
+    launch_recent = launch_window_stats()
+    verdict = _compute_health_status(
+        ready=bool(h["ready"]),
+        scraper_cdp_alive=bool(liveness.get("scraper_cdp_alive")),
+        scraper_not_required=browser_pool.scraper_not_required(),
+        mcp_cdp_alive=bool(liveness.get("mcp_cdp_alive")),
+        mcp_process_alive=mcp_process_alive,
+        mcp_http_state=mcp_http.get("state", "unknown"),
+        nav_state=nav_recent.get("state", "no_data"),
+        poison=poison,
+        launch_recent=launch_recent,
+        degraded_since=_HEALTH_DEGRADED_SINCE[0],
+        now=time.time(),
+        persist_after_s=_DEGRADED_PERSIST_AFTER_S,
+    )
+    _HEALTH_DEGRADED_SINCE[0] = verdict["degraded_since"]
+    status = verdict["status"]
     # /navigate slot accounting (independent of PROBE_LOCK / /scrape)
     nav_busy = min(_navigate_in_flight, NAVIGATE_MAX_CONCURRENT)
     nav_queued = max(0, _navigate_in_flight - NAVIGATE_MAX_CONCURRENT)
     return JSONResponse(
         {
             "status": status,
+            "browsable": verdict["browsable"],
             **h,
             **liveness,
             "scraper_chrome_state": browser_pool.scraper_chrome_state(),
@@ -1767,8 +1850,8 @@ async def health():
             "mcp_process_alive": mcp_process_alive,
             # [wave-14] MCP SERVER serving state (cache from the 15s loop —
             # this handler NEVER probes). unknown = never probed / boot window.
-            # B1-8: "down" now folds into `status` (the gauge earned kill power
-            # — it is the only signal that catches a wedged-but-alive SSE
+            # B1-8: "down" folds into `status` (the gauge earned kill power —
+            # it is the only signal that catches a wedged-but-alive SSE
             # server, half of the prod wedge signature).
             "mcp_http_state": mcp_http,
             "mcp_page_count": dict(_MCP_PAGE_COUNT),
@@ -1777,10 +1860,12 @@ async def health():
             "proxy_residential": "available" if res_available else "not configured",
             "cloak": _CLOAK_INFO_CACHE,
             "navigate_recent": nav_recent,
-            # [poison RCA 2026-09-03] ephemeral-launch counters; poison_guard
-            # > 0 = an executor thread with a leaked sync-playwright loop
-            # (also degrades `status` — restart is the only cure).
+            # [poison RCA 2026-09-03 → wave-33] launch telemetry: lifetime
+            # counters + the current poison STATE + windowed outcomes (the
+            # browsable signal). poison_guard_lifetime is INFORMATIONAL.
             "launch_health": _launch_health_snapshot(),
+            "launch_window": launch_recent,
+            "poison": poison,
             "gauges": _health_gauges(deadline),
             "navigate_slots_busy": nav_busy,
             "navigate_slots_total": NAVIGATE_MAX_CONCURRENT,
@@ -1788,7 +1873,7 @@ async def health():
             "uptime_seconds": time.time() - PROCESS_START,
             "health_elapsed_ms": round((time.monotonic() - t0) * 1000, 1),
         },
-        status_code=200 if status == "ok" else 503,
+        status_code=200 if status in ("ok", "degraded") else 503,
     )
 
 

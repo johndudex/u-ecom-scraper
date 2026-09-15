@@ -2265,11 +2265,21 @@ def _check_browser_service():
         ms = int((time.monotonic() - t0) * 1000)
         if resp.status_code in (200, 503):
             data = resp.json()
-            is_ok = resp.status_code == 200
+            # [wave-33 T33-2] Four body states now: ok/degraded are 200,
+            # degraded_persistent/dead are 503. Derive the display state from
+            # the BODY status so degraded-persistent and dead read distinctly
+            # instead of collapsing into one 503 bucket.
+            body_status = data.get("status", "?")
+            if body_status == "ok":
+                display = "up"
+            elif body_status in ("degraded", "degraded_persistent"):
+                display = "degraded"
+            else:  # dead / unknown future state — launch capability is gone
+                display = "down"
             result = {
-                "status": "up" if is_ok else "degraded",
+                "status": display,
                 "latency_ms": ms,
-                "detail": f"{'Ready' if is_ok else 'Degraded'} — {data.get('status', '?')}",
+                "detail": f"{'Ready' if display == 'up' else 'Degraded'} — {body_status}",
                 "components": {
                     "mcp_chrome": data.get("mcp_chrome_running"),
                     "scraper_chrome": data.get("scraper_chrome_running"),
