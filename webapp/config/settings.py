@@ -288,6 +288,8 @@ CODE_WRITER_DRAFT_NUDGE_CALLS = config("CODE_WRITER_DRAFT_NUDGE_CALLS", default=
 CODE_WRITER_EMBED_FULL_MAX_CHARS = config("CODE_WRITER_EMBED_FULL_MAX_CHARS", default=40_000, cast=int)
 CODE_WRITER_EMBED_HEAD = config("CODE_WRITER_EMBED_HEAD", default=20_000, cast=int)
 CODE_WRITER_EMBED_TAIL = config("CODE_WRITER_EMBED_TAIL", default=20_000, cast=int)
+# [wave-25e E1] bounded-embed ast map cap (the only new setting E1 adds).
+CODE_WRITER_EMBED_MAP_MAX_CHARS = config("CODE_WRITER_EMBED_MAP_MAX_CHARS", default=6_000, cast=int)
 # [wave-23 W23-1] Per-LLM-call no-chunk watchdog (seconds): a streaming call
 # yielding no chunks for this long is abandoned mid-call and retried as a
 # transient error (Z.AI keepalives defeat the httpx read timeout — prod 343/

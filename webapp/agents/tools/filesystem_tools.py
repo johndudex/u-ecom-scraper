@@ -504,9 +504,16 @@ def get_filesystem_tools(
 
         count = original.count(old_string)
         if count == 0:
+            # [wave-25e E6a] stale-copy honesty: a bounded prompt embed only
+            # carries head+tail of large files — the same vocabulary as the
+            # embed's staleness contract (draft_context._STALENESS_NOTE).
             return (
                 f"old_string not found in '{path}'. "
-                "Provide a more specific match or check the file content."
+                "Provide a more specific match or check the file content. "
+                "If this file was provided head+tail in your prompt, your "
+                "copy may be stale — search_content, then "
+                "read_file(path, line=N) the window, and retry the edit "
+                "(do NOT rewrite the file)."
             )
         if count > 1:
             return (

@@ -1429,6 +1429,29 @@ def _log_event_row(job_id: int, agent: str, content: str) -> None:
         pass
 
 
+def _log_writer_embed_row(agent: object, job_id: Any) -> None:
+    """[wave-25e E0] One ``[WRITER-EMBED]`` SessionLog row per writer
+    invocation that carried a template embed.
+
+    The sizes were measured at agent-BUILD time (``subagents._build_agent``
+    sets ``_embed_stats``); this node-side write pairs them with the job so
+    embed-size telemetry accrues from the job log alone — the baseline E2's
+    flip is judged against. Best-effort: telemetry never changes the flow.
+    """
+    try:
+        stats = getattr(agent, "_embed_stats", None)
+        if not stats:
+            return
+        _log_event_row(
+            job_id, "code_writer",
+            "[WRITER-EMBED] mode={mode} template={template} "
+            "embed={embed_chars:,} system_prompt={system_prompt_chars:,} chars"
+            .format(**stats),
+        )
+    except Exception:
+        pass
+
+
 def _budget_setting(name: str, default: int) -> int:
     """Budget/timeout constant, env-overridable via Django settings.
 
@@ -5300,10 +5323,17 @@ def _contract_fix_message(
     `args.listing_url = _env_listing; args.fresh_discovery = True` — and a
     wrong-shape instruction produces a Frankenstein gate; critique v1 vector 2).
     """
+    # [wave-25e E6c] Mode-agnostic phrasing: under a FULL embed everything
+    # genuinely is in the prompt; under a BOUNDED embed the head carries the
+    # imports/constants and the tail the argparse — and the redirection
+    # stays truthful instead of claiming a full view that no longer exists.
+    # Never name the templates directory: the writer container has no repo.
     gate_hint = (
         "re-add the env-var gate in the shape YOUR template's main() uses "
-        "(the full template is in your system prompt) — do NOT invent a "
-        "different shape"
+        "(the template's shape — imports, constants, argparse surface — is "
+        "in your system prompt; if the exact region is elided, re-read that "
+        "window with `read_file(line=)` on the workspace draft) — do NOT "
+        "invent a different shape"
     )
     if template_path and os.path.isfile(template_path):
         try:
@@ -5335,7 +5365,7 @@ def _contract_fix_message(
         "How to fix — a SMALL targeted edit with `edit_file` (do NOT rewrite "
         "the scraper):\n"
         "1. In main()'s argparse, add the missing flag declarations VERBATIM "
-        "from the template in your system prompt (e.g. "
+        "from the argparse surface in your system prompt (e.g. "
         '`parser.add_argument("--listing-url", type=str, default=None, ...)` '
         'and `parser.add_argument("--fresh-discovery", action="store_true", '
         "...)`).\n"
@@ -5556,14 +5586,20 @@ def _run_draft_finisher(
         _tried_note = ", ".join(_tried) if _tried else "(none recorded)"
         _fb = str((state.get("test_report") or {}).get("feedback_for_writer") or "").strip()
 
+        # [wave-32 D5] The finisher conditions on SIZE alone — it is
+        # definitionally a post-death window with no EOW state to consult.
+        # [wave-25e E1] classify_embed(eow_active=None) IS that golden.
+        from .draft_context import classify_embed
+
+        _embed_mode = classify_embed(
+            _draft_text, eow_active=None,
+            full_max_chars=_embed_full_max_chars(),
+        )
         seed = (
             "[DRAFT-FINISHER] You are FINISHING an existing scraper, not "
             "restarting. The previous invocation was cut off by its "
             "wall-clock budget while working on this draft.\n\n"
-            f"- The draft is `workspace/{slug}/scraper_draft.py` (already "
-            "in your context as the base — edit it, do NOT rewrite from "
-            "scratch).\n"
-            f"- CURRENT strategy per the deterministic analyzer: {_strategy}\n"
+            + f"- CURRENT strategy per the deterministic analyzer: {_strategy}\n"
             f"- Strategies already tried and failed: {_tried_note}\n"
             "- The analyzer may have switched strategy after this draft was "
             "written — adapt the draft to the CURRENT strategy, or add a "
@@ -5573,13 +5609,10 @@ def _run_draft_finisher(
             "Land the remaining edits, then run check_syntax and ONE sample "
             "run to confirm. Work efficiently — this is the final window."
         )
-        # [wave-32 D5] The finisher conditions on SIZE alone — it is
-        # definitionally a post-death window with no EOW state to consult.
         agent = create_code_writer(
             site_slug=slug, template_code=_draft_text,
-            embed_mode=(
-                "bounded" if len(_draft_text) >= _embed_full_max_chars() else "full"
-            ),
+            embed_mode=_embed_mode,
+            embed_kind="draft",
         )
         hb = _start_heartbeat(job_id, "code-writer-finisher")
         try:
@@ -5597,6 +5630,7 @@ def _run_draft_finisher(
         finally:
             _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "code-writer", config)
+        _log_writer_embed_row(agent, job_id)
 
         _res = result if isinstance(result, dict) else {}
         if _res.get("_error") or not _res.get("messages"):
@@ -5901,14 +5935,19 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
             # exceeds the full-embed budget. The kill-switch (default
             # "full") still vetoes at resolve time, so D5 ships dormant;
             # fixers inherit the same agent object.
+            # [wave-25e E1] classify_embed IS this golden condition.
+            from .draft_context import classify_embed
+
             _embed_mode = (
-                "bounded"
-                if _eow_active and len(_template_code) >= _embed_full_max_chars()
-                else "full"
+                classify_embed(
+                    _template_code, eow_active=_eow_active,
+                    full_max_chars=_embed_full_max_chars(),
+                )
             )
             agent = create_code_writer(
                 site_slug=slug, template_code=_template_code,
                 embed_mode=_embed_mode,
+                embed_kind="draft" if _eow_active else "file",
             )
         except BaseException:
             _writer_fix_cycle.reset(_w24_nudge_token)
@@ -5931,6 +5970,7 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
             _writer_fix_cycle.reset(_w24_nudge_token)
             _writer_codefix_cycle.reset(_w24_codefix_token)
         _persist_agent_logs(state, result, "code-writer", config)
+        _log_writer_embed_row(agent, job_id)
 
         # [wave-25 W25-c] Step-budget death accounting. langgraph's prebuilt
         # loop ends the agent NORMALLY when remaining_steps hits 0, replying

@@ -37,7 +37,10 @@ so the first attempt you hand off actually works. **Do NOT hand off an untested 
 
 ## Workflow (strict, in order)
 
-1. `read_file` the template named in the Strategy Contract (provided in the message).
+1. The template named in the Strategy Contract is already in your prompt (in
+   full below the size threshold; head+tail+map above it) — do not read it
+   back. If a region you need is elided, `read_file(path, line=N)` the exact
+   window of the workspace draft.
 2. `write_file workspace/{slug}/scraper_draft.py` — adapt the template's extraction
    functions per the Field Map (in the message). Keep the template's structure, waits,
    pagination, discovery, and output code intact. Only substitute the extraction logic.

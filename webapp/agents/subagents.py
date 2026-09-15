@@ -783,11 +783,12 @@ def create_nav_skill_review(site_slug: str = "") -> object:
 
 
 def create_code_writer(
-    site_slug: str = "", template_code: str = "", embed_mode: str = ""
+    site_slug: str = "", template_code: str = "", embed_mode: str = "",
+    embed_kind: str = "",
 ) -> object:
     return _build_agent(
         "code_writer", site_slug=site_slug, template_code=template_code,
-        embed_mode=embed_mode,
+        embed_mode=embed_mode, embed_kind=embed_kind,
     )
 
 
@@ -845,8 +846,9 @@ def _tool_msg_cap() -> int:
         return 24_000
 
 
-def _truncate_messages(input_dict: dict) -> dict:
-    """Pre-model hook: deterministic context truncation that the LLM ACTUALLY sees.
+def _make_pre_model_hook(embed_chars: int = 0):
+    """Pre-model hook factory — deterministic context truncation that the LLM
+    ACTUALLY sees.
 
     Returns ``{"llm_input_messages": kept}`` (NOT ``{"messages": kept}``). Per the
     langgraph ``pre_model_hook`` contract, returning ``messages`` is merged into
@@ -855,6 +857,14 @@ def _truncate_messages(input_dict: dict) -> dict:
     shrinking. Returning ``llm_input_messages`` instead is read FIRST by
     ``_get_model_input_state`` and used directly as the model input, WITHOUT
     mutating ``state["messages"]`` (so the react loop's accumulation is untouched).
+
+    ``embed_chars`` — [wave-25e E3] the size of the system-prompt embed this
+    agent carries (0 for every agent without one). BOTH budget gates subtract
+    it: step-1's early return compares against ``max_chars - embed_chars``
+    (rev-2 BLOCKER fix: comparing against raw max_chars let 150K of messages
+    + a 47K embed sail through as "fits"), and step-2's drop budget reserves
+    the embed alongside system + seed. ``_make_pre_model_hook(0)`` is the
+    legacy behavior exactly.
 
     Behavior:
     1. **Trim oversized NON-seed messages** to a head+tail preview. Chatter
@@ -874,107 +884,139 @@ def _truncate_messages(input_dict: dict) -> dict:
     No network, no LLM, no variance. Kill-switch ``LLM_TRUNCATION_MODE='off'`` →
     no-op (returns the input verbatim = exact rollback to pre-fix behavior).
     """
-    mode, max_chars, per_msg_cap = _trunc_settings()
-    if mode == "off":
-        return input_dict
 
-    messages = input_dict.get("messages", [])
-    if not messages:
-        return input_dict
+    def _hook(input_dict: dict) -> dict:
+        mode, max_chars, per_msg_cap = _trunc_settings()
+        if mode == "off":
+            return input_dict
 
-    _MIN_KEEP_RECENT = 6  # always retain the most recent N non-system messages
-    seed = next((m for m in messages if getattr(m, "type", "") == "human"), None)
+        messages = input_dict.get("messages", [])
+        if not messages:
+            return input_dict
 
-    def _clen(m) -> int:
-        # Count tool_calls too: an AIMessage whose .content is "" but which carries
-        # a large write_file/edit_file arg is otherwise invisible to the budget.
-        # READ-ONLY — we never mutate tool_calls.
-        n = len(str(m.content)) if hasattr(m, "content") else 0
-        tc = getattr(m, "tool_calls", None)
-        if tc:
-            n += len(str(tc))
-        return n
-
-    def _trim(m):
-        if m is seed:
-            return m  # NEVER cap the seed (task/strategy/field-map)
-        content = str(m.content) if hasattr(m, "content") else ""
-        # [wave-23 W23-3] tool RESULT messages get the bigger cap — see
-        # _tool_msg_cap. ToolMessages are identifiable by tool_call_id.
-        cap = _tool_msg_cap() if hasattr(m, "tool_call_id") else per_msg_cap
-        if len(content) <= cap:
-            return m
-        half = cap // 2
-        new_content = (
-            content[:half]
-            + f"\n\n…[deterministic-truncated {len(content)}→{cap} chars]"
-            + content[-half:]
+        # [wave-25e E0] per-turn input measurement: messages + embed.
+        _in_total = sum(
+            (len(str(m.content)) if hasattr(m, "content") else 0)
+            + len(str(getattr(m, "tool_calls", None) or ""))
+            for m in messages
         )
-        try:
-            # ToolMessage needs tool_call_id; other message types take content only.
-            if hasattr(m, "tool_call_id"):
-                return type(m)(content=new_content, tool_call_id=m.tool_call_id)
-            return type(m)(content=new_content)
-        except Exception:
-            return m  # fall back to the original if reconstruction fails
+        logger.info(
+            "[WRITER-TURN] pre-model input: msgs=%d chars=%s embed=%s "
+            "total=%s",
+            len(messages), f"{_in_total:,}", f"{embed_chars:,}",
+            f"{_in_total + embed_chars:,}",
+        )
 
-    before_total = sum(_clen(m) for m in messages)
+        _MIN_KEEP_RECENT = 6  # always retain the most recent N non-system messages
+        seed = next((m for m in messages if getattr(m, "type", "") == "human"), None)
 
-    # Step 1: deterministically trim oversized non-seed messages in place.
-    trimmed = [_trim(m) for m in messages]
-    total = sum(_clen(m) for m in trimmed)
-    if total <= max_chars:
-        if total < before_total:
-            logger.info(
-                "truncate: deterministically trimmed oversized messages (%d → %d chars)",
-                before_total, total,
+        def _clen(m) -> int:
+            # Count tool_calls too: an AIMessage whose .content is "" but which carries
+            # a large write_file/edit_file arg is otherwise invisible to the budget.
+            # READ-ONLY — we never mutate tool_calls.
+            n = len(str(m.content)) if hasattr(m, "content") else 0
+            tc = getattr(m, "tool_calls", None)
+            if tc:
+                n += len(str(tc))
+            return n
+
+        def _trim(m):
+            if m is seed:
+                return m  # NEVER cap the seed (task/strategy/field-map)
+            content = str(m.content) if hasattr(m, "content") else ""
+            # [wave-23 W23-3] tool RESULT messages get the bigger cap — see
+            # _tool_msg_cap. ToolMessages are identifiable by tool_call_id.
+            cap = _tool_msg_cap() if hasattr(m, "tool_call_id") else per_msg_cap
+            if len(content) <= cap:
+                return m
+            half = cap // 2
+            new_content = (
+                content[:half]
+                + f"\n\n…[deterministic-truncated {len(content)}→{cap} chars]"
+                + content[-half:]
             )
-        return {"llm_input_messages": trimmed}
+            try:
+                # ToolMessage needs tool_call_id; other message types take content only.
+                if hasattr(m, "tool_call_id"):
+                    return type(m)(content=new_content, tool_call_id=m.tool_call_id)
+                return type(m)(content=new_content)
+            except Exception:
+                return m  # fall back to the original if reconstruction fails
 
-    # Step 2: still over budget — keep system + seed + recent N.
-    system_msgs = [m for m in trimmed if hasattr(m, "type") and m.type == "system"]
-    other = [m for m in trimmed if not (hasattr(m, "type") and m.type == "system")]
-    kept_recent = other[-_MIN_KEEP_RECENT:] if len(other) > _MIN_KEEP_RECENT else list(other)
+        before_total = sum(_clen(m) for m in messages)
 
-    budget = max_chars - sum(_clen(m) for m in system_msgs)
-    if seed is not None:
-        budget -= _clen(seed)  # reserve room for the seed we'll prepend
+        # Step 1: deterministically trim oversized non-seed messages in place.
+        trimmed = [_trim(m) for m in messages]
+        total = sum(_clen(m) for m in trimmed)
+        # [wave-25e E3] the embed counts BEFORE the "fits" decision —
+        # the gate that enforces nothing enforces nothing.
+        _budget = max(max_chars - embed_chars, 0)
+        if total <= _budget:
+            if total < before_total:
+                logger.info(
+                    "truncate: deterministically trimmed oversized messages "
+                    "(%d → %d chars, embed=%d, total=%d, budget=%d)",
+                    before_total, total, embed_chars, total + embed_chars,
+                    max_chars,
+                )
+            return {"llm_input_messages": trimmed}
 
-    selected = []
-    acc = 0
-    for m in reversed(kept_recent):
-        if seed is not None and m is seed:
-            continue  # seed is prepended separately; don't double-count
-        ml = _clen(m)
-        if acc + ml > budget:
-            break
-        selected.append(m)
-        acc += ml
-    selected.reverse()  # back to chronological order
-    kept = system_msgs + ([seed] if seed is not None else []) + selected
+        # Step 2: still over budget — keep system + seed + recent N.
+        system_msgs = [m for m in trimmed if hasattr(m, "type") and m.type == "system"]
+        other = [m for m in trimmed if not (hasattr(m, "type") and m.type == "system")]
+        kept_recent = other[-_MIN_KEEP_RECENT:] if len(other) > _MIN_KEEP_RECENT else list(other)
 
-    # Pair-safe: drop any ToolMessage whose tool_call_id isn't backed by a kept
-    # AIMessage (otherwise the provider rejects the history with HTTP 400).
-    opened = set()
-    pair_safe = []
-    for m in kept:
-        tcid = getattr(m, "tool_call_id", None)
-        if tcid:
-            if tcid in opened:
+        budget = max(
+            max_chars - embed_chars - sum(_clen(m) for m in system_msgs)
+            - (_clen(seed) if seed is not None else 0),
+            0,
+        )  # [wave-25e E3] embed reserved alongside the seed
+
+        selected = []
+        acc = 0
+        for m in reversed(kept_recent):
+            if seed is not None and m is seed:
+                continue  # seed is prepended separately; don't double-count
+            ml = _clen(m)
+            if acc + ml > budget:
+                break
+            selected.append(m)
+            acc += ml
+        selected.reverse()  # back to chronological order
+        kept = system_msgs + ([seed] if seed is not None else []) + selected
+
+        # Pair-safe: drop any ToolMessage whose tool_call_id isn't backed by a kept
+        # AIMessage (otherwise the provider rejects the history with HTTP 400).
+        opened = set()
+        pair_safe = []
+        for m in kept:
+            tcid = getattr(m, "tool_call_id", None)
+            if tcid:
+                if tcid in opened:
+                    pair_safe.append(m)
+                # else: orphaned ToolMessage — drop
+            else:
+                for tc in (getattr(m, "tool_calls", None) or []):
+                    if isinstance(tc, dict) and tc.get("id"):
+                        opened.add(tc["id"])
                 pair_safe.append(m)
-            # else: orphaned ToolMessage — drop
-        else:
-            for tc in (getattr(m, "tool_calls", None) or []):
-                if isinstance(tc, dict) and tc.get("id"):
-                    opened.add(tc["id"])
-            pair_safe.append(m)
-    kept = pair_safe
+        kept = pair_safe
 
-    logger.info(
-        "Truncated messages: %d → %d (was %d chars, budget %d, seed_retained=%s)",
-        len(messages), len(kept), total, budget, seed is not None,
-    )
-    return {"llm_input_messages": kept}
+        logger.info(
+            "Truncated messages: %d → %d (was %d chars, budget %d, "
+            "embed=%d, total=%d, seed_retained=%s)",
+            len(messages), len(kept), total, budget, embed_chars,
+            total + embed_chars, seed is not None,
+        )
+        return {"llm_input_messages": kept}
+
+    return _hook
+
+
+# [wave-25e E3] the legacy single-arg entry point IS the zero-embed
+# instance — every existing call site and fixture is unchanged.
+_truncate_messages = _make_pre_model_hook(0)
+
 
 
 def _embed_template(system_prompt: str, template_code: str) -> str:
@@ -1044,9 +1086,19 @@ def _embed_head_tail_chars() -> tuple[int, int]:
     )
 
 
+def _embed_map_max_chars() -> int:
+    """[wave-25e E1] Bounded-embed map cap (settings-overridable, module
+    constant as default — the only new setting E1 introduces)."""
+    from django.conf import settings as _settings
+
+    from .draft_context import MAP_MAX_CHARS as _m
+
+    return int(getattr(_settings, "CODE_WRITER_EMBED_MAP_MAX_CHARS", _m) or _m)
+
+
 def _build_agent(
     agent_name: str, site_slug: str = "", use_create_agent: bool = False,
-    template_code: str = "", embed_mode: str = "",
+    template_code: str = "", embed_mode: str = "", embed_kind: str = "",
 ) -> object:
     prompt_stem = AGENT_PROMPT_MAP[agent_name]
     temperature = AGENT_TEMPERATURES[prompt_stem]
@@ -1073,15 +1125,39 @@ def _build_agent(
     # wave-24 W24-6 do-not-read note). [wave-32 D5] The embed routes through
     # draft_context.render_writer_embed: full mode is byte-identical to the
     # legacy output; bounded mode (dormant behind the CODE_WRITER_EMBED_MODE
-    # kill-switch) elides the middle of a huge edit-over-write base.
+    # kill-switch) elides the middle of a huge edit-over-write base and
+    # indexes it with the ast draft map [wave-25e E1].
     from .draft_context import render_writer_embed
 
     _head, _tail = _embed_head_tail_chars()
+    _resolved_mode = _resolve_embed_mode(embed_mode)
+    _pre_embed_len = len(system_prompt)
     system_prompt = render_writer_embed(
         system_prompt, template_code,
-        mode=_resolve_embed_mode(embed_mode),
-        slug=site_slug, head=_head, tail=_tail,
+        mode=_resolved_mode, slug=site_slug, head=_head, tail=_tail,
+        map_max_chars=_embed_map_max_chars(),
     )
+    # [wave-25e E0] Measure the embed + the final prompt. The numbers ride
+    # the agent object so the NODE can persist one [WRITER-EMBED] SessionLog
+    # row after the invoke returns (job_id lives in the node's state — never
+    # scraped from thread ContextVars; wave-32 D2 proved that path
+    # unreliable) — and the same number prices the truncation budget [E3].
+    _embed_chars = len(system_prompt) - _pre_embed_len
+    _embed_stats = None
+    if template_code and _embed_chars > 0:
+        _embed_stats = {
+            "agent": agent_name,
+            "mode": _resolved_mode,
+            "template": embed_kind or "file",
+            "embed_chars": _embed_chars,
+            "system_prompt_chars": len(system_prompt),
+        }
+        logger.info(
+            "[WRITER-EMBED] agent=%s mode=%s template=%s embed=%s "
+            "system_prompt=%s chars",
+            agent_name, _resolved_mode, _embed_stats["template"],
+            f"{_embed_chars:,}", f"{len(system_prompt):,}",
+        )
 
     if not _has_playwright_tools(tools):
         from .tools import AGENT_TOOL_MAP as _atm
@@ -1129,9 +1205,16 @@ def _build_agent(
         )
         logger.info("Created agent '%s' via create_agent (v1 path)", agent_name)
     else:
+        # [wave-25e E3] the embed counts against this agent's truncation
+        # budget (0 for every agent without a template embed).
         agent = create_react_agent(
-            llm, tools=tools, prompt=system_prompt, pre_model_hook=_truncate_messages
+            llm, tools=tools, prompt=system_prompt,
+            pre_model_hook=_make_pre_model_hook(_embed_chars),
         )
+    try:
+        agent._embed_stats = _embed_stats  # None → the node writes no row
+    except Exception:
+        pass  # a stub agent object in tests; measurement is best-effort
     return agent
 
 
