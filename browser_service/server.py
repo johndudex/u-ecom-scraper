@@ -860,6 +860,28 @@ def _ephemeral_snapshot() -> dict:
             for cid, c in _EPHEMERAL_CALLS.items()
         }
 
+
+def _ephemeral_protected_pids() -> set[int]:
+    """T33-5: full descendant trees of every LIVE call's tracked roots.
+
+    A reused PID (starttime drifted since track) protects nothing — it no
+    longer belongs to the call. An abandoned call protects nothing by
+    definition: its caller is gone, and any root the timeout arm failed to
+    kill is exactly what the orphan reaper exists for.
+    """
+    protected: set[int] = set()
+    for call in _ephemeral_snapshot().values():
+        if call["abandoned"]:
+            continue
+        for pid, born in (call["roots"] or {}).items():
+            now_st = _proc_starttime(pid)
+            if now_st is None:
+                continue  # gone since track
+            if born is not None and now_st != born:
+                continue  # PID recycled onto an innocent process
+            protected |= _tree_of(pid)
+    return protected
+
 # ── /scrape in-flight registry (F1) ────────────────────────────────────────
 # A running scraper subprocess drives the SHARED scraper Chrome; the orphan
 # killer must not reap that Chrome's children mid-run (prod 325/328/334).
@@ -1409,17 +1431,14 @@ async def _periodic_cdp_liveness():
 def _cleanup_chrome_artifacts_sync():
     # F1: snapshot + kill atomically under the restart lock so a Chrome that
     # restarts mid-cycle can't have its fresh (un-allowlisted) PID killed.
-    # Non-blocking: a restart in progress means the tree is being torn down
-    # anyway — skip the cycle (orphans reaped next interval).
-    if not browser_pool._restart_lock.acquire(blocking=False):
-        logger.info("cleanup: skipping kill cycle (Chrome restart in progress)")
-        _clean_chrome_profile_cache()
-        return
-    try:
+    # T33-5: the old skip-if-restarting escape is gone — with every ephemeral
+    # browser registry-tracked per-PID, waiting out an in-progress restart is
+    # strictly better than skipping the whole cycle (orphans stacked exactly
+    # behind that skip in the 09-14 storm). Blocking acquire: the restart
+    # holder never waits on the cleanup pool, so this cannot deadlock.
+    with browser_pool._restart_lock:
         _collect_persistent_pids()
         killed = _kill_orphan_chrome()
-    finally:
-        browser_pool._restart_lock.release()
     cleaned = _clean_chrome_profile_cache()
     if killed or cleaned:
         logger.info(
@@ -1528,32 +1547,25 @@ def _kill_orphan_chrome() -> int:
     them). Everything not protected by the persistent allowlist, the navigate
     registry, or a live run is killed, and the verdict is logged — no more
     silent swallows.
+
+    T33-5: the whole-cycle navigate skip is gone too — "any navigate in
+    flight → skip everything" was the blind spot that stacked ~10 unreaped
+    orphan browsers behind ~4 legitimate ones during the 09-14 prod storm.
+    Live callers now protect ONLY their registry-tracked trees
+    (_ephemeral_protected_pids); a caller whose HTTP call already returned
+    (abandoned) protects nothing, so the timeout arm and this sweep together
+    close the loop.
     """
     killed = 0
     skipped_run_children = 0
     try:
-        # Safety gate: if any /navigate call is in flight — or any tracked
-        # session PID is still alive — skip the kill cycle entirely. Ephemeral
-        # browsers spawn child chrome processes that pgrep matches, and we
-        # cannot reliably enumerate every child PID. The per-PID allowlist is
-        # the precision layer; this gate is the hard guarantee. Navigate calls
-        # are short (<=180s); real orphans get reaped on the next
-        # CLEANUP_INTERVAL cycle. The gate is liveness-based (see
-        # _navigate_protection_active): a live browser whose HTTP call already
-        # timed out must NOT be killed just because the counter moved on.
-        nav_active = _navigate_protection_active()
-        if nav_active:
-            logger.info(
-                "kill_orphan_chrome: skipping (%d navigate call(s) in flight, %d live session PID(s))",
-                _navigate_in_flight,
-                len(NAVIGATE_ACTIVE_PIDS),
-            )
-            return 0
+        protected: set[int] = set()
+        # T33-5: per-call ephemeral browsers (probe ladder + navigate sessions)
+        protected |= _ephemeral_protected_pids()
 
         # F1 → B1-4: a live scrape run protects its own tree only. (Cloak-mode
         # browsers detach from the group by design — the starttime rule covers
         # them: anything born after the run began is left alone this cycle.)
-        protected: set[int] = set()
         oldest_run_start: Optional[int] = None
         from .scraper_runner import active_runs_snapshot
 
@@ -1608,7 +1620,7 @@ def _kill_orphan_chrome() -> int:
         logger.warning("kill_orphan_chrome: cycle aborted: %s", exc)
     if killed or skipped_run_children:
         logger.info(
-            "kill_orphan_chrome: killed %d, spared %d live-run process(es)",
+            "kill_orphan_chrome: killed %d, spared %d protected process(es)",
             killed,
             skipped_run_children,
         )

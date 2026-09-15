@@ -44,7 +44,17 @@ def _server_ns():
         + grab("_track_navigate_pids")
         + grab("_untrack_navigate_pids")
         + grab("_proc_state")
+        + grab("_proc_starttime")
+        + grab("_tree_of")
         + grab("_navigate_protection_active")
+        + grab("_ephemeral_register")
+        + grab("_ephemeral_track")
+        + grab("_ephemeral_release")
+        + grab("_ephemeral_is_abandoned")
+        + grab("_ephemeral_abandon")
+        + grab("_ephemeral_snapshot")
+        + grab("_ephemeral_protected_pids")
+        + grab("_kill_tracked_roots")
         + grab("_kill_orphan_chrome")
     )
 
@@ -193,6 +203,10 @@ class TestNavigateGateW3:
         ns = _server_ns()
         ns["NAVIGATE_ACTIVE_PIDS"].clear()
         ns["_navigate_in_flight"] = 0
+        # [wave-33 T33-5] the registry lives in the same CACHED ns — a test
+        # that aborts before its release must not leak protection into the
+        # next test.
+        ns["_EPHEMERAL_CALLS"].clear()
 
     def test_live_pid_protects(self):
         ns = _server_ns()
@@ -235,11 +249,31 @@ class TestNavigateGateW3:
         assert 111 not in ns["NAVIGATE_ACTIVE_PIDS"]
         assert 222 in ns["NAVIGATE_ACTIVE_PIDS"]
 
-    def test_kill_cycle_skips_while_protected(self):
+    def test_kill_cycle_protects_registry_trees_only(self, monkeypatch):
+        """[wave-33 T33-5 migration] The whole-cycle skip is gone: a live
+        registry call protects ITS tracked tree, and unrelated chrome PIDs are
+        killed in the SAME cycle (the old skip is what stacked ~10 unreaped
+        orphan browsers behind ~4 legitimate ones in the 09-14 storm)."""
         ns = _server_ns()
-        ns["_navigate_in_flight"] = 1
-        assert ns["_kill_orphan_chrome"]() == 0
-        ns["_navigate_in_flight"] = 0
+        # The ns is CACHED across tests and TreeCollection plants a
+        # KeyError-ing _proc_children stub into it — replace it so the tree
+        # walk is deterministic (the root itself is the protection we assert).
+        ns["_proc_children"] = lambda pid: set()
+        ns["_ephemeral_register"]("c1", "navigate")
+        ns["_ephemeral_track"]("c1", [os.getpid()])  # definitely-alive root
+        killed_pids = []
+        monkeypatch.setattr(os, "kill", lambda pid, sig: killed_pids.append(pid))
+
+        class _FakeResult:
+            returncode = 0
+            stdout = f"{os.getpid()}\n987654\n"
+
+        monkeypatch.setattr(ns["subprocess"], "run", lambda *a, **kw: _FakeResult())
+        try:
+            assert ns["_kill_orphan_chrome"]() == 1, "the stray is reaped this cycle"
+            assert killed_pids == [987654], "the live call's root is spared"
+        finally:
+            ns["_ephemeral_release"]("c1")
 
     def test_kill_cycle_runs_when_registry_clear(self, monkeypatch=None):
         ns = _server_ns()
@@ -281,10 +315,14 @@ class TestKillGateWiring:
         assert '_proc_state(run_pid) in (None, "Z")' in block
 
     def test_kill_gates_on_navigate_protection_not_counter(self):
-        """W3: the navigate gate must consult the liveness-based predicate."""
+        """W3 → [wave-33 T33-5 migration]: the killer must consult per-PID
+        liveness — a live call protects only its registry-tracked tree, never
+        suppresses the cycle (the whole-cycle gate stacked orphans)."""
         src = pathlib.Path(os.path.join(ROOT, "browser_service/server.py")).read_text()
-        assert "nav_active = _navigate_protection_active()" in src
-        assert "if nav_active:" in src
+        assert "protected |= _ephemeral_protected_pids()" in src
+        assert "nav_active = _navigate_protection_active()" not in src, (
+            "the whole-cycle navigate skip must stay gone"
+        )
 
     def test_registry_is_timestamped_dict_with_no_raw_set_api(self):
         src = pathlib.Path(os.path.join(ROOT, "browser_service/server.py")).read_text()
@@ -292,9 +330,15 @@ class TestKillGateWiring:
         assert "NAVIGATE_ACTIVE_PIDS.update(" not in src
         assert "NAVIGATE_ACTIVE_PIDS.difference_update(" not in src
 
-    def test_cleanup_uses_nonblocking_lock(self):
+    def test_cleanup_shares_the_restart_lock(self):
+        """[wave-33 T33-5 migration] Cleanup must hold the restart lock so a
+        Chrome restarting mid-cycle can't have its fresh PID killed — but it
+        WAITS now instead of skipping the cycle (orphans stacked behind the
+        skip; the restart holder never waits on the cleanup pool, so the
+        blocking acquire cannot deadlock)."""
         src = pathlib.Path(os.path.join(ROOT, "browser_service/server.py")).read_text()
-        assert "browser_pool._restart_lock.acquire(blocking=False)" in src
+        assert "with browser_pool._restart_lock:" in src
+        assert "acquire(blocking=False)" not in src.split("def _cleanup_chrome_artifacts_sync")[1].split("def ")[0]
 
     def test_scrape_endpoint_registers_deadline(self):
         src = pathlib.Path(os.path.join(ROOT, "browser_service/server.py")).read_text()

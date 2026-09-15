@@ -224,6 +224,7 @@ def _registry_ns(starttimes=None, killed=None):
 
     ns = {
         "__name__": "t33b",
+        "os": os,
         "threading": threading,
         "time": __import__("time"),
         "logger": __import__("logging").getLogger("t33b"),
@@ -299,3 +300,66 @@ class TestT33_4Registry:
         assert ns["_ephemeral_snapshot"]()["c1"]["roots"] == {4242: None}
         ns["_ephemeral_abandon"]("c1")
         assert killed == [], "unverifiable starttime → no kill"
+
+
+# ── T33-5: per-PID orphan sweep ─────────────────────────────────────────────
+
+
+def _sweep_ns(starttimes=None, children=None):
+    """_registry_ns + the sweep helper and its tree-walking deps. The
+    children stub must NOT be overwritten by the real /proc walker."""
+    ns, killed = _registry_ns(starttimes=starttimes)
+    children = children or {}
+    ns["_proc_children"] = lambda pid: set(children.get(pid, ()))
+    for name in ("_ephemeral_protected_pids", "_tree_of"):
+        exec(compile(_grab(_read(SERVER_PATH), name), "<g>", "exec"), ns)
+    return ns, killed
+
+
+class TestT33_5PerPidSweep:
+    def test_live_call_protects_its_full_tree(self):
+        ns, _ = _sweep_ns(
+            starttimes={100: 10, 101: 11, 102: 12}, children={100: {101, 102}}
+        )
+        ns["_ephemeral_register"]("c1", "navigate")
+        ns["_ephemeral_track"]("c1", [100])
+        assert ns["_ephemeral_protected_pids"]() == {100, 101, 102}, (
+            "the reaper must spare the descendants of a live caller's browser"
+        )
+
+    def test_abandoned_call_protects_nothing(self):
+        """The timeout arm already killed this caller's trees; if a kill was
+        missed, the reaper MUST be allowed to reap it — protection ends at
+        abandonment."""
+        ns, _ = _sweep_ns(starttimes={100: 10})
+        ns["_ephemeral_register"]("c1", "navigate")
+        ns["_ephemeral_track"]("c1", [100])
+        ns["_ephemeral_abandon"]("c1")
+        assert ns["_ephemeral_protected_pids"]() == set()
+
+    def test_reused_pid_protects_nothing(self):
+        """A PID whose starttime drifted since track was recycled onto an
+        innocent process — its whole (innocent) tree must be unprotected."""
+        starttimes = {100: 10, 101: 11}
+        ns, _ = _sweep_ns(starttimes=starttimes, children={100: {101}})
+        ns["_ephemeral_register"]("c1", "probe")
+        ns["_ephemeral_track"]("c1", [100])
+        starttimes[100] = 555  # PID recycled after track
+        assert ns["_ephemeral_protected_pids"]() == set()
+
+    def test_dead_root_protects_nothing(self):
+        ns, _ = _sweep_ns(starttimes={})  # nothing alive behind any PID
+        ns["_ephemeral_register"]("c1", "probe")
+        ns["_ephemeral_track"]("c1", [4242])
+        assert ns["_ephemeral_protected_pids"]() == set()
+
+    def test_two_calls_union_of_trees(self):
+        ns, _ = _sweep_ns(
+            starttimes={100: 10, 200: 20, 201: 21},
+            children={200: {201}},
+        )
+        ns["_ephemeral_register"]("c1", "probe")
+        ns["_ephemeral_register"]("c2", "navigate")
+        ns["_ephemeral_track"]("c1", [100])
+        ns["_ephemeral_track"]("c2", [200])
+        assert ns["_ephemeral_protected_pids"]() == {100, 200, 201}
