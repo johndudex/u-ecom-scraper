@@ -1165,11 +1165,24 @@ def _capture_api_from_session(ev, goal_url: str, query: str):
         return None
 
     def _score(api):
-        # Real paginated data APIs expose an explicit count; taxonomies/lookups
-        # usually don't. Richer record schema = more likely a real entity list.
-        has_count = 1 if api.get("count") is not None else 0
+        # [wave-34 F1] Rank: POSITIVE count first (real paginated data — a
+        # vendor-domain catalog API like aya's /job/search must keep beating
+        # an on-domain taxonomy XHR), then SAME registrable domain as the
+        # goal page (a first-party endpoint beats a third-party marketing
+        # widget when neither claims a count), then record-schema richness.
+        # Before wave-34 there was no domain term at all, so on widget-heavy
+        # storefronts a klaviyo/useinsider/bluecore XHR could outrank
+        # everything (prod 614/620/626). count>0 mirrors the strategy gate's
+        # arming predicate; count=None (list-shaped payloads) earns nothing.
+        _c = api.get("count")
+        pos = (
+            1
+            if isinstance(_c, (int, float)) and not isinstance(_c, bool) and _c > 0
+            else 0
+        )
+        same = 1 if _registrable(api.get("url") or "") == _registrable(goal_url) else 0
         n_keys = len(api.get("sample_keys") or [])
-        return (has_count, n_keys)
+        return (pos, same, n_keys)
 
     best = max(candidates, key=_score)
     logger.info("browser_traverse: API captured (%d candidate(s), picked %s)",

@@ -3535,15 +3535,21 @@ def _nav_result_contamination(result: Any, job_url: str) -> list[str]:
     api = getattr(result, "api", None)
     api_url = api.get("url") if isinstance(api, dict) else ""
     if isinstance(api_url, str) and api_url.startswith("http") and _off(api_url):
-        # [wave-26/355] an off-domain api.url vetoes ONLY when the capture
-        # CLAIMS product data (count / items_per_page / sample_keys) — i.e.
-        # when it could become the extraction source (karenmillen's verbolia
-        # trap serves exactly that shape, and stays vetoed). A bare
-        # third-party widget endpoint (forevernew's truefitcorp ui-configs)
-        # carries no data evidence, and the strategy gate's shape check
-        # would reject it as a source anyway.
-        claims_data = bool(
-            api.get("count") or api.get("items_per_page") or api.get("sample_keys")
+        # [wave-26/355, tightened wave-34 F3] an off-domain api.url vetoes
+        # ONLY when the capture claims a POSITIVE total (count) — the same
+        # predicate the strategy gate demands before arming internal_api.
+        # The original disjunction (items_per_page / sample_keys) was
+        # structurally always true: verify_api only emits descriptors with
+        # items_per_page >= 1 and non-empty sample_keys, so the carve-out
+        # never once spared a real capture. browser_traverse now drops
+        # off-domain descriptors outright (F2); this arm stays as the belt
+        # for direct callers (karenmillen's verbolia trap, count=25, stays
+        # vetoed here).
+        _count = api.get("count")
+        claims_data = (
+            isinstance(_count, (int, float))
+            and not isinstance(_count, bool)
+            and _count > 0
         )
         if claims_data:
             bad.append(f"api.url={api_url[:60]}")
@@ -3790,6 +3796,40 @@ def _invoke_navigation_traverse(
                 logger.info(
                     "HTTP traverse also didn't reach goal — using best partial (job %s)",
                     job_id,
+                )
+
+        # [wave-34 F2] An off-domain api descriptor can never arm internal_api
+        # (the strategy gate demands count > 0 for the endpoint), and on
+        # widget-heavy storefronts the ONLY capture that survives verify_api
+        # is a third-party marketing XHR (prod 614 klaviyo / 620 useinsider /
+        # 625 klaviyo / 626 bluecore) while discovery itself was healthy
+        # (10-92 on-domain item links). Drop the descriptor here and proceed
+        # on detail_links instead of vetoing a healthy job. Off-domain
+        # goal_url or an item-link MAJORITY still trips the T1.6 guard below —
+        # the 323/D1 wrong-site arms are untouched.
+        _api = getattr(result, "api", None)
+        if isinstance(_api, dict) and str(_api.get("url") or "").startswith("http"):
+            try:
+                from experimental.nav_traversal.traversal import (
+                    _registrable as _reg_api,
+                )
+
+                _job_reg = _reg_api(url)
+                if _job_reg and _reg_api(str(_api["url"])) not in ("", _job_reg):
+                    logger.error(
+                        "browser_traverse: dropping off-domain api capture (job %s): "
+                        "%s — discovery stays on %s",
+                        job_id, str(_api["url"])[:100], _job_reg,
+                    )
+                    result.api = {}
+                    result.mechanism = (
+                        "detail_links"
+                        if getattr(result, "item_links", None)
+                        else "unknown"
+                    )
+            except Exception as _exc_api:
+                logger.debug(
+                    "browser_traverse: api registrable check skipped: %s", _exc_api
                 )
 
         # [wave-19 T1.6] Same-domain assertion on the traversal RESULT — the

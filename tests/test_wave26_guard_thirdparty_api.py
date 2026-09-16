@@ -6,13 +6,20 @@ for one captured XHR: ``consumer-v2.truefitcorp.com/api/store/fnw/ui-configs``
 off-domain api.url, so a legitimate third-party widget killed the job with
 "Navigator returned cross-domain traversal results twice".
 
-Contract evolution (documented, deliberate): an off-domain ``api.url`` is a
-contamination violation ONLY when the capture CLAIMS product data — count /
-items_per_page / sample_keys — i.e. when it could become the EXTRACTION
-SOURCE (karenmillen's verbolia brand-protection trap serves exactly that
-shape, and stays vetoed). A bare widget/config endpoint carries none of
-that evidence, and the strategy gate's shape check would reject it as an
-extraction source anyway.
+Contract evolution (documented, deliberate):
+- wave-26: an off-domain ``api.url`` is a contamination violation ONLY when
+  the capture CLAIMS product data — count / items_per_page / sample_keys.
+- wave-34 F3: "claims data" tightened to a POSITIVE numeric ``count`` —
+  mirroring the strategy gate's internal_api arming predicate. The wave-26
+  disjunction was structurally always true (verify_api only emits
+  descriptors with items_per_page >= 1 and non-empty sample_keys), so it
+  never once spared a real capture (prod 614 klaviyo / 620 useinsider /
+  625 klaviyo / 626 bluecore all vetoed despite "clean" walks).
+- wave-34 F2: browser_traverse now DROPS off-domain api descriptors up
+  front (soft branch, logs loudly, demotes mechanism) instead of running
+  the 2-strike honest-fail ladder — discovery was healthy in every one of
+  those jobs. This guard's api arm remains the belt for direct callers;
+  a count>0 off-domain descriptor still flags here.
 
 The other walls are unchanged: goal_url off-domain vetoes; majority
 off-domain item_links veto; _sanitize_nav_domains still blanks any
@@ -100,19 +107,40 @@ class TestDataClaimingOffDomainApiStillVetoed:
         bad = _fn()(r, "https://www.karenmillen.com/")
         assert len(bad) == 1 and "api" in bad[0]
 
-    def test_sample_keys_claiming_api_flagged(self):
+    def test_marketing_widget_with_positive_count_flagged(self):
+        """[wave-34] klaviyo/useinsider class when the payload is dict-shaped
+        and carries a total_like key — still a guard violation (the F2 soft
+        branch in browser_traverse drops the descriptor before this runs;
+        this arm is the belt)."""
         r = _result(
-            goal_url="https://www.karenmillen.com/c/x",
-            api={"url": POISON, "sample_keys": ["title"]},
+            goal_url="https://www.mimco.com.au/collections/jewellery",
+            api={
+                "url": "https://static-forms.klaviyo.com/forms/api/v7/TprMdG/full-forms",
+                "count": 3,
+                "sample_keys": ["form", "id"],
+            },
+            item_links=["https://mimco.com.au/products/x"],
         )
-        assert _fn()(r, "https://www.karenmillen.com/")
+        bad = _fn()(r, "https://mimco.com.au/")
+        assert len(bad) == 1 and "api" in bad[0]
 
-    def test_items_per_page_claiming_api_flagged(self):
+    def test_sample_keys_without_count_not_flagged(self):
+        """[wave-34 F3] items_per_page/sample_keys are structural on every
+        verify_api descriptor (>=1 / non-empty by construction) — they no
+        longer count as data claims. browser_traverse's F2 soft branch drops
+        the descriptor itself."""
         r = _result(
             goal_url="https://www.karenmillen.com/c/x",
-            api={"url": POISON, "items_per_page": 24},
+            api={"url": POISON, "sample_keys": ["title"], "items_per_page": 24},
         )
-        assert _fn()(r, "https://www.karenmillen.com/")
+        assert _fn()(r, "https://www.karenmillen.com/") == []
+
+    def test_zero_or_negative_count_not_data_claim(self):
+        r = _result(
+            goal_url="https://www.karenmillen.com/c/x",
+            api={"url": POISON, "count": 0, "sample_keys": ["title"]},
+        )
+        assert _fn()(r, "https://www.karenmillen.com/") == []
 
 
 class TestUnchangedWalls:
@@ -141,6 +169,42 @@ class TestUnchangedWalls:
             api={"url": "https://www.forevernew.com.au/api/products", "count": 12},
         )
         assert _fn()(r, FNW) == []
+
+
+class TestSoftBranchDropsOffDomainApiInNode:
+    """[wave-34 F2] browser_traverse drops an off-domain api descriptor BEFORE
+    the T1.6 guard instead of running the 2-strike honest-fail ladder —
+    prod 614/620/625/626: healthy discovery (10-92 on-domain links) was
+    discarded because a marketing XHR (klaviyo/useinsider/bluecore) was the
+    only descriptor verify_api could produce. The wrong-site arms (goal_url,
+    link majority) are untouched."""
+
+    def _wrapper_src(self):
+        m = re.search(
+            r"^def _invoke_navigation_traverse\(.*?(?=^def |\Z)",
+            _graph_src, re.S | re.M,
+        )
+        assert m, "_invoke_navigation_traverse not found"
+        return m.group(0)
+
+    def test_drop_precedes_guard_and_retraverse(self):
+        src = self._wrapper_src()
+        i_drop = src.index("dropping off-domain api capture")
+        i_guard = src.index("_nav_result_contamination(result, url)")
+        assert i_drop < i_guard, "descriptor drop must run before the guard"
+
+    def test_drop_blanks_api_and_demotes_mechanism(self):
+        src = self._wrapper_src()
+        assert "result.api = {}" in src
+        assert '"detail_links"' in src  # mechanism demotion, never a 2nd exit
+
+    def test_hard_arms_still_fail_to_cleanup(self):
+        src = self._wrapper_src()
+        i_drop = src.index("dropping off-domain api capture")
+        i_guard = src.index("_nav_result_contamination(result, url)")
+        i_cleanup = src.index('goto="cleanup"', i_guard)
+        assert i_drop < i_cleanup
+        assert "still cross-domain after re-traverse" in src
 
 
 if __name__ == "__main__":
