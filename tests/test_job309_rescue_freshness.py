@@ -37,8 +37,12 @@ import importlib as _importlib
 SLUG = "pillowtalktest"
 
 # Contract-compliant draft (env gate) so the route reaches the cascade/rescue
-# arms instead of bouncing on the CLI-contract check.
+# arms instead of bouncing on the CLI-contract check. The src.http_fetch import
+# also satisfies the wave-34 F4 ladder re-derivation (a requests-only draft
+# with no proxy-aware fetch path is deterministic-contract-bad and would
+# bounce to code_writer before the rescue arms — prod 623).
 ENV_GATE_SHAPE = """
+    from src.http_fetch import create_fetch_text  # ladder preservation
     import argparse, os
     def main():
         parser = argparse.ArgumentParser()
