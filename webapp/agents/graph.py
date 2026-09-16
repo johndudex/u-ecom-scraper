@@ -1902,6 +1902,110 @@ def _accessibility_goto(state: ScrapeState, update: dict[str, Any] | None = None
     return Command(goto="site_analyzer")
 
 
+def _jsonld_product_entity(blocks: Any, page_url: str) -> bool:
+    """[wave-34 T34-2] True when a probe payload's JSON-LD says the page IS a
+    product page: a top-level ``Product`` entity, or a ``@graph`` Product node
+    whose own url/@id/offers.url canonicalizes to this page.
+
+    A ``Product`` merely embedded in an ItemList's itemListElement is nested
+    inside the ItemList block, so it never satisfies the top-level arm —
+    listing grids don't flip. The one grid shape that DOES surface top-level
+    Products (one block per card) emits several distinct foreign-canonical
+    entities; that signature is rejected explicitly.
+    """
+    if not isinstance(blocks, list) or not page_url:
+        return False
+    try:
+        from urllib.parse import urlparse as _up
+
+        _p = _up(page_url)
+        page_host = (_p.hostname or "").lower()
+        page_path = _p.path.rstrip("/") or "/"
+    except Exception:
+        return False
+
+    def _types_of(value: Any) -> list:
+        if isinstance(value, str):
+            return [value]
+        return list(value) if isinstance(value, list) else []
+
+    def _canonical_product(node: Any) -> bool:
+        if not isinstance(node, dict) or "Product" not in _types_of(node.get("@type")):
+            return False
+        refs: list[Any] = [node.get("url"), node.get("@id")]
+        offers = node.get("offers")
+        if isinstance(offers, dict):
+            refs.append(offers.get("url"))
+        elif isinstance(offers, list):
+            refs.extend(o.get("url") for o in offers if isinstance(o, dict))
+        for ref in refs:
+            if not isinstance(ref, str) or "://" not in ref:
+                continue
+            try:
+                _r = _up(ref)
+            except Exception:
+                continue
+            if (_r.hostname or "").lower() == page_host and (
+                _r.path.rstrip("/") or "/"
+            ) == page_path:
+                return True
+        return False
+
+    top_products = [
+        b for b in blocks
+        if isinstance(b, dict) and "Product" in _types_of(b.get("@type"))
+    ]
+    if top_products:
+        if len(top_products) == 1 or any(_canonical_product(b) for b in top_products):
+            return True
+        # Multiple Product blocks, none canonical — PDP only when they don't
+        # look like a card grid (grid = ≥2 distinct foreign entity urls).
+        distinct_foreign = {
+            (b.get("url") or b.get("@id") or "")
+            for b in top_products
+            if not _canonical_product(b)
+        }
+        return len(distinct_foreign) < 2
+
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        graph = block.get("@graph")
+        if isinstance(graph, list) and any(
+            _canonical_product(n) for n in graph
+        ):
+            return True
+    return False
+
+
+def _write_flip_input_urls(state: ScrapeState, urls: list[str]) -> None:
+    """[wave-34 T34-2] Materialize ``workspace/{slug}/input_urls.json`` for a
+    PDP-flipped job. setup_workspace already ran (list_page back then), so the
+    url_list seed file the execution path stages and the scraper falls back to
+    would otherwise not exist."""
+    slug = state.get("site_slug") or ""
+    if not slug or not urls:
+        return
+    try:
+        from django.conf import settings
+
+        root = getattr(settings, "PROJECT_ROOT", "")
+        if not root:
+            return
+        ws_dir = os.path.join(root, "workspace", slug)
+        os.makedirs(ws_dir, exist_ok=True)
+        with open(
+            os.path.join(ws_dir, "input_urls.json"), "w", encoding="utf-8"
+        ) as fh:
+            json.dump({"urls": urls}, fh, indent=2, ensure_ascii=False)
+        logger.info(
+            "check_accessibility: wrote %d flipped seed URL(s) to %s",
+            len(urls), os.path.join(ws_dir, "input_urls.json"),
+        )
+    except Exception as exc:
+        logger.warning("check_accessibility: input_urls.json write failed: %s", exc)
+
+
 def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
     """Probe the target URL with LLM-based captcha verification.
 
@@ -2038,6 +2142,44 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
                 exc,
             )
 
+    # [wave-34 T34-2] PDP-seed honesty. A list_page job whose seed URL is
+    # itself a product page cannot serve as a listing start: discovery from a
+    # PDP harvests recommendation carousels (frequently cross-domain by
+    # design — prod 622 vinted, and 614/620/625/626 all rode PDP seeds into
+    # the contamination guard). When the probe's own JSON-LD says the seed is
+    # a Product, demote the job to url_list with the seed as its single item —
+    # the honest reading of the intake. navigation/search_term keep their
+    # modes: there the seed is a starting hint and the user asked for
+    # discovery, not for this one page.
+    _flip_updates: dict[str, Any] = {}
+    if _input_mode == "list_page" and _jsonld_product_entity(data.get("jsonld"), url):
+        _flip_updates = {
+            "input_mode": "url_list",
+            "input_urls": [url],
+            "pdp_seed_flip": True,
+        }
+        _note = (
+            f"[INTAKE-PDP] seed {url[:200]} is a product page (probe JSON-LD "
+            "Product); input_mode list_page → url_list with the seed as its "
+            "single item"
+        )
+        logger.info("check_accessibility: %s (job %s)", _note, job_id)
+        if job_id:
+            try:
+                from scraper.models import Job as _Job
+
+                _job = _Job.objects.filter(job_id=job_id).first()
+                if _job is not None:
+                    _job.notes = (
+                        (_job.notes + "\n") if _job.notes else ""
+                    ) + _note
+                    _job.save(update_fields=["notes"])
+            except Exception as exc:
+                logger.warning(
+                    "check_accessibility: PDP-flip note write failed: %s", exc
+                )
+        _write_flip_input_urls(state, [url])
+
     method = data.get("method", "unknown")
     proxy_tier = data.get("proxy_tier", "none")
 
@@ -2079,6 +2221,11 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
 
     update_probe_result(data)
 
+    if _flip_updates:
+        # Routing must see the flipped input_mode (url_list → site_analyzer,
+        # not browser_traverse) — the graph state gets it via probe_state.
+        probe_state.update(_flip_updates)
+        return _accessibility_goto({**state, **_flip_updates}, probe_state)
     return _accessibility_goto(state, probe_state)
 
 
@@ -3551,7 +3698,12 @@ def _invoke_navigation_traverse(
         with _mcp_browser_lock(job_id):
             result = browser_traverse(
                 url, content_type, query,
-                trust_start_as_listing=_input_mode in ("list_page", "search_term"),
+                # [wave-34 T34-2] a PDP-flipped job must never trust its seed
+                # as a listing even if a stale route still lands here.
+                trust_start_as_listing=(
+                    _input_mode in ("list_page", "search_term")
+                    and not state.get("pdp_seed_flip")
+                ),
                 # [wave-30 W30-8] heartbeat rows every 300s + the
                 # NAV_TRAVERSE_MAX_TIMEOUT hard ceiling (resolved inside
                 # traversal.py) — the walk is otherwise invisible in

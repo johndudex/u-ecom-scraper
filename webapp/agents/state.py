@@ -67,6 +67,9 @@ class ScrapeState(TypedDict, total=False):
     skip_site_analysis: bool
     skip_product_analysis: bool
     skip_code_generation: bool
+    # [wave-34 T34-2] check_accessibility proved the list_page seed is itself
+    # a product page (probe JSON-LD) and demoted the job to url_list.
+    pdp_seed_flip: bool
 
     # ── Retry counters ─────────────────────────────────────────────────
     site_analysis_retries: int
