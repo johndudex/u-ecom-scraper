@@ -440,7 +440,10 @@ class ToolCallLog(models.Model):
 
 
 class Site(models.Model):
-    url = models.URLField(unique=True)
+    # max_length: Django's URLField default is 200 — prod 626 died at intake
+    # on a 215-char PDP seed (`value too long for type character varying(200)`
+    # in check_tracker's auto-create). ScrapeJob.url already carries 1000.
+    url = models.URLField(max_length=1000, unique=True)
     name = models.CharField(max_length=200, blank=True, default="")
     slug = models.CharField(max_length=200, blank=True, default="")
     sample_url = models.URLField(max_length=1000, blank=True, default="")
