@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from celery.schedules import crontab
 from decouple import config
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -207,7 +208,22 @@ CELERY_BEAT_SCHEDULE = {
         "task": "scraper.events.reconciler.dispatch_pending_callbacks",
         "schedule": 30.0,
     },
+    # [wave-35] Daily retention purge — langgraph checkpoint_* + log tables
+    # behind dead-end jobs (failed/cancelled >7d, completed >90d by default;
+    # parked/resumable statuses never). Off-peak single daily run; rides the
+    # events pool (see CELERY_TASK_ROUTES). Kill-switch: RETENTION_ENABLED=0.
+    "purge-retention": {
+        "task": "scraper.tasks.purge_retention",
+        "schedule": crontab(hour=3, minute=17),
+    },
 }
+
+# [wave-35] Retention windows (scraper/retention.py). Defaults match the
+# 2026-09-16 manual console purge that reclaimed prod postgres from 25GB —
+# failed/cancelled have no future, completed is kept a quarter for history.
+RETENTION_ENABLED = config("RETENTION_ENABLED", default=True, cast=bool)
+RETENTION_DAYS_FAILED = config("RETENTION_DAYS_FAILED", default=7, cast=int)
+RETENTION_DAYS_COMPLETED = config("RETENTION_DAYS_COMPLETED", default=90, cast=int)
 
 # Fold B5: delivery HTTP must never share the scrape workers' 2-slot pool —
 # one hung partner endpoint ≈ 10 min of zero scrape capacity otherwise.
@@ -229,6 +245,8 @@ CELERY_TASK_ROUTES = {
     # [wave-16 B3] The park resumer polices the scrape pool — same reasoning
     # as the watchdog above, it must not queue behind the jobs it resuscitates.
     "scraper.tasks.resume_browser_unavailable_jobs": "events",
+    # [wave-35] Retention purge is maintenance — must not occupy a scrape slot.
+    "scraper.tasks.purge_retention": "events",
 }
 
 # [wave-15 1.2] Master switch for the abandoned-PENDING redispatch sweep.

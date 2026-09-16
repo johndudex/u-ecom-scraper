@@ -1990,6 +1990,31 @@ def cleanup_stuck_jobs() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# [wave-35] DB retention — daily purge behind dead-end jobs
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@shared_task
+def purge_retention() -> dict:
+    """[wave-35] Daily retention sweep (beat: ``purge-retention``).
+
+    Purges langgraph checkpoint rows + SessionLog/ToolCallLog/Step for
+    failed/cancelled jobs past RETENTION_DAYS_FAILED (default 7) and
+    completed jobs past RETENTION_DAYS_COMPLETED (default 90), and folds in
+    expired django_session cleanup. Never touches parked/live statuses —
+    resumable jobs need their checkpoints (see scraper/retention.py).
+    """
+    if not settings.RETENTION_ENABLED:
+        return {"disabled": True}
+    from scraper.retention import purge_retention as _sweep
+
+    return _sweep(
+        days_failed=settings.RETENTION_DAYS_FAILED,
+        days_completed=settings.RETENTION_DAYS_COMPLETED,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # [wave-16 B3] Dependency-park resumer
 # ═══════════════════════════════════════════════════════════════════════════
 
