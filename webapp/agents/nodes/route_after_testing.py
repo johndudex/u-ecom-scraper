@@ -1697,6 +1697,29 @@ def route_after_testing(state: ScrapeState) -> str:
                 _contract_bad = (
                     cli_contract_violation(_draft_cb, _im_cb, _st_cb) is not None
                 )
+                # [wave-34 F4] The ladder gate is the SAME deterministic
+                # force-FAIL lane (wave-19 T1.1) — prod 623: the tester
+                # failed the draft on ladder_preservation_violation, but this
+                # derivation only knew cli_contract_violation, so the
+                # ground-truth override rescued a job run_execution then
+                # refused — zero fix cycles. Belt: the tester also stamps
+                # report["deterministic_gate"] when it zeroes the report.
+                if not _contract_bad:
+                    _report_cb = state.get("test_report")
+                    if (
+                        isinstance(_report_cb, dict)
+                        and _report_cb.get("deterministic_gate")
+                    ):
+                        _contract_bad = True
+                if not _contract_bad:
+                    from ..draft_safety import ladder_preservation_violation
+
+                    _contract_bad = (
+                        ladder_preservation_violation(
+                            _draft_cb, _im_cb, _st_cb
+                        )
+                        is not None
+                    )
     except Exception as _exc_cb:
         logger.debug("route_after_testing: contract re-check errored: %s", _exc_cb)
 
@@ -1818,12 +1841,20 @@ def route_after_testing(state: ScrapeState) -> str:
     # cannot mutate state); its one-reset escape on a concrete scraper-target
     # diagnosis is what keeps a real late fix (395's Algolia re-tier) from
     # being walled off. Sibling guards wrap the terminal like the exhausted
-    # arms; the ground-truth rescue still wins.
-    if int(state.get("access_wall_cycles") or 0) >= 2:
+    # arms; the ground-truth rescue still wins. [wave-34 F4] a deterministic
+    # contract violation routes FIRST (bounded contract bounce below) — the
+    # 324/623 ladder class tests green by definition, so letting it ride the
+    # wall terminal or the rescue would skip the one known fix.
+    if (
+        int(state.get("access_wall_cycles") or 0) >= 2
+        and not _contract_bad
+    ):
         _rescue_min_aw = (
             1 if (state.get("input_mode") or "") in ("url_list", "list_page") else 3
         )
-        if _scraper_has_real_items(state, min_count=_rescue_min_aw):
+        if not _contract_bad and _scraper_has_real_items(
+            state, min_count=_rescue_min_aw
+        ):
             logger.info(
                 "route_after_testing: access-wall ×2 but output has real items "
                 "→ field_confirmation (ground truth beats the wall)"

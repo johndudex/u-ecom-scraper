@@ -224,7 +224,7 @@ class TestRouteAfterTesting:
         # workspace draft for the static re-check
         slug = "contracttest"
         ws = tmp_path / "workspace" / slug
-        ws.mkdir(parents=True)
+        ws.mkdir(parents=True, exist_ok=True)
         (ws / "scraper_draft.py").write_text(textwrap.dedent(draft_src), encoding="utf-8")
         base = {
             "site_slug": slug,
@@ -252,6 +252,12 @@ class TestRouteAfterTesting:
         # with zero items behind it is the phantom-PASS class the campaign
         # killed (job-76/81), so the compliant shape carries real evidence.
         state = {
+            # [wave-34 F4] a browser-family strategy: the ladder gate is
+            # deliberately exempt for it, so the compliant shape tests the
+            # routing (not the ladder). An HTTP-family strategy-less draft
+            # would now be contract-bad — the tester gate would force-FAIL
+            # exactly the same shape (623 class).
+            "scraper_analysis": {"strategy": "playwright"},
             "test_report": {
                 "overall_assessment": "PASS",
                 "confidence_score": 0.9,
@@ -259,7 +265,7 @@ class TestRouteAfterTesting:
                 "issues": [],
                 "results": {"successful_extractions": 7},
                 "phases_tested": {"phase1_discovery": True, "phase2_extraction": True},
-            }
+            },
         }
         assert self._route(state, tmp_path, ENV_GATE_SHAPE) == "field_confirmation"
 
@@ -271,6 +277,98 @@ class TestRouteAfterTesting:
             self._route({"test_retry_count": 2, "skip_approvals": True}, tmp_path, JOB7_SHAPE)
             == "cleanup"
         )
+
+
+LADDER_STRIP_SHAPE = """
+    import argparse, os
+    import requests
+    def main():
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--listing-url", type=str, default=None)
+        parser.add_argument("--fresh-discovery", action="store_true")
+        parser.add_argument("--sample", action="store_true")
+        parser.add_argument("--limit", type=int, default=None)
+        parser.add_argument("--input", type=str, default=None)
+        args = parser.parse_args()
+        _env_listing = os.environ.get("SCRAPER_LISTING_URL", "").strip()
+        if _env_listing or args.fresh_discovery or args.listing_url:
+            discover(_env_listing or args.listing_url)
+        elif args.input:
+            load(args.input)
+        elif os.path.exists(INPUT_FILE):
+            load(INPUT_FILE)
+    def discover(listing_url):
+        resp = requests.get(listing_url, timeout=30)
+        return resp.text
+"""
+
+
+class TestLadderGateRouting(TestRouteAfterTesting):
+    """[wave-34 F4] prod 623: the tester forced FAIL on
+    ladder_preservation_violation, but _contract_bad only re-derived the CLI
+    gate — the ground-truth override rescued the job and run_execution refused
+    it, zero fix cycles. The ladder violation must route to code_writer."""
+
+    def _pass_state(self):
+        return {
+            "scraper_analysis": {"strategy": "http_requests"},
+            "test_report": {
+                "overall_assessment": "PASS",
+                "confidence_score": 0.9,
+                "ready_for_execution": True,
+                "issues": [],
+                "results": {"successful_extractions": 50},
+                "phases_tested": {"phase1_discovery": True, "phase2_extraction": True},
+            },
+        }
+
+    def test_ladder_violation_blocks_ground_truth_override(self, tmp_path):
+        state = self._pass_state()
+        assert self._route(state, tmp_path, LADDER_STRIP_SHAPE) == "code_writer"
+
+    def test_deterministic_gate_stamp_belt(self, tmp_path):
+        # Even when the static re-derivation can't see it, the tester's own
+        # stamp (report["deterministic_gate"]) forces the bounce.
+        state = self._pass_state()
+        state["test_report"]["deterministic_gate"] = "ladder"
+        assert self._route(state, tmp_path, ENV_GATE_SHAPE) == "code_writer"
+
+    def test_access_wall_rescue_honors_contract_gate(self, tmp_path):
+        # [wave-34 critique leak #1] the ×2 access-wall terminal (and its
+        # ground-truth rescue) must not swallow a deterministic contract
+        # violation — the ladder class tests green by definition, so riding
+        # the wall arms would reach run_execution's refusal with zero fix
+        # cycles (623 again, one wall cycle later). Contract bounce wins.
+        state = self._pass_state()
+        state["access_wall_cycles"] = 2
+        assert self._route(state, tmp_path, LADDER_STRIP_SHAPE) == "code_writer"
+        # Contract-clean + real items: the W24-3 ground-truth rescue still
+        # beats the wall exactly as before (F4 must not touch that lane).
+        clean = {
+            "scraper_analysis": {"strategy": "playwright"},
+            "test_report": {
+                "overall_assessment": "PASS",
+                "confidence_score": 0.9,
+                "ready_for_execution": True,
+                "issues": [],
+                "results": {"successful_extractions": 7},
+                "phases_tested": {"phase1_discovery": True, "phase2_extraction": True},
+            },
+            "access_wall_cycles": 2,
+        }
+        assert self._route(clean, tmp_path, ENV_GATE_SHAPE) == "field_confirmation"
+
+    def test_ladder_compliant_draft_still_passes(self, tmp_path):
+        state = self._pass_state()
+        compliant = LADDER_STRIP_SHAPE.replace(
+            "import requests",
+            "import requests\n    from src.http_fetch import create_fetch_page",
+        )
+        state["test_report"] = dict(
+            state["test_report"],
+            phases_tested={"phase1_discovery": True, "phase2_extraction": True},
+        )
+        assert self._route(state, tmp_path, compliant) == "field_confirmation"
 
 
 if __name__ == "__main__":
