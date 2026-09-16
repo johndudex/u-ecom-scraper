@@ -297,10 +297,9 @@ def _discover_urls_via_search(
             break
         if limit and len(all_urls) >= limit:
             logger.info("Phase 1: Reached limit=%d", limit)
-            # No `limit_hit` enum exists (contract §2); a user cap is an
-            # inconclusive termination, so it shares `max_pages_hit`. The
-            # boolean above stays False — MAX_PAGES was not the cause.
-            _set_stop_reason(state, "max_pages_hit")
+            # [wave-34 F6] A self-imposed cap is not "max_pages_hit" — that
+            # reads as site exhaustion downstream. limit_hit is honest.
+            _set_stop_reason(state, "limit_hit")
             break
 
         # Phase 3: load-more pagination (Coveo/React/Vue load-more button).

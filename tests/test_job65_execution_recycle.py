@@ -120,6 +120,67 @@ class TestRouteAfterExecution:
         assert "error_message" not in upd
         assert "execution_status" not in upd
 
+    def test_phase2_only_collapse_recycles(self):
+        """[wave-34 F6] prod 624 brooksrunning: Phase 1 discovered URLs at
+        execution but Phase 2 extracted ZERO rows, rc=0 under
+        ``max_pages_hit`` — no recycle fired, execution_status stayed SUCCESS
+        (success writer-memory + skill-learn rode along), finalize failed the
+        job with zero recovery. Discovered-but-empty is a FAIL-class verdict
+        regardless of the healthy-flavored stop_reason."""
+        res = self._route(_zero_state(
+            discovery_coverage={
+                "ran_phase1": True,
+                "stop_reason": "max_pages_hit",
+                "discovered_urls": 24,
+                "found": 0,
+            },
+        ))
+        assert _goto(res) == "scraper_analyzer"
+        upd = _update(res)
+        assert upd["execution_recycle_count"] == 1
+        assert "extraction_empty" in upd["strategies_tried"][0]["reason"]
+
+    def test_limit_hit_zero_items_recycles(self):
+        """[wave-34 F6] the template now emits ``limit_hit`` for its own
+        --limit cap — 0 extracted rows under it still recycles."""
+        res = self._route(_zero_state(
+            discovery_coverage={
+                "ran_phase1": True,
+                "stop_reason": "limit_hit",
+                "discovered_urls": 10,
+                "found": 0,
+            },
+        ))
+        assert _goto(res) == "scraper_analyzer"
+
+    def test_phase2_collapse_after_recycle_fails_honestly(self):
+        res = self._route(_zero_state(
+            execution_recycle_count=1,
+            discovery_coverage={
+                "ran_phase1": True,
+                "stop_reason": "max_pages_hit",
+                "discovered_urls": 24,
+                "found": 0,
+            },
+        ))
+        assert _goto(res) == "cleanup"
+        upd = _update(res)
+        assert upd["execution_status"] == "FAILED"
+        assert "extraction_empty" in upd["error_message"]
+
+    def test_discovered_zero_with_healthy_reason_still_cleans_up(self):
+        """No Phase-2 signal at all (discovered_urls==0, short_page) stays
+        with the finalize backstop — not a strategy recycle."""
+        res = self._route(_zero_state(
+            discovery_coverage={
+                "ran_phase1": True,
+                "stop_reason": "short_page",
+                "discovered_urls": 0,
+                "found": 0,
+            },
+        ))
+        assert _goto(res) == "cleanup"
+
     def test_second_zero_item_execution_fails_honestly(self):
         res = self._route(_zero_state(execution_recycle_count=1))
         assert _goto(res) == "cleanup"

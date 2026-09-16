@@ -4877,7 +4877,36 @@ def _route_after_execution(state: ScrapeState):
     if (state.get("input_mode") or "") not in ("list_page", "navigation", "search_term"):
         return Command(goto="cleanup")  # url_list: no discovery phase to recycle
 
-    if stop_reason not in _COVERAGE_FAIL_STOP_REASONS:
+    # [wave-34 F6] Phase-2-only collapse (prod 624 brooksrunning): Phase 1
+    # discovered URLs at execution but extraction yielded ZERO rows, yet rc=0
+    # under a healthy-flavored stop_reason (max_pages_hit — partly our own
+    # --limit cap masquerading as the template's "max_pages_hit"). Nothing in
+    # the graph treated it as a failure: no recycle, execution_status stayed
+    # SUCCESS (a success writer-memory entry + skill-learn pass rode along),
+    # and finalize failed the job with zero recovery. Discovered-but-empty is
+    # the extraction side's failure, not the discovery side's — recycle like
+    # any other zero-item verdict.
+    if (
+        status == "SUCCESS"
+        and items == 0
+        and int(cov.get("found") or 0) == 0
+        and int(cov.get("discovered_urls") or 0) > 0
+    ):
+        logger.warning(
+            "_route_after_execution: Phase-2-only collapse (job %s) — "
+            "discovered %s URLs, extracted 0 rows (stop_reason=%r) → "
+            "recycling as extraction_empty",
+            job_id, cov.get("discovered_urls"), stop_reason,
+        )
+        stop_reason = "extraction_empty"
+
+    # [wave-34 F6] extraction_empty is execution-only (written just above);
+    # limit_hit is the template's honest "we capped ourselves" verdict
+    # (templates/http_navigation_scraper.py no longer borrows max_pages_hit
+    # for the --limit arm). Both are FAIL-class HERE; the tester-side
+    # _COVERAGE_FAIL_STOP_REASONS set is deliberately untouched.
+    _exec_fail_reasons = _COVERAGE_FAIL_STOP_REASONS | {"extraction_empty", "limit_hit"}
+    if stop_reason not in _exec_fail_reasons:
         logger.warning(
             "_route_after_execution: 0 items but stop_reason=%r is not a "
             "FAIL-class coverage reason — cleanup (job %s)", stop_reason, job_id,

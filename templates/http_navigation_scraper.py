@@ -670,6 +670,9 @@ _STOP_REASON_PRIORITY = {
     "dedup_flat": 4,        # FAIL  — broken dedup / feed injection suspected
     "navigate_throttled": 3,  # INCONCLUSIVE — 429 backpressure; coverage unproven, NOT a site defect
     "max_pages_hit": 3,     # INCONCLUSIVE — hit a cap, did not exhaust
+    "limit_hit": 3,         # INCONCLUSIVE — [wave-34 F6] our own --limit cap;
+    #                         distinct from max_pages_hit so "we capped
+    #                         ourselves" can't be read as "site exhausted"
     "no_new_items": 2,      # PASS/INCONCLUSIVE — consecutive pages were all dupes
     "short_page": 1,        # PASS  — genuine end (last page thinned out)
     "no_next_link": 0,      # PASS  — no next-page element/URL found (default)
@@ -834,10 +837,11 @@ def _discover_urls_via_search(
             break
         if limit and len(all_urls) >= limit:
             logger.info("Phase 1: Reached limit=%d", limit)
-            # No dedicated "limit_hit" enum value (contract §2). A user/config
-            # cap is the closest match to MAX_PAGES — both are INCONCLUSIVE
-            # caps, not exhaustion. See deviation note in return message.
-            stop_reason = "max_pages_hit"
+            # [wave-34 F6] A self-imposed cap is not "max_pages_hit" — that
+            # reads as site exhaustion downstream. limit_hit is honest:
+            # INCONCLUSIVE, and _route_after_execution can tell the
+            # difference between our cap and the site's end.
+            stop_reason = "limit_hit"
             break
 
         next_url = _get_next_page_url(final_url, current_page + 1, html)
@@ -981,7 +985,7 @@ def _discover_urls_via_form_search(
             break
         if limit and len(all_urls) >= limit:
             logger.info("Phase 1 (form-search): reached limit=%d", limit)
-            stop_reason = "max_pages_hit"
+            stop_reason = "limit_hit"  # [wave-34 F6] self-imposed cap
             break
 
         # Submit the form with this option
@@ -1109,7 +1113,7 @@ def _discover_urls_via_category(
             stop_reason = "max_pages_hit"
             break
         if limit and len(all_urls) >= limit:
-            stop_reason = "max_pages_hit"
+            stop_reason = "limit_hit"  # [wave-34 F6] self-imposed cap
             break
 
         next_url = _get_next_page_url(final_url, current_page + 1, html)
