@@ -8505,8 +8505,20 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 "unjudged-run routing (job %s)",
                 probe_yield.get("discovered_urls"), job_id,
             )
-        elif probe_yield is not None:
+        elif probe_yield is not None and isinstance(
+            probe_yield.get("discovered_urls"), int
+        ):
             # Probe succeeded with real yield: make the self-reported
+            # phase1_discovery boolean deterministic and record that the
+            # coverage verdict now reflects execution conditions. ``found``
+            # stays the tester's own (the probe skips Phase 2 by design —
+            # _volume_gap reads found/discovered and must see the real one).
+            # [wave-34] The inconclusive probe (wave-22 C1 blank-coverage
+            # stamp: discovered_urls=None) must NOT reach this arm — job 372
+            # paige crashed here ('>' not supported between NoneType and
+            # int) after the tester had already written a good report. An
+            # inconclusive probe manufactures evidence in neither
+            # direction: the tester's own report stands untouched.
             # phase1_discovery boolean deterministic and record that the
             # coverage verdict now reflects execution conditions. ``found``
             # stays the tester's own (the probe skips Phase 2 by design —
