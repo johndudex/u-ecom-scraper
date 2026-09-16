@@ -1932,13 +1932,7 @@ def _jsonld_product_entity(blocks: Any, page_url: str) -> bool:
     def _canonical_product(node: Any) -> bool:
         if not isinstance(node, dict) or "Product" not in _types_of(node.get("@type")):
             return False
-        refs: list[Any] = [node.get("url"), node.get("@id")]
-        offers = node.get("offers")
-        if isinstance(offers, dict):
-            refs.append(offers.get("url"))
-        elif isinstance(offers, list):
-            refs.extend(o.get("url") for o in offers if isinstance(o, dict))
-        for ref in refs:
+        for ref in _refs_of(node):
             if not isinstance(ref, str) or "://" not in ref:
                 continue
             try:
@@ -1951,12 +1945,33 @@ def _jsonld_product_entity(blocks: Any, page_url: str) -> bool:
                 return True
         return False
 
+    def _refs_of(node: dict) -> list[Any]:
+        refs: list[Any] = [node.get("url"), node.get("@id")]
+        offers = node.get("offers")
+        if isinstance(offers, dict):
+            refs.append(offers.get("url"))
+        elif isinstance(offers, list):
+            refs.extend(o.get("url") for o in offers if isinstance(o, dict))
+        return refs
+
+    def _has_absolute_refs(node: dict) -> bool:
+        return any(
+            isinstance(r, str) and "://" in r for r in _refs_of(node)
+        )
+
     top_products = [
         b for b in blocks
         if isinstance(b, dict) and "Product" in _types_of(b.get("@type"))
     ]
     if top_products:
-        if len(top_products) == 1 or any(_canonical_product(b) for b in top_products):
+        # [wave-34 critique] A lone top-level Product must either canonicalize
+        # to this page or carry NO absolute refs at all (a minimal PDP-LD with
+        # nothing to contradict). A single Product block whose refs point at a
+        # DIFFERENT url is one card of a lazy grid — never flip.
+        if len(top_products) == 1:
+            _b = top_products[0]
+            return _canonical_product(_b) or not _has_absolute_refs(_b)
+        if any(_canonical_product(b) for b in top_products):
             return True
         # Multiple Product blocks, none canonical — PDP only when they don't
         # look like a card grid (grid = ≥2 distinct foreign entity urls).
@@ -1978,20 +1993,22 @@ def _jsonld_product_entity(blocks: Any, page_url: str) -> bool:
     return False
 
 
-def _write_flip_input_urls(state: ScrapeState, urls: list[str]) -> None:
+def _write_flip_input_urls(state: ScrapeState, urls: list[str]) -> bool:
     """[wave-34 T34-2] Materialize ``workspace/{slug}/input_urls.json`` for a
     PDP-flipped job. setup_workspace already ran (list_page back then), so the
     url_list seed file the execution path stages and the scraper falls back to
-    would otherwise not exist."""
+    would otherwise not exist. Returns False on any failure — the caller must
+    then fail OPEN (keep list_page) rather than flip to a url_list job with
+    no seed file."""
     slug = state.get("site_slug") or ""
     if not slug or not urls:
-        return
+        return False
     try:
         from django.conf import settings
 
         root = getattr(settings, "PROJECT_ROOT", "")
         if not root:
-            return
+            return False
         ws_dir = os.path.join(root, "workspace", slug)
         os.makedirs(ws_dir, exist_ok=True)
         with open(
@@ -2002,8 +2019,10 @@ def _write_flip_input_urls(state: ScrapeState, urls: list[str]) -> None:
             "check_accessibility: wrote %d flipped seed URL(s) to %s",
             len(urls), os.path.join(ws_dir, "input_urls.json"),
         )
+        return True
     except Exception as exc:
         logger.warning("check_accessibility: input_urls.json write failed: %s", exc)
+        return False
 
 
 def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
@@ -2152,7 +2171,15 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
     # modes: there the seed is a starting hint and the user asked for
     # discovery, not for this one page.
     _flip_updates: dict[str, Any] = {}
-    if _input_mode == "list_page" and _jsonld_product_entity(data.get("jsonld"), url):
+    if (
+        _input_mode == "list_page"
+        and _jsonld_product_entity(data.get("jsonld"), url)
+        # [wave-34 critique] fail OPEN: if the seed file cannot be written,
+        # keep list_page — a flipped job without input_urls.json is a
+        # guaranteed downstream fail (writer prompt asserts the file,
+        # run_execution stages it).
+        and _write_flip_input_urls(state, [url])
+    ):
         _flip_updates = {
             "input_mode": "url_list",
             "input_urls": [url],
@@ -2166,9 +2193,9 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
         logger.info("check_accessibility: %s (job %s)", _note, job_id)
         if job_id:
             try:
-                from scraper.models import Job as _Job
+                from scraper.models import ScrapeJob
 
-                _job = _Job.objects.filter(job_id=job_id).first()
+                _job = ScrapeJob.objects.filter(pk=job_id).first()
                 if _job is not None:
                     _job.notes = (
                         (_job.notes + "\n") if _job.notes else ""
@@ -2178,7 +2205,6 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
                 logger.warning(
                     "check_accessibility: PDP-flip note write failed: %s", exc
                 )
-        _write_flip_input_urls(state, [url])
 
     method = data.get("method", "unknown")
     proxy_tier = data.get("proxy_tier", "none")
@@ -8483,6 +8509,9 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             report["overall_assessment"] = "FAIL"
             report["confidence_score"] = 0.0
             report["ready_for_execution"] = False
+            # [wave-34 F4] which deterministic gate forced the FAIL — routing
+            # consults this belt so a forced-FAIL can never be overridden.
+            report["deterministic_gate"] = _violation_kind or "cli"
             report.setdefault("issues", []).insert(
                 0,
                 {

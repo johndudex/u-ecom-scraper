@@ -97,6 +97,23 @@ class TestJsonldProductEntity:
         assert not graph._jsonld_product_entity(None, PDP_URL)
         assert not graph._jsonld_product_entity([{"@type": "BreadcrumbList"}], PDP_URL)
 
+    def test_lone_product_foreign_ref_does_not_flip(self):
+        # [wave-34 critique] one Product block whose refs point at a
+        # different url = a single card of a lazy grid, not a PDP.
+        assert not graph._jsonld_product_entity(
+            [{"@type": "Product", "url": "https://www.vinted.fr/items/9"}],
+            "https://www.vinted.be/catalog/5-men",
+        )
+        assert not graph._jsonld_product_entity(
+            [{"@type": "Product", "offers": {"url": "https://www.vinted.fr/items/9"}}],
+            "https://www.vinted.be/catalog/5-men",
+        )
+
+    def test_lone_product_canonical_ref_flips(self):
+        assert graph._jsonld_product_entity(
+            [{"@type": "Product", "url": PDP_URL}], PDP_URL
+        )
+
 
 # ── Flip integration through check_accessibility ────────────────────────
 
@@ -152,6 +169,65 @@ class TestPdpSeedFlip:
         assert cmd.goto == "browser_traverse"
         assert "pdp_seed_flip" not in (cmd.update or {})
         assert "input_mode" not in (cmd.update or {})
+
+    @pytest.mark.django_db
+    def test_seed_file_write_failure_fails_open(self, monkeypatch):
+        # [wave-34 critique] if input_urls.json cannot be written the flip is
+        # withheld — a flipped job without its seed file is a guaranteed fail.
+        monkeypatch.setattr(
+            probe_tools,
+            "run_probe_with_captcha_check",
+            lambda *a, **k: _probe_data([{"@type": "Product"}]),
+        )
+        monkeypatch.setattr(
+            probe_tools, "_verify_captcha_free", lambda data: {"captcha_detected": False}
+        )
+        monkeypatch.setattr(graph, "_persist_probe_summary", lambda *a, **k: None)
+        monkeypatch.setattr(graph, "_write_flip_input_urls", lambda *a, **k: False)
+
+        state = {
+            "job_id": 0,
+            "url": PDP_URL,
+            "input_mode": "list_page",
+            "site_slug": "vinted-be",
+        }
+        cmd = graph.check_accessibility(state, None)
+        assert cmd.goto == "browser_traverse"
+        assert "pdp_seed_flip" not in (cmd.update or {})
+
+    @pytest.mark.django_db
+    def test_flip_persists_notes_and_seed_file(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            probe_tools,
+            "run_probe_with_captcha_check",
+            lambda *a, **k: _probe_data([{"@type": "Product"}]),
+        )
+        monkeypatch.setattr(
+            probe_tools, "_verify_captcha_free", lambda data: {"captcha_detected": False}
+        )
+        monkeypatch.setattr(graph, "_persist_probe_summary", lambda *a, **k: None)
+
+        import agents.state as state_mod
+
+        seen = {}
+
+        def _fake_write(st, urls):
+            seen["slug"] = st.get("site_slug")
+            seen["urls"] = list(urls)
+            return True
+
+        monkeypatch.setattr(graph, "_write_flip_input_urls", _fake_write)
+        state = {
+            "job_id": 0,
+            "url": PDP_URL,
+            "input_mode": "list_page",
+            "site_slug": "vinted-be",
+        }
+        cmd = graph.check_accessibility(state, None)
+        assert cmd.update["pdp_seed_flip"] is True
+        assert seen == {"slug": "vinted-be", "urls": [PDP_URL]}
+        # state field exists for the belt (TraverseState / resume consumers)
+        assert "pdp_seed_flip" in state_mod.ScrapeState.__annotations__
 
     @pytest.mark.django_db
     def test_navigation_mode_pdp_seed_keeps_mode(self, monkeypatch):
