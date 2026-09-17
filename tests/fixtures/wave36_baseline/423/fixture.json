@@ -1,0 +1,18 @@
+{
+  "job_id": 423,
+  "url": "https://www.renttherunway.com/shop/designers/amur/belle_midi_dress?availabilityScope=reserve",
+  "site_slug": "renttherunway-com",
+  "site_name": "Rent The Runway",
+  "platform": "renttherunway_storefront_api",
+  "target_fields": [],
+  "input_mode": "list_page",
+  "search_criteria": "https://www.renttherunway.com/c/dresses",
+  "scope": "firstn",
+  "scope_value": "10",
+  "product_count": 9,
+  "output_file": "output_2026-09-08_035726_181409_2254.json",
+  "completed_at": "2026-09-08T04:01:36.771937+00:00",
+  "discovered_urls_count": 9,
+  "output_key": "products",
+  "draft_key": "scrapers/renttherunway-com/jobs/scraper-draft-423.py"
+}

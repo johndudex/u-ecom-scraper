@@ -1,0 +1,24 @@
+{
+  "job_id": 481,
+  "url": "https://www.teva.com/p/women-shoes/trailpeak-trail-running-shoe/1182711?style=1182711&color=TBA",
+  "site_slug": "teva-com",
+  "site_name": "Teva",
+  "platform": "deckers-ssr-custom",
+  "target_fields": [
+    "title",
+    "price",
+    "currency",
+    "description",
+    "avaliability"
+  ],
+  "input_mode": "list_page",
+  "search_criteria": "https://www.teva.com/c/women-view-all",
+  "scope": "firstn",
+  "scope_value": "10",
+  "product_count": 5,
+  "output_file": "output_2026-09-09_135459_675158_5699.json",
+  "completed_at": "2026-09-09T14:00:35.767643+00:00",
+  "discovered_urls_count": 10,
+  "output_key": "products",
+  "draft_key": "scrapers/teva-com/jobs/scraper-draft-481.py"
+}

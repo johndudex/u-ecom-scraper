@@ -1,0 +1,18 @@
+{
+  "job_id": 375,
+  "url": "https://www.katespade.com/products/deco-croc-embossed-large-flap-wallet/KP489-500.html?frp=KP489+YCL",
+  "site_slug": "katespade-com",
+  "site_name": "Kate Spade New York",
+  "platform": "Next.js App Router",
+  "target_fields": [],
+  "input_mode": "list_page",
+  "search_criteria": "https://www.katespade.com/shop/wallets/view-all",
+  "scope": "firstn",
+  "scope_value": "10",
+  "product_count": 7,
+  "output_file": "output_2026-09-06_150201_711771_1431.json",
+  "completed_at": "2026-09-06T15:09:37.215060+00:00",
+  "discovered_urls_count": 7,
+  "output_key": "products",
+  "draft_key": "scrapers/katespade-com/jobs/scraper-draft-375.py"
+}

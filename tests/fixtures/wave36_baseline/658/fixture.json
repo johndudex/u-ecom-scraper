@@ -1,0 +1,24 @@
+{
+  "job_id": 658,
+  "url": "https://www.westelm.com.au/fluted-marble-bath-accessories-b281",
+  "site_slug": "westelm-com-au",
+  "site_name": "West Elm Australia",
+  "platform": "NetSuite SuiteCommerce Advanced (SCA) 2018.2",
+  "target_fields": [
+    "product name",
+    "price",
+    "currency",
+    "size",
+    "avaliability"
+  ],
+  "input_mode": "list_page",
+  "search_criteria": "https://www.westelm.com.au/bath",
+  "scope": "firstn",
+  "scope_value": "10",
+  "product_count": 3,
+  "output_file": "output_2026-09-17_122513_249364_6311.json",
+  "completed_at": "2026-09-17T12:30:50.588467+00:00",
+  "discovered_urls_count": 70,
+  "output_key": "products",
+  "draft_key": "scrapers/westelm-com-au/jobs/scraper-draft-658.py"
+}

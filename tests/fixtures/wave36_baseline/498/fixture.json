@@ -1,0 +1,24 @@
+{
+  "job_id": 498,
+  "url": "https://www.briscoes.co.nz/product/1134726/kates-kitchen-butter-dome/",
+  "site_slug": "briscoes-co-nz",
+  "site_name": "Briscoes NZ",
+  "platform": "magento_pwa_studio",
+  "target_fields": [
+    "product name",
+    "price",
+    "currency",
+    "description",
+    "avaliability"
+  ],
+  "input_mode": "list_page",
+  "search_criteria": "https://www.briscoes.co.nz/kitchen/kitchen-storage/",
+  "scope": "firstn",
+  "scope_value": "10",
+  "product_count": 9,
+  "output_file": "output_2026-09-10_065500_118788_421.json",
+  "completed_at": "2026-09-10T07:02:24.273384+00:00",
+  "discovered_urls_count": 1426,
+  "output_key": "products",
+  "draft_key": "scrapers/briscoes-co-nz/jobs/scraper-draft-498.py"
+}

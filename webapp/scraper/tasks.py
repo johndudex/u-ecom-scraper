@@ -714,6 +714,249 @@ def resume_scrape_task(self, job_id: int, human_response: Any) -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _llm_field_map_adapter(
+    unresolved: list[str], page_type: str, registry_block: str = "",
+    site_context: str = "",
+) -> dict:
+    """[wave-36 §1b] One-shot small-LLM mapping leg — SINGLE attempt, by design
+    bypassing the ClassifiedRetryChatOpenAI 6-attempt ladder (round-1 F6: the
+    ladder's worst case is ≈2 min on the job-start critical path). Returns
+    ``{chip: {target, confidence, rationale}}`` or {} on ANY failure — the
+    resolver falls through to fuzzy/verbatim."""
+    try:
+        import json as _json
+
+        from agents.llm import get_small_llm
+        from agents.nodes.url_judge import _strip_fences
+
+        llm = get_small_llm(temperature=0.0, timeout=20)
+        system = (
+            "You map user-requested data fields to canonical field names for "
+            "a web-scraping output contract.\nCanonical fields for this "
+            f"content type:\n{registry_block}\n"
+            "For EACH user field, return the canonical target it describes. "
+            "If it is a genuine domain-specific field with no canonical "
+            'equivalent, return the literal string "CUSTOM" (the field will '
+            "be kept under its own name). Never invent a field name that is "
+            "not listed and not CUSTOM.\n"
+            "Respond with ONLY a JSON object (no markdown, no backticks), "
+            "exactly this shape:\n"
+            '{"<user field>": {"target": "<canonical-or-CUSTOM>", '
+            '"confidence": 0.0-1.0, "rationale": "short"}}'
+        )
+        human = f"USER FIELDS: {unresolved!r}\nCONTENT TYPE: {page_type}\n"
+        if site_context:
+            human += f"SITE: {site_context}\n"
+        resp = llm.invoke([("system", system), ("human", human)])
+        text = getattr(resp, "content", "") or ""
+        data = _json.loads(_strip_fences(text))
+        out: dict = {}
+        if isinstance(data, dict):
+            for chip, entry in data.items():
+                if isinstance(entry, dict) and entry.get("target"):
+                    out[str(chip)] = {
+                        "target": str(entry.get("target")),
+                        "confidence": entry.get("confidence") or 0.5,
+                        "rationale": str(entry.get("rationale") or "")[:200],
+                    }
+        return out
+    except Exception as exc:
+        logger.info(
+            "field-mapping LLM leg unavailable (%s) — fuzzy/verbatim fallback",
+            exc,
+        )
+        return {}
+
+
+def _persist_field_mapping(job: ScrapeJob, blob: dict) -> None:
+    """Stamp the resolved contract on the job row — the finalize prune reads
+    the SAME blob the pipeline enforced (plan §1b). Emits the silent-but-
+    logged ``[FIELD-MAP]`` audit row (job.notes + SessionLog; surfaced at
+    /jobs/<id>/api/) — the 658 signal must never again be invisible."""
+    job.field_mapping = blob
+    try:
+        job.save(update_fields=["field_mapping"])
+    except Exception as exc:
+        logger.warning("Job %s: field_mapping persist failed: %s", job.id, exc)
+    try:
+        mapping = blob.get("mapping") or {}
+        n_can = sum(
+            1 for e in mapping.values()
+            if isinstance(e, dict)
+            and e.get("target") not in (None, "CUSTOM")
+            and e.get("source") != "verbatim"
+        )
+        n_custom = sum(
+            1 for e in mapping.values()
+            if isinstance(e, dict) and e.get("target") == "CUSTOM"
+        )
+        n_verb = sum(
+            1 for e in mapping.values()
+            if isinstance(e, dict) and e.get("source") == "verbatim"
+        )
+        per_chip = "; ".join(
+            f"{chip}→{e.get('target_key') or e.get('target')}"
+            f" ({e.get('source')})"
+            for chip, e in mapping.items() if isinstance(e, dict)
+        )
+        warnings = blob.get("warnings") or []
+        row = (
+            f"[FIELD-MAP] {n_can} canonical / {n_custom} custom / "
+            f"{n_verb} verbatim — {per_chip}"
+            + (f" — WARNINGS: {'; '.join(warnings)}" if warnings else "")
+        )
+        try:
+            job.notes = (job.notes or "") + f"\n{row[:1800]}"
+            job.save(update_fields=["notes"])
+        except Exception:
+            pass
+        try:
+            from scraper.models import SessionLog
+
+            seq = SessionLog.objects.filter(job_id=job.id).count()
+            SessionLog.objects.create(
+                job_id=job.id,
+                role=SessionLog.ROLE_SYSTEM,
+                agent="check_tracker",
+                content=row[:4000],
+                seq=seq,
+            )
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.info("Job %s: field-map audit row skipped: %s", job.id, exc)
+
+
+def _resolve_field_mapping(
+    job: ScrapeJob,
+) -> tuple[dict, list[str], dict]:
+    """[wave-36 §1b] Resolve intake chips → the record contract. Returns
+    ``(blob, resolved_fields, rekeyed_field_notes)``.
+
+    Identity (empty blob, raw chips, raw notes) when: the kill-switch is off,
+    the job is partner-API authored (``created_via == "api"`` — the request
+    body IS the partner's contract, round-2 M4), there are no chips, or the
+    resolution is a no-op (resolved set == raw set, no warnings). NEVER
+    raises. Hash reuse (F3) and the per-site cache (F6) make re-drives free;
+    ``job_update`` chip edits clear the blob so the hash mismatch re-resolves.
+    """
+    raw_chips = [str(c).strip() for c in (job.target_fields or [])]
+    raw_notes = dict(getattr(job, "field_notes", None) or {})
+
+    def _identity():
+        return {}, list(job.target_fields or []), raw_notes
+
+    try:
+        from src.field_mapping import (
+            content_hash_for,
+            mapping_enabled,
+            rekey_field_notes,
+            rename_map_from_mapping,
+            resolve_mapping,
+            resolved_fields_from_mapping,
+        )
+    except Exception as exc:
+        logger.warning("field_mapping module unavailable (identity): %s", exc)
+        return _identity()
+
+    if (getattr(job, "created_via", "") or "") == "api":
+        return _identity()
+    if not mapping_enabled() or not raw_chips:
+        return _identity()
+
+    try:
+        page_type = job.page_type or "product"
+        want_hash = content_hash_for(raw_chips, page_type)
+
+        existing = (
+            job.field_mapping
+            if isinstance(getattr(job, "field_mapping", None), dict)
+            else None
+        )
+        if existing and existing.get("content_hash") == want_hash:
+            resolved = resolved_fields_from_mapping(existing)
+            if resolved:
+                return (
+                    existing, resolved,
+                    rekey_field_notes(
+                        raw_notes, existing.get("mapping") or existing,
+                    ),
+                )
+
+        # Site cache: same contract resolved for this site before (F6).
+        site = None
+        cache: dict = {}
+        cached_blob = None
+        try:
+            from scraper.models import Site
+
+            site = Site.objects.filter(url=job.url.rstrip("/")).first()
+            if site is not None and isinstance(
+                getattr(site, "field_mapping_cache", None), dict
+            ):
+                cache = dict(site.field_mapping_cache)
+                cached_blob = cache.get(want_hash)
+        except Exception:
+            site = None
+        if isinstance(cached_blob, dict):
+            resolved = resolved_fields_from_mapping(cached_blob)
+            if resolved:
+                _persist_field_mapping(job, cached_blob)
+                return (
+                    cached_blob, resolved,
+                    rekey_field_notes(
+                        raw_notes, cached_blob.get("mapping") or cached_blob,
+                    ),
+                )
+
+        mapping, warnings = resolve_mapping(
+            raw_chips, page_type,
+            llm_fn=_llm_field_map_adapter,
+            site_context=job.url or "",
+        )
+        resolved_names: list[str] = []
+        for entry in mapping.values():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("target") == "CUSTOM":
+                resolved_names.append(
+                    str(entry.get("target_key")
+                        or entry.get("target"))
+                )
+            elif entry.get("target"):
+                resolved_names.append(str(entry["target"]))
+        if not resolved_names or (
+            set(resolved_names) == set(raw_chips) and not warnings
+        ):
+            return _identity()  # no-op contract → legacy byte-compat
+
+        blob = {
+            "mapping": mapping,
+            "resolved_fields": resolved_names,
+            "content_hash": want_hash,
+            "warnings": warnings,
+        }
+        try:
+            if site is not None:
+                cache[want_hash] = blob
+                site.field_mapping_cache = cache
+                site.save(update_fields=["field_mapping_cache"])
+        except Exception as exc:
+            logger.info("field_mapping site cache write skipped: %s", exc)
+        _persist_field_mapping(job, blob)
+        logger.info(
+            "Job %d: field mapping resolved — %d chip(s), %d warning(s), "
+            "%d rename(s)", job.id, len(mapping), len(warnings),
+            len(rename_map_from_mapping(mapping)),
+        )
+        return blob, resolved_names, rekey_field_notes(raw_notes, mapping)
+    except Exception as exc:
+        logger.warning(
+            "Job %s: field mapping resolve failed (identity): %s", job.id, exc,
+        )
+        return _identity()
+
+
 def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
     """Build the initial ``ScrapeState`` from a ``ScrapeJob`` instance.
 
@@ -824,6 +1067,21 @@ def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
             logger.warning("Job %s: nested schema parse failed: %s", job.id, exc)
             _nested_schema = None
 
+    # [wave-36 §1a/§1b] Two-vocabulary seeding: the resolver maps raw chips →
+    # canonical names (alias → one-shot LLM → fuzzy → verbatim; identity for
+    # partner-API jobs and when disabled). target_fields stays chip-verbatim
+    # for skip-economics — NEVER repurposed (check_tracker contract diff).
+    try:
+        _mapping_blob, _resolved_seed, _mapped_notes = _resolve_field_mapping(
+            job
+        )
+    except Exception as exc:
+        logger.warning("Job %s: resolver seam failed (identity): %s",
+                       job.id, exc)
+        _mapping_blob = {}
+        _resolved_seed = list(job.target_fields or [])
+        _mapped_notes = dict(getattr(job, "field_notes", None) or {})
+
     return {
         "job_id": job.id,
         "url": job.url,
@@ -843,9 +1101,14 @@ def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
         "nested_schema": _nested_schema,
         # Intake-UI knobs (advisory; surfaced to product_analyzer / code_writer).
         "target_fields": list(job.target_fields or []),
+        # [wave-36 §1a] Two-vocabulary seeding (computed above the return):
+        # resolved identity-or-persisted, target chip-verbatim.
+        "resolved_fields": _resolved_seed,
+        "field_mapping": _mapping_blob,
         # W27-4: per-field instructions — rendered as "### Field guidance" in
-        # the product_analyzer + code_writer prompts.
-        "field_notes": dict(getattr(job, "field_notes", None) or {}),
+        # the product_analyzer + code_writer prompts. [wave-36 F4] re-keyed
+        # through the mapping so they match the RESOLVED record keys.
+        "field_notes": _mapped_notes,
         "scope": job.scope or "",
         "scope_value": job.scope_value or "",
         "user_notes": job.notes or "",
@@ -939,6 +1202,73 @@ def _prune_output_to_schema(
                 pass
         logger.info("schema prune: trimmed output records to %d allowed fields", len(allowed))
     return pruned
+
+
+def _rename_output_keys(output_file: str, blob: dict | None) -> bool:
+    """[wave-36 §1a] Record-key normalization at finalize: rename record keys
+    raw→resolved per the persisted mapping (rename-then-keep — the 658
+    name-loss fix). First top-level list-of-dicts only (site/metadata intact),
+    like ``_prune_output_to_schema``. Identity when the blob carries no
+    renames. Returns True when the file changed."""
+    import src.artifacts as artifacts
+    from src.field_mapping import rename_map_from_mapping
+
+    rename = rename_map_from_mapping(blob)
+    if not rename or not output_file:
+        return False
+    # [wave-36] A real local file (workspace-phase output) is read/written
+    # DIRECTLY — routing it through artifacts.* would silently store it in the
+    # FM under the raw path and leave the local file stale.
+    _is_local = os.path.isfile(output_file)
+    data = None
+    if _is_local:
+        try:
+            with open(output_file, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            return False
+    else:
+        try:
+            data = artifacts.read_json(output_file)
+        except Exception:
+            try:
+                with open(output_file, encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (json.JSONDecodeError, OSError, FileNotFoundError):
+                return False
+    if not isinstance(data, dict):
+        return False
+    changed = False
+    for key, val in data.items():
+        if isinstance(val, list) and val and isinstance(val[0], dict):
+            for rec in val:
+                if not isinstance(rec, dict):
+                    continue
+                for raw, resolved in rename.items():
+                    if raw in rec:
+                        rec[resolved] = rec.pop(raw)
+                        changed = True
+            break  # only the records list
+    if changed:
+        if _is_local:
+            try:
+                with open(output_file, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh, indent=2, ensure_ascii=False)
+            except OSError:
+                return False
+        else:
+            try:
+                artifacts.write_json(output_file, data)
+            except Exception:
+                try:
+                    with open(output_file, "w", encoding="utf-8") as fh:
+                        json.dump(data, fh, indent=2, ensure_ascii=False)
+                except Exception:
+                    return False
+        logger.info(
+            "field-mapping rename: %d record key(s) normalized", len(rename),
+        )
+    return changed
 
 
 def _finalize_was_cancelled(final_state: dict[str, Any]) -> bool:
@@ -1511,12 +1841,22 @@ def _finalize_job(job: ScrapeJob) -> None:
     # ── Enforce the requested schema (prune output + resolve for DB persist) ──
     # target_fields is authoritative; falls back to the Site's stored DB schema
     # (so re-runs of a schema'd site stay pruned). None → no schema → no prune.
+    # [wave-36 §1a] A persisted field_mapping blob is MORE authoritative than
+    # raw target_fields: record keys are renamed raw→resolved FIRST (the 658
+    # name-loss fix), then pruning uses the resolved names — the ONE
+    # resolved-only consumer (post-rename, safe). No blob → identity path,
+    # byte-identical to today.
     _schema_fields: list[str] = []
     _allowed_fields: set[str] | None = None
     if job.status == ScrapeJob.STATUS_COMPLETED:
         try:
             from scraper.models import Site as _Site
-            from src.content_types import resolve_allowed_fields, schema_field_names
+            from src.content_types import (
+                BOOKKEEPING_FIELDS,
+                resolve_allowed_fields,
+                schema_field_names,
+            )
+            from src.field_mapping import resolved_fields_from_mapping
 
             _site_for_schema = _Site.objects.filter(
                 url=job.url.rstrip("/")
@@ -1526,8 +1866,20 @@ def _finalize_job(job: ScrapeJob) -> None:
                 if _site_for_schema
                 else (final_state.get("output_schema") or {})
             )
-            _schema_fields = schema_field_names(job.target_fields or [], _db_os)
-            _allowed_fields = resolve_allowed_fields(job.target_fields or [], _db_os)
+            _mapping_blob = (
+                job.field_mapping
+                if isinstance(getattr(job, "field_mapping", None), dict)
+                else None
+            )
+            _resolved = resolved_fields_from_mapping(_mapping_blob)
+            if _resolved:
+                _schema_fields = _resolved
+                _allowed_fields = set(_resolved) | set(BOOKKEEPING_FIELDS)
+                if job.output_file:
+                    _rename_output_keys(job.output_file, _mapping_blob)
+            else:
+                _schema_fields = schema_field_names(job.target_fields or [], _db_os)
+                _allowed_fields = resolve_allowed_fields(job.target_fields or [], _db_os)
         except Exception as exc:
             logger.warning("Job %d: schema resolve failed: %s", job.id, exc)
 

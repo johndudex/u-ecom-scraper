@@ -1,0 +1,24 @@
+{
+  "job_id": 469,
+  "url": "https://www.bose.com/p/headphones/quietcomfort-acoustic-noise-cancelling-headphones/QC-HEADPHONEARN.html?dwvar_QC-HEADPHONEARN_color=SANDSTONE&quantity=1",
+  "site_slug": "bose-com",
+  "site_name": "Bose",
+  "platform": "salesforce_commerce_cloud",
+  "target_fields": [
+    "product name",
+    "price",
+    "currency",
+    "avaliability",
+    "description"
+  ],
+  "input_mode": "list_page",
+  "search_criteria": "https://www.bose.com/c/headphones",
+  "scope": "firstn",
+  "scope_value": "10",
+  "product_count": 3,
+  "output_file": "output_2026-09-09_081124_792974_2607.json",
+  "completed_at": "2026-09-09T08:20:40.368971+00:00",
+  "discovered_urls_count": 4,
+  "output_key": "products",
+  "draft_key": "scrapers/bose-com/jobs/scraper-draft-469.py"
+}

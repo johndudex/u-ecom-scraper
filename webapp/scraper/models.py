@@ -210,6 +210,12 @@ class ScrapeJob(models.Model):
     # Per-field guidance from the user ({field_name: text}) — surfaced to
     # product_analyzer / code_writer as advisory hints. [wave-27 W27-4]
     field_notes = models.JSONField(default=dict, blank=True)
+    # [wave-36] Resolved chip→canonical mapping persisted on the row:
+    # {"mapping": {chip: {target, confidence, rationale, source}},
+    #  "resolved_fields": [...], "content_hash": "..."} — the finalize prune
+    # reads THIS (not raw target_fields) so the output contract is the one the
+    # pipeline enforced. Null = unmapped legacy job (identity behavior).
+    field_mapping = models.JSONField(null=True, blank=True)
     # Rerun lineage [wave-27 W27-8]: parent = the immediate source job;
     # origin = the chain root (restart-of-restart chains read one row, not a
     # walk). Set ONLY by job_restart — fresh-create paths stay unlinked.
@@ -456,6 +462,10 @@ class Site(models.Model):
         default="shopping",
     )
     output_schema = models.JSONField(default=dict, blank=True)
+    # [wave-36] (chips-hash → resolved mapping) reuse cache across jobs on this
+    # site. Separate from output_schema (which is contract-bearing — read AS
+    # the schema at finalize; round-2 M6).
+    field_mapping_cache = models.JSONField(null=True, blank=True)
 
     platform = models.CharField(max_length=100, blank=True, default="")
     scraping_method = models.CharField(max_length=100, blank=True, default="")

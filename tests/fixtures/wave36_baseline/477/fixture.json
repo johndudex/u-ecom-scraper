@@ -1,0 +1,23 @@
+{
+  "job_id": 477,
+  "url": "https://frankbody.com/products/niacinamide-deodorant",
+  "site_slug": "frankbody-com",
+  "site_name": "Frank Body",
+  "platform": "shopify",
+  "target_fields": [
+    "product name",
+    "price",
+    "currecy",
+    "avaliabilty"
+  ],
+  "input_mode": "list_page",
+  "search_criteria": "https://frankbody.com/collections/deodorants",
+  "scope": "firstn",
+  "scope_value": "10",
+  "product_count": 4,
+  "output_file": "output_2026-09-09_100727_477417_3943.json",
+  "completed_at": "2026-09-09T10:12:36.578322+00:00",
+  "discovered_urls_count": 4,
+  "output_key": "products",
+  "draft_key": "scrapers/frankbody-com/jobs/scraper-draft-477.py"
+}

@@ -41,6 +41,21 @@ class ScrapeState(TypedDict, total=False):
     # agents + validate_coverage + normalize_fields read these). Declared here
     # so LangGraph persists them in the graph state (otherwise they'd be stripped).
     target_fields: list
+    # [wave-36] Field-mapping contract (docs/plans/wave36-field-mapping-plan.md
+    # §1a). resolved_fields = the canonical output-key list the pipeline
+    # enforces; == target_fields verbatim when no mapping exists (byte-identical
+    # legacy behavior). field_mapping = the chip→canonical resolution dict.
+    # field_notes is written at tasks.py:_build_initial_state and read by the
+    # writer guidance builder — declared so it survives graph passes instead of
+    # being stripped (it has been behavior-dead until wave-36; gated behind
+    # FIELD_MAPPING_ENABLED).
+    # TWO-VOCABULARY RULE: drafts emit BOTH canonical AND chip-verbatim keys, so
+    # every consumer that runs BEFORE the record-key rename admits
+    # resolved ∪ raw ∪ custom; resolved-only is correct only at the finalize
+    # prune (post-rename).
+    resolved_fields: list
+    field_mapping: dict
+    field_notes: dict
     scope: str
     scope_value: str
     user_notes: str
@@ -160,6 +175,17 @@ class ScrapeState(TypedDict, total=False):
     # recorded (the testing ladder escalates the rung). Capped at 1: the first
     # zero-item execution recycles; a second one finalizes honestly.
     execution_recycle_count: int
+    # [wave-36 Fix 3] Shortfall remediation budget (bound 1), SEPARATE from
+    # execution_recycle_count (transport-recycle). MUST be a declared key:
+    # undeclared keys are stripped from graph state, so an undeclared counter
+    # would read 0 on every pass → unbounded shortfall→writer→tester→execution
+    # loop until SoftTimeLimit (round-2 B3).
+    shortfall_remediation_count: int
+    # [wave-36 Fix 3] No-regression floor: the pre-remediation artifact is
+    # stashed here and restored if the remediation retry delivers fewer items
+    # — a delivering result is never converted to a worse one by a recycle.
+    prior_output_file: str
+    prior_product_count: int
     # [A2] consecutive code_writer invocations producing a draft byte-identical
     # to the last-tested draft (fixed syntax/CLI issues only, no semantic
     # change). ≥2 means the fix loop cannot improve the draft — escalate

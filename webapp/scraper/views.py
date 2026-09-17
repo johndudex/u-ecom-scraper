@@ -774,6 +774,13 @@ def job_update(request, job_id):
         tf = (request.POST.get("target_fields") or "").strip()
         job.target_fields = [f.strip() for f in tf.split(",") if f.strip()] if tf else []
         update_fields.append("target_fields")
+        # [wave-36 F3] A chip edit invalidates the resolved contract — the
+        # content hash can never match again, but clearing keeps the row
+        # honest for check_tracker's resolved-vs-resolved diff and any
+        # partner-API read.
+        if job.field_mapping:
+            job.field_mapping = None
+            update_fields.append("field_mapping")
 
     if "field_notes_json" in request.POST:
         # W27-4: the dashboard's per-field ✎ notes (chip order edits ride with

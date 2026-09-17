@@ -36,6 +36,7 @@ Usage::
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -51,6 +52,8 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
+
+from src.field_mapping import union_output_fields
 
 from .constants import (
     FINAL_RETRY_SENTINEL,
@@ -535,6 +538,33 @@ def _insert_top_level_import(code: str, import_line: str) -> str:
     return "\n".join(lines)
 
 
+def _cut_output_filter_blocks(code: str) -> str:
+    """[wave-36 M1] Remove every previously injected output-filter block
+    (stale-stamped OR legacy un-hashed). Line-based: marker comment line →
+    ``except Exception:`` / ``pass`` terminator (+ one trailing blank)."""
+    lines = code.split("\n")
+    out: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        if lines[i].lstrip().startswith("# _OUTPUT_FILTER_APPLIED"):
+            j = i + 1
+            while j < n and not (
+                lines[j].strip() == "except Exception:"
+                and j + 1 < n
+                and lines[j + 1].strip() == "pass"
+            ):
+                j += 1
+            if j + 1 < n:
+                i = j + 2
+                if i < n and lines[i].strip() == "":
+                    i += 1  # swallow the injected trailing blank line
+                continue
+            # malformed block — keep the line and stop cutting this one
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
 def _patch_scraper_output_filter(
     slug: str, content_type: str = "", target_fields: list | None = None
 ) -> None:
@@ -547,6 +577,16 @@ def _patch_scraper_output_filter(
     ``job_posting`` it's company/location; for ``article`` author/publish_date;
     unknown types keep every item with a title. GENERIC — field set comes from
     ``src.content_types.output_filter_fields``, no per-type hardcoding here.
+
+    [wave-36] The caller passes the TWO-VOCABULARY union (resolved ∪ raw ∪
+    custom — round-2 B1): the injected predicate runs inside the scraper
+    process BEFORE any record-key rename, and prod drafts emit both key
+    vocabularies, so a resolved-only predicate would drop 100% of
+    chip-verbatim rows. The marker carries a content stamp
+    (``_OUTPUT_FILTER_APPLIED:<sha1(fields)[:12]>``); a mismatch CUTS the stale
+    block before inserting (presence-check re-patching double-injects → AND
+    predicates → row loss, the exact F2 class). Ancient
+    ``_OUTPUT_PRICE_FILTER_APPLIED`` drafts keep the leave-untouched bail.
     """
     if not slug:
         return
@@ -560,27 +600,37 @@ def _patch_scraper_output_filter(
     try:
         with open(scraper_path, encoding="utf-8") as f:
             code = f.read()
-        if "_OUTPUT_FILTER_APPLIED" in code or "_OUTPUT_PRICE_FILTER_APPLIED" in code:
-            return
         if target_fields:
             # Custom schema: keep items with ANY of the user's requested fields.
             # Don't require title/price (product-specific) — that would strip
             # every record on non-product sites (profiles, jobs, articles).
-            checks = " or ".join(f"p.get({f!r})" for f in target_fields)
-            cond = checks
-            label = f"any of {','.join(target_fields)}"
             fields = list(target_fields)
         else:
             from src.content_types import output_filter_fields
 
             fields = [f for f in output_filter_fields(content_type) if isinstance(f, str)]
-            if fields:
-                checks = " or ".join(f"p.get({f!r})" for f in fields)
-                cond = f"p.get('title') and ({checks})"
-                label = f"title+{','.join(fields)}"
-            else:
-                cond = "p.get('title')"
-                label = "title"
+        stamp = hashlib.sha1(repr(sorted(fields)).encode("utf-8")).hexdigest()[:12]
+        wanted = f"_OUTPUT_FILTER_APPLIED:{stamp}"
+        if (
+            wanted in code
+            and code.count("# _OUTPUT_FILTER_APPLIED") == 1
+        ):
+            return
+        if "_OUTPUT_PRICE_FILTER_APPLIED" in code:
+            return
+        if target_fields:
+            checks = " or ".join(f"p.get({f!r})" for f in fields)
+            cond = checks
+            label = f"any of {','.join(fields)}"
+        elif fields:
+            checks = " or ".join(f"p.get({f!r})" for f in fields)
+            cond = f"p.get('title') and ({checks})"
+            label = f"title+{','.join(fields)}"
+        else:
+            cond = "p.get('title')"
+            label = "title"
+            fields = ["title"]
+        code = _cut_output_filter_blocks(code)
         # The injected block resolves the output key ITSELF: 5 of 9 template
         # families never define OUTPUT_KEY, and the old injected reference
         # NameError'd into the bare except → the filter silently no-oped
@@ -588,7 +638,7 @@ def _patch_scraper_output_filter(
         # template's OUTPUT_KEY if defined, else the first list-of-dicts
         # value in `output` (the actual item array, whatever it's called).
         filter_code = (
-            "# _OUTPUT_FILTER_APPLIED — drop non-item pages (content-type aware)\n"
+            f"# _OUTPUT_FILTER_APPLIED:{stamp} — drop non-item pages (content-type aware)\n"
             f"_FILTER_FIELDS = {fields!r}\n"
             "try:\n"
             "    _OUTPUT_KEY = OUTPUT_KEY if 'OUTPUT_KEY' in dir() else next(\n"
@@ -4794,6 +4844,70 @@ def _park_browser_unavailable(state: ScrapeState) -> Command:
     )
 
 
+_SHORTFALL_REMEDIATION_MAX = 1  # [wave-36 Fix 3] own budget, separate from
+# _EXECUTION_RECYCLE_MAX (transport/strategy ladder) — never consume that one.
+
+
+def _execution_shortfall_reason(state: ScrapeState, items: int) -> str | None:
+    """[wave-36 Fix 3] Scope-adjusted shortfall verdict, ``_volume_gap``
+    semantics (route_after_testing._volume_gap). Returns a reason string when
+    the run is a remediation candidate, else None. The zero-item arms own
+    ``items == 0`` — this gate only judges a partial delivery:
+    ``0 < items < 0.25 × expected`` with ``expected = discovered_urls``
+    (scope-narrowed runs NEVER qualify — success-by-design), and discovery
+    must have covered ≥2 pages (items_per_page denominator)."""
+    if items <= 0:
+        return None
+    cov = state.get("discovery_coverage") if isinstance(
+        state.get("discovery_coverage"), dict
+    ) else {}
+    if not cov.get("ran_phase1", True):
+        return None
+    try:
+        discovered = int(
+            cov.get("found") or len(cov.get("discovered_urls") or []) or 0
+        )
+    except (TypeError, ValueError):
+        return None
+    if discovered <= 0:
+        return None
+    scope = (state.get("scope") or "").strip().lower()
+    if scope in ("firstn", "filter") or (state.get("scope_value") or "").strip():
+        return None  # scope-narrowed: never recycle a scope-satisfied run
+    nav = state.get("navigation_analysis")
+    ep = (nav.get("api_endpoint") or {}) if isinstance(nav, dict) else {}
+    ipp = ep.get("items_per_page")
+    if not isinstance(ipp, int) or isinstance(ipp, bool) or ipp <= 0:
+        ipp = cov.get("items_per_page")
+        if not isinstance(ipp, int) or isinstance(ipp, bool) or ipp <= 0:
+            return None  # no page-size denominator → gate stays silent
+    if discovered < 2 * ipp:
+        return None  # under two pages covered — volume is unknowable
+    if items >= 0.25 * discovered:
+        return None
+    return (
+        f"extraction shortfall: discovery found {discovered} URLs (≥2 pages "
+        f"of {ipp}) but the run shipped only {items} (<25% of expected)"
+    )
+
+
+def _execution_code_fixable(output_file: str, items: int) -> bool:
+    """[wave-36 Fix 3] Is the shortfall the draft's own doing (writer can fix
+    it) rather than the site's? Signature: the draft's output metadata records
+    MORE failed products than it shipped AND at least one soft-block
+    escalation (Fix 2's ``json_no_items`` keeps that counter meaningful for
+    JSON walls). Unreadable metadata → NOT code-fixable (honest default)."""
+    try:
+        with open(output_file, encoding="utf-8") as fh:
+            data = json.load(fh)
+        meta = (data or {}).get("metadata") or {}
+        failed = int(meta.get("failed_products") or 0)
+        escalations = int(meta.get("soft_block_escalations") or 0)
+    except Exception:
+        return False
+    return failed > max(items, 0) and escalations >= 1
+
+
 def _route_after_execution(state: ScrapeState):
     """Execution-phase strategy recycle on zero-item discovery failure.
 
@@ -4832,7 +4946,109 @@ def _route_after_execution(state: ScrapeState):
     ) else {}
     stop_reason = str(cov.get("stop_reason") or "")
 
+    # [wave-36 Fix 3] keep-better — the prior artifact from a shortfall
+    # remediation wins when the retry delivered LESS (a delivering result is
+    # never converted to FAIL by a recycle). Sits above every other arm:
+    # restoring prior items also pre-empts a second zero-item strategy recycle.
+    _prior_file = state.get("prior_output_file") or ""
+    try:
+        _prior_count = int(state.get("prior_product_count") or 0)
+    except (TypeError, ValueError):
+        _prior_count = 0
+    if _prior_file and _prior_count > 0 and items < _prior_count:
+        logger.warning(
+            "_route_after_execution: keep-better (job %s) — remediation "
+            "delivered %d < prior %d; restoring the prior artifact",
+            job_id, items, _prior_count,
+        )
+        return Command(goto="cleanup", update={
+            "output_file": _prior_file,
+            "product_count": _prior_count,
+            "item_count": _prior_count,
+            "execution_status": "SUCCESS",
+            "prior_output_file": "",
+            "prior_product_count": 0,
+        })
+
     if status == "SUCCESS" and items > 0:
+        # [wave-36 Fix 3] shortfall gate — a SUCCESS run that shipped a sliver
+        # of what discovery found. Zero items never reach here (zero arms own
+        # it); scope-narrowed runs never qualify (_execution_shortfall_reason).
+        _short = _execution_shortfall_reason(state, items)
+        if _short:
+            if int(state.get("shortfall_remediation_count") or 0) < (
+                _SHORTFALL_REMEDIATION_MAX
+            ):
+                if _execution_code_fixable(
+                    state.get("output_file") or "", items
+                ):
+                    prior_strategy = (state.get("scraper_analysis") or {}).get(
+                        "strategy", ""
+                    )
+                    report = state.get("test_report")
+                    recycled_report = (
+                        dict(report) if isinstance(report, dict) else {}
+                    )
+                    recycled_report.update({
+                        "overall_assessment": "FAIL",
+                        "ready_for_execution": False,
+                        "feedback_for_writer": (
+                            "EXECUTION SHORTFALL REMEDIATION — the draft ran "
+                            f"clean but shipped only {items} items against "
+                            f"ample discovery ({_short}). Its own metadata "
+                            "records failed per-item fetches after soft-block "
+                            "escalations: harden the EXTRACTION side (retry/"
+                            "fallback per item, tolerate soft-404 shapes, "
+                            "keep rows whose partial fields exist). Discovery "
+                            "is healthy — do NOT re-derive the listing URLs."
+                        ),
+                    })
+                    logger.warning(
+                        "_route_after_execution: extraction shortfall (job %s, "
+                        "%d items) — remediating through the writer",
+                        job_id, items,
+                    )
+                    return Command(goto="scraper_analyzer", update={
+                        "shortfall_remediation_count": (
+                            int(state.get("shortfall_remediation_count") or 0)
+                            + 1
+                        ),
+                        "prior_output_file": state.get("output_file") or "",
+                        "prior_product_count": items,
+                        "strategies_tried": [{
+                            "strategy": prior_strategy,
+                            "reason": _short,
+                        }],
+                        "test_report": recycled_report,
+                    })
+            # Bound spent or not code-fixable: honest SUCCESS + loud warning
+            # in the coverage metadata the tester's reader already surfaces.
+            _cov = state.get("discovery_coverage")
+            _cov = dict(_cov) if isinstance(_cov, dict) else {}
+            _cov["shortfall_warning"] = _short
+            logger.warning(
+                "_route_after_execution: extraction shortfall NOT remediated "
+                "(job %s, %d items) — %s", job_id, items, _short,
+            )
+            return Command(goto="cleanup", update={"discovery_coverage": _cov})
+        # [wave-36 F18] A scope-narrowed SUCCESS writes the cap into the
+        # coverage metadata — the tester's coverage reader then sees WHY the
+        # count sits below discovery (10-of-70 at firstn/10 is the cap, not a
+        # gap).
+        _scope = (state.get("scope") or "").strip().lower()
+        if _scope in ("firstn", "filter") or (state.get("scope_value") or "").strip():
+            _cov = state.get("discovery_coverage")
+            _cov = dict(_cov) if isinstance(_cov, dict) else {}
+            try:
+                _limit = int((state.get("scope_value") or "").strip() or 0)
+            except (TypeError, ValueError):
+                _limit = 0
+            _cov["capped_by_scope"] = {
+                "scope": _scope,
+                "scope_value": state.get("scope_value") or "",
+                "limit": _limit,
+            }
+            return Command(goto="cleanup", update={"discovery_coverage": _cov})
         return Command(goto="cleanup")
     # [wave-16 B3] Dependency park — browser_service itself could not serve
     # this run (pre-flight unhealthy, classified 502/503 with an infra
@@ -6700,7 +6916,9 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     _ct = _cfg.name if _cfg else ""
                 except Exception:
                     _ct = ""
-            _patch_scraper_output_filter(slug, _ct, state.get("target_fields") or [])
+            # [wave-36 B1] TWO-VOCABULARY union (resolved ∪ raw ∪ custom): the
+            # injected predicate runs in-scraper BEFORE the record-key rename.
+            _patch_scraper_output_filter(slug, _ct, union_output_fields(state))
             _enforce_discovery_import(slug)
             _enforce_env_discovery_gate(slug)
 
@@ -6729,6 +6947,13 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                         "guard — restored the FM archive copy before fixing "
                         "(job %s)", job_id,
                     )
+                    # [wave-36 M1] The restored FM copy may carry a stale- or
+                    # legacy-stamped output filter — re-run the patch AFTER
+                    # the restore (cut-then-insert on stamp mismatch).
+                    if _PATCHES_ENABLED:
+                        _patch_scraper_output_filter(
+                            slug, _ct, union_output_fields(state)
+                        )
         except Exception as _d3_exc:
             logger.warning("_invoke_code_writer: archive restore check failed: %s", _d3_exc)
 

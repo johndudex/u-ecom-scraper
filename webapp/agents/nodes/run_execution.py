@@ -17,6 +17,8 @@ import subprocess
 import time
 from typing import Any
 
+from src.field_mapping import union_output_fields
+
 from ..constants import STEALTH_METHOD_PREFIXES
 from ..state import ScrapeState
 
@@ -1055,7 +1057,9 @@ def run_execution(state: ScrapeState) -> dict:
             env_overrides=_stealth_env(state),
             listing_url_env=alt_url,
             input_mode=input_mode,
-            target_fields=list(state.get("target_fields") or []),
+            # [wave-36 B1] two-vocabulary union — the scraper emits both key
+            # sets pre-rename.
+            target_fields=union_output_fields(state),
         )
 
     result = _run_in_process(
@@ -1063,7 +1067,7 @@ def run_execution(state: ScrapeState) -> dict:
         env_overrides=_stealth_env(state),
         listing_url_env=_listing_url_env,
         input_mode=input_mode,
-        target_fields=list(state.get("target_fields") or []),
+        target_fields=union_output_fields(state),
     )
     # [job-77 RC1] bounded listing fallback on a clean zero (see helper).
     return _maybe_retry_execution_listing(
@@ -1751,7 +1755,7 @@ def _run_via_browser_service(
         discovery_coverage = _read_discovery_coverage(output_file) if output_file else {}
         try:
             _pruned = prune_empty_records(
-                output_file, list(state.get("target_fields") or []) or None
+                output_file, union_output_fields(state) or None
             )
             if _pruned:
                 logger.info("run_execution: pruned %d empty records", _pruned)
@@ -1770,7 +1774,7 @@ def _run_via_browser_service(
         # F9 quality gate (nav modes): collapse-level failure rates -> FAILED
         _q = _extraction_quality_gate(
             output_file, state.get("input_mode", ""), result.get("product_count", 0),
-            target_fields=list(state.get("target_fields") or []),
+            target_fields=union_output_fields(state),
         )
         if _q:
             # [wave-19 T1.9] Name the myhouse class when it fires: a collapsed

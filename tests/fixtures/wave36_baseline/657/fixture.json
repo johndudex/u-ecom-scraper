@@ -1,0 +1,23 @@
+{
+  "job_id": 657,
+  "url": "https://diptyqueparis.com/fr-fr/products/eau-de-toilette-eau-des-sens-sens100v2",
+  "site_slug": "diptyqueparis-com",
+  "site_name": "diptyqueparis.com",
+  "platform": "shopify",
+  "target_fields": [
+    "product name",
+    "price",
+    "currency",
+    "avaliability"
+  ],
+  "input_mode": "list_page",
+  "search_criteria": "https://diptyqueparis.com/fr-fr/collections/idees-cadeaux-mariage",
+  "scope": "firstn",
+  "scope_value": "10",
+  "product_count": 9,
+  "output_file": "output_2026-09-17_114218_077445_5996.json",
+  "completed_at": "2026-09-17T11:50:02.766784+00:00",
+  "discovered_urls_count": 58,
+  "output_key": "products",
+  "draft_key": "scrapers/diptyqueparis-com/jobs/scraper-draft-657.py"
+}

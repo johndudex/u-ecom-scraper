@@ -103,6 +103,28 @@ def create_job(request):
 
     schema_text = str(body.get("schema_text", "")).strip()
     target_fields = body.get("target_fields") or []
+    # [wave-36 F7] Partner contract guard: target_fields must be a list of
+    # short key-like strings. A bare string today iterates per-character
+    # inside schema_field_names and poisons the whole record contract.
+    if target_fields and not isinstance(target_fields, list):
+        raise errors.ApiError(
+            422, "validation_failed",
+            "target_fields must be an array of field-name strings.",
+        )
+    if target_fields:
+        import re as _re
+
+        for _f in target_fields:
+            if not isinstance(_f, str) or not _re.fullmatch(
+                r"[a-zA-Z0-9_ ]{1,64}", _f.strip()
+            ):
+                raise errors.ApiError(
+                    422, "validation_failed",
+                    "target_fields entries must be 1-64 character "
+                    "field-name strings (letters, digits, spaces, "
+                    "underscores).",
+                )
+        target_fields = [str(_f).strip() for _f in target_fields]
     field_notes: dict = {}
     if schema_text:
         from src.schema_validation import validate_user_schema

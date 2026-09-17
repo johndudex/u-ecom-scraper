@@ -1,0 +1,18 @@
+{
+  "job_id": 403,
+  "url": "https://www.dyson.in/air-treatment/purifiers/purifier-cool-pc2-de-nox-white-gold",
+  "site_slug": "dyson-in",
+  "site_name": "Dyson India",
+  "platform": "magento2_adobe_commerce_custom_theme",
+  "target_fields": [],
+  "input_mode": "list_page",
+  "search_criteria": "https://www.dyson.in/air-treatment/purifiers",
+  "scope": "firstn",
+  "scope_value": "10",
+  "product_count": 5,
+  "output_file": "output_2026-09-07_182818_151621_51624.json",
+  "completed_at": "2026-09-07T18:33:26.932057+00:00",
+  "discovered_urls_count": 6,
+  "output_key": "products",
+  "draft_key": "scrapers/dyson-in/jobs/scraper-draft-403.py"
+}

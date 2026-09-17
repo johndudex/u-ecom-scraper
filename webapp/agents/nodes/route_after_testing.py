@@ -589,8 +589,14 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
     # blocked). The predicate itself — ``any(p.get(f) for f in fields)`` —
     # is byte-identical below.
     try:
+        # [wave-36 B1] union (resolved ∪ raw ∪ custom) — rows carry both key
+        # vocabularies pre-rename.
+        from src.field_mapping import union_output_fields
+
         _schema_fields: list = [
-            str(f).strip().lower() for f in (state.get("target_fields") or []) if str(f).strip()
+            str(f).strip().lower()
+            for f in union_output_fields(state)
+            if str(f).strip()
         ]
         _os_schema = state.get("output_schema")
         if not _schema_fields and isinstance(_os_schema, dict):
@@ -849,7 +855,16 @@ def _requested_field_zero_coverage(report: dict, state: ScrapeState) -> list[str
         successful = 0
     if successful <= 0:
         return []
-    requested = {str(f).lower() for f in (state.get("target_fields") or [])}
+    # [wave-36 B1] union — same two-vocabulary rule as the schema-aware set.
+    try:
+        from src.field_mapping import union_output_fields
+
+        _union = union_output_fields(state)
+    except Exception:
+        _union = None
+    requested = {
+        str(f).lower() for f in (_union or state.get("target_fields") or [])
+    }
     if not requested:
         return []
     core: set[str] = set()

@@ -1,0 +1,24 @@
+{
+  "job_id": 479,
+  "url": "https://www.thenorthface.com/en-us/p/womens/womens-fleece/womens-fleece-pullover-829793/womens-osito-evolve-1-2-zip-jacket-NF0A8H1G?color=2H9",
+  "site_slug": "thenorthface-com",
+  "site_name": "The North Face",
+  "platform": "unknown",
+  "target_fields": [
+    "product name",
+    "price",
+    "currency",
+    "description",
+    "avaliability"
+  ],
+  "input_mode": "list_page",
+  "search_criteria": "https://www.thenorthface.com/en-us/c/womens-211718",
+  "scope": "firstn",
+  "scope_value": "10",
+  "product_count": 5,
+  "output_file": "output_2026-09-09_115822_377366_4955.json",
+  "completed_at": "2026-09-09T12:03:24.664321+00:00",
+  "discovered_urls_count": 10,
+  "output_key": "products",
+  "draft_key": "scrapers/thenorthface-com/jobs/scraper-draft-479.py"
+}

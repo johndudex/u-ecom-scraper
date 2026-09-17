@@ -137,6 +137,32 @@ CHALLENGE_MARKERS_WEAK: tuple = (
 CHALLENGE_MARKERS: tuple = CHALLENGE_MARKERS_STRONG + CHALLENGE_MARKERS_WEAK
 
 SOFT_BLOCK_MIN_BYTES_ENV = "SCRAPER_SOFT_BLOCK_MIN_BYTES"
+# [wave-36 Fix 2] Complete single-object JSON is only trusted above this floor
+# (default 1024); below it the body is a json wall stub, not data.
+SOFT_BLOCK_JSON_MIN_BYTES_ENV = "SCRAPER_SOFT_BLOCK_JSON_MIN_BYTES"
+
+_JSON_WALL_REJECTIONS = 0
+
+
+def json_wall_rejections() -> int:
+    """How many 200 bodies were rejected as json walls this process — the
+    caller-escalation counterpart to soft_block_escalations."""
+    return _JSON_WALL_REJECTIONS
+
+
+def reset_json_wall_rejections() -> None:
+    global _JSON_WALL_REJECTIONS
+    _JSON_WALL_REJECTIONS = 0
+
+
+def soft_block_json_min_bytes() -> int:
+    """Trust floor for bare single-object JSON bodies (wave-36 Fix 2).
+    Read per call so a staged env change lands without a restart."""
+    raw = os.environ.get(SOFT_BLOCK_JSON_MIN_BYTES_ENV, "1024")
+    try:
+        return max(0, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 1024
 
 
 def soft_block_min_bytes() -> int:
@@ -184,10 +210,15 @@ class SoftBlock:
 def detect_soft_block(text: str) -> SoftBlock | None:
     """Challenge-shape detector for an HTTP 200 body. ``None`` = looks real.
 
-    Two shapes, either of which trips it:
+    Shapes, in precedence order:
     - a STRONG challenge phrase anywhere in the body (size-independent), or a
-      WEAK token corroborating an already-tiny body [wave-20 T0];
-    - a body smaller than the ``SCRAPER_SOFT_BLOCK_MIN_BYTES`` floor (the
+      WEAK token corroborating an already-tiny NON-JSON body [wave-20 T0];
+    - a JSON body (first char '{' or '[') is DATA, not a wall — arrays are
+      accepted at any size, bare objects above the
+      ``SCRAPER_SOFT_BLOCK_JSON_MIN_BYTES`` trust floor; smaller object stubs
+      reject as ``json_no_items`` [wave-36 Fix 2, job-658: complete 8-20KB SCA
+      payloads died as ``under_min_bytes``];
+    - otherwise a body under the ``SCRAPER_SOFT_BLOCK_MIN_BYTES`` floor (the
       zero-item-anchor check, approximated: no real listing is that small).
     """
     floor = soft_block_min_bytes()
@@ -197,6 +228,17 @@ def detect_soft_block(text: str) -> SoftBlock | None:
     hits = tuple(m for m in CHALLENGE_MARKERS_STRONG if m in lowered)
     if hits:
         return SoftBlock("challenge_marker", hits, len(text))
+    # [wave-36 Fix 2] JSON carve-out — first-char gate BEFORE any json.loads
+    # (parsing 100KB bodies on the fetch hot path is the cost being avoided).
+    stripped = text.lstrip()
+    if stripped[:1] in ("{", "["):
+        if stripped.startswith("["):
+            return None  # array-shaped: data at any size
+        if len(text) >= soft_block_json_min_bytes():
+            return None  # complete single-object payload
+        global _JSON_WALL_REJECTIONS
+        _JSON_WALL_REJECTIONS += 1
+        return SoftBlock("json_no_items", (), len(text))
     if len(text) < floor:
         weak = tuple(m for m in CHALLENGE_MARKERS_WEAK if m in lowered)
         if weak:

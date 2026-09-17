@@ -2164,6 +2164,50 @@ def _fetch_rendered_jsonld(url: str) -> str:
     return ("\n\n".join(parts))[:6000]
 
 
+def _mapping_narrative_lines(state: dict) -> list[str]:
+    """[wave-36 §1c] The chip→canonical mapping as writer-facing lines.
+
+    Only emitted when the resolved contract actually RENAMES something or
+    keeps CUSTOM fields — a verbatim/identity mapping adds noise, not signal.
+    TWO-VOCABULARY: drafts emit BOTH the canonical key AND the chip-verbatim
+    key (same value, two spellings) so every pre-rename consumer can judge
+    the rows either way; finalize renames to the canonical spelling."""
+    blob = state.get("field_mapping")
+    mapping = blob.get("mapping") if isinstance(blob, dict) else None
+    if not isinstance(mapping, dict) or not mapping:
+        return []
+    renames: list[tuple[str, str]] = []
+    customs: list[tuple[str, str]] = []
+    for chip, entry in mapping.items():
+        if not isinstance(entry, dict):
+            continue
+        target = entry.get("target")
+        if target == "CUSTOM":
+            customs.append((str(chip), str(entry.get("target_key") or chip)))
+        elif target and str(target) != str(chip):
+            renames.append((str(chip), str(target)))
+    if not renames and not customs:
+        return []
+    lines = ["Field mapping (user chips → output keys):"]
+    for chip, target in renames:
+        lines.append(
+            f"- '{chip}' → `{target}`: emit BOTH `{target}` AND `{chip}` on "
+            "every item — the same value under both spellings."
+        )
+    for chip, key in customs:
+        if key != chip:
+            lines.append(
+                f"- '{chip}' is a CUSTOM field — extract it explicitly and "
+                f"emit BOTH `{key}` AND `{chip}` on every item."
+            )
+        else:
+            lines.append(
+                f"- '{chip}' is a CUSTOM field — extract it explicitly and "
+                f"emit it under the key `{chip}`."
+            )
+    return lines
+
+
 def _user_requirements_section(state: dict) -> str:
     """Surface intake-UI field chips + notes to the agent.
 
@@ -2171,12 +2215,17 @@ def _user_requirements_section(state: dict) -> str:
     extract ONLY those (+ standard bookkeeping); extra fields are pruned from
     the output. With only notes (no fields) it stays advisory. Returns "" for
     jobs with neither (legacy home view).
+
+    [wave-36 §1c] When a resolved field mapping exists, the mapping narrative
+    is shown INSTEAD OF bare chips: "user asked for 'avaliability' → emit
+    `availability`", CUSTOM chips as explicit extraction targets.
     """
     target_fields = state.get("target_fields") or []
     notes = (state.get("user_notes") or "").strip()
     parts: list[str] = []
     if target_fields:
         parts.append("Fields requested by the user: " + ", ".join(map(str, target_fields)))
+        parts.extend(_mapping_narrative_lines(state))
     if notes:
         parts.append("User notes: " + notes)
     if not parts:
@@ -2211,6 +2260,17 @@ def _field_guidance_section(state: dict) -> str:
     notes = state.get("field_notes") or {}
     if not isinstance(notes, dict) or not notes:
         return ""
+    # [wave-36 M7] Declaring ``field_notes`` in ScrapeState ACTIVATES this
+    # section fleet-wide (undeclared keys were stripped before — the section
+    # was behavior-dead in real runs). Gate it behind the wave-36 kill-switch
+    # so FIELD_MAPPING_ENABLED=0 restores the exact pre-wave-36 behavior.
+    try:
+        from src.field_mapping import mapping_enabled
+
+        if not mapping_enabled():
+            return ""
+    except Exception:
+        pass
     lines = [
         f"- {name}: {notes[name]}"
         for name in list(notes)[:100]
@@ -3470,9 +3530,13 @@ def _platform_distillation(state: dict) -> str:
     api = nav.get("api_endpoint") if isinstance(nav.get("api_endpoint"), dict) else {}
     _add("Backend JSON API", api.get("url") or api.get("api_url"))
     try:
+        # [wave-36 §1c] Resolved names first — the writer sees the canonical
+        # contract, with chip-verbatim spellings kept for the two-vocabulary
+        # emit rule.
+        from src.field_mapping import union_output_fields
+
         _fields = [
-            str(f) for f in (state.get("target_fields") or [])
-            if str(f).strip()
+            str(f) for f in union_output_fields(state) if str(f).strip()
         ]
         if _fields:
             lines.append(f"- Fields to extract: {', '.join(_fields[:20])}")

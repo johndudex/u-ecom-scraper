@@ -1,0 +1,24 @@
+{
+  "job_id": 499,
+  "url": "https://brooksbrothers.in/product/oxford-regular-sports-shirt-17372274?f_id=collection-men&f_source=collection&f_content=1&size=XS",
+  "site_slug": "brooksbrothers-in",
+  "site_name": "Brooks Brothers India",
+  "platform": "custom_headless_storefront",
+  "target_fields": [
+    "product name",
+    "price",
+    "currency",
+    "description",
+    "size"
+  ],
+  "input_mode": "list_page",
+  "search_criteria": "https://brooksbrothers.in/collection/collection-men",
+  "scope": "firstn",
+  "scope_value": "10",
+  "product_count": 3,
+  "output_file": "output_2026-09-10_082310_889804_1400.json",
+  "completed_at": "2026-09-10T08:27:49.389295+00:00",
+  "discovered_urls_count": 10,
+  "output_key": "products",
+  "draft_key": "scrapers/brooksbrothers-in/jobs/scraper-draft-499.py"
+}

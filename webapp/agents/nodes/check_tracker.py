@@ -79,6 +79,23 @@ def _clean_workspace(root: str, slug: str, keep_draft: bool = False) -> None:
         logger.info("check_tracker: cleaned scrapers/%s (kept output files)", slug)
 
 
+def _fields_changed(state, prior) -> bool:
+    """[wave-36 F1] Resolved-vs-resolved when BOTH sides carry the mapping
+    contract; either side legacy (no field_mapping blob) falls back to
+    raw-vs-raw — today's byte-identical behavior. An alias-table change
+    legitimately invalidates skip_code exactly once per deploy (plan F25):
+    mapped state vs legacy prior reads as changed on the first re-drive."""
+    state_resolved = state.get("resolved_fields")
+    prior_blob = getattr(prior, "field_mapping", None)
+    prior_resolved = (
+        prior_blob.get("resolved_fields")
+        if isinstance(prior_blob, dict) else None
+    )
+    if state_resolved is not None and prior_resolved is not None:
+        return set(state_resolved) != set(prior_resolved)
+    return set(state.get("target_fields") or []) != set(prior.target_fields or [])
+
+
 def _compute_rescrape_skip_flags(state, url: str):
     """Compute selective skip flags for a rescrape based on config diff vs the
     prior completed job for this URL. Returns (skip_site, skip_product, skip_code).
@@ -104,7 +121,7 @@ def _compute_rescrape_skip_flags(state, url: str):
             logger.info("_compute_rescrape_skip_flags: no prior completed job → full run")
             return False, False, False
 
-        fields_changed = set(state.get("target_fields") or []) != set(prior.target_fields or [])
+        fields_changed = _fields_changed(state, prior)
         nav_changed = (
             (state.get("input_mode") or "") != (prior.input_mode or "")
             or (state.get("search_criteria") or "") != (prior.search_criteria or "")

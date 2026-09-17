@@ -115,11 +115,21 @@ def _merge_fields(existing: dict, mapped: dict, direct: dict) -> dict:
 def _prune_to_schema(merged: dict, state) -> dict:
     """If the user provided a custom schema (target_fields), prune the merged
     field map to schema ∪ bookkeeping (DIRECT_FIELDS). Prevents non-schema
-    fields from flowing through to code_writer."""
-    target_fields = state.get("target_fields") or []
-    if not target_fields:
+    fields from flowing through to code_writer.
+
+    [wave-36 B1] TWO-VOCABULARY: the analyzer field map feeds the writer's
+    extraction map, and drafts emit both canonical AND chip-verbatim keys —
+    allowed = resolved ∪ raw ∪ DIRECT_FIELDS (union_output_fields), never
+    resolved-only pre-rename."""
+    try:
+        from src.field_mapping import union_output_fields
+
+        field_names = union_output_fields(state)
+    except Exception:
+        field_names = list(state.get("target_fields") or [])
+    if not field_names:
         return merged
-    allowed = set(target_fields) | set(DIRECT_FIELDS.keys())
+    allowed = set(field_names) | set(DIRECT_FIELDS.keys())
     pruned = {k: v for k, v in merged.items() if k in allowed}
     if len(pruned) < len(merged):
         logger.info(

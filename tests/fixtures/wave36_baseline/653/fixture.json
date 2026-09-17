@@ -1,0 +1,24 @@
+{
+  "job_id": 653,
+  "url": "https://www.jetpens.com/Pilot-Kakuno-Fountain-Pen-Clear-Extra-Fine/pd/21932",
+  "site_slug": "jetpens-com",
+  "site_name": "JetPens",
+  "platform": "custom",
+  "target_fields": [
+    "product name",
+    "price",
+    "currency",
+    "description",
+    "avalibilty"
+  ],
+  "input_mode": "list_page",
+  "search_criteria": "https://www.jetpens.com/Beginner-Fountain-Pens/ct/1419",
+  "scope": "firstn",
+  "scope_value": "10",
+  "product_count": 6,
+  "output_file": "output_2026-09-17_103047_387862_44100.json",
+  "completed_at": "2026-09-17T10:35:10.782463+00:00",
+  "discovered_urls_count": 10,
+  "output_key": "products",
+  "draft_key": "scrapers/jetpens-com/jobs/scraper-draft-653.py"
+}
