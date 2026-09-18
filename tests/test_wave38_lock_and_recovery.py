@@ -329,6 +329,11 @@ class TestScrapeHardening:
             "ECONNREFUSED wherever the env differs"
         )
         assert "SCRAPER_CDP_PORT" in src
+        assert "from .browser_pool import" not in src[src.index("def _run_scraper_script_impl"):], (
+            "a relative import on the launch path executes the package "
+            "__init__ (from .server import app — FastAPI); read the env "
+            "directly instead"
+        )
 
     def test_scraper_chrome_drops_wildcard_allow_origins(self):
         """--remote-allow-origins=* turns the unauthenticated CDP into a

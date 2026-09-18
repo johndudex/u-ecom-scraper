@@ -566,11 +566,16 @@ def _run_scraper_script_impl(
         env.update(env_overrides)
     _stealth = (env.get("STEALTH_BROWSER", "") or "").strip().lower()
     if _stealth != "cloak":
-        # [wave-38 T6] single source of truth — compose's SCRAPER_CDP_PORT
-        # env var, not a hard-coded 9223 (ECONNREFUSED wherever they differ).
-        from .browser_pool import SCRAPER_CDP_PORT
-
-        env["BROWSER_CDP_ENDPOINT"] = f"http://127.0.0.1:{SCRAPER_CDP_PORT}"
+        # [wave-38 T6] compose's SCRAPER_CDP_PORT env var is the deploy-time
+        # source of truth (browser_pool reads the same var) — not a hard-coded
+        # 9223 (ECONNREFUSED wherever they differ). Read DIRECTLY: a relative
+        # browser_pool import here would execute the package __init__, which
+        # does `from .server import app` — dragging FastAPI onto the
+        # subprocess-launch path (wave-14's stub-package loader exists to
+        # dodge exactly that).
+        env["BROWSER_CDP_ENDPOINT"] = (
+            f"http://127.0.0.1:{os.environ.get('SCRAPER_CDP_PORT', '9223')}"
+        )
     else:
         env.pop("BROWSER_CDP_ENDPOINT", None)
 
