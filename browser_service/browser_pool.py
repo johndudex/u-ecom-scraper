@@ -511,7 +511,11 @@ class BrowserPool:
                 "google-chrome-stable",
                 f"--remote-debugging-port={SCRAPER_CDP_PORT}",
                 "--remote-debugging-address=0.0.0.0",
-                "--remote-allow-origins=*",
+                # [wave-38 T6] NO wildcard remote-allow-origins here: it turns
+                # the unauthenticated CDP into a reachable-from-anywhere WS
+                # endpoint. playwright connect_over_cdp sends no Origin
+                # header, so attach still works. (The MCP Chrome keeps its
+                # own flag — different launch, load-bearing there.)
                 f"--display={DISPLAY}",
                 "--no-first-run",
                 "--no-default-browser-check",

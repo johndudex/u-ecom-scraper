@@ -317,5 +317,44 @@ class TestProductAnalyzerAllowlist:
             )
 
 
+class TestScrapeHardening:
+    def _src(self, *parts):
+        return open(os.path.join(ROOT, "browser_service", *parts),
+                    encoding="utf-8").read()
+
+    def test_runner_uses_env_port_not_hardcoded(self):
+        src = self._src("scraper_runner.py")
+        assert '"BROWSER_CDP_ENDPOINT"] = "http://127.0.0.1:9223"' not in src, (
+            "hard-coded 9223 ignores compose's SCRAPER_CDP_PORT — attach dies "
+            "ECONNREFUSED wherever the env differs"
+        )
+        assert "SCRAPER_CDP_PORT" in src
+
+    def test_scraper_chrome_drops_wildcard_allow_origins(self):
+        """--remote-allow-origins=* turns the unauthenticated CDP into a
+        reachable-from-anywhere WS endpoint. The DEPRECATED scraper chrome
+        loses it; playwright connect_over_cdp sends no Origin header, so
+        attach still works."""
+        pool = self._src("browser_pool.py")
+        # scope the deprecated scraper chrome's launch fn (def → next def)
+        i0 = pool.index("def _start_scraper_chrome")
+        i1 = pool.find("\ndef ", i0 + 1)
+        block = pool[i0:i1 if i1 != -1 else len(pool)]
+        assert "--remote-allow-origins" not in block
+        # scope guard: the MCP chrome keeps its (load-bearing) flag — the
+        # file must retain EXACTLY ONE occurrence (MCP launch, browser_pool:428)
+        assert pool.count("--remote-allow-origins") == 1
+
+    def test_scrape_cap_stays_env_governed(self):
+        """D-1 decided option 2: prod's cap-1 lives in a Railway env var, so
+        the code MUST keep reading the env with default "2". A future
+        hard-code (either value) silently breaks the env-only deployment."""
+        server = self._src("server.py")
+        assert 'os.environ.get("SCRAPE_MAX_CONCURRENT", "2")' in server, (
+            "the cap must stay env-read with default 2 — prod enforcement "
+            "is the Railway var, not the code default"
+        )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

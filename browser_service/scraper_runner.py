@@ -566,7 +566,11 @@ def _run_scraper_script_impl(
         env.update(env_overrides)
     _stealth = (env.get("STEALTH_BROWSER", "") or "").strip().lower()
     if _stealth != "cloak":
-        env["BROWSER_CDP_ENDPOINT"] = "http://127.0.0.1:9223"
+        # [wave-38 T6] single source of truth — compose's SCRAPER_CDP_PORT
+        # env var, not a hard-coded 9223 (ECONNREFUSED wherever they differ).
+        from .browser_pool import SCRAPER_CDP_PORT
+
+        env["BROWSER_CDP_ENDPOINT"] = f"http://127.0.0.1:{SCRAPER_CDP_PORT}"
     else:
         env.pop("BROWSER_CDP_ENDPOINT", None)
 
