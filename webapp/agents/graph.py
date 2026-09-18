@@ -5148,6 +5148,22 @@ def _route_after_execution(state: ScrapeState):
             "stop_reason=%s) — parking for auto-resume", job_id, stop_reason,
         )
         return Command(goto="park_browser_unavailable")
+    # [wave-37 W37-NEW-F] Site-side auth wall (stop_reason=auth_wall, stamped
+    # by the tester's discovery probe or the draft's own discovery) — no
+    # strategy rung can sign in, so the ladder must never see it. Normalize
+    # honestly: FAILED cleanup, like the tester's cleanup-fail arm.
+    if (not (status == "SUCCESS" and items > 0)) and stop_reason == "auth_wall":
+        logger.warning(
+            "_route_after_execution: auth wall (job %s) — site requires "
+            "sign-in; honest cleanup, no strategy recycle", job_id,
+        )
+        return Command(goto="cleanup", update={
+            "execution_status": "FAILED",
+            "error_message": (
+                "Site requires sign-in; not scrapeable anonymously "
+                "(discovery stop_reason=auth_wall)."
+            )[:2000],
+        })
     # [T2.10/wave-13] A FAILED execution is not automatically a code problem:
     # the http_navigation template exits 3 with DISCOVERY_ZERO when Phase 1
     # ran cleanly and saw no item URLs — run_execution tags EXACTLY that shape
@@ -7190,6 +7206,42 @@ def _normalize_probe_stop_reason(stop_reason: str) -> str:
     return sr
 
 
+# [wave-37 W37-NEW-F] Sign-in-wall evidence markers, matched case-insensitively
+# against the Phase-1 discovery failure text (traceback body included — the
+# 652 goodreads redirect surfaced only as a URL inside the HTTPError line).
+_AUTH_WALL_MARKERS = (
+    "sign_in",
+    "sign in to",
+    "sign in",
+    "signin",
+    "log in",
+    "log_in",
+    "login",
+    "create an account",
+    "create_account",
+    "password",
+)
+
+
+def classify_discovery_failure(text: str) -> str | None:
+    """[wave-37 W37-NEW-F] Classify a Phase-1 discovery failure text as a
+    SITE-side wall, or None when it is not one we can name.
+
+    Prod 652 goodreads: discovery crashed on the login redirect and the job
+    burned every remaining writer cycle "fixing" an unfixable wall — a
+    sign-in requirement is the SITE's verdict on anonymous access, not a
+    draft defect. Returns ``"auth_wall"`` when the text carries sign-in /
+    login / create-account evidence; the tester's crash arm routes that to
+    honest cleanup-fail instead of the writer fix cycle.
+    """
+    if not text:
+        return None
+    low = str(text).lower()
+    if any(marker in low for marker in _AUTH_WALL_MARKERS):
+        return "auth_wall"
+    return None
+
+
 def _probe_listing_candidates(state: dict) -> tuple[str, str]:
     """(primary, alternate) ``SCRAPER_LISTING_URL`` candidates for the Phase-1
     probe, mirroring run_execution's chain. [rag-bone job 72] a URL-shaped
@@ -8750,6 +8802,47 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         # (same listing injection as run_execution), so a draft whose discovery
         # cannot see the site never reaches the 0-item execution.
         crashed, tb, probe_yield = _probe_phase1_discovery(slug, dict(state), job_id)
+        if crashed and classify_discovery_failure(tb or "") == "auth_wall":
+            # [wave-37 W37-NEW-F] Site-side wall, not a code defect (prod 652
+            # goodreads: the login redirect crashed Phase-1 discovery and the
+            # job burned its remaining writer cycles "fixing" an unfixable
+            # wall). Honest stop: cleanup-fail, never the writer fix cycle —
+            # the F13 Command route bypasses route_after_testing's ladder.
+            report = report or {}
+            report["phase2_confidence"] = report.get("confidence_score")
+            report["discovery_unvalidated"] = True
+            report["overall_assessment"] = "FAIL"
+            report["confidence_score"] = 0.0
+            report["ready_for_execution"] = False
+            _acov = dict(
+                report.get("discovery_coverage") or {}
+                if isinstance(report, dict) else {}
+            )
+            if isinstance(probe_yield, dict) and isinstance(
+                probe_yield.get("coverage"), dict
+            ):
+                _acov.update(probe_yield["coverage"])
+            _acov["stop_reason"] = "auth_wall"
+            report["discovery_coverage"] = _acov
+            _amsg = (
+                "Phase-1 discovery hit an auth wall: the site requires "
+                "sign-in, so it is not scrapeable anonymously "
+                f"(probe failure text: {(tb or '')[:300]})."
+            )
+            report.setdefault("issues", []).insert(
+                0, {"severity": "high", "message": _amsg, "description": _amsg},
+            )
+            update["test_report"] = report
+            update["error_message"] = (
+                "Site requires sign-in; not scrapeable anonymously — "
+                "Phase-1 discovery hit an auth wall (stop_reason=auth_wall)."
+            )[:2000]
+            update["execution_status"] = "FAILED"
+            logger.warning(
+                "_invoke_code_tester: discovery probe hit an AUTH WALL — "
+                "honest cleanup-fail, no writer cycle (job %s)", job_id,
+            )
+            return Command(goto="cleanup", update=update)
         if crashed:
             report = report or {}
             # [wave-22 B4] keep the tester's own verdict readable downstream:

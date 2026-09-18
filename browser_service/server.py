@@ -1569,6 +1569,27 @@ async def _periodic_cdp_liveness():
                 await asyncio.sleep(1)
                 await _start_mcp_process()
 
+            # [wave-37 W37-OPS] Saturation gauges — one INFO line per cycle:
+            # cgroup memory ratio + poison state + live ephemeral call count.
+            # Today only the gate-trip logs exist, so the next memory
+            # saturation (3 in 3 days at ~24h intervals) has no climb curve
+            # to read from service logs alone. LAST in the cycle body: a
+            # gauge bug must never skip the healing steps above it.
+            try:
+                _g_ratio = _cgroup_memory_ratio()
+                _g_poison = launch_poison_snapshot()
+                _g_ephem = len(_ephemeral_snapshot())
+                logger.info(
+                    "saturation gauge: mem_ratio=%s poisoned_threads=%d "
+                    "poison_events_1h=%d ephemeral_calls=%d",
+                    "n/a" if _g_ratio is None else f"{_g_ratio:.3f}",
+                    len(_g_poison.get("poisoned_threads") or []),
+                    int(_g_poison.get("poison_events_1h") or 0),
+                    _g_ephem,
+                )
+            except Exception:
+                logger.debug("saturation gauge failed", exc_info=True)
+
         except asyncio.CancelledError:
             raise
         except Exception:
