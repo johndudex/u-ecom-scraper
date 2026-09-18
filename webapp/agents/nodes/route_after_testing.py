@@ -1453,13 +1453,34 @@ def route_after_testing(state: ScrapeState) -> str:
     # the invocation). There is no draft verdict to judge — park (non-terminal,
     # beat-resumed on recovery) rather than fall into the no-report retry arms
     # and regenerate a draft against a dead gateway.
-    if state.get("browser_unavailable_detail"):
-        logger.warning(
-            "route_after_testing: browser_service unhealthy at tester entry "
-            "(%s) — parking job for auto-resume",
-            str(state.get("browser_unavailable_detail"))[:120],
+    #
+    # [wave-37 W37-NEW-A] Report-level sibling: the tester DID run but every
+    # failure signal in its report is browser-service infra (prod 671/672 —
+    # the outage banner landed inside the written report and burned 4 retest
+    # arms). Classify before the verdict ladder; park without consuming an
+    # arm. navigate_throttled graduates from wave-24's backoff-retest to the
+    # budget-bounded park (the parked-time budget, not the retest cap, now
+    # bounds sustained-outage exposure).
+    from ..tools.browser_http import report_is_infra_blocked
+
+    _infra = report_is_infra_blocked(report or {})
+    if state.get("browser_unavailable_detail") or _infra:
+        if _infra and not state.get("browser_unavailable_detail"):
+            # Routing functions cannot mutate state — log loudly so the
+            # SessionLog carries the classification (the park node's own
+            # detail recovery can't see a report-only outage).
+            logger.warning(
+                "route_after_testing: test report is INFRA-blocked (%s) — "
+                "parking without consuming a cascade arm (retry_count stays %s)",
+                _infra[:120],
+                state.get("test_retry_count"),
+            )
+        _log_cascade(
+            state,
+            "park-browser-service",
+            "tester pre-flight: gateway unhealthy" if not _infra
+            else f"report-level infra outage: {_infra[:120]}",
         )
-        _log_cascade(state, "park-browser-service", "tester pre-flight: gateway unhealthy")
         return "park_browser_unavailable"
 
     # [wave-22 A5] Named fast-fail: the tester died on its invoke wall clock

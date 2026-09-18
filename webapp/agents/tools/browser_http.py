@@ -335,6 +335,86 @@ def post_scrape_with_retry(
     return result
 
 
+# [wave-37 W37-NEW-A] Infra signatures that mean the failure belongs to the
+# browser-service fleet, not the draft. Marker texts are the exact strings the
+# fleet emits: BROWSER_SERVICE_UNAVAILABLE (shell_tools run_scraper outage
+# banner), navigate_throttled (discovery_coverage.stop_reason under gateway
+# 429 backpressure), "memory gate tripped" (server.py W4 admission refusal),
+# Errno 11 (fork EAGAIN under memory pressure — the prod 502 root cause).
+_INFRA_MARKERS = (
+    "BROWSER_SERVICE_UNAVAILABLE",
+    "navigate_throttled",
+    "memory gate tripped",
+    "Errno 11",
+)
+# The crash channel additionally carries the site-flavored throttle phrasing
+# the /scrape retry ladder surfaces ("HTTP 429", "Too Many Requests").
+_INFRA_CRASH_MARKERS = _INFRA_MARKERS + ("HTTP 429", "Too Many Requests")
+
+
+def _report_items(report: dict) -> int:
+    """Items the tester actually extracted — mirrors route_after_testing's
+    canonical ``_extracted_item_count`` ladder (the report carries counts
+    top-level AND nested under ``results``; ``successful_extractions`` is the
+    code-tester's primary key). Kept inline: browser_http must not import the
+    router module."""
+    results = report.get("results") if isinstance(report, dict) else None
+    for key in ("successful_extractions", "extracted_items", "item_count"):
+        v = report.get(key)
+        if v is None and isinstance(results, dict):
+            v = results.get(key)
+        if isinstance(v, (int, float)) and v:
+            return int(v)
+    sp = report.get("sample_products") or []
+    if sp:
+        return len(sp)
+    so = report.get("sample_output") or {}
+    if isinstance(so, dict):
+        for v in so.values():
+            if isinstance(v, list):
+                return len(v)
+    return 0
+
+
+def report_is_infra_blocked(report: dict) -> str | None:
+    """Return a reason string when EVERY failure signal in a test report is
+    browser-service infrastructure (429 backpressure, unavailable gateway,
+    memory gate), else None.
+
+    [wave-37 W37-NEW-A] Prod 671/672: the outage text landed INSIDE a written
+    test report (born at shell_tools when run_scraper's /scrape 429'd), which
+    the cascade read as a normal NEEDS_FIXES/CRASH report and burned 4 retest
+    arms on. A report that ALSO carries a real draft defect, or that extracted
+    real items, is NOT infra — the cascade must keep judging those.
+    """
+    if not isinstance(report, dict):
+        return None
+    if _report_items(report) > 0:
+        return None
+    # Issue messages are draft-defect text — only the narrow infra set excuses
+    # them. The crash channel and the discovery stop_reason additionally carry
+    # the site-throttle phrasing the /scrape retry ladder surfaces, so they are
+    # excused by the wider marker set too.
+    issue_signals: list[str] = []
+    for issue in report.get("issues") or []:
+        if isinstance(issue, dict):
+            issue_signals.append(str(issue.get("message") or ""))
+    crash = str(report.get("crash_error") or "")
+    cov = report.get("discovery_coverage")
+    stop_reason = str(cov.get("stop_reason") or "") if isinstance(cov, dict) else ""
+    # One non-infra issue ⇒ mixed report: real defect wins, cascade judges it.
+    real = [s for s in issue_signals if s and not any(m in s for m in _INFRA_MARKERS)]
+    if real:
+        return None
+    for s in (crash, stop_reason):
+        if s and any(m in s for m in _INFRA_CRASH_MARKERS):
+            return s[:200]
+    for s in issue_signals:
+        if s and any(m in s for m in _INFRA_MARKERS):
+            return s[:200]
+    return None
+
+
 def cancel_scrape(job_id: int, rid: str = "") -> dict:
     """[wave-14] Ask browser_service to cancel in-flight /scrape run(s).
 
