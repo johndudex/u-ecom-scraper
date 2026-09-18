@@ -1495,7 +1495,7 @@ git commit -m "fix(wave-38 T5): drop browser_tabs from product_analyzer — agen
 - Test: `tests/test_wave38_lock_and_recovery.py` (append; source pins — browser_service is not importable in the django container)
 
 **Interfaces:**
-- Consumes: `SCRAPER_CDP_PORT` from `browser_pool` (single source of truth; scraper_runner already lazy-imports browser_pool at :199, no cycle).
+- Consumes: the `SCRAPER_CDP_PORT` env var (deploy-time source of truth; browser_pool:13 reads the same var). CORRECTED during execution: a relative browser_pool import from scraper_runner is FORBIDDEN on the launch path — it executes the package `__init__` (`from .server import app`, FastAPI), the exact hazard wave-14's stub-package loader dodges; the runner reads the env directly and the T6 pin asserts no browser_pool import after `_run_scraper_script_impl`.
 
 - [ ] **Step 1: Write the failing tests** (append)
 
@@ -1550,9 +1550,17 @@ Expected: the two implementation pins (port truth, allow-origins) FAIL. `test_sc
 
 ```python
     if _stealth != "cloak":
-        from .browser_pool import SCRAPER_CDP_PORT
-
-        env["BROWSER_CDP_ENDPOINT"] = f"http://127.0.0.1:{SCRAPER_CDP_PORT}"
+        # [wave-38 T6] compose's SCRAPER_CDP_PORT env var is the deploy-time
+        # source of truth (browser_pool reads the same var) — not a hard-coded
+        # 9223 (ECONNREFUSED wherever they differ). Read DIRECTLY: a relative
+        # browser_pool import here would execute the package __init__, which
+        # does `from .server import app` — dragging FastAPI onto the
+        # subprocess-launch path (wave-14's stub-package loader exists to
+        # dodge exactly that; shipping this cost 4 full-suite reds and a
+        # fixup commit — the env-read is the corrected shape).
+        env["BROWSER_CDP_ENDPOINT"] = (
+            f"http://127.0.0.1:{os.environ.get('SCRAPER_CDP_PORT', '9223')}"
+        )
     else:
         env.pop("BROWSER_CDP_ENDPOINT", None)
 ```
