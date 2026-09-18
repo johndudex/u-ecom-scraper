@@ -3611,6 +3611,50 @@ def _nav_result_contamination(result: Any, job_url: str) -> list[str]:
     return bad
 
 
+def _strip_off_domain_links(result: Any, job_url: str) -> tuple[Any, int]:
+    """[wave-37 W37-NEW-C] Drop minority off-domain item_links; keep the run.
+
+    Returns ``(clean_result, dropped_count)``; ``(None, dropped)`` when
+    stripping cannot save the run — majority off-domain, or an off-domain
+    ``api.url`` claiming data (wave-34 F3: identity-bearing, never silently
+    rewritten). Uses the SAME ``_registrable`` comparator as
+    ``_nav_result_contamination`` so degrade and veto can never disagree.
+    Relative/anchored links are kept (only ``http…`` URLs are classified).
+    """
+    try:
+        from experimental.nav_traversal.traversal import _registrable
+    except Exception:
+        # Cannot classify → cannot strip safely; pass through unmodified.
+        return result, 0
+    job_reg = _registrable(job_url)
+    if not job_reg:
+        return result, 0
+    links = list(getattr(result, "item_links", []) or [])
+    if not links:
+        return result, 0
+    clean = [
+        u for u in links
+        if not (isinstance(u, str) and u.startswith("http")
+                and _registrable(u) not in ("", job_reg))
+    ]
+    dropped = len(links) - len(clean)
+    api = getattr(result, "api", None)
+    api_url = api.get("url") if isinstance(api, dict) else ""
+    if isinstance(api_url, str) and api_url.startswith("http"):
+        _count = api.get("count")
+        claims_data = (
+            isinstance(_count, (int, float))
+            and not isinstance(_count, bool)
+            and _count > 0
+        )
+        if claims_data and _registrable(api_url) not in ("", job_reg):
+            return None, dropped
+    if not clean or dropped > len(clean):
+        return None, dropped
+    result.item_links = clean
+    return result, dropped
+
+
 def _project_api_endpoint(api: Any) -> dict:
     """Project verify_api's descriptor for navigation_analysis.api_endpoint.
 
@@ -3891,40 +3935,59 @@ def _invoke_navigation_traverse(
         # the wrong site.
         _bad = _nav_result_contamination(result, url)
         if _bad:
-            logger.error(
-                "browser_traverse: CROSS-DOMAIN traversal result (job %s, url %s): %s "
-                "— ONE forced-homepage re-traverse",
-                job_id, url[:80], "; ".join(_bad),
-            )
-            _retry = browser_traverse(
-                url, content_type, query, trust_start_as_listing=False
-            )
-            _bad2 = _nav_result_contamination(_retry, url)
-            if not _bad2:
+            # [wave-37 W37-NEW-C] Degradation before drama: minority
+            # off-domain noise (klaviyo static forms, affiliate rows) in an
+            # otherwise-on-site capture drops the bad links and keeps the
+            # run — a forced re-traverse costs a full browser window and
+            # re-reads the same carousel. Majority off-domain and
+            # identity-bearing off-domain api captures still refuse (the
+            # (None, …) case), preserving the 323/D1 veto below.
+            _stripped, _dropped = _strip_off_domain_links(result, url)
+            if _stripped is not None:
+                result = _stripped
                 logger.warning(
-                    "browser_traverse: forced re-traverse is CLEAN — replacing the "
-                    "poisoned result (job %s)",
-                    job_id,
+                    "browser_traverse: degraded traversal result (job %s, "
+                    "url %s): dropped %d off-domain link(s), kept %d "
+                    "on-domain — %s",
+                    job_id, url[:80], _dropped,
+                    len(getattr(result, "item_links", []) or []),
+                    "; ".join(_bad),
                 )
-                result = _retry
             else:
                 logger.error(
-                    "browser_traverse: still cross-domain after re-traverse "
-                    "(job %s): %s — honest fail, no nav analysis will be built",
-                    job_id, "; ".join(_bad2),
+                    "browser_traverse: CROSS-DOMAIN traversal result (job %s, url %s): %s "
+                    "— ONE forced-homepage re-traverse",
+                    job_id, url[:80], "; ".join(_bad),
                 )
-                _notify_phase(job_id, "browser_traverse", "failed")
-                return Command(
-                    goto="cleanup",
-                    update={
-                        "error_message": (
-                            "Navigator returned cross-domain traversal results twice "
-                            f"(job url {url[:80]}): {'; '.join(_bad2)}. Refusing to "
-                            "build a navigation analysis for the wrong site."
-                        )[:2000],
-                        "navigation_analysis": {},
-                    },
+                _retry = browser_traverse(
+                    url, content_type, query, trust_start_as_listing=False
                 )
+                _bad2 = _nav_result_contamination(_retry, url)
+                if not _bad2:
+                    logger.warning(
+                        "browser_traverse: forced re-traverse is CLEAN — replacing the "
+                        "poisoned result (job %s)",
+                        job_id,
+                    )
+                    result = _retry
+                else:
+                    logger.error(
+                        "browser_traverse: still cross-domain after re-traverse "
+                        "(job %s): %s — honest fail, no nav analysis will be built",
+                        job_id, "; ".join(_bad2),
+                    )
+                    _notify_phase(job_id, "browser_traverse", "failed")
+                    return Command(
+                        goto="cleanup",
+                        update={
+                            "error_message": (
+                                "Navigator returned cross-domain traversal results twice "
+                                f"(job url {url[:80]}): {'; '.join(_bad2)}. Refusing to "
+                                "build a navigation analysis for the wrong site."
+                            )[:2000],
+                            "navigation_analysis": {},
+                        },
+                    )
 
         # Extract item URL examples so product_analyzer + code_tester have
         # ready-made sample URLs (avoids ~6.5 min of auto-discovery). Prefer the
