@@ -222,6 +222,100 @@ def ladder_preservation_violation(
     )
 
 
+# [wave-37 W37-NEW-D] The repair rewrites bare ``requests.<m>(...)`` call
+# sites — the only shape that can be rewritten BOTH safely (a dict ``.get``
+# must never gain a proxies kwarg) and honestly (the ACTUAL fetches become
+# proxied, not a dead marker that merely satisfies the gate).
+_LADDER_REWRITE_METHODS = frozenset({
+    "get", "post", "head", "put", "delete", "options", "request",
+})
+# get_proxy_dict's own default tier — the base of every escalation ladder.
+_LADDER_REPAIR_PROXIES_EXPR = "_W37_PROXY_CONFIG.get_proxy_dict('datacenter')"
+_LADDER_REPAIR_PREAMBLE = (
+    "from src.proxy import ProxyConfig  # [wave-37 W37-NEW-D] re-injected\n"
+    "_W37_PROXY_CONFIG = ProxyConfig.get_instance()\n\n"
+)
+
+
+def _ladder_gate_on_text(text: str, strategy: str) -> str | None:
+    """Run the REAL ladder gate over source text (temp-file round-trip).
+
+    ``list_page`` is the nav-mode applicability key — the gate's checks are
+    mode-independent beyond that. Reusing the gate (vs re-implementing L1-L3)
+    means repair and veto can never drift apart.
+    """
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".py")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return ladder_preservation_violation(path, "list_page", strategy)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def repair_ladder_violation(text: str, strategy: str) -> str | None:
+    """[wave-37 W37-NEW-D] Deterministic ladder re-injection; repaired source
+    or None when the draft is unrepairable.
+
+    Rewrites every bare ``requests.<method>(...)`` call to carry a resolved
+    ``proxies=`` kwarg (``ProxyConfig.get_proxy_dict('datacenter')``) and
+    prepends the ProxyConfig wiring. Honesty guards, each returning None so
+    the caller keeps today's honest-fail:
+      - draft unparseable (the syntax fixer owns those);
+      - the gate is ALREADY satisfied (exempt strategy / non-nav mode /
+        wired draft — nothing to repair);
+      - zero rewrite targets (fetches ride Session variables or unknown
+        clients — rewriting those is unsafe, and a dead factory injection
+        would pass the gate while the runtime stays unproxied);
+      - the rewritten source still violates the gate.
+
+    Formatting is NOT preserved (ast.unparse round-trip) — comments and
+    layout are lost, semantics and parseability are not.
+    """
+    if not text or not text.strip():
+        return None
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    if _ladder_gate_on_text(text, strategy) is None:
+        return None  # exempt / non-nav / already wired
+    rewrites = 0
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _LADDER_REWRITE_METHODS
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "requests"
+            and not any(kw.arg == "proxies" for kw in node.keywords)
+        ):
+            node.keywords.append(ast.keyword(
+                arg="proxies",
+                value=ast.parse(
+                    _LADDER_REPAIR_PROXIES_EXPR, mode="eval"
+                ).body,
+            ))
+            rewrites += 1
+    if not rewrites:
+        return None
+    src = ast.unparse(ast.fix_missing_locations(tree))
+    if "from src.proxy import" not in src:
+        src = _LADDER_REPAIR_PREAMBLE + src
+    try:
+        ast.parse(src)
+    except SyntaxError:
+        return None
+    if _ladder_gate_on_text(src, strategy) is not None:
+        return None
+    return src
+
+
 def restore_job_draft(root: str, slug: str, job_id) -> str | None:
     """Restore THIS job's own draft archive into the workspace.
 

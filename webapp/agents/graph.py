@@ -8274,6 +8274,44 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             )
     except Exception as _te_exc:
         logger.warning("_invoke_code_tester: draft entry guard failed: %s", _te_exc)
+    # [wave-37 W37-NEW-D] ONE deterministic ladder repair BEFORE the window is
+    # spent: a nav-mode HTTP draft whose proxy wiring was stripped (prod
+    # 628/623/600) otherwise burns a full tester window on a guaranteed
+    # force-FAIL plus a writer fix cycle for a mechanical defect. Runs BEFORE
+    # the entry fingerprint so the repaired bytes are what this pass tests
+    # (a post-fingerprint write would stamp the verdict unproven). Budget 1
+    # per job via state.ladder_repairs — the second violation keeps today's
+    # honest path (tester force-FAIL → writer directive → execution refusal).
+    _lr_repaired_here = False
+    try:
+        if (
+            _te_draft
+            and int(state.get("ladder_repairs") or 0) < 1
+        ):
+            from .draft_safety import repair_ladder_violation
+
+            _lr_sa = state.get("scraper_analysis")
+            _lr_strategy = (
+                (_lr_sa.get("strategy") or "") if isinstance(_lr_sa, dict) else ""
+            )
+            with open(_te_draft, encoding="utf-8", errors="replace") as _lr_fh:
+                _lr_src = _lr_fh.read()
+            _lr_new = repair_ladder_violation(_lr_src, _lr_strategy)
+            if _lr_new and _lr_new != _lr_src:
+                with open(_te_draft, "w", encoding="utf-8") as _lr_fh:
+                    _lr_fh.write(_lr_new)
+                _lr_repaired_here = True
+                logger.warning(
+                    "_invoke_code_tester: ladder violation repaired at entry "
+                    "(job %s, strategy=%s) — proxied requests call sites "
+                    "re-injected; this pass tests the repaired draft",
+                    job_id, _lr_strategy or "unknown",
+                )
+    except Exception as _lr_exc:
+        logger.warning(
+            "_invoke_code_tester: ladder repair check failed (job %s): %s",
+            job_id, _lr_exc,
+        )
     # [wave-24 W24-1] Fingerprint the draft AT ENTRY (after the presence guard
     # may have restored it — this is exactly what the tester will run). If the
     # exit fingerprint differs, the draft moved under the live test and the
@@ -8368,6 +8406,10 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "code-tester", config)
         update = {"messages": [], "draft_absent_count": _te_absent}
+        if _lr_repaired_here:
+            # [wave-37 W37-NEW-D] the job's ONE ladder repair is spent win or
+            # lose (B2 semantics) — a repeating violation keeps the honest path.
+            update["ladder_repairs"] = int(state.get("ladder_repairs") or 0) + 1
         if bool(state.get("draft_mutated_during_test")):
             # [wave-24 W24-1] Entering with the un-proven flag set: consume the
             # router's one-mutated-verdict re-test allowance so a repeating

@@ -122,6 +122,13 @@ class ScrapeState(TypedDict, total=False):
     # the allowance when it enters with that mismatch signature, so a forced
     # pass that dies cannot bounce terminal→code_tester forever.
     forced_retest_count: int
+    # [wave-37 W37-NEW-D] Ladder-repair budget: ONE deterministic proxy-ladder
+    # re-injection per job, applied by _invoke_code_tester at entry (before
+    # the window is spent) when the draft violates
+    # ladder_preservation_violation (prod 628/623/600: otherwise-sound
+    # drafts whose wiring the writer stripped). A second violation keeps the
+    # honest-fail path.
+    ladder_repairs: int
     # [wave-24 W24-1] Draft changed WHILE the tester ran (leaked writer thread
     # mutating under a live test — prod 395: zombie edit_file 2s into the
     # tester's run). _invoke_code_tester stamps it by comparing entry/exit
