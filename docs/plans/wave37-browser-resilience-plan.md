@@ -1218,7 +1218,27 @@ belt at the decision node itself (resume paths can deliver raw state).
   `items_extracted` key; both gates read the shared `report_extracted_items` ladder
   (browser_http). The 671/672 outage banner text (verbatim, from the retest reasons above):
   `BROWSER_SERVICE_UNAVAILABLE: the browser-service gateway itself cannot serve this run …`
-- Task 3/4: (quote the exact 671/672 report JSON keys for `items_extracted`-equivalent and the BROWSER_SERVICE_UNAVAILABLE issue text here)
+- Task 3/4: 671 report keys PINNED from prod SessionLog [TOOL] rows (2026-09-18 read): the
+  items-count evidence lives at the NESTED `results.successful_extractions` (0) — `"results":
+  {"successful_extractions": 0, "failed_extractions": 1, "skipped_dead_urls": 0,
+  "discovered_urls_phase1": 0, "phase1_stop_reason": "empty_render", ...}`; no
+  `extracted_items`/`item_count` key appears anywhere in the 671 log. The outage banner the
+  writer relayed as an issue message (seq 67, verbatim): `BROWSER_SERVICE_UNAVAILABLE: the
+  browser-service gateway itself cannot serve this run (browser_service throttled the scrape
+  (HTTP 429) after 3 attempt(s) — backpressure, re-run may succeed). This is an infrastructure
+  outage, NOT a site or scraper problem — do not strategy-switch and do not rewrite the
+  scraper; record the phase as not testable due to the outage.` NOTE the banner itself carries
+  `HTTP 429` — the exact text the narrow-issue/wide-crash channel split exists for (a
+  narrow-only filter would have called this banner a "real defect" and excused nothing).
+- Task 9 (auth-wall) shipped: `classify_discovery_failure` in graph.py; tester probe crash arm
+  routes `auth_wall` straight to cleanup-fail (FAILED + stop_reason=auth_wall, F13 Command
+  route); `_route_after_execution` normalizes an auth_wall zero-item execution to honest FAILED
+  cleanup, never the ladder.
+- Task 10 (W37-OPS) shipped FLAG-OFF: `browser_service/recycle_policy.py`
+  (SustainedPressureTracker) + second trigger in `_maybe_recycle_scraper_chrome` behind the
+  scrape guard; `BROWSER_PROACTIVE_RECYCLE` default 0 — enablement stays a user decision after
+  the next saturation event's data. Saturation gauges (T9 rider) log one INFO line per liveness
+  cycle: `saturation gauge: mem_ratio=… poisoned_threads=N poison_events_1h=N ephemeral_calls=N`.
 - Wave-36 e2e baseline results (2026-09-18, full-pipeline via `POST /intake/create-job/` force=1, one fire each): **3/3 PASS** — 411 westelm 10/10 in 79min (all 5 alias/LLM chips resolved canonical, discovered=50, 0 escalations); 412 renttherunway 10/10 in 108min (no-chips identity lane: no FIELD-MAP row, zero renames, 20-field raw shape intact, one legit tester→writer fix cycle); 413 au-yotoplay 1/1 scope-satisfied in 25min (all 5 chips canonical; delta vs sentinel's 5/5 fully explained by the wave-34 T34-2 `[INTAKE-PDP]` flip coercing the PDP-shaped seed to url_list — mode coercion, not extraction loss). Cross-checks: alias→canonical ✓ both legs exercised, identity lane ✓, JSON soft-block escalations 0 everywhere, zero shortfall-gate misfires, no gate bypasses, no COMPLETED-with-zero. §4.5 merge gate: SATISFIED (no wave-36 regression under full-pipeline conditions).
 - NEW candidate observed during e2e (→ wave-38 candidate, NOT a wave-37 task): **cross-job network-capture bleed in the shared browser-service** — while 411/412 ran concurrently, job 412's traverse captured `https://www.westelm.com.au/api/items` (411's site): `dropping off-domain api capture (job 412)` + `CROSS-DOMAIN traversal result (item_links 12/12 off-domain) — ONE forced re-traverse` (13:21:12Z). Contained by the wave-32 B3 host gate, but capture attribution across concurrent jobs sharing one Chrome is a real defect class.
 
