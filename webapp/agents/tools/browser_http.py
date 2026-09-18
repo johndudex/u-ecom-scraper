@@ -575,7 +575,6 @@ def park_job_for_browser_service(job_id: int, reason: str) -> bool:
     try:
         from django.db.models import Value
         from django.db.models.functions import Coalesce
-
         from scraper.models import ScrapeJob
 
         # [wave-37 W37-3b] Stamp the park-episode start; the beat resumer adds
