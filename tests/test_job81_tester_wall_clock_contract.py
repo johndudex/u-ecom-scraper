@@ -73,12 +73,18 @@ def _write_report(tmp_path, assessment="CRASH", age=0.0):
     d = tmp_path / "workspace" / SLUG
     d.mkdir(parents=True, exist_ok=True)
     p = d / "test_report.json"
-    p.write_text(json.dumps({
+    report = {
         "overall_assessment": assessment,
         "confidence_score": 0.2,
         "ready_for_execution": False,
         "issues": [],
-    }))
+    }
+    if assessment == "PASS":
+        # [wave-37 W37-NEW-B] A PASS verdict must carry positive items
+        # evidence or the false-PASS sanitizer (correctly) flips it — these
+        # tests exercise wall-clock adoption, not items semantics.
+        report["successful_extractions"] = 2
+    p.write_text(json.dumps(report))
     if age:
         past = time.time() - age
         os.utime(p, (past, past))

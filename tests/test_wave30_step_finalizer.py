@@ -76,14 +76,20 @@ class TestCloseOpenSteps:
 
     def test_finalize_path_uses_the_closer(self):
         src = open(os.path.join(ROOT, "webapp", "scraper", "tasks.py")).read()
-        i_fn = src.index("def _finalize_job")
-        tail = src[i_fn:]
-        i_close = tail.index("def _close_open_steps")
-        i_call = tail.index("_close_open_steps(job)")
-        assert i_call > i_close, (
+        i_close = src.index("def _close_open_steps")
+        # [wave-37] word-exact match on the def (the old prefix search also
+        # matched _finalize_job_failed, and T1's legitimate helper reuse in
+        # finalize_from_artifacts — which sits ABOVE the helper's def — broke
+        # the old whole-tail order heuristic). Intent unchanged: the finalize
+        # BODY must call the shared helper, never an inline re-implementation.
+        i_fn = src.index("def _finalize_job(")
+        i_next = src.find("\ndef ", i_fn + 1)
+        body = src[i_fn:i_next if i_next != -1 else len(src)]
+        assert "_close_open_steps(job)" in body, (
             "the inline step-closing block must be the shared helper, called "
             "from the finalize path"
         )
+        assert src.count("def _close_open_steps") == 1
 
 
 if __name__ == "__main__":

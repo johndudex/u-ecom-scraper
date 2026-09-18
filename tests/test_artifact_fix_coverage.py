@@ -125,6 +125,7 @@ class TestCodeTesterRepairThenReload:
         retry loop / F19 failed-finalize path)."""
         corrupt = (
             '{"overall_assessment": "PASS",\n'
+            ' "successful_extractions": 2,\n'
             ' "feedback_for_writer": "phase 2 fixed' + chr(10) + chr(10) + 'phase 1 broken"}'
         )
         artifact = self._run(tmp_path, monkeypatch, corrupt)
