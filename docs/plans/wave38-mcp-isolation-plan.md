@@ -227,21 +227,29 @@ RTR = "https://www.renttherunway.com/collections"
 
 def _make_tools(surfaces, network="[]", item_links="[]"):
     """One fake MCP toolset. surfaces[i] is the i-th _PAGE_STATE_JS read (an
-    Exception instance = raise). Later reads clamp to the last entry."""
+    Exception instance = raise). Later reads clamp to the last entry.
+
+    JS routing by unique markers in the REAL payloads: getEntriesByType =
+    network resource log; _commonPrefixDepth (underscored helper) =
+    _PAGE_STATE_JS; bare commonPrefixDepth = _ITEM_LINKS_JS (its helper is
+    NOT underscored — verified against traversal.py; a single
+    commonPrefixDepth marker collides with the page-state JS)."""
     reads = {"n": 0}
 
     def ev_fn(kwargs):
         js = kwargs.get("function", "")
         if "getEntriesByType" in js:
             return _Resp(network)
+        if "_commonPrefixDepth" in js:
+            i = reads["n"]
+            reads["n"] += 1
+            s = surfaces[min(i, len(surfaces) - 1)]
+            if isinstance(s, Exception):
+                raise s
+            return _resp(s)
         if "commonPrefixDepth" in js:
             return _Resp(item_links)
-        i = reads["n"]
-        reads["n"] += 1
-        s = surfaces[min(i, len(surfaces) - 1)]
-        if isinstance(s, Exception):
-            raise s
-        return _resp(s)
+        return _Resp("{}")
 
     def noop(kwargs):
         return _Resp("ok")

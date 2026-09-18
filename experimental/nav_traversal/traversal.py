@@ -29,8 +29,8 @@ import logging
 import os
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -108,7 +108,10 @@ def _same_site(a: str, b: str) -> bool:
     # allow subdomains (api.x.com vs www.x.com): compare the registrable tail.
     if not ha or not hb:
         return False
-    tail = lambda h: ".".join(h.split(".")[-2:]) if h.count(".") >= 2 else h
+
+    def tail(h):
+        return ".".join(h.split(".")[-2:]) if h.count(".") >= 2 else h
+
     return tail(ha) == tail(hb) or ha.endswith(hb) or hb.endswith(ha)
 
 
@@ -672,6 +675,15 @@ class TraversalResult:
     goal_request_url: str = ""           # the URL the winning action hit (form action)
     item_links: list = field(default_factory=list)  # real item/detail hrefs from the rendered goal page
     discovery: dict = field(default_factory=dict)  # {listing_url, listing_reached, pagination} — the contract
+    # [wave-38 W38-A1] Honest wrong-site abort (412): the walk observed the
+    # shared tab on ANOTHER registrable domain — an off-domain page the LLM
+    # judged is_listing (immediate abort), or wrong_site_tolerance
+    # consecutive off-domain reads — and refused to judge/capture it. The
+    # graph recovers via _retraverse_locked; notes deliberately never
+    # contain "MCP" (that substring routes into the navigate_explore
+    # fallback — same dirty browser).
+    wrong_site_abort: bool = False
+    wrong_site_url: str = ""
 
 
 def _pick_mechanism(reached_by: str, signals: dict) -> str:
@@ -1421,8 +1433,8 @@ def choose_action(surface: dict, content_type: str, query: str, history: list) -
         '{"action": "click"|"scroll"|"goto"|"done", "target": "<index or url or down>", "reason": "short"}'
     )
     try:
-        from langchain_core.messages import HumanMessage
         from agents.llm import get_small_llm
+        from langchain_core.messages import HumanMessage
 
         llm = get_small_llm(temperature=0.0)
         resp = llm.invoke([HumanMessage(content=prompt)])
@@ -1518,8 +1530,8 @@ def llm_step(snapshot_text: str, content_type: str, query: str, history: list) -
         '"text": "text to type or option-value to select", "reason": "short"}'
     )
     try:
-        from langchain_core.messages import HumanMessage
         from agents.llm import get_small_llm
+        from langchain_core.messages import HumanMessage
 
         llm = get_small_llm(temperature=0.0)
         resp = llm.invoke([HumanMessage(content=prompt)])
@@ -1663,7 +1675,6 @@ def _do_action(action: dict, nav, click, ev, wait, type_t=None) -> str:
     elif a == "goto" and target:
         # domain guard: prevent the LLM from wandering off-site
         # (locumtenens: LLM guessed lw.com, kirkland.com, indeed.com)
-        from urllib.parse import urlparse as _up
         goto_host = _norm_host(target)
         start_host = _norm_host(_START_URL) if _START_URL else goto_host
         if goto_host and start_host and not _same_site(target, _START_URL):
@@ -1832,6 +1843,8 @@ def browser_traverse(
     heartbeat_fn: Callable[[dict], None] | None = None,
     heartbeat_interval: float = 300.0,
     max_seconds: float | None = None,
+    job_id: int | None = None,
+    wrong_site_tolerance: int = 2,
 ) -> TraversalResult:
     """Browser-driven navigation via MCP snapshot + LLM.
 
@@ -1879,6 +1892,12 @@ def browser_traverse(
     if not nav or not ev or not snap:
         return TraversalResult(False, None, [start_url], "unknown", None, {}, [start_url], [],
                                "missing navigate/evaluate/snapshot tools")
+
+    # [wave-38 W38-A1/D2] Anchor for every in-walk domain assertion: the JOB's
+    # start_url registrable — never the live goal_url, which during a bleed IS
+    # the wrong site.
+    job_registrable = _registrable(start_url) if start_url else ""
+    off_domain_reads = 0
 
     step = step_fn or llm_step
 
@@ -1972,6 +1991,69 @@ def browser_traverse(
 
         snap_text = _render_surface_text(surface)
         result = step(snap_text, content_type, query, history)
+
+        # [wave-38 W38-A1] In-loop domain gate, judged on the STEP RESULT.
+        # The MCP one-shot session always lands on the context's OLDEST tab
+        # (@playwright/mcp 0.0.78 _currentTab default), so a concurrent
+        # walk's leftover navigation can leave us reading someone else's
+        # page (jobs 411/412). The 412 capture fired on the FIRST wrong-site
+        # read — a tolerance counter alone never fires on that shape — so
+        # this gate is TWO-TIER (D3):
+        #   • off-domain + is_listing → abort NOW: never capture, never
+        #     click around, someone else's listing;
+        #   • off-domain + not-listing → tolerate `wrong_site_tolerance`
+        #     consecutive reads (consent/SSO hops resolve within one).
+        # Unclassifiable surfaces (about:blank, chrome-error://, empty
+        # registrable) NEVER feed the counter — those are navigation states,
+        # and a flaky site bouncing to chrome-error must not masquerade as
+        # a bleed; they also never RESET the counter. Any on-domain read
+        # resets it. The poisoned surface may cost ONE LLM step on first
+        # sight — the price of not false-aborting consent walls; capture
+        # and wrong-site ACTIONS stay impossible. (The abort path skips the
+        # release quiesce by design — T4's recovery walk re-quiesces at its
+        # own start before reading anything.)
+        _s_url = surface.get("url") or ""
+        _s_reg = _registrable(_s_url) if _s_url else ""
+        if job_registrable and _s_reg and _s_reg != job_registrable:
+            if result.get("is_listing"):
+                _abort_notes = (
+                    f"wrong-site abort: browser tab on {_s_url} (expected "
+                    f"{job_registrable}) — off-domain page judged is_listing"
+                )
+                logger.error("[W38-A1] %s (job=%s)", _abort_notes, job_id)
+                return TraversalResult(
+                    reached=False, goal_url=start_url, path=path,
+                    mechanism="unknown", api=None, signals={},
+                    visited=path, pruned=[], notes=_abort_notes,
+                    discovery={"listing_url": None,
+                               "listing_reached": False,
+                               "pagination": None},
+                    wrong_site_abort=True, wrong_site_url=_s_url,
+                )
+            off_domain_reads += 1
+            logger.warning(
+                "[W38-A1] off-domain read %d/%d (job=%s want=%s got=%s)",
+                off_domain_reads, wrong_site_tolerance, job_id,
+                job_registrable, _s_url[:120],
+            )
+            if off_domain_reads >= wrong_site_tolerance:
+                _abort_notes = (
+                    f"wrong-site abort: browser tab on {_s_url} (expected "
+                    f"{job_registrable}) after {off_domain_reads} "
+                    "consecutive off-domain reads"
+                )
+                logger.error("[W38-A1] %s (job=%s)", _abort_notes, job_id)
+                return TraversalResult(
+                    reached=False, goal_url=start_url, path=path,
+                    mechanism="unknown", api=None, signals={},
+                    visited=path, pruned=[], notes=_abort_notes,
+                    discovery={"listing_url": None,
+                               "listing_reached": False,
+                               "pagination": None},
+                    wrong_site_abort=True, wrong_site_url=_s_url,
+                )
+        elif _s_reg == job_registrable and job_registrable:
+            off_domain_reads = 0
 
         # B1-veto: the LLM's is_listing judgment is FINAL. The DOM-repetition
         # detector's counts are shown in the surface text (_render_surface_text

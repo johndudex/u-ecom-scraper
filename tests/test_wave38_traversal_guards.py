@@ -1,0 +1,198 @@
+"""[wave-38] Shared-browser isolation: in-walk guards (T1 abort, T2 quiesce,
+T3 capture filters).
+
+The 412 bleed: the MCP one-shot session always lands on the context's OLDEST
+tab, so a concurrent job's in-flight goto was read, judged is_listing=True,
+and captured (its API + item links) — all upstream nets, nothing in-walk.
+These tests pin the in-walk defenses. Run inside the docker suite:
+  docker compose exec -T django sh -c 'cd /app/webapp && pytest ../tests . -q'
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "webapp"))
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+import django  # noqa: E402
+
+django.setup()
+
+import pytest  # noqa: E402
+
+from experimental.nav_traversal import traversal as tv  # noqa: E402
+
+
+class _Resp:
+    def __init__(self, content):
+        self.content = content
+
+
+def _resp(obj):
+    return _Resp(json.dumps(obj))
+
+
+class _FakeTool:
+    def __init__(self, name, fn):
+        self.name, self._fn = name, fn
+
+    def invoke(self, kwargs):
+        return self._fn(kwargs)
+
+
+def _surface(url, signals=None):
+    return {"url": url, "title": "t", "clickables": [], "scroll_hint": False,
+            "has_load_more": False, "signals": signals or {}}
+
+
+WESTELM = "https://www.westelm.com.au/bath"
+RTR = "https://www.renttherunway.com/collections"
+
+
+def _make_tools(surfaces, network="[]", item_links="[]"):
+    """One fake MCP toolset. surfaces[i] is the i-th _PAGE_STATE_JS read (an
+    Exception instance = raise). Later reads clamp to the last entry.
+
+    JS routing by unique markers in the REAL payloads: getEntriesByType =
+    network resource log; _commonPrefixDepth (underscored helper) =
+    _PAGE_STATE_JS; bare commonPrefixDepth = _ITEM_LINKS_JS (its helper is
+    NOT underscored — checked against traversal.py, the plan's original
+    single marker collided with the page-state JS)."""
+    reads = {"n": 0}
+
+    def ev_fn(kwargs):
+        js = kwargs.get("function", "")
+        if "getEntriesByType" in js:
+            return _Resp(network)
+        if "_commonPrefixDepth" in js:
+            i = reads["n"]
+            reads["n"] += 1
+            s = surfaces[min(i, len(surfaces) - 1)]
+            if isinstance(s, Exception):
+                raise s
+            return _resp(s)
+        if "commonPrefixDepth" in js:
+            return _Resp(item_links)
+        return _Resp("{}")
+
+    def noop(kwargs):
+        return _Resp("ok")
+
+    return [
+        _FakeTool("playwright_browser_navigate", noop),
+        _FakeTool("playwright_browser_click", noop),
+        _FakeTool("playwright_browser_evaluate", ev_fn),
+        _FakeTool("playwright_browser_wait_for", noop),
+        _FakeTool("playwright_browser_snapshot", noop),
+    ]
+
+
+def _step(action="click", listing=False):
+    def _fn(text, content_type, query, history):
+        return {"is_listing": listing, "action": action,
+                "target": "Shop", "reason": "test"}
+    return _fn
+
+
+_REAL_STABLE = getattr(tv, "wait_for_stable_page", None)  # pre-stub ref (None until T2 lands)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic(monkeypatch):
+    """No LLM, no network, no real capture, no quiesce ev-consumption:
+    walks are pure state machines over the scripted surfaces. (The real
+    wait_for_stable_page would CONSUME _PAGE_STATE_JS reads from the fake
+    ev, shifting every scripted sequence — stub it; TestWaitForStablePage
+    calls the captured _REAL_STABLE directly. raising=False: the attr only
+    exists once T2 has landed.)"""
+    monkeypatch.setattr(tv, "_do_action", lambda *a, **k: "acted")
+    monkeypatch.setattr(tv, "_capture_api_from_session", lambda *a, **k: None)
+    monkeypatch.setattr(tv, "_extract_item_links", lambda *a, **k: [])
+    monkeypatch.setattr(tv, "wait_for_stable_page", lambda *a, **k: True,
+                        raising=False)
+    monkeypatch.setattr(tv, "llm_step", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("llm_step must not run under test")))
+
+
+def _walk(monkeypatch, surfaces, step, **kwargs):
+    return tv.browser_traverse(
+        RTR, "product", "dress", mcp_tools=_make_tools(surfaces),
+        step_fn=step, max_actions=6, **kwargs)
+
+
+class TestWrongSiteGate:
+    def test_first_read_listing_judgment_aborts_immediately(self, monkeypatch):
+        """THE 412 REGRESSION TEST. The incident was a FIRST off-domain read
+        judged is_listing=True and captured — a tolerance counter never
+        reaches 2 on that shape. A listing judgment on an off-domain surface
+        aborts NOW: no capture, no action on the wrong site."""
+        actions = []
+        monkeypatch.setattr(
+            tv, "_do_action", lambda *a, **k: actions.append("x") or "x")
+        result = _walk(monkeypatch, [_surface(WESTELM)], _step(listing=True))
+        assert result.reached is False
+        assert result.wrong_site_abort is True
+        assert result.wrong_site_url == WESTELM
+        assert result.discovery["listing_reached"] is False
+        assert actions == [], "must not click around someone else's site"
+
+    def test_off_domain_non_listing_reads_abort_at_tolerance(self, monkeypatch):
+        """Tier 2: non-listing off-domain reads (consent-wall flavor)
+        tolerate 2 consecutive; the second aborts before a second action."""
+        result = _walk(monkeypatch, [_surface(WESTELM), _surface(WESTELM)],
+                       _step())
+        assert result.wrong_site_abort is True
+        assert result.wrong_site_url == WESTELM
+        assert result.discovery["listing_reached"] is False
+
+    def test_abort_notes_never_contain_mcp(self, monkeypatch):
+        """Routing contract: 'MCP' in notes sends _invoke_navigation_traverse
+        into the navigate_explore fallback — which drives the SAME dirty
+        browser. The abort note must never say MCP."""
+        result = _walk(monkeypatch, [_surface(WESTELM)], _step(listing=True))
+        assert "MCP" not in (result.notes or "")
+        assert "wrong-site" in (result.notes or "")
+
+    def test_single_off_domain_read_then_on_domain_recovers(self, monkeypatch):
+        """D3 tier 2: one consent-wall read must NOT abort — the counter
+        resets on the first on-domain read and the walk finds the listing."""
+        calls = {"n": 0}
+
+        def step(text, ct, q, history):
+            calls["n"] += 1
+            return {"is_listing": calls["n"] >= 2, "action": "click",
+                    "target": "Shop", "reason": "test"}
+
+        result = _walk(monkeypatch, [_surface(WESTELM), _surface(RTR)], step)
+        assert result.reached is True
+        assert result.wrong_site_abort is False
+
+    def test_unclassifiable_surfaces_never_count_as_off_domain(
+            self, monkeypatch):
+        """about:blank / chrome-error:// are navigation states, not another
+        site's content — a flaky site bouncing to chrome-error twice must
+        not masquerade as a 412 bleed."""
+        result = _walk(monkeypatch,
+                       [_surface("about:blank"), _surface("about:blank")],
+                       _step())
+        assert result.wrong_site_abort is False
+
+    def test_fields_default_off(self):
+        """Existing positional constructions (10 call sites) must be
+        untouched by the new fields."""
+        r = tv.TraversalResult(False, None, ["u"], "unknown", None, {}, ["u"], [])
+        assert r.wrong_site_abort is False
+        assert r.wrong_site_url == ""
+
+    def test_job_id_flows_through(self, monkeypatch):
+        result = _walk(monkeypatch, [_surface(WESTELM)], _step(listing=True),
+                       job_id=412)
+        assert result.wrong_site_abort is True
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
