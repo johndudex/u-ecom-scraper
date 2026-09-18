@@ -33,6 +33,12 @@ from .probe import (
     run_probe,
     render_page,
 )
+from .recycle_policy import (
+    BROWSER_PROACTIVE_RECYCLE,
+    BROWSER_RECYCLE_RATIO,
+    BROWSER_RECYCLE_SUSTAINED_S,
+    SustainedPressureTracker,
+)
 from .render_gate import render_gate_arm, render_gate_note, render_gate_satisfied as _render_gate_satisfied
 from .scraper_runner import run_scraper_script
 
@@ -1233,6 +1239,17 @@ async def _periodic_cleanup():
 # mutation from both the endpoint thread and the guarded runner).
 _SCRAPER_LAST_BUSY: list[float] = [time.monotonic()]
 
+# [wave-37 W37-OPS] Opt-in sustained-pressure recycle (Task 10, flag-off by
+# default): memory re-saturates within ~24h under batch load and the reactive
+# gate sheds 429s at 0.90 — this recycles the SCRAPER Chrome between
+# navigations once pressure has been SUSTAINED, buying headroom before the
+# gate trips. MCP Chrome is never touched here (analyzer/tester sessions ride
+# it). Track the dwell in module state (the tracker), armed/consumed by the
+# maintenance cycle.
+_PRESSURE_TRACKER = SustainedPressureTracker(
+    BROWSER_RECYCLE_RATIO, BROWSER_RECYCLE_SUSTAINED_S, BROWSER_PROACTIVE_RECYCLE,
+)
+
 
 def _maybe_recycle_scraper_chrome() -> None:
     """Stop the resident Scraper Chrome after a long idle period (B1-6).
@@ -1243,6 +1260,13 @@ def _maybe_recycle_scraper_chrome() -> None:
     the lazy state — ``ensure_scraper_chrome()`` relaunches it on the next
     /scrape, so recycling is invisible to callers. Runs on RESTART_EXECUTOR
     (it holds the restart lock for the teardown).
+
+    [wave-37 W37-OPS] Same teardown, second trigger: when
+    ``BROWSER_PROACTIVE_RECYCLE`` is enabled and the cgroup ratio has stayed
+    >= ``BROWSER_RECYCLE_RATIO`` for ``BROWSER_RECYCLE_SUSTAINED_S``, stop
+    the Scraper Chrome even WITHOUT idle — behind the same scrape guard (a
+    run in flight postpones, and the dwell keeps accumulating so the recycle
+    fires as soon as the guard lifts). Flag-off keeps this a no-op.
     """
     from .browser_pool import SCRAPER_RECYCLE_IDLE_S
 
@@ -1250,6 +1274,16 @@ def _maybe_recycle_scraper_chrome() -> None:
         return
     if _scrape_protection_active():
         _SCRAPER_LAST_BUSY[0] = time.monotonic()  # busy now — reset the idle clock
+        return
+    if _PRESSURE_TRACKER.observe(_cgroup_memory_ratio(), time.monotonic()):
+        logger.warning(
+            "recycle: cgroup memory >= %.2f sustained %.0fs — proactive "
+            "Scraper Chrome recycle (W37-OPS; lazy relaunch on next /scrape; "
+            "MCP Chrome untouched)",
+            BROWSER_RECYCLE_RATIO, BROWSER_RECYCLE_SUSTAINED_S,
+        )
+        browser_pool.stop_scraper_chrome()
+        _SCRAPER_LAST_BUSY[0] = time.monotonic()
         return
     idle_s = time.monotonic() - _SCRAPER_LAST_BUSY[0]
     if idle_s < SCRAPER_RECYCLE_IDLE_S:
