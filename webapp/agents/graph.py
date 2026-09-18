@@ -4633,8 +4633,24 @@ def _decide_strategy(state: ScrapeState) -> dict[str, Any]:
                 _cov_bad = bool(_discovery_coverage_failure(_prior_report))
             except Exception as _e:
                 logger.debug("_decide_strategy: coverage check skipped: %s", _e)
+        # [wave-37 W37-NEW-E] A PASS over zero extracted items is a failed
+        # cycle too (the false-PASS shape that produced 671/672's
+        # playwright→playwright no-op rerun: the escalated current strategy
+        # never entered history, so escalation landed right back on it).
+        _prior_false_pass = False
+        if isinstance(_prior_report, dict) and str(
+            _prior_report.get("overall_assessment") or ""
+        ).strip().upper() == "PASS":
+            try:
+                from .tools.browser_http import report_extracted_items
+
+                _prior_false_pass = report_extracted_items(_prior_report) == 0
+            except Exception as _e:
+                logger.debug("_decide_strategy: items check skipped: %s", _e)
         if _prior_strategy and isinstance(_prior_report, dict) and (
-            _prior_report.get("overall_assessment") not in (None, "PASS") or _cov_bad
+            _prior_report.get("overall_assessment") not in (None, "PASS")
+            or _cov_bad
+            or _prior_false_pass
         ):
             try:
                 from .nodes.route_after_testing import classify_test_failure
