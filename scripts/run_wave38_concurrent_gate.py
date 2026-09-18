@@ -89,9 +89,11 @@ def seed(job_id: int) -> int:
 def _drive_job(job_id: int):
     from scraper.models import ScrapeJob
 
+    # contains, NOT endswith: the graph APPENDS phase rows (e.g. [FIELD-MAP])
+    # to notes as the drive progresses, so the fixture tag drifts off the end.
     return (
         ScrapeJob.objects.filter(notes__startswith=WAVE38_NOTE,
-                                 notes__endswith=f"fixture={job_id}")
+                                 notes__contains=f"fixture={job_id}")
         .order_by("-id")
         .first()
     )
