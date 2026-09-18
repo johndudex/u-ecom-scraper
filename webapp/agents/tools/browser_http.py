@@ -493,11 +493,18 @@ def park_job_for_browser_service(job_id: int, reason: str) -> bool:
     falls back to the job's normal failure handling.
     """
     try:
+        from django.db.models import Value
+        from django.db.models.functions import Coalesce
+
         from scraper.models import ScrapeJob
 
+        # [wave-37 W37-3b] Stamp the park-episode start; the beat resumer adds
+        # the finished episode to parked_seconds when it flips the row. A row
+        # parked while ALREADY parked keeps its original episode start.
         updated = ScrapeJob.objects.filter(pk=job_id).update(
             status=ScrapeJob.STATUS_BROWSER_UNAVAILABLE,
             error_message=str(reason)[:2000],
+            last_parked_at=Coalesce("last_parked_at", Value(float(time.time()))),
         )
         if updated:
             logger.warning(

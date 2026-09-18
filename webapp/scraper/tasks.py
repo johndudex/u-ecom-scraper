@@ -2490,21 +2490,72 @@ def resume_browser_unavailable_jobs() -> dict:
 
     from agents.tools.browser_http import BROWSER_RESUME_BATCH
 
+    # [wave-37 W37-3b] Cumulative parked budget: park/resume exists to
+    # survive SHORT outages, not to fund unbounded park→resume→park flapping
+    # across repeated saturation windows. Past the budget, finalize honestly.
+    budget = int(os.environ.get("PARKED_TIME_BUDGET_S", "7200"))
+
     parked = list(
         ScrapeJob.objects.filter(
             status=ScrapeJob.STATUS_BROWSER_UNAVAILABLE
-        ).values_list("id", flat=True).order_by("id")[:BROWSER_RESUME_BATCH]
+        ).values("id", "parked_seconds", "last_parked_at").order_by("id")[
+            :BROWSER_RESUME_BATCH
+        ]
     )
     if not parked:
         return {"resumed": 0, "reason": "none parked"}
 
     resumed = []
-    for job_id in parked:
+    exhausted: list[dict] = []
+    for row in parked:
+        job_id = row["id"]
+        # Current episode counts toward the budget even before it finishes.
+        episode = max(0.0, time.time() - row["last_parked_at"]) if row["last_parked_at"] else 0.0
+        total = (row["parked_seconds"] or 0) + episode
+        if total >= budget:
+            # Claim-by-rowcount finalize: only a still-parked row may flip.
+            claimed = ScrapeJob.objects.filter(
+                pk=job_id, status=ScrapeJob.STATUS_BROWSER_UNAVAILABLE
+            ).update(
+                status=ScrapeJob.STATUS_FAILED,
+                error_message=(
+                    f"Browser-service park budget exhausted ({int(total)}s "
+                    f"cumulative across outages; budget {budget}s). Finalized "
+                    f"honestly — re-drive manually when the service is stable."
+                )[:4000],
+                completed_at=timezone.now(),
+            )
+            if not claimed:
+                continue
+            logger.warning(
+                "browser-park resumer: job %d EXHAUSTED park budget "
+                "(%ds >= %ds) — finalized failed instead of re-dispatching",
+                job_id, int(total), budget,
+            )
+            _publish_job_status(job_id, ScrapeJob.STATUS_FAILED)
+            try:
+                from scraper.models import Site
+
+                job_url = ScrapeJob.objects.filter(pk=job_id).values_list(
+                    "url", flat=True
+                ).first()
+                db_site = Site.objects.filter(url=(job_url or "").rstrip("/")).first()
+                if db_site and db_site.status == "in_progress":
+                    db_site.status = "failed"
+                    db_site.save(update_fields=["status"])
+            except Exception:
+                pass
+            exhausted.append({"job_id": job_id, "parked_seconds": int(total)})
+            continue
         # Claim-by-rowcount: only a still-parked row may flip. A row that
         # changed underneath (manual cancel/re-drive) is skipped untouched.
         claimed = ScrapeJob.objects.filter(
             pk=job_id, status=ScrapeJob.STATUS_BROWSER_UNAVAILABLE
-        ).update(status=ScrapeJob.STATUS_PENDING)
+        ).update(
+            status=ScrapeJob.STATUS_PENDING,
+            parked_seconds=(row["parked_seconds"] or 0) + int(episode),
+            last_parked_at=None,
+        )
         if not claimed:
             continue
         try:
@@ -2525,7 +2576,7 @@ def resume_browser_unavailable_jobs() -> dict:
                 "browser-park resumer: job %d dispatch failed (%s) — still parked",
                 job_id, exc,
             )
-    return {"resumed": len(resumed), "jobs": resumed}
+    return {"resumed": len(resumed), "jobs": resumed, "exhausted": exhausted}
 
 
 @shared_task

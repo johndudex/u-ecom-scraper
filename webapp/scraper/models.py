@@ -216,6 +216,14 @@ class ScrapeJob(models.Model):
     # reads THIS (not raw target_fields) so the output contract is the one the
     # pipeline enforced. Null = unmapped legacy job (identity behavior).
     field_mapping = models.JSONField(null=True, blank=True)
+    # Cumulative browser-service park time [wave-37 W37-3b]. parked_seconds =
+    # finished episodes; last_parked_at = current episode's start epoch (set
+    # by park_job_for_browser_service, cleared by the beat resumer on flip).
+    # Past PARKED_TIME_BUDGET_S total the resumer finalizes instead of
+    # re-dispatching — park/resume exists to survive SHORT outages, not to
+    # fund unbounded flapping.
+    parked_seconds = models.PositiveIntegerField(default=0)
+    last_parked_at = models.FloatField(null=True, blank=True)
     # Rerun lineage [wave-27 W27-8]: parent = the immediate source job;
     # origin = the chain root (restart-of-restart chains read one row, not a
     # walk). Set ONLY by job_restart — fresh-create paths stay unlinked.
