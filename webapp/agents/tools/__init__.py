@@ -87,7 +87,8 @@ ALLOWED_PLAYWRIGHT_TOOLS: dict[str, list[str]] = {
         "playwright_browser_network_requests",
         "playwright_browser_network_request",
         "playwright_browser_wait_for",
-        "playwright_browser_tabs",
+        # [wave-38 T5] playwright_browser_tabs REMOVED — agents must not
+        # retarget the shared walk tab (the 412 bleed leaned on tab flows).
     ],
     # ═══ ARCHIVED (replaced by browser_traverse) ═══
     # "navigation_agent": [

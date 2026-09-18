@@ -273,5 +273,49 @@ class TestLockRenewal:
         assert rows, "the SessionLog row must survive a dead redis"
 
 
+class TestProductAnalyzerAllowlist:
+    def _names(self):
+        import re
+
+        src = open(os.path.join(ROOT, "webapp", "agents", "tools",
+                                "__init__.py"), encoding="utf-8").read()
+        # anchor inside ALLOWED_PLAYWRIGHT_TOOLS — "product_analyzer" also
+        # keys the file-tool ALLOWED_TOOLS dict earlier in the file
+        i = src.index("ALLOWED_PLAYWRIGHT_TOOLS")
+        m = re.search(r'"product_analyzer":\s*\[(.*?)\]', src[i:], re.DOTALL)
+        return re.findall(r'"(playwright_[a-z_]+)"', m.group(1))
+
+    def test_browser_tabs_removed(self):
+        assert "playwright_browser_tabs" not in self._names()
+
+    def test_reader_tools_survive(self):
+        for n in ("playwright_browser_navigate",
+                  "playwright_browser_evaluate",
+                  "playwright_browser_click",
+                  "playwright_browser_wait_for"):
+            assert n in self._names(), f"{n} must stay (product_analyzer reads pages)"
+
+    def test_remaining_names_resolve_no_fail_open(self):
+        """Fail-open awareness, statically: @playwright/mcp tool names are
+        discovered LIVE over HTTP (playwright_tools.py holds no name
+        literals), so the in-repo manifest of the tool surface is the
+        SKILL.md tool table. An ALL-stale allowlist is what trips the
+        fail-open branch (subagents.py extends ALL tools, tabs included);
+        one stale name would silently drop a tool."""
+        import re as _re
+
+        skill = open(os.path.join(ROOT, ".opencode", "skills",
+                                  "playwright-navigation", "SKILL.md"),
+                     encoding="utf-8").read()
+        documented = set(_re.findall(r"`(playwright_[a-z_]+)`", skill))
+        names = self._names()
+        assert names, "empty allowlist would fail product_analyzer open"
+        for n in names:
+            assert n in documented, (
+                f"{n} missing from SKILL.md tool table — stale entry risks "
+                "the fail-open branch"
+            )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

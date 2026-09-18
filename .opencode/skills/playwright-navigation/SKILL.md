@@ -35,12 +35,18 @@ Use this when:
 | `playwright_browser_hover` | Hover over elements |
 | `playwright_browser_wait_for` | Wait for text/element/time |
 | `playwright_browser_network_requests` | Monitor network traffic |
+| `playwright_browser_network_request` | Inspect a single network request |
 | `playwright_browser_press_key` | Simulate keyboard input |
 | `playwright_browser_select_option` | Select dropdown options |
-| `playwright_browser_tabs` | Manage browser tabs |
 | `playwright_browser_drag` | Drag and drop |
 | `playwright_browser_fill_form` | Fill form fields |
 | `playwright_browser_close` | Close page |
+
+## Tabs
+
+Agents have no tab tools. The shared browser's active tab is managed by the
+infrastructure (one walk at a time, traversal lock). Never plan multi-tab
+flows.
 
 ## Core Navigation Patterns
 
