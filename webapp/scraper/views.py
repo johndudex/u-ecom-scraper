@@ -2652,6 +2652,9 @@ _INTAKE_NAV_TO_INPUT_MODE = {
     "list": "url_list",
     "listing": "list_page",
     "search": "search_term",
+    # [wave-37 W37-NEW-C] PDP-shaped intake coercion lands here: a coerced
+    # job runs the pipeline's url_list single-item mode.
+    "pdp": "url_list",
 }
 
 
@@ -2987,6 +2990,18 @@ def intake_create_job(request):
 
     if not url:
         return JsonResponse({"error": "url required"}, status=400)
+
+    # [wave-37 W37-NEW-C] PDP-shaped listing/search submissions coerce to PDP
+    # mode at intake (prod 626-class: 7 jobs mined a PDP's recommendation
+    # carousels as a "listing" and died on the cross-domain guard). Rebind
+    # nav_method so EVERY downstream branch — search_criteria selection, the
+    # wave-32 B3 host gate, the mode map — follows the coerced mode.
+    from src.intake_coerce import coerce_pdp_intake
+
+    nav_method, _coerce_note = coerce_pdp_intake(url, nav_method)
+    if _coerce_note:
+        notes = f"{notes} | {_coerce_note}".strip(" |")
+        logger.info("intake_create_job: %s", _coerce_note)
 
     input_mode = _INTAKE_NAV_TO_INPUT_MODE.get(nav_method, "url_list")
     page_type = content_type or "product"
