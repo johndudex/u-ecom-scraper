@@ -946,9 +946,9 @@ from experimental.nav_traversal import traversal as tv  # noqa: E402
 
 
 def _tr(seed, **kw):
-    """Honest TraversalResult via the same positional idiom graph uses."""
-    return tv.TraversalResult(seed[0], seed[1], seed[2], seed[3], seed[4],
-                              seed[5], seed[6], seed[7], seed[8], **kw)
+    """Honest TraversalResult via the same positional idiom graph uses.
+    (seed may carry 8 or 9 elements — the 9th positional IS notes.)"""
+    return tv.TraversalResult(*seed, **kw)
 
 
 NOT_REACHED = (False, None, ["https://a.example/"], "unknown", None, {},
@@ -1053,7 +1053,7 @@ class TestWrongSiteRecovery:
 
     def test_abort_triggers_exactly_one_locked_recovery(
             self, monkeypatch, tmp_path):
-        abort = _tr(NOT_REACHED, wrong_site_abort=True,
+        abort = _tr(NOT_REACHED[:8], wrong_site_abort=True,  # seed[:8]: 9th positional IS notes
                     wrong_site_url="https://www.westelm.com.au/bath",
                     notes="wrong-site abort: browser tab on "
                           "https://www.westelm.com.au/bath (expected "
@@ -1078,7 +1078,7 @@ class TestWrongSiteRecovery:
         `if not result.reached:` HTTP fallback runs traverse() EXACTLY ONCE.
         The helper runs no internal HTTP lane (D5); on a JS-listing site this
         degrades honestly instead of fabricating a second browser walk."""
-        abort = _tr(NOT_REACHED, wrong_site_abort=True,
+        abort = _tr(NOT_REACHED[:8], wrong_site_abort=True,  # seed[:8]: 9th positional IS notes
                     wrong_site_url="https://www.westelm.com.au/bath",
                     notes="wrong-site abort: browser tab on "
                           "https://www.westelm.com.au/bath (expected "

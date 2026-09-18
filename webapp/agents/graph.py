@@ -3689,6 +3689,14 @@ end
 return 0
 """
 
+# [wave-38 W38-A5] compare-and-expire: renew ONLY if we still own the lock
+_RENEW_LOCK_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('expire', KEYS[1], ARGV[2])
+end
+return 0
+"""
+
 
 def _traversal_redis():
     """Redis client for the traversal lock. Deliberately NOT django.core.cache:
@@ -3762,7 +3770,7 @@ def _mcp_browser_lock(
             )
 
 
-def _traverse_heartbeat_writer(job_id):
+def _traverse_heartbeat_writer(job_id, *, renew_lock: bool = False):
     """[wave-30 W30-8] SessionLog heartbeat writer for the browser_traverse
     walk.
 
@@ -3771,9 +3779,17 @@ def _traverse_heartbeat_writer(job_id):
     calls this at most every 300s with step/elapsed info; each call becomes
     one ``[NAV-TRAVERSE]`` system row (agent-heartbeat idiom). Failures are
     swallowed: telemetry must never break the walk.
+
+    [wave-38 W38-A5/D4] With renew_lock=True (the caller holds the traversal
+    lock), a beat showing PROGRESS (actions increased since the previous
+    beat) also renews the lock TTL. Stalled walks stop renewing → TTL expiry
+    keeps today's crashed-holder self-heal; a healthy walk longer than the
+    TTL (1500s) no longer silently outlives its own lock (ceiling is 3600s).
     """
+    last_actions = 0
 
     def _write(info: dict) -> None:
+        nonlocal last_actions
         try:
             from scraper.models import SessionLog
 
@@ -3791,8 +3807,83 @@ def _traverse_heartbeat_writer(job_id):
             )
         except Exception as exc:
             logger.debug("traverse heartbeat write failed (job %s): %s", job_id, exc)
+        if renew_lock:
+            try:
+                _actions = int(info.get("actions") or 0)
+                if _actions > last_actions:
+                    last_actions = _actions
+                    client = _traversal_redis()
+                    client.eval(
+                        _RENEW_LOCK_LUA, 1, _TRAVERSAL_LOCK_KEY,
+                        str(job_id), _TRAVERSAL_LOCK_TTL,
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "traverse lock renewal failed (job %s): %s", job_id, exc
+                )
 
     return _write
+
+
+def _retraverse_locked(
+    url: str, content_type: str, query: str, job_id: int, *,
+    wait_timeout: float = 150.0,
+):
+    """[wave-38 W38-A1/A4] ONE recovery walk under a freshly-acquired lock.
+
+    Serves both recovery arms: the W38-A1 wrong-site abort and the T1.6
+    cross-domain contamination. The old forced re-traverse ran OUTSIDE the
+    lock — a guaranteed bleed window, and the exact shape that made 412
+    possible.
+
+    Lock-and-walk ONLY (D5): on lock-busy (bounded ~2.5 min wait — never
+    stack another 15-minute walker behind the walk that poisoned this one)
+    or a walk exception, return an honest not-reached result and let the
+    NODE's existing ``if not result.reached:`` HTTP fallback be the single
+    HTTP lane. An internal lane here would run HTTP traverse TWICE per
+    recovery; and the node re-runs T1.6 contamination after that fallback,
+    so a lock-busy sentinel can never silently substitute for a real walk.
+    ALWAYS returns a TraversalResult; never raises.
+    """
+    from experimental.nav_traversal.traversal import TraversalResult
+
+    def _not_reached(notes: str):
+        return TraversalResult(
+            False, None, [url], "unknown", None, {}, [url], [], notes,
+            discovery={"listing_url": None, "listing_reached": False,
+                       "pagination": None},
+        )
+
+    try:
+        with _mcp_browser_lock(job_id, wait_timeout=wait_timeout) as acquired:
+            if acquired:
+                from experimental.nav_traversal.traversal import (
+                    browser_traverse,
+                )
+
+                return browser_traverse(
+                    url, content_type, query,
+                    trust_start_as_listing=False,
+                    job_id=job_id,
+                    heartbeat_fn=(
+                        _traverse_heartbeat_writer(job_id, renew_lock=True)
+                        if job_id else None
+                    ),
+                )
+            return _not_reached(
+                f"re-traverse lock busy after {wait_timeout:.0f}s "
+                f"(job {job_id}) — HTTP lane"
+            )
+    except Exception as exc:
+        logger.exception(
+            "browser_traverse: locked re-traverse failed (job %s)", job_id
+        )
+        # Notes carry the exception TYPE only — this sentinel passes the
+        # node's `if "MCP" in notes:` router, and an embedded message (e.g.
+        # "MCP session closed") would divert recovery into the
+        # navigate_explore fallback: the same shared browser we just found
+        # dirty. Full detail is already in the logger.exception traceback.
+        return _not_reached(f"locked re-traverse failed: {type(exc).__name__}")
 
 
 def _invoke_navigation_traverse(
@@ -3821,7 +3912,7 @@ def _invoke_navigation_traverse(
         # [jobs 349/350] the walk drives the ONE shared MCP Chrome — hold the
         # cross-worker lock so concurrent jobs take turns instead of
         # interleaving pages into each other's traversal results.
-        with _mcp_browser_lock(job_id):
+        with _mcp_browser_lock(job_id) as _lock_held:
             result = browser_traverse(
                 url, content_type, query,
                 # [wave-34 T34-2] a PDP-flipped job must never trust its seed
@@ -3830,12 +3921,31 @@ def _invoke_navigation_traverse(
                     _input_mode in ("list_page", "search_term")
                     and not state.get("pdp_seed_flip")
                 ),
+                # [wave-38 W38-A1] in-walk wrong-site assertion anchor.
+                job_id=job_id,
                 # [wave-30 W30-8] heartbeat rows every 300s + the
                 # NAV_TRAVERSE_MAX_TIMEOUT hard ceiling (resolved inside
                 # traversal.py) — the walk is otherwise invisible in
-                # SessionLog (prod 569).
-                heartbeat_fn=_traverse_heartbeat_writer(job_id) if job_id else None,
+                # SessionLog (prod 569). [wave-38 W38-A5] the heartbeat
+                # renews the lock TTL on progress when we hold the lock.
+                heartbeat_fn=(
+                    _traverse_heartbeat_writer(job_id, renew_lock=_lock_held)
+                    if job_id else None
+                ),
             )
+
+        # [wave-38 W38-A1/D1] The walk aborted because the shared tab was on
+        # another site. Recover with ONE locked+quiesced walk BEFORE any
+        # generic fallback: the HTTP lane fails on JS listings, and the
+        # navigate_explore fallback drives the SAME browser we just found
+        # dirty. (The abort notes never contain "MCP" — routing contract.)
+        if getattr(result, "wrong_site_abort", False):
+            logger.error(
+                "browser_traverse: wrong-site abort (job %s) — browser tab "
+                "on %s; ONE locked re-traverse",
+                job_id, (result.wrong_site_url or "")[:80],
+            )
+            result = _retraverse_locked(url, content_type, query, job_id)
 
         # MCP unavailable → fall back to the archived deterministic explorer +
         # synthesizer (imported lazily here so the fallback path is self-contained).
@@ -3959,9 +4069,7 @@ def _invoke_navigation_traverse(
                     "— ONE forced-homepage re-traverse",
                     job_id, url[:80], "; ".join(_bad),
                 )
-                _retry = browser_traverse(
-                    url, content_type, query, trust_start_as_listing=False
-                )
+                _retry = _retraverse_locked(url, content_type, query, job_id)
                 _bad2 = _nav_result_contamination(_retry, url)
                 if not _bad2:
                     logger.warning(

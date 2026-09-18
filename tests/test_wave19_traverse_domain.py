@@ -151,7 +151,16 @@ class TestWrapperWiring:
 
     def test_one_forced_homepage_retraverse(self):
         src = self._wrapper_src()
-        assert "trust_start_as_listing=False" in src, (
+        # [wave-38 T4] the recovery walk runs via _retraverse_locked — locked,
+        # bounded-wait — instead of a bare browser_traverse call.
+        assert "_retraverse_locked(" in src, (
+            "the re-traverse must run under a freshly-acquired traversal lock"
+        )
+        m = re.search(
+            r"^def _retraverse_locked\(.*?(?=^def |\Z)", _graph_src, re.S | re.M
+        )
+        assert m, "_retraverse_locked not found"
+        assert "trust_start_as_listing=False" in m.group(0), (
             "the re-traverse must restart from the homepage, not trust the poisoned path"
         )
 
