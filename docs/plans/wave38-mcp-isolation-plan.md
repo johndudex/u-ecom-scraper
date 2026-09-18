@@ -4,7 +4,7 @@
 
 **Goal:** Make the shared Playwright-MCP Chrome safe under concurrency — a walk can never silently read, judge, or capture ANOTHER job's pages (the 411/412 cross-job bleed), and the deprecated `/scrape` lane stops sharing destructive state between sibling runs.
 
-**Architecture:** Defense at the only boundary that always executes — inside the walk itself. `browser_traverse` gains an in-loop domain assertion (2 consecutive off-domain reads → honest abort), a best-effort quiesce at walk boundaries (no read while a navigation is in flight), and job-domain filters on both capture paths (API candidates filtered BEFORE verify probes, item links filtered after parse). Graph-side, every recovery walk runs under a freshly-acquired traversal lock via one new `_retraverse_locked` helper, and the lock TTL is renewed only on heartbeat progress so long healthy walks stop outliving their own lock. Scrape-lane hardening is minimal and mechanical: honor `SCRAPER_CDP_PORT` in `scraper_runner`, drop `--remote-allow-origins=*` from the deprecated scraper Chrome, and (decision-gated) drop the scraper concurrency cap to 1.
+**Architecture:** Defense at the only boundary that always executes — inside the walk itself. `browser_traverse` gains a POST-step two-tier wrong-site gate (an off-domain read the LLM judged `is_listing` aborts IMMEDIATELY — the 412 shape; non-listing off-domain reads tolerate 2 consecutive), a best-effort quiesce at walk boundaries (no read while a navigation is in flight), and count-gated two-pass capture filters (probe on-domain API candidates first; off-domain candidates probed only when nothing on-domain produced a count — aya's vendor-domain API class survives; item links filtered after parse). Graph-side, every recovery walk runs under a freshly-acquired traversal lock via one new `_retraverse_locked` helper — lock-and-walk ONLY, with the node's existing HTTP fallback as the single HTTP lane — and the lock TTL is renewed only on heartbeat progress so long healthy walks stop outliving their own lock. Scrape-lane hardening is minimal and mechanical: honor `SCRAPER_CDP_PORT` in `scraper_runner`, drop `--remote-allow-origins=*` from the deprecated scraper Chrome, and (decision-gated) drop the scraper concurrency cap to 1.
 
 **Tech Stack:** Python (LangGraph node + pure module `experimental/nav_traversal/traversal.py`), Redis Lua CAS scripts, pytest with fake MCP tools, browser_service (FastAPI) env/source pins.
 
@@ -33,10 +33,10 @@
 These five amendments came from the adversarial review the user demanded. They are constraints, not suggestions:
 
 - **D1 — Wrong-site abort must route DIRECTLY to a locked+quiesced re-traverse, never into the generic fallback chain.** The observed 412 recovery (forced re-traverse → 10/10) must be preserved, not flipped into a 0-item failure: on a JS-listing site the HTTP `traverse()` lane returns 0 items, and the `navigate_explore` fallback drives the same shared browser. Recovery = `_retraverse_locked` (T4), bounded-wait, then the existing HTTP lane as last resort.
-- **D2 — Capture filters anchor on the JOB's `start_url` registrable, never `goal_url`.** During a bleed, `goal_url` IS the wrong site — filtering against it launders the poison (412's westelm `/api/items` capture "matched" the westelm goal page). `job_registrable = _registrable(start_url)` computed once at walk start. API candidates are filtered BEFORE `verify_api` probes fire (a filtered candidate must not be requested at all). Unparseable-registrable candidates (`""`) are KEPT (conservative: don't drop what we can't classify).
-- **D3 — Abort only after 2 consecutive off-domain reads** (no on-domain read in between). Legit SSO/consent hops resolve within one read; a bleed persists. Counter resets on any on-domain read. Off-domain abort applies to ALL input modes (a user-seeded `list_page` URL that genuinely redirects cross-domain degrades honestly to the HTTP lane — acceptable; the T1.6 result guard remains the backstop).
+- **D2 — Capture filters anchor on the JOB's `start_url` registrable, never `goal_url`.** During a bleed, `goal_url` IS the wrong site — filtering against it launders the poison (412's westelm `/api/items` capture "matched" the westelm goal page). `job_registrable = _registrable(start_url)` computed once at walk start. SELECTION is filtered: an off-domain candidate can never win while an on-domain candidate exists. PROBING is two-pass and count-gated: on-domain candidates verify first; off-domain candidates verify ONLY if no on-domain candidate returned count>0 — this preserves the **aya vendor-API class** (wave-34 F1 explicitly ranks a vendor-domain `aya /job/search`, count=26803, ABOVE an on-domain count-less taxonomy XHR; a naive pre-verify filter silently breaks it). Unparseable-registrable candidates (`""`) count as on-domain (don't drop what we can't classify).
+- **D3 — Two-tier off-domain gate, judged on the STEP RESULT.** The 412 incident was a FIRST wrong-site read judged `is_listing=True` and captured — a tolerance-2 pre-step counter never fires on that shape. So the gate runs AFTER the LLM step: (tier 1) an off-domain read (registrable non-empty and ≠ job) where the LLM judged `is_listing` aborts IMMEDIATELY — never judge, capture, or click another site's listing; (tier 2) off-domain reads judged not-listing tolerate 2 consecutive (legit SSO/consent hops resolve within one). Unclassifiable surfaces (`about:blank`, `chrome-error://`, empty registrable) NEVER feed the counter — they're navigation states, and a flaky site's chrome-error bounce must not masquerade as a bleed; they also never RESET the counter. Counter resets on any on-domain read. The poisoned surface may cost ONE LLM step on first sight — the price of not false-aborting consent walls; capture and wrong-site ACTIONS stay impossible. Off-domain abort applies to ALL input modes (a user-seeded `list_page` URL that genuinely redirects cross-domain degrades honestly to the HTTP lane — acceptable; the T1.6 result guard remains the backstop).
 - **D4 — Lock-TTL renewal is progress-gated, never unconditional.** TTL expiry (1500s) is today's hung-walk self-heal; renewal fires only when the heartbeat's `actions` count increased since the previous beat. A stalled walk stops renewing and stays self-healing.
-- **D5 — Quiesce is best-effort, never a gate.** `wait_for_stable_page` never raises, never aborts, and treats evaluate exceptions (including "Execution context destroyed" — the very condition it exists for) as `False` → proceed. Recovery walks wait ≤150s for the lock, then take the HTTP lane instead of stacking another 15-minute walker behind the walk that poisoned them.
+- **D5 — Quiesce is best-effort, never a gate.** `wait_for_stable_page` never raises, never aborts, and treats evaluate exceptions (including "Execution context destroyed" — the very condition it exists for) as `False` → proceed. Recovery walks wait ≤150s for the lock, then take the HTTP lane — the NODE's existing `if not result.reached:` fallback, which the helper itself deliberately does NOT duplicate (an internal lane would run HTTP traverse twice per recovery).
 
 ---
 
@@ -44,9 +44,9 @@ These five amendments came from the adversarial review the user demanded. They a
 
 | # | Deliverable | Files | Evidence |
 |---|-------------|-------|----------|
-| T1 | In-walk wrong-site abort (2-read tolerance) + honest result fields | `experimental/nav_traversal/traversal.py` | §2.1, §2.2 |
+| T1 | In-walk wrong-site gate (listing-tier immediate abort + 2-read non-listing tolerance) + honest result fields | `experimental/nav_traversal/traversal.py` | §2.1, §2.2 |
 | T2 | `wait_for_stable_page` best-effort quiesce at 3 walk boundaries | `experimental/nav_traversal/traversal.py` | §2.1 |
-| T3 | Job-domain capture filters (API candidates pre-verify + item links) | `experimental/nav_traversal/traversal.py` | §2.1, D2 |
+| T3 | Job-domain capture filters (count-gated two-pass API probing + item-link filter) | `experimental/nav_traversal/traversal.py` | §2.1, D2 |
 | T4 | Lock hygiene: progress-gated TTL renewal, `_retraverse_locked`, recovery wiring | `webapp/agents/graph.py` | §2.3 |
 | T5 | Remove `browser_tabs` from product_analyzer allowlist | `webapp/agents/tools/__init__.py`, skill doc | §2.3 |
 | T6 | Scrape hardening: CDP port truth, drop wildcard allow-origins, cap decision | `browser_service/scraper_runner.py`, `browser_pool.py`, `server.py` | §2.4 |
@@ -70,7 +70,7 @@ Timeline from the celery log of the shared browser-service:
 | + | 412's LLM judges `is_listing=True` on wrong-site content; capture pulls westelm's resource log (`/api/items`) + 12 westelm item links |
 | + | Downstream nets catch it: wave-34 F2 off-domain api-drop ERROR + T1.6 contamination → forced re-traverse (OUTSIDE the lock) comes back clean → 412 still finished 10/10 |
 
-Root cause: the lock WORKED — the bleed was leftover tab state, not interleaved walks. Every defense that fired was a DOWNSTREAM net; nothing in the walk itself noticed the wrong domain.
+Root cause: the lock WORKED — the bleed was leftover tab state, not interleaved walks. Every defense that fired was a DOWNSTREAM net; nothing in the walk itself noticed the wrong domain. **Design note:** the capture fired on the FIRST wrong-site read — any tolerance-2 pre-step counter would have MISSED this exact incident. That fact drives the two-tier gate in D3.
 
 ### 2.2 Active-tab rule (@playwright/mcp@0.0.78, verified from the running container's npx cache)
 
@@ -145,8 +145,10 @@ _RENEW_LOCK_LUA = """..."""   # compare-and-expire, mirrors _RELEASE_LOCK_LUA
 def _traverse_heartbeat_writer(job_id, *, renew_lock: bool = False) -> Callable[[dict], None]: ...
 def _retraverse_locked(url: str, content_type: str, query: str, job_id: int,
                        *, wait_timeout: float = 150.0) -> TraversalResult: ...
-    # ALWAYS returns a TraversalResult (HTTP-lane errors become an honest
-    # not-reached result, never None, never an exception).
+    # Lock-and-walk ONLY. ALWAYS returns a TraversalResult, never raises.
+    # Lock-busy (bounded wait) / walk-exception → honest not-reached; the
+    # NODE's existing `if not result.reached:` fallback is the single HTTP
+    # lane (an internal one would run HTTP traverse twice per recovery).
 ```
 
 Graph call sites after T4: `browser_traverse(url, content_type, query, trust_start_as_listing=..., job_id=job_id, heartbeat_fn=_traverse_heartbeat_writer(job_id, renew_lock=_lock_held) if job_id else None)` under `with _mcp_browser_lock(job_id) as _lock_held:`; the contamination branch calls `_retry = _retraverse_locked(url, content_type, query, job_id)`; a `wrong_site_abort` result triggers `result = _retraverse_locked(...)` BEFORE the `"MCP" in notes` check.
@@ -260,7 +262,7 @@ def _step(action="click", listing=False):
     return _fn
 
 
-_REAL_STABLE = tv.wait_for_stable_page  # captured pre-stub for T2's own tests
+_REAL_STABLE = getattr(tv, "wait_for_stable_page", None)  # pre-stub ref (None until T2 lands)
 
 
 @pytest.fixture(autouse=True)
@@ -269,11 +271,13 @@ def _hermetic(monkeypatch):
     walks are pure state machines over the scripted surfaces. (The real
     wait_for_stable_page would CONSUME _PAGE_STATE_JS reads from the fake
     ev, shifting every scripted sequence — stub it; TestWaitForStablePage
-    calls the captured _REAL_STABLE directly.)"""
+    calls the captured _REAL_STABLE directly. raising=False: the attr only
+    exists once T2 has landed.)"""
     monkeypatch.setattr(tv, "_do_action", lambda *a, **k: "acted")
     monkeypatch.setattr(tv, "_capture_api_from_session", lambda *a, **k: None)
     monkeypatch.setattr(tv, "_extract_item_links", lambda *a, **k: [])
-    monkeypatch.setattr(tv, "wait_for_stable_page", lambda *a, **k: True)
+    monkeypatch.setattr(tv, "wait_for_stable_page", lambda *a, **k: True,
+                        raising=False)
     monkeypatch.setattr(tv, "llm_step", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("llm_step must not run under test")))
 
@@ -284,11 +288,27 @@ def _walk(monkeypatch, surfaces, step, **kwargs):
         step_fn=step, max_actions=6, **kwargs)
 
 
-class TestWrongSiteAbort:
-    def test_two_consecutive_off_domain_reads_abort(self, monkeypatch):
+class TestWrongSiteGate:
+    def test_first_read_listing_judgment_aborts_immediately(self, monkeypatch):
+        """THE 412 REGRESSION TEST. The incident was a FIRST off-domain read
+        judged is_listing=True and captured — a tolerance counter never
+        reaches 2 on that shape. A listing judgment on an off-domain surface
+        aborts NOW: no capture, no action on the wrong site."""
+        actions = []
+        monkeypatch.setattr(
+            tv, "_do_action", lambda *a, **k: actions.append("x") or "x")
+        result = _walk(monkeypatch, [_surface(WESTELM)], _step(listing=True))
+        assert result.reached is False
+        assert result.wrong_site_abort is True
+        assert result.wrong_site_url == WESTELM
+        assert result.discovery["listing_reached"] is False
+        assert actions == [], "must not click around someone else's site"
+
+    def test_off_domain_non_listing_reads_abort_at_tolerance(self, monkeypatch):
+        """Tier 2: non-listing off-domain reads (consent-wall flavor)
+        tolerate 2 consecutive; the second aborts before a second action."""
         result = _walk(monkeypatch, [_surface(WESTELM), _surface(WESTELM)],
                        _step())
-        assert result.reached is False
         assert result.wrong_site_abort is True
         assert result.wrong_site_url == WESTELM
         assert result.discovery["listing_reached"] is False
@@ -297,32 +317,33 @@ class TestWrongSiteAbort:
         """Routing contract: 'MCP' in notes sends _invoke_navigation_traverse
         into the navigate_explore fallback — which drives the SAME dirty
         browser. The abort note must never say MCP."""
-        result = _walk(monkeypatch, [_surface(WESTELM), _surface(WESTELM)],
-                       _step())
+        result = _walk(monkeypatch, [_surface(WESTELM)], _step(listing=True))
         assert "MCP" not in (result.notes or "")
         assert "wrong-site" in (result.notes or "")
 
     def test_single_off_domain_read_then_on_domain_recovers(self, monkeypatch):
-        """D3: one off-domain read (legit SSO/consent hop) must NOT abort —
-        the counter resets on the first on-domain read."""
-        result = _walk(monkeypatch, [_surface(WESTELM), _surface(RTR)],
-                       _step(action="click", listing=False))
-        assert result.reached is True  # second read judged listing
+        """D3 tier 2: one consent-wall read must NOT abort — the counter
+        resets on the first on-domain read and the walk finds the listing."""
+        calls = {"n": 0}
+
+        def step(text, ct, q, history):
+            calls["n"] += 1
+            return {"is_listing": calls["n"] >= 2, "action": "click",
+                    "target": "Shop", "reason": "test"}
+
+        result = _walk(monkeypatch, [_surface(WESTELM), _surface(RTR)], step)
+        assert result.reached is True
         assert result.wrong_site_abort is False
 
-    def test_no_llm_call_consumed_by_the_aborted_read(self, monkeypatch):
-        """The abort fires on the READ, before step() — the poisoned surface
-        must not burn an LLM turn."""
-        calls = []
-
-        def counting_step(text, ct, q, history):
-            calls.append(text)
-            return {"is_listing": False, "action": "click",
-                    "target": "x", "reason": ""}
-
-        _walk(monkeypatch, [_surface(WESTELM), _surface(WESTELM)],
-              counting_step)
-        assert len(calls) <= 1, "second off-domain read must abort pre-step"
+    def test_unclassifiable_surfaces_never_count_as_off_domain(
+            self, monkeypatch):
+        """about:blank / chrome-error:// are navigation states, not another
+        site's content — a flaky site bouncing to chrome-error twice must
+        not masquerade as a 412 bleed."""
+        result = _walk(monkeypatch,
+                       [_surface("about:blank"), _surface("about:blank")],
+                       _step())
+        assert result.wrong_site_abort is False
 
     def test_fields_default_off(self):
         """Existing positional constructions (10 call sites) must be
@@ -331,9 +352,9 @@ class TestWrongSiteAbort:
         assert r.wrong_site_abort is False
         assert r.wrong_site_url == ""
 
-    def test_job_id_is_ignored_by_pure_walk(self, monkeypatch):
-        result = _walk(monkeypatch, [_surface(WESTELM), _surface(WESTELM)],
-                       _step(), job_id=412)
+    def test_job_id_flows_through(self, monkeypatch):
+        result = _walk(monkeypatch, [_surface(WESTELM)], _step(listing=True),
+                       job_id=412)
         assert result.wrong_site_abort is True
 ```
 
@@ -350,10 +371,12 @@ In `experimental/nav_traversal/traversal.py`:
 
 ```python
     # [wave-38 W38-A1] Honest wrong-site abort (412): the walk observed the
-    # shared tab on ANOTHER registrable domain for wrong_site_tolerance
-    # consecutive reads and refused to judge/capture it. The graph recovers
-    # via _retraverse_locked; notes deliberately never contain "MCP" (that
-    # substring routes into the navigate_explore fallback — same dirty browser).
+    # shared tab on ANOTHER registrable domain — an off-domain page the LLM
+    # judged is_listing (immediate abort), or wrong_site_tolerance
+    # consecutive off-domain reads — and refused to judge/capture it. The
+    # graph recovers via _retraverse_locked; notes deliberately never
+    # contain "MCP" (that substring routes into the navigate_explore
+    # fallback — same dirty browser).
     wrong_site_abort: bool = False
     wrong_site_url: str = ""
 ```
@@ -375,43 +398,74 @@ In `experimental/nav_traversal/traversal.py`:
     off_domain_reads = 0
 ```
 
-(d) In the main loop, immediately after the empty-surface break (`if not surface: ... break`) and BEFORE `signals = surface.get("signals") or {}`, insert:
+(d) In the main loop, directly AFTER `result = step(snap_text, content_type, query, history)` and BEFORE `history.append(result)`, insert the two-tier domain gate:
 
 ```python
-        # [wave-38 W38-A1] In-loop domain assertion. The MCP one-shot session
-        # always lands on the context's OLDEST tab (@playwright/mcp 0.0.78
-        # _currentTab default), so a concurrent walk's leftover navigation can
-        # leave us reading someone else's page (jobs 411/412). Two consecutive
-        # off-domain reads → the tab is not ours; abort honestly BEFORE any
-        # LLM judgment or capture instead of extracting their data.
-        if job_registrable and wrong_site_tolerance > 0:
-            _s_url = surface.get("url") or ""
-            if _s_url and _registrable(_s_url) == job_registrable:
-                off_domain_reads = 0
-            elif _s_url:
-                off_domain_reads += 1
-                logger.warning(
-                    "[W38-A1] off-domain read %d/%d (job=%s want=%s got=%s)",
-                    off_domain_reads, wrong_site_tolerance, job_id,
-                    job_registrable, _s_url[:120],
+        # [wave-38 W38-A1] In-loop domain gate, judged on the STEP RESULT.
+        # The MCP one-shot session always lands on the context's OLDEST tab
+        # (@playwright/mcp 0.0.78 _currentTab default), so a concurrent
+        # walk's leftover navigation can leave us reading someone else's
+        # page (jobs 411/412). The 412 capture fired on the FIRST wrong-site
+        # read — a tolerance counter alone never fires on that shape — so
+        # this gate is TWO-TIER (D3):
+        #   • off-domain + is_listing → abort NOW: never capture, never
+        #     click around, someone else's listing;
+        #   • off-domain + not-listing → tolerate `wrong_site_tolerance`
+        #     consecutive reads (consent/SSO hops resolve within one).
+        # Unclassifiable surfaces (about:blank, chrome-error://, empty
+        # registrable) NEVER feed the counter — those are navigation states,
+        # and a flaky site bouncing to chrome-error must not masquerade as
+        # a bleed; they also never RESET the counter. Any on-domain read
+        # resets it. The poisoned surface may cost ONE LLM step on first
+        # sight — the price of not false-aborting consent walls; capture
+        # and wrong-site ACTIONS stay impossible. (The abort path skips the
+        # release quiesce by design — T4's recovery walk re-quiesces at its
+        # own start before reading anything.)
+        _s_url = surface.get("url") or ""
+        _s_reg = _registrable(_s_url) if _s_url else ""
+        if job_registrable and _s_reg and _s_reg != job_registrable:
+            if result.get("is_listing"):
+                _abort_notes = (
+                    f"wrong-site abort: browser tab on {_s_url} (expected "
+                    f"{job_registrable}) — off-domain page judged is_listing"
                 )
-                if off_domain_reads >= wrong_site_tolerance:
-                    _abort_notes = (
-                        f"wrong-site abort: browser tab on {_s_url} (expected "
-                        f"{job_registrable}) after {off_domain_reads} "
-                        "consecutive off-domain reads"
-                    )
-                    logger.error("[W38-A1] %s (job=%s)", _abort_notes, job_id)
-                    return TraversalResult(
-                        reached=False, goal_url=start_url, path=path,
-                        mechanism="unknown", api=None, signals={},
-                        visited=path, pruned=[], notes=_abort_notes,
-                        discovery={"listing_url": None,
-                                   "listing_reached": False,
-                                   "pagination": None},
-                        wrong_site_abort=True, wrong_site_url=_s_url,
-                    )
+                logger.error("[W38-A1] %s (job=%s)", _abort_notes, job_id)
+                return TraversalResult(
+                    reached=False, goal_url=start_url, path=path,
+                    mechanism="unknown", api=None, signals={},
+                    visited=path, pruned=[], notes=_abort_notes,
+                    discovery={"listing_url": None,
+                               "listing_reached": False,
+                               "pagination": None},
+                    wrong_site_abort=True, wrong_site_url=_s_url,
+                )
+            off_domain_reads += 1
+            logger.warning(
+                "[W38-A1] off-domain read %d/%d (job=%s want=%s got=%s)",
+                off_domain_reads, wrong_site_tolerance, job_id,
+                job_registrable, _s_url[:120],
+            )
+            if off_domain_reads >= wrong_site_tolerance:
+                _abort_notes = (
+                    f"wrong-site abort: browser tab on {_s_url} (expected "
+                    f"{job_registrable}) after {off_domain_reads} "
+                    "consecutive off-domain reads"
+                )
+                logger.error("[W38-A1] %s (job=%s)", _abort_notes, job_id)
+                return TraversalResult(
+                    reached=False, goal_url=start_url, path=path,
+                    mechanism="unknown", api=None, signals={},
+                    visited=path, pruned=[], notes=_abort_notes,
+                    discovery={"listing_url": None,
+                               "listing_reached": False,
+                               "pagination": None},
+                    wrong_site_abort=True, wrong_site_url=_s_url,
+                )
+        elif _s_reg == job_registrable and job_registrable:
+            off_domain_reads = 0
 ```
+
+Placement guards: the gate sits before `history.append(result)` so a poisoned judgment never feeds the stuck-breaker, and before the `if result.get("is_listing"):` branch so the capture path only ever runs on-domain. The empty-surface break (`if not surface: ... break`) above stays untouched.
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -531,6 +585,12 @@ def wait_for_stable_page(
             stable = 0
             last_url = url
         time.sleep(poll_s)
+    # [T7 criterion 5] INFO so the marker survives docker logs (debug does
+    # not) — on healthy sites this line must NEVER appear in the gate drive.
+    logger.info(
+        "wait_for_stable_page: page never settled in %.0fs (last=%s)",
+        timeout_s, str(last_url)[:120],
+    )
     return False
 ```
 
@@ -585,56 +645,86 @@ git commit -m "feat(wave-38 T2): best-effort page quiesce at walk start, pre-cap
 
 ```python
 class TestCaptureFilters:
-    def test_api_candidates_filtered_before_verify(self, monkeypatch):
-        """D2: the westelm candidate must never be VERIFY-PROBED — the probe
-        itself is a cross-domain request. Filter at _consider, pre-verify."""
-        seen = []
+    @staticmethod
+    def _api(url, count):
+        return {"url": url, "count": count, "sample_keys": ["x"]}
 
-        def fake_verify(cand, fetch, query):
-            seen.append(cand.get("url") if isinstance(cand, dict) else cand)
-            return {"url": "https://www.renttherunway.com/api/items",
-                    "count": 3, "sample_keys": ["x"]}
-
-        monkeypatch.setattr(tv, "verify_api", fake_verify)
-        monkeypatch.setattr(
-            tv, "api_from_network",
-            lambda entries: [
-                {"url": "https://www.renttherunway.com/api/items"},
-                {"url": "https://www.westelm.com.au/api/items"},
-            ])
-        monkeypatch.setattr(tv, "_httpx_fetch", lambda *a, **k: {"ok": False})
-
-        ev = _FakeTool("playwright_browser_evaluate",
-                       lambda kw: _Resp("[]"))
-        api = tv._capture_api_from_session(
-            ev, WESTELM, "dress", job_registrable="renttherunway.com")
-        assert api and "renttherunway.com" in api["url"]
-        assert not any("westelm" in str(u) for u in seen), (
-            "off-domain candidate must be dropped BEFORE verify_api probes it"
-        )
-
-    def test_no_job_registrable_keeps_everything(self, monkeypatch):
-        """Backwards compat: empty anchor = today's behavior."""
-        seen = []
+    def _run(self, monkeypatch, net_candidates, job_reg, verify_map):
+        probed = []
 
         def fake_verify(cand, fetch, query):
             u = cand.get("url") if isinstance(cand, dict) else str(cand)
-            seen.append(u)
-            return {"url": u, "count": 1, "sample_keys": ["x"]}
+            probed.append(u)
+            return verify_map.get(u)
 
         monkeypatch.setattr(tv, "verify_api", fake_verify)
-        monkeypatch.setattr(
-            tv, "api_from_network",
-            lambda entries: [
-                {"url": "https://www.renttherunway.com/api/items"},
-                {"url": "https://www.westelm.com.au/api/items"},
-            ])
+        monkeypatch.setattr(tv, "api_from_network",
+                            lambda entries: list(net_candidates))
         monkeypatch.setattr(tv, "_httpx_fetch", lambda *a, **k: {"ok": False})
-
         ev = _FakeTool("playwright_browser_evaluate",
                        lambda kw: _Resp("[]"))
-        tv._capture_api_from_session(ev, WESTELM, "dress")
-        assert any("westelm" in str(u) for u in seen)
+        api = tv._capture_api_from_session(
+            ev, "https://www.renttherunway.com/collections", "dress",
+            job_registrable=job_reg)
+        return api, probed
+
+    def test_off_domain_not_probed_when_on_domain_has_count(self, monkeypatch):
+        """The bleed case: westelm's /api/items is real and count>0, but the
+        JOB is renttherunway — the on-domain candidate wins and the
+        off-domain one is never even probed (count-gated pass 2 skipped)."""
+        api, probed = self._run(
+            monkeypatch,
+            [{"url": "https://www.renttherunway.com/api/items"},
+             {"url": "https://www.westelm.com.au/api/items"}],
+            "renttherunway.com",
+            {"https://www.renttherunway.com/api/items": self._api(
+                "https://www.renttherunway.com/api/items", 3)})
+        assert not any("westelm" in u for u in probed), (
+            "off-domain pass must be skipped when an on-domain candidate "
+            "already returned count>0"
+        )
+        assert api and "renttherunway.com" in api["url"]
+
+    def test_vendor_api_still_probed_when_on_domain_lacks_count(
+            self, monkeypatch):
+        """The aya class (wave-34 F1): a VENDOR-domain API with count>0 must
+        stay reachable — on-domain candidates exist but verify count-less,
+        so the off-domain pass MUST run and the count-ranking picks it. A
+        naive pre-verify filter would have silently broken aya."""
+        api, probed = self._run(
+            monkeypatch,
+            [{"url": "https://jobs.example.com/taxonomy"},
+             {"url": "https://vendor-jobs.io/search"}],
+            "jobs.example.com",
+            {"https://jobs.example.com/taxonomy": self._api(
+                "https://jobs.example.com/taxonomy", None),
+             "https://vendor-jobs.io/search": self._api(
+                 "https://vendor-jobs.io/search", 26803)})
+        assert any("vendor-jobs.io" in u for u in probed)
+        assert api and "vendor-jobs.io" in api["url"]
+
+    def test_off_domain_selected_when_it_is_all_there_is(self, monkeypatch):
+        """Pure bleed, no on-domain API at all: the wrong-site candidate is
+        probed and returned — the graph's wave-34 F2 drop is the existing
+        downstream net for exactly this residual."""
+        api, probed = self._run(
+            monkeypatch,
+            [{"url": "https://www.westelm.com.au/api/items"}],
+            "renttherunway.com",
+            {"https://www.westelm.com.au/api/items": self._api(
+                "https://www.westelm.com.au/api/items", 40)})
+        assert api and "westelm" in api["url"]
+
+    def test_no_job_registrable_probes_everything(self, monkeypatch):
+        """Backwards compat: empty anchor = today's behavior (both probed,
+        count-ranking decides)."""
+        urls = ("https://www.renttherunway.com/api/items",
+                "https://www.westelm.com.au/api/items")
+        api, probed = self._run(
+            monkeypatch,
+            [{"url": u} for u in urls], "",
+            {u: self._api(u, 1) for u in urls})
+        assert len(probed) == 2
 
     def test_item_links_filtered_by_job_domain(self, monkeypatch):
         ev = _FakeTool(
@@ -673,29 +763,78 @@ Expected: FAIL — `_capture_api_from_session` has no `job_registrable` kwarg (T
 
 - [ ] **Step 3: Implement**
 
-(a) `_capture_api_from_session(ev, goal_url, query, *, job_registrable: str = "")` — rewrite `_consider` to filter BEFORE `verify_api` (D2):
+(a) `_capture_api_from_session(ev, goal_url, query, *, job_registrable: str = "")` — restructure the body: GATHER raw candidates from both signals WITHOUT verifying, then verify in two count-gated passes (D2):
 
 ```python
     def _consider(api):
         if not api:
             return
-        # [wave-38 W38-A3/D2] Filter BEFORE verify_api — the probe is itself
-        # a cross-domain request. Anchor is the JOB's registrable (never
-        # goal_url, which during a bleed IS the wrong site). Unparseable
-        # registrables ("") are KEPT — don't drop what we can't classify.
-        if job_registrable:
-            _reg = _registrable(api.get("url") or "")
-            if _reg and _reg != job_registrable:
-                logger.info(
-                    "browser_traverse: capture filter dropped off-domain API "
-                    "candidate BEFORE verify: %s (job domain %s)",
-                    str(api.get("url"))[:100], job_registrable,
-                )
-                return
         base = (api.get("url") or "").split("?")[0]
         if base and base not in seen:
             seen.add(base)
             candidates.append(api)
+
+    # Gather raw candidates from both signals (no probing yet).
+    raw_net: list[dict] = []
+    try:
+        raw = ev.invoke({"function": _NETWORK_JS})
+        entries = _parse_resource_entries(
+            raw.content if hasattr(raw, "content") else str(raw))
+        raw_net = list(api_from_network(entries))
+    except Exception as exc:
+        logger.warning("browser_traverse: network API capture failed: %s", exc)
+
+    raw_bundle: list[dict] = []
+    try:
+        page = _fast_fetch(goal_url)
+        if page.get("ok"):
+            raw_bundle = list(scan_bundles_for_api(
+                page.get("text", ""), goal_url, _fast_fetch))
+    except Exception as exc:
+        logger.warning("browser_traverse: bundle-scan API capture failed: %s", exc)
+
+    # [wave-38 W38-A3/D2] Partition by the JOB's registrable (never goal_url
+    # — during a bleed the goal page IS the wrong site). SELECTION is
+    # filtered: an off-domain candidate can never win while an on-domain one
+    # exists. PROBING is two-pass and COUNT-GATED: on-domain candidates
+    # verify first; off-domain candidates verify ONLY if no on-domain
+    # candidate returned count>0. The count gate is load-bearing — it keeps
+    # the aya vendor-API class (wave-34 F1 ranks a vendor-domain API above
+    # an on-domain count-less taxonomy XHR) while cutting the
+    # klaviyo-class probe waste (prod 614/620/626).
+    def _on_domain(cand) -> bool:
+        if not job_registrable:
+            return True  # legacy callers: no anchor, nothing filtered
+        _reg = _registrable(cand.get("url") or "")
+        return _reg in ("", job_registrable)
+
+    _all_raw = raw_net + raw_bundle
+    _on = [c for c in _all_raw if _on_domain(c)]
+    _off = [c for c in _all_raw if not _on_domain(c)]
+    if _off:
+        logger.info(
+            "browser_traverse: %d off-domain API candidate(s) deferred "
+            "behind the on-domain pass (job domain %s)",
+            len(_off), job_registrable or "(none)",
+        )
+
+    def _probe(cands):
+        for cand in cands:
+            try:
+                _consider(verify_api(cand, _fast_fetch, query))
+            except Exception as exc:
+                logger.debug("verify_api failed for %s: %s",
+                             cand.get("url"), exc)
+
+    _probe(_on)
+    _has_count = any(
+        isinstance(c.get("count"), (int, float))
+        and not isinstance(c.get("count"), bool)
+        and c["count"] > 0
+        for c in candidates
+    )
+    if _off and not _has_count:
+        _probe(_off)
 ```
 
 (b) `_extract_item_links(ev, *, job_registrable: str = "")` — filter just before the final log line:
@@ -732,7 +871,7 @@ Expected: PASS (T1 + T2 + T3 classes).
 
 ```bash
 git add experimental/nav_traversal/traversal.py tests/test_wave38_traversal_guards.py
-git commit -m "feat(wave-38 T3): job-domain capture filters — API candidates dropped pre-verify, item links filtered (D2)"
+git commit -m "feat(wave-38 T3): job-domain capture filters — count-gated two-pass probing, item links filtered (D2)"
 ```
 
 ---
@@ -826,36 +965,28 @@ class TestRetraverseLocked:
         assert seen.get("trust_start_as_listing") is False
         assert callable(seen.get("heartbeat_fn"))
 
-    def test_not_acquired_falls_to_http_lane(self, monkeypatch):
+    def test_not_acquired_returns_honest_not_reached(self, monkeypatch):
+        """Lock-busy = D5 boundary: NO walk, NO internal HTTP lane — the
+        helper returns an honest sentinel and the NODE's existing
+        `if not result.reached:` fallback (the single HTTP lane) takes over."""
         monkeypatch.setattr(tv, "browser_traverse", lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("must not walk without the lock")))
-        calls = []
-        monkeypatch.setattr(tv, "traverse",
-                            lambda *a, **k: calls.append(a) or _tr(CLEAN))
+        monkeypatch.setattr(tv, "traverse", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("HTTP lane belongs to the NODE, not the helper")))
         monkeypatch.setattr(g, "_mcp_browser_lock",
                             lambda job_id, wait_timeout=900.0,
                             poll_interval=5.0: _lock(False))
         out = g._retraverse_locked("https://a.example/", "product", "x", 7)
-        assert out.reached is True and calls
+        assert out.reached is False
+        assert "lock busy" in (out.notes or "")
+        assert out.discovery["listing_reached"] is False
 
-    def test_walk_exception_falls_to_http_lane(self, monkeypatch):
+    def test_walk_exception_returns_honest_not_reached(self, monkeypatch):
         monkeypatch.setattr(tv, "browser_traverse",
                             lambda *a, **k: (_ for _ in ()).throw(
                                 RuntimeError("boom")))
-        monkeypatch.setattr(tv, "traverse", lambda *a, **k: _tr(CLEAN))
-        monkeypatch.setattr(g, "_mcp_browser_lock",
-                            lambda job_id, wait_timeout=900.0,
-                            poll_interval=5.0: _lock(True))
-        assert g._retraverse_locked(
-            "https://a.example/", "product", "x", 7).reached is True
-
-    def test_double_failure_returns_honest_not_reached(self, monkeypatch):
-        monkeypatch.setattr(tv, "browser_traverse",
-                            lambda *a, **k: (_ for _ in ()).throw(
-                                RuntimeError("boom")))
-        monkeypatch.setattr(tv, "traverse",
-                            lambda *a, **k: (_ for _ in ()).throw(
-                                RuntimeError("boom")))
+        monkeypatch.setattr(tv, "traverse", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("HTTP lane belongs to the NODE, not the helper")))
         monkeypatch.setattr(g, "_mcp_browser_lock",
                             lambda job_id, wait_timeout=900.0,
                             poll_interval=5.0: _lock(True))
@@ -915,6 +1046,49 @@ class TestWrongSiteRecovery:
         out, calls = self._run(monkeypatch, tmp_path,
                                _tr(CLEAN, **CLEAN_KW), None)
         assert len(calls) == 1
+
+    def test_recovery_lock_busy_degrades_to_node_http_lane(
+            self, monkeypatch, tmp_path):
+        """Abort → recovery lock busy → honest sentinel → the NODE's own
+        `if not result.reached:` HTTP fallback runs traverse() EXACTLY ONCE.
+        The helper runs no internal HTTP lane (D5); on a JS-listing site this
+        degrades honestly instead of fabricating a second browser walk."""
+        abort = _tr(NOT_REACHED, wrong_site_abort=True,
+                    wrong_site_url="https://www.westelm.com.au/bath",
+                    notes="wrong-site abort: browser tab on "
+                          "https://www.westelm.com.au/bath (expected "
+                          "a.example) — off-domain page judged is_listing")
+        locks = iter([True, False])
+
+        monkeypatch.setattr(
+            g, "_mcp_browser_lock",
+            lambda job_id, wait_timeout=900.0, poll_interval=5.0:
+                _lock(next(locks, False)))
+        walks = []
+
+        def scripted(url, ct, q, **kw):
+            walks.append("walk")
+            return abort
+
+        monkeypatch.setattr(tv, "browser_traverse", scripted)
+        monkeypatch.setattr(
+            tv, "traverse",
+            lambda *a, **k: walks.append("http") or _tr(CLEAN, **CLEAN_KW))
+        monkeypatch.setattr(g, "_notify_phase", lambda *a, **k: None)
+        monkeypatch.setattr(g, "_log_event_row", lambda *a, **k: None)
+        monkeypatch.setattr(g, "_get_project_root", lambda: str(tmp_path))
+        (tmp_path / "workspace" / "s").mkdir(parents=True, exist_ok=True)
+        state = {"job_id": 0, "site_slug": "s", "url": "https://a.example/",
+                 "page_type": "product", "input_mode": "navigation",
+                 "search_criteria": "dress"}
+        out = g._invoke_navigation_traverse(state, RunnableConfig())
+        assert walks == ["walk", "http"], (
+            "initial walk + exactly one HTTP fallback; the lock-busy "
+            "recovery must not add a second walk"
+        )
+        assert isinstance(out, Command) and out.goto == "product_analyzer"
+        assert out.update["navigation_analysis"]["discovery"][
+            "listing_reached"] is True
 
 
 class TestLockRenewal:
@@ -1080,12 +1254,25 @@ def _retraverse_locked(
     Serves both recovery arms: the W38-A1 wrong-site abort and the T1.6
     cross-domain contamination. The old forced re-traverse ran OUTSIDE the
     lock — a guaranteed bleed window, and the exact shape that made 412
-    possible. The wait is bounded (~2.5 min, D5): a still-busy browser sends
-    this job down the HTTP lane instead of stacking another 15-minute walker
-    behind the very walk that poisoned it. ALWAYS returns a TraversalResult;
-    never raises.
+    possible.
+
+    Lock-and-walk ONLY (D5): on lock-busy (bounded ~2.5 min wait — never
+    stack another 15-minute walker behind the walk that poisoned this one)
+    or a walk exception, return an honest not-reached result and let the
+    NODE's existing ``if not result.reached:`` HTTP fallback be the single
+    HTTP lane. An internal lane here would run HTTP traverse TWICE per
+    recovery; and the node re-runs T1.6 contamination after that fallback,
+    so a lock-busy sentinel can never silently substitute for a real walk.
+    ALWAYS returns a TraversalResult; never raises.
     """
     from experimental.nav_traversal.traversal import TraversalResult
+
+    def _not_reached(notes: str):
+        return TraversalResult(
+            False, None, [url], "unknown", None, {}, [url], [], notes,
+            discovery={"listing_url": None, "listing_reached": False,
+                       "pagination": None},
+        )
 
     try:
         with _mcp_browser_lock(job_id, wait_timeout=wait_timeout) as acquired:
@@ -1103,28 +1290,20 @@ def _retraverse_locked(
                         if job_id else None
                     ),
                 )
-    except Exception:
+            return _not_reached(
+                f"re-traverse lock busy after {wait_timeout:.0f}s "
+                f"(job {job_id}) — HTTP lane"
+            )
+    except Exception as exc:
         logger.exception(
             "browser_traverse: locked re-traverse failed (job %s)", job_id
         )
-    logger.warning(
-        "browser_traverse: locked re-traverse unavailable (job %s) — HTTP lane",
-        job_id,
-    )
-    try:
-        from experimental.nav_traversal.traversal import traverse
-
-        return traverse(url, content_type, query)
-    except Exception as exc:
-        logger.exception(
-            "browser_traverse: HTTP re-traverse failed (job %s)", job_id
-        )
-        return TraversalResult(
-            False, None, [url], "unknown", None, {}, [url], [],
-            f"locked re-traverse failed: {exc}",
-            discovery={"listing_url": None, "listing_reached": False,
-                       "pagination": None},
-        )
+        # Notes carry the exception TYPE only — this sentinel passes the
+        # node's `if "MCP" in notes:` router, and an embedded message (e.g.
+        # "MCP session closed") would divert recovery into the
+        # navigate_explore fallback: the same shared browser we just found
+        # dirty. Full detail is already in the logger.exception traceback.
+        return _not_reached(f"locked re-traverse failed: {type(exc).__name__}")
 ```
 
 (d) In `_invoke_navigation_traverse`:
@@ -1376,7 +1555,7 @@ Run: `docker compose exec -T django sh -c 'cd /app/webapp && pytest ../tests . -
 2. Celery logs contain ZERO of: `[W38-A1] wrong-site abort`, `CROSS-DOMAIN traversal result`, `dropping off-domain api capture`.
 3. Each job's output JSON contains no match of the OTHER sentinel's registrable domain (the T1.6-veto-absent assertion — the nets exist as backstop; this wave asserts they never had to fire).
 4. If D-1 adopted: any `scrape rejected (busy` 429 events appear as W8 park-and-retry rows in SessionLog, never as failed runs.
-5. New quiesce/renewal markers present in logs (`[W38-A1]`-free but `wait_for_stable_page` debug lines and `[TRAVERSAL-LOCK]` release lines) — proof the boundaries ran.
+5. `[TRAVERSAL-LOCK] acquired/released` pairs present for BOTH jobs (proof the boundaries ran), and ZERO `page never settled` INFO lines — that marker is what T2 logs on quiesce timeout, and docker logs swallow `debug`, so the healthy-site assertion is the INFO line's ABSENCE, not debug lines' presence.
 
 - [ ] **Step 5: Record §5 evidence + update memory.** Fill §5 with the drive IDs, log excerpts, suite counts, and any stale-fixture repairs. Write the wave-38 shipped memory file + MEMORY.md index line. EB sync per standing rules (`sync-w38` branch → EB, fork main push with lease, merge-tree check, compare link handed to user — PR creation is the USER's action).
 
