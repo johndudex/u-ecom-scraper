@@ -100,6 +100,9 @@ def _step(action="click", listing=False):
 
 
 _REAL_STABLE = getattr(tv, "wait_for_stable_page", None)  # pre-stub ref (None until T2 lands)
+_REAL_CAPTURE = tv._capture_api_from_session  # pre-stub refs: the _hermetic
+_REAL_LINKS = tv._extract_item_links          # fixture stubs these, but T3's
+# TestCaptureFilters exercises the REAL functions directly against fake evs.
 
 
 @pytest.fixture(autouse=True)
@@ -193,6 +196,123 @@ class TestWrongSiteGate:
         result = _walk(monkeypatch, [_surface(WESTELM)], _step(listing=True),
                        job_id=412)
         assert result.wrong_site_abort is True
+
+
+class TestCaptureFilters:
+    @staticmethod
+    def _api(url, count):
+        return {"url": url, "count": count, "sample_keys": ["x"]}
+
+    def _run(self, monkeypatch, net_candidates, job_reg, verify_map):
+        probed = []
+
+        def fake_verify(cand, fetch, query):
+            # REAL contract: api_from_network yields URL STRINGS
+            # (traversal.api_from_network -> list[str]); tolerate dicts
+            # defensively for non-network candidate shapes.
+            u = cand.get("url") if isinstance(cand, dict) else str(cand)
+            probed.append(u)
+            return verify_map.get(u)
+
+        monkeypatch.setattr(tv, "verify_api", fake_verify)
+        monkeypatch.setattr(tv, "api_from_network",
+                            lambda entries: list(net_candidates))
+        monkeypatch.setattr(tv, "_httpx_fetch", lambda *a, **k: {"ok": False})
+        ev = _FakeTool("playwright_browser_evaluate",
+                       lambda kw: _Resp("[]"))
+        api = _REAL_CAPTURE(
+            ev, "https://www.renttherunway.com/collections", "dress",
+            job_registrable=job_reg)
+        return api, probed
+
+    def test_off_domain_not_probed_when_on_domain_has_count(self, monkeypatch):
+        """The bleed case: westelm's /api/items is real and count>0, but the
+        JOB is renttherunway — the on-domain candidate wins and the
+        off-domain one is never even probed (count-gated pass 2 skipped)."""
+        api, probed = self._run(
+            monkeypatch,
+            ["https://www.renttherunway.com/api/items",
+             "https://www.westelm.com.au/api/items"],
+            "renttherunway.com",
+            {"https://www.renttherunway.com/api/items": self._api(
+                "https://www.renttherunway.com/api/items", 3)})
+        assert not any("westelm" in u for u in probed), (
+            "off-domain pass must be skipped when an on-domain candidate "
+            "already returned count>0"
+        )
+        assert api and "renttherunway.com" in api["url"]
+
+    def test_vendor_api_still_probed_when_on_domain_lacks_count(
+            self, monkeypatch):
+        """The aya class (wave-34 F1): a VENDOR-domain API with count>0 must
+        stay reachable — on-domain candidates exist but verify count-less,
+        so the off-domain pass MUST run and the count-ranking picks it. A
+        naive pre-verify filter would have silently broken aya."""
+        api, probed = self._run(
+            monkeypatch,
+            ["https://jobs.example.com/taxonomy",
+             "https://vendor-jobs.io/search"],
+            "jobs.example.com",
+            {"https://jobs.example.com/taxonomy": self._api(
+                "https://jobs.example.com/taxonomy", None),
+             "https://vendor-jobs.io/search": self._api(
+                 "https://vendor-jobs.io/search", 26803)})
+        assert any("vendor-jobs.io" in u for u in probed)
+        assert api and "vendor-jobs.io" in api["url"]
+
+    def test_off_domain_selected_when_it_is_all_there_is(self, monkeypatch):
+        """Pure bleed, no on-domain API at all: the wrong-site candidate is
+        probed and returned — the graph's wave-34 F2 drop is the existing
+        downstream net for exactly this residual."""
+        api, probed = self._run(
+            monkeypatch,
+            ["https://www.westelm.com.au/api/items"],
+            "renttherunway.com",
+            {"https://www.westelm.com.au/api/items": self._api(
+                "https://www.westelm.com.au/api/items", 40)})
+        assert api and "westelm" in api["url"]
+
+    def test_no_job_registrable_probes_everything(self, monkeypatch):
+        """Backwards compat: empty anchor = today's behavior (both probed,
+        count-ranking decides)."""
+        urls = ("https://www.renttherunway.com/api/items",
+                "https://www.westelm.com.au/api/items")
+        api, probed = self._run(
+            monkeypatch,
+            list(urls), "",
+            {u: self._api(u, 1) for u in urls})
+        assert len(probed) == 2
+
+    def test_item_links_filtered_by_job_domain(self, monkeypatch):
+        # _extract_item_links regexes raw.content — it must be a JSON
+        # STRING, never a bare Python list.
+        ev = _FakeTool(
+            "playwright_browser_evaluate",
+            lambda kw: _Resp(json.dumps([
+                "https://www.renttherunway.com/dresses/p/1",
+                "https://www.westelm.com.au/p/2",
+                "https://www.renttherunway.com/dresses/p/3",
+            ])))
+        out = _REAL_LINKS(ev, job_registrable="renttherunway.com")
+        assert out == [
+            "https://www.renttherunway.com/dresses/p/1",
+            "https://www.renttherunway.com/dresses/p/3",
+        ]
+
+    def test_item_links_unfiltered_without_anchor(self, monkeypatch):
+        ev = _FakeTool(
+            "playwright_browser_evaluate",
+            lambda kw: _Resp(json.dumps([
+                "https://www.renttherunway.com/dresses/p/1",
+                "https://www.westelm.com.au/p/2",
+            ])))
+        assert len(_REAL_LINKS(ev)) == 2
+
+    def test_two_part_tld_anchor(self):
+        """Same _registrable rule as T1.6 — .com.au subdomain matches its
+        apex, so the JOB's own regional host is never its own off-domain."""
+        assert tv._registrable("https://www.westelm.com.au/x") == \
+            tv._registrable("https://westelm.com.au/y")
 
 
 class TestWaitForStablePage:

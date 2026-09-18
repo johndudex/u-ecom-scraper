@@ -1104,7 +1104,8 @@ def api_from_network(resources: list[dict]) -> list[str]:
     return out
 
 
-def _capture_api_from_session(ev, goal_url: str, query: str):
+def _capture_api_from_session(ev, goal_url: str, query: str,
+                              *, job_registrable: str = ""):
     """Discover the backend data API from the LIVE browser session on the goal page.
 
     Called by ``browser_traverse`` once the LLM judges a listing — the browser is
@@ -1155,23 +1156,73 @@ def _capture_api_from_session(ev, goal_url: str, query: str):
 
     _fast_fetch = functools.partial(_httpx_fetch, timeout=8.0)
 
-    # 1. live network resource log
+    # 1. live network resource log — gather RAW, verify below (two passes).
+    raw_net: list = []
     try:
         raw = ev.invoke({"function": _NETWORK_JS})
         entries = _parse_resource_entries(raw.content if hasattr(raw, "content") else str(raw))
-        for cand in api_from_network(entries):
-            _consider(verify_api(cand, _fast_fetch, query))
+        raw_net = list(api_from_network(entries))
     except Exception as exc:
         logger.warning("browser_traverse: network API capture failed: %s", exc)
 
     # 2. JS-bundle scan (catches aya/amn-style interaction-triggered APIs)
+    raw_bundle: list = []
     try:
         page = _fast_fetch(goal_url)
         if page.get("ok"):
-            for cand in scan_bundles_for_api(page.get("text", ""), goal_url, _fast_fetch):
-                _consider(verify_api(cand, _fast_fetch, query))
+            raw_bundle = list(scan_bundles_for_api(
+                page.get("text", ""), goal_url, _fast_fetch))
     except Exception as exc:
         logger.warning("browser_traverse: bundle-scan API capture failed: %s", exc)
+
+    # [wave-38 W38-A3/D2] Partition by the JOB's registrable (never goal_url
+    # — during a bleed the goal page IS the wrong site). SELECTION is
+    # filtered: an off-domain candidate can never win while an on-domain one
+    # exists. PROBING is two-pass and COUNT-GATED: on-domain candidates
+    # verify first; off-domain candidates verify ONLY if no on-domain
+    # candidate returned count>0. The count gate is load-bearing — it keeps
+    # the aya vendor-API class (wave-34 F1 ranks a vendor-domain API above
+    # an on-domain count-less taxonomy XHR) while cutting the
+    # klaviyo-class probe waste (prod 614/620/626).
+    def _cand_url(cand) -> str:
+        # api_from_network / scan_bundles_for_api yield URL strings; tolerate
+        # dict descriptors defensively.
+        return ((cand.get("url") if isinstance(cand, dict) else str(cand))
+                or "")
+
+    def _on_domain(cand) -> bool:
+        if not job_registrable:
+            return True  # legacy callers: no anchor, nothing filtered
+        _reg = _registrable(_cand_url(cand))
+        return _reg in ("", job_registrable)
+
+    _all_raw = raw_net + raw_bundle
+    _on = [c for c in _all_raw if _on_domain(c)]
+    _off = [c for c in _all_raw if not _on_domain(c)]
+    if _off:
+        logger.info(
+            "browser_traverse: %d off-domain API candidate(s) deferred "
+            "behind the on-domain pass (job domain %s)",
+            len(_off), job_registrable or "(none)",
+        )
+
+    def _probe(cands):
+        for cand in cands:
+            try:
+                _consider(verify_api(_cand_url(cand), _fast_fetch, query))
+            except Exception as exc:
+                logger.debug("verify_api failed for %s: %s",
+                             _cand_url(cand), exc)
+
+    _probe(_on)
+    _has_count = any(
+        isinstance(c.get("count"), (int, float))
+        and not isinstance(c.get("count"), bool)
+        and c["count"] > 0
+        for c in candidates
+    )
+    if _off and not _has_count:
+        _probe(_off)
 
     if not candidates:
         return None
@@ -1833,7 +1884,7 @@ _ITEM_LINKS_JS = r"""
 """
 
 
-def _extract_item_links(ev) -> list[str]:
+def _extract_item_links(ev, *, job_registrable: str = "") -> list[str]:
     """Extract real item/detail hrefs from the rendered goal page via evaluate.
 
     Called from browser_traverse's is_listing branch while the browser is still
@@ -1865,6 +1916,17 @@ def _extract_item_links(ev) -> list[str]:
         logger.warning("_extract_item_links: expected list, got %s", type(arr).__name__)
         return []
     out = [str(u) for u in arr if isinstance(u, str) and u.startswith("http")]
+    # [wave-38 W38-A3] Item links feed product_analyzer samples + tester
+    # URLs — an off-domain link here poisons TWO downstream agents.
+    if job_registrable and out:
+        _before = len(out)
+        out = [u for u in out
+               if _registrable(u) in ("", job_registrable)]
+        if _before != len(out):
+            logger.info(
+                "_extract_item_links: dropped %d off-domain item link(s) "
+                "(job domain %s)", _before - len(out), job_registrable,
+            )
     logger.info("_extract_item_links: parsed %d item links (raw_len=%d)", len(out), len(content))
     return out
 
@@ -2141,13 +2203,15 @@ def browser_traverse(
             #   2. JS-bundle scan       -> interaction-triggered APIs whose XHR
             #      never fired because no search was submitted (aya, amn — the
             #      endpoint lives as a literal in a JS bundle).
-            api = _capture_api_from_session(ev, url, query)
+            api = _capture_api_from_session(ev, url, query,
+                                            job_registrable=job_registrable)
 
             # Capture real item/detail hrefs from the RENDERED goal page (the
             # browser is on it now). These become url_examples for product_analyzer
             # + code_tester sample URLs — a plain HTTP fetch would only see the
             # pre-render nav links on CSR pages (Coveo/React/Vue).
-            item_links = _extract_item_links(ev)
+            item_links = _extract_item_links(ev,
+                                             job_registrable=job_registrable)
             if item_links:
                 logger.info(
                     "browser_traverse: captured %d item links from rendered goal page",

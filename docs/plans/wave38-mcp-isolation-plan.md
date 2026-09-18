@@ -271,6 +271,9 @@ def _step(action="click", listing=False):
 
 
 _REAL_STABLE = getattr(tv, "wait_for_stable_page", None)  # pre-stub ref (None until T2 lands)
+_REAL_CAPTURE = tv._capture_api_from_session  # pre-stub refs: the _hermetic
+_REAL_LINKS = tv._extract_item_links          # fixture stubs these, but T3's
+# TestCaptureFilters exercises the REAL functions directly against fake evs.
 
 
 @pytest.fixture(autouse=True)
@@ -664,6 +667,9 @@ class TestCaptureFilters:
         probed = []
 
         def fake_verify(cand, fetch, query):
+            # REAL contract: api_from_network yields URL STRINGS
+            # (traversal.api_from_network -> list[str]); tolerate dicts
+            # defensively for non-network candidate shapes.
             u = cand.get("url") if isinstance(cand, dict) else str(cand)
             probed.append(u)
             return verify_map.get(u)
@@ -674,7 +680,7 @@ class TestCaptureFilters:
         monkeypatch.setattr(tv, "_httpx_fetch", lambda *a, **k: {"ok": False})
         ev = _FakeTool("playwright_browser_evaluate",
                        lambda kw: _Resp("[]"))
-        api = tv._capture_api_from_session(
+        api = _REAL_CAPTURE(
             ev, "https://www.renttherunway.com/collections", "dress",
             job_registrable=job_reg)
         return api, probed
@@ -738,14 +744,16 @@ class TestCaptureFilters:
         assert len(probed) == 2
 
     def test_item_links_filtered_by_job_domain(self, monkeypatch):
+        # _extract_item_links regexes raw.content — it must be a JSON
+        # STRING, never a bare Python list.
         ev = _FakeTool(
             "playwright_browser_evaluate",
-            lambda kw: _Resp([
+            lambda kw: _Resp(json.dumps([
                 "https://www.renttherunway.com/dresses/p/1",
                 "https://www.westelm.com.au/p/2",
                 "https://www.renttherunway.com/dresses/p/3",
-            ]))
-        out = tv._extract_item_links(ev, job_registrable="renttherunway.com")
+            ])))
+        out = _REAL_LINKS(ev, job_registrable="renttherunway.com")
         assert out == [
             "https://www.renttherunway.com/dresses/p/1",
             "https://www.renttherunway.com/dresses/p/3",
@@ -754,11 +762,11 @@ class TestCaptureFilters:
     def test_item_links_unfiltered_without_anchor(self, monkeypatch):
         ev = _FakeTool(
             "playwright_browser_evaluate",
-            lambda kw: _Resp([
+            lambda kw: _Resp(json.dumps([
                 "https://www.renttherunway.com/dresses/p/1",
                 "https://www.westelm.com.au/p/2",
-            ]))
-        assert len(tv._extract_item_links(ev)) == 2
+            ])))
+        assert len(_REAL_LINKS(ev)) == 2
 
     def test_two_part_tld_anchor(self):
         """Same _registrable rule as T1.6 — .com.au subdomain matches its
@@ -813,10 +821,16 @@ Expected: FAIL — `_capture_api_from_session` has no `job_registrable` kwarg (T
     # the aya vendor-API class (wave-34 F1 ranks a vendor-domain API above
     # an on-domain count-less taxonomy XHR) while cutting the
     # klaviyo-class probe waste (prod 614/620/626).
+    def _cand_url(cand) -> str:
+        # api_from_network / scan_bundles_for_api yield URL strings; tolerate
+        # dict descriptors defensively.
+        return ((cand.get("url") if isinstance(cand, dict) else str(cand))
+                or "")
+
     def _on_domain(cand) -> bool:
         if not job_registrable:
             return True  # legacy callers: no anchor, nothing filtered
-        _reg = _registrable(cand.get("url") or "")
+        _reg = _registrable(_cand_url(cand))
         return _reg in ("", job_registrable)
 
     _all_raw = raw_net + raw_bundle
@@ -832,10 +846,10 @@ Expected: FAIL — `_capture_api_from_session` has no `job_registrable` kwarg (T
     def _probe(cands):
         for cand in cands:
             try:
-                _consider(verify_api(cand, _fast_fetch, query))
+                _consider(verify_api(_cand_url(cand), _fast_fetch, query))
             except Exception as exc:
                 logger.debug("verify_api failed for %s: %s",
-                             cand.get("url"), exc)
+                             _cand_url(cand), exc)
 
     _probe(_on)
     _has_count = any(
