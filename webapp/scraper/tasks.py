@@ -21,13 +21,13 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from celery import shared_task
-from celery.exceptions import MaxRetriesExceededError
+from celery.exceptions import MaxRetriesExceededError, SoftTimeLimitExceeded
 from celery.signals import task_failure
 from django.conf import settings
 from django.db.models import F, Q
 from django.utils import timezone
 
-from .models import Approval, ScrapeJob, Step
+from .models import Approval, JobListing, ScrapeJob, Step
 from .services import LangGraphService
 
 logger = logging.getLogger(__name__)
@@ -135,6 +135,75 @@ def _finalize_job_failed(job_id: int, error_message: str, close_steps: bool = Fa
             logger.info("Job %s: reset Site '%s' to failed", job_id, db_site.slug)
     except Exception:
         pass
+
+
+def _output_artifact_item_count(job: ScrapeJob) -> int:
+    """[wave-37 W37-3a] Count real records in the job's output artifact.
+
+    The universal execution evidence (any content type): the record-array
+    the runner wrote, read through the artifacts store with a direct-path
+    fallback. Unreadable/missing/empty → 0 (never invents evidence).
+    """
+    if not job.output_file:
+        return 0
+    out: Any = None
+    try:
+        import json
+
+        import src.artifacts as artifacts
+
+        out = json.loads(artifacts.read_text(job.output_file))
+    except Exception:
+        try:
+            import json
+
+            with open(job.output_file) as f:
+                out = json.load(f)
+        except Exception:
+            return 0
+    if not isinstance(out, dict):
+        return 0
+    for value in out.values():
+        if isinstance(value, list):
+            return len(value)
+    return 0
+
+
+def finalize_from_artifacts(job_id: int, fallback_message: str) -> str:
+    """[wave-37 W37-3a] Resolve the final status from on-disk evidence.
+
+    Prod 593 died AFTER execution wrote real items but BEFORE the COMPLETED
+    write; the generic failure finalize then lied about the run. Evidence
+    order: (1) real records in the job's output artifact (universal; count
+    = actual records, never the stale counter, steps closed like the
+    success path); (2) real JobListing rows (jobs-domain dashboard table);
+    (3) otherwise the honest failure path with the original cause. Only a
+    RUNNING row is ever touched — parked/resumable (browser_unavailable,
+    captcha/akamai) and already-terminal rows keep their status.
+    """
+    job = ScrapeJob.objects.filter(pk=job_id).first()
+    if job is None:
+        return ""
+    if job.status != ScrapeJob.STATUS_RUNNING:
+        return job.status
+    items = _output_artifact_item_count(job)
+    if items <= 0:
+        items = JobListing.objects.filter(scrape_job=job).count()
+    if items > 0:
+        job.status = ScrapeJob.STATUS_COMPLETED
+        job.product_count = items
+        job.completed_at = timezone.now()
+        job.save(update_fields=["status", "product_count", "completed_at"])
+        logger.warning(
+            "Job %d: finalize_from_artifacts — %d record(s) on disk after a "
+            "mid-flight kill; finalized COMPLETED from evidence (was RUNNING)",
+            job_id, items,
+        )
+        _close_open_steps(job)
+        _publish_job_status(job_id, ScrapeJob.STATUS_COMPLETED)
+        return job.status
+    _finalize_job_failed(job_id, fallback_message)
+    return ScrapeJob.STATUS_FAILED
 
 
 # [wave-14 job-133] Process-death honesty. When a prefork CHILD is SIGKILLed
@@ -405,6 +474,12 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False, force_full: bool 
 
     try:
         _run_graph_job(job, rescrape=rescrape, force_full=force_full)
+    except SoftTimeLimitExceeded:
+        # [wave-37 W37-3a] The soft-limit kill lands mid-graph; finalize from
+        # on-disk evidence so a run that already wrote real items is not
+        # marked FAILED (prod 593: every step done, count=10, marked failed).
+        logger.error("Job %d: SoftTimeLimitExceeded — artifact-evidence finalize", job_id)
+        finalize_from_artifacts(job_id, "Soft time limit exceeded mid-graph")
     except Exception as exc:
         logger.exception("Scrape job %d failed: %s", job_id, exc)
         # F4: the original failure is often a dead DB connection (postgres
@@ -682,6 +757,16 @@ def resume_scrape_task(self, job_id: int, human_response: Any) -> None:
             )
             LangGraphService.create_recursion_approval(job, str(exc))
             _publish_job_status(job.id, ScrapeJob.STATUS_WAITING_APPROVAL)
+            return
+
+        if isinstance(exc, SoftTimeLimitExceeded):
+            # [wave-37 W37-3a] A resume that dies mid-flight is the same 593
+            # shape — finalize from on-disk evidence, not a blind FAILED.
+            logger.error(
+                "Job %d: SoftTimeLimitExceeded in resume — artifact-evidence finalize",
+                job_id,
+            )
+            finalize_from_artifacts(job_id, "Soft time limit exceeded mid-resume")
             return
 
         logger.exception("Job %d resume failed: %s", job_id, exc)
