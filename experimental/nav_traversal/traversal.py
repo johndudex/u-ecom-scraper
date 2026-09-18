@@ -1694,6 +1694,49 @@ def _do_action(action: dict, nav, click, ev, wait, type_t=None) -> str:
     return desc
 
 
+def wait_for_stable_page(
+    ev, *, timeout_s: float = 20.0, stable_reads: int = 2,
+    poll_s: float = 1.0,
+) -> bool:
+    """[wave-38 W38-A2] Best-effort quiesce: poll the page URL until it stops
+    moving. The 412 bleed fired at lock HANDOFF — the previous job's goto was
+    still in flight when our first read ran. This wait gives that navigation
+    time to land BEFORE we read/capture, and runs again before we hand the
+    lock back so the NEXT job starts clean. D5: never raises, never aborts —
+    evaluate errors (including 'Execution context destroyed', the very
+    condition this exists for) simply return False and the caller proceeds.
+    """
+    if ev is None:
+        return False
+    deadline = time.monotonic() + timeout_s
+    last_url = None
+    stable = 0
+    while time.monotonic() < deadline:
+        try:
+            raw = ev.invoke({"function": _PAGE_STATE_JS})
+        except Exception as exc:
+            logger.debug("wait_for_stable_page: evaluate error: %s", exc)
+            return False
+        data = _parse_mcp_json(raw) or {}
+        url = data.get("url") or ""
+        # An empty url means a navigation is mid-flight — that IS instability.
+        if url and url == last_url:
+            stable += 1
+            if stable >= stable_reads:
+                return True
+        else:
+            stable = 0
+            last_url = url
+        time.sleep(poll_s)
+    # [T7 criterion 5] INFO so the marker survives docker logs (debug does
+    # not) — on healthy sites this line must NEVER appear in the gate drive.
+    logger.info(
+        "wait_for_stable_page: page never settled in %.0fs (last=%s)",
+        timeout_s, str(last_url)[:120],
+    )
+    return False
+
+
 def _read_page_state_with_retry(ev, wait, *, waits=(0, 5, 8)):
     """Evaluate ``_PAGE_STATE_JS`` with progressive waits on empty results.
 
@@ -1916,6 +1959,10 @@ def browser_traverse(
         return TraversalResult(False, None, [start_url], "unknown", None, {}, [start_url], [],
                                f"navigate failed: {exc}")
 
+    # [wave-38 W38-A2] quiesce before the first read — the 412 bleed shape:
+    # a prior job's in-flight goto lands after we start reading.
+    wait_for_stable_page(ev)
+
     history: list[dict] = []
     path: list[str] = [start_url]
 
@@ -2082,6 +2129,7 @@ def browser_traverse(
                     break
 
         if result.get("is_listing"):
+            wait_for_stable_page(ev, timeout_s=10.0)
             url = surface.get("url") or start_url
             path.append(url)
 
@@ -2165,6 +2213,9 @@ def browser_traverse(
         path.append(desc)
         _beat("action", step_num)
 
+    # [wave-38 W38-A2] release-quiesce: never hand the lock back
+    # mid-navigation — the next job's step-0 read must not see OUR goto.
+    wait_for_stable_page(ev, timeout_s=10.0)
     return TraversalResult(
         reached=False, goal_url=start_url, path=path,
         mechanism="unknown", api=None, signals={},

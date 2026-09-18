@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -192,6 +193,54 @@ class TestWrongSiteGate:
         result = _walk(monkeypatch, [_surface(WESTELM)], _step(listing=True),
                        job_id=412)
         assert result.wrong_site_abort is True
+
+
+class TestWaitForStablePage:
+    def _ev(self, surfaces):
+        reads = {"n": 0}
+
+        def ev_fn(kwargs):
+            i = reads["n"]
+            reads["n"] += 1
+            # CYCLE, not clamp: a "churning" sequence must keep churning —
+            # clamping to the last entry would let it settle and defeat
+            # test_false_on_churning_urls_and_bounded.
+            s = surfaces[i % len(surfaces)]
+            if isinstance(s, Exception):
+                raise s
+            return _resp(s)
+
+        return _FakeTool("playwright_browser_evaluate", ev_fn)
+
+    def test_true_when_url_settles(self):
+        ev = self._ev([_surface(RTR), _surface(RTR)])
+        assert _REAL_STABLE(
+            ev, timeout_s=5.0, stable_reads=2, poll_s=0.01) is True
+
+    def test_false_on_churning_urls_and_bounded(self):
+        t0 = time.monotonic()
+        ev = self._ev([_surface(RTR + "/a"), _surface(RTR + "/b")])
+        ok = _REAL_STABLE(ev, timeout_s=0.3, stable_reads=2, poll_s=0.05)
+        assert ok is False
+        assert time.monotonic() - t0 < 5.0, "must respect its timeout"
+
+    def test_tool_errors_are_false_not_raise(self):
+        ev = self._ev([RuntimeError("Execution context destroyed")])
+        assert _REAL_STABLE(ev, timeout_s=1.0, poll_s=0.01) is False
+
+    def test_none_ev_is_false(self):
+        assert _REAL_STABLE(None) is False
+
+    def test_quiesce_runs_at_walk_boundaries(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            tv, "wait_for_stable_page",
+            lambda *a, **k: calls.append(k.get("timeout_s")) or True)
+        _walk(monkeypatch, [_surface(RTR)], _step(action="click",
+                                                  listing=True))
+        assert len(calls) >= 2, (
+            "quiesce must run at walk start AND before the is_listing capture"
+        )
 
 
 if __name__ == "__main__":

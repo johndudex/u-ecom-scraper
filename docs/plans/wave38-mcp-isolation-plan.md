@@ -511,7 +511,10 @@ class TestWaitForStablePage:
         def ev_fn(kwargs):
             i = reads["n"]
             reads["n"] += 1
-            s = surfaces[min(i, len(surfaces) - 1)]
+            # CYCLE, not clamp: a "churning" sequence must keep churning —
+            # clamping to the last entry would let it settle and defeat
+            # test_false_on_churning_urls_and_bounded.
+            s = surfaces[i % len(surfaces)]
             if isinstance(s, Exception):
                 raise s
             return _resp(s)
