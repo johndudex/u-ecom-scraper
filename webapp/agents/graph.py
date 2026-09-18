@@ -8106,6 +8106,43 @@ def _access_wall_update(
     }
 
 
+def _sanitize_pass_verdict(report: dict) -> dict:
+    """[wave-37 W37-NEW-B] A PASS over zero real extracted items is not a PASS.
+
+    Prod 672: the tester emitted PASS conf 0.25 with nothing extracted; the
+    exhausted arm refused execution (correct) and the job died ON A PASS.
+    Force-FAIL the shape at the report boundary (wave-22 B4 idiom: keep the
+    tester's own confidence in phase2_confidence so routing can tell a tester
+    PASS from a sanitizer override). The working-scraper-rescue arm
+    (route_after_testing real-items gate) then behaves: PASS ⇒ items exist
+    ⇒ rescue routes to run_execution.
+    """
+    if not isinstance(report, dict):
+        return report
+    if str(report.get("overall_assessment") or "").strip().upper() != "PASS":
+        return report
+    from .tools.browser_http import report_extracted_items
+
+    if report_extracted_items(report) > 0:
+        return report
+    report["phase2_confidence"] = report.get("confidence_score")
+    report["overall_assessment"] = "FAIL"
+    report["confidence_score"] = 0.0
+    report["ready_for_execution"] = False
+    report.setdefault("issues", []).insert(0, {
+        "issue_type": "false_pass",
+        "message": (
+            "PASS verdict carried zero extracted items — sanitizer forced "
+            "FAIL [wave-37 W37-NEW-B]; fix the extraction or the emission "
+            "filter."
+        ),
+        "description": (
+            "PASS verdict carried zero extracted items — sanitizer forced FAIL."
+        ),
+    })
+    return report
+
+
 def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
     job_id = state.get("job_id", 0)
     retry_count = state.get("test_retry_count", 0)
@@ -8479,6 +8516,12 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     {"type": "reject", "label": "Cancel", "allow_feedback": False},
                 ]
         if report:
+            # [wave-37 W37-NEW-B] Honesty gate FIRST: a PASS over zero real
+            # extracted items is not a PASS (prod 672 died on one). Every
+            # downstream consumer — coverage attach, deterministic issues,
+            # the router's verdict ladder and its real-items rescue arm —
+            # sees the sanitized dict.
+            report = _sanitize_pass_verdict(report)
             # Phase 4a: deterministically attach the scraper's discovery_coverage
             # so the coverage-aware classifier sees it (the LLM-written report
             # doesn't reliably carry it).

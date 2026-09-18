@@ -352,12 +352,12 @@ _INFRA_MARKERS = (
 _INFRA_CRASH_MARKERS = _INFRA_MARKERS + ("HTTP 429", "Too Many Requests")
 
 
-def _report_items(report: dict) -> int:
+def report_extracted_items(report: dict) -> int:
     """Items the tester actually extracted — mirrors route_after_testing's
     canonical ``_extracted_item_count`` ladder (the report carries counts
     top-level AND nested under ``results``; ``successful_extractions`` is the
-    code-tester's primary key). Kept inline: browser_http must not import the
-    router module."""
+    code-tester's primary key). Shared with graph.py's PASS sanitizer
+    [wave-37 W37-NEW-B] so both verdict gates read the same contract."""
     results = report.get("results") if isinstance(report, dict) else None
     for key in ("successful_extractions", "extracted_items", "item_count"):
         v = report.get(key)
@@ -389,7 +389,7 @@ def report_is_infra_blocked(report: dict) -> str | None:
     """
     if not isinstance(report, dict):
         return None
-    if _report_items(report) > 0:
+    if report_extracted_items(report) > 0:
         return None
     # Issue messages are draft-defect text — only the narrow infra set excuses
     # them. The crash channel and the discovery stop_reason additionally carry
