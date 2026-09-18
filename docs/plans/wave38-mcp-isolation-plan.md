@@ -4,7 +4,7 @@
 
 **Goal:** Make the shared Playwright-MCP Chrome safe under concurrency — a walk can never silently read, judge, or capture ANOTHER job's pages (the 411/412 cross-job bleed), and the deprecated `/scrape` lane stops sharing destructive state between sibling runs.
 
-**Architecture:** Defense at the only boundary that always executes — inside the walk itself. `browser_traverse` gains a POST-step two-tier wrong-site gate (an off-domain read the LLM judged `is_listing` aborts IMMEDIATELY — the 412 shape; non-listing off-domain reads tolerate 2 consecutive), a best-effort quiesce at walk boundaries (no read while a navigation is in flight), and count-gated two-pass capture filters (probe on-domain API candidates first; off-domain candidates probed only when nothing on-domain produced a count — aya's vendor-domain API class survives; item links filtered after parse). Graph-side, every recovery walk runs under a freshly-acquired traversal lock via one new `_retraverse_locked` helper — lock-and-walk ONLY, with the node's existing HTTP fallback as the single HTTP lane — and the lock TTL is renewed only on heartbeat progress so long healthy walks stop outliving their own lock. Scrape-lane hardening is minimal and mechanical: honor `SCRAPER_CDP_PORT` in `scraper_runner`, drop `--remote-allow-origins=*` from the deprecated scraper Chrome, and (decision-gated) drop the scraper concurrency cap to 1.
+**Architecture:** Defense at the only boundary that always executes — inside the walk itself. `browser_traverse` gains a POST-step two-tier wrong-site gate (an off-domain read the LLM judged `is_listing` aborts IMMEDIATELY — the 412 shape; non-listing off-domain reads tolerate 2 consecutive), a best-effort quiesce at walk boundaries (no read while a navigation is in flight), and count-gated two-pass capture filters (probe on-domain API candidates first; off-domain candidates probed only when nothing on-domain produced a count — aya's vendor-domain API class survives; item links filtered after parse). Graph-side, every recovery walk runs under a freshly-acquired traversal lock via one new `_retraverse_locked` helper — lock-and-walk ONLY, with the node's existing HTTP fallback as the single HTTP lane — and the lock TTL is renewed only on heartbeat progress so long healthy walks stop outliving their own lock. Scrape-lane hardening is minimal and mechanical: honor `SCRAPER_CDP_PORT` in `scraper_runner`, drop `--remote-allow-origins=*` from the deprecated scraper Chrome, and enforce the scraper concurrency cap via a Railway env var (`SCRAPE_MAX_CONCURRENT=1`, D-1 option 2 — code default stays 2, no source change).
 
 **Tech Stack:** Python (LangGraph node + pure module `experimental/nav_traversal/traversal.py`), Redis Lua CAS scripts, pytest with fake MCP tools, browser_service (FastAPI) env/source pins.
 
@@ -49,7 +49,7 @@ These five amendments came from the adversarial review the user demanded. They a
 | T3 | Job-domain capture filters (count-gated two-pass API probing + item-link filter) | `experimental/nav_traversal/traversal.py` | §2.1, D2 |
 | T4 | Lock hygiene: progress-gated TTL renewal, `_retraverse_locked`, recovery wiring | `webapp/agents/graph.py` | §2.3 |
 | T5 | Remove `browser_tabs` from product_analyzer allowlist | `webapp/agents/tools/__init__.py`, skill doc | §2.3 |
-| T6 | Scrape hardening: CDP port truth, drop wildcard allow-origins, cap decision | `browser_service/scraper_runner.py`, `browser_pool.py`, `server.py` | §2.4 |
+| T6 | Scrape hardening: CDP port truth, drop wildcard allow-origins, cap via Railway env (D-1 opt 2 — no code change) | `browser_service/scraper_runner.py`, `browser_pool.py` (server.py: ops-only) | §2.4 |
 | T7 | Concurrent two-site gate drive (the 411/412 shape) + §5 evidence | ops (no source) | §2.1 |
 
 ---
@@ -479,7 +479,7 @@ Expected: baseline green + 4 known reds.
 
 ```bash
 git add experimental/nav_traversal/traversal.py tests/test_wave38_traversal_guards.py
-git commit -m "feat(wave-38 T1): in-walk wrong-site abort — 2 consecutive off-domain reads refuse to judge/capture (412)"
+git commit -m "feat(wave-38 T1): in-walk wrong-site gate — listing-judgment aborts immediately, non-listing tolerates 2 (412)"
 ```
 
 ---
@@ -1451,7 +1451,7 @@ git commit -m "fix(wave-38 T5): drop browser_tabs from product_analyzer — agen
 **Files:**
 - Modify: `browser_service/scraper_runner.py:569-571` (port truth)
 - Modify: `browser_service/browser_pool.py:505-534` (drop line 514 `--remote-allow-origins=*` from `_start_scraper_chrome` ONLY — the MCP Chrome's own flag at :428 STAYS)
-- Modify: `browser_service/server.py:96` — **DECISION-GATED**, see DECISION-NEEDED D-1
+- NO source change: `browser_service/server.py` — D-1 **decided option 2**: the cap is enforced by a Railway env var (user sets `SCRAPE_MAX_CONCURRENT=1`), code default stays `"2"`
 - Test: `tests/test_wave38_lock_and_recovery.py` (append; source pins — browser_service is not importable in the django container)
 
 **Interfaces:**
@@ -1488,18 +1488,21 @@ class TestScrapeHardening:
         # file must retain EXACTLY ONE occurrence (MCP launch, browser_pool:428)
         assert pool.count("--remote-allow-origins") == 1
 
-    def test_scrape_cap_default(self):
-        """D-1: code default drops 2→1 (concurrent /scrapes share one Chrome
-        with no mutual exclusion; _restart_scraper_chrome SIGTERMs the shared
-        process). If the user picks keep-2, this pin changes to "2"."""
+    def test_scrape_cap_stays_env_governed(self):
+        """D-1 decided option 2: prod's cap-1 lives in a Railway env var, so
+        the code MUST keep reading the env with default "2". A future
+        hard-code (either value) silently breaks the env-only deployment."""
         server = self._src("server.py")
-        assert 'SCRAPE_MAX_CONCURRENT", "1"' in server
+        assert 'os.environ.get("SCRAPE_MAX_CONCURRENT", "2")' in server, (
+            "the cap must stay env-read with default 2 — prod enforcement "
+            "is the Railway var, not the code default"
+        )
 ```
 
 - [ ] **Step 2: Run to verify failure**
 
 Run: `docker compose exec -T django sh -c 'cd /app/webapp && pytest ../tests/test_wave38_lock_and_recovery.py::TestScrapeHardening -q'`
-Expected: FAIL — all three pins red.
+Expected: the two implementation pins (port truth, allow-origins) FAIL. `test_scrape_cap_stays_env_governed` is a **regression pin, green from the start by design** — D-1 option 2 changes no code, so there is nothing to red-green; the pin only guards future drift.
 
 - [ ] **Step 3: Implement**
 
@@ -1516,21 +1519,15 @@ Expected: FAIL — all three pins red.
 
 (b) `browser_pool.py` — delete the `"--remote-allow-origins=*",` line from `_start_scraper_chrome`'s args ONLY (:514).
 
-(c) `server.py:96` (D-1 recommended option): `"2"` → `"1"`:
+(c) `server.py` — **NO code change** (D-1 decided: option 2, env-only). The cap is enforced by the user setting `SCRAPE_MAX_CONCURRENT=1` as a Railway env var on the browser-service; it takes effect via the existing `os.environ.get` read at import time (:96) on that service's next redeploy/restart. Code default stays `"2"` so fresh local environments keep parallel scrape capability; prod gets the mutual exclusion a shared Chrome needs. Revert = flip the Railway var (no deploy). With `SCRAPE_MAX_QUEUE=0` this is admit-or-429; run_scraper's W8 ladder already parks and retries on 429/502/503/504, so concurrent scrapers are DELAYED, not failed — the accepted cost is caller wall clock on the rare overlap.
 
-```python
-SCRAPE_MAX_CONCURRENT = int(os.environ.get("SCRAPE_MAX_CONCURRENT", "1"))
-```
-
-With SCRAPE_MAX_QUEUE=0 this is admit-or-429; run_scraper's W8 ladder already parks and retries on 429/502/503/504, so concurrent scrapers are DELAYED, not failed — the cost is caller wall clock (tester's derived window), which is why this is a decision box and not a silent change.
-
-- [ ] **Step 4: Run to verify pass** — same command as Step 2. Expected: PASS.
+- [ ] **Step 4: Run to verify pass** — same command as Step 2. Expected: PASS (all three green).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add browser_service/scraper_runner.py browser_service/browser_pool.py browser_service/server.py tests/test_wave38_lock_and_recovery.py
-git commit -m "feat(wave-38 T6): scrape hardening — SCRAPER_CDP_PORT truth, drop wildcard allow-origins, scraper cap 1 (D-1)"
+git add browser_service/scraper_runner.py browser_service/browser_pool.py tests/test_wave38_lock_and_recovery.py
+git commit -m "feat(wave-38 T6): scrape hardening — SCRAPER_CDP_PORT truth, drop wildcard allow-origins (cap = Railway env per D-1 opt 2)"
 ```
 
 ---
@@ -1541,7 +1538,7 @@ git commit -m "feat(wave-38 T6): scrape hardening — SCRAPER_CDP_PORT truth, dr
 - Modify: `docs/plans/wave38-mcp-isolation-plan.md` §5 (fill during execution)
 - Ops only — no source changes.
 
-- [ ] **Step 1: Build + restart the full stack** — `docker compose --profile full up --build -d`, then restart `celery-worker` + `django` (graph edits) and `browser_service` LAST (T6 edits). Fire restarts ONCE.
+- [ ] **Step 1: Build + restart the full stack** — `docker compose --profile full up --build -d`, then restart `celery-worker` + `django` (graph edits) and `browser_service` LAST (T6 edits). Fire restarts ONCE. **Before the browser_service restart the user sets `SCRAPE_MAX_CONCURRENT=1` as a Railway env var** (D-1 option 2 — the local gate runs code default 2, which is fine locally; the var is what makes prod cap-1).
 
 - [ ] **Step 2: Full suite + ruff green**
 
@@ -1554,7 +1551,7 @@ Run: `docker compose exec -T django sh -c 'cd /app/webapp && pytest ../tests . -
 1. Both jobs COMPLETED with item_count > 0.
 2. Celery logs contain ZERO of: `[W38-A1] wrong-site abort`, `CROSS-DOMAIN traversal result`, `dropping off-domain api capture`.
 3. Each job's output JSON contains no match of the OTHER sentinel's registrable domain (the T1.6-veto-absent assertion — the nets exist as backstop; this wave asserts they never had to fire).
-4. If D-1 adopted: any `scrape rejected (busy` 429 events appear as W8 park-and-retry rows in SessionLog, never as failed runs.
+4. Any `scrape rejected (busy` 429 events appear as W8 park-and-retry rows in SessionLog, never as failed runs (the local gate runs cap-2 code default, so this may legitimately not fire — absence of 429s is also a pass; the assertion is conditional on the event existing).
 5. `[TRAVERSAL-LOCK] acquired/released` pairs present for BOTH jobs (proof the boundaries ran), and ZERO `page never settled` INFO lines — that marker is what T2 logs on quiesce timeout, and docker logs swallow `debug`, so the healthy-site assertion is the INFO line's ABSENCE, not debug lines' presence.
 
 - [ ] **Step 5: Record §5 evidence + update memory.** Fill §5 with the drive IDs, log excerpts, suite counts, and any stale-fixture repairs. Write the wave-38 shipped memory file + MEMORY.md index line. EB sync per standing rules (`sync-w38` branch → EB, fork main push with lease, merge-tree check, compare link handed to user — PR creation is the USER's action).
@@ -1581,11 +1578,6 @@ Run: `docker compose exec -T django sh -c 'cd /app/webapp && pytest ../tests . -
 
 ---
 
-## DECISION-NEEDED
+## Decisions
 
-**D-1 — `SCRAPE_MAX_CONCURRENT` code default (server.py:96):**
-- **(1) Recommended: 2→1 in code** (as written in T6). Concurrent `/scrape`s share one Chrome with no mutual exclusion, and `_restart_scraper_chrome()` SIGTERMs the shared Chrome — a sibling run dies mid-flight (audit hazard M2). With SCRAPE_MAX_QUEUE=0 the second caller gets 429 → run_scraper's W8 ladder parks and retries → delayed, not failed. Cost: caller wall clock (tester's derived window) when two browser scrapers genuinely race — rare, and correctness beats latency here.
-- (2) Keep code 2, set `SCRAPE_MAX_CONCURRENT=1` as a Railway env var only — reversible without a deploy, but the code default stays unsafe for any fresh environment.
-- (3) Keep 2 everywhere — accept M2; rely on T1-T4 only. NOT recommended.
-
-**D-2 — if (2) or (3):** tell me and I'll adjust T6c + its test pin (`test_scrape_cap_default`) to match before execution starts.
+**D-1 — `SCRAPE_MAX_CONCURRENT` (server.py:96): DECIDED — option 2, env-only (2026-09-18).** Code default stays `"2"`; T6 makes NO source change to server.py. Prod enforcement is the user setting `SCRAPE_MAX_CONCURRENT=1` as a Railway env var on browser-service, effective via the existing `os.environ.get` read at import time on that service's next redeploy. Rationale: concurrent `/scrape`s share one Chrome with no mutual exclusion and `_restart_scraper_chrome()` SIGTERMs the shared process (audit hazard M2), but both runs contend for the same browser process anyway — cap 2 never bought 2× throughput — while a killed sibling costs a full re-drive. Env-only keeps fresh environments parallel-capable and makes the change instantly reversible (var flip, no deploy). `test_scrape_cap_stays_env_governed` pins the env-read idiom so a future hard-code can't silently break the deployment. If batch wall clock ever shows the park-and-retry wait hurting: revert the var, and promote per-run Chrome isolation (wave-39 Phase-D) to the real fix — which first needs the Railway memory-headroom question answered (3 saturations in 3 days, wave-37 open decision).
