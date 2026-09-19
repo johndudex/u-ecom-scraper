@@ -37,6 +37,7 @@ def _probe_data(jsonld):
 # ── Discriminator unit tests ────────────────────────────────────────────
 
 PDP_URL = "https://www.vinted.be/items/10014966848-levis-501"
+LISTING_URL = "https://www.vinted.be/catalog/5-men"
 
 
 class TestJsonldProductEntity:
@@ -266,3 +267,82 @@ class TestPdpFlipBelt:
         )
         assert m, "primary browser_traverse call with belt not found"
         assert 'not state.get("pdp_seed_flip")' in m.group(1)
+
+
+# ── [wave-39] PDP seed + same-host listing → swap, not demote ───────────
+
+class TestPdpListingSwap:
+    """The wave-34 demote is right when the job ONLY has a PDP. When the job
+    itself names a same-host listing (search_criteria) and the advisory
+    listing probe reached it, the honest reading of the intake is "discover
+    from the listing" — prod retry batch 719-737 all collapsed to 1 item."""
+
+    def _state(self, criteria=LISTING_URL, mode="list_page"):
+        return {
+            "job_id": 0,
+            "url": PDP_URL,
+            "input_mode": mode,
+            "site_slug": "vinted-be",
+            "search_criteria": criteria,
+        }
+
+    def _seed_probe(self):
+        return _probe_data([{"@type": "Product", "offers": {"price": 44.99}}])
+
+    def _listing_probe(self, jsonld=None, **over):
+        lp = _probe_data(
+            jsonld
+            if jsonld is not None
+            else [{"@type": "ItemList", "itemListElement": [{"@type": "Product"}]}]
+        )
+        lp.update(over)
+        return lp
+
+    def _swap(self, state, listing_probe):
+        return graph._pdp_listing_swap(
+            state, PDP_URL, self._seed_probe(), listing_probe
+        )
+
+    def test_swap_fires_same_host_listing(self):
+        out = self._swap(self._state(), self._listing_probe())
+        assert out is not None
+        updates, note = out
+        assert updates["url"] == LISTING_URL
+        assert updates["product_url"] == LISTING_URL
+        assert "[INTAKE-PDP-SWAP]" in note
+
+    def test_no_criteria_demotes(self):
+        # No listing named → the wave-34 demote is still the honest reading.
+        assert self._swap(self._state(criteria=""), self._listing_probe()) is None
+
+    def test_cross_host_criteria_demotes(self):
+        st = self._state(criteria="https://www.vinted.fr/catalog/5-men")
+        assert self._swap(st, self._listing_probe()) is None
+
+    def test_missing_listing_probe_demotes(self):
+        # Advisory probe never ran (host mismatch / skip path) — no evidence,
+        # no swap.
+        assert self._swap(self._state(), None) is None
+
+    def test_blocked_listing_probe_demotes(self):
+        lp = self._listing_probe(blocked=True)
+        assert self._swap(self._state(), lp) is None
+
+    def test_listing_itself_pdp_demotes(self):
+        # User pasted two product URLs — demote, never discover from a PDP.
+        lp = self._listing_probe([{"@type": "Product", "offers": {"price": 1.0}}])
+        assert self._swap(self._state(), lp) is None
+
+    def test_non_list_page_mode_never_swaps(self):
+        st = self._state(mode="navigation")
+        assert self._swap(st, self._listing_probe()) is None
+
+    def test_seed_not_pdp_no_swap(self):
+        # Defensive: helper re-checks the seed discriminator itself.
+        listing_seed_probe = _probe_data(
+            [{"@type": "ItemList", "itemListElement": [{"@type": "Product"}]}]
+        )
+        out = graph._pdp_listing_swap(
+            self._state(), LISTING_URL, listing_seed_probe, self._listing_probe()
+        )
+        assert out is None

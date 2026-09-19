@@ -2075,6 +2075,60 @@ def _write_flip_input_urls(state: ScrapeState, urls: list[str]) -> bool:
         return False
 
 
+def _pdp_listing_swap(
+    state: ScrapeState,
+    url: str,
+    data: dict[str, Any],
+    listing_probe: dict[str, Any] | None,
+) -> tuple[dict[str, Any], str] | None:
+    """[wave-39] PDP-seed listing swap — the demote's smarter sibling.
+
+    A list_page job whose seed URL is a product page BUT that also names a
+    same-host listing (search_criteria) is a discovery job pointed at the
+    wrong start URL, not a one-item job (prod retry batch 719-737: every
+    intake/status Retry row collapsed to 1 item because the wave-34 demote
+    ignored the listing sitting in search_criteria). Returns
+    ``(state_updates, note)`` to swap the discovery seed to the listing, or
+    None to fall through to the wave-34 demote.
+
+    Evidence-gated: the advisory listing probe must have REACHED the listing
+    (not blocked, with a transport verdict) and the listing must not itself
+    be a product page. Fail-closed in the swap direction — any missing
+    evidence demotes exactly as before.
+    """
+    if (state.get("input_mode") or "").lower() != "list_page":
+        return None
+    if not _jsonld_product_entity(data.get("jsonld"), url):
+        return None
+    _criteria = str(state.get("search_criteria") or "").strip()
+    if not _criteria.startswith(("http://", "https://")):
+        return None
+    if listing_probe is None or listing_probe.get("blocked"):
+        return None
+    if not (
+        listing_probe.get("method_that_worked")
+        or listing_probe.get("needs_browser") is not None
+    ):
+        return None
+    try:
+        from urllib.parse import urlparse as _urlparse
+
+        _seed_host = (_urlparse(url).hostname or "").lower()
+        _crit_host = (_urlparse(_criteria).hostname or "").lower()
+    except Exception:
+        return None
+    if not _seed_host or _crit_host != _seed_host:
+        return None
+    if _jsonld_product_entity(listing_probe.get("jsonld"), _criteria):
+        return None
+    _note = (
+        f"[INTAKE-PDP-SWAP] seed {url[:200]} is a product page; discovery "
+        f"seed swapped to listing {_criteria[:200]} (listing probe "
+        f"method={listing_probe.get('method_that_worked') or 'browser'})"
+    )
+    return {"url": _criteria, "product_url": _criteria}, _note
+
+
 def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
     """Probe the target URL with LLM-based captcha verification.
 
@@ -2221,40 +2275,63 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
     # modes: there the seed is a starting hint and the user asked for
     # discovery, not for this one page.
     _flip_updates: dict[str, Any] = {}
-    if (
-        _input_mode == "list_page"
-        and _jsonld_product_entity(data.get("jsonld"), url)
+    if _input_mode == "list_page" and _jsonld_product_entity(
+        data.get("jsonld"), url
+    ):
+        # [wave-39] A PDP seed with a same-host listing on the job is a
+        # discovery job pointed at the wrong start URL, not a one-item job:
+        # swap the seed to the listing (evidence-gated — see helper). Only
+        # when no usable listing exists does the wave-34 demote apply.
+        _swap = _pdp_listing_swap(state, url, data, listing_probe)
+        if _swap is not None:
+            _swap_updates, _swap_note = _swap
+            logger.info("check_accessibility: %s (job %s)", _swap_note, job_id)
+            if job_id:
+                try:
+                    from scraper.models import ScrapeJob
+
+                    _job = ScrapeJob.objects.filter(pk=job_id).first()
+                    if _job is not None:
+                        _job.url = _swap_updates["url"]
+                        _job.notes = (
+                            (_job.notes + "\n") if _job.notes else ""
+                        ) + _swap_note
+                        _job.save(update_fields=["url", "notes"])
+                except Exception as exc:
+                    logger.warning(
+                        "check_accessibility: PDP-swap job update failed: %s", exc
+                    )
+            _flip_updates = _swap_updates
         # [wave-34 critique] fail OPEN: if the seed file cannot be written,
         # keep list_page — a flipped job without input_urls.json is a
         # guaranteed downstream fail (writer prompt asserts the file,
         # run_execution stages it).
-        and _write_flip_input_urls(state, [url])
-    ):
-        _flip_updates = {
-            "input_mode": "url_list",
-            "input_urls": [url],
-            "pdp_seed_flip": True,
-        }
-        _note = (
-            f"[INTAKE-PDP] seed {url[:200]} is a product page (probe JSON-LD "
-            "Product); input_mode list_page → url_list with the seed as its "
-            "single item"
-        )
-        logger.info("check_accessibility: %s (job %s)", _note, job_id)
-        if job_id:
-            try:
-                from scraper.models import ScrapeJob
+        elif _write_flip_input_urls(state, [url]):
+            _flip_updates = {
+                "input_mode": "url_list",
+                "input_urls": [url],
+                "pdp_seed_flip": True,
+            }
+            _note = (
+                f"[INTAKE-PDP] seed {url[:200]} is a product page (probe JSON-LD "
+                "Product); input_mode list_page → url_list with the seed as its "
+                "single item"
+            )
+            logger.info("check_accessibility: %s (job %s)", _note, job_id)
+            if job_id:
+                try:
+                    from scraper.models import ScrapeJob
 
-                _job = ScrapeJob.objects.filter(pk=job_id).first()
-                if _job is not None:
-                    _job.notes = (
-                        (_job.notes + "\n") if _job.notes else ""
-                    ) + _note
-                    _job.save(update_fields=["notes"])
-            except Exception as exc:
-                logger.warning(
-                    "check_accessibility: PDP-flip note write failed: %s", exc
-                )
+                    _job = ScrapeJob.objects.filter(pk=job_id).first()
+                    if _job is not None:
+                        _job.notes = (
+                            (_job.notes + "\n") if _job.notes else ""
+                        ) + _note
+                        _job.save(update_fields=["notes"])
+                except Exception as exc:
+                    logger.warning(
+                        "check_accessibility: PDP-flip note write failed: %s", exc
+                    )
 
     method = data.get("method", "unknown")
     proxy_tier = data.get("proxy_tier", "none")
