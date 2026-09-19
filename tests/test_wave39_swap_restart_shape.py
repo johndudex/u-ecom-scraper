@@ -8,7 +8,6 @@ persist the new target + [INTAKE-PDP-SWAP] marker on the ScrapeJob row.
 """
 
 import pytest
-
 from agents import graph
 from agents.tools import probe_tools
 from scraper import models as scraper_models

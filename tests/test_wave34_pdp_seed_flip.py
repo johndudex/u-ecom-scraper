@@ -10,7 +10,6 @@ item instead of traversing from a PDP.
 import re
 
 import pytest
-
 from agents import graph
 from agents.tools import probe_tools
 
