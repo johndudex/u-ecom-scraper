@@ -6923,8 +6923,18 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         # largest parseable fenced block to the draft path and let the normal
         # post-invocation checks see a healthy draft. No code_writer_error_count
         # bump — this is delivery-format recovery, not a failure.
+        # [wave-40 T7] FENCE: this bypass writes straight to disk, so it skips
+        # the write-path gates the writer's own write_file would have run. A
+        # fenced block that violates a helper signature (the 760/791/762 crash
+        # class) is therefore left unsalvaged — the job keeps its honest
+        # no-draft path instead of smuggling a draft into testing that can only
+        # crash at execution. SCRAPER_DRAFT_CALL_GATE=0 disarms the fence too.
         try:
-            from .draft_safety import draft_parses, extract_fenced_python
+            from .draft_safety import (
+                draft_call_violation,
+                draft_parses,
+                extract_fenced_python,
+            )
 
             _cw_pre = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
             if not draft_parses(_cw_pre):
@@ -6937,7 +6947,17 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                         break
                 if _cw_text:
                     _fenced = extract_fenced_python(_cw_text)
-                    if _fenced:
+                    if _fenced and (
+                        os.getenv("SCRAPER_DRAFT_CALL_GATE", "1") != "0"
+                        and draft_call_violation(_fenced)
+                    ):
+                        logger.warning(
+                            "_invoke_code_writer: fence recovery SKIPPED — the fenced "
+                            "scraper violates a helper signature the write-path gate "
+                            "would have rejected (job %s)",
+                            job_id,
+                        )
+                    elif _fenced:
                         os.makedirs(os.path.dirname(_cw_pre), exist_ok=True)
                         with open(_cw_pre, "w", encoding="utf-8") as _ff:
                             _ff.write(_fenced)
@@ -9273,6 +9293,33 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     "_invoke_code_tester: ladder gate errored (job %s): %s",
                     job_id, _exc,
                 )
+        # [wave-40 T7] third arm on the same lane: helper CALL signatures.
+        # Neither the compile gate nor F821 binds arguments, so the 760/791/762
+        # class (unexpected kwarg, multiple values for argument, non-compiling
+        # regex literal) passed testing and crashed at execution hours later.
+        # The write-path gate rejects these at the writer now; this belt covers
+        # a draft that reached disk another way (FM restore, hand-carried
+        # workspace, a gate disarmed by SCRAPER_DRAFT_CALL_GATE=0).
+        if not _cli_violation:
+            try:
+                from .draft_safety import (
+                    DRAFT_CALL_VIOLATION_MARKER,
+                    draft_call_violation,
+                )
+
+                _call_src = ""
+                if os.path.isfile(_draft):
+                    with open(_draft, encoding="utf-8", errors="replace") as _call_fh:
+                        _call_src = _call_fh.read()
+                _call_violation = draft_call_violation(_call_src)
+                if _call_violation.startswith(DRAFT_CALL_VIOLATION_MARKER):
+                    _cli_violation = _call_violation
+                    _violation_kind = "call"
+            except Exception as _exc:
+                logger.warning(
+                    "_invoke_code_tester: call-signature gate errored (job %s): %s",
+                    job_id, _exc,
+                )
         if _cli_violation:
             report = report or {}
             # [wave-22 B4] preserve the tester's verdict before zeroing.
@@ -9282,7 +9329,11 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             report["ready_for_execution"] = False
             # [wave-34 F4] which deterministic gate forced the FAIL — routing
             # consults this belt so a forced-FAIL can never be overridden.
-            report["deterministic_gate"] = _violation_kind or "cli"
+            # [wave-40 T7] the stamp is a DICT now ({"violation_kind": ...}) so
+            # the call class is distinguishable from cli/ladder;
+            # route_after_testing reads it truthily, so the string stamps
+            # historical reports carry still satisfy the same belt.
+            report["deterministic_gate"] = {"violation_kind": _violation_kind or "cli"}
             report.setdefault("issues", []).insert(
                 0,
                 {
@@ -9301,6 +9352,19 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     "create_fetch_json / create_fetch_text), or pass "
                     "proxies=proxy_config.get_proxy_dict(tier) on your "
                     "requests calls. Use edit_file; do NOT rewrite the scraper."
+                )
+            elif _violation_kind == "call":
+                # [wave-40 T7] its own directive — the CLI text below would
+                # send the writer chasing argparse declarations on a draft
+                # whose actual defect is a mis-bound helper call.
+                report["feedback_for_writer"] = (
+                    "HELPER CALL SIGNATURE VIOLATION (deterministic — testing "
+                    "cannot pass while a helper is called with arguments it "
+                    "does not accept; this is the 760/791/762 crash class):\n"
+                    + _cli_violation + "\n"
+                    "Fix each flagged call site to the real signature shown "
+                    "beside the finding. Use edit_file; do NOT rewrite the "
+                    "scraper."
                 )
             else:
                 report["feedback_for_writer"] = (

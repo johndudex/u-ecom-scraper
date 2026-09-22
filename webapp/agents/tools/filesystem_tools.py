@@ -18,6 +18,8 @@ import subprocess
 
 from langchain_core.tools import tool
 
+from agents.draft_safety import draft_call_violation
+
 logger = logging.getLogger(__name__)
 
 # F2 (artifact-corruption): what write_file/edit_file append to the tool result
@@ -61,11 +63,26 @@ _F821_REPAIR_CONTRACT = (
 
 
 def _f821_rejections(path: str, content: str) -> str:
-    """Run ruff F821 over draft content; return "" (gate open) or rejection.
+    """Run the draft write gates over content; "" (gate open) or a rejection.
+
+    Two gates, one seam (every code_writer write_file/edit_file call site goes
+    through here):
+
+    1. ruff F821 — an undefined name is the more basic defect and keeps
+       priority: the call gate below is only reached once this one is clean.
+    2. [wave-40 T7] ``draft_call_violation`` — helper CALL signatures. The F821
+       check binds no arguments, so the prod 760/791/762 class (unexpected
+       kwarg, multiple values for argument, non-compiling regex literal) sailed
+       through both this gate and the compile gate and crashed at execution
+       hours later.
 
     Falls OPEN on any checker malfunction (binary missing, timeout, crash):
     a broken linter must never block a write — ``_fix_scraper_syntax`` at the
-    phase boundary stays the authoritative backstop.
+    phase boundary stays the authoritative backstop. A dead F821 checker
+    disarms both gates on that write (gate 2 rides gate 1's clean path);
+    ``draft_call_violation`` itself falls open on anything it cannot judge, so
+    a gate bug never blocks a draft here. ``SCRAPER_DRAFT_CALL_GATE=0``
+    disarms gate 2 only.
     """
     try:
         proc = subprocess.run(
@@ -85,6 +102,13 @@ def _f821_rejections(path: str, content: str) -> str:
         ln.strip() for ln in (proc.stdout or "").splitlines() if "F821" in ln
     ]
     if not findings:
+        # [wave-40 T7] helper CALL-signature gate — same rejection shape the
+        # F821 check returns (the tool result IS the rejection; nothing is
+        # written), guarded by its own kill switch.
+        if os.getenv("SCRAPER_DRAFT_CALL_GATE", "1") != "0":
+            _call = draft_call_violation(content)
+            if _call:
+                return _call
         return ""
     shown = findings[:_F821_MAX_FINDINGS]
     more = len(findings) - len(shown)

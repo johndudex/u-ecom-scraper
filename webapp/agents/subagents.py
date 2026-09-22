@@ -1418,7 +1418,8 @@ def _get_tools_sync(agent_name: str, workspace_scope: str = "") -> list:
 
             # [wave-22 B1] the F821 draft gate is kwarg-scoped to code_writer:
             # 8 agents share get_filesystem_tools and none of the others
-            # draft code.
+            # draft code. [wave-40 T7] the helper CALL-signature gate rides
+            # the same seam inside _f821_rejections — no extra plumbing here.
             tools.extend(_gft(
                 workspace_scope=workspace_scope or None,
                 syntax_gate=(agent_name == "code_writer"),
