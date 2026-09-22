@@ -1568,6 +1568,344 @@ def _final_status_ladder(
     return ScrapeJob.STATUS_COMPLETED, ""
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# [wave-40 T8] Job-scoped real-items evidence — the evidence layer under the
+# finalize rescue ladder. `_real_items_evidence` + `_rescue_min_count` are
+# consumed by `_finalize_job`/`_final_status_ladder` (wave-40 T9).
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Top-level record keys a content-type output may use besides the job's own
+# output_key (mirrors the key list `_scraper_has_real_items`'s file scan uses).
+_RESCUE_ROW_KEYS = ("products", "jobs", "articles", "results", "items",
+                    "threads", "pages")
+
+# output_%Y-%m-%d_%H%M%S[_%f]_{pid}.json — the optional middle field is the
+# templates' 6-digit %f stamp (e.g. 000001), not a sub-second claim.
+_RESCUE_OUTPUT_NAME_PATTERN = (
+    r"^output_(?P<date>\d{4}-\d{2}-\d{2})_(?P<clock>\d{6})"
+    r"(?:_(?P<micro>\d{6}))?_(?P<pid>\d+)\.json$"
+)
+
+
+def _rescue_min_count(input_mode: str) -> int:
+    """Minimum real rows a rescue must prove, by input mode.
+
+    Identical to the wave-37 adaptive ladder rule: url_list/list_page jobs
+    extract from user-supplied URLs — 1 rich row IS a success — while
+    navigation/search_term jobs need 3+ to prove discovery worked.
+    """
+    return 1 if (input_mode or "").strip() in ("url_list", "list_page") else 3
+
+
+def _output_name_epoch(name: str) -> float | None:
+    """``output_%Y-%m-%d_%H%M%S[_%f]_{pid}.json`` → UTC epoch, else None.
+
+    The filename IS the write time: the File Master /list endpoint returns keys
+    without mtimes, so an FM key's own name is the only freshness signal it
+    has. Both the ``_%f`` and the no-``%f`` shapes are matched.
+    """
+    import re
+
+    match = re.match(_RESCUE_OUTPUT_NAME_PATTERN, name or "")
+    if not match:
+        return None
+    from datetime import datetime as _datetime
+    from datetime import timezone as _dttz
+
+    try:
+        stamp = _datetime.strptime(
+            f"{match.group('date')}_{match.group('clock')}", "%Y-%m-%d_%H%M%S"
+        )
+    except ValueError:
+        return None
+    return stamp.replace(tzinfo=_dttz.utc).timestamp()
+
+
+def _rescue_dead_row(row: dict) -> bool:
+    """Dead-row predicate — `route_after_testing._is_dead_product`, imported so
+    the rescue can never drift from the router's definition (redirect/404/410
+    status codes + soft-404 markers). If that module is unimportable, the same
+    two checks run off agents.constants; if even those fail the row is KEPT —
+    a rescue slightly over-counting a real file beats a decode hiccup
+    discarding the whole file.
+    """
+    try:
+        from agents.nodes.route_after_testing import _is_dead_product
+
+        return bool(_is_dead_product(row))
+    except Exception:
+        pass
+    try:
+        from agents.constants import DEAD_STATUS_CODES, SOFT_404_MARKERS
+
+        if row.get("status_code", 200) in DEAD_STATUS_CODES:
+            return True
+        remarks = (row.get("remarks") or "").lower()
+        return any(marker in remarks for marker in SOFT_404_MARKERS)
+    except Exception:
+        return False
+
+
+def _good_rows(data: object, fields: list[str], output_key: str) -> list[dict]:
+    """Rows of one output payload that qualify as real items.
+
+    Same predicate chain as the wave-37 rescue guard
+    (`route_after_testing._scraper_has_real_items`, :623-646, with the job-118
+    schema union the caller folds into ``fields``): the payload's top-level
+    list under ``output_key`` (then the known content-type keys), minus dead
+    rows, keeping rows that carry at least one filter/schema field — or, when
+    the job declares none, any substantive (non-bookkeeping) field. A
+    ``metadata.phase == "discovery"`` payload (job-76's URL stubs) is never
+    extraction truth. Any shape problem degrades to [] — never raises.
+    """
+    try:
+        if isinstance(data, list):
+            # Bare top-level array — the shape `_output_file_has_zero_items`
+            # also admits.
+            rows = [r for r in data if isinstance(r, dict)]
+        elif isinstance(data, dict):
+            metadata = data.get("metadata")
+            if isinstance(metadata, dict) and metadata.get("phase") == "discovery":
+                return []
+            rows = []
+            for key in [output_key] + [k for k in _RESCUE_ROW_KEYS
+                                       if k != output_key]:
+                value = data.get(key)
+                if isinstance(value, list) and value:
+                    rows = [r for r in value if isinstance(r, dict)]
+                    break
+        else:
+            return []
+        live = [r for r in rows if not _rescue_dead_row(r)]
+        if fields:
+            return [r for r in live if any(r.get(field) for field in fields)]
+        try:
+            from src.content_types import has_substantive_field
+        except Exception:
+
+            def has_substantive_field(item):  # type: ignore[misc]
+                return bool(item.get("title"))
+
+        return [r for r in live if has_substantive_field(r)]
+    except Exception:
+        return []
+
+
+def _real_items_evidence(
+    slug: str, job: ScrapeJob, final_state: dict | None = None
+) -> tuple[int, str]:
+    """How many real rows did THIS job demonstrably produce, and in which file?
+
+    Returns ``(good_row_count, locator)`` — locator is the local path or File
+    Master key of the qualifying output that carried the most rows — or
+    ``(0, "")`` when nothing qualifies. Three sources, best-of-N: (a)
+    ``workspace/{slug}/output_*.json`` (mtime), (b) local
+    ``scrapers/{slug}/output_*.json`` (mtime — dev bind-mount only), (c) FM
+    keys ``scrapers/{slug}/output_*.json`` (filename epoch) via
+    ``src.artifacts``.
+
+    Deliberately JOB-scoped, not attempt-scoped: the wave-37 rescue predicate
+    (`_scraper_has_real_items`) scans workspace-only and gates on the current
+    draft / last_tested_at, so prod 762 (8 workspace outputs from earlier
+    cycles, all older than the crashed attempt's draft floor → honest FAIL
+    with 4+ real products on disk) and prod 770 (its own cleanup agent had
+    already moved the 19-product output to ``scrapers/``, so a workspace-only
+    scan saw nothing) both escaped it. Here the window is the JOB's
+    (``started_at - 5s``, the 5s tolerating same-second writes).
+
+    HONEST LIMITS. (1) Attribution is job-scoped, not output-to-sha: output
+    files carry no draft sha, so sha-level attribution is impossible
+    retroactively — the trace guard instead requires draft provenance for this
+    job (state ``tested_draft_sha256`` / ``last_tested_draft_fp``, or this
+    job's per-job FM draft key ``scrapers/{slug}/jobs/scraper-{job_id}.py``).
+    (2) An FM key is admitted on its name alone, not window-gated: prod 770's
+    output was published by the job's own cleanup agent yet the FM exposes no
+    mtime, and a same-run publish can carry an earlier-stamped name — gating
+    FM keys on the name epoch would have re-killed 770. Cross-job exclusion on
+    the FM path therefore rests entirely on the trace guard (state provenance
+    is this job's checkpoint; the per-job draft key is this job's). (3) A
+    local output whose stamped name already proves it predates this job is a
+    prior job's leftover re-hydrated into this workspace — its mtime is only
+    the copy time — so it counts only when this job's own draft sits beside it,
+    which vouches for the SAME job's earlier-cycle outputs (762's shape).
+    (4) Sources (b) are dev-bind-mount only; in prod only (a) pre-publish and
+    (c) exist. Every read error degrades to ``(0, "")`` — a rescue must never
+    fail a job on OUR OWN read error.
+
+    Kill switch: ``REAL_ITEMS_RESCUE_ENABLED=0`` (default on).
+    """
+    if os.getenv("REAL_ITEMS_RESCUE_ENABLED", "1") == "0":
+        return 0, ""
+    state = final_state or {}
+    started = getattr(job, "started_at", None)
+    if not slug or started is None:
+        # No start time → no attribution window → no honest attribution.
+        return 0, ""
+    job_id = getattr(job, "id", None)
+
+    # ── Trace guard: a draft must be traceable to THIS job ──────────────────
+    draft_key = f"scrapers/{slug}/jobs/scraper-{job_id}.py" if job_id else ""
+    artifacts = None
+    fm_keys: list[str] = []
+    try:
+        import src.artifacts as artifacts
+
+        fm_keys = [
+            key for key in (artifacts.list_keys(f"scrapers/{slug}/") or [])
+            if isinstance(key, str)
+        ]
+    except Exception as exc:
+        logger.warning(
+            "Job %s: real-items FM listing unavailable (%s) — local sources only",
+            job_id, exc,
+        )
+        fm_keys = []
+    has_provenance = any(
+        str(state.get(key) or "").strip()
+        for key in ("tested_draft_sha256", "last_tested_draft_fp")
+    ) or bool(draft_key and draft_key in fm_keys)
+    if not has_provenance:
+        return 0, ""
+
+    # ── Job window + the content-type field contract ────────────────────────
+    from datetime import timedelta as _timedelta
+    from datetime import timezone as _dttz
+
+    try:
+        started_at = started
+        if timezone.is_naive(started_at):
+            started_at = started_at.replace(tzinfo=_dttz.utc)
+        floor = (started_at - _timedelta(seconds=5)).timestamp()
+    except Exception:
+        return 0, ""
+    ct_config = state.get("content_type_config") or {}
+    output_key = (ct_config.get("output_key", "products") if ct_config
+                  else "products")
+    fields: list[str] = []
+    try:
+        from src.content_types import output_filter_fields
+
+        fields = list(output_filter_fields(ct_config.get("content_type", "")) or [])
+    except Exception:
+        fields = []
+    try:
+        # [wave-36 B1 / job-118] schema union (resolved ∪ raw ∪ custom): when
+        # the job's own schema asks for NONE of the content type's filter
+        # fields, judge rows by the fields the user actually requested.
+        from src.field_mapping import union_output_fields
+
+        schema_fields = [
+            str(f).strip().lower()
+            for f in union_output_fields(state) if str(f).strip()
+        ]
+        output_schema = state.get("output_schema")
+        if not schema_fields and isinstance(output_schema, dict):
+            schema_fields = [
+                str(k).strip().lower() for k in output_schema.keys()
+                if str(k).strip()
+            ]
+        schema_fields = [
+            f for f in schema_fields if f not in ("title", "url", "src_url")
+        ]
+        if schema_fields and fields and not (set(fields) & set(schema_fields)):
+            fields = schema_fields
+    except Exception:
+        pass
+
+    from pathlib import Path as _P
+
+    root = _P(getattr(settings, "PROJECT_ROOT", os.getcwd()))
+    ws_dir = root / "workspace" / slug
+    local_scrapers_dir = root / "scrapers" / slug
+    local_draft = False
+    draft_candidates = [ws_dir / "scraper_draft.py"]
+    if job_id:
+        draft_candidates.append(
+            local_scrapers_dir / "jobs" / f"scraper-{job_id}.py")
+    for candidate in draft_candidates:
+        try:
+            if candidate.is_file():
+                local_draft = True
+                break
+        except OSError:
+            continue
+
+    best_count, best_fresh, best_loc = 0, 0.0, ""
+
+    def _consider(count: int, fresh: float, locator: str) -> None:
+        nonlocal best_count, best_fresh, best_loc
+
+        if count > 0 and (count > best_count
+                          or (count == best_count and fresh > best_fresh)):
+            best_count, best_fresh, best_loc = count, fresh, locator
+
+    # ── Sources (a) + (b): local output files, freshness-gated by mtime ────
+    for directory in (ws_dir, local_scrapers_dir):
+        try:
+            names = sorted(os.listdir(directory)) if directory.is_dir() else []
+        except OSError:
+            names = []
+        source_total, source_rows, source_loc, source_fresh = 0, 0, "", 0.0
+        for name in names:
+            if not (name.startswith("output_") and name.endswith(".json")):
+                continue
+            path = directory / name
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime < floor:
+                continue  # predates this job's window — not this job's output
+            name_epoch = _output_name_epoch(name)
+            if name_epoch is not None and name_epoch < floor and not local_draft:
+                continue  # see HONEST LIMITS (3)
+            try:
+                data = json.loads(
+                    path.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                continue  # unreadable/unparseable — one file is not evidence
+            rows = _good_rows(data, fields, output_key)
+            if not rows:
+                continue
+            source_total += len(rows)
+            fresh = name_epoch if name_epoch is not None else mtime
+            if len(rows) > source_rows or (
+                len(rows) == source_rows and fresh > source_fresh
+            ):
+                source_rows, source_loc, source_fresh = len(rows), str(path), fresh
+        if source_total:
+            _consider(source_total, source_fresh, source_loc)
+
+    # ── Source (c): File Master output keys, freshness from the name ────────
+    if artifacts is not None and fm_keys:
+        fm_total, fm_rows, fm_loc, fm_fresh = 0, 0, "", 0.0
+        for key in fm_keys:
+            name = key.rsplit("/", 1)[-1]
+            if not (name.startswith("output_") and name.endswith(".json")):
+                continue
+            name_epoch = _output_name_epoch(name)
+            if name_epoch is None:
+                continue  # not a stamped output name — cannot attribute it
+            try:
+                payload = json.loads(artifacts.read_text(key))
+            except Exception:
+                continue  # one unreadable key must not discard the others
+            rows = _good_rows(payload, fields, output_key)
+            if not rows:
+                continue
+            fm_total += len(rows)
+            if len(rows) > fm_rows or (
+                len(rows) == fm_rows and name_epoch > fm_fresh
+            ):
+                fm_rows, fm_loc, fm_fresh = len(rows), key, name_epoch
+        if fm_total:
+            _consider(fm_total, fm_fresh, fm_loc)
+
+    if best_count:
+        return best_count, best_loc
+    return 0, ""
+
+
 def _publish_analysis_artifacts(job_id: int, site_slug: str, ws) -> None:
     """Copy the analysis artifacts from the LOCAL workspace to the File Master.
 
