@@ -862,6 +862,7 @@ def _approval_visible(approval, request) -> bool:
     )
 
 
+@login_required
 def approval_inline(request, job_id, approval_id):
     approval = get_object_or_404(Approval, pk=approval_id, job_id=job_id)
     if not _approval_visible(approval, request):

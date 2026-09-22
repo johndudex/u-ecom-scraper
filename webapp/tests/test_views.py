@@ -1,13 +1,16 @@
 from unittest.mock import MagicMock, patch
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import Client, TestCase
+from django.test import Client, TestCase, override_settings
 from django.urls import reverse
 from model_bakery import baker
 from scraper.models import Approval, ScrapeJob
 
 User = get_user_model()
+
+NO_AUTO_LOGIN = [m for m in settings.MIDDLEWARE if "DebugAutoLogin" not in m]
 
 
 class TestHomeView(TestCase):
@@ -221,6 +224,61 @@ class TestApprovalDetailView(TestCase):
         )
         self.approval.refresh_from_db()
         self.assertEqual(self.approval.status, Approval.STATUS_REJECTED)
+
+
+@override_settings(MIDDLEWARE=NO_AUTO_LOGIN)
+class TestApprovalInlineAuth(TestCase):
+    """[wave-40 T3] approval_inline shipped without @login_required:
+    _approval_visible hands OWNERLESS jobs to any caller, so an anonymous POST
+    resolved an approval and resumed the graph (reproduced: 302 to job page +
+    status=approved + resume_scrape_task.delay dispatched)."""
+
+    def setUp(self):
+        self.client = Client()
+        self.owner = User.objects.create_user("owner", password="pw")
+        self.orphan_job = baker.make(ScrapeJob, user=None)
+        self.orphan = baker.make(Approval, job=self.orphan_job,
+                                 approval_type="field_confirm", question="q")
+        self.owned_job = baker.make(ScrapeJob, user=self.owner)
+        self.owned = baker.make(Approval, job=self.owned_job,
+                                approval_type="field_confirm", question="q")
+
+    def _post(self, approval, choice="Approve"):
+        return self.client.post(
+            reverse("approval_inline",
+                    kwargs={"job_id": approval.job_id, "approval_id": approval.id}),
+            {"choice": choice})
+
+    def test_anonymous_post_is_redirected_and_resolves_nothing(self):
+        resp = self._post(self.orphan)
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn("/accounts/login/", resp["Location"])
+        self.orphan.refresh_from_db()
+        self.assertEqual(self.orphan.status, Approval.STATUS_PENDING)
+
+    def test_anonymous_get_is_redirected_too(self):
+        resp = self.client.get(
+            reverse("approval_inline",
+                    kwargs={"job_id": self.orphan.job_id,
+                            "approval_id": self.orphan.id}))
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn("/accounts/login/", resp["Location"])
+
+    def test_logged_in_non_owner_gets_404(self):
+        self.client.force_login(User.objects.create_user("intruder", password="pw"))
+        resp = self._post(self.owned)
+        self.assertEqual(resp.status_code, 404)
+        self.owned.refresh_from_db()
+        self.assertEqual(self.owned.status, Approval.STATUS_PENDING)
+
+    def test_owner_still_resolves_and_resumes(self):
+        self.client.force_login(self.owner)
+        with patch("scraper.tasks.resume_scrape_task") as task:  # function-level import
+            resp = self._post(self.owned)
+        self.assertEqual(resp.status_code, 302)
+        task.delay.assert_called_once()
+        self.owned.refresh_from_db()
+        self.assertEqual(self.owned.status, Approval.STATUS_APPROVED)
 
 
 class TestJobAPIView(TestCase):
