@@ -259,3 +259,63 @@ def test_output_name_epoch_is_second_granular_utc():
     assert tasks._output_name_epoch("output_2026-09-20_235455.json") is None
     assert tasks._output_name_epoch("") is None
     assert tasks._output_name_epoch(None) is None
+
+
+# ── [wave-40 T8 r1] review findings ─────────────────────────────────────────
+
+def test_dead_row_fallback_tier_filters_when_router_unimportable(monkeypatch):
+    """[T8 r1 Finding 1] The agents.constants middle tier must actually RUN: with
+    route_after_testing unimportable, a soft-404 / dead-status row is still
+    dropped and a live row is kept. RED today — SOFT_404_MARKERS lives only in
+    route_after_testing, so the middle tier's import always failed and rows
+    were silently kept."""
+    import sys
+    import types
+
+    monkeypatch.setitem(
+        sys.modules, "agents.nodes.route_after_testing",
+        types.ModuleType("agents.nodes.route_after_testing"))
+    assert tasks._rescue_dead_row(
+        {"title": "soft", "price": "$1", "remarks": "product not found"}
+    ) is True
+    assert tasks._rescue_dead_row(
+        {"title": "gone", "price": "$1", "status_code": 404}) is True
+    assert tasks._rescue_dead_row({"title": "alive", "price": "$1"}) is False
+
+
+def test_workspace_draft_does_not_vouch_across_directories(tmp_path, monkeypatch):
+    """[T8 r1 Finding 2] A draft vouches only for files in its OWN directory: a
+    workspace draft must not admit a stale-named leftover under scrapers/{slug}/
+    (that would widen the prior-rows residual to source (b))."""
+    started = timezone.now() - timezone.timedelta(hours=1)
+    ws = tmp_path / "workspace" / "xsite"
+    ws.mkdir(parents=True)
+    (ws / "scraper_draft.py").write_text("# draft")
+    stale_dir = tmp_path / "scrapers" / "xsite"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "output_2026-09-20_010000_000001_1.json").write_text(
+        json.dumps({"products": _rows(9)}))
+    _fm(monkeypatch, [], {})
+    _root(monkeypatch, tmp_path)
+    n, _ = tasks._real_items_evidence(
+        "xsite", _job(started), final_state={"last_tested_draft_fp": "fp"})
+    assert n == 0
+
+
+def test_per_job_local_draft_vouches_for_its_own_scrapers_dir(
+        tmp_path, monkeypatch):
+    """[T8 r1] Positive half of Finding 2 — source (b) keeps a same-directory
+    carve-out via the per-job draft copy (regression pin against
+    over-restricting source (b) out of existence)."""
+    started = timezone.now() - timezone.timedelta(hours=1)
+    sc = tmp_path / "scrapers" / "ysite"
+    (sc / "jobs").mkdir(parents=True)
+    (sc / "jobs" / "scraper-11.py").write_text("# per-job draft copy")
+    (sc / "output_2026-09-20_010000_000001_1.json").write_text(
+        json.dumps({"products": _rows(2)}))
+    _fm(monkeypatch, [], {})
+    _root(monkeypatch, tmp_path)
+    n, loc = tasks._real_items_evidence(
+        "ysite", _job(started, id=11),
+        final_state={"last_tested_draft_fp": "fp"})
+    assert n == 2 and loc.endswith("output_2026-09-20_010000_000001_1.json")

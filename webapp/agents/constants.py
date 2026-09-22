@@ -29,6 +29,18 @@ FINAL_RETRY_FAILED: str = "final_retry_failed"
 
 DEAD_STATUS_CODES: frozenset[int] = frozenset({301, 302, 303, 307, 308, 404, 410, 451})
 
+# Remarks substrings that mark a row a soft-404 ("product not found", …).
+# Lives beside DEAD_STATUS_CODES so dead-row consumers that cannot import the
+# router (scraper.tasks' rescue evidence reads it as a fallback tier — wave-40
+# T8 r1) still get the real markers; route_after_testing imports it from here.
+SOFT_404_MARKERS: tuple[str, ...] = (
+    "soft 404",
+    "product not found",
+    "no longer available",
+    "discontinued",
+    "not a product page",
+)
+
 # ── Scraper CLI contract (discovery modes) ───────────────────────────────────
 #
 # Single source of truth for the discovery surface run_execution passes to a

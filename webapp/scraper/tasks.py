@@ -1625,8 +1625,10 @@ def _rescue_dead_row(row: dict) -> bool:
     """Dead-row predicate — `route_after_testing._is_dead_product`, imported so
     the rescue can never drift from the router's definition (redirect/404/410
     status codes + soft-404 markers). If that module is unimportable, the same
-    two checks run off agents.constants; if even those fail the row is KEPT —
-    a rescue slightly over-counting a real file beats a decode hiccup
+    two checks run off agents.constants — which owns BOTH constants (T8 r1
+    moved SOFT_404_MARKERS there so this tier is genuinely reachable,
+    `route_after_testing` importing it back); if even that fails the row is
+    KEPT — a rescue slightly over-counting a real file beats a decode hiccup
     discarding the whole file.
     """
     try:
@@ -1726,8 +1728,10 @@ def _real_items_evidence(
     is this job's checkpoint; the per-job draft key is this job's). (3) A
     local output whose stamped name already proves it predates this job is a
     prior job's leftover re-hydrated into this workspace — its mtime is only
-    the copy time — so it counts only when this job's own draft sits beside it,
-    which vouches for the SAME job's earlier-cycle outputs (762's shape).
+    the copy time — so it counts only when this job's own draft sits beside it
+    IN THE SAME DIRECTORY — a workspace draft never vouches for
+    scrapers/{slug}/ files, and vice versa (T8 r1) — which vouches for the
+    SAME job's earlier-cycle outputs (762's shape).
     (4) Sources (b) are dev-bind-mount only; in prod only (a) pre-publish and
     (c) exist. Every read error degrades to ``(0, "")`` — a rescue must never
     fail a job on OUR OWN read error.
@@ -1817,18 +1821,25 @@ def _real_items_evidence(
     root = _P(getattr(settings, "PROJECT_ROOT", os.getcwd()))
     ws_dir = root / "workspace" / slug
     local_scrapers_dir = root / "scrapers" / slug
-    local_draft = False
-    draft_candidates = [ws_dir / "scraper_draft.py"]
-    if job_id:
-        draft_candidates.append(
-            local_scrapers_dir / "jobs" / f"scraper-{job_id}.py")
-    for candidate in draft_candidates:
-        try:
-            if candidate.is_file():
-                local_draft = True
-                break
-        except OSError:
-            continue
+
+    def _draft_beside(directory) -> bool:
+        """[T8 r1] Does this job's draft sit in exactly this directory? A draft
+        vouches only for the files it sits BESIDE — a workspace draft must not
+        admit stale-named leftovers under scrapers/{slug}/, or the prior-rows
+        residual widens to source (b)."""
+        candidates = [directory / "scraper_draft.py"]
+        if job_id:
+            candidates.append(directory / "jobs" / f"scraper-{job_id}.py")
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    return True
+            except OSError:
+                continue
+        return False
+
+    ws_vouches = _draft_beside(ws_dir)
+    scrapers_vouches = _draft_beside(local_scrapers_dir)
 
     best_count, best_fresh, best_loc = 0, 0.0, ""
 
@@ -1840,7 +1851,8 @@ def _real_items_evidence(
             best_count, best_fresh, best_loc = count, fresh, locator
 
     # ── Sources (a) + (b): local output files, freshness-gated by mtime ────
-    for directory in (ws_dir, local_scrapers_dir):
+    for directory, draft_beside in ((ws_dir, ws_vouches),
+                                    (local_scrapers_dir, scrapers_vouches)):
         try:
             names = sorted(os.listdir(directory)) if directory.is_dir() else []
         except OSError:
@@ -1857,8 +1869,8 @@ def _real_items_evidence(
             if mtime < floor:
                 continue  # predates this job's window — not this job's output
             name_epoch = _output_name_epoch(name)
-            if name_epoch is not None and name_epoch < floor and not local_draft:
-                continue  # see HONEST LIMITS (3)
+            if name_epoch is not None and name_epoch < floor and not draft_beside:
+                continue  # see HONEST LIMITS (3) — per-directory vouch (T8 r1)
             try:
                 data = json.loads(
                     path.read_text(encoding="utf-8", errors="replace"))

@@ -11,6 +11,7 @@ from ..constants import (
     FINAL_RETRY_SENTINEL,
     MAX_REMAPS,
     MAX_TEST_RETRIES,
+    SOFT_404_MARKERS,
     STEALTH_METHOD_PREFIXES,
 )
 from ..state import ScrapeState
@@ -414,15 +415,6 @@ def classify_test_failure(
 
 MIN_CONFIDENCE_PASS = 0.85
 MIN_CONFIDENCE_PARTIAL = 0.5
-
-SOFT_404_MARKERS = (
-    "soft 404",
-    "product not found",
-    "no longer available",
-    "discontinued",
-    "not a product page",
-)
-
 
 def _is_dead_product(p: dict) -> bool:
     status = p.get("status_code", 200)
