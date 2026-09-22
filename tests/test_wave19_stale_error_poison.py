@@ -107,11 +107,20 @@ class TestFinalizerLadder:
             r"^def _output_file_has_zero_items\(.*?(?=^def |\Z)", src, re.M | re.S
         )
         assert m0, "_output_file_has_zero_items not found in tasks.py"
+        # [wave-40 T9] the ladder's rescue arm delegates to `_rescue_fires`
+        # (which needs `_rescue_min_count`). Both are pure stdlib like the
+        # ladder itself, so they exec-extract into the same sandbox namespace.
+        m1 = re.search(r"^def _rescue_min_count\(.*?(?=^def |\Z)", src, re.M | re.S)
+        assert m1, "_rescue_min_count not found in tasks.py"
+        m2 = re.search(r"^def _rescue_fires\(.*?(?=^def |\Z)", src, re.M | re.S)
+        assert m2, "_rescue_fires not found in tasks.py"
         from scraper.models import ScrapeJob  # real status constants
 
         TestFinalizerLadder.SJ = ScrapeJob
         ns: dict = {"__name__": "t_wave19_ladder", "ScrapeJob": ScrapeJob}
         exec(m0.group(0), ns)
+        exec(m1.group(0), ns)
+        exec(m2.group(0), ns)
         exec(m.group(0), ns)
         return ns["_final_status_ladder"]
 

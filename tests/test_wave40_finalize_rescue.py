@@ -292,3 +292,42 @@ def test_rescue_never_clobbers_a_productive_run(monkeypatch, tmp_path):
     assert job.product_count == 7          # the run's own count stands
     assert job.output_file == (
         "scrapers/z-example/output_2026-09-20_050000_000001_3.json")
+
+
+def test_rescue_fires_is_the_one_predicate(tmp_path):
+    """[T9 r1] The invariant is stated once: no count, no evidence file, a
+    productive run, or a below-minimum count — none of them rescue."""
+    from scraper.tasks import _rescue_fires
+
+    failed_zero = {"execution_status": "FAILED", "product_count": 0,
+                   "input_mode": "navigation"}
+    key = "scrapers/x-example/output_1.json"
+    assert _rescue_fires(failed_zero, 19, key) is True
+    assert _rescue_fires(failed_zero, 0, key) is False       # never a zero
+    assert _rescue_fires(failed_zero, 19, "") is False       # no file, no credit
+    assert _rescue_fires({}, 19, key) is True                # absent == 0 items
+    assert _rescue_fires({"product_count": 7}, 19, key) is False   # productive run
+    assert _rescue_fires({"product_count": 0, "input_mode": "navigation"},
+                         2, key) is False                    # 2 < 3
+
+
+def test_resolve_rescue_file_local_path_branch(tmp_path, monkeypatch):
+    """[T9 r1 Minor 4] A LOCAL locator (absolute path — what `_real_items_evidence`
+    returns when a workspace/dev-scrapers file wins) resolves to the File
+    Master key the publish block created; when the FM does not hold it
+    (bind-mount / failed publish) the local path stands. FM-key locators pass
+    through untouched."""
+    from django.conf import settings
+
+    monkeypatch.setattr(settings, "PROJECT_ROOT", str(tmp_path))
+    slug = "x-example"
+    local = tmp_path / "scrapers" / slug / "output_2026-09-20_040000_000001_1.json"
+    local.parent.mkdir(parents=True)
+    local.write_text("{}", encoding="utf-8")
+    fm_key = f"scrapers/{slug}/output_2026-09-20_040000_000001_1.json"
+    _fm(monkeypatch, [fm_key], {fm_key: "{}"})
+    assert tasks._resolve_rescue_file(str(local), slug) == fm_key
+    _fm(monkeypatch, [], {})                       # FM no longer holds it
+    assert tasks._resolve_rescue_file(str(local), slug) == str(local)
+    assert tasks._resolve_rescue_file(fm_key, slug) == fm_key   # already canonical
+    assert tasks._resolve_rescue_file("", slug) == ""

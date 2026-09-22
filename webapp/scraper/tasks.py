@@ -1543,7 +1543,9 @@ def _final_status_ladder(
     cancelled job, and a COMPLETED row must never end with 0 items — so a
     zero credit is impossible (``rescue_count > 0`` is the arm's first
     clause). ``input_mode`` arrives inside the state dict ``_finalize_job``
-    already passes down.
+    already passes down. ``rescue_file`` is load-bearing, not decorative —
+    the arm credits nothing without the pointer to the output that carried
+    the rows (see ``_rescue_fires``).
     """
     if already_terminal:
         return "", ""
@@ -1553,18 +1555,11 @@ def _final_status_ladder(
         # products (prod jobs 263/266/327).
         return ScrapeJob.STATUS_CANCELLED, ""
     # [wave-40 T9] Job-scoped real-items evidence outranks a stale failure
-    # verdict. Fires ONLY when the state claims zero items and this job
-    # demonstrably produced >= min_count good rows (T8 evidence, started_at
-    # window + draft provenance). Never fires for cancelled jobs (the arm
-    # above already returned); never credits a zero (count > 0 is
-    # structural).
-    if (
-        rescue_count > 0
-        and not was_cancelled
-        and int((final_state or {}).get("product_count") or 0) == 0
-        and rescue_count >= _rescue_min_count(
-            (final_state or {}).get("input_mode") or "navigation")
-    ):
+    # verdict. `_rescue_fires` is the single statement of the binding
+    # invariant (count > 0, evidence file known, state claims zero, min count
+    # held). Never fires for cancelled jobs (the arm above already returned);
+    # never credits a zero.
+    if _rescue_fires(final_state, rescue_count, rescue_file):
         return ScrapeJob.STATUS_COMPLETED, ""
     if final_state.get("execution_status") == "FAILED":
         return ScrapeJob.STATUS_FAILED, ""
@@ -1622,6 +1617,35 @@ def _rescue_min_count(input_mode: str) -> int:
     navigation/search_term jobs need 3+ to prove discovery worked.
     """
     return 1 if (input_mode or "").strip() in ("url_list", "list_page") else 3
+
+
+def _rescue_fires(
+    final_state: dict, rescue_count: int, rescue_file: str = ""
+) -> bool:
+    """[wave-40 T9 r1] The SINGLE statement of the rescue invariant.
+
+    The binding business rule lives here and nowhere else — the ladder arm
+    and `_finalize_job`'s side-effect block both call this, so the two can
+    never drift. The rescue upgrades a FAILED/zero verdict to COMPLETED only
+    when ALL of:
+
+    - ``rescue_count > 0`` — this job demonstrably produced real rows; a
+      zero credit is structurally impossible;
+    - ``rescue_file`` is truthy — nothing is credited without a pointer to
+      the output that carried the rows;
+    - the state claims ZERO items — a productive run is never re-judged;
+    - the count clears the input mode's minimum (`_rescue_min_count`).
+
+    Net effect: a COMPLETED row can never end with ``product_count == 0``.
+    Cancelled jobs are excluded by the ladder's cancel arm, which runs first.
+    """
+    return (
+        rescue_count > 0
+        and bool(rescue_file)
+        and int((final_state or {}).get("product_count") or 0) == 0
+        and rescue_count >= _rescue_min_count(
+            (final_state or {}).get("input_mode") or "navigation")
+    )
 
 
 def _output_name_epoch(name: str) -> float | None:
@@ -2480,19 +2504,15 @@ def _finalize_job(job: ScrapeJob) -> None:
         job.error_message = ""
 
     # ── [wave-40 T9] Rescue side effects. ────────────────────────────────
-    # Mirror of the ladder arm's predicate (the ladder returns only
-    # (status, diag), and a productive run whose state claims items must not
-    # be clobbered): a rescue COMPLETED credits the EVIDENCE count and
-    # repoints output_file at the file that carried it. was_cancelled is
-    # implied — a cancelled job can never reach _status == COMPLETED here.
-    # The stale-error scrub above already cleared the failure note.
-    if (
-        _status == ScrapeJob.STATUS_COMPLETED
-        and rescue_count > 0
-        and rescue_file
-        and int((final_state or {}).get("product_count") or 0) == 0
-        and rescue_count >= _rescue_min_count(
-            (final_state or {}).get("input_mode") or "navigation")
+    # `_rescue_fires` is the single statement of the binding invariant; this
+    # block re-checks it only because the ladder returns just (status, diag).
+    # A rescue COMPLETED credits the EVIDENCE count and repoints output_file
+    # at the file that carried it — a productive run (state claims items) is
+    # never clobbered. was_cancelled is implied: a cancelled job can never
+    # reach _status == COMPLETED here. The stale-error scrub above already
+    # cleared the failure note.
+    if _status == ScrapeJob.STATUS_COMPLETED and _rescue_fires(
+        final_state, rescue_count, rescue_file
     ):
         job.product_count = rescue_count
         job.output_file = rescue_file
