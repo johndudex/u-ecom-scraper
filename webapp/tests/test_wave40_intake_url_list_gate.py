@@ -25,13 +25,23 @@ class TestIntakeUrlListGate(TestCase):
         self.user = User.objects.create_user("staff", password="pw")
         self.client.force_login(self.user)
         # Deterministic File Master: the gate must not depend on the dev
-        # file-master's contents, and no test may write to it.
+        # file-master's contents, and no test may read or write it.
         fm = patch("scraper.views._fm_exists", MagicMock(return_value=False))
         self.mock_fm_exists = fm.start()
         self.addCleanup(fm.stop)
+        exists = patch("src.artifacts.exists", MagicMock(return_value=False))
+        self.mock_artifact_exists = exists.start()
+        self.addCleanup(exists.stop)
         write = patch("src.artifacts.write_json", MagicMock(), create=True)
         self.mock_write_json = write.start()
         self.addCleanup(write.stop)
+
+    def _writes(self) -> dict:
+        return {
+            c.args[0]: c.args[1]
+            for c in self.mock_write_json.call_args_list
+            if len(c.args) >= 2
+        }
 
     def _post(self, **over):
         data = {"url": over.pop("url", PDP), "list_urls": over.pop("list_urls", "")}
@@ -57,6 +67,46 @@ class TestIntakeUrlListGate(TestCase):
         self.assertIn("scrapers/example-com/input_urls.json", writes)
         self.assertEqual(writes["scrapers/example-com/input_urls.json"],
                          {"urls": [PDP]})
+
+    def test_established_site_list_not_truncated_by_bare_pdp(self):
+        """[wave-40 T5 r1] the most common T5 trajectory: a bare PDP
+        resubmission of an ESTABLISHED site (Site.input_urls holds the real
+        list) with an empty list box. Job still created; the 1-URL repair
+        seed must NOT be written over its production input_urls.json."""
+        Site.objects.create(
+            url=PDP, name="example", slug="example-com",
+            input_urls=[f"https://www.example.com/p/{i}" for i in range(50)],
+        )
+        self.mock_write_json.reset_mock()
+        resp = self._post()
+        self.assertNotEqual(resp.status_code, 422)
+        self.assertTrue(ScrapeJob.objects.exists())
+        self.assertEqual(self._writes(), {})
+
+    def test_seed_write_never_shrinks_a_production_file(self):
+        """[wave-40 T5 r1] the gate's FM check raced (no file at check time,
+        a 50-URL production list by write time): the seed write refuses to
+        shrink it — models._sync_input_urls_file's no-shrinkage rule."""
+        exists = patch("src.artifacts.exists", MagicMock(return_value=True))
+        read = patch(
+            "src.artifacts.read_json",
+            MagicMock(return_value={
+                "urls": [f"https://www.example.com/p/{i}" for i in range(50)]}),
+        )
+        with exists, read:
+            resp = self._post()
+        self.assertNotEqual(resp.status_code, 422)
+        self.assertTrue(ScrapeJob.objects.exists())
+        self.assertEqual(self._writes(), {})
+
+    def test_seed_skipped_when_fm_file_already_holds_the_list(self):
+        """[wave-40 T5 r1] repair fires only when nothing else holds a list:
+        a production input_urls.json means the PDP adds nothing to seed."""
+        self.mock_fm_exists.return_value = True
+        resp = self._post()
+        self.assertNotEqual(resp.status_code, 422)
+        self.assertTrue(ScrapeJob.objects.exists())
+        self.assertEqual(self._writes(), {})
 
     def test_truly_empty_url_list_is_422_and_no_job_row(self):
         resp = self._post(url=HOME)
@@ -125,13 +175,15 @@ class TestScrapeCommandUrlListGate(TestCase):
     with the reason text BEFORE any row is created or task enqueued; a
     PDP-shaped url is still seeded (repair-on-coercion)."""
 
-    def _command(self, url):
+    def _command(self, url) -> MagicMock:
         from scraper.management.commands import scrape as scrape_cmd
 
+        write_json = MagicMock()
         with patch("scraper.tasks.run_scrape_task", MagicMock()), patch(
             "src.artifacts.exists", MagicMock(return_value=False)
-        ), patch("src.artifacts.write_json", MagicMock(), create=True):
+        ), patch("src.artifacts.write_json", write_json, create=True):
             call_command(scrape_cmd.Command(), url, mode="url_list")
+        return write_json
 
     def test_home_url_list_systemexits_with_no_row(self):
         with self.assertRaises(SystemExit):
@@ -139,9 +191,15 @@ class TestScrapeCommandUrlListGate(TestCase):
         self.assertFalse(ScrapeJob.objects.exists())
 
     def test_pdp_url_list_is_seeded_and_created(self):
-        self._command(PDP)
+        write_json = self._command(PDP)
         job = ScrapeJob.objects.latest("id")
         self.assertEqual(job.input_mode, "url_list")
+        # the seed actually lands in the File Master, not just the gate path
+        self.assertEqual(
+            {c.args[0]: c.args[1] for c in write_json.call_args_list
+             if len(c.args) >= 2},
+            {"scrapers/example-com/input_urls.json": {"urls": [PDP]}},
+        )
 
 
 class HermeticFmTestCase(TestCase):

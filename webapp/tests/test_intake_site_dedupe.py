@@ -109,11 +109,14 @@ class TestIntakeCreateJobSiteGate(TestCase):
     def _post(self, **extra):
         # [wave-40 T5] non-empty list_urls: an empty url_list payload is 422'd
         # at intake now, and these tests are about the dedupe gate.
+        # [T5 r1] hermetic FM: never read/write the dev file-master.
         data = {"url": self.POST_URL, "list_urls": self.POST_URL}
         data.update(extra)
         dispatch = MagicMock()
         dispatch.delay.return_value.id = "test-task-id"
-        with patch("scraper.tasks.run_scrape_task", dispatch):
+        with patch("scraper.tasks.run_scrape_task", dispatch), patch(
+            "src.artifacts.exists", MagicMock(return_value=False), create=True
+        ), patch("src.artifacts.write_json", MagicMock(), create=True):
             return self.client.post(
                 self.URL, data, HTTP_X_REQUESTED_WITH="XMLHttpRequest"
             )

@@ -1740,10 +1740,15 @@ def site_scrape(request, site_id):
     # [wave-40 T5] same repair+gate as intake: url_list (the model default
     # here) with no URL list anywhere dies ~4s into setup_workspace. Seed a
     # PDP-shaped sample URL (repair), refuse the genuinely-empty case (422).
+    # [wave-40 T5 r1] the seed only fires when nothing else holds a list, and
+    # its write is no-shrinkage (same rule as intake).
     from src.intake_coerce import coerce_pdp_intake
 
+    _fm_has_file = _fm_file_exists_failopen(site.slug or "")
     _seed = ""
-    if not site.input_urls and coerce_pdp_intake(site.sample_url or site.url, "listing")[0] == "pdp":
+    if (not site.input_urls
+            and _fm_has_file is not True
+            and coerce_pdp_intake(site.sample_url or site.url, "listing")[0] == "pdp"):
         _seed = coerced_seed_url(
             site.sample_url or site.url, "url_list",
             "\n".join(site.input_urls or []),
@@ -1752,7 +1757,7 @@ def site_scrape(request, site_id):
         "url_list",
         "",
         bool(site.input_urls),
-        _fm_file_exists_failopen(site.slug or ""),
+        _fm_has_file,
         _seed,
     )
     if _reason:
@@ -1774,9 +1779,9 @@ def site_scrape(request, site_id):
         )
     elif _seed and site.slug:
         import src.artifacts as artifacts
-        artifacts.write_json(
-            artifacts.scrapers_key(site.slug, "input_urls.json"),
-            {"urls": [_seed]},
+
+        _write_input_urls_no_shrink(
+            artifacts.scrapers_key(site.slug, "input_urls.json"), [_seed]
         )
 
     from .tasks import dispatch_scrape_job
@@ -2854,6 +2859,32 @@ def _fm_file_exists_failopen(site_slug: str) -> bool | None:
         return None
 
 
+def _write_input_urls_no_shrink(key: str, urls: list[str]) -> bool:
+    """Write ``key`` unless that would SHRINK a production list (T5 r1).
+
+    Same rule as models._sync_input_urls_file — the wildsecrets 50→1 /
+    dollartree 5→1 / vistastaff 5→1 truncations: a 1-URL repair seed must
+    never overwrite a longer scrapers/{slug}/input_urls.json. Returns True
+    when written.
+    """
+    import src.artifacts as artifacts
+
+    if artifacts.exists(key):
+        try:
+            _existing = (artifacts.read_json(key) or {}).get("urls") or []
+        except Exception:
+            _existing = []
+        if len(_existing) >= len(urls):
+            logger.warning(
+                "input_urls write skipped for %s: file holds %d urls, incoming "
+                "%d (refusing to shrink the production list)",
+                key, len(_existing), len(urls),
+            )
+            return False
+    artifacts.write_json(key, {"urls": urls})
+    return True
+
+
 def _clean_field_notes(raw) -> dict:
     """Sanitize a {field: instruction} map (W27-4) from JSON text or a dict.
 
@@ -3189,16 +3220,24 @@ def intake_create_job(request):
 
     # [wave-40 T5] repair-on-coercion: a PDP coerced to url_list IS a 1-item
     # list — seed it (prod 758 proves the flow works). Gate only the empty case.
+    # [wave-40 T5 r1] repair ONLY when nothing else already holds a list: the
+    # bare-PDP resubmission of an established site is the common trajectory,
+    # and a 1-URL seed over scrapers/{slug}/input_urls.json would truncate its
+    # production list (see _write_input_urls_no_shrink).
     list_urls = request.POST.get("list_urls", "")
     from .tasks import _generate_slug
 
     site_slug = _generate_slug(url)
     site = Site.objects.filter(slug=site_slug).first()
+    _fm_has_file = _fm_file_exists_failopen(site_slug)
     _seed = ""
     # The W37-NEW-C predicate above only runs for listing/search submissions;
     # probe the URL shape through the SAME predicate so a default-"list" PDP
     # submission (prod 775-814) is repaired too, while a homepage is not.
-    if coerce_pdp_intake(url, "listing")[0] == "pdp":
+    if (input_mode == "url_list"
+            and not (site and site.input_urls)
+            and _fm_has_file is not True
+            and coerce_pdp_intake(url, "listing")[0] == "pdp"):
         _seed = coerced_seed_url(url, input_mode, list_urls)
     if _seed:
         list_urls = _seed  # flows into the seeding branch below
@@ -3206,7 +3245,7 @@ def intake_create_job(request):
         input_mode,
         list_urls,
         bool(site and site.input_urls),
-        _fm_file_exists_failopen(site_slug),
+        _fm_has_file,
         _seed,
     )
     if _reason:
@@ -3245,10 +3284,14 @@ def intake_create_job(request):
             try:
                 slug = _generate_slug(url)
                 import src.artifacts as artifacts
-                artifacts.write_json(
-                    artifacts.scrapers_key(slug, "input_urls.json"),
-                    {"urls": urls},
-                )
+
+                key = artifacts.scrapers_key(slug, "input_urls.json")
+                # [wave-40 T5 r1] a repair seed goes through the no-shrinkage
+                # guard; a user-pasted list is written verbatim (pre-existing).
+                if _seed:
+                    _write_input_urls_no_shrink(key, urls)
+                else:
+                    artifacts.write_json(key, {"urls": urls})
             except Exception as exc:
                 logger.warning(
                     "intake: could not persist list URLs for %s: %s",

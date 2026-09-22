@@ -23,14 +23,27 @@ def _fm_input_urls_file_exists(slug: str) -> bool | None:
 
 
 def _write_input_urls(slug: str, urls: list) -> None:
-    """Best-effort seed write (mirrors intake_create_job: an FM outage logs
-    and never breaks the create)."""
+    """Best-effort seed write, refusing to SHRINK a production list (T5 r1 —
+    mirrors intake_create_job: an FM outage logs and never breaks the create)."""
     try:
         import src.artifacts as artifacts
 
-        artifacts.write_json(
-            artifacts.scrapers_key(slug, "input_urls.json"), {"urls": urls}
-        )
+        key = artifacts.scrapers_key(slug, "input_urls.json")
+        if artifacts.exists(key):
+            try:
+                _existing = (artifacts.read_json(key) or {}).get("urls") or []
+            except Exception:
+                _existing = []
+            if len(_existing) >= len(urls):
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "scrape command: input_urls write skipped for %s: file holds "
+                    "%d urls, incoming %d (refusing to shrink the production list)",
+                    slug, len(_existing), len(urls),
+                )
+                return
+        artifacts.write_json(key, {"urls": urls})
     except Exception as exc:
         import logging
 
@@ -93,8 +106,16 @@ class Command(BaseCommand):
 
         slug = _generate_slug(url)
         _site = Site.objects.filter(slug=slug).first()
+        _fm_has_file = _fm_input_urls_file_exists(slug)
+        # [T5 r1] seed ONLY when nothing else holds a list — same rule as the
+        # intake view; never clobber a production input_urls.json.
         _seed = ""
-        if coerce_pdp_intake(options["product_url"] or url, "listing")[0] == "pdp":
+        if (
+            not (_site and _site.input_urls)
+            and _fm_has_file is not True
+            and coerce_pdp_intake(options["product_url"] or url, "listing")[0]
+            == "pdp"
+        ):
             _seed = coerced_seed_url(
                 options["product_url"] or url, options["mode"], ""
             )
@@ -102,7 +123,7 @@ class Command(BaseCommand):
             options["mode"],
             "",
             bool(_site and _site.input_urls),
-            _fm_input_urls_file_exists(slug),
+            _fm_has_file,
             _seed,
         )
         if _reason:
