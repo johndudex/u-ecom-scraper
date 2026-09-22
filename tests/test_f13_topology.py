@@ -161,3 +161,66 @@ class TestLiveGraph:
         assert any("validate_coverage" in repr(w) for w in writers), (
             "normalize_fields lost its validate_coverage edge"
         )
+
+
+class TestConditionalEdgeMapCompleteness:
+    """[wave-40 T2] Every name a routing fn can return must be a key in the
+    conditional-edge path map. Prod: the wave-16/37 park lanes returned
+    "park_browser_unavailable", the map lacked it, langgraph raised KeyError
+    and the job FAILED instead of parking (never resumed by beat)."""
+
+    def _rat_mod(self):
+        # agents.nodes.__init__ re-exports the route_after_testing FUNCTION
+        # over the submodule — attribute access would yield a callable.
+        import sys
+
+        import agents.nodes.route_after_testing  # noqa: F401
+
+        return sys.modules["agents.nodes.route_after_testing"]
+
+    def _build(self):
+        import os
+
+        import django
+
+        os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+        django.setup()
+        from agents.graph import build_scrape_graph
+
+        return build_scrape_graph()
+
+    def _ends(self, g, source):
+        ends = {}
+        for br in getattr(g.builder, "branches", {}).get(source, {}).values():
+            ends.update(
+                getattr(br, "ends", None) or getattr(br, "path_map", None) or {}
+            )
+        return ends
+
+    def test_park_branch_is_registered(self):
+        ends = self._ends(self._build(), "code_tester")
+        assert ends.get("park_browser_unavailable") == "park_browser_unavailable"
+
+    def test_every_router_return_literal_is_registered(self):
+        rat = self._rat_mod()
+        with open(rat.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        ends = self._ends(self._build(), "code_tester")
+        rets = set(re.findall(r'return "([a-z_]+)"', src))
+        rets |= {"cleanup", "human_approval", "code_writer"}  # helper-rewritten dests
+        assert rets <= set(ends), f"unmapped router destinations: {rets - set(ends)}"
+
+    def test_park_arm_yields_a_registered_destination(self):
+        rat = self._rat_mod()
+        ends = self._ends(self._build(), "code_tester")
+        # job_id 0 keeps _log_cascade off the DB; no report -> the wave-16
+        # pre-flight arm is the one under test.
+        dest = rat.route_after_testing(
+            {
+                "job_id": 0,
+                "test_report": None,
+                "browser_unavailable_detail": "waited 120s for /health",
+            }
+        )
+        assert dest == "park_browser_unavailable"
+        assert dest in ends, "router returned an unmapped destination (KeyError)"

@@ -10562,6 +10562,13 @@ def build_scrape_graph(
             "run_execution": "run_execution",
             "human_approval": "human_approval",
             "cleanup": "cleanup",
+            # [wave-16 B3 / wave-37 / wave-40 T2] infra-park lanes: tester
+            # pre-flight unhealthy (route_after_testing.py:1484), report-level
+            # infra outage, access_wall_all_throttled (:1902) and the
+            # park_unhealthy-with-dead-gateway arm (:2190) all return this
+            # name. An unmapped return raises KeyError inside langgraph and
+            # FAILED the job instead of parking it.
+            "park_browser_unavailable": "park_browser_unavailable",
         },
     )
 
