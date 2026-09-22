@@ -15,6 +15,7 @@ import select
 import signal
 import subprocess
 import time
+from pathlib import Path
 from typing import Any
 
 from src.field_mapping import union_output_fields
@@ -714,6 +715,48 @@ def _clear_transient_channels(result: dict) -> dict:
     return result
 
 
+def _ensure_draft_or_restore(root: str, slug: str, job_id: int, ws: Path) -> dict | None:
+    """[wave-40 T10] Draft missing at execution → try THIS job's FM archive first.
+
+    Prod 807 (papier): the tester PASSED at 0.94 with 25 products on disk, the
+    draft vanished from the workspace mid-run, and the old unconditional
+    refusal ("scraper_draft.py not found") turned a deliverable job into a
+    FAILED — for want of a file the File Master was still holding. So the
+    refusal is now the LAST resort: ``restore_job_draft`` re-hydrates this
+    job's per-job archive (``scrapers/{slug}/jobs/scraper-draft-{job_id}.py``
+    — the same key the writer snapshots and the tester/writer restores read)
+    into the workspace before the node gives up.
+
+    Returns ``None`` when a draft is present or was restored (execution
+    proceeds), else the honest refusal state-update — its message stays
+    byte-identical to the pre-T10 refusal.
+    """
+    from ..draft_safety import restore_job_draft
+
+    scraper_path = os.path.join(str(ws), "scraper_draft.py")
+    try:
+        restored = restore_job_draft(root, slug, job_id)
+    except Exception as exc:  # it swallows its own errors; belt for the seam
+        logger.warning(
+            "run_execution: draft restore errored before execution "
+            "(job %s): %s", job_id, exc,
+        )
+        restored = None
+    if os.path.isfile(scraper_path):
+        if restored:
+            logger.warning(
+                "run_execution: scraper_draft.py was missing from the "
+                "workspace — restored THIS job's FM archive copy %s (job %s)",
+                restored, job_id,
+            )
+        return None
+    logger.error("run_execution: scraper not found at %s", scraper_path)
+    return _clear_transient_channels({
+        "execution_status": "FAILED",
+        "error_message": f"scraper_draft.py not found at {scraper_path}",
+    })
+
+
 def run_execution(state: ScrapeState) -> dict:
     from ..graph import _notify_phase
 
@@ -726,11 +769,12 @@ def run_execution(state: ScrapeState) -> dict:
     site_folder = os.path.join(root, "scrapers", slug)
 
     if not os.path.isfile(scraper_path):
-        logger.error("run_execution: scraper not found at %s", scraper_path)
-        return _clear_transient_channels({
-            "execution_status": "FAILED",
-            "error_message": f"scraper_draft.py not found at {scraper_path}",
-        })
+        # [wave-40 T10] the draft may have been lost mid-run (prod 807) —
+        # restore THIS job's FM archive before refusing.
+        _refusal = _ensure_draft_or_restore(root, slug, job_id,
+                                            Path(workspace_folder))
+        if _refusal is not None:
+            return _refusal
 
     # [job-329 wall] Refuse to dispatch a draft that is not valid Python —
     # fail with the real SyntaxError before any launch, never as a 55s

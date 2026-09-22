@@ -2162,6 +2162,26 @@ def _publish_analysis_artifacts(job_id: int, site_slug: str, ws) -> None:
                 "Job %s: preserve %s failed: %s", job_id, artifact, exc
             )
 
+    # [wave-40 T10] Publish the draft to its per-job FM archive key too, so a
+    # draft lost from the workspace AFTER this point (prod 807: vanished
+    # mid-run) can still be restored by run_execution instead of refusing.
+    # Archive key ONLY — promotion to scrapers/{slug}/scraper.py stays the
+    # compile-gated _promote_rescued_draft's job.
+    draft_src = ws / "scraper_draft.py"
+    if draft_src.is_file():
+        try:
+            artifacts.write(
+                artifacts.scrapers_key(
+                    site_slug, "jobs", f"scraper-draft-{job_id}.py"
+                ),
+                draft_src.read_bytes(),
+            )
+            logger.info("Job %s: preserved scraper_draft.py to jobs/", job_id)
+        except Exception as exc:
+            logger.warning(
+                "Job %s: preserve scraper_draft.py failed: %s", job_id, exc
+            )
+
 
 def _close_open_steps(job: ScrapeJob) -> None:
     """Close steps the graph left open when it finished.
