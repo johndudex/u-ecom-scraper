@@ -237,7 +237,9 @@ def _tester_listing_candidate(state: dict) -> tuple[str, str]:
     ``search_criteria``; '' when there is nothing to inject OR when the
     candidate sits off the job's registrable domain (F17 drops it at
     execution, so injecting it would test a listing execution can never use
-    — 587's tester burned budget on exactly that). ``drop_note`` is ''
+    — 587's tester burned budget on exactly that). Multi-line criteria:
+    the FIRST http(s) line — a mangled joined URL is a 404, not a listing
+    (wave-40 T4). ``drop_note`` is ''
     unless a candidate was dropped; it becomes the run-scope note so the
     suppression is visible to the agent, not a silent side effect.
     """
@@ -245,9 +247,9 @@ def _tester_listing_candidate(state: dict) -> tuple[str, str]:
     _disc = (_nav.get("discovery") if isinstance(_nav, dict) else None) or {}
     cand = (_disc.get("listing_url") if isinstance(_disc, dict) else "") or ""
     if not cand:
-        _sc = str(state.get("search_criteria") or "").strip()
-        if _sc.startswith(("http://", "https://")):
-            cand = _sc
+        from src.seed_urls import first_criteria_url
+
+        cand = first_criteria_url(state.get("search_criteria"))
     if not cand:
         return "", ""
     try:

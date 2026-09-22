@@ -137,6 +137,29 @@ class TestTesterToolGuard:
         cand, note = self._helper()(_state(nav_listing=""))
         assert cand == "" and note == ""
 
+    def test_same_host_multiline_criteria_candidate_is_line_one(self):
+        # [wave-40 T4 r1] intake.html:509 stores "One listing page per line"
+        # text verbatim in search_criteria; urlsplit deletes the newline, so
+        # the WHOLE multi-line string used to become ONE same-host mangled
+        # SCRAPER_LISTING_URL. The candidate is the FIRST http(s) line and
+        # search_criteria itself stays verbatim.
+        multi = f"{SAME_LISTING}\n{SAME_LISTING}?page=2"
+        st = _state(criteria=multi, nav_listing="")
+        cand, note = self._helper()(st)
+        assert cand == SAME_LISTING and "\n" not in cand
+        assert st["search_criteria"] == multi
+        assert note == ""
+
+    def test_multiline_criteria_line_two_never_rides_past_f17(self):
+        # The old joined-string parse read as ONE same-host URL, so an
+        # off-host line 2 rode into the tester's env inside the mangled
+        # candidate, past the F17 registrable guard.
+        multi = f"{SAME_LISTING}\n{CROSS_LISTING}"
+        st = _state(criteria=multi, nav_listing="")
+        cand, note = self._helper()(st)
+        assert cand == SAME_LISTING and CROSS_LISTING not in cand
+        assert st["search_criteria"] == multi
+
     def test_run_scraper_wiring_uses_the_guard(self):
         from webapp.agents.tools import shell_tools
 
