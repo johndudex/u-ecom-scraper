@@ -23,16 +23,18 @@ Surfaces that call this:
   (belt: catches ANY writer this module's callers missed)
 - ``agents.graph`` code_writer seed write — navigation-derived sample URLs
 
-Stdlib only (``urllib.parse``) — importable from src/, webapp/, templates.
+Stdlib only (``re``, ``urllib.parse``) — importable from src/, webapp/, templates.
 """
 
 from __future__ import annotations
 
+import re
 from urllib.parse import urlparse
 
 __all__ = [
     "filter_seed_payload",
     "filter_seed_urls",
+    "first_criteria_url",
     "normalize_host",
     "seed_report",
 ]
@@ -47,6 +49,23 @@ def normalize_host(host: str | None) -> str:
     ``athleta.gap.com`` and ``gap.com`` stay DIFFERENT — that is the point.
     """
     return str(host or "").strip().lower().removeprefix("www.")
+
+
+def first_criteria_url(criteria: str | None) -> str:
+    """First http(s) URL in a free-text ``search_criteria`` value.
+
+    Intake stores the ``listing_urls`` textarea verbatim ("One listing page
+    per line", intake.html:509), so search_criteria is routinely MULTI-line.
+    urlsplit deletes ASCII newlines, so parsing the whole string yields ONE
+    same-host mangled URL (prod job 758: advisory probe 404 -> swap gate
+    failed closed -> wave-34 demote). Token rule matches the intake host gate
+    (views.py:3030). "" when no line is a URL; the full string stays in
+    state/job.search_criteria untouched. Lines 2..N are intentionally not
+    parsed here — per-line seeding is intake's job (wave-40 T5).
+    """
+    for token in re.findall(r"https?://[^\s,]+", str(criteria or "")):
+        return token
+    return ""
 
 
 # [W26-2/prod-419] First path segments that are site chrome, never item

@@ -471,11 +471,12 @@ def _extended_wall_clock_deadline(
 
 def _url_shaped_criteria(state: ScrapeState) -> str:
     """The user's search_criteria when it is itself a URL (job 85's real
-    listing lived ONLY in search_criteria while the job URL was a PDP)."""
-    sc = str(state.get("search_criteria") or "").strip()
-    if sc.startswith(("http://", "https://")):
-        return sc
-    return ""
+    listing lived ONLY in search_criteria while the job URL was a PDP).
+    Multi-line criteria: the FIRST http(s) line — a mangled joined URL is
+    a 404, not a listing (prod job 758)."""
+    from src.seed_urls import first_criteria_url
+
+    return first_criteria_url(state.get("search_criteria"))
 
 
 def _scope_target(state: ScrapeState) -> int:

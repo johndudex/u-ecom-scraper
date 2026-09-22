@@ -345,3 +345,44 @@ class TestPdpListingSwap:
             self._state(), LISTING_URL, listing_seed_probe, self._listing_probe()
         )
         assert out is None
+
+
+# ── [wave-40 T4] multi-line search_criteria parses line ONE ─────────────
+
+MULTI = f"{LISTING_URL}\nhttps://www.vinted.be/catalog/6-women"
+
+
+class TestMultiLineCriteria:
+    """[wave-40 T4] intake.html:509 puts 'One listing page per line' text into
+    search_criteria; urlsplit strips the newline and every consumer parsed ONE
+    same-host mangled URL (prod 758 birkenstock: advisory probe 404 -> swap
+    gate failed closed -> wave-34 demote -> 1-item COMPLETED)."""
+
+    def test_first_criteria_url_helper(self):
+        from src.seed_urls import first_criteria_url
+        assert first_criteria_url(MULTI) == LISTING_URL
+        assert first_criteria_url(f"see below\n{LISTING_URL}, {PDP_URL}") == LISTING_URL
+        assert first_criteria_url("levis 501") == ""
+        assert first_criteria_url(None) == ""
+        assert first_criteria_url(LISTING_URL) == LISTING_URL
+
+    def test_swap_uses_first_line_only(self):
+        st = {"job_id": 0, "url": PDP_URL, "input_mode": "list_page",
+              "site_slug": "vinted-be", "search_criteria": MULTI}
+        seed = _probe_data([{"@type": "Product", "offers": {"price": 44.99}}])
+        lp = _probe_data([{"@type": "ItemList",
+                           "itemListElement": [{"@type": "Product"}]}])
+        updates, note = graph._pdp_listing_swap(st, PDP_URL, seed, lp)
+        assert updates["url"] == LISTING_URL and "\n" not in updates["url"]
+        assert updates["product_url"] == LISTING_URL
+        assert LISTING_URL in note and "catalog/6-women" not in note
+
+    def test_url_shaped_criteria_returns_first_line(self):
+        from webapp.agents.nodes.run_execution import _url_shaped_criteria
+        assert _url_shaped_criteria({"search_criteria": MULTI}) == LISTING_URL
+        assert _url_shaped_criteria({"search_criteria": "levis"}) == ""
+
+    def test_traverse_and_probe_sites_read_the_helper(self):
+        with open(graph.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        assert src.count("first_criteria_url(") >= 4

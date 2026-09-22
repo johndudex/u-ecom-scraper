@@ -54,6 +54,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
 from src.field_mapping import union_output_fields
+from src.seed_urls import first_criteria_url
 
 from .constants import (
     FINAL_RETRY_SENTINEL,
@@ -2100,7 +2101,7 @@ def _pdp_listing_swap(
         return None
     if not _jsonld_product_entity(data.get("jsonld"), url):
         return None
-    _criteria = str(state.get("search_criteria") or "").strip()
+    _criteria = first_criteria_url(state.get("search_criteria"))
     if not _criteria.startswith(("http://", "https://")):
         return None
     if listing_probe is None or listing_probe.get("blocked"):
@@ -2225,7 +2226,7 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
     # with measured evidence instead of hope.
     listing_probe: dict[str, Any] | None = None
     _input_mode = (state.get("input_mode") or "").lower()
-    _criteria = str(state.get("search_criteria") or "").strip()
+    _criteria = first_criteria_url(state.get("search_criteria"))
     if (
         _input_mode in ("navigation", "list_page", "search_term")
         and _criteria.startswith(("http://", "https://"))
@@ -4264,7 +4265,7 @@ def _invoke_navigation_traverse(
                 # site root, silently redirecting discovery to homepage featured
                 # links (the exact rmwilliams job-227 failure this branch exists
                 # to prevent). Candidate order: search_criteria → state.url → root.
-                _crit = (state.get("search_criteria") or "").strip()
+                _crit = first_criteria_url(state.get("search_criteria"))
                 try:
                     _cp = _urlparse(_crit)
                     if _cp.scheme in ("http", "https") and _cp.netloc == _p.netloc:
@@ -7439,7 +7440,7 @@ def _probe_listing_candidates(state: dict) -> tuple[str, str]:
     ``discovery.listing_url`` is the retry candidate when it was not already
     the primary — job 85's real listing lived only in search_criteria.
     """
-    _sc = str(state.get("search_criteria") or "").strip()
+    _sc = first_criteria_url(state.get("search_criteria"))
     criteria = _sc if _sc.startswith(("http://", "https://")) else ""
     primary = ""
     if state.get("input_mode") == "list_page":
