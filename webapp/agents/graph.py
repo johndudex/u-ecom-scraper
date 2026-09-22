@@ -2836,7 +2836,15 @@ def _register_abandoned_walk(job_id, phase: str) -> None:
     failure only means the zombie goes uncounted, never that the phase fails.
     """
     try:
-        from . import invocation_registry
+        # ABSOLUTE identity, per this module's sibling rule: in-container
+        # ``agents.*`` and ``webapp.agents.*`` are distinct module objects, and
+        # a relative import here would put abandoned-walk entries into a
+        # second store the finalize guard (``scraper.tasks``, which imports
+        # ``agents.invocation_registry``) never sees. Verified importable in
+        # every live context that loads this file: celery worker
+        # (PYTHONPATH=/app:/app/webapp), run_node (manage.py script dir) and
+        # the django test env (conftest inserts ROOT/webapp).
+        from agents import invocation_registry
 
         slug = ""
         try:

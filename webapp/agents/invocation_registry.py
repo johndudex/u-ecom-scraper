@@ -25,7 +25,11 @@ Semantics:
 - ``register_abandoned(slug, job_id)`` — the agent-abandonment sites in
   ``graph._invoke_agent_with_timeout``. An abandoned daemon walk keeps
   running after its task's token is unregistered, so NOTHING discards these
-  entries: they block until process restart / the ``_trash`` retention sweep.
+  entries and WORKER RESTART is the only unblock — the ``_trash`` retention
+  sweep ages out on-disk tombstones, never registry entries. So after one
+  abandonment every later run of that slug tombstones at finalize until the
+  worker recycles. Conservative by design: a needless tombstone costs disk
+  space, a missed one costs the workspace.
 - ``alive_for_slug(slug)`` — any entry at all. It must NOT special-case job
   ids: the 765 zombie shares the resumed job's id, and an entry under the
   same ``(slug, job_id)`` from an abandoned generation still counts.
@@ -40,6 +44,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import os
+import sys
 import threading
 import time
 import uuid
@@ -93,7 +98,8 @@ def register_abandoned(slug: str, job_id: int) -> None:
         _abandoned.setdefault(slug, set()).add(int(job_id))
     logger.warning(
         "invocation_registry: ABANDONED walk registered for '%s' (job %s) — "
-        "its workspace stays guarded until restart/purge", slug, job_id,
+        "its workspace stays guarded until worker restart (no other "
+        "unblock)", slug, job_id,
     )
 
 
@@ -227,3 +233,32 @@ def _reset_for_tests() -> None:
         _live.clear()
         _abandoned.clear()
     _current_token.set("")
+
+
+# ── single-store guarantee ──────────────────────────────────────────────────
+# Dual-path layout: BOTH ``/app`` and ``/app/webapp`` end up on sys.path in
+# the worker, so this file can load under two names — ``agents.
+# invocation_registry`` and ``webapp.agents.invocation_registry`` — as two
+# DISTINCT module objects with two DISTINCT ``_live``/``_abandoned`` dicts. A
+# split store would make an abandoned-walk registration invisible to the
+# finalize guard, so whichever identity imports FIRST owns the store and the
+# other name aliases it. ``setdefault`` (never assignment): a second import
+# can not replace the first-won object.
+#
+# The twin PACKAGE is aliased too and the child attribute set on it, because
+# ``import webapp.agents.invocation_registry as x`` compiles to IMPORT_FROM
+# lookups on the parent chain and the import system short-circuits a
+# sys.modules hit WITHOUT importing the parents — alias the submodule alone
+# and the twin import dies on a missing parent attribute.
+_THIS = sys.modules[__name__]
+
+if __name__ == "agents.invocation_registry":
+    _TWIN_PKG_NAME = "webapp.agents"
+else:
+    _TWIN_PKG_NAME = "agents"
+_TWIN_NAME = f"{_TWIN_PKG_NAME}.invocation_registry"
+
+sys.modules.setdefault(_TWIN_NAME, _THIS)
+_own_pkg = sys.modules[__package__]
+_twin_pkg = sys.modules.setdefault(_TWIN_PKG_NAME, _own_pkg)
+setattr(_twin_pkg, "invocation_registry", _THIS)

@@ -74,6 +74,29 @@ def test_registry_roundtrip_and_abandoned_outlives_unregister():
     assert reg.alive_for_slug("nike-in") is True    # zombie still counted
 
 
+def test_registry_is_one_module_object_under_both_import_paths():
+    """Identity pin: in-container ``agents.*`` and ``webapp.agents.*`` are
+    distinct module objects for the same file, and a split store would make
+    graph.py's abandoned-walk registrations invisible to the finalize guard
+    (``scraper.tasks`` imports the ``agents`` identity). Both names must
+    resolve to ONE object — the module aliases its twin at import, first
+    loader wins — and graph.py must reach it via the absolute ``agents``
+    identity, never a relative one."""
+    import agents.graph  # noqa: F401
+    import agents.invocation_registry as via_agents
+
+    import webapp.agents.invocation_registry as via_webapp
+
+    assert sys.modules["agents.invocation_registry"] is \
+        sys.modules["webapp.agents.invocation_registry"]
+    assert via_agents is via_webapp
+    assert via_agents._live is via_webapp._live
+    source = inspect.getsource(agents.graph)
+    assert "from agents import invocation_registry" in source, (
+        "graph.py must import the registry by the absolute agents identity"
+    )
+
+
 @pytest.mark.django_db
 def test_abandoned_generation_under_the_same_job_id_still_blocks(
         db, tmp_path, monkeypatch):
@@ -146,7 +169,6 @@ def test_finalize_tombstones_when_sibling_same_slug_is_running(
     assert not ws.exists()
     trash = tmp_path / "workspace" / "_trash"
     assert trash.exists() and any(trash.iterdir())
-    assert other.id == other.id  # the sibling's artifacts survive in _trash
 
 
 @pytest.mark.django_db
