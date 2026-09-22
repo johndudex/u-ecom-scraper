@@ -71,7 +71,10 @@ def create_job(request):
             "url (sample item page) and input_mode are required; "
             f"input_mode must be one of {sorted(INPUT_MODES)}.",
         )
-    if input_mode == "url_list" and not item_urls:
+    # [wave-40 T5] the DEDUPED list decides: a payload whose entries are all
+    # blank must not yield a url_list job (it would die ~4s into
+    # setup_workspace with no URLs).
+    if input_mode == "url_list" and not item_urls_deduped:
         raise errors.ApiError(422, "validation_failed", "item_urls is required for url_list.")
     if input_mode == "list_page" and not listing_urls:
         raise errors.ApiError(422, "validation_failed", "listing_urls is required for list_page.")

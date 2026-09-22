@@ -117,7 +117,10 @@ class TestJobRestartView(TestCase):
     def setUp(self):
         self.client = Client()
         self.job = baker.make(
-            ScrapeJob, url="https://example.com", status="completed"
+            ScrapeJob, url="https://example.com", status="completed",
+            # [wave-40 T5] the restart gate refuses a url_list job with no URL
+            # list anywhere; this test is about restart counting.
+            input_mode="list_page",
         )
 
     def test_restart_completed(self):

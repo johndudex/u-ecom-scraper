@@ -25,6 +25,7 @@ from django.shortcuts import get_object_or_404, redirect, render, reverse
 from django.utils import timezone
 from django.views.decorators.cache import never_cache
 
+from src.intake_url_list import coerced_seed_url, missing_url_list_reason
 from src.schema_validation import validate_user_schema
 
 from .forms import SiteForm
@@ -694,6 +695,23 @@ def job_restart(request, job_id):
                         },
                         status=422,
                     )
+
+        # [wave-40 T5] A url_list re-run whose URL list is gone everywhere is
+        # unrecoverable — it would re-die ~4s into setup_workspace (prod
+        # 775-814). Gate AFTER the host gate; no repair here: the intake form
+        # is where a coerced PDP gets (re-)seeded.
+        from .tasks import _generate_slug
+
+        _slug = _generate_slug(job.url)
+        _restart_site = Site.objects.filter(slug=_slug).first()
+        _reason = missing_url_list_reason(
+            job.input_mode,
+            "",
+            bool(_restart_site and _restart_site.input_urls),
+            _fm_file_exists_failopen(_slug),
+        )
+        if _reason:
+            return JsonResponse({"error": _reason, "missing_url_list": True}, status=422)
 
         new_job = ScrapeJob.objects.create(
             url=job.url,
@@ -1719,6 +1737,27 @@ def site_scrape(request, site_id):
     if existing:
         return redirect("job_detail", job_id=existing.id)
 
+    # [wave-40 T5] same repair+gate as intake: url_list (the model default
+    # here) with no URL list anywhere dies ~4s into setup_workspace. Seed a
+    # PDP-shaped sample URL (repair), refuse the genuinely-empty case (422).
+    from src.intake_coerce import coerce_pdp_intake
+
+    _seed = ""
+    if not site.input_urls and coerce_pdp_intake(site.sample_url or site.url, "listing")[0] == "pdp":
+        _seed = coerced_seed_url(
+            site.sample_url or site.url, "url_list",
+            "\n".join(site.input_urls or []),
+        )
+    _reason = missing_url_list_reason(
+        "url_list",
+        "",
+        bool(site.input_urls),
+        _fm_file_exists_failopen(site.slug or ""),
+        _seed,
+    )
+    if _reason:
+        return JsonResponse({"error": _reason, "missing_url_list": True}, status=422)
+
     job = ScrapeJob.objects.create(
         url=site.url,
         product_url=site.sample_url,
@@ -1732,6 +1771,12 @@ def site_scrape(request, site_id):
         artifacts.write_json(
             artifacts.scrapers_key(site.slug, "input_urls.json"),
             {"urls": site.input_urls},
+        )
+    elif _seed and site.slug:
+        import src.artifacts as artifacts
+        artifacts.write_json(
+            artifacts.scrapers_key(site.slug, "input_urls.json"),
+            {"urls": [_seed]},
         )
 
     from .tasks import dispatch_scrape_job
@@ -2801,6 +2846,14 @@ def _parse_url_lines(text: str) -> list[str]:
     return urls
 
 
+def _fm_file_exists_failopen(site_slug: str) -> bool | None:
+    """True/False from _fm_exists; None on any error (fail-open, T5)."""
+    try:
+        return _fm_exists(f"scrapers/{site_slug}/input_urls.json")
+    except Exception:
+        return None
+
+
 def _clean_field_notes(raw) -> dict:
     """Sanitize a {field: instruction} map (W27-4) from JSON text or a dict.
 
@@ -3134,6 +3187,31 @@ def intake_create_job(request):
     if _form_notes:
         field_notes.update(_form_notes)
 
+    # [wave-40 T5] repair-on-coercion: a PDP coerced to url_list IS a 1-item
+    # list — seed it (prod 758 proves the flow works). Gate only the empty case.
+    list_urls = request.POST.get("list_urls", "")
+    from .tasks import _generate_slug
+
+    site_slug = _generate_slug(url)
+    site = Site.objects.filter(slug=site_slug).first()
+    _seed = ""
+    # The W37-NEW-C predicate above only runs for listing/search submissions;
+    # probe the URL shape through the SAME predicate so a default-"list" PDP
+    # submission (prod 775-814) is repaired too, while a homepage is not.
+    if coerce_pdp_intake(url, "listing")[0] == "pdp":
+        _seed = coerced_seed_url(url, input_mode, list_urls)
+    if _seed:
+        list_urls = _seed  # flows into the seeding branch below
+    _reason = missing_url_list_reason(
+        input_mode,
+        list_urls,
+        bool(site and site.input_urls),
+        _fm_file_exists_failopen(site_slug),
+        _seed,
+    )
+    if _reason:
+        return JsonResponse({"error": _reason, "missing_url_list": True}, status=422)
+
     job = ScrapeJob.objects.create(
         url=url,
         product_url=url,
@@ -3157,12 +3235,14 @@ def intake_create_job(request):
     # For "list" mode, persist the provided item URLs so the url_list pipeline
     # finds them (_build_initial_state falls back to scrapers/{slug}/input_urls.json
     # when Site.input_urls is empty).
-    if nav_method == "list":
-        urls = _parse_url_lines(request.POST.get("list_urls", ""))
+    # [wave-40 T5] keyed off input_mode, not the nav_method label: W37-NEW-C
+    # rebinds a coerced PDP's nav_method to "pdp", so the old label check
+    # skipped this write and the job ran with zero URLs (prod 775-814). The
+    # T5 repair above puts the coerced URL into list_urls for exactly this.
+    if input_mode == "url_list":
+        urls = _parse_url_lines(list_urls)
         if urls:
             try:
-                from .tasks import _generate_slug
-
                 slug = _generate_slug(url)
                 import src.artifacts as artifacts
                 artifacts.write_json(

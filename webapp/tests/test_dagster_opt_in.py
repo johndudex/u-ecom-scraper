@@ -89,7 +89,12 @@ class TestRestartCarriesOptIn(TestCase):
     def _restart(self, job, **extra):
         dispatch = MagicMock()
         dispatch.delay.return_value.id = "test-task-id"
-        with patch("scraper.tasks.run_scrape_task", dispatch):
+        # [wave-40 T5] Hermetic FM: declare the site's production
+        # input_urls.json present so the restart gate passes regardless of the
+        # dev file-master's contents — this test is about dagster opt-in.
+        with patch("scraper.tasks.run_scrape_task", dispatch), patch(
+            "scraper.views._fm_exists", MagicMock(return_value=True)
+        ):
             return self.client.post(
                 reverse("job_restart", kwargs={"job_id": job.id}), extra
             )

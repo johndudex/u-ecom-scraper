@@ -72,6 +72,25 @@ def _client(who):
     return c
 
 
+def _site_with_seed():
+    """[wave-40 T5] A Site whose URL list is recoverable — the site_scrape and
+    job_restart url_list gates refuse a site with no list anywhere. The FM
+    sync write is mocked: Site.save() mirrors input_urls into the File
+    Master, and no test touches the dev file-master. get_or_create: restart
+    chains re-enter this helper within one test."""
+    with patch("src.artifacts.write_json", create=True), patch(
+        "src.artifacts.exists", create=True, return_value=False
+    ):
+        site, _ = models.Site.objects.get_or_create(
+            url="https://w27.example/",
+            defaults=dict(
+                name="w27-example", slug="w27-example",
+                input_urls=["https://w27.example/p/1"],
+            ),
+        )
+        return site
+
+
 @pytest.fixture
 def alice(db):
     return User.objects.create_user("w27alice", password="x")
@@ -261,6 +280,9 @@ class TestLineageFields:
 
 class TestRestartLineage:
     def _restart(self, client, job):
+        # [wave-40 T5] a recoverable URL list on the Site row keeps this test
+        # on lineage — the restart gate refuses a url_list job with none.
+        _site_with_seed()
         with patch("scraper.tasks.dispatch_scrape_job") as dispatch:
             r = client.post(reverse("job_restart", args=[job.id]))
         assert r.status_code == 302
@@ -287,7 +309,7 @@ class TestRestartLineage:
         assert c.origin_job_id == a.id, "origin is the chain root, one read"
 
     def test_site_scrape_creates_unlinked_job(self, alice):
-        site = _site()
+        site = _site_with_seed()  # [wave-40 T5] a scrapeable site has a URL list
         with patch("scraper.tasks.dispatch_scrape_job"):
             _client(alice).post(reverse("site_scrape", args=[site.id]))
         job = models.ScrapeJob.objects.get(url=site.url)

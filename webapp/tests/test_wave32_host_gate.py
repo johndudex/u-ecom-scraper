@@ -52,7 +52,9 @@ class TestIntakeHostGate(TestCase):
         self.client = Client()
 
     def _post(self, **extra):
-        data = {"url": JOB_URL}
+        # [wave-40 T5] non-empty list_urls: an empty url_list payload is 422'd
+        # at intake now, and these tests are about the host gate.
+        data = {"url": JOB_URL, "list_urls": JOB_URL}
         data.update(extra)
         dispatch = MagicMock()
         dispatch.delay.return_value.id = "test-task-id"

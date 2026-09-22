@@ -107,7 +107,9 @@ class TestIntakeCreateJobSiteGate(TestCase):
         self.me = User.objects.filter(is_superuser=True).order_by("pk").first()
 
     def _post(self, **extra):
-        data = {"url": self.POST_URL}
+        # [wave-40 T5] non-empty list_urls: an empty url_list payload is 422'd
+        # at intake now, and these tests are about the dedupe gate.
+        data = {"url": self.POST_URL, "list_urls": self.POST_URL}
         data.update(extra)
         dispatch = MagicMock()
         dispatch.delay.return_value.id = "test-task-id"

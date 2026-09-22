@@ -209,6 +209,9 @@ class TestCreateFlowsPersistNotes:
             url="https://w27b2.example/p/1", user=alice,
             status=models.ScrapeJob.STATUS_COMPLETED,
             field_notes={"price": "in cents"},
+            # [wave-40 T5] list_page keeps this test on notes carry-over — the
+            # restart gate refuses a url_list job with no URL list anywhere.
+            input_mode="list_page",
         )
         with patch("scraper.tasks.dispatch_scrape_job"):
             rr = _client(alice).post(reverse("job_restart", args=[a.id]))
