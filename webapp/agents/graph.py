@@ -2695,6 +2695,9 @@ def _invoke_agent_async(agent, messages, agent_cfg, phase, job_id, timeout):
         # tool-context cancel so its NEXT tool call refuses (same disarm the
         # sync path applies to its abandoned thread).
         mark_invocation_cancelled(phase, invocation_id=invocation_id)
+        # [wave-40 T11] An abandoned sync tool keeps walking in the executor —
+        # it must stay counted against workspace disposal.
+        _register_abandoned_walk(job_id, phase)
         # T0.3: the dead invocation must be DISTINGUISHABLE from a healthy
         # budget-exhausted return — both paths used to be bare {"messages": []}
         # and `_error` was read by nobody, so a wall-clock death was invisible
@@ -2821,6 +2824,45 @@ def _fast_fail_detail(
         f"(last tool: {last_tool or 'none'}) — failing fast instead of "
         f"burning retry windows against the same wall; re-drive to retry"
     )
+
+
+def _register_abandoned_walk(job_id, phase: str) -> None:
+    """[wave-40 T11] A wall-clock abandonment leaves a daemon walk running that
+    no token can ever clear — record it in the invocation registry so
+    finalize's workspace guard keeps counting it. Prod 765: the zombie kept
+    walking inside ``run_scraper``'s body and re-created the workspace
+    finalize had just rmtree'd. Best-effort on both legs: the slug comes from
+    the job row (an unknown/absent job simply registers nothing), and any
+    failure only means the zombie goes uncounted, never that the phase fails.
+    """
+    try:
+        from . import invocation_registry
+
+        slug = ""
+        try:
+            from scraper.models import ScrapeJob
+            from scraper.tasks import _generate_slug
+
+            _url = (
+                ScrapeJob.objects.filter(pk=job_id)
+                .values_list("url", flat=True)
+                .first()
+                if job_id
+                else None
+            )
+            slug = _generate_slug(_url or "") if _url else ""
+        except Exception as exc:
+            logger.warning(
+                "_invoke_agent_with_timeout[%s]: abandoned-walk slug lookup "
+                "failed (job %s): %s", phase, job_id, exc,
+            )
+        if slug and job_id:
+            invocation_registry.register_abandoned(slug, job_id)
+    except Exception as exc:
+        logger.warning(
+            "_invoke_agent_with_timeout[%s]: abandoned-walk registration "
+            "failed (job %s): %s", phase, job_id, exc,
+        )
 
 
 def _invoke_agent_with_timeout(
@@ -3013,6 +3055,10 @@ def _invoke_agent_with_timeout(
         # global flag alone was re-armed by the very next set_tool_context
         # (prod 395: zombie edit_file 2s into the tester's run).
         mark_invocation_cancelled(phase, invocation_id=invocation_id)
+        # [wave-40 T11] The abandoned thread cannot be killed either — it keeps
+        # walking (and can re-create a deleted workspace via run_scraper's
+        # makedirs), so it must stay counted against workspace disposal.
+        _register_abandoned_walk(job_id, phase)
         # T0.3 (sync twin of the async-path marker): surface the dead invocation.
         # [wave-32 A3] Name BOTH windows: the base timeout the phase was given
         # and the wall seconds actually waited — the W30-1 extension can push

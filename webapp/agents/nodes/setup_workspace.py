@@ -276,9 +276,31 @@ def setup_workspace(state: ScrapeState) -> dict[str, Any]:
         except OSError:
             pass
 
-    removed = _clean_stale_artifacts(workspace_dir, skip_files)
-    if removed:
-        logger.info("setup_workspace: cleaned %d stale artifacts from %s", removed, slug)
+    # [wave-40 T11] The stale-artifact wipe honours the same slug-scoped guard
+    # as finalize's disposal (prod 765/807): a same-slug sibling or an
+    # abandoned walk still needs this directory. Blocked → tombstone the whole
+    # workspace (rename into workspace/_trash/, nothing lost) and recreate a
+    # fresh empty one — this run's own makedirs below and the FM re-hydration
+    # repopulate it, and the zombie's os.makedirs recreates a harmless empty
+    # dir too. Never a silent skip.
+    from agents import invocation_registry
+
+    blocked = invocation_registry.delete_blocked_reason(
+        slug, state.get("job_id")
+    )
+    if blocked:
+        _where = invocation_registry.tombstone_into_trash(
+            workspace_dir, slug, state.get("job_id")
+        )
+        logger.warning(
+            "setup_workspace: workspace/%s NOT wiped — %s (%s)",
+            slug, blocked, _where or "left in place",
+        )
+        os.makedirs(workspace_dir, exist_ok=True)
+    else:
+        removed = _clean_stale_artifacts(workspace_dir, skip_files)
+        if removed:
+            logger.info("setup_workspace: cleaned %d stale artifacts from %s", removed, slug)
 
     # [jobs-79/80] If the draft is gone anyway (worker volume was recycled —
     # Railway redeploys wipe the ephemeral FS), restore THIS job's own archive:

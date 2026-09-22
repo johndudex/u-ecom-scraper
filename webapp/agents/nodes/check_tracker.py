@@ -32,11 +32,33 @@ def _find_site(url: str):
         return None
 
 
-def _clean_workspace(root: str, slug: str, keep_draft: bool = False) -> None:
+def _clean_workspace(root: str, slug: str, keep_draft: bool = False,
+                     exclude_job_id: int | None = None) -> None:
     import shutil
+
+    from agents import invocation_registry
 
     workspace_dir = os.path.join(root, "workspace", slug)
     scrapers_dir = os.path.join(root, "scrapers", slug)
+
+    # [wave-40 T11] This wipe is the other half of the workspace-vanish class
+    # (prod 765/807): a same-slug sibling (783/790 accessorize ran
+    # concurrently on different URLs — invisible to the URL-scoped dispatch
+    # guard) must not lose its artifacts to this run's cleanup. Blocked →
+    # tombstone the whole directory (same-filesystem rename into
+    # workspace/_trash/, nothing lost) and leave the scrapers sweep alone
+    # too; the sibling keeps a coherent tree and a later unblocked run
+    # cleans again.
+    blocked = invocation_registry.delete_blocked_reason(slug, exclude_job_id)
+    if blocked:
+        _where = invocation_registry.tombstone_into_trash(
+            workspace_dir, slug, exclude_job_id
+        )
+        logger.warning(
+            "check_tracker: workspace/%s NOT wiped — %s (%s)",
+            slug, blocked, _where or "left in place",
+        )
+        return
 
     if os.path.isdir(workspace_dir):
         for fname in os.listdir(workspace_dir):
@@ -216,7 +238,7 @@ def check_tracker(state: ScrapeState) -> Command:
             # be forced False HERE — _compute_rescrape_skip_flags would still
             # return True for a completed twin and setup_workspace re-hydrates
             # anything a True flag names.
-            _clean_workspace(root, slug)
+            _clean_workspace(root, slug, exclude_job_id=state.get("job_id"))
             skip_site = skip_product = skip_code = False
             logger.info(
                 "check_tracker: FULL re-run for '%s' — workspace + analysis "
@@ -246,7 +268,8 @@ def check_tracker(state: ScrapeState) -> Command:
     if site.status == "failed":
         return _handle_failed(site, slug, state.get("skip_approvals", False))
     if site.status == "in_progress":
-        return _handle_in_progress(site, slug, root, input_mode)
+        return _handle_in_progress(site, slug, root, input_mode,
+                                   job_id=state.get("job_id"))
 
     logger.warning("check_tracker: unknown status '%s' for %s, treating as new", site.status, url)
     return _handle_new_site(url, slug, site_type)
@@ -399,7 +422,8 @@ def _handle_failed(site, slug: str, skip: bool = False) -> Command:
     )
 
 
-def _handle_in_progress(site, slug: str, root: str, input_mode: str = "") -> Command:
+def _handle_in_progress(site, slug: str, root: str, input_mode: str = "",
+                        job_id: int | None = None) -> Command:
     logger.info("check_tracker: site '%s' in_progress from a previous run, checking for existing artifacts", slug)
 
     # For navigation mode, always start fresh — don't skip to product analysis
@@ -410,7 +434,7 @@ def _handle_in_progress(site, slug: str, root: str, input_mode: str = "") -> Com
         )
         # keep_draft: a watchdog re-drive of a navigation job must not lose the
         # draft its own writer already produced (jobs-79/80 class).
-        _clean_workspace(root, slug, keep_draft=True)
+        _clean_workspace(root, slug, keep_draft=True, exclude_job_id=job_id)
         return Command(
             update={
                 "site_status": "in_progress",                "skip_site_analysis": False,
@@ -462,7 +486,7 @@ def _handle_in_progress(site, slug: str, root: str, input_mode: str = "") -> Com
         )
 
     logger.info("check_tracker: no artifacts for %s, starting from scratch", slug)
-    _clean_workspace(root, slug, keep_draft=True)
+    _clean_workspace(root, slug, keep_draft=True, exclude_job_id=job_id)
 
     return Command(
         update={

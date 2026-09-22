@@ -116,8 +116,11 @@ def _workspaces(root: str):
     ws = os.path.join(root, "workspace")
     if not os.path.isdir(ws):
         return []
+    # [wave-40 T11] `_`-prefixed dirs are system namespace (workspace/_trash
+    # holds the tombstoned workspaces the finalize guard renames aside), not
+    # site workspaces.
     return [os.path.join(ws, d) for d in os.listdir(ws)
-            if os.path.isdir(os.path.join(ws, d))]
+            if os.path.isdir(os.path.join(ws, d)) and not d.startswith("_")]
 
 
 def main() -> int:

@@ -38,7 +38,10 @@ migration — a fresh database may not have them yet. The sweep skips them
 from __future__ import annotations
 
 import logging
+import shutil
+from pathlib import Path
 
+from django.conf import settings
 from django.db import connection, transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -206,6 +209,9 @@ def purge_retention(
         )
 
     report["django_sessions_purged"] = _clear_django_sessions(now)
+    report["trash_entries_purged"] = _sweep_workspace_trash(
+        now, days_failed, days_completed
+    )
     return report
 
 
@@ -218,3 +224,53 @@ def _clear_django_sessions(now) -> int:
         return 0
     total, _ = Session.objects.filter(expire_date__lt=now).delete()
     return total
+
+
+def _sweep_workspace_trash(now, days_failed: int, days_completed: int) -> int:
+    """[wave-40 T11] Age out tombstoned workspaces (``workspace/_trash/``).
+
+    A tombstone is the preserved directory a blocked delete renamed aside
+    (``invocation_registry.tombstone_into_trash``), so it is evidence, not
+    live scratch — but it is also the only copy of what a zombie or a sibling
+    had in flight. Same window semantics as the DB rows above: the owner's
+    COMPLETED tombstone lives ``days_completed``, anything else
+    ``days_failed``, and a tombstone whose job is still in a resumable status
+    is NEVER swept (that sibling may still come back for it). The stamp in
+    the name (``{slug}-{job_id}-{ns}``) is the age; a directory whose name
+    the registry did not write is left alone.
+    """
+    from agents.invocation_registry import TRASH_DIRNAME, parse_trash_name
+
+    trash_root = Path(str(settings.PROJECT_ROOT)) / "workspace" / TRASH_DIRNAME
+    if not trash_root.is_dir():
+        return 0
+    purged = 0
+    for entry in sorted(trash_root.iterdir()):
+        if not entry.is_dir():
+            continue
+        parsed = parse_trash_name(entry.name)
+        if parsed is None:
+            continue
+        _slug, job_id, stamp = parsed
+        age_days = (now.timestamp() - stamp) / 86400
+        window_days = days_failed
+        if job_id:
+            status = (
+                ScrapeJob.objects.filter(pk=job_id)
+                .values_list("status", flat=True)
+                .first()
+            )
+            if status == ScrapeJob.STATUS_COMPLETED:
+                window_days = days_completed
+            elif status is not None and status not in _PURGEABLE_FAILED_GROUP:
+                continue  # pending/running/waiting_approval/parked — hands off
+        if age_days < window_days:
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        if not entry.exists():
+            purged += 1
+            logger.info(
+                "retention: swept tombstone %s (%.1fd old, window %dd)",
+                entry.name, age_days, window_days,
+            )
+    return purged

@@ -12,6 +12,7 @@ not by a separate Celery queue.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
+from agents import invocation_registry
 from celery import shared_task
 from celery.exceptions import MaxRetriesExceededError, SoftTimeLimitExceeded
 from celery.signals import task_failure
@@ -383,6 +385,30 @@ def resume_maintenance_held_jobs() -> list[int]:
     return held
 
 
+@contextlib.contextmanager
+def _invocation_scope(job: ScrapeJob):
+    """[wave-40 T11] Bracket one task generation in the invocation registry.
+
+    (Named for the registry, NOT ``_task_liveness`` — that name already
+    belongs to the wave-30 celery-liveness probe further down this module,
+    and a collision would silently shadow this contextmanager.)
+
+
+    Registered at TASK START so every in-flight generation is counted —
+    including soft-limit deaths raised in this task thread — and unregistered
+    in the caller's outermost finally, AFTER finalize. The token rides a
+    ContextVar, which is what lets ``_maybe_delete_workspace`` clear this
+    generation's own entry at delete time without ever clearing an ABANDONED
+    walk that shares the same ``(slug, job_id)``.
+    """
+    slug = _generate_slug(job.url or "")
+    token = invocation_registry.register(slug, job.id)
+    try:
+        yield token
+    finally:
+        invocation_registry.unregister(slug, job.id, token)
+
+
 @shared_task(
     bind=True,
     max_retries=1,
@@ -473,7 +499,13 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False, force_full: bool 
             return
 
     try:
-        _run_graph_job(job, rescrape=rescrape, force_full=force_full)
+        # [wave-40 T11] Registered for the whole generation — `_run_graph_job`
+        # ends in _finalize_job, i.e. the workspace disposal runs INSIDE this
+        # block, while this generation's token is still current. The
+        # post-mortem arms below (soft-limit / exception) never touch the
+        # workspace, so they need no entry.
+        with _invocation_scope(job):
+            _run_graph_job(job, rescrape=rescrape, force_full=force_full)
     except SoftTimeLimitExceeded:
         # [wave-37 W37-3a] The soft-limit kill lands mid-graph; finalize from
         # on-disk evidence so a run that already wrote real items is not
@@ -668,81 +700,125 @@ def resume_scrape_task(self, job_id: int, human_response: Any) -> None:
     root_logger.setLevel(logging.INFO)
     root_logger.addHandler(syslog_handler)
 
-    try:
-        from langgraph.types import Command
-
-        job.status = ScrapeJob.STATUS_RUNNING
-        job.save(update_fields=["status"])
-        _publish_job_status(job.id, ScrapeJob.STATUS_RUNNING)
-        logger.warning(
-            "resume INVOKE job=%s recursion_limit=%s", job.id, config.get("recursion_limit")
-        )
-        # LangGraph v1: interrupts accumulate in the checkpoint across the
-        # pipeline. When the user approves a specific gate, we must resume ONLY
-        # that gate's interrupt — not all pending ones (stale interrupts from
-        # earlier nodes would get the wrong response). The Approval carries the
-        # interrupt_id; we resume as {interrupt_id: response} for a targeted
-        # resume. If interrupt_id is missing (old approval), fall back to
-        # resuming all pending with the same value (the dict approach).
-        snapshot = graph.get_state(config)
-        all_interrupt_ids = []
-        for task in getattr(snapshot, "tasks", []):
-            for intr in (getattr(task, "interrupts", None) or []):
-                # LangGraph's Interrupt exposes `.id` (the resume key).
-                # `interrupt_id` is a deprecated alias removed in V2 — avoid it.
-                iid = getattr(intr, "id", None)
-                if iid:
-                    all_interrupt_ids.append(str(iid))
-
-        # Find the interrupt_id of the gate the user actually approved. Pick
-        # the most-recently-resolved approval whose interrupt_id is STILL
-        # pending — this skips approvals whose interrupt was already consumed
-        # by an earlier resume (stale) and handles a rapid double-approve
-        # (two approvals before either resume fires): each resume targets the
-        # one still left pending.
-        target_iid = ""
+    # [wave-40 T11] Registered for the whole resume generation — finalize
+    # (below) runs INSIDE this block, before the token is unregistered.
+    with _invocation_scope(job):
         try:
-            pending_set = set(all_interrupt_ids)
-            approved_qs = Approval.objects.filter(
-                job_id=job_id, status=Approval.STATUS_APPROVED
-            ).exclude(interrupt_id="").order_by("-resolved_at")
-            for a in approved_qs:
-                if a.interrupt_id in pending_set:
-                    target_iid = a.interrupt_id
-                    break
-        except Exception as exc:
-            # Was a bare `pass` — silently turned every target-iid lookup
-            # failure into a non-targeted resume, making stuck interrupts
-            # impossible to diagnose. Log it so the fallback is visible.
+            from langgraph.types import Command
+
+            job.status = ScrapeJob.STATUS_RUNNING
+            job.save(update_fields=["status"])
+            _publish_job_status(job.id, ScrapeJob.STATUS_RUNNING)
             logger.warning(
-                "Job %d: target interrupt_id lookup failed, falling back "
-                "to non-targeted resume: %s",
-                job_id,
-                exc,
+                "resume INVOKE job=%s recursion_limit=%s", job.id, config.get("recursion_limit")
             )
+            # LangGraph v1: interrupts accumulate in the checkpoint across the
+            # pipeline. When the user approves a specific gate, we must resume ONLY
+            # that gate's interrupt — not all pending ones (stale interrupts from
+            # earlier nodes would get the wrong response). The Approval carries the
+            # interrupt_id; we resume as {interrupt_id: response} for a targeted
+            # resume. If interrupt_id is missing (old approval), fall back to
+            # resuming all pending with the same value (the dict approach).
+            snapshot = graph.get_state(config)
+            all_interrupt_ids = []
+            for task in getattr(snapshot, "tasks", []):
+                for intr in (getattr(task, "interrupts", None) or []):
+                    # LangGraph's Interrupt exposes `.id` (the resume key).
+                    # `interrupt_id` is a deprecated alias removed in V2 — avoid it.
+                    iid = getattr(intr, "id", None)
+                    if iid:
+                        all_interrupt_ids.append(str(iid))
 
-        if target_iid and target_iid in all_interrupt_ids:
-            # Targeted resume: only the approved interrupt.
-            logger.info(
-                "Job %d: targeted resume interrupt_id=%s (%d total pending)",
-                job.id, target_iid, len(all_interrupt_ids),
-            )
-            resume_value = {target_iid: human_response}
-        elif len(all_interrupt_ids) > 1:
-            # Fallback: resume all pending with the same value.
-            logger.info(
-                "Job %d: no target interrupt_id — resuming all %d pending",
-                job.id, len(all_interrupt_ids),
-            )
-            resume_value = {iid: human_response for iid in all_interrupt_ids}
-        else:
-            resume_value = human_response
+            # Find the interrupt_id of the gate the user actually approved. Pick
+            # the most-recently-resolved approval whose interrupt_id is STILL
+            # pending — this skips approvals whose interrupt was already consumed
+            # by an earlier resume (stale) and handles a rapid double-approve
+            # (two approvals before either resume fires): each resume targets the
+            # one still left pending.
+            target_iid = ""
+            try:
+                pending_set = set(all_interrupt_ids)
+                approved_qs = Approval.objects.filter(
+                    job_id=job_id, status=Approval.STATUS_APPROVED
+                ).exclude(interrupt_id="").order_by("-resolved_at")
+                for a in approved_qs:
+                    if a.interrupt_id in pending_set:
+                        target_iid = a.interrupt_id
+                        break
+            except Exception as exc:
+                # Was a bare `pass` — silently turned every target-iid lookup
+                # failure into a non-targeted resume, making stuck interrupts
+                # impossible to diagnose. Log it so the fallback is visible.
+                logger.warning(
+                    "Job %d: target interrupt_id lookup failed, falling back "
+                    "to non-targeted resume: %s",
+                    job_id,
+                    exc,
+                )
 
-        graph.invoke(Command(resume=resume_value), config)
-    except Exception as exc:
-        from langgraph.errors import GraphInterrupt, GraphRecursionError
+            if target_iid and target_iid in all_interrupt_ids:
+                # Targeted resume: only the approved interrupt.
+                logger.info(
+                    "Job %d: targeted resume interrupt_id=%s (%d total pending)",
+                    job.id, target_iid, len(all_interrupt_ids),
+                )
+                resume_value = {target_iid: human_response}
+            elif len(all_interrupt_ids) > 1:
+                # Fallback: resume all pending with the same value.
+                logger.info(
+                    "Job %d: no target interrupt_id — resuming all %d pending",
+                    job.id, len(all_interrupt_ids),
+                )
+                resume_value = {iid: human_response for iid in all_interrupt_ids}
+            else:
+                resume_value = human_response
 
-        if isinstance(exc, GraphInterrupt):
+            graph.invoke(Command(resume=resume_value), config)
+        except Exception as exc:
+            from langgraph.errors import GraphInterrupt, GraphRecursionError
+
+            if isinstance(exc, GraphInterrupt):
+                logger.info("Job %d: interrupted again after resume", job.id)
+                LangGraphService._check_and_create_approval(graph, config, job)
+                job.status = ScrapeJob.STATUS_WAITING_APPROVAL
+                job.save(update_fields=["status"])
+                _publish_job_status(job.id, ScrapeJob.STATUS_WAITING_APPROVAL)
+                return
+
+            if isinstance(exc, GraphRecursionError):
+                logger.warning(
+                    "Job %d: GraphRecursionError after resume -> pausing for approval",
+                    job.id,
+                )
+                LangGraphService.create_recursion_approval(job, str(exc))
+                _publish_job_status(job.id, ScrapeJob.STATUS_WAITING_APPROVAL)
+                return
+
+            if isinstance(exc, SoftTimeLimitExceeded):
+                # [wave-37 W37-3a] A resume that dies mid-flight is the same 593
+                # shape — finalize from on-disk evidence, not a blind FAILED.
+                logger.error(
+                    "Job %d: SoftTimeLimitExceeded in resume — artifact-evidence finalize",
+                    job_id,
+                )
+                finalize_from_artifacts(job_id, "Soft time limit exceeded mid-resume")
+                return
+
+            logger.exception("Job %d resume failed: %s", job_id, exc)
+            job.status = ScrapeJob.STATUS_FAILED
+            job.error_message = str(exc)[-4000:]  # tail: keep the exception, not the banner
+            job.completed_at = timezone.now()
+            job.save(update_fields=["status", "error_message", "completed_at"])
+            _publish_job_status(job.id, ScrapeJob.STATUS_FAILED)
+            return
+        finally:
+            RedisLogHandler.clear_job_id()
+            root_logger.setLevel(_saved_root_level)
+            root_logger.removeHandler(syslog_handler)
+            syslog_handler.close()
+
+        # Check for post-resume interrupt (stream_events may not raise).
+        if _graph_is_interrupted(graph, config):
             logger.info("Job %d: interrupted again after resume", job.id)
             LangGraphService._check_and_create_approval(graph, config, job)
             job.status = ScrapeJob.STATUS_WAITING_APPROVAL
@@ -750,48 +826,7 @@ def resume_scrape_task(self, job_id: int, human_response: Any) -> None:
             _publish_job_status(job.id, ScrapeJob.STATUS_WAITING_APPROVAL)
             return
 
-        if isinstance(exc, GraphRecursionError):
-            logger.warning(
-                "Job %d: GraphRecursionError after resume -> pausing for approval",
-                job.id,
-            )
-            LangGraphService.create_recursion_approval(job, str(exc))
-            _publish_job_status(job.id, ScrapeJob.STATUS_WAITING_APPROVAL)
-            return
-
-        if isinstance(exc, SoftTimeLimitExceeded):
-            # [wave-37 W37-3a] A resume that dies mid-flight is the same 593
-            # shape — finalize from on-disk evidence, not a blind FAILED.
-            logger.error(
-                "Job %d: SoftTimeLimitExceeded in resume — artifact-evidence finalize",
-                job_id,
-            )
-            finalize_from_artifacts(job_id, "Soft time limit exceeded mid-resume")
-            return
-
-        logger.exception("Job %d resume failed: %s", job_id, exc)
-        job.status = ScrapeJob.STATUS_FAILED
-        job.error_message = str(exc)[-4000:]  # tail: keep the exception, not the banner
-        job.completed_at = timezone.now()
-        job.save(update_fields=["status", "error_message", "completed_at"])
-        _publish_job_status(job.id, ScrapeJob.STATUS_FAILED)
-        return
-    finally:
-        RedisLogHandler.clear_job_id()
-        root_logger.setLevel(_saved_root_level)
-        root_logger.removeHandler(syslog_handler)
-        syslog_handler.close()
-
-    # Check for post-resume interrupt (stream_events may not raise).
-    if _graph_is_interrupted(graph, config):
-        logger.info("Job %d: interrupted again after resume", job.id)
-        LangGraphService._check_and_create_approval(graph, config, job)
-        job.status = ScrapeJob.STATUS_WAITING_APPROVAL
-        job.save(update_fields=["status"])
-        _publish_job_status(job.id, ScrapeJob.STATUS_WAITING_APPROVAL)
-        return
-
-    _finalize_job(job)
+        _finalize_job(job)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2204,6 +2239,50 @@ def _close_open_steps(job: ScrapeJob) -> None:
         logger.warning("Failed to close steps for job %d: %s", job.id, exc)
 
 
+def _maybe_delete_workspace(job: ScrapeJob, ws) -> str:
+    """[wave-40 T11] Finalize's workspace disposal, behind the liveness guard.
+
+    Replaces the raw ``shutil.rmtree`` that prod 765 (nike.in) and 807
+    (papier) ran while a zombie generation or a same-slug sibling still
+    needed the directory. Order:
+
+    1. ``clear_own`` — this generation's walk is finished (finalize is
+       post-graph); drop its own token so the job cannot block itself. The
+       token comes from the ContextVar ``_invocation_scope`` set at task start,
+       so an ABANDONED generation sharing this ``(slug, job_id)`` is NOT
+       cleared and keeps blocking.
+    2. ``delete_blocked_reason`` — `_`-namespace refusal + registry liveness +
+       the slug-scoped DB sibling check (what the old URL-scoped
+       ``exclude(pk=job.id)`` filter should have been).
+    3. Blocked → tombstone (same-filesystem rename into
+       ``workspace/_trash/{slug}-{job_id}-{ns}/``, no data loss — the zombie's
+       ``os.makedirs`` then recreates a fresh empty workspace harmlessly).
+       Unblocked → delete, unless ``FINALIZE_WORKSPACE_DELETE=0`` forces the
+       tombstone everywhere (there is no old-behaviour mode; rollback = revert).
+
+    Returns ``"deleted"``, ``"tombstoned"`` or ``"kept"`` (blocked but the
+    rename failed, or there was nothing to dispose of).
+    """
+    slug = _generate_slug(job.url or "") or os.path.basename(str(ws).rstrip(os.sep))
+    invocation_registry.clear_own(
+        slug, job.id, invocation_registry.current_token()
+    )
+    blocked = invocation_registry.delete_blocked_reason(slug, exclude_job_id=job.id)
+    if not blocked and os.environ.get("FINALIZE_WORKSPACE_DELETE", "1") == "0":
+        blocked = "FINALIZE_WORKSPACE_DELETE=0 (always tombstone)"
+    if blocked:
+        logger.warning(
+            "Job %d: NOT deleting workspace/%s — %s", job.id, slug, blocked
+        )
+        if invocation_registry.tombstone_into_trash(ws, slug, job.id):
+            return "tombstoned"
+        return "kept"
+    import shutil
+
+    shutil.rmtree(ws, ignore_errors=True)
+    return "deleted"
+
+
 def _finalize_job(job: ScrapeJob) -> None:
     """Read the final graph checkpoint and persist results to the job.
 
@@ -2396,25 +2475,15 @@ def _finalize_job(job: ScrapeJob) -> None:
                         _matched_key = _key
                 # analysis → FM (M4: validated — corruption never reaches the FM)
                 _publish_analysis_artifacts(job.id, site_slug, ws)
-                # Defense-in-depth: don't rmtree if another job for this URL is
-                # mid-flight (the dispatch guard should prevent this, but a
-                # bypassed/played-with workspace would lose its artifacts).
-                import shutil
-
-                other_running = (
-                    ScrapeJob.objects
-                    .filter(url=job.url, status=ScrapeJob.STATUS_RUNNING)
-                    .exclude(pk=job.id)
-                    .exists()
+                # [wave-40 T11] The disposal is guarded: never delete a
+                # workspace a live/abandoned walk or a same-slug sibling still
+                # needs — tombstone it instead (rename into workspace/_trash/,
+                # no data loss). The old guard here was URL-scoped, slug-blind
+                # and self-excluding (prod 765/807).
+                _verdict = _maybe_delete_workspace(job, ws)
+                logger.info(
+                    "Job %d: workspace/%s %s", job.id, site_slug, _verdict
                 )
-                if other_running:
-                    logger.warning(
-                        "Job %d: NOT removing workspace/%s/ — another job is running",
-                        job.id, site_slug,
-                    )
-                else:
-                    shutil.rmtree(ws, ignore_errors=True)
-                logger.info("Job %d: cleaned workspace/%s/", job.id, site_slug)
             if _matched_key:
                 job.output_file = _matched_key
         except Exception as exc:
@@ -3067,6 +3136,11 @@ def purge_retention() -> dict:
     completed jobs past RETENTION_DAYS_COMPLETED (default 90), and folds in
     expired django_session cleanup. Never touches parked/live statuses —
     resumable jobs need their checkpoints (see scraper/retention.py).
+
+    [wave-40 T11] Also ages out tombstoned workspaces
+    (``workspace/_trash/{slug}-{job_id}-{ns}/``, the preserved directories
+    the finalize/wipe guard renames aside instead of deleting) on the same
+    windows — see ``retention._sweep_workspace_trash``.
     """
     if not settings.RETENTION_ENABLED:
         return {"disabled": True}
