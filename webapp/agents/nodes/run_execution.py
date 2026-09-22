@@ -1090,7 +1090,14 @@ def run_execution(state: ScrapeState) -> dict:
         return result
 
     def _redispatch_inprocess(alt_url: str) -> dict:
-        return _run_in_process(
+        # [wave-40 T1 r1] the fallback ADOPTS this dict verbatim when it
+        # delivers (product_count>0) — a delivering run stamps neither channel,
+        # and an absent key is a no-op in a LastValue channel, so the primary
+        # attempt's no_fresh_output=True / browser_unavailable_detail would
+        # ride into the router. Normalize here, at the adopt boundary (the
+        # wave-33 source pin on `return _maybe_retry_execution_listing(` below
+        # is untouched).
+        return _clear_transient_channels(_run_in_process(
             scraper_path, _args_with_listing_url(args, alt_url),
             root, site_folder, workspace_folder, job_id=job_id,
             env_overrides=_stealth_env(state),
@@ -1099,7 +1106,7 @@ def run_execution(state: ScrapeState) -> dict:
             # [wave-36 B1] two-vocabulary union — the scraper emits both key
             # sets pre-rename.
             target_fields=union_output_fields(state),
-        )
+        ))
 
     result = _run_in_process(
         scraper_path, args, root, site_folder, workspace_folder, job_id=job_id,

@@ -8837,6 +8837,11 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         # failure class, and the retry ladder already owns it.
         if report:
             update["tester_wall_clock_timeouts"] = 0
+            # [wave-40 T1 r1] declared channel: a detail stamped by an earlier
+            # no-report cycle would survive a REPORTED cycle and misfire the
+            # A5 fast-fail arm (SCRAPER_FAST_FAIL) on a later cycle that died
+            # of a different cause. Same reset rule as the counter above.
+            update["fast_fail_detail"] = ""
         elif _ct_dead and "wall-clock timeout" in _ct_err:
             update["tester_wall_clock_timeouts"] = (
                 int(state.get("tester_wall_clock_timeouts") or 0) + 1
