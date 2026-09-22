@@ -16,6 +16,7 @@
 import ast
 import logging
 import os
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -360,3 +361,355 @@ def restore_job_draft(root: str, slug: str, job_id) -> str | None:
     except Exception as exc:
         logger.warning("draft_safety: per-job draft restore failed (job %s): %s", job_id, exc)
         return None
+
+
+# ── [wave-40 T6] AST-only helper CALL-signature gate ─────────────────────────
+#
+# Three prod jobs crashed AT EXECUTION on a helper call shape that both the
+# compile gate and the F821 gate (filesystem_tools) accept, because neither
+# binds arguments:
+#   job 760  fetch_json() got an unexpected keyword argument 'post'
+#            (the create_fetch_json closure takes url, params, min_tier)
+#   job 791  _discover_listing_urls_with_retry() got multiple values for
+#            argument 'fetch_page' (positional slot 1 AND keyword)
+#   job 762  re.error: nothing to repeat (a bad regex literal)
+#
+# Everything here is AST-only: no runtime import/exec of the draft, no network,
+# no LLM. Registry signatures are read from SOURCE (importing the registry
+# modules would silently fall open whenever an import fails), so a draft can
+# never be executed or imported to be judged.
+
+DRAFT_CALL_VIOLATION_MARKER: str = "HELPER CALL SIGNATURE VIOLATION"
+
+# Findings shown to the writer per draft — enough to fix the class, not enough
+# to drown the fix directive.
+_DRAFT_CALL_FINDING_CAP = 5
+
+# Repo-relative module paths whose callables a generated draft may legally
+# call bare. src/ modules first (their signatures win name collisions);
+# the active template set follows. The retired per-domain templates
+# (article/forum/generic/akamai_stealth) are deliberately absent — CLAUDE.md
+# dead-templates list.
+_REGISTRY_MODULES: list[str] = [
+    "src/http_fetch.py",
+    "src/listing_discovery.py",
+    "src/seed_urls.py",
+    "src/content_types.py",
+    "src/intake_coerce.py",
+    "src/intake_url_list.py",
+    "templates/http_navigation_scraper.py",
+    "templates/navigation_scraper.py",
+    "templates/undetected_chromedriver_scraper.py",
+    "templates/api_scraper.py",
+    "templates/playwright_scraper.py",
+    "templates/requests_scraper.py",
+    "templates/shopify_scraper.py",
+]
+
+# ``re.<method>(pattern, ...)`` calls whose FIRST positional argument, when a
+# string literal, must compile (job-762 class).
+_REGEX_PATTERN_METHODS = frozenset({
+    "compile", "match", "fullmatch", "search", "sub", "subn", "split",
+    "findall", "finditer",
+})
+
+# Memoization. Two views are built in one pass:
+#   _REGISTRY_CACHE — name -> signature profile (the brief's registry dict)
+#   _FACTORY_SIGS   — factory name -> the factory's OWN signature
+# The registry deliberately maps a factory name to its RETURNED CLOSURE's
+# signature (both names), because drafts call the closures bare after
+# ``fetch_json = create_fetch_json()``. But a factory is also INVOKED with its
+# own kwargs — templates/requests_scraper.py:105 writes
+# ``create_fetch_page(delay_s=..., headers=...)`` and drafts copy that line
+# verbatim — so judging the invocation against the closure signature would
+# false-flag every template-derived draft. The factory's own signature is kept
+# aside for exactly that call shape.
+_REGISTRY_CACHE: dict[str, dict] = {}
+_FACTORY_SIGS: dict[str, dict] = {}
+_REGISTRY_BUILT = False
+
+
+def _registry_root() -> str:
+    """Repo root for the registry's repo-relative module paths.
+
+    This module lives at ``<repo>/webapp/agents/``, so the root is two parents
+    up; a couple of extra levels are probed for exotic layouts. A wrong root
+    just empties the registry, which makes the gate fall open.
+    """
+    agents_dir = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(os.path.dirname(agents_dir))
+    probe = _REGISTRY_MODULES[0]
+    for candidate in (root, os.path.dirname(root),
+                      os.path.dirname(os.path.dirname(root))):
+        if os.path.isfile(os.path.join(candidate, probe)):
+            return candidate
+    return root
+
+
+def _signature_profile(node) -> dict:
+    """Plain signature dict for a FunctionDef/AsyncFunctionDef."""
+    args = node.args
+    positional = [a.arg for a in getattr(args, "posonlyargs", []) + args.args]
+    return {
+        "positional": positional,
+        "kwonly": [a.arg for a in args.kwonlyargs],
+        "vararg": args.vararg is not None,
+        "kwarg": args.kwarg is not None,
+        "required_positional": max(0, len(positional) - len(args.defaults)),
+        "required_kwonly": [
+            a.arg for a, default in zip(args.kwonlyargs, args.kw_defaults)
+            if default is None
+        ],
+    }
+
+
+def _signature_hint(name: str, profile: dict) -> str:
+    parts = list(profile["positional"])
+    if profile["vararg"]:
+        parts.append("*args")
+    elif profile["kwonly"]:
+        parts.append("*")
+    parts.extend(profile["kwonly"])
+    if profile["kwarg"]:
+        parts.append("**kwargs")
+    return f"{name}({', '.join(parts)})"
+
+
+def _returned_closure_name(top) -> str | None:
+    """Name returned by a module-level factory's tail ``return <name>``, else None."""
+    body = top.body
+    if not body:
+        return None
+    tail = body[-1]
+    if isinstance(tail, ast.Return) and isinstance(tail.value, ast.Name):
+        return tail.value.id
+    return None
+
+
+def _register_module(tree, factories: dict[str, dict]) -> dict[str, dict]:
+    """Signatures for one module: every def at ANY depth, plus factory→closure
+    aliasing (a module-level function whose body ends in ``return <nested>``
+    registers the NESTED signature under both names, because that closure is
+    what a draft actually calls)."""
+    mod: dict[str, dict] = {}
+    for top in tree.body:
+        if not isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        mod[top.name] = _signature_profile(top)
+        tail = _returned_closure_name(top)
+        if not tail:
+            continue
+        for sub in ast.walk(top):
+            if (sub is not top
+                    and isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and sub.name == tail):
+                closure = _signature_profile(sub)
+                mod[top.name] = closure
+                mod.setdefault(tail, closure)
+                factories.setdefault(top.name, _signature_profile(top))
+                break
+        for sub in ast.walk(top):
+            if (sub is not top
+                    and isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef))):
+                mod.setdefault(sub.name, _signature_profile(sub))
+    return mod
+
+
+def _helper_registry() -> dict[str, dict]:
+    """Memoized AST-only registry: helper name -> signature profile."""
+    global _REGISTRY_BUILT
+    if _REGISTRY_BUILT:
+        return _REGISTRY_CACHE
+    registry: dict[str, dict] = {}
+    factories: dict[str, dict] = {}
+    root = _registry_root()
+    parsed_any = False
+    for rel in _REGISTRY_MODULES:
+        path = os.path.join(root, rel)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                tree = ast.parse(fh.read(), filename=path)
+        except Exception as exc:
+            # A missing/unreadable module contributes nothing — the OTHER
+            # modules still carry the load-bearing http_fetch signatures.
+            logger.warning("draft_safety: registry module skipped %s (%s)", rel, exc)
+            continue
+        parsed_any = True
+        try:
+            module_sigs = _register_module(tree, factories)
+        except Exception as exc:
+            logger.warning("draft_safety: registry module half-parsed %s (%s)", rel, exc)
+            continue
+        for name, profile in module_sigs.items():
+            registry.setdefault(name, profile)
+    if not registry:
+        # A half-built gate must never block drafts — fall open, loudly.
+        logger.error(
+            "draft_safety: helper call registry is EMPTY (root=%s, parsed_any=%s) "
+            "— draft_call_violation will fall open", root, parsed_any,
+        )
+    _REGISTRY_CACHE.clear()
+    _REGISTRY_CACHE.update(registry)
+    _FACTORY_SIGS.clear()
+    _FACTORY_SIGS.update(factories)
+    _REGISTRY_BUILT = True
+    return _REGISTRY_CACHE
+
+
+def _factory_signatures() -> dict[str, dict]:
+    """Factory name -> the factory's OWN (pre-closure) signature."""
+    if not _REGISTRY_BUILT:
+        _helper_registry()
+    return _FACTORY_SIGS
+
+
+def _signature_violations(name: str, node: ast.Call, profile: dict) -> list[str]:
+    """bind-partial call check: only shapes that CRASH at runtime are
+    violations. Missing-required and starred calls stay LEGAL — the writer may
+    know runtime defaults and shapes the AST cannot see."""
+    out: list[str] = []
+    if any(isinstance(arg, ast.Starred) for arg in node.args):
+        return out  # *args: the runtime arity is unknowable — LEGAL
+    positional = profile["positional"]
+    if len(node.args) > len(positional) and not profile["vararg"]:
+        out.append(
+            f"line {node.lineno}: {name}() takes at most {len(positional)} "
+            f"positional argument(s) but {len(node.args)} were given "
+            f"(known signature {_signature_hint(name, profile)})"
+        )
+    for kw in node.keywords:
+        if kw.arg is None:
+            continue  # **spread — LEGAL
+        if kw.arg in positional:
+            slot = positional.index(kw.arg)
+            if slot < len(node.args):
+                out.append(
+                    f"line {node.lineno}: {name}() got multiple values for "
+                    f"argument '{kw.arg}' — it is positional slot {slot + 1} "
+                    "and is also passed by keyword"
+                )
+            continue
+        if kw.arg in profile["kwonly"] or profile["kwarg"]:
+            continue
+        out.append(
+            f"line {node.lineno}: {name}() got an unexpected keyword argument "
+            f"'{kw.arg}' (known signature {_signature_hint(name, profile)})"
+        )
+    return out
+
+
+def _regex_literal_violation(node: ast.Call, func) -> list[str]:
+    """A string-literal pattern handed to ``re.<method>`` must compile."""
+    if not (isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "re"
+            and func.attr in _REGEX_PATTERN_METHODS
+            and node.args):
+        return []
+    first = node.args[0]
+    if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+        return []
+    try:
+        re.compile(first.value)
+    except re.error as exc:
+        return [
+            f"line {node.lineno}: re.{func.attr}({first.value!r}) raises "
+            f"re.error: {exc} — this pattern literal never compiles "
+            "(job-762 class)"
+        ]
+    except Exception:
+        return []  # not a clean re.error → fall open
+    return []
+
+
+def _call_violations(node: ast.Call, local: dict, registry: dict,
+                     factory_sigs: dict) -> list[str]:
+    func = node.func
+    name = func.id if isinstance(func, ast.Name) else ""
+    profile: dict | None = None
+    if name:
+        if name in local:
+            profile = local[name]  # draft-local def shadows the registry
+        elif name in factory_sigs:
+            profile = factory_sigs[name]  # factory INVOCATION → own signature
+        else:
+            profile = registry.get(name)
+    out = _signature_violations(name, node, profile) if profile else []
+    out.extend(_regex_literal_violation(node, func))
+    return out
+
+
+def draft_call_violation(source: str) -> str:
+    """AST pre-gate: helper CALL signatures in a generated draft.
+
+    Returns "" on PASS (or whenever the gate cannot decide — fall OPEN, a gate
+    bug must never block a good draft) and otherwise a capped, newline-joined
+    findings string prefixed with ``DRAFT_CALL_VIOLATION_MARKER``.
+
+    Checked, per ``ast.Call``:
+      - unexpected-kwarg / multiple-values-for-argument / too-many-positionals
+        against the AST-derived registry of src/ + template helpers;
+      - ``re.<method>('literal', ...)`` patterns that raise ``re.error``.
+    Legal by design: missing-required args and starred calls (the writer may
+    know runtime defaults), ``**spread`` keywords, and any call on a name the
+    draft defines itself or that the registry does not know.
+
+    No runtime import/exec of the draft, no network, no LLM.
+    """
+    if not source or not source.strip():
+        return ""
+    try:
+        tree = ast.parse(source)
+    except Exception:
+        return ""  # unparseable → the syntax fixer owns those, not this gate
+    try:
+        findings = _draft_call_findings(tree)
+    except Exception as exc:
+        logger.warning(
+            "draft_safety: call-signature gate fell open on an internal error: %s",
+            exc,
+        )
+        return ""
+    if not findings:
+        return ""
+    findings = findings[:_DRAFT_CALL_FINDING_CAP]
+    return (
+        f"{DRAFT_CALL_VIOLATION_MARKER} — {len(findings)} draft call(s) would "
+        f"crash at execution:\n" + "\n".join(findings)
+    )
+
+
+def _draft_call_findings(tree) -> list[str]:
+    registry = _helper_registry()
+    if not registry:
+        return []  # empty registry → fall open (logged at build time)
+    factory_sigs = _factory_signatures()
+    # Draft-local view, built FIRST so it shadows the registry:
+    #   - every def/async def name in the draft;
+    #   - ``name = factory_call()`` aliases name to the factory's returned
+    #     closure signature — how generated drafts actually reach the
+    #     http_fetch closures (``fetch_json = create_fetch_json()`` then a
+    #     bare ``fetch_json(url, ...)``).
+    local: dict[str, dict] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            local[node.name] = _signature_profile(node)
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)):
+            continue
+        factory_name = node.value.func.id
+        closure = registry.get(factory_name) if factory_name in factory_sigs else None
+        if closure:
+            local[node.targets[0].id] = closure
+    findings: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        findings.extend(_call_violations(node, local, registry, factory_sigs))
+        if len(findings) >= _DRAFT_CALL_FINDING_CAP:
+            break
+    return findings
