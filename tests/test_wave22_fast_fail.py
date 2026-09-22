@@ -119,7 +119,18 @@ class TestFastFailHelper:
 
 
 class TestRouterFastFailArm:
-    """The router must act on the stamped flag ABOVE the no-report ladder."""
+    """The router must act on the stamped flag ABOVE the no-report ladder.
+
+    [wave-40 T1 guard 5] ``fast_fail_detail`` is a DECLARED channel now, which
+    would have turned this arm live for the first time as a side effect of a
+    declaration. It is gated behind SCRAPER_FAST_FAIL (default off); these
+    tests opt IN to pin the enabled contract. The default-off contract is
+    pinned by TestFastFailGateDefaultsOff below.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _enable_fast_fail(self, monkeypatch):
+        monkeypatch.setenv("SCRAPER_FAST_FAIL", "1")
 
     def _route(self, extra: dict, skip_approvals: bool) -> str:
         state = {
@@ -171,6 +182,29 @@ class TestRouterFastFailArm:
             "tester_wall_clock_timeouts": 0,
         }
         assert rat.route_after_testing(state) == "scraper_analyzer"
+
+
+class TestFastFailGateDefaultsOff:
+    """[wave-40 T1 guard 5] The arm must stay INERT unless SCRAPER_FAST_FAIL
+    opts in — a channel declaration must not smuggle an unreviewed behavior
+    change into prod."""
+
+    def test_detail_is_inert_when_the_gate_is_off(self, monkeypatch):
+        monkeypatch.delenv("SCRAPER_FAST_FAIL", raising=False)
+        state = {
+            "job_id": 0,
+            "site_slug": "example-com",
+            "test_report": None,
+            "test_retry_count": 0,
+            "skip_approvals": True,
+            "tester_wall_clock_timeouts": 0,
+            "fast_fail_detail": "code_tester hit its wall clock",
+        }
+        assert rat.route_after_testing(state) == "scraper_analyzer", (
+            "with SCRAPER_FAST_FAIL unset the stamped detail must be inert — "
+            "the no-report ladder owns the run exactly as it did before the "
+            "channel was declared"
+        )
 
 
 class TestNodeWiring:

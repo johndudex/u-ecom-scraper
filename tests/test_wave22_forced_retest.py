@@ -137,7 +137,10 @@ class TestRouterIntegration:
         state = _state(ws, forced_retest_count=1)
         assert rat.route_after_testing(state) == "cleanup"
 
-    def test_fast_fail_arm_is_never_intercepted(self, ws):
+    def test_fast_fail_arm_is_never_intercepted(self, ws, monkeypatch):
+        # [wave-40 T1 guard 5] the arm is opt-in (SCRAPER_FAST_FAIL); this test
+        # pins its ENABLED contract — the funnel must not sit in front of it.
+        monkeypatch.setenv("SCRAPER_FAST_FAIL", "1")
         (ws / "scraper_draft.py").write_text(DRAFT_B)
         state = _state(ws)
         state["fast_fail_detail"] = "code_tester hit its wall clock"

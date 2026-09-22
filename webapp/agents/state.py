@@ -122,6 +122,19 @@ class ScrapeState(TypedDict, total=False):
     # the allowance when it enters with that mismatch signature, so a forced
     # pass that dies cannot bounce terminal→code_tester forever.
     forced_retest_count: int
+    # [wave-40 T1] Tester-side accounting channels. UNDECLARED keys are
+    # silently stripped from node returns by langgraph, so every one of these
+    # was behavior-dead: writers stamped them, readers always read 0/""/False.
+    # Plain (LastValue) channels — each writer OVERWRITES; none may use
+    # operator.add (graph.py's reset-to-0 for tester_wall_clock_timeouts is
+    # load-bearing). Activation guards live at the writer sites — see
+    # tests/test_wave40_state_channel_contract.py.
+    tester_wall_clock_timeouts: int
+    fast_fail_detail: str
+    browser_unavailable_detail: str
+    draft_absent_count: int
+    last_tested_draft_bytes: int
+    no_fresh_output: bool
     # [wave-37 W37-NEW-D] Ladder-repair budget: ONE deterministic proxy-ladder
     # re-injection per job, applied by _invoke_code_tester at entry (before
     # the window is spent) when the draft violates

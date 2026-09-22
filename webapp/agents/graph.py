@@ -8614,6 +8614,12 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     f"browser_service unhealthy before testing "
                     f"(waited {int(_CT_PFW)}s for /health)"
                 ),
+                # [wave-40 T1 guard 4] The counter is declared now (it used to
+                # be stripped, so this reset was a no-op). Reset it at the park
+                # so a beat-resumed generation does not inherit the dead
+                # generation's wall-clock strikes — the park means NOTHING was
+                # tested, not that testing failed twice.
+                "tester_wall_clock_timeouts": 0,
             }
     except ImportError:
         logger.warning("_invoke_code_tester: pre-flight import failed — proceeding")
@@ -8642,7 +8648,18 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         finally:
             _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "code-tester", config)
-        update = {"messages": [], "draft_absent_count": _te_absent}
+        # [wave-40 T1 guard 2] browser_unavailable_detail is a declared channel
+        # now, so a stale detail would survive into the router's park arm.
+        # Reaching this line means the pre-flight PASSED, so any detail left in
+        # state is from an earlier attempt — clear it on every tester pass that
+        # actually runs. (The pre-flight's own failure return stamps the detail
+        # and returns above; the report-level infra classifier is a separate
+        # signal and is not touched here.)
+        update = {
+            "messages": [],
+            "draft_absent_count": _te_absent,
+            "browser_unavailable_detail": "",
+        }
         if _lr_repaired_here:
             # [wave-37 W37-NEW-D] the job's ONE ladder repair is spent win or
             # lose (B2 semantics) — a repeating violation keeps the honest path.

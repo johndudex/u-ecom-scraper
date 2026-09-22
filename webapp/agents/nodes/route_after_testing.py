@@ -1443,6 +1443,23 @@ def _terminal_after_grace_check(state: ScrapeState, dest: str) -> str:
     return "code_writer"
 
 
+def _fast_fail_escalation_enabled() -> bool:
+    """[wave-40 T1 guard 5] Kill-switch for the A5 named fast-fail arm.
+
+    ``fast_fail_detail`` was an UNDECLARED channel until wave-40 T1 — the
+    tester's stamp was stripped from every node return, so this arm never fired
+    and no behavior ever accrued to it. Declaring the channel would have
+    activated it silently as a side effect; instead it stays OFF by default and
+    must be switched on deliberately with ``SCRAPER_FAST_FAIL=1`` (a prod
+    rollout decision, not a code-path accident).
+    """
+    import os
+
+    return str(os.environ.get("SCRAPER_FAST_FAIL", "0")).strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def route_after_testing(state: ScrapeState) -> str:
     report = state.get("test_report")
     retry_count = state.get("test_retry_count", 0)
@@ -1464,7 +1481,14 @@ def route_after_testing(state: ScrapeState) -> str:
     from ..tools.browser_http import report_is_infra_blocked
 
     _infra = report_is_infra_blocked(report or {})
-    if state.get("browser_unavailable_detail") or _infra:
+    # [wave-40 T1 guard 1] browser_unavailable_detail is now a DECLARED channel
+    # (it used to be stripped, so this arm only ever fired on _infra). The
+    # detail is cleared on every tester pass that actually runs (graph.py's
+    # success stamp) and on run_execution's non-infra returns, but a resume
+    # path can still land here holding a stale detail. Only trust it when there
+    # is NO report to judge — a real verdict means the gateway was up, and
+    # parking on a stale detail would loop the park forever.
+    if _infra or (state.get("browser_unavailable_detail") and not report):
         if _infra and not state.get("browser_unavailable_detail"):
             # Routing functions cannot mutate state — log loudly so the
             # SessionLog carries the classification (the park node's own
@@ -1489,7 +1513,10 @@ def route_after_testing(state: ScrapeState) -> str:
     # below cannot rescue this: every rung re-burns a full window against the
     # same wall. Terminal cleanup with the named detail (recoverable via
     # re-drive), in BOTH skip_approvals modes.
-    if state.get("fast_fail_detail"):
+    # [wave-40 T1 guard 5] Declaring fast_fail_detail turned this arm live for
+    # the first time; it stays behind SCRAPER_FAST_FAIL (default off) so no
+    # unreviewed behavior change rides a declaration into prod.
+    if state.get("fast_fail_detail") and _fast_fail_escalation_enabled():
         _ff_detail = str(state.get("fast_fail_detail"))
         logger.error(
             "route_after_testing: fast-fail → cleanup (%s)", _ff_detail[:160]

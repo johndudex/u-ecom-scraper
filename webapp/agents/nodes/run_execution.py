@@ -679,6 +679,40 @@ def _cancel_job_scrapes(job_id: int) -> None:
         logger.warning("run_execution: scrape cancel failed: %s", exc)
 
 
+def _clear_transient_channels(result: dict) -> dict:
+    """[wave-40 T1 guards 2+3] Keep the newly declared channels from going stale.
+
+    ``browser_unavailable_detail`` and ``no_fresh_output`` used to be stripped
+    from every node return by langgraph, so nothing ever accumulated in state.
+    Declaring them (ScrapeState) means a value stamped by one attempt would
+    otherwise ride into the NEXT attempt's routing: a stale detail would park a
+    job that just produced a real report, and a stale ``no_fresh_output=True``
+    would re-cycle a plain crash through the strategy ladder.
+
+    Every run_execution exit goes through this normalization (the entry
+    refusals wrap their return; the two dispatch legs clear in place once the
+    leg's result is final):
+    - only the infra-unavailable returns (pre-flight unhealthy, classified
+      502/503, NAVIGATE_UNAVAILABLE) keep a ``browser_unavailable_detail`` —
+      every other return clears it (the tester node clears its own side at its
+      success stamp, graph.py);
+    - only the zero-output paths (rc=3 DISCOVERY_ZERO in-process and via
+      browser_service, and the clean rc=0 that wrote no output file) keep
+      ``no_fresh_output=True`` — every other return, including a delivering
+      run, stamps an explicit False.
+
+    Mutates ``result`` in place and returns it, so callers may use it either
+    way.
+    """
+    if not isinstance(result, dict):
+        return result
+    if not result.get("browser_unavailable_detail"):
+        result["browser_unavailable_detail"] = ""
+    if "no_fresh_output" not in result:
+        result["no_fresh_output"] = False
+    return result
+
+
 def run_execution(state: ScrapeState) -> dict:
     from ..graph import _notify_phase
 
@@ -692,10 +726,10 @@ def run_execution(state: ScrapeState) -> dict:
 
     if not os.path.isfile(scraper_path):
         logger.error("run_execution: scraper not found at %s", scraper_path)
-        return {
+        return _clear_transient_channels({
             "execution_status": "FAILED",
             "error_message": f"scraper_draft.py not found at {scraper_path}",
-        }
+        })
 
     # [job-329 wall] Refuse to dispatch a draft that is not valid Python —
     # fail with the real SyntaxError before any launch, never as a 55s
@@ -703,10 +737,10 @@ def run_execution(state: ScrapeState) -> dict:
     _parse_err = _draft_parse_error(scraper_path)
     if _parse_err:
         logger.error("run_execution: %s", _parse_err)
-        return {
+        return _clear_transient_channels({
             "execution_status": "FAILED",
             "error_message": _parse_err,
-        }
+        })
 
     # [job-329 wall] Freeze: refuse to execute a draft that drifted after the
     # tester verdict. What runs must be byte-identical to what was judged.
@@ -720,7 +754,7 @@ def run_execution(state: ScrapeState) -> dict:
                 str(_tested_sha)[:12],
                 str(_current_sha)[:12],
             )
-            return {
+            return _clear_transient_channels({
                 "execution_status": "FAILED",
                 "error_message": (
                     "scraper draft was modified after the tester verdict "
@@ -728,7 +762,7 @@ def run_execution(state: ScrapeState) -> dict:
                     f"{str(_current_sha)[:12]}…) — refusing to execute an "
                     "untested file"
                 ),
-            }
+            })
 
     # [wave-19 T1.1] Structural ladder gate: an HTTP-family nav draft with no
     # proxy-aware fetch path (no src.http_fetch import, no proxies= kwarg, no
@@ -750,14 +784,14 @@ def run_execution(state: ScrapeState) -> dict:
         _ladder_violation = None
     if _ladder_violation:
         logger.error("run_execution: %s", _ladder_violation)
-        return {
+        return _clear_transient_channels({
             "execution_status": "FAILED",
             "error_message": (
                 f"{_ladder_violation} Refusing unproxied execution — "
                 "regenerate the scraper so it fetches through the shared "
                 "proxy ladder."
             ),
-        }
+        })
 
     # NOTE: the FINAL execution always extracts the FULL result set (--sample is
     # only for code_tester validation). "sample_only" still skips the approval
@@ -987,14 +1021,14 @@ def run_execution(state: ScrapeState) -> dict:
                 except Exception:
                     _strict = True
                 if _contract and _strict:
-                    return {
+                    return _clear_transient_channels({
                         "execution_status": "FAILED",
                         "error_message": (
                             f"{_contract} Refusing silent seed-only execution. "
                             "Remedy: regenerate the scraper (delete the cached "
                             "draft to force code_writer) or re-submit the job."
                         ),
-                    }
+                    })
         args = filtered
 
     # Execution-mode feature flag (settings.SCRAPER_EXECUTION_MODE):
@@ -1048,6 +1082,11 @@ def run_execution(state: ScrapeState) -> dict:
         # in-flight server-side run for this job so it stops holding a Chrome.
         if (result or {}).get("execution_status") == "FAILED":
             _cancel_job_scrapes(job_id)
+        # [wave-40 T1 guards 2+3] the leg is final — clear the transient
+        # channels in place so a stale detail / no_fresh_output=True from an
+        # earlier attempt cannot ride into the router (an infra return keeps
+        # its own stamps; see _clear_transient_channels).
+        _clear_transient_channels(result)
         return result
 
     def _redispatch_inprocess(alt_url: str) -> dict:
@@ -1069,6 +1108,10 @@ def run_execution(state: ScrapeState) -> dict:
         input_mode=input_mode,
         target_fields=union_output_fields(state),
     )
+    # [wave-40 T1 guards 2+3] clear in place on the leg's RAW result: the
+    # listing fallback below either keeps this dict (already normalized) or
+    # adopts a delivering retry, which carries no stale channel values.
+    _clear_transient_channels(result)
     # [job-77 RC1] bounded listing fallback on a clean zero (see helper).
     return _maybe_retry_execution_listing(
         result, state, _listing_url_env or _working_url, _redispatch_inprocess
