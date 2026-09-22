@@ -1514,6 +1514,8 @@ def _final_status_ladder(
     error_message: str,
     output_file: str,
     diagnose_no_execution=None,
+    rescue_count: int = 0,
+    rescue_file: str = "",
 ) -> tuple[str, str]:
     """The finalize status decision, as a pure function. [wave-19 T1.5]
 
@@ -1531,6 +1533,17 @@ def _final_status_ladder(
     extracted real items, and the old ladder's ``elif job.error_message:``
     killed the productive run anyway. A productive execution now outranks the
     note; the caller scrubs the stale note on COMPLETED.
+
+    The wave-40 ordering is authority order: cancel > real-items rescue >
+    execution verdict > diagnostics. The rescue arm (T9) upgrades a
+    FAILED/zero verdict to COMPLETED only when the caller hands in job-scoped
+    evidence (``_real_items_evidence``: ``rescue_count`` good rows in
+    ``rescue_file``, this job's started_at window + draft provenance) while
+    the state claims zero items. Structural invariants: never fires for a
+    cancelled job, and a COMPLETED row must never end with 0 items — so a
+    zero credit is impossible (``rescue_count > 0`` is the arm's first
+    clause). ``input_mode`` arrives inside the state dict ``_finalize_job``
+    already passes down.
     """
     if already_terminal:
         return "", ""
@@ -1539,6 +1552,20 @@ def _final_status_ladder(
         # execution_status — the old ladder blessed it COMPLETED with 0
         # products (prod jobs 263/266/327).
         return ScrapeJob.STATUS_CANCELLED, ""
+    # [wave-40 T9] Job-scoped real-items evidence outranks a stale failure
+    # verdict. Fires ONLY when the state claims zero items and this job
+    # demonstrably produced >= min_count good rows (T8 evidence, started_at
+    # window + draft provenance). Never fires for cancelled jobs (the arm
+    # above already returned); never credits a zero (count > 0 is
+    # structural).
+    if (
+        rescue_count > 0
+        and not was_cancelled
+        and int((final_state or {}).get("product_count") or 0) == 0
+        and rescue_count >= _rescue_min_count(
+            (final_state or {}).get("input_mode") or "navigation")
+    ):
+        return ScrapeJob.STATUS_COMPLETED, ""
     if final_state.get("execution_status") == "FAILED":
         return ScrapeJob.STATUS_FAILED, ""
     if not final_state.get("execution_status") and not output_file:
@@ -1918,6 +1945,146 @@ def _real_items_evidence(
     return 0, ""
 
 
+def _resolve_rescue_file(locator: str, slug: str) -> str:
+    """[wave-40 T9] The evidence locator → the canonical File Master key.
+
+    ``_real_items_evidence`` returns an FM key when the FM won, an absolute
+    local path when a workspace/``scrapers`` file won. A local path names a
+    file the publish block has just copied to ``scrapers/{slug}/{basename}``,
+    so that key is used when the FM has it (checked AFTER publish+prune — a
+    key the prune dropped must not become ``job.output_file``); otherwise the
+    local path stands (dev bind-mount fallback — the workspace copy is gone
+    either way once the rmtree ran).
+    """
+    if not locator:
+        return ""
+    normalized = locator.replace("\\", "/")
+    if not normalized.startswith("/") and normalized.startswith("scrapers/"):
+        return locator  # already an FM key
+    if not slug:
+        return locator
+    try:
+        import src.artifacts as artifacts
+
+        key = artifacts.scrapers_key(slug, os.path.basename(normalized))
+        if artifacts.exists(key):
+            return key
+    except Exception as exc:
+        logger.warning(
+            "Job finalize: rescue file resolution fell back to the local "
+            "path %s (%s)", locator, exc,
+        )
+    return locator
+
+
+def _promote_rescued_draft(slug: str, job_id: int | None) -> str:
+    """[wave-40 T9] Promote a rescued job's draft to production, compile-gated.
+
+    rev-1 of this task promoted the workspace/FM draft unconditionally — that
+    would have promoted prod 762's CRASHING draft. Candidates, in order: the
+    per-job FM draft ``scrapers/{slug}/jobs/scraper-{job_id}.py`` (the copy
+    ``_promote_scraper`` archives for THIS job), its known-good ``-good``
+    freeze twin (wave-32 D3), then the local workspace draft. The FIRST
+    candidate whose source ``compile(source, name, "exec")`` succeeds AND
+    carries no ``draft_call_violation`` (the AST helper-call gate — consulted
+    only when ``agents.draft_safety`` imports cleanly; compile() alone catches
+    SyntaxError, not the 760/791/762 crash classes) wins and is written to
+    ``scrapers/{slug}/scraper.py`` (FM key + best-effort local copy).
+
+    None qualifies → NOTHING is promoted, logged loudly, "" returned: a
+    COMPLETED-with-items job whose draft cannot be promoted is honest — the
+    invariant that must never break is product_count > 0, not draft presence.
+
+    Returns the production FM key on success, else "". Failure-safe: the
+    caller treats this as best-effort and never lets it move the verdict.
+    """
+    if not slug:
+        return ""
+    try:
+        import src.artifacts as artifacts
+    except Exception as exc:
+        logger.warning("Job %s: rescue promotion unavailable (%s)", job_id, exc)
+        return ""
+    try:
+        from agents.draft_safety import draft_call_violation, draft_good_key
+    except Exception:
+
+        def draft_call_violation(source: str) -> str:  # type: ignore[misc]
+            return ""  # gate unavailable → fall open (compile() still applies)
+
+        def draft_good_key(slug_: str, job_id_: object) -> str:  # type: ignore[misc]
+            return f"scrapers/{slug_}/jobs/scraper-draft-{job_id_}-good.py"
+
+    from pathlib import Path as _P
+
+    root = _P(getattr(settings, "PROJECT_ROOT", os.getcwd()))
+    candidates: list[tuple[str, str]] = []
+    if job_id:
+        candidates.append(
+            (f"scrapers/{slug}/jobs/scraper-{job_id}.py", "fm"))
+        candidates.append((draft_good_key(slug, job_id), "fm"))
+    candidates.append(
+        (str(root / "workspace" / slug / "scraper_draft.py"), "local"))
+
+    for ref, kind in candidates:
+        try:
+            if kind == "fm":
+                source = artifacts.read_text(ref)
+            else:
+                path = _P(ref)
+                source = (
+                    path.read_text(encoding="utf-8", errors="replace")
+                    if path.is_file() else ""
+                )
+        except Exception:
+            continue
+        if not source or not source.strip():
+            continue  # an empty source would compile() — it is not a draft
+        try:
+            compile(source, ref, "exec")
+        except Exception as exc:
+            logger.warning(
+                "Job %s: rescue promotion skipped %s — does not compile (%s)",
+                job_id, ref, exc,
+            )
+            continue
+        violation = draft_call_violation(source)
+        if violation:
+            logger.warning(
+                "Job %s: rescue promotion skipped %s — %s",
+                job_id, ref, violation.splitlines()[0],
+            )
+            continue
+        prod_key = artifacts.scrapers_key(slug, "scraper.py")
+        try:
+            artifacts.write(prod_key, source.encode("utf-8"))
+        except Exception as exc:
+            logger.warning(
+                "Job %s: rescue promotion FM write failed for %s — trying the "
+                "next candidate (%s)", job_id, prod_key, exc,
+            )
+            continue
+        try:
+            local = root / "scrapers" / slug / "scraper.py"
+            local.parent.mkdir(parents=True, exist_ok=True)
+            local.write_text(source, encoding="utf-8")
+        except OSError as exc:
+            logger.warning(
+                "Job %s: rescue promotion local copy failed (%s)", job_id, exc
+            )
+        logger.warning(
+            "Job %s: real-items rescue promoted %s → %s (compile-gated)",
+            job_id, ref, prod_key,
+        )
+        return prod_key
+    logger.warning(
+        "Job %s: real-items rescue promoted NOTHING for site %s — no candidate "
+        "draft compiles; the job stays COMPLETED with its items but no "
+        "production scraper", job_id, slug,
+    )
+    return ""
+
+
 def _publish_analysis_artifacts(job_id: int, site_slug: str, ws) -> None:
     """Copy the analysis artifacts from the LOCAL workspace to the File Master.
 
@@ -2005,6 +2172,18 @@ def _finalize_job(job: ScrapeJob) -> None:
     finalized in check_accessibility) and for browser_unavailable jobs
     [wave-16 B3] — already parked by the park node; _finalize_job's
     COMPLETED/FAILED ladder must not overwrite a resumable park.
+
+    [wave-40 T9] The finalize rescue: BEFORE the publish block (whose rmtree
+    would erase the workspace evidence) the job's real-items evidence is read
+    (`_real_items_evidence`); when the verdict is a FAILED/zero and the
+    evidence proves at least `_rescue_min_count` good rows for THIS job, the
+    ladder upgrades to COMPLETED, credits the evidence count, repoints
+    output_file at the winning File Master key (the existing rule then
+    scrubs the stale failure note) and promotes the draft compile-gated
+    (`_promote_rescued_draft`). HONEST LIMITS (identical to
+    `finalize_from_artifacts`, wave-37 W37-3a): `store_job_listings` and
+    `nav_skill_review` do not re-run on a rescued finalize, and attribution
+    is job-scoped, not output-to-sha.
     """
     job.refresh_from_db()
     if job.status in (
@@ -2127,6 +2306,27 @@ def _finalize_job(job: ScrapeJob) -> None:
                 "Job %d: could not read output file for overrides: %s", job.id, exc
             )
 
+    # ── [wave-40 T9] Real-items evidence — BEFORE the publish block. ──────
+    # The workspace output mtimes are live evidence and the publish block
+    # rmtree's the directory, so the evidence pass must see them first.
+    # ``site_slug`` normally rides in the state; a checkpoint without one (a
+    # crashed attempt can die before the state update) falls back to the slug
+    # the rest of tasks.py derives from the job URL. Never raises: the helper
+    # degrades to (0, "") on every read problem, and the guard below makes
+    # sure even an unexpected error cannot fail the finalize.
+    rescue_count, rescue_locator = 0, ""
+    evidence_slug = site_slug or _generate_slug(job.url or "")
+    if evidence_slug:
+        try:
+            rescue_count, rescue_locator = _real_items_evidence(
+                evidence_slug, job, final_state
+            )
+        except Exception as exc:
+            logger.warning(
+                "Job %d: real-items evidence unavailable (%s) — no rescue",
+                job.id, exc,
+            )
+
     # ── Publish outputs + analysis to the File Master; repoint job.output_file ──
     if site_slug:
         try:
@@ -2242,6 +2442,10 @@ def _finalize_job(job: ScrapeJob) -> None:
     # ── Determine final status ──────────────────────────────────────────
     # The decision lives in _final_status_ladder (pure, tested); this site
     # keeps only the side effects (writes, logs). [wave-19 T1.5]
+    # [wave-40 T9] The evidence locator is resolved to its File Master key
+    # HERE — after publish+prune — so the key handed to the ladder (and to
+    # job.output_file on a rescue) is one the FM actually still holds.
+    rescue_file = _resolve_rescue_file(rescue_locator, evidence_slug)
     _status, _diag = _final_status_ladder(
         final_state,
         already_terminal=job.status in (
@@ -2253,6 +2457,8 @@ def _finalize_job(job: ScrapeJob) -> None:
         error_message=job.error_message or "",
         output_file=job.output_file or "",
         diagnose_no_execution=lambda: _diagnose_no_execution(site_slug, job.id),
+        rescue_count=rescue_count,
+        rescue_file=rescue_file,
     )
     if _status:
         job.status = _status
@@ -2272,6 +2478,37 @@ def _finalize_job(job: ScrapeJob) -> None:
             job.id, (job.error_message or "")[:120],
         )
         job.error_message = ""
+
+    # ── [wave-40 T9] Rescue side effects. ────────────────────────────────
+    # Mirror of the ladder arm's predicate (the ladder returns only
+    # (status, diag), and a productive run whose state claims items must not
+    # be clobbered): a rescue COMPLETED credits the EVIDENCE count and
+    # repoints output_file at the file that carried it. was_cancelled is
+    # implied — a cancelled job can never reach _status == COMPLETED here.
+    # The stale-error scrub above already cleared the failure note.
+    if (
+        _status == ScrapeJob.STATUS_COMPLETED
+        and rescue_count > 0
+        and rescue_file
+        and int((final_state or {}).get("product_count") or 0) == 0
+        and rescue_count >= _rescue_min_count(
+            (final_state or {}).get("input_mode") or "navigation")
+    ):
+        job.product_count = rescue_count
+        job.output_file = rescue_file
+        logger.warning(
+            "Job %d: real-items rescue — %d good row(s) in %s outrank the "
+            "failure verdict; COMPLETED with product_count=%d",
+            job.id, rescue_count, rescue_file, rescue_count,
+        )
+        try:
+            _promote_rescued_draft(evidence_slug, job.id)
+        except Exception as exc:
+            # Best-effort by contract: the verdict is already COMPLETED with
+            # items — a promotion accident must not move it.
+            logger.warning(
+                "Job %d: rescue draft promotion failed: %s", job.id, exc
+            )
 
     # ── Enforce the requested schema (prune output + resolve for DB persist) ──
     # target_fields is authoritative; falls back to the Site's stored DB schema
