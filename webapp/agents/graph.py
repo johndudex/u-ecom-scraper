@@ -2454,6 +2454,81 @@ def _writer_max_timeout() -> int:
     return _env_int("WRITER_MAX_TIMEOUT", 2700)
 
 
+def _writer_progress_escalation_enabled() -> bool:
+    """[wave-40 T12] Opt-in switch for the writer progress escalation.
+
+    Prod 765 (nike.in): the writer was CONVERGING — cycle-3 tested PASS with
+    36/36 extraction verified — and the 2-strike wall-clock abort fired first,
+    so a stale draft went to execution (n=0) and a zombie writer finished the
+    PASS draft into a workspace that was then deleted.
+
+    Budget history is why this is opt-in: wave-23-era budget bumps ballooned
+    the writer's context and were REVERTED
+    (docs/code-writer-context-ballooning.md). The escape hatch therefore ships
+    OFF and must be switched on deliberately with ``WRITER_PROGRESS_ESCALATION=1``
+    as a controlled prod experiment — never as a code-path accident (same idiom
+    as route_after_testing's ``SCRAPER_FAST_FAIL`` guard).
+    """
+    return str(os.environ.get("WRITER_PROGRESS_ESCALATION", "0")).strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def _writer_escalation_window(
+    state: ScrapeState, job_deadline: float | None, now: float | None = None
+) -> int | None:
+    """[wave-40 T12] The ONE capped, budget-clamped extra writer window.
+
+    Returns the wall-clock seconds to hand a converging writer, or None when
+    the hatch must stay shut. Every arm below is a refusal — the grant needs
+    ALL of:
+
+    - ``WRITER_PROGRESS_ESCALATION=1`` (default OFF; with the flag off this
+      helper is a constant None and every caller is byte-identical to today);
+    - **verifiable progress**, per the tester's own stamps — the draft
+      fingerprint of the last TESTED cycle is present
+      (``last_tested_draft_fp``), the draft did not mutate while the tester
+      ran, and the no-op-fix counter is 0;
+    - the latch is unset (``writer_escalation_used`` False) — the grant is
+      spent at most ONCE per job, so a second strike never escalates.
+
+    **Gate signal is the fingerprint, NOT ``tested_draft_sha256``**: the sha
+    is stamped only at execution launch (run_execution), so on exactly the
+    765 shape — the abort fired before execution ever ran — the sha is empty
+    and a sha gate could never fire on its own motivation job. The tester
+    stamps the fingerprint on every converging test cycle.
+
+    The granted window is the writer's wall clock
+    (:func:`_writer_invoke_timeout`) DOUBLED, then clamped through the REAL
+    :func:`_effective_timeout` so it can never run past the job's remaining
+    budget minus the finalize margin. A clamp that leaves nothing (the job is
+    already inside the finalize reserve) refuses the grant.
+    """
+    if not _writer_progress_escalation_enabled():
+        return None
+    if not str(state.get("last_tested_draft_fp") or ""):
+        return None
+    if bool(state.get("draft_mutated_during_test")):
+        return None
+    if int(state.get("noop_fix_cycles") or 0) != 0:
+        return None
+    if bool(state.get("writer_escalation_used")):
+        return None
+    window = 2.0 * float(_writer_invoke_timeout())
+    if now is None:
+        now = time.time()
+    elif hasattr(now, "timestamp"):  # tolerate a datetime from a test harness
+        now = float(now.timestamp())
+    if job_deadline is not None and hasattr(job_deadline, "timestamp"):
+        job_deadline = float(job_deadline.timestamp())
+    effective, _clamp_reason = _effective_timeout(window, job_deadline, float(now))
+    if effective <= 0:
+        # Only the finalize margin (or less) is left — a window here would
+        # collide with finalize itself. Refuse.
+        return None
+    return int(effective)
+
+
 def _embed_full_max_chars() -> int:
     """[wave-32 D5] Draft size above which the writer's embed is worth
     eliding (settings ``CODE_WRITER_EMBED_FULL_MAX_CHARS``, default 40_000 —
@@ -6653,6 +6728,135 @@ def _run_draft_finisher(
         return None
 
 
+def _run_writer_progress_escalation(
+    state: ScrapeState, config: RunnableConfig, slug: str, job_id: Any, window: int
+) -> dict[str, Any] | None:
+    """[wave-40 T12] Spend the ONE escalation window (same shape as the W30-2
+    finisher: one bounded invocation, no activity extension, all failure modes
+    → None so the caller's abort path still runs).
+
+    Caller has already gated on verifiable progress and clamped ``window``
+    through ``_effective_timeout``; the draft is parseable by construction
+    (the arm sits behind the deterministic parse gate), re-verified
+    defensively. The seed hands the writer its OWN converging draft back with
+    an explicit "no second window" framing — the point is to let a converging
+    run LAND (765), not to open a new strategy.
+    """
+    try:
+        from .draft_safety import draft_parses
+
+        draft_path = os.path.join(
+            _get_project_root(), "workspace", slug, "scraper_draft.py"
+        )
+        if not draft_parses(draft_path):
+            return None
+        with open(draft_path, encoding="utf-8", errors="replace") as _wpe_fh:
+            _draft_text = _wpe_fh.read()
+
+        # [wave-32 D5 / wave-25e E1] Same embed discipline as the finisher: a
+        # post-death window has no EOW state to consult, so classify on size.
+        from .draft_context import classify_embed
+
+        _embed_mode = classify_embed(
+            _draft_text, eow_active=None,
+            full_max_chars=_embed_full_max_chars(),
+        )
+        if _embed_mode == "bounded":
+            _base_clause = (
+                f"- The draft is `workspace/{slug}/scraper_draft.py` (in "
+                "your context as head+tail+map only — the middle is NOT "
+                "included; re-read any region with read_file(line=) before "
+                "editing it — edit it, do NOT rewrite from scratch).\n"
+            )
+        else:
+            _base_clause = (
+                f"- The draft is `workspace/{slug}/scraper_draft.py` (already "
+                "in your context as the base — edit it, do NOT rewrite from "
+                "scratch).\n"
+            )
+        seed = (
+            "[WRITER-PROGRESS-ESCALATION] The previous invocation was cut off "
+            "by its wall-clock budget while the run was still CONVERGING (the "
+            "tester had verified this draft's extraction). You have ONE "
+            "additional window — it is clamped to the job's remaining budget "
+            "and there will NOT be another.\n\n"
+            + _base_clause
+            + "- Keep the current approach: land the remaining edits, run "
+            "check_syntax, then ONE sample run to confirm.\n"
+            "- Do not restart from scratch and do not switch strategy — the "
+            "draft was converging.\n"
+        )
+        agent = create_code_writer(
+            site_slug=slug, template_code=_draft_text,
+            embed_mode=_embed_mode,
+            embed_kind="draft",
+        )
+        hb = _start_heartbeat(job_id, "code-writer-escalation")
+        try:
+            # Hard-bounded: the window was already clamped to the remaining
+            # budget, so no activity extension may quietly buy past it.
+            result = _invoke_agent_with_timeout(
+                agent,
+                [{"role": "user", "content": seed}],
+                _agent_config(config, "code_writer"),
+                "code_writer",
+                job_id,
+                timeout=int(window),
+                allow_activity_extension=False,
+            )
+        finally:
+            _stop_heartbeat(hb)
+        _persist_agent_logs(state, result, "code-writer", config)
+        _log_writer_embed_row(agent, job_id)
+
+        _res = result if isinstance(result, dict) else {}
+        if _res.get("_error") or not _res.get("messages"):
+            _log_event_row(
+                job_id, "code_writer",
+                f"[WRITER-PROGRESS-ESCALATION] the extra window did not "
+                f"complete ({str(_res.get('_error') or 'no messages')[:160]}) "
+                "— the abort path proceeds",
+            )
+            return None
+        if not draft_parses(draft_path):
+            _log_event_row(
+                job_id, "code_writer",
+                "[WRITER-PROGRESS-ESCALATION] left an uncompilable draft — "
+                "the abort path proceeds",
+            )
+            return None
+
+        _log_event_row(
+            job_id, "code_writer",
+            "[WRITER-PROGRESS-ESCALATION] the extra window produced a "
+            "parseable draft — resuming the normal test ladder",
+        )
+        # Snapshot like the main path and the finisher: promotion happens at
+        # cleanup, which a wedged run never reaches.
+        try:
+            import src.artifacts as _art
+
+            _art.write(
+                _art.scrapers_key(slug, "jobs", f"scraper-draft-{job_id}.py"),
+                open(draft_path, "rb").read(),
+            )
+            from .draft_safety import freeze_good_draft
+
+            freeze_good_draft(_get_project_root(), slug, job_id)
+        except Exception as _snap_exc:
+            logger.warning(
+                "_run_writer_progress_escalation: draft FM snapshot failed "
+                "(job %s): %s", job_id, _snap_exc,
+            )
+        return result
+    except Exception as _exc:
+        logger.warning(
+            "_run_writer_progress_escalation: escalation aborted (job %s): %s",
+            job_id, _exc,
+        )
+        return None
+
+
 def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
     job_id = state.get("job_id", 0)
     _notify_phase(job_id, "code_writer", "running")
@@ -7170,6 +7374,57 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     "draft on disk (job %s)", _wc, job_id,
                 )
                 if _wc >= 2:
+                    # [wave-40 T12] Opt-in escape hatch BEFORE the honest
+                    # abort: if the run shows verifiable convergence (the
+                    # tester stamped this draft's fingerprint, it did not
+                    # mutate under test, no no-op cycles) and
+                    # WRITER_PROGRESS_ESCALATION=1, hold the abort and spend
+                    # ONE extra window — doubled writer wall clock, clamped
+                    # through _effective_timeout so it cannot run past the
+                    # job's remaining budget. Prod 765: cycle-3 tested PASS
+                    # 36/36 and the 2-strike abort destroyed it. The latch
+                    # (writer_escalation_used) is stamped whether or not the
+                    # extra window pays off, so a second strike never
+                    # escalates into a second grant. Flag off → the helper is
+                    # a constant None → byte-identical to the pre-T12 arm.
+                    _esc_window = _writer_escalation_window(
+                        state,
+                        ((_cw_cfg or {}).get("configurable") or {}).get(
+                            "task_deadline"
+                        ),
+                    )
+                    if _esc_window:
+                        update["writer_escalation_used"] = True
+                        _log_event_row(
+                            job_id, "code_writer",
+                            f"[WRITER-PROGRESS-ESCALATION] 2-strike abort held "
+                            f"back — verifiable progress (tested draft "
+                            f"fingerprint, no mutation under test, no no-op "
+                            f"cycles); granting ONE extra "
+                            f"{int(_esc_window)}s writer window "
+                            f"(WRITER_PROGRESS_ESCALATION=1)",
+                        )
+                        _esc = _run_writer_progress_escalation(
+                            state, config, slug, job_id, _esc_window
+                        )
+                        if _esc is not None:
+                            # Salvage: treat as a healthy writer cycle — the
+                            # normal usable-draft path below re-tests the
+                            # draft with a clean death counter (same contract
+                            # as the finisher salvage).
+                            result = _esc
+                            _cw_dead = False
+                            _cw_err = ""
+                            update["writer_wall_clock_timeouts"] = 0
+                            logger.warning(
+                                "_invoke_code_writer: WRITER-PROGRESS-"
+                                "ESCALATION window salvaged the converging "
+                                "draft (job %s)", job_id,
+                            )
+                            # fall through to the usable-draft path — no return
+                        # else: the grant was spent and did not pay off —
+                        # fall through to the UNCHANGED abort arms below.
+
                     _wc_note = (
                         "code_writer hit its wall-clock timeout twice in a row "
                         f"({_cw_err or 'no detail'}) while a draft already "
@@ -8866,6 +9121,14 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             # state, so a dead/no-op attempt would silently route on the
             # LAST cycle's verdict even with the file-level mtime floor).
             update["test_report"] = None
+            # [wave-40 T12] A no-report cycle must clear the detail a PRIOR
+            # cycle stamped, even when THIS cycle does not qualify for the A5
+            # fast-fail — the report branch resets it (T1 r1) but this branch
+            # never did, so a stale detail rode into the next no-report cycle
+            # and would misfire the (now-declared) fast-fail arm. Inert while
+            # SCRAPER_FAST_FAIL is off; the _ff_detail stamp below overwrites
+            # it when this cycle DOES qualify.
+            update["fast_fail_detail"] = ""
             # [wave-22 A5] Named fast-fail: a wall-clock death with no report
             # on disk AT DECISION TIME cannot be rescued by the no-report
             # ladder (every rung re-burns a full window against the same

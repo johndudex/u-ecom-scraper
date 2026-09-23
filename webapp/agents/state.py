@@ -135,6 +135,13 @@ class ScrapeState(TypedDict, total=False):
     draft_absent_count: int
     last_tested_draft_bytes: int
     no_fresh_output: bool
+    # [wave-40 T12] Opt-in writer progress escalation latch — same declaration
+    # pattern as the T1 channels above (undeclared keys are silently stripped,
+    # so the latch would read False on every cycle and re-grant forever).
+    # Stamped True the moment the 2-strike abort grants its ONE extra
+    # budget-clamped writer window (WRITER_PROGRESS_ESCALATION=1, default
+    # OFF); the gate reads it so a second strike never escalates.
+    writer_escalation_used: bool
     # [wave-37 W37-NEW-D] Ladder-repair budget: ONE deterministic proxy-ladder
     # re-injection per job, applied by _invoke_code_tester at entry (before
     # the window is spent) when the draft violates
