@@ -42,10 +42,11 @@ import logging
 import os
 import time
 from collections.abc import Callable
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode, urljoin, urlparse
 
 from src.discovery import pdp_candidates
 from src.http_fetch import SoftBlock
+from src.seed_urls import normalize_host
 
 logger = logging.getLogger(__name__)
 
@@ -560,3 +561,284 @@ def discover_listing_urls_with_retry(
     if not urls and meta.get("stop_reason") not in ("navigate_error", "navigate_throttled"):
         meta["stop_reason"] = "empty_first_page"
     return urls, meta
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# [wave-40 T13] Discovery checkpoint reuse — validation + coverage merge.
+#
+# Prod 769: the tester's run discovered 20 product URLs and banked them in
+# ``discovered_urls_checkpoint.json``; the execution run re-ran discovery hours
+# later, got 0 (``empty_first_page``), hit the DISCOVERY_ZERO ``exit 3`` and
+# the job FAILED — with the good URL set sitting unread in the workspace. The
+# helpers below let a phase-1 template (wave-40 T14) rescue that zero: load
+# the banked URLs back, validate them (fresh? same host? enough of them?),
+# and stamp the resulting coverage so the honest fresh verdict survives.
+#
+# Reuse is armed by run_execution (wave-40 T15 sets ``SCRAPER_CHECKPOINT_REUSE=1``
+# on the phase-1 execution run it wants rescued). The loader below is a pure
+# validator and does NOT enforce default-off — ONLY an explicit
+# ``SCRAPER_CHECKPOINT_REUSE=0`` disables it — so the consumers own arming:
+# T14's template rescue branch gates on the env being "1", and T15 passes the
+# explicit "0" whenever reuse is NOT armed.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Written by templates/http_navigation_scraper.py and templates/navigation_scraper.py
+# (``json.dump({"urls": [...], "count": n, "ts": time.time()})`` next to the
+# scraper in SCRIPT_DIR).
+CHECKPOINT_FILENAME = "discovered_urls_checkpoint.json"
+CHECKPOINT_REUSE_ENV = "SCRAPER_CHECKPOINT_REUSE"
+CHECKPOINT_MIN_URLS_ENV = "SCRAPER_CHECKPOINT_MIN_URLS"
+CHECKPOINT_MAX_AGE_S_ENV = "SCRAPER_CHECKPOINT_MAX_AGE_S"
+# 1 day. A checkpoint older than this is NOT reusable: the critique caught
+# rev-1's 604800 (a week) shipping a week-stale URL set as a rescue.
+DEFAULT_MAX_AGE_S = 86400
+CHECKPOINT_REUSE_MARKER = "[DISCOVERY-CHECKPOINT-REUSED]"
+CHECKPOINT_REUSED_STOP_REASON = "checkpoint_reused"
+# Operator knob for the max-URL cap (same env-read idiom as this module's
+# SCRAPER_DISCOVERY_MAX_PAGES probe cap). Unset = no cap.
+CHECKPOINT_MAX_URLS_ENV = "SCRAPER_CHECKPOINT_MAX_URLS"
+
+# Checkpoints belong to runs that HAVE a Phase-1 discovery leg — the same set
+# run_execution arms reuse for (_PHASE1_MODES). src/ cannot import webapp, so
+# the set is restated here; url_list seeds never discover, never bank, never
+# reuse.
+_CHECKPOINT_PHASE1_MODES = frozenset({"navigation", "list_page", "search_term"})
+
+
+def zero_discovery_rescuable(stop_reason: str) -> bool:
+    """True when a zero-URL phase-1 verdict MAY be rescued from a checkpoint.
+
+    False ONLY for ``navigate_unavailable``: an infrastructure verdict (the
+    browser service was unreachable) must never be papered over with old URLs
+    — the job's own B3 marker lane owns it, and reusing a stale URL set would
+    turn "we could not see the site" into "we crawled it".
+    """
+    return str(stop_reason or "").strip().lower() != "navigate_unavailable"
+
+
+def _checkpoint_max_age_s() -> float:
+    """Max checkpoint age in seconds (env override, else ``DEFAULT_MAX_AGE_S``)."""
+    raw = str(os.environ.get(CHECKPOINT_MAX_AGE_S_ENV) or "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return value
+    return float(DEFAULT_MAX_AGE_S)
+
+
+def _checkpoint_min_urls() -> int:
+    """Reusable-yield floor (default ``ZERO_YIELD_JUNK_LINKS``).
+
+    Reuses this module's junk boundary: a checkpoint banked with fewer than
+    ``ZERO_YIELD_JUNK_LINKS`` URLs is a detail page's lone self/related link,
+    not a catalog — the exact shape the yield gates already call dead — so
+    there is nothing in it worth a rescue. ``SCRAPER_CHECKPOINT_MIN_URLS``
+    raises the bar ("fewer than N banked URLs → ``below_floor``"); ``0``
+    disables the floor entirely.
+    """
+    raw = str(os.environ.get(CHECKPOINT_MIN_URLS_ENV) or "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return ZERO_YIELD_JUNK_LINKS
+
+
+def _checkpoint_max_urls() -> int | None:
+    """Max URLs a checkpoint may contribute (env cap; unset = uncapped).
+
+    Same env-read idiom as the SCRAPER_DISCOVERY_MAX_PAGES probe cap above:
+    ``0``/unset/ garbage → ``None`` (no cap), never a crash.
+    """
+    try:
+        return int(os.environ.get(CHECKPOINT_MAX_URLS_ENV) or 0) or None
+    except ValueError:
+        return None
+
+
+def load_discovery_checkpoint(path: str, input_mode: str, *, host: str) -> dict:
+    """Validate a discovery checkpoint and return it ONLY if it is reusable.
+
+    Reads the payload the phase-1 templates write (``{"urls": [...], "count":
+    n, "ts": epoch}``). Returns ``{"urls", "reason", "raw_count", "dropped",
+    "age_s", "capped"}`` where ``urls`` is non-empty ONLY on ``reason == "ok"``
+    — the caller gates the rescue on that reason, so every refusal must leave
+    the list empty.
+
+    Reasons, in the order they are decided:
+
+    - ``disabled`` — reuse is not available for this load: non-phase-1
+      ``input_mode`` (url_list seeds never discover), or the
+      ``SCRAPER_CHECKPOINT_REUSE`` kill switch is explicitly ``0``.
+    - ``absent`` — no file (the normal shape: nothing was ever banked).
+    - ``unparseable`` — file exists but is not JSON / not the expected shape.
+    - ``empty`` — the payload holds zero URLs (a first-attempt discovery that
+      found nothing; the templates' job-77 guard only protects a BANKED set
+      from being overwritten, it cannot conjure URLs).
+    - ``stale`` — ``ts`` older than ``SCRAPER_CHECKPOINT_MAX_AGE_S`` (default
+      ``DEFAULT_MAX_AGE_S`` = 1 day), or missing/unparseable: an unknowable
+      age is not a fresh one.
+    - ``below_floor`` — fewer banked URLs than the reusable-yield floor
+      (``SCRAPER_CHECKPOINT_MIN_URLS``, default ``ZERO_YIELD_JUNK_LINKS``:
+      a lone self-link is a detail page, not a banked catalog). Decided on
+      the banked count, BEFORE the same-host filter — the filter legitimately
+      shrinks a banked set, and the count gate owns the output verdict.
+    - ``filtered_empty`` — every URL was dropped by the same-host filter.
+    - ``ok`` — reusable; ``urls`` is the same-host, deduped list (possibly
+      truncated by the max-URL cap, flagged via ``capped``).
+
+    ``raw_count`` is the on-disk URL count; ``dropped`` counts URLs removed by
+    the same-host filter + dedupe (the cap truncation is reported separately
+    via ``capped``); ``age_s`` is the payload age in seconds, ``None`` when it
+    could not be read.
+
+    WARNING: this loader does NOT enforce default-off. An UNSET
+    ``SCRAPER_CHECKPOINT_REUSE`` behaves as enabled BY DESIGN (only an
+    explicit ``"0"`` disables) — the loader is a pure validator, and arming is
+    the CALLER's obligation. Callers MUST gate the rescue on
+    ``os.getenv(CHECKPOINT_REUSE_ENV) == "1"`` (wave-40 T14's template rescue
+    precondition) and must pass ``SCRAPER_CHECKPOINT_REUSE="0"`` explicitly
+    when NOT armed (wave-40 T15), so an un-armed run can never inherit an
+    armed env.
+
+    ``host`` is REQUIRED and keyword-only — rev-1 made it optional and the
+    same-host filter silently passed everything, which is precisely the hole
+    this filter exists to close. A blank/unusable ``host`` therefore filters
+    EVERYTHING out (``filtered_empty``): fail closed, never "pass everything".
+    Host comparison is the pipeline's canonical full-host rule
+    (``src.seed_urls.normalize_host``: case-folded, one ``www.`` stripped —
+    ``athleta.gap.com`` and ``gap.com`` stay different).
+    """
+    result = {
+        "urls": [],
+        "reason": "absent",
+        "raw_count": 0,
+        "dropped": 0,
+        "age_s": None,
+        "capped": False,
+    }
+
+    if str(input_mode or "") not in _CHECKPOINT_PHASE1_MODES:
+        logger.warning(
+            "Checkpoint reuse: input_mode %r has no Phase-1 discovery leg — "
+            "refusing to reuse %s", input_mode, path,
+        )
+        result["reason"] = "disabled"
+        return result
+    # Kill switch: ONLY an explicit "0" disables (unset = the loader is not
+    # the opt-in layer — run_execution's arming predicate is; see T15).
+    reuse_env = os.environ.get(CHECKPOINT_REUSE_ENV)
+    if reuse_env is not None and str(reuse_env).strip() == "0":
+        result["reason"] = "disabled"
+        return result
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except FileNotFoundError:
+        return result
+    except (OSError, ValueError):
+        result["reason"] = "unparseable"
+        return result
+
+    raw_urls = payload.get("urls") if isinstance(payload, dict) else None
+    if not isinstance(raw_urls, list):
+        result["reason"] = "unparseable"
+        return result
+    raw_urls = [u for u in raw_urls if isinstance(u, str) and u.strip()]
+    result["raw_count"] = len(raw_urls)
+
+    ts = payload.get("ts") if isinstance(payload, dict) else None
+    if isinstance(ts, str):
+        try:
+            ts = float(ts)
+        except ValueError:
+            ts = None
+    if isinstance(ts, (int, float)):
+        age_s = max(0.0, time.time() - float(ts))
+        result["age_s"] = age_s
+    else:
+        age_s = None
+    if not raw_urls:
+        result["reason"] = "empty"
+        return result
+    if age_s is None or age_s > _checkpoint_max_age_s():
+        result["reason"] = "stale"
+        return result
+
+    # Junk floor on the BANKED count (before filtering — see the docstring):
+    # rescuing a run from a single self-link is not a rescue.
+    floor = _checkpoint_min_urls()
+    if floor > 0 and len(raw_urls) < floor:
+        result["reason"] = "below_floor"
+        return result
+
+    # Same-host filter (the required-host rule) + dedupe, keeping discovery
+    # order. A blank job host drops everything — see the docstring.
+    want_host = normalize_host(host)
+    kept: list[str] = []
+    seen: set[str] = set()
+    dropped = 0
+    for url in raw_urls:
+        try:
+            url_host = urlparse(url).hostname or ""
+        except Exception:
+            url_host = ""
+        if not want_host or normalize_host(url_host) != want_host:
+            dropped += 1
+            continue
+        if url in seen:
+            dropped += 1
+            continue
+        seen.add(url)
+        kept.append(url)
+    result["dropped"] = dropped
+
+    if not kept:
+        result["reason"] = "filtered_empty"
+        return result
+
+    cap = _checkpoint_max_urls()
+    if cap is not None and len(kept) > cap:
+        kept = kept[:cap]
+        result["capped"] = True
+
+    result["urls"] = kept
+    result["reason"] = "ok"
+    return result
+
+
+def checkpoint_coverage_patch(fresh_coverage: dict, reused: dict) -> dict:
+    """Coverage for a run rescued by checkpoint reuse.
+
+    Merges the reused-URL yield into the fresh attempt's coverage dict: the
+    fresh verdict moves to ``fresh_stop_reason`` and the top-level
+    ``stop_reason`` becomes ``checkpoint_reused`` — which is in NEITHER the
+    coverage-fail set nor the access-wall set (route_after_testing), so an
+    honest-fail gate can never read a rescued run as a dead listing, while
+    ``fresh_stop_reason`` keeps the original evidence inspectable.
+    ``checkpoint_urls`` carries the reused yield (the URL list length when the
+    loader's dict is passed, else its ``checkpoint_urls``).
+
+    Returns a NEW dict; the caller's ``fresh_coverage`` is never mutated (a
+    template merges with ``coverage.update(checkpoint_coverage_patch(...))``).
+    """
+    if not isinstance(fresh_coverage, dict):
+        fresh_coverage = {}
+    reused_urls = reused.get("urls") if isinstance(reused, dict) else None
+    if isinstance(reused_urls, (list, tuple, set)):
+        reused_count = len(reused_urls)
+    else:
+        try:
+            reused_count = int((reused or {}).get("checkpoint_urls") or 0)
+        except (TypeError, ValueError):
+            reused_count = 0
+    patched = dict(fresh_coverage)
+    patched["fresh_stop_reason"] = fresh_coverage.get("stop_reason")
+    patched["stop_reason"] = CHECKPOINT_REUSED_STOP_REASON
+    patched["checkpoint_urls"] = reused_count
+    return patched
