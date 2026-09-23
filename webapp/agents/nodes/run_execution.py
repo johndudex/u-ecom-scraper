@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from src.field_mapping import union_output_fields
+from src.listing_discovery import CHECKPOINT_FILENAME, CHECKPOINT_REUSE_ENV
 
 from ..constants import STEALTH_METHOD_PREFIXES
 from ..state import ScrapeState
@@ -537,6 +538,56 @@ def _wants_fresh_discovery(input_mode: str) -> bool:
     return input_mode in _PHASE1_MODES
 
 
+def _checkpoint_reuse_env(
+    state: ScrapeState | None, workspace_folder: str
+) -> dict[str, str]:
+    """[wave-40 T15] Arm (or explicitly disarm) checkpoint reuse for one run.
+
+    Prod 769: the tester banked 20 discovered URLs in
+    ``discovered_urls_checkpoint.json``; the execution Phase 1 re-ran hours
+    later, found 0 (``empty_first_page``), exited 3 DISCOVERY_ZERO and the job
+    FAILED with the good URL set sitting unread in the workspace. When reuse is
+    armed, this env reaches the scraper subprocess (both lanes: the in-process
+    Popen env AND the browser_service ``/scrape`` ``env_overrides``) and the
+    template's T14 rescue branch does the rest — on a rescuable zero it loads
+    the checkpoint through ``src.listing_discovery.load_discovery_checkpoint``
+    (same-host filter, age cap, yield floor) and stamps
+    ``stop_reason=checkpoint_reused`` with the fresh verdict preserved.
+
+    Returns an EXPLICIT value in BOTH directions:
+    - armed      → ``{"SCRAPER_CHECKPOINT_REUSE": "1"}``
+    - NOT armed  → ``{"SCRAPER_CHECKPOINT_REUSE": "0"}``
+
+    The explicit off matters: ``browser_service`` is a separate container whose
+    ambient env may carry ``SCRAPER_CHECKPOINT_REUSE=1`` from an operator
+    experiment while celery's does not (and vice versa). Only an explicit
+    ``"0"`` reaches the subprocess and makes the arming decision single-sourced
+    here — the loader (T13) treats an UNSET var as enabled by design, so
+    "don't send anything" would be "inherit whatever the other container has".
+
+    Armed requires ALL of:
+    - ambient ``SCRAPER_CHECKPOINT_REUSE != "0"`` (the operator kill switch);
+    - ``input_mode`` is a Phase-1 mode — via ``_wants_fresh_discovery`` /
+      ``_PHASE1_MODES`` above, the SAME frozenset the ``--fresh-discovery``
+      append uses (never a second literal set);
+    - the checkpoint file exists in ``workspace_folder``;
+    - NOT a discover-only / force-full run. ``run_execution`` never passes
+      ``--discover-only`` (that flag is the probe lane's —
+      ``graph._probe_phase1_discovery_once`` builds its own env and is
+      deliberately checkpoint-free), so the only force-full concept this lane
+      owns is ``state["force_full"]`` — the user-declared full re-run that
+      wipes the workspace and must regenerate every phase (check_tracker).
+    """
+    armed = (
+        os.getenv(CHECKPOINT_REUSE_ENV, "0") != "0"
+        and bool(workspace_folder)
+        and _wants_fresh_discovery(str((state or {}).get("input_mode") or ""))
+        and not bool((state or {}).get("force_full"))
+        and os.path.isfile(os.path.join(workspace_folder, CHECKPOINT_FILENAME))
+    )
+    return {CHECKPOINT_REUSE_ENV: "1" if armed else "0"}
+
+
 def _args_with_listing_url(base_args: list, alt_url: str) -> list:
     """Swap the value after an existing ``--listing-url`` flag, or append the
     flag pair when the primary run carried none."""
@@ -962,6 +1013,27 @@ def run_execution(state: ScrapeState) -> dict:
     if _wants_fresh_discovery(input_mode):
         args.append("--fresh-discovery")
 
+    # [wave-40 T15] Checkpoint-reuse arming for THIS run. RULING R1 — the
+    # --fresh-discovery append above stays UNCONDITIONAL on purpose: the flag
+    # is the api family's execution trigger (see the entry contract at the top
+    # of this file; it is also appended to the probe args in graph.py), so
+    # gating it on reuse would break api-family execution, and skipping it
+    # would push armed runs onto the template's legacy B-core resume lane
+    # (stop_reason "skipped", unvalidated) instead of the validated T14 rescue
+    # lane. Armed runs therefore take the FRESH-THEN-VALIDATED-RESCUE lane:
+    # Phase 1 runs fresh under --fresh-discovery, and only on a rescuable zero
+    # does the template's T14 branch read the staged checkpoint through
+    # load_discovery_checkpoint (host filter + age cap + yield floor) and stamp
+    # checkpoint_reused. The explicit "0" below disarms the other container's
+    # ambient env (see _checkpoint_reuse_env).
+    _ckpt_reuse_env = _checkpoint_reuse_env(state, workspace_folder)
+    if _ckpt_reuse_env[CHECKPOINT_REUSE_ENV] == "1":
+        logger.info(
+            "run_execution: SCRAPER_CHECKPOINT_REUSE=1 — phase-1 checkpoint "
+            "rescue armed (%s present)",
+            CHECKPOINT_FILENAME,
+        )
+
     # DETERMINISTIC DISCOVERY (env-var): compute the listing URL for env-var
     # injection. This bypasses the argparse + _filter_supported_args chain —
     # code_writer's per-run argparse may or may not declare --listing-url/
@@ -1145,7 +1217,8 @@ def run_execution(state: ScrapeState) -> dict:
         return _clear_transient_channels(_run_in_process(
             scraper_path, _args_with_listing_url(args, alt_url),
             root, site_folder, workspace_folder, job_id=job_id,
-            env_overrides=_stealth_env(state),
+            # [wave-40 T15] the armed/disarmed env rides every in-process leg.
+            env_overrides={**_stealth_env(state), **_ckpt_reuse_env},
             listing_url_env=alt_url,
             input_mode=input_mode,
             # [wave-36 B1] two-vocabulary union — the scraper emits both key
@@ -1155,7 +1228,7 @@ def run_execution(state: ScrapeState) -> dict:
 
     result = _run_in_process(
         scraper_path, args, root, site_folder, workspace_folder, job_id=job_id,
-        env_overrides=_stealth_env(state),
+        env_overrides={**_stealth_env(state), **_ckpt_reuse_env},
         listing_url_env=_listing_url_env,
         input_mode=input_mode,
         target_fields=union_output_fields(state),
@@ -1263,6 +1336,11 @@ def _run_category_sources(state, scraper_path, base_args, site_folder, primary_r
         all_products = list(primary_products)
         service_url = _os.environ.get("BROWSER_SERVICE_URL", "http://browser_service:8001")
         stealth_env = _stealth_env(state)
+        # [wave-40 T15] every /scrape dispatch carries the explicit
+        # armed-or-disarmed value — this multi-source lane POSTs its own payload,
+        # so without the merge here it would be the one lane left inheriting the
+        # browser_service container's ambient env (see _checkpoint_reuse_env).
+        stealth_env.update(_checkpoint_reuse_env(state, os.path.dirname(scraper_path)))
         accepted_flags = _accepted_cli_flags(scraper_path)
         # If the scraper doesn't accept --category-url, multisource can't target
         # a category page — every run would just repeat full discovery (the
@@ -1677,6 +1755,17 @@ def _run_via_browser_service(
         _listing_env_bs = (_disc_bs.get("listing_url") if isinstance(_disc_bs, dict) else "") or ""
     if _listing_env_bs and (state or {}).get("input_mode") in ("navigation", "list_page", "search_term"):
         stealth_env["SCRAPER_LISTING_URL"] = _listing_env_bs
+    # [wave-40 T15] Arm (or explicitly disarm) checkpoint reuse on the /scrape
+    # payload env_overrides — browser_service forwards them into the scraper
+    # subprocess, and the T14 template rescue branch reads the value there. The
+    # explicit "0" defeats a stale ambient SCRAPER_CHECKPOINT_REUSE in the
+    # browser_service container (see _checkpoint_reuse_env). The checkpoint
+    # file itself rides the extra_files staging tuple below (VERBATIM — no seed
+    # filtering; the T13 reader does the host/age/floor filtering), because the
+    # browser_service container has no shared filesystem with this one.
+    stealth_env.update(_checkpoint_reuse_env(
+        state, os.path.dirname(scraper_path)
+    ))
     logger.info(
         "run_execution: dispatching to browser_service at %s: %s (cloak=%s)",
         service_url,
@@ -1718,8 +1807,14 @@ def _run_via_browser_service(
                 "error_message": f"Could not read scraper source {scraper_path}: {exc}",
             }
         # Read sibling files (input_urls.json, discovery_config.json) for staging
+        # [wave-40 T15] + the discovery checkpoint, staged VERBATIM (no
+        # filter_seed_payload — src.listing_discovery.load_discovery_checkpoint
+        # owns host/age/floor filtering at the point of use). This is the
+        # EXECUTION lane's staging tuple; the probe lane's own loop in
+        # graph._probe_phase1_discovery_once deliberately does NOT stage a
+        # checkpoint — a probe must never see one (763 nastygal).
         _extra = {}
-        for _sf in ("input_urls.json", "discovery_config.json"):
+        for _sf in ("input_urls.json", "discovery_config.json", CHECKPOINT_FILENAME):
             _sp = os.path.join(os.path.dirname(scraper_path), _sf)
             if os.path.isfile(_sp):
                 try:
