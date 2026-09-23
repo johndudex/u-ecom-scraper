@@ -1069,6 +1069,49 @@ def main():
         if args.discover_only:
             logger.info("--discover-only: skipping Phase 2 extraction (discovery-only probe)")
 
+        # [wave-40 T14] Checkpoint rescue — ONE attempt to reuse a banked
+        # discovered_urls_checkpoint.json before the honest zero below (a
+        # test-phase discovery that found items, then an execution Phase 1 that
+        # found 0). Preconditions, in order: a rescuable zero verdict (never
+        # navigate_unavailable — an infra verdict the strategy ladder owns), a
+        # Phase-2 run (--discover-only probes are exempt: a probe must never
+        # fake a yield), and reuse armed for THIS run via
+        # SCRAPER_CHECKPOINT_REUSE=1 (default OFF — the loader treats unset as
+        # enabled by design, so the arming gate lives HERE, in the caller).
+        # Imports are LAZY and the whole branch is try-guarded: benign deploy
+        # skew (a browser-service image running an older src/) or any other
+        # failure must fall through to the honest zero, never crash the
+        # template and never continue with 0 URLs.
+        checkpoint_reuse = None
+        if not discovered_urls:
+            try:
+                from src.listing_discovery import zero_discovery_rescuable
+
+                if (zero_discovery_rescuable(discovery_state["stop_reason"])
+                        and not args.discover_only
+                        and os.getenv("SCRAPER_CHECKPOINT_REUSE") == "1"):
+                    from urllib.parse import urlparse as _urlparse
+                    from src.listing_discovery import (
+                        checkpoint_coverage_patch, load_discovery_checkpoint,
+                    )
+                    ckpt = load_discovery_checkpoint(
+                        _CHECKPOINT_PATH, "navigation",
+                        host=(_urlparse(SITE_URL).hostname or ""),
+                    )
+                    if ckpt.get("reason") == "ok":
+                        discovered_urls = list(ckpt["urls"])
+                        checkpoint_reuse = ckpt
+                        logger.info(
+                            "[DISCOVERY-CHECKPOINT-REUSED] Phase 1 found 0 — reusing %d "
+                            "banked URLs from %s (fresh verdict preserved)",
+                            len(discovered_urls), _CHECKPOINT_PATH,
+                        )
+            except Exception as rescue_exc:
+                logger.warning(
+                    "Checkpoint rescue unavailable (%s) — honest zero stands", rescue_exc,
+                    exc_info=True,  # deploy-skew ImportError vs logic bug, per RCA
+                )
+
         if not discovered_urls:
             # Discovery ran but found nothing (often navigate_error). Don't
             # sys.exit — we still emit output so the gate can see the failure.
@@ -1131,6 +1174,21 @@ def main():
         "ran_phase1": ran_phase1,
         "skipped_reason": skipped_reason,
     }
+
+    # [wave-40 T14] A checkpoint-rescued run reports the REUSED yield as its
+    # verdict: stop_reason becomes "checkpoint_reused" (in NEITHER the
+    # coverage-fail set nor the access-wall set downstream, so no honest-fail
+    # gate can read a rescued run as a dead listing) while the fresh zero
+    # verdict stays inspectable under fresh_stop_reason. Non-mutating patch.
+    if checkpoint_reuse is not None:
+        # Re-imported here on purpose: the binding above lives ~100 lines
+        # earlier inside a conditional try, and an unbound name here would
+        # crash a rescued run AFTER Phase 2 (the exact class T14's smoke hit).
+        from src.listing_discovery import checkpoint_coverage_patch
+
+        discovery_coverage.update(
+            checkpoint_coverage_patch(discovery_coverage, checkpoint_reuse)
+        )
 
     output = {
         "site": {
