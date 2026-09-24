@@ -1662,6 +1662,22 @@ paths:
         single-use (consumed atomically on first successful connect) and
         short-lived; query-param exposure is bounded by the TTL. Rate-limited
         with the global per-key limits (429 with Retry-After).
+
+        The token is KEY-SCOPED, not job-scoped: it works on any stream the
+        key may read. Supplying the optional `job_id` body field merely asks
+        the server to echo a ready-made `connect_url` for that job's SSE
+        stream (404 if the job does not exist / is not yours); WSS clients
+        omit it and build `wss://<gateway>/ws/v1/jobs?token=<token>`
+        themselves.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                job_id:
+                  type: integer
+                  description: Optional — echo a ready-made SSE connect_url for this job (ownership-checked).
       responses:
         "201":
           description: Token minted.
@@ -1677,12 +1693,25 @@ paths:
                     type: integer
                     example: 300
                   connect_url:
-                    type: string
-                    description: Ready-to-use stream URL with the token appended.
-              example:
-                token: "01J8ZQ9VK7M2X4A6B8C0D1E3F5"
-                expires_in: 300
-                connect_url: "/api/v1/jobs/481/events?token=01J8ZQ9VK7M2X4A6B8C0D1E3F5"
+                    type: [string, "null"]
+                    description: |
+                      Ready-to-use SSE stream URL with the token appended —
+                      null when no `job_id` was supplied (the token itself
+                      is still valid on any permitted stream, including the
+                      WSS gateway).
+              examples:
+                sse:
+                  description: With job_id — ready-to-use SSE URL.
+                  value:
+                    token: "01J8ZQ9VK7M2X4A6B8C0D1E3F5"
+                    expires_in: 300
+                    connect_url: "/api/v1/jobs/481/events?token=01J8ZQ9VK7M2X4A6B8C0D1E3F5"
+                keyScoped:
+                  description: Without job_id — key-scoped token, null URL.
+                  value:
+                    token: "01J8ZQ9VK7M2X4A6B8C0D1E3F5"
+                    expires_in: 300
+                    connect_url: null
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":

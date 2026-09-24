@@ -11,8 +11,9 @@ asyncapi: 3.0.0
 #   x-status: live      — mechanism exists in the repo today (cited).
 #   x-status: planned   — designed here, NOT built. Do not code against it
 #                         assuming it exists.
-# The WSS gateway is LIVE (event-gateway service — deploy runbook Phase 12)
-# and the transport phasing note in info.description.
+# All three transports (callbacks, SSE bridge, WSS gateway) are BUILT —
+# see "Transport reality" in info.description. Do not reintroduce phased
+# promises without re-verifying the code first.
 # ═══════════════════════════════════════════════════════════════════════════
 
 info:
@@ -23,28 +24,33 @@ info:
     either (a) give us a callback endpoint at submit time and we push events to
     them, or (b) hold an inbound subscription and receive the same events.
 
-    ## Transport phasing (IMPORTANT — read before building a client)
+    ## Transport reality (IMPORTANT — read before building a client)
 
-    **Phase 1 (what the spec promises for first release):**
-      1. **Outbound callbacks** over HTTPS. We POST each event, signed with
-         HMAC-SHA256. At-least-once delivery, dedupe by `event_id`.
-      2. **Inbound subscription over SSE**, not WSS. The Redis pub/sub → SSE
-         bridge is the ONLY live realtime mechanism in the codebase today
-         (`webapp/scraper/views.py:1123` `job_events`, fed by
-         `webapp/scraper/services.py:460` `_publish_redis`). It carries the
-         same event payloads defined here, but framed as SSE, not WS frames.
+    All three transports below are BUILT in the repo today — this is no
+    longer a phased promise (earlier drafts said "Phase 2 not built"; that
+    text is stale):
 
-    **Phase 2 (declared here, not yet built):** a WSS gateway so partners
-    subscribe over `wss://` as originally requested. The `production-wss`
-    server, the `jobs` WS channel, and its control messages below are the
-    contract for that gateway. The server stack has NO websocket support
-    today — no `channels`/`daphne` in `webapp/requirements.txt`, no Channels
-    in `INSTALLED_APPS` (`webapp/config/settings.py:37`), stock
-    `get_asgi_application()` with no ProtocolTypeRouter
-    (`webapp/config/asgi.py:13`), and the web tier is gunicorn/WSGI
-    (`Dockerfile:40`). Phase 2 adds one small ASGI gateway service (the
-    FastAPI+uvicorn pattern already proven by browser_service and
-    file-master); it does NOT convert the Django service to ASGI.
+      1. **Outbound callbacks** over HTTPS — built. EventOutbox model +
+         dispatcher/reconciler beat tasks (`webapp/scraper/events/`:
+         emitter.py, dispatcher.py, reconciler.py; beat routes in
+         `webapp/config/settings.py:235-237`). We POST each event, signed
+         with HMAC-SHA256. At-least-once delivery, dedupe by `event_id`.
+      2. **Inbound subscription over SSE** — built
+         (`webapp/scraper/api/sse.py` `job_events_sse`, mounted at
+         `/api/v1/jobs/{job_id}/events`). Constrained stream: global
+         concurrent budget of 1 (`PARTNER_STREAM_BUDGET`, over budget → 503
+         immediately, never a hang; Redis down fails OPEN on the budget),
+         hard stream deadline of 540 s (`PARTNER_STREAM_DEADLINE` — clients
+         MUST auto-reconnect; the stream closing at 540 s is normal, not an
+         error), and a `: ping` keepalive frame every 25 s of silence
+         (`KEEPALIVE_SECONDS = 25`, below the documented 30 s proxy-kill
+         window).
+      3. **WSS gateway** — built (`event_gateway/app.py` + `gateway.py`,
+         FastAPI+uvicorn — the same pattern as browser_service and
+         file-master; the Django web tier itself remains gunicorn/WSGI).
+         Redis pub/sub → WS frames; heartbeat.ping every ≤25 s of silence
+         (`HEARTBEAT_SECONDS = 25`); unauthenticated handshakes are closed
+         with code **4401** ("unauthorized").
 
     ## WS auth token exchange (because browsers cannot set headers)
 
@@ -69,13 +75,14 @@ info:
         inprogress -> sample_ready -> scraper_ready
              \____________> failed (from any state)
 
-    They are a PROJECTION of the eight internal `ScrapeJob` statuses
-    (`webapp/scraper/models.py:99-113`):
+    They are a PROJECTION of the nine internal `ScrapeJob` statuses
+    (`webapp/scraper/models.py:115-127`):
 
     | internal                              | partner state  |
     |---------------------------------------|----------------|
     | pending, running                      | inprogress     |
     | waiting_approval                      | inprogress (1) |
+    | browser_unavailable (PARKED)          | inprogress (2) |
     | (new) code_tester sample validated    | sample_ready   |
     | (new) scraper promoted by cleanup     | scraper_ready  |
     | failed, cancelled, captcha_blocked,   | failed         |
@@ -86,6 +93,12 @@ info:
     `waiting_approval` should never appear; if it does (budget escalation),
     the job stays `inprogress` and a supplementary
     `job.approval.required` event is emitted.
+
+    (2) `browser_unavailable` is NON-terminal — the browser service is down
+    and the job resumes automatically when it recovers. A consumer that
+    omits this row from its state derivation will wrongly snapshot parked
+    jobs as `failed` (the event gateway's `_STATE_MAP` had exactly this
+    defect — see the sync spec's JobState note).
 
     `sample_ready` and `scraper_ready` are NEW milestones — no such states
     exist internally today. They are derived from phase events that DO exist:
@@ -213,7 +226,14 @@ channels:
       A single connection per client. The client subscribes to jobs with
       `subscribe` control messages; the server confirms with
       `subscribe.ack` (which carries a state snapshot for late joiners) and
-      then streams `job.*` events and `heartbeat.ping` frames.
+      then streams `job.*` events and `heartbeat.ping` frames
+      (`HEARTBEAT_SECONDS = 25` — at least every 25 s of silence).
+
+      AUTH (built — event_gateway/app.py): the handshake accepts X-API-Key
+      OR a single-use 300 s query-param token from POST /api/v1/ws-token.
+      An unauthenticated handshake is closed with code **4401**
+      ("unauthorized") — clients should treat 4401 as "credential problem,
+      do not hot-reconnect"; mint a fresh token or fix the key first.
 
       Why one multiplexed endpoint rather than per-job URLs
       (`/ws/v1/jobs/{job_id}`): partners fan out many jobs per API key; N
@@ -270,13 +290,16 @@ channels:
       the transport that exists today internally; exposing it to partners
       (X-API-Key + owner check + envelope framing) is a small change to the
       existing view, not new infrastructure.
-      KEEPALIVE (critique fix): intermediary proxies idle-kill silent
-      streams — a documented gunicorn WORKER-TIMEOUT storm already hit
-      /jobs/1/events/. The partner-facing view MUST emit a
-      `: ping` comment frame (or an heartbeat.ping envelope) at least every
-      30 s of silence, and SHOULD set SSE `retry:` on connect. Clients
-      should auto-reconnect with backoff; SSE here is live-only (no
-      Last-Event-ID replay) until Phase 2.5.
+      KEEPALIVE + LIMITS (built — webapp/scraper/api/sse.py): a `: ping`
+      comment frame every 25 s of silence (`KEEPALIVE_SECONDS`, below the
+      30 s proxy-kill window that caused a documented gunicorn
+      WORKER-TIMEOUT storm on the internal feed); a HARD stream deadline of
+      540 s (`PARTNER_STREAM_DEADLINE`) — the stream closing at 540 s is
+      NORMAL, clients MUST auto-reconnect (no Last-Event-ID replay); and a
+      global concurrent-stream budget of 1 (`PARTNER_STREAM_BUDGET`, shared
+      with the internal UI) — over budget the request is refused with 503
+      immediately, never queued to hang; the budget FAILS OPEN if Redis is
+      down (auth still holds).
     servers:
       - $ref: '#/servers/production-sse'
     parameters:
@@ -329,6 +352,10 @@ channels:
         $ref: '#/components/messages/JobFailed'
       JobArtifactAvailable:
         $ref: '#/components/messages/JobArtifactAvailable'
+      JobPhaseUpdated:
+        $ref: '#/components/messages/JobPhaseUpdated'
+      CallbackReenabled:
+        $ref: '#/components/messages/CallbackReenabled'
     x-status: live
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -449,13 +476,27 @@ operations:
       stops, and the data remains fetchable via the sync endpoints forever.
       Re-enabling is an explicit partner action: `PATCH
       /api/v1/jobs/{job_id}/callback` with `{"action": "reenable"}` (see
-      the sibling sync spec). Re-enable has a 60 s cooldown per job and
-      resets the attempt counter; PENDING events that queued while
-      disabled are delivered after re-arm (re-armed rows stay subject to
-      the 30-day outbox prune). Rotation (`action=rotate`) swaps the
-      URL/secret atomically at the next dispatch — in-flight deliveries
-      during the swap complete under the OLD signature (verifiers should
-      accept either secret for a 30 s rotation window).
+      the sibling sync spec). Re-enable has a 60 s cooldown per job. HONESTY
+      (corrected per audit — earlier drafts over-promised): re-enable does
+      NOT reset the attempt counters on already-exhausted outbox rows (a
+      re-armed callback delivers only events still pending; poison events
+      stay dead), and there is NO outbox prune in v1 — nothing expires
+      outbox rows (the "30-day prune" in earlier drafts was never built);
+      rows accumulate for the job's lifetime. A `callback.reenabled` event
+      is emitted on re-arm. Rotation (`action=rotate`) swaps the URL/secret
+      atomically at the next dispatch — in-flight deliveries during the
+      swap complete under the OLD signature (verifiers should accept either
+      secret for a 30 s rotation window).
+
+      ## SSRF re-validation at delivery time
+
+      Every delivery attempt re-runs the registration SSRF gate on the
+      stored URL (dispatcher `_deliver`: validate → sign → POST). If the
+      host has stopped resolving public (DNS change, rebinding, hostname
+      repointed at an internal address) the callback is DISABLED IMMEDIATELY
+      — `disabled_reason: "SSRF re-validation failed: <reason>"` — and no
+      POST is attempted. This is an instant-disable, not a retryable
+      failure.
 
       ## Security — how we authenticate TO the partner
 
@@ -477,15 +518,18 @@ operations:
 
       ## Dispatcher implementation note
 
-      Follows the pattern the beat scheduler already runs
-      (CELERY_BEAT_SCHEDULE, webapp/config/settings.py:150 — three periodic
-      watchdogs at 300 s): a `dispatch_pending_callbacks` beat task drains
-      an outbox table (NEW MODEL + migration — nothing comparable exists in scraper/models.py today; must be built with Phase 1), and a `deliver_callback` task with
-      `autoretry_for`/`retry_backoff` performs each POST. Events enter the
-      outbox at publish time alongside the existing Redis publish hook
-      (`LangGraphService._publish_redis`, webapp/scraper/services.py:460),
-      which gives at-least-once semantics for free (outbox row survives
-      worker death; Redis fan-out does not).
+      BUILT (earlier drafts said "must be built" — stale): the EventOutbox
+      model exists (`webapp/scraper/models.py:515+`, dedupe index on
+      job/event_type/dedupe_key), and the beat scheduler runs
+      `dispatch_pending_callbacks` (sweep) + `deliver_callback` (per-POST)
+      + a reconciler that re-emits terminal states the graph never did
+      (`webapp/scraper/events/dispatcher.py`, `reconciler.py`; beat routes
+      `webapp/config/settings.py:235-237`). Two-phase claim: FOR UPDATE
+      SKIP LOCKED select nominates candidates; a dead worker's lease is
+      reclaimed AND burns one attempt so poison events still reach
+      exhaustion. Events enter the outbox at publish time alongside the
+      Redis publish hook, which gives at-least-once semantics for free
+      (outbox row survives worker death; Redis fan-out does not).
     messages:
       - $ref: '#/channels/partnerCallback/messages/JobCreated'
       - $ref: '#/channels/partnerCallback/messages/JobInprogress'
@@ -551,14 +595,26 @@ components:
         POST body) is this envelope. Transport framing differs; the JSON is
         identical.
 
-        v1 PAYLOAD SCOPE (deliberate): state events carry a minimal `data`
-        (e.g. `{}` for scraper_ready) — the authoritative rich state lives in
-        the WSS subscribe.ack snapshot and the REST job resource; partners
-        reconcile via those. `job.approval.required` and `job.log.appended`
-        are NOT emitted in v1 (partner jobs run with approvals skipped and
-        log streaming is internal-only); they remain reserved enum values
-        for a future release. `job.artifact.available` data is flat
-        {kind, url, ...} — size_bytes/sha256 are future additions.
+        v1 PAYLOAD SCOPE (deliberate, and VERIFIED against the emitters):
+        state events carry a MINIMAL `data` — the envelope `type` IS the
+        state signal, `data.state` is NOT duplicated into the payload. The
+        authoritative rich state lives in the WSS subscribe.ack snapshot and
+        the REST job resource; partners reconcile via those. Exact v1 data
+        shapes as emitted (`webapp/scraper/api/writers.py`,
+        `sample_persist.py`, `output_index.py`, `events/reconciler.py`):
+          - job.created        → {state, url, content_type, input_mode,
+                                  rerun_of, callback} (no previous_state)
+          - job.inprogress     → {internal_status}
+          - job.sample_ready   → {item_count, sample_url}
+          - job.scraper_ready  → {reason}   (synthesized by the reconciler)
+          - job.failed         → {reason}
+          - job.artifact.available → FLAT {kind, url, records?|item_count?}
+          - callback.reenabled → {}
+        `job.approval.required`, `job.log.appended` and `job.phase.updated`
+        are NOT emitted in v1 (partner jobs run with approvals skipped, log
+        streaming is internal-only, and no emit site exists for phase
+        updates); they remain reserved enum values for a future release.
+        size_bytes/sha256 on artifact events are future additions.
       required: [event_id, type, occurred_at, job_id, user_id, data]
       additionalProperties: false
       properties:
@@ -615,7 +671,6 @@ components:
       required: [state, url, content_type, input_mode]
       properties:
         state: { $ref: '#/components/schemas/JobState' }
-        previous_state: { type: 'null' }
         url: { type: string, format: uri, description: Target site URL. }
         content_type:
           type: string
@@ -648,26 +703,31 @@ components:
     StateChangeData:
       type: object
       description: |
-        Shared shape of the four state events. `sample_url` /
-        `scraper_code_url` echo the artifact URLs of the sync API (endpoints
-        3/4/5) so a partner can act on the state event alone.
-      required: [state, previous_state]
+        Shared shape of the four state events' `data`. V1 REALITY (corrected
+        per audit — earlier drafts required `state`/`previous_state` here but
+        NO emitter produced them): the payload does NOT carry the state —
+        the envelope `type` (`job.inprogress` … `job.failed`) is the state
+        signal. Required is therefore empty; each emitter writes only the
+        fields below that it needs. Partners wanting a normalized view
+        derive `state` from `type` and fill gaps from the REST resource.
+      required: []
       properties:
-        state: { $ref: '#/components/schemas/JobState' }
-        previous_state:
-          oneOf:
-            - $ref: '#/components/schemas/JobState'
-            - type: 'null'
+        internal_status:
+          type: string
+          description: job.inprogress only — the internal ScrapeJob.status
+            that produced the transition (e.g. running, waiting_approval).
         reason:
           type: string
           description: |
-            Human-readable cause. On `job.failed` this is the job's
-            error_message (e.g. anti-bot block, timeout, no items found).
+            Human-readable cause, written by the reconciler on
+            job.scraper_ready / job.failed. On `job.failed` this is the
+            job's error_message (e.g. anti-bot block, timeout, no items
+            found).
         item_count:
           type: integer
           description: |
             Substantive items extracted so far (internal product_count).
-            Present on sample_ready / scraper_ready.
+            Written on sample_ready.
         sample_url: { type: string, description: Sync API sample endpoint (3). }
         output_url: { type: string, description: Sync API full-output endpoint (4). }
         scraper_code_url: { type: string, description: Sync API scraper-code endpoint (5). }
@@ -675,12 +735,15 @@ components:
     ArtifactDescriptor:
       type: object
       description: |
-        Big artifacts (full output, scraper code) are delivered BY
-        REFERENCE — url + integrity metadata. Full outputs reach tens of
-        thousands of records (a 26,742-item job exists in production
-        history) and have already caused OOM/hang incidents when moved as
-        blobs; pushing them through pub/sub + WS frames would repeat that.
-        Small artifacts (sample) are inlined.
+        RESERVED for a future release: a by-reference artifact descriptor
+        (url + integrity metadata) intended to replace the flat
+        ArtifactAvailableData payload when size_bytes/sha256 land. Not
+        emitted anywhere in v1 — artifact events are flat
+        {kind, url, records?|item_count?}. Big artifacts are delivered BY
+        REFERENCE either way: full outputs reach tens of thousands of
+        records (a 26,742-item job exists in production history) and have
+        already caused OOM/hang incidents when moved as blobs; only the
+        small sample is inlined via `records`.
       required: [kind, url]
       properties:
         kind:
@@ -704,30 +767,41 @@ components:
     ArtifactAvailableData:
       type: object
       description: |
-        Emitted for each of the three sync-API artifacts (3 sample, 4 full
-        output, 5 scraper code) plus dagster code when generated.
-        Ordering (corrected per critique — matches the real pipeline):
-        sample (at sample_ready) → scraper_code (promoted in-graph at
-        cleanup) → output (published by the finalizer AFTER the graph
-        ends; arrives with, never before, the terminal status event).
-        event_id order (ULID), not arrival order, is authoritative.
-      required: [artifact]
+        V1 REALITY (corrected per audit — earlier drafts required a nested
+        `artifact` descriptor, but the emitters write a FLAT payload):
+        `data` is `{kind, url, ...}` directly (sample_persist.py,
+        output_index.py). Ordering (corrected per critique — matches the
+        real pipeline): sample (at sample_ready) → output (published by the
+        finalizer AFTER the graph ends; arrives with, never before, the
+        terminal status event). NOTE the honest gap: only `sample` and
+        `output` events are emitted in v1 — scraper-code availability is
+        signalled by the `job.scraper_ready` state event, not by an artifact
+        event (dagster code likewise has no event). event_id order (ULID),
+        not arrival order, is authoritative.
+      required: [kind, url]
       properties:
-        artifact: { $ref: '#/components/schemas/ArtifactDescriptor' }
+        kind:
+          type: string
+          enum: [sample, output, scraper_code, dagster_code]
+          description: |
+            Only `sample` and `output` are emitted in v1; `scraper_code` /
+            `dagster_code` remain reserved enum values.
+        url:
+          type: string
+          description: |
+            RELATIVE path on the API host (e.g. /api/v1/jobs/{job_id}/output)
+            — fetch with the same X-API-Key header used everywhere else.
         records:
           type: array
           description: |
-            INLINE records — present ONLY when kind=sample. Samples are
-            single-URL extractions (a few KB); the internal UI already
-            NOTE (same backend addition the sync spec flags): structured
-            sample records do not exist today — persisting
-            scrapers/{slug}/samples/sample-{job_id}.json at
-            field_confirmation time is REQUIRED before this event can carry
-            records (field_confirmation.py:288-313 already holds them).
-            caps its preview the same way (webapp/scraper/views.py:972
-            _job_output_preview, first 3 records). Absent for output /
-            scraper_code — fetch via `artifact.url`.
+            INLINE records — present ONLY when kind=sample (the sample is
+            small and already persisted to
+            scrapers/{slug}/samples/sample-{job_id}.json). Absent for
+            output — fetch via `url`.
           items: { type: object, additionalProperties: true }
+        item_count:
+          type: integer
+          description: Written on output events (total items in the index).
 
     PhaseUpdatedData:
       type: object
@@ -735,14 +809,21 @@ components:
         Fine-grained pipeline progress. Maps 1:1 to the internal `step`
         pub/sub event (webapp/agents/graph.py:888) and the Step model. A
         minimal partner ignores these and listens only to the four state
-        events.
+        events. NOT EMITTED in v1 — no emit site exists (reserved event
+        type); this schema is the contract for when it lands.
       required: [phase, phase_status]
       properties:
         phase:
           type: string
           description: Internal pipeline phase (site_analysis, testing,
             cleanup, ...).
-        phase_status: { type: string, enum: [running, done, failed] }
+        phase_status:
+          type: string
+          enum: [running, done, failed, skipped]
+          description: |
+            Mirrors Step.status (webapp/scraper/models.py:283-289).
+            `skipped` is load-bearing: a phase that never ran on a resumed
+            job is recorded as skipped — never done (wave-30 W30-9).
 
     ApprovalRequiredData:
       type: object
@@ -1040,7 +1121,7 @@ components:
             occurred_at: '2026-08-20T09:00:41Z'
             job_id: 345
             user_id: 12
-            data: { state: inprogress, previous_state: null }
+            data: { internal_status: running }
 
     JobSampleReady:
       name: job.sample_ready
@@ -1060,8 +1141,6 @@ components:
             job_id: 345
             user_id: 12
             data:
-              state: sample_ready
-              previous_state: inprogress
               item_count: 5
               sample_url: '/api/v1/jobs/345/sample'
 
@@ -1083,11 +1162,7 @@ components:
             job_id: 345
             user_id: 12
             data:
-              state: scraper_ready
-              previous_state: sample_ready
-              item_count: 1284
-              output_url: '/api/v1/jobs/345/output'
-              scraper_code_url: '/api/v1/jobs/345/scraper-code'
+              reason: ''
 
     JobFailed:
       name: job.failed
@@ -1107,8 +1182,6 @@ components:
             job_id: 346
             user_id: 12
             data:
-              state: failed
-              previous_state: inprogress
               reason: 'code generation failed after 3 attempts'
 
     # ── Supplementary events ──────────────────────────────────────────────
@@ -1131,6 +1204,29 @@ components:
             user_id: 12
             data: { phase: code_generation, phase_status: running }
 
+    CallbackReenabled:
+      name: callback.reenabled
+      title: Callback delivery re-armed after exhaustion
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/EventEnvelope'
+          - type: object
+            properties:
+              type: { const: callback.reenabled }
+              data:
+                type: object
+                description: Empty in v1 (emitted as {} — writers.py PATCH
+                  action=reenable); the cooldown bookkeeping reads the row
+                  itself.
+      examples:
+        - payload:
+            event_id: '01JZQ432K4M6O8Q0S2U4W6Y8A0C'
+            type: callback.reenabled
+            occurred_at: '2026-08-20T10:02:00Z'
+            job_id: 346
+            user_id: 12
+            data: {}
+
     JobArtifactAvailable:
       name: job.artifact.available
       title: Artifact ready to fetch (or inlined, for samples)
@@ -1149,10 +1245,8 @@ components:
             job_id: 345
             user_id: 12
             data:
-              artifact:
-                kind: sample
-                url: '/api/v1/jobs/345/sample'
-                item_count: 5
+              kind: sample
+              url: '/api/v1/jobs/345/sample'
               records:
                 - title: 'Widget Pro'
                   price: '29.99'
@@ -1165,12 +1259,9 @@ components:
             job_id: 345
             user_id: 12
             data:
-              artifact:
-                kind: output
-                url: '/api/v1/jobs/345/output'
-                size_bytes: 4821933
-                sha256: '9f2c...e1'
-                item_count: 1284
+              kind: output
+              url: '/api/v1/jobs/345/output'
+              item_count: 1284
 
     JobApprovalRequired:
       name: job.approval.required
