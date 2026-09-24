@@ -31,7 +31,7 @@ django.setup()
 
 import pytest  # noqa: E402
 
-from scraper.api.ssrf import validate_callback_url  # noqa: E402
+from scraper.api.ssrf import validate_callback_url, validate_public_http_url  # noqa: E402
 
 
 def resolve_none(host):
@@ -102,6 +102,50 @@ class TestDNSResolution:
 
     def test_unresolvable_rejected(self):
         assert validate_callback_url("https://noexist.invalid/cb", resolver=resolve_none) is not None
+
+
+# ── wave-41: discovery-URL sibling (http allowed, any port, public host) ────
+
+class TestPublicHttpUrlGate:
+    def test_http_public_ok(self):
+        assert validate_public_http_url("http://shop.example/p/1", resolver=resolve_public) is None
+
+    def test_https_ok(self):
+        assert validate_public_http_url("https://shop.example/p/1", resolver=resolve_public) is None
+
+    def test_nonstandard_port_ok(self):
+        # shop URLs are routinely non-443; only the HOST policy is inherited
+        assert validate_public_http_url("http://shop.example:8443/p/1", resolver=resolve_public) is None
+
+    def test_non_http_scheme_rejected(self):
+        assert validate_public_http_url("ftp://shop.example/p/1", resolver=resolve_public) is not None
+
+    @pytest.mark.parametrize("url", [
+        "http://127.0.0.1/p/1",
+        "http://10.0.0.5/p/1",
+        "http://192.168.1.1/p/1",
+        "http://169.254.169.254/p/1",   # cloud metadata
+        "http://[::1]/p/1",
+        "http://2130706433/p/1",        # integer spelling
+    ])
+    def test_private_literals_rejected(self, url):
+        assert validate_public_http_url(url, resolver=resolve_public) is not None, url
+
+    def test_public_literal_ok(self):
+        assert validate_public_http_url("http://93.184.216.34/p/1", resolver=resolve_none) is None
+
+    def test_private_dns_record_rejected(self):
+        assert validate_public_http_url("http://shop.example/p/1", resolver=resolve_private) is not None
+
+    def test_mixed_records_rejected(self):
+        # ANY A record private → reject (no partial trust), same as callbacks
+        assert validate_public_http_url(
+            "http://shop.example/p/1",
+            resolver=lambda h: ["93.184.216.34", "192.168.0.1"],
+        ) is not None
+
+    def test_unresolvable_rejected(self):
+        assert validate_public_http_url("http://noexist.invalid/p/1", resolver=resolve_none) is not None
 
 
 if __name__ == "__main__":

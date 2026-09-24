@@ -236,6 +236,27 @@ class TestSpecFilesStructural:
         assert "/api/v1/ws-token:" in src
         assert "createWsToken" in src
 
+    def test_discover_fields_documented_in_sync(self):
+        """wave-41: the Extractor Builder's field-discovery endpoint lives in
+        the sync spec with every constraint written out — dedicated rate
+        limit, ~45s ceiling, homepage rule, and each error code. Not
+        folklore: the test pins the words."""
+        doc = self._check("sync_api.yaml")  # re-sweeps every $ref
+        src = open(os.path.join(ROOT, "docs/specs/sync_api.yaml"), encoding="utf-8").read()
+        op = doc["paths"]["/api/v1/discover-fields"]["post"]
+        assert op["operationId"] == "discoverFields"
+        assert op["security"] == [{"ApiKeyAuth": []}]
+        assert "field-discovery" in op["tags"]
+        # dedicated cost guard is published (M11 pattern: limits in spec)
+        assert "per_minute: 6" in src
+        assert "concurrent_per_key: 1" in src
+        # every error code the handler can emit is documented
+        for code in ("homepage_url", "blocked_host", "site_blocked",
+                     "discovery_unavailable", "discovery_timeout"):
+            assert code in src, code
+        # response schema exists and resolves (the _check sweep proves refs)
+        assert "DiscoverFieldsResponse" in doc["components"]["schemas"]
+
     def test_secret_policy_unified(self):
         """One policy, one maxLength for the CALLBACK secret (raw, HMAC-signable).
 

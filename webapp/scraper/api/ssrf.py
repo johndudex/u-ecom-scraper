@@ -82,3 +82,39 @@ def _looks_like_ip(host: str) -> bool:
         return True
     except OSError:
         return False
+
+
+def validate_public_http_url(url: str, resolver=_resolve) -> str | None:
+    """Public-host gate for partner-supplied RENDER targets (wave-41
+    discover-fields). Same IP policy as validate_callback_url — literal
+    private/loopback/reserved IPs and hostnames with ANY non-public
+    A/AAAA record reject — but scheme/port rules are relaxed (http/https,
+    any explicit port) because shop URLs are routinely both.
+
+    The browser render executes inside the platform network, so this gate
+    is mandatory before any probe. Create-time-only: no secret payload
+    rides the render (unlike callbacks), so delivery-time revalidation is
+    not required; revisit if that changes.
+    """
+    try:
+        p = urlparse(url)
+    except ValueError:
+        return "url is not a valid URL"
+    if p.scheme not in ("http", "https"):
+        return "url must use http or https"
+    host = (p.hostname or "").strip("[]")
+    if not host:
+        return "url has no host"
+
+    if _looks_like_ip(host):
+        if _bad_ip(host):
+            return f"url host {host} is not a public address"
+        return None
+
+    records = resolver(host)
+    if not records:
+        return f"url host {host} does not resolve"
+    bad = [r for r in records if _bad_ip(r.split("%")[0])]
+    if bad:
+        return f"url host {host} resolves to a non-public address"
+    return None

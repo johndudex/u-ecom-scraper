@@ -1918,6 +1918,16 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
         if(j.search_criteria && m==='listing'){ var el=X('#cfg-listing-text'); if(el && !el.value.trim()) el.value=j.search_criteria; }
         if(j.search_criteria && m==='search'){ var el=X('#cfg-search-kw'); if(el && !el.value.trim()) el.value=j.search_criteria; }
         if(j.search_url && m==='search'){ var el=X('#cfg-search-url'); if(el && !el.value.trim()) el.value=j.search_url; }
+        // [wave-41] url_list jobs: the job row carries no URL list — job_api
+        // resolves the run's seed (Site.input_urls → input_urls.json, the
+        // pipeline's own order). Restore into BOTH textareas so Edit → re-run
+        // posts the same list (runBuild reads the nav-side textarea).
+        if(m==='list' && j.input_urls && j.input_urls.length){
+          var listTxt=j.input_urls.join('\n');
+          var cfgList=X('#cfg-list-text'); if(cfgList && !cfgList.value.trim()) cfgList.value=listTxt;
+          var navList=X('#nav-list-text'); if(navList && !navList.value.trim()) navList.value=listTxt;
+          if(typeof refreshListLocks==='function'){ refreshListLocks(); }
+        }
         intakeState.cfgPopulated=true;
       }
       if(j.started_at && j.completed_at){
@@ -1933,6 +1943,7 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       if(j.owner_username) det.push(['Owner', j.owner_username + (j.owner_email ? ' ('+j.owner_email+')' : '')]);
       det.push(['Status', (j.status||'').replace(/_/g,' ')]);
       det.push(['Records', intakeState.recordsStr]);
+      if(j.input_urls_count) det.push(['Input URLs', j.input_urls_count + (j.input_urls_truncated ? ' (showing first '+j.input_urls.length+')' : '')]);
       if(j.full_extraction!=null) det.push(['Mode', j.full_extraction?'Full':'Sample']);
       if(j.started_at) det.push(['Started', new Date(j.started_at).toLocaleString()]);
       if(j.completed_at) det.push(['Finished', new Date(j.completed_at).toLocaleString()]);

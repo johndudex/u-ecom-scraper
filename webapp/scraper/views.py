@@ -1170,6 +1170,39 @@ def _job_run_history(job, limit: int = 15) -> list:
     return runs
 
 
+# [wave-41] Deep-link restore cap: job_api exposes the run's url_list seed for
+# the intake cfg panel, but a production list can hold thousands of URLs and
+# job_api is polled — past the cap the payload carries the count only.
+INPUT_URLS_DISPLAY_CAP = 500
+
+
+def _job_input_urls(job) -> dict:
+    """The effective url_list seed this job consumes, for display only.
+
+    The ScrapeJob row carries NO URL list — intake/API persist pastes to
+    scrapers/{slug}/input_urls.json and the pipeline reads Site.input_urls
+    first with the FM file as fallback (tasks discovery order). Mirror that
+    exact order so the deep-link cfg panel shows what the run actually uses.
+    """
+    empty = {"input_urls": [], "input_urls_count": 0, "input_urls_truncated": False}
+    if (job.input_mode or "") != "url_list":
+        return empty
+    urls: list = []
+    slug = _resolve_job_slug(job)
+    site = Site.objects.filter(slug=slug).first() if slug else None
+    if site is not None and site.input_urls:
+        urls = [u for u in site.input_urls if isinstance(u, str)]
+    elif slug:
+        data = _fm_read_json(f"scrapers/{slug}/input_urls.json")
+        if isinstance(data, dict):
+            urls = [u for u in (data.get("urls") or []) if isinstance(u, str)]
+    return {
+        "input_urls": urls[:INPUT_URLS_DISPLAY_CAP],
+        "input_urls_count": len(urls),
+        "input_urls_truncated": len(urls) > INPUT_URLS_DISPLAY_CAP,
+    }
+
+
 @login_required
 def job_api(request, job_id):
     job = _get_job(request, job_id)
@@ -1197,6 +1230,8 @@ def job_api(request, job_id):
             "scope": job.scope,
             "scope_value": job.scope_value,
             "notes": job.notes,
+            # [wave-41] url_list seed for the deep-link cfg panel (display-capped)
+            **_job_input_urls(job),
             "schema_text": job.schema_text or "",
             "product_count": job.product_count,
             "output_file": job.output_file,
@@ -2959,9 +2994,13 @@ def intake_validate_schema(request):
 def intake_discover_fields(request):
     """AJAX: browse the actual website + discover all extractable fields via LLM.
 
-    Calls browser_service ``/navigate`` (cloak, direct — skip the 90s probe) →
-    extracts page content → one-shot LLM → returns field candidates + JSON schema.
-    Best-effort: all errors return 200 with a user-friendly message.
+    Thin UI envelope over ``scraper.api.discovery.probe_and_discover`` — the
+    same core POST /api/v1/discover-fields serves (wave-41): browser_service
+    ``/navigate`` (cloak) → one-shot LLM with a deterministic JSON-LD fallback.
+    Best-effort: every failure is a 200 with a user-friendly message. The
+    modal shows ``error`` verbatim when truthy, else ``message`` — so
+    infrastructure failures ride ``error`` as a sentence while a blocked
+    page keeps the old ``error: ""`` + message contract.
     """
     if request.method != "POST" or request.headers.get("x-requested-with") != "XMLHttpRequest":
         return JsonResponse({"error": "POST + AJAX required"}, status=400)
@@ -2979,57 +3018,22 @@ def intake_discover_fields(request):
             status=400,
         )
 
-    # Step 1: browse the site via /navigate (cloak, direct, ~5-13s).
-    bs_url = getattr(settings, "BROWSER_SERVICE_URL", "http://browser_service:8001")
+    from .api import errors as api_errors
+    from .api.discovery import probe_and_discover
+
     try:
-        nav_resp = httpx.post(
-            f"{bs_url}/navigate",
-            json={
-                "url": url,
-                "stealth": "cloak",
-                "return_what": "all",
-                "wait_until": "domcontentloaded",
-                "timeout": 25,
-            },
-            timeout=30,
-        )
-    except httpx.ConnectError:
+        result = probe_and_discover(url)
+    except api_errors.ApiError as exc:
+        logger.info("intake discover_fields: %s → %s", url[:120], exc.code)
+        if exc.code == "site_blocked":
+            # Old intake contract: a blocked page is not an "error" — the
+            # modal shows it via the message path and offers manual fields.
+            return JsonResponse({"fields": [], "json_schema": None, "source": "browser",
+                                  "error": "",
+                                  "message": f"{exc.message} Add fields manually, or try another URL."})
         return JsonResponse({"fields": [], "json_schema": None, "source": "browser",
-                              "error": "browser_unreachable",
-                              "message": "Couldn't reach the browser service. Add fields manually."})
-    except httpx.ReadTimeout:
-        return JsonResponse({"fields": [], "json_schema": None, "source": "browser",
-                              "error": "navigate_timeout",
-                              "message": "The page took too long to load. Try a different URL."})
-    except httpx.HTTPError as exc:
-        return JsonResponse({"fields": [], "json_schema": None, "source": "browser",
-                              "error": "browser_error",
-                              "message": f"Browser request failed: {str(exc)[:160]}"})
-
-    if nav_resp.status_code != 200:
-        return JsonResponse({"fields": [], "json_schema": None, "source": "browser",
-                              "error": "browser_error",
-                              "message": f"Browser service error (HTTP {nav_resp.status_code})."})
-
-    nav_data = nav_resp.json()
-    if nav_data.get("blocked") or nav_data.get("blocked_type"):
-        bt = nav_data.get("blocked_type") or "antibot"
-        return JsonResponse({"fields": [], "json_schema": None, "source": "browser",
-                              "error": "",
-                              "message": f"This page is blocking automated access ({bt}). "
-                                         "Add fields manually, or try another URL."})
-
-    html = nav_data.get("html") or ""
-    title = nav_data.get("title") or ""
-    if len(html) < 500:
-        return JsonResponse({"fields": [], "json_schema": None, "source": "browser",
-                              "error": "",
-                              "message": "The page loaded but had no usable content. Try another URL."})
-
-    # Step 2 + 3: extract content + LLM discovery (with JSON-LD fallback).
-    try:
-        from src.field_discovery import discover_fields_from_html
-        result = discover_fields_from_html(url=url, html=html, title=title, llm_timeout=20)
+                              "error": f"{exc.message} Add fields manually, or try another URL.",
+                              "message": ""})
     except Exception as exc:
         logger.warning("intake discover_fields failed for %s: %s", url[:120], exc)
         return JsonResponse({"fields": [], "json_schema": None, "source": "llm",

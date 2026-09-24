@@ -123,6 +123,7 @@ info:
 # does not collide with the existing UI routes (webapp/scraper/urls.py).
   x-rate-limits:
     requests: {sustained_per_second: 10, burst: 30, scope: per key, enforced: true}
+    field_discovery: {per_minute: 6, concurrent_per_key: 1, scope: per key, enforced: true, over_limit_status: 429, note: POST /api/v1/discover-fields only — one browser render + one LLM pass per call, ~45s wall-clock ceiling}
     event_streams: {concurrent_total: 1, scope: global (all partners share the sync tier's worker budget), enforced: true, over_limit_status: 503, note: raise PARTNER_STREAM_BUDGET or deploy the Phase-12 gateway when a partner needs concurrent streams}
     response: {status: 429, retry_after_header: seconds}
     not_yet_enforced: |
@@ -150,6 +151,13 @@ tags:
       exposed but deliberately metadata-only — `known_site` true is a bounded
       cross-tenant signal (boolean + platform string; never fields or other
       tenants' data — see design rationale).
+  - name: field-discovery
+    description: >-
+      Live field discovery for a sample item page (wave-41): renders the URL
+      in the platform browser (stealth) and extracts candidate fields via an
+      LLM pass with a deterministic JSON-LD fallback. Expensive — one browser
+      render + one LLM call per request (~45s ceiling); dedicated per-key
+      limits apply on top of the global limiter.
   - name: extractors
     description: |
       Reusable extractor configurations (the Site a job runs against), scoped
@@ -213,6 +221,95 @@ paths:
                     example: "product"
         "401": { $ref: "#/components/responses/Unauthorized" }
         "422": { $ref: "#/components/responses/ValidationError" }
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # 1a-2. FIELD DISCOVERY (wave-41) — live probe of a sample item page.
+  # ─────────────────────────────────────────────────────────────────────────
+  /api/v1/discover-fields:
+    post:
+      tags: [field-discovery]
+      operationId: discoverFields
+      summary: Discover extractable fields from a sample item page
+      description: |
+        Renders `url` in the platform browser (stealth) and returns the
+        extractable field names plus a flat JSON schema for them — what the
+        Extractor Builder UI shows as "available fields" (title, price,
+        availability, currency, ...).
+
+        **Constraints (all enforced, not advisory):**
+        - `url` must be an absolute http(s) URL of a SAMPLE ITEM PAGE (one
+          product/job/article), not the site homepage — homepage-only URLs
+          are rejected with `homepage_url`.
+        - The host must be public: literal private/loopback/reserved IPs and
+          hostnames resolving to any non-public address are rejected with
+          `blocked_host` (the render executes inside the platform network).
+        - Budget: 6 requests/min per key AND 1 concurrent request per key.
+          Either limit exceeded → 429 with `Retry-After`.
+        - Wall-clock ceiling ≈ 45s per call (browser render ≤25s + LLM pass
+          ≤20s). Budget client timeouts accordingly.
+
+        **No cross-tenant surface:** the response describes only the page the
+        caller supplied. Nothing is persisted; no job is created; no other
+        tenant's data is consulted.
+
+        `fields: []` with `source: "none"` is a SUCCESS response — the page
+        rendered but nothing extractable was found. Infrastructure failures
+        use the error codes listed below instead.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  format: uri
+                  example: "https://www.example-shop.com/p/merino-polo-123"
+      responses:
+        "200":
+          description: |
+            Discovery completed. `fields` may be empty (source "none") when
+            nothing could be extracted from the rendered page.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DiscoverFieldsResponse" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422":
+          description: Bad URL — not absolute http(s), homepage-only, or non-public host.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                invalid_url:
+                  value: {code: "invalid_url", message: "url must be an absolute http(s) URL."}
+                homepage_url:
+                  value: {code: "homepage_url", message: "url must be a sample item page, not the site homepage."}
+                blocked_host:
+                  value: {code: "blocked_host", message: "url host is not a public address."}
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502":
+          description: The target page blocked automated access.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: {code: "site_blocked", message: "The page blocked automated access (antibot)."}
+        "503":
+          description: Browser render service unreachable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: {code: "discovery_unavailable", message: "Browser service unreachable."}
+        "504":
+          description: The render or the LLM pass exceeded its budget.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: {code: "discovery_timeout", message: "The page took too long to load."}
 
   # ─────────────────────────────────────────────────────────────────────────
   # 1b. EXTRACTORS (wave-27 W27-6) — reusable Site configurations, scoped to
@@ -2484,6 +2581,38 @@ components:
           oneOf:
             - $ref: "#/components/schemas/ContentType"
             - type: "null"
+
+    DiscoverFieldsResponse:
+      type: object
+      required: [url, fields, source, content_type]
+      description: Field candidates for one sample item page (wave-41).
+      properties:
+        url:
+          type: string
+          description: Echo of the requested sample item page URL.
+        fields:
+          type: array
+          items: { type: string }
+          description: >-
+            Candidate extractable field names (snake_case — e.g. title,
+            price, availability, currency). Empty when nothing could be
+            extracted.
+        json_schema:
+          type: [object, "null"]
+          description: >-
+            Flat JSON Schema (type object, one property per field) when a
+            schema could be derived; null when `source` is "none".
+        source:
+          type: string
+          enum: [llm, jsonld, none]
+          description: >-
+            llm = model-extracted from rendered content; jsonld =
+            deterministic JSON-LD @type mapping; none = nothing found.
+        content_type:
+          type: string
+          description: >-
+            Inferred content type (e.g. "product", "article"); empty string
+            when unknown.
 
     ExtractorSummary:
       type: object

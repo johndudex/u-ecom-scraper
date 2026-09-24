@@ -42,7 +42,10 @@ def api_view(methods):
             except errors.ApiError as e:
                 resp = JsonResponse(e.body(), status=e.status)
                 if e.status == 429:
-                    resp["Retry-After"] = "1"
+                    # Honor a limit-specific wait when the raiser knows it
+                    # (discovery window, callback re-enable cooldown) — a
+                    # hard-coded "1" made clients hammer real 60s cooldowns.
+                    resp["Retry-After"] = str(e.details.get("retry_after", 1))
                 return resp
             except Exception:
                 logger.exception("api 500 on %s %s", request.method, request.path)

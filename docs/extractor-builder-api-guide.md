@@ -58,10 +58,37 @@ Job state model (sync spec): `inprogress` → `sample_ready` → `scraper_ready`
 | `GET /api/v1/ws-token` | Short-lived token for the AsyncAPI WebSocket channel. |
 | `POST /api/v1/validate-schema` | `{"schema": <object>}` → **200 always** `{valid, issues, derived_fields, detected_content_type, fields: [{name, description?}]}`. `fields` carries per-field instructions (wave-27). Pure function, no writes. |
 | `GET/POST /api/v1/check-site` | Metadata-only site recognition: `{known_site, platform, site_type, site_name, scraping_method, last_scraped_at}`. Deliberately does **not** return known fields (cross-tenant leak guard). |
+| `POST /api/v1/discover-fields` | **Live field discovery** (wave-41) — renders the URL in the platform browser (stealth) and returns the fields the Extractor Builder shows as "available fields": `200 {url, fields: [..], json_schema, source: llm\|jsonld\|none, content_type}`. **Constraints (all enforced):** `url` must be an absolute http(s) URL of a sample *item* page — homepage-only → 422 `homepage_url`; the host must be public (private/reserved IPs and non-public DNS → 422 `blocked_host`); **6 req/min per key** and **1 concurrent request per key** → 429 with `Retry-After`; **~45s wall-clock ceiling** (25s render + 20s LLM) — budget client timeouts. `fields: []` with `source: "none"` is a success (nothing extractable). Infrastructure failures: 502 `site_blocked`, 503 `discovery_unavailable`, 504 `discovery_timeout`. No cross-tenant surface — nothing persisted, no job created. |
 | `GET /api/v1/extractors` | Paginated list of Sites reachable from THIS key's jobs (trailing-slash tolerant), most recently updated first — `{extractors: [ExtractorSummary], page, page_size, total_items, total_pages}`. Other partners' sites and job-less sites never appear (no oracle). |
 | `GET /api/v1/extractors/{slug}` | Detail: summary fields + `platform`, `scraping_method`, `input_urls_count`, `fields: [{name, type?, description?}]` (the stored output schema). Cross-tenant slug → 404. |
 | `PATCH /api/v1/extractors/{slug}` | Strict allowlist `{name, site_type, sample_url, currency, input_urls, field_notes}`; unknown key → 422 and nothing is applied. `field_notes` merges into `fields[].description` by name (unknown names appended). Returns the updated detail. |
 | `POST /api/v1/extractors/{slug}/archive` / `/unarchive` | Idempotent soft-remove / restore → `{slug, archived_at}`. **No partner DELETE** — `DELETE /api/v1/extractors/{slug}` answers **405 by design**; hard delete stays a superuser UI action. |
+
+### `POST /api/v1/discover-fields` example (wave-41)
+
+```bash
+curl -sS -X POST https://<host>/api/v1/discover-fields \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"url": "https://www.example-shop.com/p/merino-polo-123"}'
+```
+
+```json
+{
+  "url": "https://www.example-shop.com/p/merino-polo-123",
+  "fields": ["title", "price", "availability", "currency", "description"],
+  "json_schema": {"type": "object", "properties": {"title": {"type": "string"}, "...": {}}},
+  "source": "llm",
+  "content_type": "product"
+}
+```
+
+The synchronous call costs a browser render + one small-LLM pass, hence the
+dedicated budget: **6 requests/min per key, 1 concurrent per key, ~45s
+ceiling**. Client-side timeout should be **≥ 60s**. Retry guidance: honor
+`Retry-After` on 429; on 502 (`site_blocked`) try a different sample URL —
+the target refused automation, retrying the same URL won't help. This is the
+partner twin of the intake UI's "Discover fields from this page" button; the
+internal `POST /intake/discover-fields/` stays login-only.
 
 ### `POST /api/v1/jobs` request body
 

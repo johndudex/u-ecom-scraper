@@ -2,7 +2,7 @@
 from django.urls import path
 from django.views.decorators.csrf import csrf_exempt
 
-from . import extractors, readers, writers
+from . import discovery, extractors, readers, writers
 from . import sse as sse_views
 
 
@@ -27,6 +27,7 @@ def _extractor_slug_dispatch(request, slug: str):
 
 urlpatterns = [
     path("check-site", readers.check_site, name="api_check_site"),
+    path("discover-fields", discovery.discover_fields, name="api_discover_fields"),
     path("validate-schema", readers.validate_schema, name="api_validate_schema"),
     # [wave-27 W27-6] extractor resource — Sites scoped to the key's own jobs.
     # archive/unarchive/list are api_view-wrapped (they carry their own
