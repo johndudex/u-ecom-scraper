@@ -1936,7 +1936,93 @@ def _now() -> float:
     return time.monotonic()
 
 
+def _dispose_walk_tab(mcp_tools: list | None) -> None:
+    """[wave-42 T1] Hand the shared walk tab back EMPTY (NAV_TAB_DISPOSAL).
+
+    The idle-memory RCA: the walk tab IS the context's OLDEST tab, so the
+    reaper's keep-oldest policy exempts it by construction — the last job's
+    listing-page renderer (~50-150MB) stayed resident until a Chrome restart
+    (dev repro: one example.com tab held 39h). Disposal navigates it to
+    about:blank the moment the walk is done: renderer released immediately,
+    tab identity preserved (the next one-shot session lands on the same tab —
+    dev-verified against MCP 0.0.78), and the W38-A1 gate classifies
+    about:blank as a navigation state that never feeds its off-domain counter
+    (traversal.py, the D3 two-tier gate).
+
+    Runs in the caller's ``finally``: the TraversalResult is already computed
+    on every path, so a disposal failure can never alter a walk verdict.
+    Every exception is swallowed — telemetry-grade, never load-bearing.
+    """
+    if os.environ.get("NAV_TAB_DISPOSAL", "").strip().lower() not in (
+        "1", "true", "yes", "on",
+    ):
+        return
+    try:
+        tools = mcp_tools or []
+        nav = next(
+            (t for t in tools if getattr(t, "name", "") == "playwright_browser_navigate"),
+            None,
+        )
+        ev = next(
+            (t for t in tools if getattr(t, "name", "") == "playwright_browser_evaluate"),
+            None,
+        )
+        if nav is None:
+            return
+        try:
+            nav.invoke({"url": "about:blank"})
+            return
+        except Exception as nav_exc:
+            logger.debug("tab disposal: navigate failed (%s) — trying evaluate", nav_exc)
+        if ev is not None:
+            try:
+                ev.invoke({"function": "location.replace('about:blank'); 'wave-42 disposed'"})
+            except Exception as ev_exc:
+                logger.debug("tab disposal: evaluate fallback failed (%s)", ev_exc)
+    except Exception:
+        logger.debug("tab disposal: skipped", exc_info=True)
+
+
 def browser_traverse(
+    start_url: str,
+    content_type: str,
+    query: str,
+    *,
+    mcp_tools: list | None = None,
+    step_fn: Callable | None = None,
+    max_actions: int = 12,
+    trust_start_as_listing: bool = False,
+    heartbeat_fn: Callable[[dict], None] | None = None,
+    heartbeat_interval: float = 300.0,
+    max_seconds: float | None = None,
+    job_id: int | None = None,
+    wrong_site_tolerance: int = 2,
+) -> TraversalResult:
+    """Browser-driven navigation walk + [wave-42 T1] post-walk tab disposal.
+
+    Thin wrapper: the walk itself is ``_browser_traverse_impl`` (unchanged
+    mechanics). ``_dispose_walk_tab`` runs in the finally so EVERY exit path —
+    reached, budget-exhausted, wrong-site abort, even an exception — hands
+    the shared tab back empty behind NAV_TAB_DISPOSAL (default OFF).
+    """
+    try:
+        return _browser_traverse_impl(
+            start_url, content_type, query,
+            mcp_tools=mcp_tools,
+            step_fn=step_fn,
+            max_actions=max_actions,
+            trust_start_as_listing=trust_start_as_listing,
+            heartbeat_fn=heartbeat_fn,
+            heartbeat_interval=heartbeat_interval,
+            max_seconds=max_seconds,
+            job_id=job_id,
+            wrong_site_tolerance=wrong_site_tolerance,
+        )
+    finally:
+        _dispose_walk_tab(mcp_tools)
+
+
+def _browser_traverse_impl(
     start_url: str,
     content_type: str,
     query: str,
