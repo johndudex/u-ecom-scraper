@@ -299,9 +299,15 @@ class TestSpecFilesStructural:
         assert "token=" not in _auth_urls
         # callback secret exists in sync (the HMAC path is implementable)
         assert "callback_secret" in sync_src
-        # both carry the 4-state vocabulary
-        for state in ("inprogress", "sample_ready", "scraper_ready", "failed"):
+        # [wave-41 round-4] both carry the THREE-state vocabulary — the
+        # projection never returns a sample state; sample readiness is the
+        # job.sample_ready EVENT, which must be NAMED in both specs but is
+        # a state value in neither (the old 4-state loop pinned a fiction).
+        for state in ("inprogress", "scraper_ready", "failed"):
             assert state in sync_src and state in async_src, state
+        for src, name in ((sync_src, "sync"), (async_src, "async")):
+            assert "sample_ready" in src, name
+            assert "enum: [inprogress, sample_ready" not in src, name
 
 
 class TestSiteAlreadyProcessedDocs:

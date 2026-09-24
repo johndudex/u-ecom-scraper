@@ -4,8 +4,10 @@ asyncapi: 3.0.0
 # REALTIME / EVENT LAYER — PARTNER-FACING API (DRAFT)
 #
 # Sibling of sync_api.draft.yaml (sync REST). Vocabulary is LOCKED to the sync
-# spec: job_id, user_id, states inprogress|sample_ready|scraper_ready|failed,
-# X-API-Key auth, base path /api/v1/jobs. Do not rename unilaterally.
+# spec: job_id, user_id, states inprogress|scraper_ready|failed (THREE —
+# sample readiness is the job.sample_ready EVENT + REST sample_available,
+# never a state value; see JobState), X-API-Key auth, base path /api/v1/jobs.
+# Do not rename unilaterally.
 #
 # HONESTY FLAGS — read before implementing:
 #   x-status: live      — mechanism exists in the repo today (cited).
@@ -32,8 +34,9 @@ info:
 
       1. **Outbound callbacks** over HTTPS — built. EventOutbox model +
          dispatcher/reconciler beat tasks (`webapp/scraper/events/`:
-         emitter.py, dispatcher.py, reconciler.py; beat routes in
-         `webapp/config/settings.py:235-237`). We POST each event, signed
+         emitter.py, dispatcher.py, reconciler.py; the 30 s beat sweep is
+         the `dispatch-pending-callbacks` entry in `settings.py:207-210`,
+         task→pool routes at `:235-237`). We POST each event, signed
          with HMAC-SHA256. At-least-once delivery, dedupe by `event_id`.
       2. **Inbound subscription over SSE** — built
          (`webapp/scraper/api/sse.py` `job_events_sse`, mounted at
@@ -54,9 +57,11 @@ info:
 
     ## WS auth token exchange (because browsers cannot set headers)
 
-    The browser `WebSocket` API cannot send `X-API-Key`. Non-browser clients
-    MAY authenticate the handshake with `X-API-Key` directly. Browser clients
-    MUST first call the sync endpoint:
+    The browser `WebSocket` API cannot send `X-API-Key` — and neither can
+    the WS handshake itself: the gateway reads QUERY PARAMETERS, not
+    headers (`event_gateway/app.py:50-62`). The handshake accepts EITHER
+    `?apikey=<raw key>` (non-browser convenience) OR a single-use token.
+    Browser clients MUST first call the sync endpoint:
 
         POST /api/v1/ws-token        (header: X-API-Key)
         -> 201 { "token": "...", "expires_in": 300,
@@ -70,21 +75,26 @@ info:
 
     ## State model (shared with the sync spec — do not fork)
 
-    Partners observe exactly four states:
+    Partners observe exactly THREE states (audit round 4: an earlier draft
+    of both specs said four and that was fiction — the projection in
+    `webapp/scraper/api/state.py` never returns a sample state; sample
+    readiness is the `job.sample_ready` EVENT plus the REST
+    `sample_available` boolean, not a state value):
 
-        inprogress -> sample_ready -> scraper_ready
-             \____________> failed (from any state)
+        inprogress -> scraper_ready
+             \______> failed (from any state)
 
-    They are a PROJECTION of the nine internal `ScrapeJob` statuses
-    (`webapp/scraper/models.py:115-127`):
+    with `job.sample_ready` firing as a MILESTONE EVENT while the state is
+    still `inprogress`. They are a PROJECTION of the nine internal
+    `ScrapeJob` statuses (`webapp/scraper/models.py:115-127`):
 
     | internal                              | partner state  |
     |---------------------------------------|----------------|
     | pending, running                      | inprogress     |
     | waiting_approval                      | inprogress (1) |
     | browser_unavailable (PARKED)          | inprogress (2) |
-    | (new) code_tester sample validated    | sample_ready   |
-    | (new) scraper promoted by cleanup     | scraper_ready  |
+    | completed (scraper promoted, output   | scraper_ready  |
+    | produced)                             |                |
     | failed, cancelled, captcha_blocked,   | failed         |
     | akamai_blocked                        |                |
 
@@ -100,17 +110,20 @@ info:
     jobs as `failed` (the event gateway's `_STATE_MAP` had exactly this
     defect — see the sync spec's JobState note).
 
-    `sample_ready` and `scraper_ready` are NEW milestones — no such states
-    exist internally today. They are derived from phase events that DO exist:
-    the testing phase completing (`_notify_phase`, `webapp/agents/graph.py:888`)
-    and cleanup promoting the scraper (`webapp/agents/graph.py:3597-3603`).
-    Note the pipeline produces the FULL output (run_execution) BEFORE cleanup
-    promotes the scraper, so the `output` artifact event fires between
-    `sample_ready` and `scraper_ready`. `scraper_ready` is the terminal
-    success state UNLESS superseded by `failed` (rare post-promotion
-    finalizer failure — clients must treat `job.failed` as the
-    authoritative terminal event, matching the sync spec's JobState
-    caveat).
+    Where the milestones actually come from (verified emit sites): the
+    testing phase's output is persisted as the sample, which emits
+    `job.sample_ready` `{item_count, sample_url}`
+    (`webapp/scraper/api/sample_persist.py:81`); cleanup promoting the
+    scraper emits `job.scraper_ready` `{}` IN-GRAPH
+    (`webapp/agents/graph.py:1780`), with the reconciler backfilling
+    `{reason: "scraper_ready"}` only when the graph never got to emit
+    (`webapp/scraper/events/reconciler.py:53`). The pipeline produces the
+    FULL output (run_execution) BEFORE cleanup promotes the scraper, so the
+    `output` artifact event fires between `job.sample_ready` and
+    `job.scraper_ready`. `scraper_ready` is the terminal success state
+    UNLESS superseded by `failed` (rare post-promotion finalizer failure —
+    clients must treat `job.failed` as the authoritative terminal event,
+    matching the sync spec's JobState caveat).
 
     ## Ownership
 
@@ -155,34 +168,45 @@ servers:
     host: api.example-scraper.internal
     pathname: /api/v1
     protocol: https
-    title: SSE bridge (live today for the internal UI; partner exposure Phase 1)
+    title: SSE bridge (partner endpoint BUILT — webapp/scraper/api/sse.py)
     description: |
       Server-Sent Events fallback carrying the SAME envelope payloads over
-      `GET /api/v1/jobs/{job_id}/events`. Internally this view exists and is
-      live (`webapp/scraper/views.py:1123`, routed at
-      `webapp/scraper/urls.py:66`) but is session-authenticated for the web
-      UI; the partner variant adds X-API-Key auth and the envelope framing
-      defined here. Use it until the WSS gateway ships; the event JSON is
-      byte-identical, so client deserialization code does not change.
+      `GET /api/v1/jobs/{job_id}/events`. The PARTNER variant is BUILT and
+      live (`webapp/scraper/api/sse.py` `job_events_sse`, routed at
+      `webapp/scraper/api/urls.py:48`) with X-API-Key/token auth, the
+      owner check, and the envelope framing defined here. (The internal
+      web-UI feed is a separate session-authenticated view at
+      `webapp/scraper/views.py:1123` with its own ad-hoc framing — partners
+      never touch it.) The event JSON is byte-identical to WSS/callback
+      payloads, so client deserialization code does not change.
 
       BROWSER AUTH: the browser `EventSource` API cannot set X-API-Key
       (same limitation as WebSocket). Browser clients authenticate with
       `GET /api/v1/jobs/{job_id}/events?token=<single-use token>` using
       the SAME ws-token exchange the WSS gateway uses (300 s TTL,
-      single-use). Non-browser clients SHOULD use the header.
+      single-use — the minted `connect_url` points at this endpoint).
+      Non-browser clients SHOULD use the header (header handshakes also
+      pass the global per-key rate limit).
     security:
       - $ref: '#/components/securitySchemes/apiKeyHeader'
       - $ref: '#/components/securitySchemes/eventTokenQuery'
-    x-status: live-internal
+    x-status: live
     x-bridge-notes: |
-      SSE framing today: named `event: status` / `event: done` frames plus
-      unnamed `data:` frames that are raw Redis pub/sub passthrough. The
-      partner variant wraps every payload in the EventEnvelope of this spec.
+      BUILT PARTNER FRAMING (webapp/scraper/api/sse.py): every `data:`
+      frame is one EventEnvelope (the stream forwards the envelope JSON
+      the emitter publishes to Redis); keepalive is a `: ping` comment
+      frame every 25 s of silence. The stream OPENS with the current
+      state — the terminal event if the job already finished, else
+      `job.inprogress` `{internal_status}` — and CLOSES after the
+      terminal event (a 10 s silent-channel status check synthesizes the
+      terminal envelope even if the Redis publish was missed) or at the
+      540 s hard deadline, whichever comes first.
       AUTH FAILURES: missing/expired/consumed token or bad key returns
-      401 immediately (no stream). Tokens are SINGLE-USE, so the browser
-      EventSource auto-reconnect after a drop will 401 — clients must
-      catch `onerror`, mint a fresh token (POST /api/v1/ws-token), and
-      re-GET the stream; the old connect URL is NOT reusable.
+      401 immediately (no stream); a job the key does not own is 404.
+      Tokens are SINGLE-USE, so the browser EventSource auto-reconnect
+      after a drop will 401 — clients must catch `onerror`, mint a fresh
+      token (POST /api/v1/ws-token), and re-GET the stream; the old
+      connect URL is NOT reusable.
       No `id:` / `Last-Event-ID` support exists — SSE here is LIVE-ONLY with
       no replay (verified: no id/retry fields emitted). Reconnect strategy:
       re-GET the stream, then reconcile via the sync job endpoint.
@@ -229,8 +253,11 @@ channels:
       then streams `job.*` events and `heartbeat.ping` frames
       (`HEARTBEAT_SECONDS = 25` — at least every 25 s of silence).
 
-      AUTH (built — event_gateway/app.py): the handshake accepts X-API-Key
-      OR a single-use 300 s query-param token from POST /api/v1/ws-token.
+      AUTH (built — event_gateway/app.py:50-62): the handshake accepts an
+      `apikey` QUERY PARAMETER (the raw key: `...?apikey=<key>`) OR a
+      single-use 300 s query-param token from POST /api/v1/ws-token
+      (the `token` query parameter). It does NOT read an X-API-Key header — browsers
+      cannot send one and the WS server never looks for one.
       An unauthenticated handshake is closed with code **4401**
       ("unauthorized") — clients should treat 4401 as "credential problem,
       do not hot-reconnect"; mint a fresh token or fix the key first.
@@ -282,14 +309,16 @@ channels:
 
   jobEventsSse:
     address: /api/v1/jobs/{job_id}/events
-    title: Per-job SSE feed (Phase 1 bridge)
+    title: Per-job SSE feed
     description: |
       Server-Sent Events variant of the same feed, one stream per job, no
       subscribe messages (the job is in the URL). Emits the identical
-      EventEnvelope JSON as the `data:` payload of each SSE frame. This is
-      the transport that exists today internally; exposing it to partners
-      (X-API-Key + owner check + envelope framing) is a small change to the
-      existing view, not new infrastructure.
+      EventEnvelope JSON as the `data:` payload of each SSE frame. BUILT
+      for partners (`webapp/scraper/api/sse.py` `job_events_sse`, routed at
+      `webapp/scraper/api/urls.py:48`): X-API-Key header OR single-use
+      stream-token auth, owner check (another key's job is a 404), envelope
+      framing, keepalive, and the stream budget below — not a planned
+      bridge.
       KEEPALIVE + LIMITS (built — webapp/scraper/api/sse.py): a `: ping`
       comment frame every 25 s of silence (`KEEPALIVE_SECONDS`, below the
       30 s proxy-kill window that caused a documented gunicorn
@@ -326,7 +355,7 @@ channels:
         $ref: '#/components/messages/JobArtifactAvailable'
       JobApprovalRequired:
         $ref: '#/components/messages/JobApprovalRequired'
-    x-status: live-internal
+    x-status: live
 
   partnerCallback:
     address: '#/callback'
@@ -414,12 +443,14 @@ operations:
     x-status: live
     x-heartbeat: |
       Server sends heartbeat.ping every 25 s of silence. Rationale: the
-      existing SSE feed has NO keepalive at all (verified — the internal
-      heartbeat mechanism at webapp/agents/graph.py:762 writes SessionLog
-      DB rows for the stuck-job watchdog, it does not emit transport
-      frames), so idle SSE connections are already exposed to proxy idle
-      timeouts during long quiet LLM phases. The WS gateway must not
-      repeat that mistake.
+      INTERNAL web-UI SSE feed has no transport keepalive at all (the
+      "heartbeat" at webapp/agents/graph.py:762 writes SessionLog DB rows
+      for the stuck-job watchdog — it emits no transport frames), so idle
+      connections there are exposed to proxy idle timeouts during long
+      quiet LLM phases. The partner surfaces do NOT repeat that mistake:
+      the partner SSE stream sends a `: ping` comment every 25 s
+      (`KEEPALIVE_SECONDS = 25`), and this gateway pings on the same
+      cadence (`HEARTBEAT_SECONDS = 25`).
 
   # ── SSE bridge ─────────────────────────────────────────────────────────
   streamJobEventsSse:
@@ -428,10 +459,11 @@ operations:
       $ref: '#/channels/jobEventsSse'
     title: Stream per-job events over SSE
     summary: |
-      The stream opens with the current state (the internal view already
-      emits an initial `status` frame, webapp/scraper/views.py:1141) and
-      closes after the terminal event (the internal view synthesizes
-      `done`, webapp/scraper/views.py:1145). Live-only, no replay.
+      The stream opens with the current state — the terminal event if the
+      job already finished, else `job.inprogress` `{internal_status}` —
+      and closes after the terminal event or at the 540 s hard deadline
+      (webapp/scraper/api/sse.py `event_stream`). Live-only, no replay;
+      the 25 s `: ping` keepalive frames are comments, not events.
     security:
       - $ref: '#/components/securitySchemes/apiKeyHeader'
       - $ref: '#/components/securitySchemes/eventTokenQuery'
@@ -444,7 +476,7 @@ operations:
       - $ref: '#/channels/jobEventsSse/messages/JobPhaseUpdated'
       - $ref: '#/channels/jobEventsSse/messages/JobArtifactAvailable'
       - $ref: '#/channels/jobEventsSse/messages/JobApprovalRequired'
-    x-status: live-internal
+    x-status: live
 
   # ── Outbound callback: WE send, partner receives ──────────────────────
   deliverCallback:
@@ -523,8 +555,10 @@ operations:
       job/event_type/dedupe_key), and the beat scheduler runs
       `dispatch_pending_callbacks` (sweep) + `deliver_callback` (per-POST)
       + a reconciler that re-emits terminal states the graph never did
-      (`webapp/scraper/events/dispatcher.py`, `reconciler.py`; beat routes
-      `webapp/config/settings.py:235-237`). Two-phase claim: FOR UPDATE
+      (`webapp/scraper/events/dispatcher.py`, `reconciler.py`; the 30 s
+      beat sweep is the `dispatch-pending-callbacks` entry in
+      `settings.py:207-210`, task→pool routes at `:235-237`). Two-phase
+      claim: FOR UPDATE
       SKIP LOCKED select nominates candidates; a dead worker's lease is
       reclaimed AND burns one attempt so poison events still reach
       exhaustion. Events enter the outbox at publish time alongside the
@@ -577,16 +611,25 @@ components:
       description: |
         Short-lived (300 s), single-use token from POST /api/v1/ws-token —
         the browser-compatible path, since the browser WebSocket API
-        cannot set headers. Non-browser clients should prefer
-        X-API-Key on the handshake.
+        cannot set headers (the whole handshake is query-parameter
+        driven). Non-browser clients MAY pass the raw key instead via the
+        `apikey` query parameter (`?apikey=<key>` — verified:
+        event_gateway/app.py reads `ws.query_params.get("apikey")`).
 
   schemas:
     # ── Core shared vocabulary ────────────────────────────────────────────
     JobState:
       type: string
-      description: Partner-visible lifecycle state. Locked vocabulary,
-        shared with the sibling OpenAPI spec.
-      enum: [inprogress, sample_ready, scraper_ready, failed]
+      description: |
+        Partner-visible lifecycle state — locked vocabulary, shared with
+        the sibling OpenAPI spec, and THREE-valued there. The projection
+        (`webapp/scraper/api/state.py` + the gateway `_STATE_MAP`) NEVER
+        returns a sample state: sample readiness is the `job.sample_ready`
+        EVENT plus the REST `sample_available` boolean, never a state
+        value. An earlier draft of both specs carried a fourth
+        `sample_ready` member; that was fiction. Enum values here are
+        exactly what `subscribe.ack` snapshots and `job.created` carry.
+      enum: [inprogress, scraper_ready, failed]
 
     EventEnvelope:
       type: object
@@ -603,17 +646,33 @@ components:
         shapes as emitted (`webapp/scraper/api/writers.py`,
         `sample_persist.py`, `output_index.py`, `events/reconciler.py`):
           - job.created        → {state, url, content_type, input_mode,
-                                  rerun_of, callback} (no previous_state)
+                                  rerun_of, callback} (no previous_state;
+                                  callback is null when unregistered)
           - job.inprogress     → {internal_status}
           - job.sample_ready   → {item_count, sample_url}
-          - job.scraper_ready  → {reason}   (synthesized by the reconciler)
-          - job.failed         → {reason}
-          - job.artifact.available → FLAT {kind, url, records?|item_count?}
+          - job.scraper_ready  → {}   happy path — emitted IN-GRAPH at
+                                  scraper promotion (graph.py
+                                  _promote_scraper); the beat reconciler
+                                  backfills {reason: "scraper_ready"} ONLY
+                                  when the graph never emitted it (crash
+                                  window). Treat `reason` as optional.
+          - job.failed         → {reason}   — reason is the STATUS TOKEN
+                                  (pipeline_failed | cancelled |
+                                  captcha_blocked | akamai_blocked), never
+                                  the human error_message
+          - job.artifact.available → FLAT {kind, url, records?|item_count?,
+                                  key?} — kinds sample, output AND
+                                  scraper_code (emitted at promotion with
+                                  the File Master key in `key`);
+                                  dagster_code has no emit site in v1
+          - job.phase.updated  → {phase, phase_status} — emitted at the
+                                  single phase choke point (graph.py
+                                  _notify_phase) for every phase
+                                  transition on partner jobs
           - callback.reenabled → {}
-        `job.approval.required`, `job.log.appended` and `job.phase.updated`
-        are NOT emitted in v1 (partner jobs run with approvals skipped, log
-        streaming is internal-only, and no emit site exists for phase
-        updates); they remain reserved enum values for a future release.
+        `job.approval.required` and `job.log.appended` are NOT emitted in
+        v1 (partner jobs run with approvals skipped; log streaming is
+        internal-only) — reserved enum values for a future release.
         size_bytes/sha256 on artifact events are future additions.
       required: [event_id, type, occurred_at, job_id, user_id, data]
       additionalProperties: false
@@ -628,10 +687,12 @@ components:
         type:
           type: string
           description: |
-            Event type. The four state events (`job.inprogress`,
-            `job.sample_ready`, `job.scraper_ready`, `job.failed`) map 1:1
-            to the JobState enum and are the only events a minimal partner
-            integration needs.
+            Event type. The state events (`job.created`, `job.inprogress`,
+            `job.sample_ready`, `job.scraper_ready`, `job.failed`) are the
+            only ones a minimal partner integration needs. Note
+            `job.sample_ready` is a MILESTONE EVENT, not a state — the
+            JobState value stays `inprogress` through it (see JobState and
+            the State model section).
           enum:
             - job.created
             - job.inprogress
@@ -689,7 +750,16 @@ components:
             UI-side). Present so the event schema matches
             JobStatus.rerun_of on the sync API.
         callback:
-          $ref: '#/components/schemas/CallbackStatus'
+          description: |
+            The submit-time callback, VERBATIM from the emitter — and NULL
+            when the job was created without one (the emit site writes
+            `"callback": null`, webapp/scraper/api/writers.py:304-308). The
+            create event's projection is reduced to `{url, status}`; the
+            full registration state (disabled_reason, counters) comes from
+            the sync API's GET /callback.
+          oneOf:
+            - $ref: '#/components/schemas/CallbackStatus'
+            - type: 'null'
       examples:
         - state: inprogress
           url: 'https://example-store.com/products/widget'
@@ -719,10 +789,12 @@ components:
         reason:
           type: string
           description: |
-            Human-readable cause, written by the reconciler on
-            job.scraper_ready / job.failed. On `job.failed` this is the
-            job's error_message (e.g. anti-bot block, timeout, no items
-            found).
+            OPTIONAL. On `job.failed` this is the failure STATUS TOKEN
+            (`pipeline_failed` | `cancelled` | `captcha_blocked` |
+            `akamai_blocked`) — NOT the human error_message (that lives in
+            the REST `failure.message`). On `job.scraper_ready` it appears
+            only in the reconciler's backfill (`"scraper_ready"`) when the
+            in-graph emit never happened; the happy-path payload is `{}`.
         item_count:
           type: integer
           description: |
@@ -770,22 +842,25 @@ components:
         V1 REALITY (corrected per audit — earlier drafts required a nested
         `artifact` descriptor, but the emitters write a FLAT payload):
         `data` is `{kind, url, ...}` directly (sample_persist.py,
-        output_index.py). Ordering (corrected per critique — matches the
-        real pipeline): sample (at sample_ready) → output (published by the
+        output_index.py, graph.py _promote_scraper). Ordering (matches the
+        real pipeline): sample (at sample_ready) → scraper_code (at
+        promotion, before the terminal event) → output (published by the
         finalizer AFTER the graph ends; arrives with, never before, the
-        terminal status event). NOTE the honest gap: only `sample` and
-        `output` events are emitted in v1 — scraper-code availability is
-        signalled by the `job.scraper_ready` state event, not by an artifact
-        event (dagster code likewise has no event). event_id order (ULID),
-        not arrival order, is authoritative.
+        terminal status event). Only `dagster_code` has no emit site in v1.
+        event_id order (ULID), not arrival order, is authoritative.
       required: [kind, url]
       properties:
         kind:
           type: string
           enum: [sample, output, scraper_code, dagster_code]
           description: |
-            Only `sample` and `output` are emitted in v1; `scraper_code` /
-            `dagster_code` remain reserved enum values.
+            `sample`, `output` and `scraper_code` are emitted in v1;
+            `dagster_code` is the one reserved value with no emit site.
+        key:
+          type: string
+          description: |
+            scraper_code events only — the File Master key of the promoted
+            scraper (e.g. scrapers/{slug}/jobs/scraper-{job_id}.py).
         url:
           type: string
           description: |
@@ -806,11 +881,12 @@ components:
     PhaseUpdatedData:
       type: object
       description: |
-        Fine-grained pipeline progress. Maps 1:1 to the internal `step`
-        pub/sub event (webapp/agents/graph.py:888) and the Step model. A
-        minimal partner ignores these and listens only to the four state
-        events. NOT EMITTED in v1 — no emit site exists (reserved event
-        type); this schema is the contract for when it lands.
+        Fine-grained pipeline progress — EMITTED on every partner-job phase
+        transition from the single phase choke point (graph.py
+        `_notify_phase`); partners filtering for it on the WSS gateway
+        receive it live. Maps 1:1 to the Step model's (phase, status). A
+        minimal partner may still ignore these and listen only to the four
+        state events.
       required: [phase, phase_status]
       properties:
         phase:
@@ -898,9 +974,12 @@ components:
         events:
           type: array
           description: |
-            Filter. Default is the four state events plus
-            job.artifact.available. Add 'job.log.appended' for the agent
-            tail; add 'job.phase.updated' for per-phase progress.
+            Filter. Default (gateway DEFAULT_EVENT_FILTER,
+            event_gateway/gateway.py:182-189) is job.created, the four
+            state events (job.inprogress, job.sample_ready,
+            job.scraper_ready, job.failed), and job.artifact.available.
+            Add 'job.log.appended' for the agent tail; add
+            'job.phase.updated' for per-phase progress.
           items:
             type: string
             enum:
@@ -936,17 +1015,23 @@ components:
           type: object
           properties:
             last_event_id: { type: string }
-            item_count: { type: integer }
+            item_count:
+              type: ['integer', 'null']
+              description: Internal product_count — NULL while the state is
+                `inprogress` (the gateway masks it for non-terminal jobs,
+                event_gateway/gateway.py:168); final count once terminal.
             sample_url: { type: string }
             output_url: { type: string }
             scraper_code_url: { type: string }
       examples:
         - job_id: 345
-          state: sample_ready
+          state: scraper_ready
           snapshot:
             last_event_id: '01JZQ3V8W2C4B6D8F0H2J4L6N8P'
             item_count: 5
             sample_url: '/api/v1/jobs/345/sample'
+            output_url: '/api/v1/jobs/345/output'
+            scraper_code_url: '/api/v1/jobs/345/scraper-code'
 
     NackData:
       type: object
@@ -1161,8 +1246,11 @@ components:
             occurred_at: '2026-08-20T09:47:19Z'
             job_id: 345
             user_id: 12
-            data:
-              reason: ''
+            # Happy path: the in-graph emit at promotion writes NO fields
+            # (graph.py:1780). reason appears only in the reconciler's
+            # backfill ({reason: "scraper_ready"}) when the graph never
+            # got to emit.
+            data: {}
 
     JobFailed:
       name: job.failed

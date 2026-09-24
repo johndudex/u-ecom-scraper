@@ -13,40 +13,27 @@ jsonSchemaDialect: "https://json-schema.org/draft/2020-12/schema"
 # Design notes (full rationale in the accompanying design message):
 #
 # 1. SYNC-STYLED OVER AN ASYNC CORE. Jobs run 10-60 min. This API exposes the
-#    async pipeline as a synchronous-looking resource: create -> poll a 4-state
+#    async pipeline as a synchronous-looking resource: create -> poll a 3-state
 #    status -> fetch artifacts. No websockets, no SSE here (the AsyncAPI
 #    sibling spec owns push/callback delivery; `callback_url` on create is
 #    ACCEPTED here but its delivery contract is defined there).
 #
-# 2. THE 4 STATES AND WHAT ACTUALLY PRODUCES THEM (see JobState description
-#    for the full derivation table):
+# 2. THE 3 STATES AND WHAT ACTUALLY PRODUCES THEM (see JobState description
+#    for the full derivation table). Sample readiness is NOT a state — the
+#    handler's projection (scraper/api/state.py partner_state) only ever
+#    returns inprogress | scraper_ready | failed; "the sample is fetchable"
+#    is the separate `sample_available` boolean on the status resource (and
+#    the `job.sample_ready` EVENT on the stream — REST and events agree via
+#    the m4 state gate):
 #      inprogress    — ScrapeJob.status in {pending, running, waiting_approval,
 #                      browser_unavailable (PARKED — non-terminal, resumes
-#                      when the browser service recovers)}
-#                      and no sample artifact yet.
-#      sample_ready  — testing phase done, a sample artifact is resolvable.
-#                      *** LOUD CAVEAT ***: today the pipeline does NOT persist
-#                      structured sample records anywhere a partner API can
-#                      read them. What exists at that point in the run:
-#                        - Step(phase="testing", status="done")
-#                          (webapp/agents/graph.py:870 _notify_phase)
-#                        - test_report.json published to the File Master at
-#                          scrapers/{slug}/analysis/test_report.json
-#                          (webapp/agents/graph.py:586-603 _preserve_test_report)
-#                          — structured field coverage, but NO sample records
-#                          (code_tester never populates sample_products /
-#                          sample_output; see route_after_testing.py:181-186).
-#                        - a SessionLog row (agent="field_confirmation",
-#                          content="Sample output presented for review:...")
-#                          with up to 5 items as a TRUNCATED TEXT blob
-#                          (webapp/agents/nodes/field_confirmation.py:510-527).
-#                      SERVING THIS ENDPOINT WITH STRUCTURED RECORDS REQUIRES A
-#                      SMALL BACKEND ADDITION: persist the testing-phase output
-#                      records (or field_confirmation's items) as JSON to the
-#                      File Master at a deterministic per-job key, e.g.
-#                      scrapers/{slug}/samples/sample-{job_id}.json. The spec
-#                      below assumes that addition; until it lands, GET /sample
-#                      would have to serve the text blob or 409.
+#                      when the browser service recovers)}.
+#                      sample_available flips true mid-run once testing has
+#                      passed and the sample is persisted as structured
+#                      records (File Master key
+#                      scrapers/{slug}/samples/sample-{job_id}.json — written
+#                      by the pipeline's sample-persist step; GET /sample
+#                      reads exactly that key).
 #      scraper_ready — ScrapeJob.status == completed (terminal success). The
 #                      scraper is promoted by cleanup
 #                      (webapp/agents/graph.py:973-1018 _promote_scraper; per-job
@@ -91,9 +78,10 @@ info:
        `job_id` back immediately (HTTP 202).
     2. Poll `GET /api/v1/jobs/{job_id}` until `state` is terminal
        (`scraper_ready` or `failed`). Typical wall-clock: 10-60 minutes.
-       While the extractor is being built and validated, `state` flips to
-       `sample_ready` — at that point `GET .../sample` returns a small set of
-       extracted records you can show a user before the full run completes.
+       While the extractor is being built and validated, `sample_available`
+       flips true (the `state` value itself stays `inprogress`) — at that
+       point `GET .../sample` returns a small set of extracted records you
+       can show a user before the full run completes.
     3. On `scraper_ready`: `GET .../output` (paginated) or
        `GET .../output/download` (raw file) for the full dataset, and
        `GET .../scraper-code` for the generated Python scraper.
@@ -217,12 +205,18 @@ paths:
                   example: "https://www.rmwilliams.com.au/"
       responses:
         "200":
-          description: Site knowledge summary (scope-limited).
+          description: |
+            Site knowledge summary (scope-limited). For an UNKNOWN host the
+            handler returns exactly `{known_site: false, platform: null}` —
+            the four other properties are absent, not null.
           content:
             application/json:
               schema:
                 type: object
                 required: [known_site]
+                description: |
+                  Only `known_site` is guaranteed present; the rest appear
+                  when a Site record exists.
                 properties:
                   known_site:
                     type: boolean
@@ -242,8 +236,27 @@ paths:
                       these domains; the API does not expose the finer
                       page-type vocabulary here).
                     example: "shopping"
+                  site_name:
+                    type: [string, "null"]
+                    description: Site display name, null when unknown.
+                    example: "R.M.Williams"
+                  scraping_method:
+                    type: [string, "null"]
+                    description: Detected scraping strategy (matches JobStatus.scraping_method), null when unknown.
+                    example: "playwright"
+                  last_scraped_at:
+                    type: [string, "null"]
+                    format: date-time
+                    description: When the site was last scraped to completion, null when never.
         "401": { $ref: "#/components/responses/Unauthorized" }
-        "422": { $ref: "#/components/responses/ValidationError" }
+        "422":
+          description: "Bad `url` — not absolute http(s)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                code: "validation_failed"
+                message: "url must be an absolute http(s) URL."
 
   # ─────────────────────────────────────────────────────────────────────────
   # 1a-2. FIELD DISCOVERY (wave-41) — live probe of a sample item page.
@@ -328,7 +341,11 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
               example: {code: "discovery_unavailable", message: "Browser service unreachable."}
         "504":
-          description: The render or the LLM pass exceeded its budget.
+          description: |
+            The BROWSER RENDER exceeded its budget (`discovery_timeout` —
+            navigate ≤25 s + 5 s headroom). An LLM pass that overruns or
+            yields nothing is NOT a 504: the call returns 200 with
+            `source: "none"` and an empty field list.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -643,16 +660,22 @@ paths:
                 output_download_url: "/api/v1/jobs/481/output/download"
                 scraper_code_url: "/api/v1/jobs/481/scraper-code"
         "400":
-          description: Malformed JSON body, or a required field is missing/invalid (`url` missing, non-http(s) URL, `item_urls` entries not absolute http(s) URLs, `input_mode` incompatible with the provided navigation fields).
+          description: |
+            Malformed JSON body only (`validation_failed`). There is no
+            scheme/format validation of `url` or `item_urls` at create time
+            and no required-field 400 — every field/mode requirement the
+            handler checks (`url` + `input_mode` present, `item_urls`
+            required for url_list, `listing_urls` for list_page,
+            `search_criteria` for search_term, `target_fields` shape,
+            `schema_text` validity) is a 422 `validation_failed` or
+            `schema_invalid` instead (see the 422 response).
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
               example:
                 code: "validation_failed"
-                message: "url is required and must be an absolute http(s) URL of a sample item page"
-                details:
-                  fields: ["url"]
+                message: "Request body is not valid JSON."
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -707,7 +730,9 @@ paths:
 
             (1) `schema_invalid` — `schema_text` failed validation (gate
             re-run server-side exactly as in views.py:2560-2570). The
-            per-issue list uses the same shape as /validate-schema.
+            per-issue list is a REDUCED projection: `{code, message}` ONLY
+            — no `severity`/`path` here (writers.py:157-163). Use
+            /validate-schema for the full SchemaIssue shape.
 
             (2) `host_mismatch` — wave-32 host gate: for `input_mode`
             `list_page`/`search_term`, every URL in `listing_urls` must sit
@@ -742,13 +767,13 @@ paths:
                 schemaInvalid:
                   value:
                     code: "schema_invalid"
-                    message: "Schema invalid"
+                    message: "schema_text failed validation."
                     details:
+                      # create's issues are {code, message} only — the
+                      # create gate does not attach severity/path.
                       issues:
                         - code: "type_unsupported"
                           message: "Property 'price' declares type 'decimal'; supported types are string|number|integer|boolean"
-                          severity: "error"
-                          path: "$.properties.price.type"
                 hostMismatch:
                   value:
                     code: "host_mismatch"
@@ -770,21 +795,17 @@ paths:
         strictly scoped to the key's user (no superuser see-all bypass in the
         API namespace — see security rationale) and returns the derived
         partner `state` on every row.
+
+        ONLY `page`, `page_size`, and `created_since` are supported. The
+        handler silently ignores any other query parameter — there is no
+        `state` or `input_mode` filter in v1 (filter client-side after
+        fetching, or request it as an enhancement).
       parameters:
         - $ref: "#/components/parameters/page"
         - $ref: "#/components/parameters/pageSize"
-        - name: state
-          in: query
-          description: Filter by the derived partner state.
-          schema:
-            $ref: "#/components/schemas/JobState"
-        - name: input_mode
-          in: query
-          schema:
-            $ref: "#/components/schemas/InputMode"
         - name: created_since
           in: query
-          description: Only jobs created at or after this ISO-8601 timestamp.
+          description: Only jobs created at or after this ISO-8601 timestamp (invalid value -> 422 `invalid_created_since`).
           schema:
             type: string
             format: date-time
@@ -809,7 +830,7 @@ paths:
                     completed_at: "2026-08-20T19:24:49Z"
                   - job_id: 480
                     title: null
-                    state: "sample_ready"
+                    state: "inprogress"
                     url: "https://www.ayahealthcare.com/travel-nursing/jobs/oral-surgeon-dentist-wisconsin/"
                     input_mode: "search_term"
                     content_type: "job_posting"
@@ -876,7 +897,8 @@ paths:
         |---------------------------------------------|----------------------------------------------------------|------------------|
         | `pending`                                   | —                                                        | `inprogress`     |
         | `running`                                   | testing step not done, no sample artifact                | `inprogress`     |
-        | `running`                                   | sample artifact resolvable (see below)                   | `sample_ready`   |
+        | `running`                                   | sample artifact resolvable (see below)                   | `inprogress` (`sample_available: true`) |
+        | `browser_unavailable`                       | PARKED, non-terminal (resumes on browser-service recovery) | `inprogress` |
         | `waiting_approval`                          | — rare but REACHABLE for API jobs: budget-escalation pauses set this status WITHOUT checking `skip_approvals` (services.py:413-451, called unconditionally); the job resumes on its own — mapped to `inprogress` | `inprogress` |
         | `completed`                                 | —                                                        | `scraper_ready`  |
         | `failed`                                    | —                                                        | `failed`         |
@@ -899,9 +921,9 @@ paths:
         MONOTONICITY (critique round, vector 2a): retry cycles re-fire
         `testing → running → done` on every code_tester loop
         (graph.py:3382/3413 + retry wiring at graph.py:4488-4500), so a
-        CURRENT-status check oscillates `sample_ready → inprogress →
-        sample_ready`. Derive instead from "a Step(testing) row has EVER
-        been completed (`completed_at IS NOT NULL`)" — state clamps at the
+        CURRENT-status check oscillates `sample_available: true → false →
+        true`. Derive instead from "a Step(testing) row has EVER been
+        completed (`completed_at IS NOT NULL`)" — the gate clamps at the
         first done and never regresses until a terminal state.
 
         **`scraper_ready` invariants** — `status=completed` is set only by the
@@ -952,11 +974,11 @@ paths:
                     created_at: "2026-08-20T19:10:45Z"
                     started_at: "2026-08-20T19:10:47Z"
                     completed_at: null
-                sample_ready:
-                  summary: Extractor validated; sample records ready
+                sampleAvailable:
+                  summary: Extractor validated; sample records fetchable mid-run
                   value:
                     job_id: 481
-                    state: "sample_ready"
+                    state: "inprogress"
                     internal_status: "running"
                     url: "https://www.rmwilliams.com.au/comfort-craftsman-boot-chestnut-yearling-leather.html?lang=en_AU"
                     input_mode: "url_list"
@@ -1011,9 +1033,6 @@ paths:
                     created_at: "2026-08-20T19:10:45Z"
                     started_at: "2026-08-20T19:10:47Z"
                     completed_at: "2026-08-20T19:24:49Z"
-                    duration_seconds: 842.0
-                    output_download_url: "/api/v1/jobs/481/output/download"
-                    scraper_code_url: "/api/v1/jobs/481/scraper-code"
                 failed:
                   summary: Terminal failure — with a retrievable sample
                   value:
@@ -1023,7 +1042,7 @@ paths:
                     url: "https://www.example-boutique.com/products/wool-scarf"
                     input_mode: "url_list"
                     content_type: "product"
-                    current_phase: "execution"
+                    current_phase: null
                     failure:
                       code: "execution_failed"
                       message: "Scraper exceeded 900s wall-clock"
@@ -1061,16 +1080,17 @@ paths:
       summary: Get the sample extraction (available before the run completes)
       description: |
         The small, early artifact: up to 5 extracted records produced while the
-        extractor was being built and validated (testing phase /
-        field_confirmation). Available in state `sample_ready`, and best-effort
-        in `failed` (a failed full run may still have a perfectly good sample —
-        see the guarantee in the info block).
+        extractor was being built and validated (testing phase). Available
+        once `sample_available` is true on the status resource (the `state`
+        value itself stays `inprogress` mid-run — there is no sample_ready
+        state), and best-effort in `failed` (a failed full run may still
+        have a perfectly good sample — see the guarantee in the info block).
 
         MUTABILITY: the sample is written when testing first passes and
         OVERWRITTEN on later retry cycles — availability is monotone (the
-        state never regresses from sample_ready) but the record contents
-        may change between fetches while a retry cycle is in flight. Once
-        the job is terminal, the sample is frozen.
+        gate never regresses) but the record contents may change between
+        fetches while a retry cycle is in flight. Once the job is terminal,
+        the sample is frozen.
 
         **Never paginated.** Samples are capped at
         `FIELD_CONFIRMATION_SAMPLE_COUNT = 5` records
@@ -1078,20 +1098,16 @@ paths:
         requested schema for display (field_confirmation.py:229-237), so the
         payload is a few KB at most.
 
-        **Implementation provenance (LOUD)**: as of this draft the pipeline
-        persists the sample as (a) coverage statistics in
-        `scrapers/{slug}/analysis/test_report.json` (graph.py:586-603) and (b)
-        a truncated text blob in a SessionLog row
-        (field_confirmation.py:510-527). Neither is structured records. Serving
-        this endpoint as specified requires persisting the sample records as
-        JSON in the File Master (recommended key:
-        `scrapers/{slug}/samples/sample-{job_id}.json`) when field_confirmation
-        runs — the records are already in hand at that point (they come from
-        the workspace `output_*.json` the tester wrote). `field_coverage`
-        in the response is sourced from the test report when present.
+        **Implementation provenance**: the pipeline persists the sample as
+        structured records in the File Master at
+        `scrapers/{slug}/samples/sample-{job_id}.json` (written when testing
+        first passes); this endpoint reads exactly that key (writers.py). The
+        response is the three-key envelope `{job_id, records, record_count}` —
+        there is no per-field coverage or state metadata on it (coverage
+        details live in the site's preserved `analysis/test_report.json`).
       responses:
         "200":
-          description: Sample records. `items` uses the job's output key (`products`, `jobs`, `articles`, `threads`, `results`, `pages` — src/content_types.py:294-306).
+          description: Sample records — `{job_id, records, record_count}` (the tester's five-record sample verbatim; records carry the job's normal output fields).
           content:
             application/json:
               schema:
@@ -1101,11 +1117,8 @@ paths:
                   summary: Product sample (rmwilliams)
                   value:
                     job_id: 481
-                    state: "sample_ready"
-                    source: "testing"
-                    output_key: "products"
-                    item_count: 5
-                    items:
+                    record_count: 5
+                    records:
                       - id: 1
                         title: "Craftsman boot"
                         price: "$699.00"
@@ -1130,21 +1143,12 @@ paths:
                         status_code: 200
                         scraped_at: "2026-08-20T19:27:04.113902+00:00"
                         remarks: ""
-                    field_coverage:
-                      title: {count: 5, coverage: "100%", status: "CORRECT"}
-                      price: {count: 5, coverage: "100%", status: "CORRECT"}
-                      availability: {count: 5, coverage: "100%", status: "CORRECT"}
-                      currency: {count: 5, coverage: "100%", status: "CORRECT"}
-                    generated_at: "2026-08-20T19:22:10Z"
                 jobSample:
                   summary: Job-posting sample (aya-style)
                   value:
                     job_id: 480
-                    state: "sample_ready"
-                    source: "testing"
-                    output_key: "jobs"
-                    item_count: 3
-                    items:
+                    record_count: 3
+                    records:
                       - title: "Permanent, Oral Surgeon, Dentist"
                         company: ""
                         location: "Milwaukee, Wisconsin"
@@ -1154,11 +1158,6 @@ paths:
                         status_code: 200
                         scraped_at: "2026-08-20T18:19:44.720815+00:00"
                         remarks: ""
-                    field_coverage:
-                      title: {count: 3, coverage: "100%", status: "CORRECT"}
-                      location: {count: 3, coverage: "100%", status: "CORRECT"}
-                      salary: {count: 2, coverage: "67%", status: "PARTIAL"}
-                    generated_at: "2026-08-20T18:21:02Z"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1192,8 +1191,8 @@ paths:
                       retry_after_seconds: 60
         "500":
           $ref: "#/components/responses/InternalError"
-        "503":
-          $ref: "#/components/responses/StorageUnavailable"
+        # NO 503 here: a File Master failure on the sample read surfaces as
+        # 404 not_ready (writers.py) — the sample path never 503s.
 
   # ─────────────────────────────────────────────────────────────────────────
   # 4. FULL OUTPUT (paginated)
@@ -1297,52 +1296,46 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
+          $ref: "#/components/responses/OutputArtifactNotFound"
+        "422":
           description: |
-            Job not found / not owned by this key, OR the job exists but no
-            output is (yet) resolvable. The error `code` distinguishes the
-            three cases:
-            - `not_found` — job does not exist or belongs to another tenant.
-            - `output_not_found` — terminal (or failed) run whose execution
-              never wrote an output file.
-            - `not_ready` — the job is still running and no output exists
-              yet; fetch-when-available semantics (poll status, retry).
+            Page parameters out of range. Codes are `invalid_page` (page >
+            total_pages, < 1, or non-integer) and `invalid_page_size`
+            (outside [1, 500] — note the paginated-output bound is 500, the
+            list endpoint's is 100) — NOT `validation_failed` (wave-41
+            audit round 4).
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
               examples:
-                jobMissing:
+                invalidPage:
                   value:
-                    code: "not_found"
-                    message: "Job 999 does not exist"
-                outputMissing:
-                  value:
-                    code: "output_not_found"
-                    message: "Job 479 has no output file — the run failed before execution produced one"
-                notReady:
-                  value:
-                    code: "not_ready"
-                    message: "Output not available yet — job is running (current phase: execution)"
+                    code: "invalid_page"
+                    message: "page must be <= 1."
                     details:
-                      state: "sample_ready"
-                      current_phase: "execution"
-                      retry_after_seconds: 120
-        "422":
-          description: Page parameters out of bounds (page > total_pages, page_size > max).
+                      total_pages: 1
+                invalidPageSize:
+                  value:
+                    code: "invalid_page_size"
+                    message: "page_size must be in [1, 500]."
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: |
+            The File Master read behind the page window failed (fail-fast —
+            the worker never hangs on the artifact store). Code is
+            `internal_error` with message "Output store unavailable."
+            (wave-41 audit round 4: there is no `storage_unavailable` code —
+            that value never existed in the handlers). Retry with backoff;
+            the job's recorded state is unaffected.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
               example:
-                code: "validation_failed"
-                message: "page 42 exceeds total_pages 1"
-                details:
-                  fields: ["page"]
-                  total_pages: 1
-        "500":
-          $ref: "#/components/responses/InternalError"
-        "503":
-          $ref: "#/components/responses/StorageUnavailable"
+                code: "internal_error"
+                message: "Output store unavailable."
 
   /api/v1/jobs/{job_id}/output/download:
     parameters:
@@ -1381,38 +1374,11 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
-          description: |
-            Either the job does not exist / is not owned by this key
-            (`code: "not_found"`), or no output is (yet) resolvable — same
-            three `code` cases as the paginated endpoint (`not_found`,
-            `output_not_found`, `not_ready`; fetch-when-available for the
-            last). 404 not 409 for the not-ready case, consistent with
-            /sample: the resource simply does not exist yet.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-              examples:
-                jobMissing:
-                  value:
-                    code: "not_found"
-                    message: "Job 999 does not exist"
-                outputMissing:
-                  value:
-                    code: "output_not_found"
-                    message: "Job 479 has no output file — the run failed before execution produced one"
-                notReady:
-                  value:
-                    code: "not_ready"
-                    message: "Output not available yet — job is running (current phase: execution)"
-                    details:
-                      state: "sample_ready"
-                      current_phase: "execution"
-                      retry_after_seconds: 120
+          $ref: "#/components/responses/OutputArtifactNotFound"
         "500":
           $ref: "#/components/responses/InternalError"
-        "503":
-          $ref: "#/components/responses/StorageUnavailable"
+        # NO 503: a File Master failure/miss on the download path surfaces
+        # as 404 output_not_found (writers.py) — fail-fast, never a hang.
 
   # ─────────────────────────────────────────────────────────────────────────
   # 5. SCRAPER CODE
@@ -1432,34 +1398,27 @@ paths:
       operationId: getJobScraperCode
       summary: Get the generated scraper (Python source)
       description: |
-        The Python scraper this job produced. Resolution order mirrors the
-        existing `scraper_code` view (webapp/scraper/views.py:499-522):
-        1. this job's own attributed copy
-           `scrapers/{slug}/jobs/scraper-{job_id}.py` (from `job.scraper_file`,
-           written by `_promote_scraper`, graph.py:973-1018), then
-        2. the site's production scraper `scrapers/{slug}/scraper.py`.
-        The per-job copy exists for ANY run that produced a draft (including
-        failed ones — per-job attribution is unconditional), so scraper code is
-        retrievable on `failed` jobs too; it is simply not promoted to
-        production unless execution succeeded.
+        The Python scraper this job produced: the job's OWN attributed copy
+        (`job.scraper_file` — written by `_promote_scraper` at graph time for
+        any run that produced a draft, including failed ones; only production
+        promotion is success-gated). The handler reads that one key — there is
+        no production-scraper fallback in the API namespace (the internal UI
+        view has one; the API 404s instead).
 
         Note: for navigation-style jobs the scraper is self-contained (two
         phases: discovery + extraction) and runnable outside this platform
         with plain Python + the declared strategy's driver.
       responses:
         "200":
-          description: Scraper source. With `format=json`, the code plus attribution metadata; with `format=raw`, the file itself.
+          description: Scraper source. With `format=json`, `{code, filename, size_bytes, url}`; with `format=raw`, the file itself.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ScraperCode"
               example:
-                job_id: 481
-                state: "scraper_ready"
                 filename: "rmwilliams-com-au_scraper.py"
-                language: "python"
-                strategy: "playwright"
-                source: "per_job"
+                size_bytes: 14210
+                url: "/api/v1/jobs/481/scraper-code"
                 code: |
                   #!/usr/bin/env python3
                   """R.M.Williams product scraper (playwright).
@@ -1480,33 +1439,20 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           description: |
-            Either the job does not exist / is not owned by this key
-            (`code: "not_found"` — deliberately indistinguishable so job ids
-            cannot be enumerated across tenants), or the job is still running
-            and no draft has been promoted yet (`code: "not_ready"` — scraper
-            code normally exists from the moment cleanup runs, including on
-            later failure, so this is rare). Fetch-when-available semantics.
+            Either the job does not exist / is not owned by this key, or this
+            job has no attributable scraper file (`code: "not_found"` in both
+            cases — deliberately indistinguishable so job ids cannot be
+            enumerated across tenants; there is no `not_ready` branch here —
+            poll `scraper_available` on GET /jobs/{id} instead).
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
-              examples:
-                jobMissing:
-                  value:
-                    code: "not_found"
-                    message: "Job 481 does not exist"
-                notReady:
-                  value:
-                    code: "not_ready"
-                    message: "Scraper code not available yet — the extractor is still being generated"
-                    details:
-                      state: "inprogress"
-                      current_phase: "code_generation"
-                      retry_after_seconds: 120
+              example:
+                code: "not_found"
+                message: "No scraper was produced for this job."
         "500":
           $ref: "#/components/responses/InternalError"
-        "503":
-          $ref: "#/components/responses/StorageUnavailable"
 
   # ─────────────────────────────────────────────────────────────────────────
   # RECOMMENDED EXTRAS
@@ -1572,7 +1518,18 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/CallbackStatus"
+                oneOf:
+                  - $ref: "#/components/schemas/CallbackStatus"
+                  - type: object
+                    description: |
+                      Unregistered — the handler returns this WRAPPER
+                      (`{"callback": null}`, writers.py:429-434), NOT a bare
+                      JSON null. Registered jobs get the bare CallbackStatus.
+                      Clients must check for the `callback` key.
+                    required: [callback]
+                    properties:
+                      callback:
+                        type: "null"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1597,6 +1554,20 @@ paths:
               example:
                 code: "invalid_callback_url"
                 message: "callback_url resolves to a private address"
+        "429":
+          description: |
+            Re-enable cooldown: at most one `action=reenable` per job per
+            60 s (the previous re-enable's `callback.reenabled` outbox row
+            starts the window). Honor `Retry-After` (60).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: "rate_limited"
+                message: "Re-enable cooldown: 60 s between attempts."
+                details:
+                  retry_after: 60
         "500":
           $ref: "#/components/responses/InternalError"
 
@@ -1716,6 +1687,18 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "404":
+          description: |
+            `job_id` was supplied but no such job exists for this key
+            (ownership-checked — a foreign id is indistinguishable from a
+            missing one, per the tenancy rule).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: "not_found"
+                message: "Job 999 does not exist."
         "429":
           $ref: "#/components/responses/RateLimited"
         "500":
@@ -1801,6 +1784,20 @@ paths:
               example:
                 code: "invalid_request"
                 message: "Supply either 'schema' (object) or 'schema_text' (string), not both."
+        "422":
+          description: |
+            `schema` was supplied but is not a JSON object/array (code
+            `schema_invalid`). NOTE: a schema that PARSES but fails schema
+            validation is NOT a 422 — the 200 body carries
+            `valid: false` with the issue list; this endpoint is the
+            pre-flight check, not a gate.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                code: "schema_invalid"
+                message: "schema must be a JSON object (the schema document itself)."
         "401":
           $ref: "#/components/responses/Unauthorized"
         "500":
@@ -1922,26 +1919,46 @@ components:
             code: "not_found"
             message: "Job 481 does not exist"
     ValidationError:
-      description: Request body or query parameters failed validation.
+      description: Query-parameter validation failure (pagination on list endpoints).
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
-          example:
-            code: "schema_invalid"
-            message: "schema_text is not a valid JSON Schema"
-    StorageUnavailable:
+          examples:
+            invalidPage:
+              value:
+                code: "invalid_page"
+                message: "page must be <= 1."
+            invalidPageSize:
+              value:
+                code: "invalid_page_size"
+                message: "page must be >= 1 and page_size in [1, 100]."
+            invalidCreatedSince:
+              value:
+                code: "invalid_created_since"
+                message: "created_since must be ISO-8601."
+    OutputArtifactNotFound:
       description: |
-        The artifact store (File Master) is temporarily unreadable. The
-        job's recorded state is unaffected — retry with backoff; this is an
-        infrastructure condition, not a job outcome.
+        Either the job does not exist / is not owned by this key
+        (`code: "not_found"` — deliberately indistinguishable so job ids
+        cannot be enumerated across tenants), or the job has no resolvable
+        output (`code: "output_not_found"` — the run never wrote one, or
+        the artifact store missed; there is NO `not_ready` branch on the
+        output paths — poll `output_available` on GET /jobs/{id} instead).
+        Shared verbatim by GET .../output and GET .../output/download.
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
-          example:
-            code: "storage_unavailable"
-            message: "Artifact store temporarily unavailable"
+          examples:
+            jobMissing:
+              value:
+                code: "not_found"
+                message: "Job 999 does not exist"
+            outputMissing:
+              value:
+                code: "output_not_found"
+                message: "No output for this job."
     InternalError:
       description: Unexpected server error. `details.trace_id` correlates with server logs.
       content:
@@ -1958,21 +1975,21 @@ components:
     # ── Enums ──────────────────────────────────────────────────────────────
     JobState:
       type: string
-      enum: [inprogress, sample_ready, scraper_ready, failed]
+      enum: [inprogress, scraper_ready, failed]
       description: |
-        The four partner-facing states, derived (never stored) from
-        `ScrapeJob.status` + step/artifact resolvability:
+        The three partner-facing states, derived (never stored) from
+        `ScrapeJob.status` (wave-41 audit round 4: the projection —
+        scraper/api/state.py `partner_state` — NEVER returns
+        `sample_ready`; an earlier draft of this spec said four states and
+        that was fiction). Sample fetchability is the separate
+        `sample_available` boolean on the status resource, and the event
+        stream's `job.sample_ready` is its push equivalent — that is
+        exactly how the REST and event surfaces agree:
 
         - `inprogress` — accepted; the pipeline is analyzing the site, building
-          and validating the extractor. Nothing retrievable yet.
-        - `sample_ready` — the extractor passed testing; a small sample of
-          extracted records is available at `/sample`. The full run continues.
-          (TRANSPORT NOTE: the EVENT stream reports this state as a
-          `job.sample_ready` event the moment testing passes; the REST
-          `state` field reports it only opportunistically — polling
-          clients should treat `sample_available: true` on an
-          `inprogress` job as the equivalent signal, which is exactly how
-          the event and REST surfaces agree.)
+          and validating the extractor. `sample_available` flips true
+          mid-run once testing has passed; `GET /sample` then returns
+          records while the full run continues.
         - `scraper_ready` — terminal success. Full output and scraper code are
           available. (Invariant: `output_available` and `scraper_available`
           flags are authoritative within this state; `item_count` may be 0.)
@@ -2049,8 +2066,10 @@ components:
           description: |
             Stable machine-readable error code. Registry:
             - Auth/tenancy: `unauthorized`, `forbidden`, `not_found`
-            - Availability: `not_ready`, `output_not_found`,
-              `storage_unavailable`
+            - Availability: `not_ready`, `output_not_found`
+              (`storage_unavailable` is NOT a real code — an artifact-store
+              outage surfaces as `internal_error` on the paginated output
+              endpoint and as the endpoint's 404 elsewhere)
             - Create gates: `duplicate_running_job`, `site_already_processed`,
               `host_mismatch`, `validation_failed`, `schema_invalid`
             - Parameter checks: `not_cancellable`, `invalid_page`,
@@ -2063,6 +2082,8 @@ components:
             - Field discovery (POST /api/v1/discover-fields only):
               `invalid_url`, `homepage_url`, `blocked_host`, `site_blocked`,
               `discovery_unavailable`, `discovery_timeout`
+            - Method: `method_not_allowed` (wrong HTTP verb on an extractor
+              path — DELETE is not the removal verb; archive instead)
             - Server: `internal_error`
 
             `host_mismatch` = wave-32 host gate refused cross-host listing
@@ -2369,8 +2390,11 @@ components:
           $ref: "#/components/schemas/JobState"
         internal_status:
           type: [string, "null"]
-          enum: [pending, running, waiting_approval, completed, failed, cancelled, captcha_blocked, akamai_blocked, null]
-          description: Read-only raw ScrapeJob.status for support/debugging. Clients should branch on `state`, not this.
+          enum: [pending, running, waiting_approval, browser_unavailable, completed, failed, cancelled, captcha_blocked, akamai_blocked, null]
+          description: |
+            Read-only raw ScrapeJob.status for support/debugging. Clients
+            should branch on `state`, not this. `browser_unavailable` is the
+            parked job (transient; projects to `state: inprogress`).
         url:
           type: string
           format: uri
@@ -2401,7 +2425,10 @@ components:
           description: Strategy used (e.g. "playwright", "http_navigation", "internal_api").
         current_phase:
           type: [string, "null"]
-          description: Phase currently `running` (or the failed one); null when terminal.
+          description: |
+            The phase currently `running`, else null — including on failed
+            jobs (the projection never names the failing phase; find it in
+            `phases` by status, or read `failure`).
         phases:
           type: array
           items:
@@ -2440,6 +2467,9 @@ components:
               type: [string, "null"]
             last_failure:
               type: [string, "null"]
+            pending_count:
+              type: integer
+              description: Undelivered outbox events for this job (0 when healthy).
         created_at:
           type: string
           format: date-time
@@ -2449,13 +2479,12 @@ components:
         completed_at:
           type: [string, "null"]
           format: date-time
-        duration_seconds:
-          type: [number, "null"]
-          description: completed_at - started_at, when both exist.
-        output_download_url:
-          type: [string, "null"]
-        scraper_code_url:
-          type: [string, "null"]
+          description: |
+            NOTE (wave-41 audit round 4): JobStatus does NOT carry
+            `duration_seconds`, `output_download_url`, or
+            `scraper_code_url` — the handler never returns them. The
+            convenience URLs ride ONLY on the create response (JobCreated);
+            derive duration from the timestamps here client-side.
 
     JobSummary:
       type: object
@@ -2583,47 +2612,25 @@ components:
 
     SampleResponse:
       type: object
-      required: [job_id, state, output_key, item_count, items]
+      required: [job_id, records, record_count]
+      description: |
+        The tester's five-record sample, verbatim (wave-41 audit round 4:
+        the handler returns exactly these three keys — no state, output_key,
+        or field_coverage envelope; derive progress from
+        `sample_available`/`state` on GET /jobs/{id} instead).
       properties:
         job_id:
           type: integer
-        state:
-          description: The state at fetch time — `sample_ready`, or `failed` when a failed run still yielded a sample.
-          type: string
-          enum: [sample_ready, failed, scraper_ready]
-        source:
-          type: string
-          enum: [testing, execution]
-          description: "`testing` = records from the extractor-validation run; `execution` = the sample was read back from the full run's output (terminal jobs)."
-        output_key:
-          $ref: "#/components/schemas/OutputKey"
-        item_count:
-          type: integer
-          minimum: 0
-          maximum: 5
-          description: Number of records in `items`.
-        items:
+        records:
           type: array
           maxItems: 5
           items:
             $ref: "#/components/schemas/ScrapedRecord"
-        field_coverage:
-          type: object
-          additionalProperties:
-            type: object
-            properties:
-              count:
-                type: integer
-              coverage:
-                type: string
-                description: "e.g. \"100%\", \"67%\""
-              status:
-                type: string
-                enum: [CORRECT, PARTIAL, MISSING, INCORRECT]
-          description: Per-field coverage from the test report (`results.field_coverage`, e.g. scrapers/vistaff placeholder — see scrapers/vistastaff-com/analysis/test_report.json). Absent when no test report was preserved.
-        generated_at:
-          type: [string, "null"]
-          format: date-time
+        record_count:
+          type: integer
+          minimum: 0
+          maximum: 5
+          description: Number of records in `records`.
 
     OutputPage:
       type: object
@@ -2659,30 +2666,24 @@ components:
 
     ScraperCode:
       type: object
-      required: [job_id, filename, language, code]
+      required: [code, filename, size_bytes, url]
+      description: |
+        The job's attributed scraper copy (`job.scraper_file`), verbatim
+        (wave-41 audit round 4: the handler returns exactly these four keys —
+        no job_id/state/strategy/source envelope).
       properties:
-        job_id:
-          type: integer
-        state:
-          type: string
-          enum: [scraper_ready, failed, sample_ready]
-          description: State at fetch time — scraper code exists from cleanup onward, including on failed runs (per-job attribution is unconditional; only production promotion is success-gated).
-        filename:
-          type: string
-          examples: ["rmwilliams-com-au_scraper.py"]
-        language:
-          type: string
-          const: python
-        strategy:
-          type: [string, "null"]
-          description: Strategy the scraper implements (matches `scraping_method`).
-        source:
-          type: string
-          enum: [per_job, production]
-          description: Which copy was served — this job's own attributed copy, or the site's production scraper (only when the per-job copy is missing).
         code:
           type: string
           description: Full Python source. Typically 200-600 lines.
+        filename:
+          type: string
+          examples: ["rmwilliams-com-au_scraper.py"]
+        size_bytes:
+          type: integer
+          description: Length of `code` in UTF-8 bytes.
+        url:
+          type: string
+          description: Canonical fetch URL for this artifact (this endpoint).
 
     # ── Schema validation ──────────────────────────────────────────────────
     SchemaIssue:
