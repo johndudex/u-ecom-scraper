@@ -15,6 +15,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(__file__))
 
 os.environ.setdefault("EVENT_GATEWAY_TEST", "1")
+import django  # noqa: E402
+import pytest_django  # noqa: E402,F401
 from gateway import (  # noqa: E402
     DEFAULT_EVENT_FILTER,
     HEARTBEAT_SECONDS,
@@ -26,9 +28,6 @@ from gateway import (  # noqa: E402
     retire_subscription,
     verify_api_key,
 )
-
-import django  # noqa: E402
-import pytest_django  # noqa: E402,F401
 
 pytestmark_async = pytest.mark.asyncio
 
@@ -285,6 +284,16 @@ class TestSnapshot:
         )
         snap = build_snapshot(job.id, u.id)
         assert snap["snapshot"]["last_event_id"]
+
+    def test_browser_unavailable_is_inprogress(self, partner, transactional_db):
+        """[wave-41 T10] browser_unavailable is PARKED (non-terminal) — the
+        late joiner must see inprogress/item_count:null, not failed (the
+        Django projection, scraper/api/state.py, has mapped it since W40)."""
+        u, raw = partner
+        job = _job(u, status="browser_unavailable")
+        snap = build_snapshot(job.id, u.id)
+        assert snap["state"] == "inprogress"
+        assert snap["snapshot"]["item_count"] is None
 
 
 class TestTimers:

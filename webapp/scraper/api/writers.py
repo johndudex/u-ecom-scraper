@@ -4,6 +4,7 @@ create follows the M12/R2 contract: ONE transaction wraps job + JobCallback
 + events.emit(job.created); dispatch happens in transaction.on_commit ONLY
 (the celery worker must never read an uncommitted row).
 """
+
 from __future__ import annotations
 
 import json
@@ -17,7 +18,9 @@ from .. import models
 from ..dedupe import site_processing_history
 from ..events import emit
 from . import errors
+from .readers import _job_status_payload
 from .ssrf import validate_callback_url
+from .state import partner_state
 from .views import _api_get_job, api_view
 
 logger = logging.getLogger("scraper.api")
@@ -27,7 +30,9 @@ def _body(request) -> dict:
     try:
         return json.loads(request.body.decode("utf-8") or "{}")
     except (json.JSONDecodeError, UnicodeDecodeError):
-        raise errors.ApiError(400, "validation_failed", "Request body is not valid JSON.")
+        raise errors.ApiError(
+            400, "validation_failed", "Request body is not valid JSON."
+        )
 
 
 INPUT_MODES = {"url_list", "list_page", "navigation", "search_term"}
@@ -56,18 +61,21 @@ def create_job(request):
     # search_criteria — the field the browser path actually reads (the
     # CharField→TextField widening was done for exactly this; intake does
     # the same join server-side for its textarea form field).
-    item_urls_deduped = list(dict.fromkeys(
-        u.strip() for u in item_urls if isinstance(u, str) and u.strip()
-    ))
-    listing_urls_deduped = list(dict.fromkeys(
-        u.strip() for u in listing_urls if isinstance(u, str) and u.strip()
-    ))
+    item_urls_deduped = list(
+        dict.fromkeys(u.strip() for u in item_urls if isinstance(u, str) and u.strip())
+    )
+    listing_urls_deduped = list(
+        dict.fromkeys(
+            u.strip() for u in listing_urls if isinstance(u, str) and u.strip()
+        )
+    )
     if input_mode == "list_page" and listing_urls_deduped:
         search_criteria = "\n".join(listing_urls_deduped)
 
     if not url or input_mode not in INPUT_MODES:
         raise errors.ApiError(
-            422, "validation_failed",
+            422,
+            "validation_failed",
             "url (sample item page) and input_mode are required; "
             f"input_mode must be one of {sorted(INPUT_MODES)}.",
         )
@@ -75,13 +83,21 @@ def create_job(request):
     # blank must not yield a url_list job (it would die ~4s into
     # setup_workspace with no URLs).
     if input_mode == "url_list" and not item_urls_deduped:
-        raise errors.ApiError(422, "validation_failed", "item_urls is required for url_list.")
+        raise errors.ApiError(
+            422, "validation_failed", "item_urls is required for url_list."
+        )
     if input_mode == "list_page" and not listing_urls:
-        raise errors.ApiError(422, "validation_failed", "listing_urls is required for list_page.")
+        raise errors.ApiError(
+            422, "validation_failed", "listing_urls is required for list_page."
+        )
     if input_mode == "search_term" and not search_criteria:
-        raise errors.ApiError(422, "validation_failed", "search_criteria is required for search_term.")
+        raise errors.ApiError(
+            422, "validation_failed", "search_criteria is required for search_term."
+        )
     if item_urls and (len(item_urls) > 10000 or any(len(u) > 1000 for u in item_urls)):
-        raise errors.ApiError(422, "validation_failed", "item_urls: max 10000 items, 1000 chars each.")
+        raise errors.ApiError(
+            422, "validation_failed", "item_urls: max 10000 items, 1000 chars each."
+        )
 
     # [wave-32 B3] Host gate — the pipeline's F17 seed filter silently drops
     # cross-host listing URLs at runtime (587: a loveamika listing on a
@@ -92,13 +108,17 @@ def create_job(request):
 
         job_reg = registrable_of(url)
         if job_reg:
-            _offending = sorted({
-                u for u in listing_urls_deduped
-                if registrable_of(u) and registrable_of(u) != job_reg
-            })
+            _offending = sorted(
+                {
+                    u
+                    for u in listing_urls_deduped
+                    if registrable_of(u) and registrable_of(u) != job_reg
+                }
+            )
             if _offending:
                 raise errors.ApiError(
-                    422, "host_mismatch",
+                    422,
+                    "host_mismatch",
                     f"listing_urls must be on {job_reg} — cross-host URLs "
                     "would be silently dropped by the pipeline.",
                     {"offending_urls": _offending},
@@ -111,7 +131,8 @@ def create_job(request):
     # inside schema_field_names and poisons the whole record contract.
     if target_fields and not isinstance(target_fields, list):
         raise errors.ApiError(
-            422, "validation_failed",
+            422,
+            "validation_failed",
             "target_fields must be an array of field-name strings.",
         )
     if target_fields:
@@ -122,7 +143,8 @@ def create_job(request):
                 r"[a-zA-Z0-9_ ]{1,64}", _f.strip()
             ):
                 raise errors.ApiError(
-                    422, "validation_failed",
+                    422,
+                    "validation_failed",
                     "target_fields entries must be 1-64 character "
                     "field-name strings (letters, digits, spaces, "
                     "underscores).",
@@ -135,8 +157,14 @@ def create_job(request):
         result = validate_user_schema(schema_text)
         if not result.valid:
             raise errors.ApiError(
-                422, "schema_invalid", "schema_text failed validation.",
-                {"issues": [{"code": i.code, "message": i.message} for i in result.issues]},
+                422,
+                "schema_invalid",
+                "schema_text failed validation.",
+                {
+                    "issues": [
+                        {"code": i.code, "message": i.message} for i in result.issues
+                    ]
+                },
             )
         if not target_fields:
             target_fields = result.derived_fields
@@ -151,25 +179,33 @@ def create_job(request):
     if field_instructions is not None:
         if not isinstance(field_instructions, dict):
             raise errors.ApiError(
-                422, "validation_failed",
+                422,
+                "validation_failed",
                 "field_instructions must be an object mapping field names to instruction strings.",
             )
         if len(field_instructions) > 100:
             raise errors.ApiError(
-                422, "validation_failed", "field_instructions: max 100 entries.",
+                422,
+                "validation_failed",
+                "field_instructions: max 100 entries.",
             )
         for _k, _v in field_instructions.items():
             if not isinstance(_k, str) or not isinstance(_v, str) or not _v.strip():
                 raise errors.ApiError(
-                    422, "validation_failed",
+                    422,
+                    "validation_failed",
                     "field_instructions: every key must be a field name and every value a non-empty instruction string.",
                 )
             if len(_v) > 300:
                 raise errors.ApiError(
-                    422, "validation_failed",
+                    422,
+                    "validation_failed",
                     f"field_instructions['{_k}'] is {len(_v)} chars; the limit is 300.",
                 )
-        field_notes = {**field_notes, **{k: v.strip() for k, v in field_instructions.items()}}
+        field_notes = {
+            **field_notes,
+            **{k: v.strip() for k, v in field_instructions.items()},
+        }
 
     cb = None
     if callback_url:
@@ -186,12 +222,15 @@ def create_job(request):
 
     # 409: live duplicate for THIS partner on the same URL
     existing = models.ScrapeJob.objects.filter(
-        url=url, status__in=[models.ScrapeJob.STATUS_PENDING, models.ScrapeJob.STATUS_RUNNING],
+        url=url,
+        status__in=[models.ScrapeJob.STATUS_PENDING, models.ScrapeJob.STATUS_RUNNING],
         user=request.api_user,
     ).first()
     if existing:
         raise errors.ApiError(
-            409, "duplicate_running_job", f"A job for this URL is already running (Job #{existing.id}).",
+            409,
+            "duplicate_running_job",
+            f"A job for this URL is already running (Job #{existing.id}).",
             {"existing_job_id": existing.id},
         )
 
@@ -204,9 +243,10 @@ def create_job(request):
         hist = site_processing_history(url)
         if hist["processed"] and not hist["site_archived"]:
             raise errors.ApiError(
-                409, "site_already_processed",
+                409,
+                "site_already_processed",
                 f"Site {hist['host']} was already scraped. "
-                "Re-send with \"force\": true to create a new job.",
+                'Re-send with "force": true to create a new job.',
                 {
                     "site_slug": hist["site_slug"],
                     "prior_job_ids": [j["job_id"] for j in hist["prior_jobs"]],
@@ -215,7 +255,8 @@ def create_job(request):
                     ),
                     "status_url": (
                         f"/api/v1/jobs/{hist['prior_jobs'][0]['job_id']}"
-                        if hist["prior_jobs"] else ""
+                        if hist["prior_jobs"]
+                        else ""
                     ),
                 },
             )
@@ -249,7 +290,8 @@ def create_job(request):
                 job=job, url=callback_url, secret=callback_secret
             )
         emit(
-            job, "job.created",
+            job,
+            "job.created",
             {
                 "state": "inprogress",
                 "url": url,
@@ -333,11 +375,16 @@ def cancel_job(request, job_id: int):
     job = _api_get_job(request, job_id)
     if job.status not in _CANCELLABLE:
         if job.status == models.ScrapeJob.STATUS_CANCELLED:
-            return JsonResponse({"job_id": job.id, "state": "failed",
-                                 "failure": {"code": "cancelled", "message": None}})
+            # [wave-41 T10] Idempotent re-cancel returns the full projection
+            # (spec 200 = $ref JobStatus), same as a fresh cancel.
+            return JsonResponse(_job_status_payload(job))
         raise errors.ApiError(
-            409, "not_cancellable", f"Job {job.id} is terminal ({job.status}).",
-            {"state": "completed" if job.status == "completed" else "failed"},
+            409,
+            "not_cancellable",
+            f"Job {job.id} is terminal ({job.status}).",
+            # [wave-41 T10] details.state is a $ref JobState ("scraper_ready"),
+            # not the internal status ("completed" isn't in the enum).
+            {"state": partner_state(job.status)},
         )
     with transaction.atomic():
         job.status = models.ScrapeJob.STATUS_CANCELLED
@@ -351,16 +398,21 @@ def cancel_job(request, job_id: int):
             run_scrape_task.AsyncResult(job.celery_task_id).revoke(terminate=True)
         except Exception as e:
             logger.warning("api cancel: could not revoke %s: %s", job.celery_task_id, e)
-    return JsonResponse({"job_id": job.id, "state": "failed",
-                         "failure": {"code": "cancelled", "message": None}})
+    # [wave-41 T10] Spec 200 = $ref JobStatus — the full projection, not the
+    # old {job_id, state, failure} summary (partner already has a status
+    # parser; giving it a third shape was the audit's finding).
+    return JsonResponse(_job_status_payload(job))
 
 
 # ── callback read/patch ─────────────────────────────────────────────────────
 
+
 def _callback_payload(cb) -> dict:
-    pending = models.EventOutbox.objects.filter(job_id=cb.job_id).exclude(
-        state=models.EventOutbox.STATE_DELIVERED
-    ).count()
+    pending = (
+        models.EventOutbox.objects.filter(job_id=cb.job_id)
+        .exclude(state=models.EventOutbox.STATE_DELIVERED)
+        .count()
+    )
     return {
         "status": cb.status,
         "url": cb.url,
@@ -391,20 +443,30 @@ def patch_job_callback(request, job_id: int):
     body = _body(request)
     action = body.get("action")
     if action not in ("reenable", "rotate"):
-        raise errors.ApiError(422, "validation_failed", "action must be reenable|rotate.")
+        raise errors.ApiError(
+            422, "validation_failed", "action must be reenable|rotate."
+        )
 
     if action == "reenable":
         if cb.status == models.JobCallback.STATUS_ACTIVE:
             raise errors.ApiError(
-                409, "callback_already_active", "Callback is active; use action=rotate to change it."
+                409,
+                "callback_already_active",
+                "Callback is active; use action=rotate to change it.",
             )
         # 60 s cooldown per job (spec: re-enable hardening)
-        last = models.EventOutbox.objects.filter(
-            job=job, event_type="callback.reenabled"
-        ).order_by("-created_at").first()
+        last = (
+            models.EventOutbox.objects.filter(job=job, event_type="callback.reenabled")
+            .order_by("-created_at")
+            .first()
+        )
         if last and (timezone.now() - last.created_at).total_seconds() < 60:
-            raise errors.ApiError(429, "rate_limited", "Re-enable cooldown: 60 s between attempts.",
-                                  {"retry_after": 60})
+            raise errors.ApiError(
+                429,
+                "rate_limited",
+                "Re-enable cooldown: 60 s between attempts.",
+                {"retry_after": 60},
+            )
         with transaction.atomic():
             cb.status = models.JobCallback.STATUS_ACTIVE
             cb.disabled_reason = ""
@@ -416,7 +478,11 @@ def patch_job_callback(request, job_id: int):
     new_url = str(body.get("callback_url", "")).strip()
     new_secret = str(body.get("callback_secret", "")).strip()
     if not new_url and not new_secret:
-        raise errors.ApiError(422, "validation_failed", "rotate requires callback_url and/or callback_secret.")
+        raise errors.ApiError(
+            422,
+            "validation_failed",
+            "rotate requires callback_url and/or callback_secret.",
+        )
     if new_url:
         from . import ssrf as _ssrf
 
@@ -424,7 +490,9 @@ def patch_job_callback(request, job_id: int):
         if reason:
             raise errors.ApiError(422, "invalid_callback_url", reason)
     if new_secret and not (32 <= len(new_secret) <= 256):
-        raise errors.ApiError(422, "validation_failed", "callback_secret must be 32-256 characters.")
+        raise errors.ApiError(
+            422, "validation_failed", "callback_secret must be 32-256 characters."
+        )
     with transaction.atomic():
         if new_url:
             cb.url = new_url
@@ -437,6 +505,7 @@ def patch_job_callback(request, job_id: int):
 
 
 # ── sample read ─────────────────────────────────────────────────────────────
+
 
 def _fm_read_json(key: str):
     try:
@@ -470,14 +539,17 @@ def get_job_sample(request, job_id: int):
     data = _fm_read_json(f"scrapers/{slug}/samples/sample-{job.id}.json")
     if not data or not data.get("records"):
         raise errors.ApiError(404, "not_ready", "Sample is not available for this job.")
-    return JsonResponse({
-        "job_id": job.id,
-        "records": data["records"],
-        "record_count": len(data["records"]),
-    })
+    return JsonResponse(
+        {
+            "job_id": job.id,
+            "records": data["records"],
+            "record_count": len(data["records"]),
+        }
+    )
 
 
 # ── output endpoints ────────────────────────────────────────────────────────
+
 
 def _fm_read_text(key: str) -> str:
     import src.artifacts as artifacts
@@ -555,6 +627,7 @@ def download_job_output(request, job_id: int):
 
 # ── scraper-code ────────────────────────────────────────────────────────────
 
+
 @api_view(["GET"])
 def get_job_scraper_code(request, job_id: int):
     """GET /api/v1/jobs/{id}/scraper-code — the generated Python source.
@@ -574,9 +647,11 @@ def get_job_scraper_code(request, job_id: int):
         resp = HttpResponse(code, content_type="text/x-python")
         resp["Content-Disposition"] = f'attachment; filename="{filename}"'
         return resp
-    return JsonResponse({
-        "code": code,
-        "filename": filename,
-        "size_bytes": len(code.encode("utf-8")),
-        "url": f"/api/v1/jobs/{job.id}/scraper-code",
-    })
+    return JsonResponse(
+        {
+            "code": code,
+            "filename": filename,
+            "size_bytes": len(code.encode("utf-8")),
+            "url": f"/api/v1/jobs/{job.id}/scraper-code",
+        }
+    )

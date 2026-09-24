@@ -30,6 +30,7 @@ import django  # noqa: E402
 django.setup()
 
 from django.conf import settings as dj_settings  # noqa: E402
+
 logger = logging.getLogger("event_gateway")
 
 HEARTBEAT_SECONDS = 25  # spec x-heartbeat: <=25s of silence
@@ -120,6 +121,10 @@ _TERMINAL_EVENT = {
 }
 _STATE_MAP = {
     "pending": "inprogress", "running": "inprogress", "waiting_approval": "inprogress",
+    # [wave-41 T10] Parked is TRANSIENT (wave-16 B3 / wave-40 park-resume) —
+    # mirror scraper/api/state.py: a late joiner must see inprogress, not
+    # the unknown-status fallback "failed". Non-terminal → no _TERMINAL_EVENT.
+    "browser_unavailable": "inprogress",
     **{k: "failed" for k in ("failed", "cancelled", "captcha_blocked", "akamai_blocked")},
     "completed": "scraper_ready",
 }

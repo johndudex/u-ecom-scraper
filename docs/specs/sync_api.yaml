@@ -1793,11 +1793,14 @@ paths:
                     derived_fields: []
                     detected_content_type: null
         "400":
-          description: "Neither `schema` nor `schema_text` supplied, both supplied, or `schema_text` is not valid UTF-8 JSON text."
+          description: "Neither `schema` nor `schema_text` supplied, both supplied, or `schema_text` is not valid UTF-8 JSON text. Code: `invalid_request`."
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+              example:
+                code: "invalid_request"
+                message: "Supply either 'schema' (object) or 'schema_text' (string), not both."
         "401":
           $ref: "#/components/responses/Unauthorized"
         "500":
@@ -2052,6 +2055,9 @@ components:
               `host_mismatch`, `validation_failed`, `schema_invalid`
             - Parameter checks: `not_cancellable`, `invalid_page`,
               `invalid_page_size`, `invalid_created_since`
+            - Request shape: `invalid_request` (validate-schema only —
+              both or neither of `schema`/`schema_text` supplied, or
+              `schema_text` is not valid JSON text)
             - Callbacks: `invalid_callback_url`, `callback_already_active`
             - Limits: `rate_limited`
             - Field discovery (POST /api/v1/discover-fields only):

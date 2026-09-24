@@ -8,6 +8,7 @@ validate-schema  POST /api/v1/validate-schema
 status      GET  /api/v1/jobs/{id}
 list        GET  /api/v1/jobs
 """
+
 from __future__ import annotations
 
 import json
@@ -30,7 +31,9 @@ def _parse_body(request) -> dict:
     try:
         return json.loads(request.body.decode("utf-8") or "{}")
     except (json.JSONDecodeError, UnicodeDecodeError):
-        raise errors.ApiError(400, "validation_failed", "Request body is not valid JSON.")
+        raise errors.ApiError(
+            400, "validation_failed", "Request body is not valid JSON."
+        )
 
 
 @api_view(["POST"])
@@ -39,7 +42,9 @@ def check_site(request):
     url = str(body.get("url", "")).strip()
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise errors.ApiError(422, "validation_failed", "url must be an absolute http(s) URL.")
+        raise errors.ApiError(
+            422, "validation_failed", "url must be an absolute http(s) URL."
+        )
     host = parsed.netloc.lower()
 
     site = (
@@ -65,11 +70,41 @@ def check_site(request):
 
 @api_view(["POST"])
 def validate_schema(request):
+    # [wave-41 T10] Dual-accept per the committed spec: `schema` (object,
+    # canonical) XOR `schema_text` (string, intake-UI parity form). Both or
+    # neither is a 400 invalid_request; a supplied-but-wrong-typed `schema`
+    # stays a 422 schema_invalid.
     body = _parse_body(request)
     schema = body.get("schema")
+    schema_text = body.get("schema_text")
+    if schema is not None and schema_text is not None:
+        raise errors.ApiError(
+            400,
+            "invalid_request",
+            "Supply either 'schema' (object) or 'schema_text' (string), not both.",
+        )
+    if schema_text is not None:
+        if not isinstance(schema_text, str):
+            raise errors.ApiError(
+                400, "invalid_request", "'schema_text' must be a JSON string."
+            )
+        try:
+            schema = json.loads(schema_text)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise errors.ApiError(
+                400, "invalid_request", f"'schema_text' is not valid JSON: {e}."
+            )
+    if schema is None:
+        raise errors.ApiError(
+            400,
+            "invalid_request",
+            "Supply 'schema' (a JSON object) or 'schema_text' (the same schema as a JSON string).",
+        )
     if not isinstance(schema, (dict, list)):
         raise errors.ApiError(
-            422, "schema_invalid", "schema must be a JSON object (the schema document itself)."
+            422,
+            "schema_invalid",
+            "schema must be a JSON object (the schema document itself).",
         )
     from src.schema_validation import validate_user_schema
 
@@ -78,7 +113,12 @@ def validate_schema(request):
         {
             "valid": result.valid,
             "issues": [
-                {"code": i.code, "message": i.message, "severity": i.severity, "path": i.path}
+                {
+                    "code": i.code,
+                    "message": i.message,
+                    "severity": i.severity,
+                    "path": i.path,
+                }
                 for i in result.issues
             ],
             "derived_fields": result.derived_fields,
@@ -91,7 +131,9 @@ def validate_schema(request):
 
 def _job_status_payload(job) -> dict:
     """The JobStatus projection (sync_api.yaml). Shared by status + list."""
-    steps = list(job.steps.order_by("id").values("phase", "status", "started_at", "completed_at"))
+    steps = list(
+        job.steps.order_by("id").values("phase", "status", "started_at", "completed_at")
+    )
     testing_done = any(
         s["phase"] == "testing" and s["completed_at"] is not None for s in steps
     )
@@ -129,7 +171,9 @@ def _job_status_payload(job) -> dict:
         "rerun_of": job.origin_job_id,
         "platform": job.platform or None,
         "scraping_method": job.scraping_method or None,
-        "current_phase": next((s["phase"] for s in reversed(steps) if s["status"] == "running"), None),
+        "current_phase": next(
+            (s["phase"] for s in reversed(steps) if s["status"] == "running"), None
+        ),
         "phases": phases,
         "sample_available": sample_available,
         "output_available": bool(job.output_file),
@@ -150,9 +194,11 @@ def _callback_summary(job) -> dict | None:
         return None
     from ..models import EventOutbox
 
-    pending = EventOutbox.objects.filter(job=job).exclude(
-        state=EventOutbox.STATE_DELIVERED
-    ).count()
+    pending = (
+        EventOutbox.objects.filter(job=job)
+        .exclude(state=EventOutbox.STATE_DELIVERED)
+        .count()
+    )
     return {
         "status": cb.status,
         "disabled_reason": cb.disabled_reason or None,
@@ -180,19 +226,25 @@ def list_jobs(request):
         if not 1 <= page_size <= 100:
             raise ValueError
     except (TypeError, ValueError):
-        raise errors.ApiError(422, "invalid_page_size", "page must be >= 1 and page_size in [1, 100].")
+        raise errors.ApiError(
+            422, "invalid_page_size", "page must be >= 1 and page_size in [1, 100]."
+        )
     created_since = request.GET.get("created_since", "").strip()
     if created_since:
         from django.utils.dateparse import parse_datetime
 
         dt = parse_datetime(created_since)
         if dt is None:
-            raise errors.ApiError(422, "invalid_created_since", "created_since must be ISO-8601.")
+            raise errors.ApiError(
+                422, "invalid_created_since", "created_since must be ISO-8601."
+            )
         qs = qs.filter(created_at__gte=dt)
 
     paginator = Paginator(qs, page_size)
     if page > paginator.num_pages and paginator.num_pages > 0:
-        raise errors.ApiError(422, "invalid_page", f"page must be <= {paginator.num_pages}.")
+        raise errors.ApiError(
+            422, "invalid_page", f"page must be <= {paginator.num_pages}."
+        )
     rows = paginator.page(page).object_list
     # list rows are summaries (spec JobList) — no phases[] here
     payloads = []

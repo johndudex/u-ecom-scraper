@@ -14,6 +14,7 @@ Budget (fold M9): a GLOBAL Redis counter caps concurrent streams across
 internal + partner surfaces — 2 sync workers means 2 streams = 0% HTTP
 capacity. Over budget → 503 immediately, never a silent hang.
 """
+
 from __future__ import annotations
 
 import json
@@ -116,6 +117,9 @@ def job_events_sse(request, job_id: int):
             api_user, _key = resolve_api_key(req_clone)
         except errors.ApiError as e:
             return JsonResponse(e.body(), status=e.status)
+        limited = _global_limiter_response(_key.key_hash)
+        if limited is not None:
+            return limited
     else:
         token = request.GET.get("token", "").strip()
         if not token:
@@ -141,8 +145,11 @@ def job_events_sse(request, job_id: int):
     # ── global stream budget ──
     if not _budget_take():
         return JsonResponse(
-            {"code": "rate_limited", "message": "Stream budget exhausted.",
-             "details": {"retry_after": 30}},
+            {
+                "code": "rate_limited",
+                "message": "Stream budget exhausted.",
+                "details": {"retry_after": 30},
+            },
             status=503,
         )
 
@@ -174,7 +181,9 @@ def job_events_sse(request, job_id: int):
                     new_event_id(),
                 )
                 return
-            yield _envelope("job.inprogress", {"internal_status": job.status}, new_event_id())
+            yield _envelope(
+                "job.inprogress", {"internal_status": job.status}, new_event_id()
+            )
             try:
                 pubsub = _get_redis().pubsub()
                 pubsub.subscribe(channel)
@@ -195,8 +204,11 @@ def job_events_sse(request, job_id: int):
                     yield f"data: {frame}\n\n"
                     try:
                         env = json.loads(frame)
-                        if str(env.get("type", "")).startswith("job.") and env.get("type") in (
-                            "job.scraper_ready", "job.failed",
+                        if str(env.get("type", "")).startswith("job.") and env.get(
+                            "type"
+                        ) in (
+                            "job.scraper_ready",
+                            "job.failed",
                         ):
                             terminal_seen = True
                     except json.JSONDecodeError:
@@ -238,6 +250,22 @@ def job_events_sse(request, job_id: int):
     return resp
 
 
+def _global_limiter_response(key_hash: str):
+    """[wave-41 T10] The spec puts ws-token behind "the global per-key
+    limits" — but neither this view nor the SSE handshake routes through
+    api_view, so the 10 r/s burst check must be applied here by hand.
+    Token-path handshakes have no key (single-use token + stream budget
+    bound them instead)."""
+    from .ratelimit import check_rate_limit
+
+    retry_after = check_rate_limit(key_hash[:16])
+    if retry_after is None:
+        return None
+    resp = JsonResponse(errors.rate_limited("10 req/s (burst 30)").body(), status=429)
+    resp["Retry-After"] = str(retry_after)
+    return resp
+
+
 @csrf_exempt
 def ws_token(request):
     """POST /api/v1/ws-token — mint a single-use stream token (spec).
@@ -250,9 +278,12 @@ def ws_token(request):
     from .auth import resolve_api_key
 
     try:
-        user, _key = resolve_api_key(request)
+        user, key = resolve_api_key(request)
     except errors.ApiError as e:
         return JsonResponse(e.body(), status=e.status)
+    limited = _global_limiter_response(key.key_hash)
+    if limited is not None:
+        return limited
     from ..models import ScrapeJob
 
     job_id = None
@@ -271,7 +302,8 @@ def ws_token(request):
         {
             "token": token,
             "expires_in": TOKEN_TTL,
-            "connect_url": f"/api/v1/jobs/{job_id}/events?token={token}" if job_id
+            "connect_url": f"/api/v1/jobs/{job_id}/events?token={token}"
+            if job_id
             else None,
         },
         status=201,
