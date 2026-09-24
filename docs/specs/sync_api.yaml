@@ -20,7 +20,9 @@ jsonSchemaDialect: "https://json-schema.org/draft/2020-12/schema"
 #
 # 2. THE 4 STATES AND WHAT ACTUALLY PRODUCES THEM (see JobState description
 #    for the full derivation table):
-#      inprogress    — ScrapeJob.status in {pending, running, waiting_approval}
+#      inprogress    — ScrapeJob.status in {pending, running, waiting_approval,
+#                      browser_unavailable (PARKED — non-terminal, resumes
+#                      when the browser service recovers)}
 #                      and no sample artifact yet.
 #      sample_ready  — testing phase done, a sample artifact is resolvable.
 #                      *** LOUD CAVEAT ***: today the pipeline does NOT persist
@@ -56,6 +58,8 @@ jsonSchemaDialect: "https://json-schema.org/draft/2020-12/schema"
 #                      akamai_blocked}. Cancelled/blocked are folded into failed
 #                      with a machine-readable `failure.code` (see open
 #                      questions if a 5th state is preferred).
+#                      browser_unavailable (parked) is NOT failed — see
+#                      inprogress above.
 #
 # 3. MULTI-TENANCY. Every job is scoped to the API key's owning user
 #    (ScrapeJob.user, webapp/scraper/models.py:156-159). Cross-tenant reads are
@@ -131,6 +135,18 @@ info:
       recorded for capacity planning, not enforced in v1 — the global
       request limiter (10 rps/key) bounds them indirectly. Enforce
       per-limit if abuse appears.
+    fail_open: |
+      CAVEAT (honesty): every limiter reads Redis. If Redis is unreachable the
+      limiters FAIL OPEN (requests proceed unthrottled) rather than failing
+      closed — availability is preferred over enforcement. Durations of
+      unthrottled service are expected to be short (Redis is on the same
+      deployment), but partners MUST NOT rely on 429s as a backpressure signal.
+  x-timeouts:
+    # Server-side ceilings a client should budget against (proxy idle timeouts
+    # sit below these; a ceiling exceeded = 504/503, never a hang).
+    artifact_read: {seconds: 120, applies_to: "GET .../sample, /output (paginated), /scraper-code — File Master read + JSON decode"}
+    output_download: {seconds: 30, applies_to: "GET .../output/download — proxy stream start; bytes then flow for the file's duration"}
+    field_discovery: {seconds: 45, applies_to: "POST /api/v1/discover-fields — browser render ≤25s + LLM ≤20s (enforced upstream)"}
 
 servers:
   - url: /
@@ -215,10 +231,17 @@ paths:
                     type: [string, "null"]
                     description: Detected platform (e.g. "Salesforce Commerce Cloud (Demandware)"), null when unknown.
                     example: "Salesforce Commerce Cloud (Demandware)"
-                  content_type:
+                  site_type:
                     type: [string, "null"]
-                    description: Last-scraped content type on record, null when unknown.
-                    example: "product"
+                    description: |
+                      Content domain recorded on the Site (Site.site_type —
+                      one of shopping | articles | jobs | forum | general),
+                      null when unknown. Named `site_type`, not
+                      `content_type`: that is the field the record carries
+                      (src/content_types.py maps user-facing page types onto
+                      these domains; the API does not expose the finer
+                      page-type vocabulary here).
+                    example: "shopping"
         "401": { $ref: "#/components/responses/Unauthorized" }
         "422": { $ref: "#/components/responses/ValidationError" }
 
@@ -1141,26 +1164,36 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
-          $ref: "#/components/responses/NotFound"
-        "404":
           description: |
-            No sample yet (state `inprogress` before testing passes) or the
-            job is terminal without a sample. Same `not_ready` code, 404
-            status — fetch-when-available semantics: poll status and retry
-            when `sample_available` flips true. (404 not 409: nothing is
-            wrong with the request and there is no conflict to resolve —
-            the resource simply does not exist yet.)
+            Either the job does not exist / is not owned by this key
+            (`code: "not_found"` — deliberately indistinguishable so job ids
+            cannot be enumerated across tenants), or no sample exists yet:
+            state `inprogress` before testing passes, or the job is terminal
+            without a sample. The not-ready case is fetch-when-available:
+            poll status and retry when `sample_available` flips true. (404
+            not 409: nothing is wrong with the request and there is no
+            conflict to resolve — the resource simply does not exist yet.)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
-              example:
-                code: "not_ready"
-                message: "Sample not available yet — the extractor is still being built (current phase: code_generation)"
-                details:
-                  retry_after_seconds: 60  # CONSTANT HINT (not an estimate — no phase-duration telemetry exists; clients should treat it as a floor)
+              examples:
+                jobMissing:
+                  value:
+                    code: "not_found"
+                    message: "Job 481 does not exist"
+                notReady:
+                  value:
+                    code: "not_ready"
+                    message: "Sample not available yet — the extractor is still being built (current phase: code_generation)"
+                    details:
+                      # CONSTANT HINT (not an estimate — no phase-duration
+                      # telemetry exists; clients should treat it as a floor)
+                      retry_after_seconds: 60
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/StorageUnavailable"
 
   # ─────────────────────────────────────────────────────────────────────────
   # 4. FULL OUTPUT (paginated)
@@ -1264,7 +1297,15 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
-          description: Job not found / not owned by this key, OR the job exists but no output file was produced (e.g. a failed run whose execution never wrote a file). The error `code` distinguishes the two.
+          description: |
+            Job not found / not owned by this key, OR the job exists but no
+            output is (yet) resolvable. The error `code` distinguishes the
+            three cases:
+            - `not_found` — job does not exist or belongs to another tenant.
+            - `output_not_found` — terminal (or failed) run whose execution
+              never wrote an output file.
+            - `not_ready` — the job is still running and no output exists
+              yet; fetch-when-available semantics (poll status, retry).
           content:
             application/json:
               schema:
@@ -1278,19 +1319,14 @@ paths:
                   value:
                     code: "output_not_found"
                     message: "Job 479 has no output file — the run failed before execution produced one"
-        "404":
-          description: The job is still running and no output exists yet (same `not_ready` code, 404 fetch-when-available semantics).
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
-              example:
-                code: "not_ready"
-                message: "Output not available yet — job is running (current phase: execution)"
-                details:
-                  state: "sample_ready"
-                  current_phase: "execution"
-                  retry_after_seconds: 120
+                notReady:
+                  value:
+                    code: "not_ready"
+                    message: "Output not available yet — job is running (current phase: execution)"
+                    details:
+                      state: "sample_ready"
+                      current_phase: "execution"
+                      retry_after_seconds: 120
         "422":
           description: Page parameters out of bounds (page > total_pages, page_size > max).
           content:
@@ -1305,6 +1341,8 @@ paths:
                   total_pages: 1
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/StorageUnavailable"
 
   /api/v1/jobs/{job_id}/output/download:
     parameters:
@@ -1343,11 +1381,38 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
-          $ref: "#/components/responses/NotFound"
-        "409":
-          $ref: "#/components/responses/NotReady"
+          description: |
+            Either the job does not exist / is not owned by this key
+            (`code: "not_found"`), or no output is (yet) resolvable — same
+            three `code` cases as the paginated endpoint (`not_found`,
+            `output_not_found`, `not_ready`; fetch-when-available for the
+            last). 404 not 409 for the not-ready case, consistent with
+            /sample: the resource simply does not exist yet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                jobMissing:
+                  value:
+                    code: "not_found"
+                    message: "Job 999 does not exist"
+                outputMissing:
+                  value:
+                    code: "output_not_found"
+                    message: "Job 479 has no output file — the run failed before execution produced one"
+                notReady:
+                  value:
+                    code: "not_ready"
+                    message: "Output not available yet — job is running (current phase: execution)"
+                    details:
+                      state: "sample_ready"
+                      current_phase: "execution"
+                      retry_after_seconds: 120
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/StorageUnavailable"
 
   # ─────────────────────────────────────────────────────────────────────────
   # 5. SCRAPER CODE
@@ -1414,22 +1479,34 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
-          $ref: "#/components/responses/NotFound"
-        "404":
-          description: Job still running and no draft has been promoted yet (scraper code normally exists from the moment cleanup runs — including on later failure — so this is rare). Same `not_ready` code, 404 semantics.
+          description: |
+            Either the job does not exist / is not owned by this key
+            (`code: "not_found"` — deliberately indistinguishable so job ids
+            cannot be enumerated across tenants), or the job is still running
+            and no draft has been promoted yet (`code: "not_ready"` — scraper
+            code normally exists from the moment cleanup runs, including on
+            later failure, so this is rare). Fetch-when-available semantics.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
-              example:
-                code: "not_ready"
-                message: "Scraper code not available yet — the extractor is still being generated"
-                details:
-                  state: "inprogress"
-                  current_phase: "code_generation"
-                  retry_after_seconds: 120
+              examples:
+                jobMissing:
+                  value:
+                    code: "not_found"
+                    message: "Job 481 does not exist"
+                notReady:
+                  value:
+                    code: "not_ready"
+                    message: "Scraper code not available yet — the extractor is still being generated"
+                    details:
+                      state: "inprogress"
+                      current_phase: "code_generation"
+                      retry_after_seconds: 120
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/StorageUnavailable"
 
   # ─────────────────────────────────────────────────────────────────────────
   # RECOMMENDED EXTRAS
@@ -1637,23 +1714,31 @@ paths:
         content:
           application/json:
             schema:
-              type: object
-              required: [schema_text]
-              properties:
-                schema_text:
-                  type: string
-                  description: "Raw JSON Schema (or the internal {fields: [...]} dialect) as a string."
+              oneOf:
+                - type: object
+                  required: [schema]
+                  properties:
+                    schema:
+                      type: object
+                      description: |
+                        The JSON Schema (or the internal `{fields: [...]}` dialect)
+                        as a JSON object — the form Extractor Builder sends.
+                - type: object
+                  required: [schema_text]
+                  properties:
+                    schema_text:
+                      type: string
+                      description: "The same schema serialized as a UTF-8 JSON string — the form the /intake UI posts."
                   examples:
                     - |
                       {
-                        "type": "object",
-                        "properties": {
-                          "title": {"type": "string"},
-                          "price": {"type": "string"},
-                          "availability": {"type": "string"}
-                        },
-                        "required": ["title", "price"]
+                        "schema_text": "{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"},\"price\":{\"type\":\"string\"},\"availability\":{\"type\":\"string\"}},\"required\":[\"title\",\"price\"]}"
                       }
+              description: |
+                Exactly one of `schema` (object) or `schema_text` (string).
+                The object form is canonical; the string form exists for
+                intake-UI parity and is parsed server-side. Supplying both is
+                a 400 (ambiguous); neither is a 400.
       responses:
         "200":
           description: Validation result (valid or not).
@@ -1679,7 +1764,7 @@ paths:
                     derived_fields: []
                     detected_content_type: null
         "400":
-          description: "`schema_text` missing or not valid UTF-8 JSON text."
+          description: "Neither `schema` nor `schema_text` supplied, both supplied, or `schema_text` is not valid UTF-8 JSON text."
           content:
             application/json:
               schema:
@@ -1813,18 +1898,18 @@ components:
           example:
             code: "schema_invalid"
             message: "schema_text is not a valid JSON Schema"
-    NotReady:
-      description: Job exists but the artifact is not available yet.
+    StorageUnavailable:
+      description: |
+        The artifact store (File Master) is temporarily unreadable. The
+        job's recorded state is unaffected — retry with backoff; this is an
+        infrastructure condition, not a job outcome.
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
           example:
-            code: "not_ready"
-            message: "Output not available yet — job is running"
-            details:
-              state: "sample_ready"
-              retry_after_seconds: 120
+            code: "storage_unavailable"
+            message: "Artifact store temporarily unavailable"
     InternalError:
       description: Unexpected server error. `details.trace_id` correlates with server logs.
       content:
@@ -1873,6 +1958,13 @@ components:
         `akamai_blocked` all map to `failed` with a distinct `failure.code`;
         `waiting_approval` maps to `inprogress` (API jobs run unattended with
         `skip_approvals=true`, so it should not occur — mapped defensively).
+        `browser_unavailable` (PARKED — the browser service is down and the
+        job resumes automatically when it recovers) maps to `inprogress`,
+        NOT `failed`: it is non-terminal and can persist for a long time.
+        Implementations that omit this mapping would wrongly snapshot parked
+        jobs as failed — the state derivation MUST include it. A parked job
+        is distinguishable by `current_phase` staying frozen and no step
+        progression; there is no separate partner-facing parked state in v1.
     InputMode:
       type: string
       enum: [url_list, list_page, search_term]
@@ -1881,8 +1973,14 @@ components:
         `ScrapeJob.input_mode` (webapp/scraper/models.py:123-127). The /intake
         UI's radio shorthands map as `list`→`url_list`, `listing`→`list_page`,
         `search`→`search_term` (`_INTAKE_NAV_TO_INPUT_MODE`,
-        webapp/scraper/views.py:2223-2227). `navigation` exists internally but
-        is not offered to partners in v1 (no intake form path produces it).
+        webapp/scraper/views.py:2223-2227).
+
+        REALITY NOTE: `navigation` (agentic browse-and-discover) is currently
+        ACCEPTED by createJob's validation (`INPUT_MODES` in
+        webapp/scraper/api/writers.py) but is NOT part of the v1 contract —
+        no SLA, no documented behavior, subject to removal. Do not ship
+        against it. Whether v1 strictly rejects `navigation` (422) or
+        documents it is an open product decision.
     ContentType:
       type: string
       enum: [product, article, job_posting, forum_thread, serp, page_content]
@@ -1907,7 +2005,7 @@ components:
         - akamai_blocked
         - pipeline_failed
         - internal_error
-      description: Machine-readable failure classification. `cancelled`/`captcha_blocked`/`akamai_blocked` mirror the internal terminal statuses (models.py:104-106); `pipeline_failed` covers every other pipeline failure (the human-readable stage detail lives in `message`); `internal_error` for unexpected server faults.
+      description: Machine-readable failure classification. `cancelled`/`captcha_blocked`/`akamai_blocked` mirror the internal terminal statuses (models.py:104-106); `pipeline_failed` covers every other pipeline failure (the human-readable stage detail lives in `message`); `internal_error` for unexpected server faults. There is deliberately NO member for `browser_unavailable` — parked jobs are non-terminal (they map to `inprogress`) and never produce a `failure` object.
 
     # ── Errors ─────────────────────────────────────────────────────────────
     Error:
@@ -1916,7 +2014,24 @@ components:
       properties:
         code:
           type: string
-          description: Stable machine-readable error code (`unauthorized`, `forbidden`, `not_found`, `not_ready`, `duplicate_running_job`, `site_already_processed`, `validation_failed`, `schema_invalid`, `host_mismatch`, `output_not_found`, `not_cancellable`, `invalid_page`, `invalid_page_size`, `invalid_created_since`, `invalid_callback_url`, `callback_already_active`, `rate_limited`, `internal_error`). `host_mismatch` = wave-32 host gate refused cross-host listing URLs at create time (POST /api/v1/jobs only; no `force` escape).
+          description: |
+            Stable machine-readable error code. Registry:
+            - Auth/tenancy: `unauthorized`, `forbidden`, `not_found`
+            - Availability: `not_ready`, `output_not_found`,
+              `storage_unavailable`
+            - Create gates: `duplicate_running_job`, `site_already_processed`,
+              `host_mismatch`, `validation_failed`, `schema_invalid`
+            - Parameter checks: `not_cancellable`, `invalid_page`,
+              `invalid_page_size`, `invalid_created_since`
+            - Callbacks: `invalid_callback_url`, `callback_already_active`
+            - Limits: `rate_limited`
+            - Field discovery (POST /api/v1/discover-fields only):
+              `invalid_url`, `homepage_url`, `blocked_host`, `site_blocked`,
+              `discovery_unavailable`, `discovery_timeout`
+            - Server: `internal_error`
+
+            `host_mismatch` = wave-32 host gate refused cross-host listing
+            URLs at create time (POST /api/v1/jobs only; no `force` escape).
           examples: ["not_found"]
         message:
           type: string
@@ -2061,12 +2176,18 @@ components:
             Optional HTTPS endpoint to notify on terminal state transitions.
             Delivery semantics (event types, payload shape, retry policy,
             signature header) are specified in the companion AsyncAPI
-            document. VALIDATION (enforced here, at create time): the URL
-            MUST be https, MUST NOT target private/loopback/link-local
-            ranges or internal service hostnames (browser_service,
-            file-master, postgres, redis, \*.railway.internal), and MUST use
-            a standard port (443/8443) — signed POSTs to arbitrary internal
-            targets would be an SSRF vector (critique round, vector 3d).
+            document. VALIDATION (enforced here, at create time, by
+            `ssrf.validate_callback_url`): the URL MUST be https on port 443
+            ONLY (explicit non-443 ports are rejected — there is no 8443
+            allowance), MUST NOT be a literal private/loopback/reserved IP,
+            MUST resolve at registration time, and every resolved address
+            MUST be public (hostnames with ANY private/loopback/link-local
+            record are rejected, as are internal service hostnames —
+            browser_service, file-master, postgres, redis,
+            \*.railway.internal). Signed POSTs to arbitrary internal targets
+            would be an SSRF vector (critique round, vector 3d). Resolution
+            is checked at REGISTRATION only — DNS rebinding between
+            registration and delivery is out of scope for v1.
         callback_secret:
           type: string
           minLength: 32
