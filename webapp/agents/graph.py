@@ -45,6 +45,7 @@ import time
 from contextlib import contextmanager
 from typing import Any
 
+import requests
 from django.utils import timezone
 from langchain_core.callbacks import BaseCallbackHandler, BaseCallbackManager
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -4093,6 +4094,28 @@ def _retraverse_locked(
         return _not_reached(f"locked re-traverse failed: {type(exc).__name__}")
 
 
+def _claim_mcp_walk(job_id: int) -> None:
+    """[wave-42 T2] Tell browser-service this walk is driving the MCP Chrome.
+
+    The one-shot SSE architecture makes browser-service's client-connected
+    check blind BETWEEN tool calls (each call is a transient connection; the
+    150s+ LLM turns read as idle), so the idle MCP recycle
+    (MCP_IDLE_RECYCLE) needs this explicit walk window — POSTed with the
+    node's whole walk budget + grace as TTL. Best-effort: every failure is
+    swallowed and the recycle then falls back to the in-flight-call check
+    alone (today's behavior, never worse). Fired unconditionally — a
+    browser-service without the endpoint 404s harmlessly.
+    """
+    try:
+        from django.conf import settings
+
+        ttl = int(float(os.environ.get("NAV_TRAVERSE_MAX_TIMEOUT") or 3600)) + 600
+        url = getattr(settings, "BROWSER_SERVICE_URL", "").rstrip("/") + "/mcp/walk-claim"
+        requests.post(url, json={"ttl_s": ttl, "job_id": job_id}, timeout=5)
+    except Exception as exc:
+        logger.debug("walk-claim POST failed (job %s): %s", job_id, exc)
+
+
 def _invoke_navigation_traverse(
     state: ScrapeState, config: RunnableConfig
 ) -> dict[str, Any] | Command:
@@ -4112,6 +4135,10 @@ def _invoke_navigation_traverse(
     query = state.get("search_criteria", "") or ""
 
     _notify_phase(job_id, "browser_traverse", "running")
+    # [wave-42 T2] claim the MCP Chrome for this node's whole budget (walk,
+    # re-traverse, and the navigate_explore fallback all ride it) so the
+    # browser-service idle recycle can never restart under us.
+    _claim_mcp_walk(job_id)
     try:
         from experimental.nav_traversal.traversal import browser_traverse, traverse
 

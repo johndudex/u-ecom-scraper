@@ -37,7 +37,10 @@ from .recycle_policy import (
     BROWSER_PROACTIVE_RECYCLE,
     BROWSER_RECYCLE_RATIO,
     BROWSER_RECYCLE_SUSTAINED_S,
+    MCP_IDLE_RECYCLE,
+    MCP_IDLE_RECYCLE_COOLDOWN_S,
     SustainedPressureTracker,
+    mcp_recycle_due,
 )
 from .render_gate import render_gate_arm, render_gate_note, render_gate_satisfied as _render_gate_satisfied
 from .scraper_runner import run_scraper_script
@@ -1223,6 +1226,12 @@ async def _periodic_cleanup():
             )
         except Exception:
             logger.exception("Periodic Scraper Chrome recycle failed")
+        # [wave-42 T2] idle recycling of the MCP Chrome — flag-off by default;
+        # a no-op until MCP_IDLE_RECYCLE=1 is consciously set.
+        try:
+            await _maybe_recycle_mcp_chrome()
+        except Exception:
+            logger.exception("Periodic MCP Chrome recycle failed")
         # B1-8/H10: Xvfb had no repair path — a dead Xvfb left both headed
         # Chromes "running" against a dead display while every launch failed
         # cryptically. Restart it here; the CDP liveness loop's existing
@@ -1294,6 +1303,69 @@ def _maybe_recycle_scraper_chrome() -> None:
     )
     browser_pool.stop_scraper_chrome()
     _SCRAPER_LAST_BUSY[0] = time.monotonic()
+
+
+# [wave-42 T2] MCP idle-recycle state. The claim window is stamped by
+# /mcp/walk-claim (celery fires it at the top of the traversal node with the
+# node's whole budget as TTL); monotonic() 0.0 = never claimed.
+_MCP_WALK_CLAIMED_UNTIL: list[float] = [0.0]
+_MCP_LAST_RECYCLE: list[float] = [0.0]
+MCP_WALK_CLAIM_MAX_TTL_S = 14400.0  # 4h clamp — far beyond any node budget
+
+
+async def _maybe_recycle_mcp_chrome() -> None:
+    """[wave-42 T2] Idle recycle of the MCP Chrome (flag-off by default).
+
+    The MCP Chrome had NO idle lever — its floor (~250-400MB) plus the
+    never-disposed walk-tab renderers rode the container for its whole life
+    (the bimodal 0.5-2.5GB idle band in the Railway RAM series). With
+    MCP_IDLE_RECYCLE=1 the maintenance cycle restarts it ONLY when the
+    walk-claim window is clear AND no MCP tool call is in flight AND the
+    cooldown has elapsed (mcp_recycle_due). The restart sequence mirrors the
+    CDP-liveness auto-restart exactly (restart_chrome → sleep → MCP
+    re-attach); restart_chrome holds _restart_lock, and a liveness probe
+    landing in the dead window adds 1 of 3 required consecutive failures —
+    well inside tolerance. A tiny decision→restart race window remains (a
+    claim POSTing between the two): the affected walk degrades to the retry
+    ladder, never to a wrong result.
+    """
+    due = await asyncio.get_event_loop().run_in_executor(
+        MAINT_EXECUTOR,
+        _maint_task(
+            "recycle_mcp_decision",
+            lambda: mcp_recycle_due(
+                MCP_IDLE_RECYCLE,
+                _MCP_WALK_CLAIMED_UNTIL[0],
+                time.monotonic(),
+                _MCP_LAST_RECYCLE[0],
+                MCP_IDLE_RECYCLE_COOLDOWN_S,
+                _mcp_client_connected(),
+            ),
+        ),
+    )
+    if not due:
+        return
+    logger.warning(
+        "recycle: MCP Chrome idle (no walk claim, no client, cooldown %.0fs "
+        "elapsed) — restarting + MCP re-attach (wave-42; next walk lands on "
+        "a fresh blank tab)",
+        MCP_IDLE_RECYCLE_COOLDOWN_S,
+    )
+    loop = asyncio.get_event_loop()
+    res = await loop.run_in_executor(RESTART_EXECUTOR, browser_pool.restart_chrome, "mcp")
+    if res.get("errors"):
+        logger.error(
+            "recycle: MCP Chrome restart failed: %s — liveness auto-restart "
+            "remains the backstop", res["errors"],
+        )
+        return
+    _MCP_LAST_RECYCLE[0] = time.monotonic()
+    await asyncio.sleep(2)
+    if not await _start_mcp_process():
+        logger.error(
+            "recycle: MCP process failed to re-attach after idle restart — "
+            "the CDP liveness loop will retry"
+        )
 
 
 def _repair_xvfb() -> bool:
@@ -2323,6 +2395,31 @@ async def restart_cdp(request: RestartCdpRequest):
             result.setdefault("errors", []).append("mcp_restart_failed")
     status_code = 200 if not result.get("errors") else 500
     return JSONResponse(result, status_code=status_code)
+
+
+class WalkClaimRequest(BaseModel):
+    ttl_s: float = Field(0, ge=0)
+    job_id: Optional[int] = None
+
+
+@app.post("/mcp/walk-claim")
+async def mcp_walk_claim(request: WalkClaimRequest):
+    """[wave-42 T2] Declare "a walk is driving the MCP Chrome" for ttl_s.
+
+    The one-shot SSE architecture makes _mcp_client_connected() blind BETWEEN
+    tool calls (each call is a transient connection; the 150s+ LLM turns read
+    as idle) — the idle recycle needs this explicit window to never restart
+    under a live walk. A crashed claimant self-heals when its TTL lapses.
+    Best-effort by contract: the recycle falls back to the live-client check
+    alone if this is never called.
+    """
+    ttl = min(max(request.ttl_s, 0.0), MCP_WALK_CLAIM_MAX_TTL_S)
+    _MCP_WALK_CLAIMED_UNTIL[0] = time.monotonic() + ttl
+    logger.info(
+        "walk-claim: MCP Chrome claimed for %.0fs (job %s)",
+        ttl, request.job_id,
+    )
+    return {"claimed_for_s": ttl}
 
 
 @app.post("/probe")

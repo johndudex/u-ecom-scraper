@@ -31,6 +31,52 @@ BROWSER_RECYCLE_SUSTAINED_S = float(
 )
 
 
+# ── [wave-42 T2] idle MCP-Chrome recycle ─────────────────────────────────
+# The MCP Chrome had NO idle lever (the W37 note above says "never MCP —
+# analyzer/tester sessions ride it"). The idle-memory RCA changed the
+# tradeoff: its floor (~250-400MB) plus the never-disposed walk-tab
+# renderers are the single biggest avoidable slice of the fleet's idle RAM.
+# The hazard that made it "never" was killing a LIVE walk — which the
+# one-shot-SSE architecture made undetectable by connection checks alone
+# (each tool call is a transient connection; the 150s+ LLM turns between
+# calls read as idle). So the decision requires an explicit walk-claim
+# window (celery POSTs /mcp/walk-claim with the node's whole budget as TTL)
+# IN ADDITION to the live-client check. Flag-off keeps prod identical.
+MCP_IDLE_RECYCLE = _env_flag("MCP_IDLE_RECYCLE")
+MCP_IDLE_RECYCLE_COOLDOWN_S = float(
+    os.environ.get("MCP_IDLE_RECYCLE_COOLDOWN_S", "21600")
+)
+
+
+def mcp_recycle_due(
+    flag: bool,
+    claim_until: float,
+    now: float,
+    last_recycle: float,
+    cooldown_s: float,
+    client_connected: bool,
+) -> bool:
+    """True exactly when the idle MCP recycle may fire.
+
+    EVERY guard must hold:
+      - ``flag`` — MCP_IDLE_RECYCLE (default OFF: prod identical until
+        consciously enabled);
+      - ``claim_until`` — no live walk-claim window (a crashed claimant's
+        TTL self-heals when it lapses);
+      - ``client_connected`` — no MCP tool call in flight right now
+        (fail-safe: a connected client always blocks);
+      - ``cooldown_s`` elapsed since the previous recycle (bounds how often
+        the operation is even attempted).
+    """
+    if not flag:
+        return False
+    if claim_until and now < claim_until:
+        return False
+    if client_connected:
+        return False
+    return (now - last_recycle) >= cooldown_s
+
+
 class SustainedPressureTracker:
     """Dwell tracker for "memory has been high for long enough".
 
