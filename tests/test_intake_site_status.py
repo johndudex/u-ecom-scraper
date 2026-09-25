@@ -127,11 +127,13 @@ class TestAggregation:
     def test_first_try_flag_and_success_link(self, admin_client, mixed_history):
         html = admin_client.get(reverse("intake_site_status")).content.decode()
         # a.com/p/1: first-try yes; a.com/p/2: first-try no, success link to
-        # its completed job
+        # its completed job — [wave-42c] in the intake UI (/intake/?job=N),
+        # not the legacy /jobs/ dashboard
         row1 = _row(html, "https://a.com/p/1")
         assert "first-try" in row1
         row2 = _row(html, "https://a.com/p/2")
-        assert "/jobs/" in row2
+        assert "/intake/?job=" in row2
+        assert "/jobs/" not in row2, "success link must not point at legacy UI"
 
 
 class TestCsvExport:
@@ -153,7 +155,10 @@ class TestCsvExport:
         ).first()
         assert by_purl["https://a.com/p/1"][4] == "completed"
         assert by_purl["https://a.com/p/1"][5] == "true"
-        assert by_purl["https://a.com/p/1"][6].endswith(f"/jobs/{first_job.id}/")
+        # [wave-42c] success_job_url = intake dashboard deep-link (absolute)
+        assert by_purl["https://a.com/p/1"][6].endswith(
+            f"/intake/?job={first_job.id}"
+        )
         # retry-then-succeed row: final completed, first-try false
         assert by_purl["https://a.com/p/2"][4] == "completed"
         assert by_purl["https://a.com/p/2"][5] == "false"

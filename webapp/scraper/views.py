@@ -3516,8 +3516,11 @@ def _site_status_rows():
             "final_status": latest.status,
             "attempts": len(js),
             "first_try": js[0].status == ScrapeJob.STATUS_COMPLETED,
+            # [wave-42c] Intake deep-link, not the legacy /jobs/ dashboard —
+            # this URL is both the table's "view job" link and the CSV's
+            # success_job_url column.
             "success_job_url": (
-                reverse("job_detail", args=[success.id]) if success else ""
+                f"{reverse('intake')}?job={success.id}" if success else ""
             ),
             # In-flight products haven't failed yet — only a TERMINAL
             # non-success state (failed/cancelled/blocked) counts.
