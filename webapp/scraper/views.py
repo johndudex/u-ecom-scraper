@@ -763,11 +763,20 @@ def job_restart(request, job_id):
                     "cancel_url": reverse("job_cancel", args=[new_job.id]),
                 }
             )
+        # [wave-42c] The intake status board's Retry posts from=intake_status
+        # (its form must stay POST-only — /restart/ spawns a job per call, a
+        # GET link would fire on prefetch). Land THAT caller back in the
+        # intake UI on the new job's dashboard deep-link; job_detail is the
+        # legacy page. All other non-AJAX callers keep the legacy redirect.
+        if request.POST.get("from") == "intake_status":
+            return redirect(f"{reverse('intake')}?job={new_job.id}")
         return redirect("job_detail", job_id=new_job.id)
     if is_ajax:
         return JsonResponse(
             {"error": "job is not in a restartable state"}, status=409
         )
+    if request.POST.get("from") == "intake_status":
+        return redirect(f"{reverse('intake')}?job={job.id}")
     return redirect("job_detail", job_id=job.id)
 
 

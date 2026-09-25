@@ -119,6 +119,8 @@
         {# POST, never GET: /restart/ spawns a NEW job per call — a prefetched link must not fire one. #}
         <form method="post" action="{% url 'job_restart' r.latest_job_id %}">
           {% csrf_token %}
+          {# from=intake_status → job_restart lands the new job's dashboard in THIS intake UI, not the legacy /jobs/ page. #}
+          <input type="hidden" name="from" value="intake_status">
           <button class="btn btn-sm" type="submit">Retry</button>
         </form>
         {% else %}<span class="muted">&mdash;</span>{% endif %}
