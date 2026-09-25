@@ -238,6 +238,95 @@ class TestCanRetriedLabel:
         assert "never succeeded" not in html
 
 
+class TestRetryableFilter:
+    """[wave-42d] The CAN-BE-RETRIED tile becomes a filter toggle, and the
+    confusing Retry dash gets an honest tooltip. Scope: /intake/status/ only."""
+
+    def test_tile_links_to_filter_when_inactive(self, admin_client, mixed_history):
+        html = admin_client.get(reverse("intake_site_status")).content.decode()
+        assert 'data-summary="never_succeeded"' in html
+        assert 'href="/intake/status/?retryable=1"' in html, (
+            "inactive tile must offer the retryable filter"
+        )
+
+    def test_retryable_shows_only_never_succeeded(self, admin_client, mixed_history):
+        html = admin_client.get(
+            reverse("intake_site_status"), {"retryable": "1"}
+        ).content.decode()
+        assert "https://b.com/p/3" in html, "failed-no-success row stays"
+        assert "https://a.com/p/1" not in html, "completed row filtered out"
+        assert "https://a.com/p/2" not in html, "retry-then-success row filtered out"
+        assert "tile never_succeeded tile-active" in html, "tile shows active state"
+
+    def test_active_tile_toggle_keeps_other_filters(self, admin_client, mixed_history):
+        html = admin_client.get(
+            reverse("intake_site_status"),
+            {"retryable": "1", "status": "failed", "q": "b.com"},
+        ).content.decode()
+        m = re.search(
+            r'class="tile never_succeeded tile-active"[^>]*href="([^"]+)"', html
+        )
+        assert m, "active tile must be a link"
+        href = m.group(1)
+        assert "retryable" not in href, "toggling an active tile drops the filter"
+        assert "status=failed" in href and "q=b.com" in href, (
+            "toggle must preserve the other GET filters"
+        )
+
+    def test_retryable_applies_to_csv(self, admin_client, mixed_history):
+        r = admin_client.get(
+            reverse("intake_site_status"), {"retryable": "1", "format": "csv"}
+        )
+        rows = list(csv.reader(io.StringIO(r.content.decode())))
+        data = rows[1:]
+        assert len(data) == 1, "filters apply to the CSV export too"
+        assert data[0][2] == "https://b.com/p/3"
+
+    def test_summary_tiles_stay_unfiltered(self, admin_client, mixed_history):
+        """Tile counts answer 'how big is the backlog' — not the filtered view."""
+        html = admin_client.get(
+            reverse("intake_site_status"), {"retryable": "1"}
+        ).content.decode()
+        assert 'data-summary="never_succeeded">1<' in html
+
+    def test_failed_with_prior_success_dash_has_tooltip(self, admin_client, mixed_history):
+        """The silent Retry dash on a failed-latest-but-succeeded-before row
+        gets an honest tooltip (has an earlier success — re-run from it)."""
+        _job("https://c.com/p/9", ScrapeJob.STATUS_COMPLETED, "Site C", days_ago=2)
+        _job("https://c.com/p/9", ScrapeJob.STATUS_FAILED, "Site C", days_ago=1)
+        html = admin_client.get(reverse("intake_site_status")).content.decode()
+        row = _row(html, "https://c.com/p/9")
+        assert "earlier run succeeded" in row
+        # the truly-never-succeeded dash (plain muted) is untouched
+        done = _row(html, "https://a.com/p/1")
+        assert "earlier run succeeded" not in done
+
+
+class TestListingColumnTruncation:
+    def test_listing_cell_single_line_with_hover_title(self, admin_client, mixed_history):
+        # mixed_history rows carry no search_criteria — make one that does
+        # (the title attr must mirror the listing value for hover/full-copy)
+        _job("https://c.com/p/8", ScrapeJob.STATUS_FAILED, "Site C", days_ago=1,
+             search_criteria="https://c.com/search?q=shoes")
+        html = admin_client.get(reverse("intake_site_status")).content.decode()
+        row = _row(html, "https://c.com/p/8")
+        assert 'class="url listing" title="https://c.com/search?q=shoes"' in row
+
+    def test_sticky_header_css_present(self):
+        src = open(
+            os.path.join(
+                ROOT, "webapp", "scraper", "templates", "scraper",
+                "intake_site_status.html",
+            )
+        ).read()
+        # sticky th needs z-index to win over cell backgrounds, and the
+        # scroll container must NOT be .tablewrap (overflow there pins the
+        # sticky header to a container that never scrolls vertically).
+        assert "position:sticky" in src
+        assert "z-index" in src.split("position:sticky", 1)[1][:120]
+        assert ".tablewrap" not in src or "overflow-x" not in src.split(".tablewrap", 1)[1][:200]
+
+
 class TestIntakeWiring:
     def test_intake_has_status_button_for_all_logged_in_users(self):
         src = open(

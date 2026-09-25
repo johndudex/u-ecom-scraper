@@ -3553,6 +3553,13 @@ def intake_site_status(request):
             r for r in rows
             if q in r["site_name"].lower() or q in r["product_url"].lower()
         ]
+    # [wave-42d] retryable=1 → only products with no successful run ever
+    # (the same rows that show a Retry button). Composes with status/q and
+    # applies to the CSV export like the other filters. The summary tiles
+    # stay computed over the UNFILTERED set.
+    retryable = request.GET.get("retryable") == "1"
+    if retryable:
+        rows = [r for r in rows if r["never_succeeded"]]
 
     if request.GET.get("format") == "csv":
         response = HttpResponse(content_type="text/csv")
@@ -3573,6 +3580,16 @@ def intake_site_status(request):
     # Summary over the UNFILTERED set — the tiles answer "how big is the
     # backlog" even while the table is filtered.
     all_rows = _site_status_rows()
+
+    # [wave-42d] The CAN-BE-RETRIED tile toggles the filter while preserving
+    # the other GET params (status/q), so it composes with them.
+    _params = request.GET.copy()
+    if retryable:
+        _params.pop("retryable", None)
+    else:
+        _params["retryable"] = "1"
+    _qs = _params.urlencode()
+    retryable_toggle_url = f"{request.path}?{_qs}" if _qs else request.path
     summary = {
         "products": len(all_rows),
         # Real sites, not display-name variants — host-keyed like the rows.
@@ -3600,6 +3617,8 @@ def intake_site_status(request):
             ],
             "sel_status": status,
             "sel_q": q,
+            "sel_retryable": retryable,
+            "retryable_toggle_url": retryable_toggle_url,
             "maintenance": _maintenance_state(),
         },
     )

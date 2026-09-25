@@ -23,6 +23,9 @@
   .btn:hover { background:#f1f5f9; }
   .tiles { display:flex; flex-wrap:wrap; gap:10px; padding:16px 20px; }
   .tile { background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px 14px; min-width:110px; }
+  a.tile { text-decoration:none; color:inherit; display:block; }
+  a.tile:hover { border-color:#94a3b8; }
+  .tile.tile-active { border-color:#b45309; box-shadow:0 0 0 1px #b45309 inset; background:#fffbeb; }
   .tile .num { font-size:22px; font-weight:650; }
   .tile .lbl { font-size:11.5px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
   .tile.completed .num { color:#15803d; }
@@ -31,12 +34,15 @@
   .tile.never_succeeded .num { color:#b45309; }
   form.filters { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:0 20px 14px; }
   form.filters select, form.filters input { padding:6px 8px; border:1px solid var(--line); border-radius:6px; font-size:13px; background:#fff; }
-  .tablewrap { padding:0 20px 40px; overflow-x:auto; }
-  table { border-collapse:collapse; width:100%; background:#fff; border:1px solid var(--line); border-radius:8px; font-size:13px; }
+  {# wave-42d: no overflow wrapper — an overflow-x scroll box here became the scroll ancestor, so the sticky th was pinned inside a container that never scrolls vertically and the header silently stopped sticking. The viewport scrolls; the body scrolls horizontally if the table outruns a narrow window. #}
+  .tablewrap { padding:0 20px 40px; }
+  table { border-collapse:collapse; width:100%; min-width:1080px; background:#fff; border:1px solid var(--line); border-radius:8px; font-size:13px; }
   th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
-  th { background:#f1f5f9; font-size:11.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); position:sticky; top:0; }
+  th { background:#f1f5f9; font-size:11.5px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); position:sticky; top:0; z-index:1; box-shadow:0 1px 0 var(--line); }
   tbody tr:hover { background:#f8fafc; }
   td.url { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; word-break:break-all; max-width:420px; }
+  {# wave-42d: listing/search URLs ran 2-3 wrapped lines and dominated row height — one ellipsised line, full value on hover (title). #}
+  td.listing { white-space:nowrap; max-width:320px; overflow:hidden; text-overflow:ellipsis; }
   .badge { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11.5px; font-weight:600; }
   .badge.first-try { background:#dcfce7; color:#15803d; }
   .status { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11.5px; font-weight:600; background:#e2e8f0; }
@@ -68,7 +74,8 @@
   <div class="tile"><div class="num" data-summary="pending">{{ summary.pending }}</div><div class="lbl">pending</div></div>
   <div class="tile"><div class="num" data-summary="waiting_approval">{{ summary.waiting_approval }}</div><div class="lbl">waiting approval</div></div>
   <div class="tile"><div class="num" data-summary="first_try">{{ summary.first_try }}</div><div class="lbl">first-try</div></div>
-  <div class="tile never_succeeded"><div class="num" data-summary="never_succeeded">{{ summary.never_succeeded }}</div><div class="lbl">can be retried</div></div>
+  {# wave-42d: the actionable tile is a toggle — click to filter the table (and CSV) to never-succeeded rows; click again to clear. Other filters (status/q) ride along. #}
+  <a class="tile never_succeeded{% if sel_retryable %} tile-active{% endif %}" href="{{ retryable_toggle_url }}" title="Show only products with no successful run"><div class="num" data-summary="never_succeeded">{{ summary.never_succeeded }}</div><div class="lbl">can be retried</div></a>
 </section>
 
 <form class="filters" method="get">
@@ -108,7 +115,7 @@
     <tr>
       <td>{{ r.site_name }}</td>
       <td class="url">{{ r.product_url }}</td>
-      <td class="url">{{ r.listing }}</td>
+      <td class="url listing" title="{{ r.listing }}">{{ r.listing }}</td>
       <td><span class="status st-{{ r.final_status }}">{{ r.final_status }}</span></td>
       <td>{{ r.attempts }}</td>
       <td>{% if r.first_try %}<span class="badge first-try">first-try</span>{% else %}<span class="muted">&mdash;</span>{% endif %}</td>
@@ -123,6 +130,7 @@
           <input type="hidden" name="from" value="intake_status">
           <button class="btn btn-sm" type="submit">Retry</button>
         </form>
+        {% elif r.final_status == "failed" and r.success_job_url %}<span class="muted" title="Latest attempt failed, but an earlier run succeeded — re-run from that job's dashboard.">&mdash;</span>
         {% else %}<span class="muted">&mdash;</span>{% endif %}
       </td>
     </tr>
