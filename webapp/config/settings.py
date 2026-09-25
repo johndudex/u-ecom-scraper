@@ -154,6 +154,16 @@ CELERY_TASK_ACKS_LATE = config("CELERY_TASK_ACKS_LATE", default=False, cast=bool
 CELERY_TASK_REJECT_ON_WORKER_LOST = config(
     "CELERY_TASK_REJECT_ON_WORKER_LOST", default=False, cast=bool
 )
+# [wave-42b] Fair scheduling: celery's default prefetch_multiplier=4 pins up to
+# 4 tasks per child process AT RECEIPT. With 20-40 min scrape tasks, tasks
+# pinned to a busy child wait behind it while freshly published (newer) jobs
+# flow to a freed child — jobs added later visibly ran before earlier queued
+# ones (prod RCA 2026-09-25). prefetch=1 makes the pool pull one task per free
+# slot, so execution order tracks submission order. The prefetch buffer buys
+# nothing for tasks this long; broker round-trip cost is negligible.
+CELERY_WORKER_PREFETCH_MULTIPLIER = config(
+    "CELERY_WORKER_PREFETCH_MULTIPLIER", default=1, cast=int
+)
 # [wave-22 A1] Process-level deadline for run_scrape_task. tasks.py bakes
 # these into the @shared_task decorator at import time; before wave-22 the
 # attributes were never defined here, so the documented "tune via settings"
