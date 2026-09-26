@@ -3492,6 +3492,15 @@ def _site_status_rows():
         host = (urlparse(purl).hostname or "").removeprefix("www.")
         groups.setdefault((host, purl), []).append(j)
 
+    # [wave-42e] Terminal anti-bot walls. A row whose LATEST attempt ended in
+    # one of these is a dead end for Retry — it would just walk back into the
+    # same wall — so it is not retryable backlog. It lands in the board's
+    # anti-bot bucket instead (own tile + ?antibot=1 filter, no Retry button).
+    antibot_statuses = frozenset({
+        ScrapeJob.STATUS_CAPTCHA_BLOCKED,
+        ScrapeJob.STATUS_AKAMAI_BLOCKED,
+    })
+
     rows = []
     in_flight = {
         ScrapeJob.STATUS_RUNNING,
@@ -3523,8 +3532,15 @@ def _site_status_rows():
                 f"{reverse('intake')}?job={success.id}" if success else ""
             ),
             # In-flight products haven't failed yet — only a TERMINAL
-            # non-success state (failed/cancelled/blocked) counts.
-            "never_succeeded": success is None and latest.status not in in_flight,
+            # non-success state (failed/cancelled/blocked) counts. A walled
+            # latest attempt is terminal but NOT backlog: it moves to the
+            # anti-bot bucket [wave-42e] instead of staying retryable.
+            "anti_bot": success is None and latest.status in antibot_statuses,
+            "never_succeeded": (
+                success is None
+                and latest.status not in in_flight
+                and latest.status not in antibot_statuses
+            ),
             "latest_job_id": latest.id,
             "last_activity": (
                 latest.completed_at or latest.started_at or latest.created_at
@@ -3561,6 +3577,13 @@ def intake_site_status(request):
     if retryable:
         rows = [r for r in rows if r["never_succeeded"]]
 
+    # [wave-42e] antibot=1 → only products whose LATEST attempt hit a
+    # captcha/akamai wall. Composes with status/q/retryable (disjoint from
+    # retryable by construction) and applies to the CSV like the others.
+    antibot = request.GET.get("antibot") == "1"
+    if antibot:
+        rows = [r for r in rows if r["anti_bot"]]
+
     if request.GET.get("format") == "csv":
         response = HttpResponse(content_type="text/csv")
         response["Content-Disposition"] = 'attachment; filename="prod_job_status_by_site_product.csv"'
@@ -3590,12 +3613,24 @@ def intake_site_status(request):
         _params["retryable"] = "1"
     _qs = _params.urlencode()
     retryable_toggle_url = f"{request.path}?{_qs}" if _qs else request.path
+
+    # [wave-42e] The ANTI-BOT tile toggles the same way (preserves status/q/
+    # retryable), so the two toggles compose in either order.
+    _params = request.GET.copy()
+    if antibot:
+        _params.pop("antibot", None)
+    else:
+        _params["antibot"] = "1"
+    _qs = _params.urlencode()
+    antibot_toggle_url = f"{request.path}?{_qs}" if _qs else request.path
+
     summary = {
         "products": len(all_rows),
         # Real sites, not display-name variants — host-keyed like the rows.
         "sites": len({r["host"] for r in all_rows}),
         "first_try": sum(1 for r in all_rows if r["first_try"]),
         "never_succeeded": sum(1 for r in all_rows if r["never_succeeded"]),
+        "antibot": sum(1 for r in all_rows if r["anti_bot"]),
     }
     for s in (
         ScrapeJob.STATUS_COMPLETED, ScrapeJob.STATUS_FAILED,
@@ -3619,6 +3654,8 @@ def intake_site_status(request):
             "sel_q": q,
             "sel_retryable": retryable,
             "retryable_toggle_url": retryable_toggle_url,
+            "sel_antibot": antibot,
+            "antibot_toggle_url": antibot_toggle_url,
             "maintenance": _maintenance_state(),
         },
     )

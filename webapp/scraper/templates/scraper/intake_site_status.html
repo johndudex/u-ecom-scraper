@@ -32,6 +32,7 @@
   .tile.failed .num { color:#b91c1c; }
   .tile.running .num { color:#1d4ed8; }
   .tile.never_succeeded .num { color:#b45309; }
+  .tile.antibot .num { color:#c2410c; }
   form.filters { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:0 20px 14px; }
   form.filters select, form.filters input { padding:6px 8px; border:1px solid var(--line); border-radius:6px; font-size:13px; background:#fff; }
   {# wave-42d: no overflow wrapper — an overflow-x scroll box here became the scroll ancestor, so the sticky th was pinned inside a container that never scrolls vertically and the header silently stopped sticking. The viewport scrolls; the body scrolls horizontally if the table outruns a narrow window. #}
@@ -76,6 +77,7 @@
   <div class="tile"><div class="num" data-summary="first_try">{{ summary.first_try }}</div><div class="lbl">first-try</div></div>
   {# wave-42d: the actionable tile is a toggle — click to filter the table (and CSV) to never-succeeded rows; click again to clear. Other filters (status/q) ride along. #}
   <a class="tile never_succeeded{% if sel_retryable %} tile-active{% endif %}" href="{{ retryable_toggle_url }}" title="Show only products with no successful run"><div class="num" data-summary="never_succeeded">{{ summary.never_succeeded }}</div><div class="lbl">can be retried</div></a>
+  <a class="tile antibot{% if sel_antibot %} tile-active{% endif %}" href="{{ antibot_toggle_url }}" title="Show only products whose latest attempt hit a captcha/Akamai wall — Retry would just walk into the same wall"><div class="num" data-summary="antibot">{{ summary.antibot }}</div><div class="lbl">anti-bot</div></a>
 </section>
 
 <form class="filters" method="get">
