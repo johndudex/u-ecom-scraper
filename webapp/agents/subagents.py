@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 # ── Temperature mapping from .opencode/agents/*.md frontmatter ──────────────
 
+
 # Per-agent sampling temperatures (Phase 5: configurable for A/B determinism).
 # When LLM_CODEGEN_DETERMINISTIC is True, code-writer + product-analyzer are
 # forced to temperature 0 to narrow the codegen distribution (NOTE: z.ai does
@@ -61,7 +62,9 @@ def _agent_temperatures() -> dict[str, float]:
 
         # Per-agent env overrides: CODE_WRITER_TEMP etc.
         for stem in list(base):
-            env_val = getattr(settings, f"AGENT_TEMP_{stem.upper().replace('-', '_')}", None)
+            env_val = getattr(
+                settings, f"AGENT_TEMP_{stem.upper().replace('-', '_')}", None
+            )
             if env_val is not None:
                 base[stem] = float(env_val)
         if getattr(settings, "LLM_CODEGEN_DETERMINISTIC", False):
@@ -274,9 +277,7 @@ def _mr_has_verdict(mr: object) -> bool:
     return False
 
 
-def _suppress_mechanism_reassessment(
-    mr: object, scraper_analysis: object
-) -> bool:
+def _suppress_mechanism_reassessment(mr: object, scraper_analysis: object) -> bool:
     """T1.5 (I7): decide whether the mechanism_reassessment block is injected.
 
     DEFAULT is render — resumed jobs and any run where scraper_analysis is
@@ -404,12 +405,25 @@ def _summarize_product_analysis(
     lines = ["\n### Product Analysis (COMPLETE summary — do NOT read the file)\n"]
     # Per-field extraction map (compact). Cap at core + top-12 non-core to keep
     # the generated scraper concise (35+ fields → 972-line scraper blows up context).
-    _CORE_FIELDS = {"title", "price", "url", "src_url", "company", "location",
-                    "description", "posted_date", "salary", "job_id", "availability",
-                    "currency", "employment_type", "specialty", "profession"}
+    _CORE_FIELDS = {
+        "title",
+        "price",
+        "url",
+        "src_url",
+        "company",
+        "location",
+        "description",
+        "posted_date",
+        "salary",
+        "job_id",
+        "availability",
+        "currency",
+        "employment_type",
+        "specialty",
+        "profession",
+    }
     _sorted_fields = sorted(
-        fields.items(),
-        key=lambda kv: (0 if kv[0] in _CORE_FIELDS else 1, kv[0])
+        fields.items(), key=lambda kv: (0 if kv[0] in _CORE_FIELDS else 1, kv[0])
     )
     _shown = 0
     _MAX_FIELDS = 15
@@ -419,7 +433,11 @@ def _summarize_product_analysis(
         # non-core entries (e.g. ratings on an API-fed site) the core-first
         # cap would silently drop, and the api_path/notes this loop renders
         # are the only place code_writer sees how to read them.
-        if _shown >= _MAX_FIELDS and name not in _CORE_FIELDS and not _is_api_field(info):
+        if (
+            _shown >= _MAX_FIELDS
+            and name not in _CORE_FIELDS
+            and not _is_api_field(info)
+        ):
             continue
         _shown += 1
         if not isinstance(info, dict):
@@ -468,9 +486,7 @@ def _summarize_product_analysis(
         # or a PROVEN-DEAD source would suppress the honesty marker.
         try:
             _has_example = bool(
-                info.get("example")
-                or info.get("examples")
-                or info.get("sample_value")
+                info.get("example") or info.get("examples") or info.get("sample_value")
             )
             _tested_raw = info.get("tested")
             if isinstance(_tested_raw, str):
@@ -573,7 +589,9 @@ def _summarize_navigation_extras(na: dict) -> str:
     return ("\n" + "\n".join(lines) + "\n") if lines else ""
 
 
-def _embedded_json_listing_urls(navigation_analysis: dict, limit: int = 15) -> list[str]:
+def _embedded_json_listing_urls(
+    navigation_analysis: dict, limit: int = 15
+) -> list[str]:
     """Listing/category URLs to fetch for the embedded-JSON model (deduped)."""
     na = navigation_analysis or {}
     urls: list[str] = []
@@ -745,7 +763,9 @@ def _get_skill_descriptions() -> str:
     )
 
 
-def _append_skill_descriptions(system_prompt: str, tool_names: set[str] | None = None) -> str:
+def _append_skill_descriptions(
+    system_prompt: str, tool_names: set[str] | None = None
+) -> str:
     """Append skill discovery section to the agent system prompt.
 
     [wave-29 A3] When ``tool_names`` is given, the blurb is attached ONLY if
@@ -783,12 +803,17 @@ def create_nav_skill_review(site_slug: str = "") -> object:
 
 
 def create_code_writer(
-    site_slug: str = "", template_code: str = "", embed_mode: str = "",
+    site_slug: str = "",
+    template_code: str = "",
+    embed_mode: str = "",
     embed_kind: str = "",
 ) -> object:
     return _build_agent(
-        "code_writer", site_slug=site_slug, template_code=template_code,
-        embed_mode=embed_mode, embed_kind=embed_kind,
+        "code_writer",
+        site_slug=site_slug,
+        template_code=template_code,
+        embed_mode=embed_mode,
+        embed_kind=embed_kind,
     )
 
 
@@ -901,9 +926,10 @@ def _make_pre_model_hook(embed_chars: int = 0):
             for m in messages
         )
         logger.info(
-            "[WRITER-TURN] pre-model input: msgs=%d chars=%s embed=%s "
-            "total=%s",
-            len(messages), f"{_in_total:,}", f"{embed_chars:,}",
+            "[WRITER-TURN] pre-model input: msgs=%d chars=%s embed=%s total=%s",
+            len(messages),
+            f"{_in_total:,}",
+            f"{embed_chars:,}",
             f"{_in_total + embed_chars:,}",
         )
 
@@ -956,7 +982,10 @@ def _make_pre_model_hook(embed_chars: int = 0):
                 logger.info(
                     "truncate: deterministically trimmed oversized messages "
                     "(%d → %d chars, embed=%d, total=%d, budget=%d)",
-                    before_total, total, embed_chars, total + embed_chars,
+                    before_total,
+                    total,
+                    embed_chars,
+                    total + embed_chars,
                     max_chars,
                 )
             return {"llm_input_messages": trimmed}
@@ -964,10 +993,14 @@ def _make_pre_model_hook(embed_chars: int = 0):
         # Step 2: still over budget — keep system + seed + recent N.
         system_msgs = [m for m in trimmed if hasattr(m, "type") and m.type == "system"]
         other = [m for m in trimmed if not (hasattr(m, "type") and m.type == "system")]
-        kept_recent = other[-_MIN_KEEP_RECENT:] if len(other) > _MIN_KEEP_RECENT else list(other)
+        kept_recent = (
+            other[-_MIN_KEEP_RECENT:] if len(other) > _MIN_KEEP_RECENT else list(other)
+        )
 
         budget = max(
-            max_chars - embed_chars - sum(_clen(m) for m in system_msgs)
+            max_chars
+            - embed_chars
+            - sum(_clen(m) for m in system_msgs)
             - (_clen(seed) if seed is not None else 0),
             0,
         )  # [wave-25e E3] embed reserved alongside the seed
@@ -996,7 +1029,7 @@ def _make_pre_model_hook(embed_chars: int = 0):
                     pair_safe.append(m)
                 # else: orphaned ToolMessage — drop
             else:
-                for tc in (getattr(m, "tool_calls", None) or []):
+                for tc in getattr(m, "tool_calls", None) or []:
                     if isinstance(tc, dict) and tc.get("id"):
                         opened.add(tc["id"])
                 pair_safe.append(m)
@@ -1005,8 +1038,13 @@ def _make_pre_model_hook(embed_chars: int = 0):
         logger.info(
             "Truncated messages: %d → %d (was %d chars, budget %d, "
             "embed=%d, total=%d, seed_retained=%s)",
-            len(messages), len(kept), total, budget, embed_chars,
-            total + embed_chars, seed is not None,
+            len(messages),
+            len(kept),
+            total,
+            budget,
+            embed_chars,
+            total + embed_chars,
+            seed is not None,
         )
         return {"llm_input_messages": kept}
 
@@ -1016,7 +1054,6 @@ def _make_pre_model_hook(embed_chars: int = 0):
 # [wave-25e E3] the legacy single-arg entry point IS the zero-embed
 # instance — every existing call site and fixture is unchanged.
 _truncate_messages = _make_pre_model_hook(0)
-
 
 
 def _embed_template(system_prompt: str, template_code: str) -> str:
@@ -1041,9 +1078,7 @@ def _embed_template(system_prompt: str, template_code: str) -> str:
         "`from src.discovery import ...` line, the `discover_item_urls(...)` call, "
         "the argparse, and the env-var gate UNCHANGED. Do NOT define "
         "`_click_load_more`, `_get_next_page_url`, or any pagination loop inline.\n\n"
-        "```python\n"
-        + template_code
-        + "\n```\n"
+        "```python\n" + template_code + "\n```\n"
         "NOTE: the template above is embedded in this prompt — do NOT "
         "read_file templates/*.py; that path does not exist in this container.\n"
     )
@@ -1097,8 +1132,12 @@ def _embed_map_max_chars() -> int:
 
 
 def _build_agent(
-    agent_name: str, site_slug: str = "", use_create_agent: bool = False,
-    template_code: str = "", embed_mode: str = "", embed_kind: str = "",
+    agent_name: str,
+    site_slug: str = "",
+    use_create_agent: bool = False,
+    template_code: str = "",
+    embed_mode: str = "",
+    embed_kind: str = "",
 ) -> object:
     prompt_stem = AGENT_PROMPT_MAP[agent_name]
     temperature = AGENT_TEMPERATURES[prompt_stem]
@@ -1133,8 +1172,12 @@ def _build_agent(
     _resolved_mode = _resolve_embed_mode(embed_mode)
     _pre_embed_len = len(system_prompt)
     system_prompt = render_writer_embed(
-        system_prompt, template_code,
-        mode=_resolved_mode, slug=site_slug, head=_head, tail=_tail,
+        system_prompt,
+        template_code,
+        mode=_resolved_mode,
+        slug=site_slug,
+        head=_head,
+        tail=_tail,
         map_max_chars=_embed_map_max_chars(),
     )
     # [wave-25e E0] Measure the embed + the final prompt. The numbers ride
@@ -1155,8 +1198,11 @@ def _build_agent(
         logger.info(
             "[WRITER-EMBED] agent=%s mode=%s template=%s embed=%s "
             "system_prompt=%s chars",
-            agent_name, _resolved_mode, _embed_stats["template"],
-            f"{_embed_chars:,}", f"{len(system_prompt):,}",
+            agent_name,
+            _resolved_mode,
+            _embed_stats["template"],
+            f"{_embed_chars:,}",
+            f"{len(system_prompt):,}",
         )
 
     if not _has_playwright_tools(tools):
@@ -1201,14 +1247,18 @@ def _build_agent(
         from langchain.agents import create_agent
 
         agent = create_agent(
-            model=llm, tools=tools, system_prompt=system_prompt,
+            model=llm,
+            tools=tools,
+            system_prompt=system_prompt,
         )
         logger.info("Created agent '%s' via create_agent (v1 path)", agent_name)
     else:
         # [wave-25e E3] the embed counts against this agent's truncation
         # budget (0 for every agent without a template embed).
         agent = create_react_agent(
-            llm, tools=tools, prompt=system_prompt,
+            llm,
+            tools=tools,
+            prompt=system_prompt,
             pre_model_hook=_make_pre_model_hook(_embed_chars),
         )
     try:
@@ -1420,10 +1470,12 @@ def _get_tools_sync(agent_name: str, workspace_scope: str = "") -> list:
             # 8 agents share get_filesystem_tools and none of the others
             # draft code. [wave-40 T7] the helper CALL-signature gate rides
             # the same seam inside _f821_rejections — no extra plumbing here.
-            tools.extend(_gft(
-                workspace_scope=workspace_scope or None,
-                syntax_gate=(agent_name == "code_writer"),
-            ))
+            tools.extend(
+                _gft(
+                    workspace_scope=workspace_scope or None,
+                    syntax_gate=(agent_name == "code_writer"),
+                )
+            )
         except Exception as exc:
             logger.error(
                 "Failed to load filesystem tools for '%s': %s", agent_name, exc
@@ -1457,9 +1509,7 @@ def _get_tools_sync(agent_name: str, workspace_scope: str = "") -> list:
     # the production-dead async get_tools_for_agent ever wired them. Every
     # nav_skill_review run since the FM migration was a no-op write-side
     # (shared-data/skills/_audit.jsonl: zero production appends).
-    needs_skill_write = (
-        "learn_skill" in requested or "create_new_skill" in requested
-    )
+    needs_skill_write = "learn_skill" in requested or "create_new_skill" in requested
     if needs_skill_write:
         try:
             from .tools.skill_tools import get_skill_write_tools as _gswt
@@ -1639,9 +1689,7 @@ def apply_anti_read_nudge(tools: list, threshold: int | None = None) -> list:
                 and isinstance(result, str)
                 and "READ-BUDGET" not in result
             ):
-                result = result + _ANTI_READ_NUDGE_TEXT.format(
-                    calls=state["reads"]
-                )
+                result = result + _ANTI_READ_NUDGE_TEXT.format(calls=state["reads"])
             return result
 
         return wrapper
@@ -2068,9 +2116,7 @@ def _project_jsonld(node, _depth: int = 0) -> str:
         if isinstance(v, dict) and _depth < 2:
             lines.append(f"{k}: {{{_project_jsonld(v, _depth + 1)}}}")
         elif isinstance(v, list) and v and isinstance(v[0], dict) and _depth < 2:
-            lines.append(
-                f"{k}: [{_project_jsonld(v[0], _depth + 1)}] (len={len(v)})"
-            )
+            lines.append(f"{k}: [{_project_jsonld(v[0], _depth + 1)}] (len={len(v)})")
         else:
             s = v if isinstance(v, str) else json.dumps(v, default=str)
             lines.append(f"{k}: {str(s)[:_JSONLD_SAMPLE]}")
@@ -2121,7 +2167,8 @@ def _fetch_rendered_jsonld(url: str) -> str:
     html = data.get("html", "") or ""
     blocks = re.findall(
         r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html, re.DOTALL | re.IGNORECASE,
+        html,
+        re.DOTALL | re.IGNORECASE,
     )
     out = []
     for b in blocks[:6]:
@@ -2143,15 +2190,24 @@ def _fetch_rendered_jsonld(url: str) -> str:
     # agent enough to map fields WITHOUT browsing (which blows the 15-min budget).
     def _first(pat):
         m = re.search(pat, html, re.IGNORECASE | re.DOTALL)
-        return (m.group(1).strip()[:200] if m else "")
+        return m.group(1).strip()[:200] if m else ""
 
     title = _first(r"<title[^>]*>(.*?)</title>")
     h1 = _first(r"<h1[^>]*>(.*?)</h1>")
-    desc = _first(r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']') or _first(
+    desc = _first(
+        r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']'
+    ) or _first(
         r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\'](.*?)["\']'
     )
-    og_title = _first(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\'](.*?)["\']')
-    text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", html, flags=re.IGNORECASE | re.DOTALL)
+    og_title = _first(
+        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\'](.*?)["\']'
+    )
+    text = re.sub(
+        r"<script.*?</script>|<style.*?</style>",
+        " ",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     dom = (
@@ -2225,7 +2281,9 @@ def _user_requirements_section(state: dict) -> str:
     notes = (state.get("user_notes") or "").strip()
     parts: list[str] = []
     if target_fields:
-        parts.append("Fields requested by the user: " + ", ".join(map(str, target_fields)))
+        parts.append(
+            "Fields requested by the user: " + ", ".join(map(str, target_fields))
+        )
         parts.extend(_mapping_narrative_lines(state))
     if notes:
         parts.append("User notes: " + notes)
@@ -2275,7 +2333,9 @@ def _field_guidance_section(state: dict) -> str:
     lines = [
         f"- {name}: {notes[name]}"
         for name in list(notes)[:100]
-        if isinstance(name, str) and isinstance(notes[name], str) and notes[name].strip()
+        if isinstance(name, str)
+        and isinstance(notes[name], str)
+        and notes[name].strip()
     ]
     if not lines:
         return ""
@@ -2309,7 +2369,9 @@ def _nested_schema_section(state: dict) -> str:
     if not tree:
         return ""
     lines = ["### Nested Schema — PRESERVE STRUCTURE"]
-    lines.append("The user's schema contains nested fields. Emit each in the EXACT shape below:")
+    lines.append(
+        "The user's schema contains nested fields. Emit each in the EXACT shape below:"
+    )
     for name, node in tree.items():
         lines.extend(_render_nested_node(name, node, ""))
     lines.append(
@@ -2351,7 +2413,8 @@ def _remap_sample_urls(state: dict, slug: str, limit: int = 5) -> list[str]:
             ws = os.path.join(root, "workspace", slug)
             outs = sorted(
                 [
-                    f for f in (os.listdir(ws) if os.path.isdir(ws) else [])
+                    f
+                    for f in (os.listdir(ws) if os.path.isdir(ws) else [])
                     if f.startswith("output_") and f.endswith(".json")
                 ],
                 key=lambda f: os.path.getmtime(os.path.join(ws, f)),
@@ -2511,10 +2574,14 @@ def build_product_analyzer_message(state: dict) -> list:
     # route_after_testing when test_report.remediiation.target == "mapping".
     remap_context = ""
     test_report = state.get("test_report") or {}
-    remediation = test_report.get("remediation") if isinstance(test_report, dict) else None
+    remediation = (
+        test_report.get("remediation") if isinstance(test_report, dict) else None
+    )
     failed_fields: list[str] = []
     if isinstance(remediation, dict) and remediation.get("target") == "mapping":
-        failed_fields = [f for f in (remediation.get("fields") or []) if isinstance(f, str)]
+        failed_fields = [
+            f for f in (remediation.get("fields") or []) if isinstance(f, str)
+        ]
         fields_str = ", ".join(failed_fields) or "(unspecified)"
         # [T3.13d] Hand the remap the URLs the failed run actually touched —
         # ``results.sample_products`` is never populated (not in code_tester's
@@ -2526,9 +2593,7 @@ def build_product_analyzer_message(state: dict) -> list:
             _remap_urls_block = (
                 "URLs from the failed run — verify each re-mapped field against 2-3 of "
                 "these REAL URLs (probe or ONE httpx fetch), not just the original "
-                "sample page:\n"
-                + "\n".join(f"  - {u}" for u in _remap_urls)
-                + "\n"
+                "sample page:\n" + "\n".join(f"  - {u}" for u in _remap_urls) + "\n"
             )
         remap_context = (
             f"\n### CRITICAL — RE-MAP FAILED FIELDS (mapping-failure recovery)\n"
@@ -2552,14 +2617,17 @@ def build_product_analyzer_message(state: dict) -> list:
     # browser). Otherwise it's just a hint.
     api_hint = ""
     nav_analysis = state.get("navigation_analysis") or {}
-    api_endpoint = nav_analysis.get("api_endpoint") if isinstance(nav_analysis, dict) else None
+    api_endpoint = (
+        nav_analysis.get("api_endpoint") if isinstance(nav_analysis, dict) else None
+    )
     api_endpoint = api_endpoint if isinstance(api_endpoint, dict) else {}
     api_url = api_endpoint.get("url")
     if api_url and nav_analysis.get("data_source") == "api":
         sample = _fetch_api_sample(api_url)
         sample_block = (
             f"\nSample record from the API (map fields from THIS):\n```json\n{sample}\n```\n"
-            if sample else ""
+            if sample
+            else ""
         )
         api_hint = (
             f"\n### ★ DATA SOURCE = BACKEND JSON API (primary) ★\n"
@@ -3102,12 +3170,7 @@ def _summarize_test_report(state: dict) -> str:
         # probe-crash bounce render as "`?`: <empty>" until now). Read all
         # three keys; deterministic inserts carry message+description both.
         def _issue_text(i: dict) -> str:
-            return (
-                i.get("description")
-                or i.get("message")
-                or i.get("problem")
-                or ""
-            )
+            return i.get("description") or i.get("message") or i.get("problem") or ""
 
         high = [i for i in issues if i.get("severity") == "high"]
         medium = [i for i in issues if i.get("severity") == "medium"]
@@ -3140,11 +3203,7 @@ def _summarize_test_report(state: dict) -> str:
         # Relay CLI-contract issues verbatim (Edit 7): the marker-prefixed
         # bounce must reach the next code_writer message intact so the fix
         # instruction's vocabulary matches the guard's.
-        _marked = [
-            i
-            for i in issues
-            if "CLI CONTRACT VIOLATION" in _issue_text(i)
-        ]
+        _marked = [i for i in issues if "CLI CONTRACT VIOLATION" in _issue_text(i)]
         if _marked:
             lines.append(
                 "\n**⚠️ CLI CONTRACT VIOLATION — targeted argparse fix, do NOT "
@@ -3192,7 +3251,9 @@ def _summarize_test_report(state: dict) -> str:
                 or ""
             )
     try:
-        _t3_items = int((report.get("results") or {}).get("successful_extractions") or 0)
+        _t3_items = int(
+            (report.get("results") or {}).get("successful_extractions") or 0
+        )
     except (TypeError, ValueError):
         _t3_items = 0
     if (
@@ -3204,7 +3265,7 @@ def _summarize_test_report(state: dict) -> str:
         lines.append(
             "\n**⚠️ GOTCHA — PORT BROWSER-JS TO PURE-PYTHON PARSING** (pages "
             "fetched healthy — no crash — yet zero items extracted: the "
-            "parser is inert). Parse `<script type=\"application/ld+json\">` "
+            'parser is inert). Parse `<script type="application/ld+json">` '
             "blocks with `json.loads` and plain dict/list traversal. Do NOT "
             "paste JavaScript expressions from the analyzer verbatim — they "
             "are JS, not Python. NEVER swallow parse exceptions "
@@ -3305,8 +3366,10 @@ def _summarize_test_report(state: dict) -> str:
     if retry_count > 0 and retry_count != FINAL_RETRY_SENTINEL:
         lines.append(f"\n*{retry_count} previous attempt(s) failed.*")
     elif retry_count == FINAL_RETRY_SENTINEL:
-        lines.append("\n*This is the FINAL retry attempt based on user feedback. "
-                      "If this does not pass, the job will end.*")
+        lines.append(
+            "\n*This is the FINAL retry attempt based on user feedback. "
+            "If this does not pass, the job will end.*"
+        )
     # [wave-29 B5] Cross-job memory (the load-bearing surface): when this
     # failure's structural fingerprint matches a prior job's FM entry, say
     # so in the retry slot — the one injection point with proven behavioral
@@ -3366,9 +3429,7 @@ def _render_verified_selectors(scraper_analysis: dict) -> str:
         if note:
             lines.append(f"    Note: {note}")
     return (
-        "\n### Verified Selectors (from scraper_analyzer)\n"
-        + "\n".join(lines)
-        + "\n"
+        "\n### Verified Selectors (from scraper_analyzer)\n" + "\n".join(lines) + "\n"
     )
 
 
@@ -3401,9 +3462,7 @@ def _render_critical_fix(scraper_analysis: dict) -> str:
             "A previous scraper attempt crashed with a KNOWN, DOCUMENTED defect. "
             "You MUST apply the fix below. Reproducing the same defect will fail. "
             "Pay special attention to any selector marked as non-existent — it "
-            "MUST NOT appear in your code.\n"
-            + "\n".join(cf_lines)
-            + "\n"
+            "MUST NOT appear in your code.\n" + "\n".join(cf_lines) + "\n"
         )
     if isinstance(retry_adj, dict) and retry_adj:
         ra_changes = retry_adj.get("changes_made") or []
@@ -3475,13 +3534,116 @@ def _checkpoint_discovery_section(state: dict) -> str:
 # [wave-29 C1] platform → detection-skill mapping for learned-section
 # surfacing (matched as substring, case-insensitive, against site_analysis
 # platform values like "shopify", "Salesforce Commerce Cloud SFCC", ...).
+# [wave-43 §4.1 → wave-45b] Platform skill map — magento/netsuite/
+# suitecommerce added by wave-43. Originally gated behind
+# WAVE43_TIER3_SKILL_INJECTION for local-only development; the env gate was
+# REMOVED (owner call: an env var is not a proper switch — the reviewed
+# merge/deploy is the switch, revert the commit to disable). Substring
+# matching is naive ("magento" occurs inside "custom (... no shopify/
+# magento/sfcc markers)"), so matching rejects a key whose occurrence sits
+# in a "no <word> key" negation list (_negation_guard).
 _PLATFORM_SKILLS = {
     "shopify": "shopify-detection",
     "sfcc": "sfcc-detection",
     "algolia": "algolia-detection",
     "amazon": "amazon-detection",
     "kibo": "kibo-detection",
+    "magento": "magento-detection",
+    "netsuite": "netsuite-detection",
+    "suitecommerce": "netsuite-detection",
+    # [wave-46] The four homeless harvest families (docs/plans/
+    # wave46-harvest2-plan.md §4) — verdicts for these usually say
+    # "custom", so the wave-45 host hints below carry the real signal.
+    "sap": "sap-hybris-detection",
+    "hybris": "sap-hybris-detection",
+    "spartacus": "sap-hybris-detection",
+    "bigcommerce": "bigcommerce-detection",
+    "stencil": "bigcommerce-detection",
+    "thg": "thg-ingenuity-detection",
+    "fanatics": "fanatics-commerce-detection",
 }
+_CROSSCUTTING_SKILLS = (
+    "output-schema-integrity",
+    "variant-availability",  # [wave-46 §2] per-variant truth, every job
+)
+# [wave-46 §6] Mode-gated Tier-2 reader: navigation lessons are noise on
+# url_list PDP jobs; inject only when the job must discover URLs.
+_NAVIGATION_MODES = ("navigation", "list_page", "search_term")
+_TIER2_MODEGATED_SKILL = "navigation-patterns"
+
+
+def _negation_guard(keyword: str, platform_lower: str) -> bool:
+    """True when the keyword's occurrence sits in a 'no ...' negation list
+    (one word / slash-list after 'no' — covers the harvest's real verdict
+    'custom (server-rendered ecommerce, no shopify/magento/sfcc markers)')."""
+    return bool(re.search(rf"\bno\s+[a-z0-9/_-]*{re.escape(keyword)}", platform_lower))
+
+
+def _learned_notes_block(skill: str) -> str:
+    header = (
+        f"\n### LEARNED SKILL NOTES (from `{skill}`, newest first — "
+        "curated by post-run review; apply when relevant)\n"
+    )
+    return header
+
+
+def _site_platform(site_analysis: dict, extra_urls: list | None = None) -> str:
+    """Lowercased platform from site_analysis — flat first, then the nested
+    ``site.platform`` the LLM site_analyzer actually emits (job 453: the flat
+    read missed it entirely, killing the platform channel).
+
+    [wave-45] When extra_urls are given (see the caller in
+    _platform_distillation), deterministic URL evidence appends hint words:
+    the LLM labels generic platforms "custom" (job 460 amazon.ie →
+    "platform: custom", job 404 fanatics → "custom (Kibo-family offers
+    shape)"), which starves the platform-skill map. Hints never override a
+    verdict word — they only add to it, so the negation guard still wins.
+    """
+    if not isinstance(site_analysis, dict):
+        return ""
+    verdict = str(
+        site_analysis.get("platform")
+        or (site_analysis.get("site") or {}).get("platform")
+        or ""
+    ).lower()
+    if extra_urls:
+        hints = _platform_hints(extra_urls)
+        if hints:
+            return verdict + " " + " ".join(hints)
+    return verdict
+
+
+# [wave-45] URL-evidence → platform hint word. Host regex refuses lookalikes
+# (notamazon-shop.com, amazonwatch.org) via the preceding char check.
+_AMAZON_HOST_RE = re.compile(r"(?<![\w-])amazon\.[a-z]{2,3}(?:\.[a-z]{2})?", re.I)
+# Kibo-family PDP slugs (harvest job 404, fanatics): o-<id>+t-<id>+p-<id>
+_KIBO_SLUG_RE = re.compile(r"\bo-\d+\+t-\d+\+p-\d+", re.I)
+# [wave-46 §4] Asset-host tells for the homeless families — verdicts say
+# "custom" for all three, the CDNs don't.
+_BIGCOMMERCE_HOST_RE = re.compile(r"(?<![\w-])bigcommerce\.com", re.I)
+_THG_HOST_RE = re.compile(r"(?<![\w-])(?:thcdn\.com|thehut\.(?:net|com))", re.I)
+_FANATICS_HOST_RE = re.compile(
+    r"(?<![\w-])fanatics\.[a-z]{2,3}(?:\.[a-z]{2})?", re.I
+)
+
+
+def _platform_hints(urls: list) -> list:
+    hints: list = []
+    for u in urls:
+        text = str(u or "")
+        if not text:
+            continue
+        if _AMAZON_HOST_RE.search(text):
+            hints.append("amazon")
+        if _KIBO_SLUG_RE.search(text):
+            hints.append("kibo")
+        if _BIGCOMMERCE_HOST_RE.search(text):
+            hints.append("bigcommerce")
+        if _THG_HOST_RE.search(text):
+            hints.append("thg")
+        if _FANATICS_HOST_RE.search(text):
+            hints.append("fanatics")
+    return list(dict.fromkeys(hints))
 
 
 def _platform_distillation(state: dict) -> str:
@@ -3493,17 +3655,25 @@ def _platform_distillation(state: dict) -> str:
     (``skills_section = ""``): 25KB/skill looped the writer; this is ~1KB and
     never guesses (every line comes from an artifact, "" when absent).
     """
-    site_analysis = state.get("site_analysis") if isinstance(
-        state.get("site_analysis"), dict
-    ) else {}
-    nav = state.get("navigation_analysis") if isinstance(
-        state.get("navigation_analysis"), dict
-    ) else {}
-    scraper_analysis = state.get("scraper_analysis") if isinstance(
-        state.get("scraper_analysis"), dict
-    ) else {}
+    site_analysis = (
+        state.get("site_analysis")
+        if isinstance(state.get("site_analysis"), dict)
+        else {}
+    )
+    nav = (
+        state.get("navigation_analysis")
+        if isinstance(state.get("navigation_analysis"), dict)
+        else {}
+    )
+    scraper_analysis = (
+        state.get("scraper_analysis")
+        if isinstance(state.get("scraper_analysis"), dict)
+        else {}
+    )
 
-    lines: list[str] = ["\n### SITE MECHANICS (deterministic digest — from analysis artifacts)"]
+    lines: list[str] = [
+        "\n### SITE MECHANICS (deterministic digest — from analysis artifacts)"
+    ]
 
     def _add(label: str, value) -> None:
         text = str(value or "").strip()
@@ -3520,11 +3690,15 @@ def _platform_distillation(state: dict) -> str:
     _add("Search input selector", search.get("input_selector"))
     discovery = nav.get("discovery") if isinstance(nav.get("discovery"), dict) else {}
     _add("Promoted listing URL", discovery.get("listing_url"))
-    pagination = nav.get("pagination") if isinstance(nav.get("pagination"), dict) else {}
+    pagination = (
+        nav.get("pagination") if isinstance(nav.get("pagination"), dict) else {}
+    )
     _add("Pagination type", pagination.get("type"))
     _add("Pagination page param", pagination.get("page_param_name"))
     _add("Next-button selector", pagination.get("next_button_selector"))
-    item_links = nav.get("item_links") if isinstance(nav.get("item_links"), dict) else {}
+    item_links = (
+        nav.get("item_links") if isinstance(nav.get("item_links"), dict) else {}
+    )
     _add("Item URL pattern", item_links.get("url_pattern"))
     _add("Item container selector", item_links.get("container_selector"))
     _add("Item link selector", item_links.get("link_selector"))
@@ -3536,9 +3710,7 @@ def _platform_distillation(state: dict) -> str:
         # emit rule.
         from src.field_mapping import union_output_fields
 
-        _fields = [
-            str(f) for f in union_output_fields(state) if str(f).strip()
-        ]
+        _fields = [str(f) for f in union_output_fields(state) if str(f).strip()]
         if _fields:
             lines.append(f"- Fields to extract: {', '.join(_fields[:20])}")
     except Exception:
@@ -3556,18 +3728,35 @@ def _platform_distillation(state: dict) -> str:
     try:
         from src.skills_store import render_learned_sections
 
-        _platform = str(site_analysis.get("platform") or "").lower()
+        _hint_urls = [
+            state.get("url") or "",
+            state.get("sample_url") or state.get("product_url") or "",
+            (site_analysis.get("site") or {}).get("url") or "",
+            site_analysis.get("url") or "",
+        ]
+        _platform = _site_platform(site_analysis, [u for u in _hint_urls if u])
         _skill = next(
-            (s for key, s in _PLATFORM_SKILLS.items() if key in _platform), ""
+            (
+                s
+                for key, s in _PLATFORM_SKILLS.items()
+                if key in _platform and not _negation_guard(key, _platform)
+            ),
+            "",
         )
         if _skill:
             _learned = render_learned_sections(_skill, cap=1500)
             if _learned:
-                block += (
-                    f"\n### LEARNED SKILL NOTES (from `{_skill}`, newest first — "
-                    "curated by post-run review; apply when relevant)\n"
-                    + _learned
-                )
+                block += _learned_notes_block(_skill) + _learned
+        for _cut_skill in _CROSSCUTTING_SKILLS:
+            _cut = render_learned_sections(_cut_skill, cap=1500)
+            if _cut:
+                block += _learned_notes_block(_cut_skill) + _cut
+        # [wave-46 §6] navigation-patterns rides only discovery-shaped jobs.
+        _input_mode = (state.get("input_mode") or "url_list").strip().lower()
+        if _input_mode in _NAVIGATION_MODES:
+            _nav_cut = render_learned_sections(_TIER2_MODEGATED_SKILL, cap=1500)
+            if _nav_cut:
+                block += _learned_notes_block(_TIER2_MODEGATED_SKILL) + _nav_cut
     except Exception as _exc:
         logger.debug("_platform_distillation: learned sections skipped: %s", _exc)
     return block
@@ -3594,7 +3783,8 @@ def build_code_writer_message(state: dict) -> list:
 
         _prior = (
             _SJ.objects.filter(
-                site_folder__contains=slug, status=_SJ.STATUS_COMPLETED,
+                site_folder__contains=slug,
+                status=_SJ.STATUS_COMPLETED,
                 product_count__gt=0,
             )
             .exclude(pk=state.get("job_id") or 0)
@@ -3622,9 +3812,9 @@ def build_code_writer_message(state: dict) -> list:
     try:
         from src.writer_memory import load_memory, render_first_attempt_block
 
-        _wmem_probe = (
-            (state.get("probe_result") or {}).get("connectivity") or {}
-        ).get("method_that_worked")
+        _wmem_probe = ((state.get("probe_result") or {}).get("connectivity") or {}).get(
+            "method_that_worked"
+        )
         _writer_memory_block = render_first_attempt_block(
             load_memory(slug), fresh_probe_method=_wmem_probe
         )
@@ -3644,7 +3834,10 @@ def build_code_writer_message(state: dict) -> list:
         from agents.tools.context import is_anti_bot_detected
 
         if is_anti_bot_detected() and mechanism in (
-            "seleniumbase_uc", "undetected_chromedriver", "stealth_browser", "uc_chrome",
+            "seleniumbase_uc",
+            "undetected_chromedriver",
+            "stealth_browser",
+            "uc_chrome",
         ):
             mechanism = "playwright"
     except Exception:
@@ -3716,10 +3909,19 @@ def build_code_writer_message(state: dict) -> list:
     # single-phase template. Stealth for browser jobs is applied at runtime via
     # STEALTH_BROWSER (cloak), NOT by switching to the UC template.
     _browser_strategies = (
-        "playwright", "stealth_browser", "undetected_chromedriver",
-        "seleniumbase_uc", "browser", "uc_chrome", "http_navigation", "",
+        "playwright",
+        "stealth_browser",
+        "undetected_chromedriver",
+        "seleniumbase_uc",
+        "browser",
+        "uc_chrome",
+        "http_navigation",
+        "",
     )
-    if input_mode in ("navigation", "list_page", "search_term") and mechanism in _browser_strategies:
+    if (
+        input_mode in ("navigation", "list_page", "search_term")
+        and mechanism in _browser_strategies
+    ):
         if mechanism == "http_navigation":
             template_file = "http_navigation_scraper.py"
         elif mechanism == "playwright":
@@ -3746,8 +3948,8 @@ def build_code_writer_message(state: dict) -> list:
                     # just passes `stealth: "cloak"` in the /navigate payload.
                     _cloak_note = (
                         "\n**STEALTH:** This site uses anti-bot/Akamai protection. Pass "
-                        "`stealth: \"cloak\"` in the /navigate payload for every call — "
-                        "set `STEALTH = \"cloak\"` at the top of the scraper so it is the "
+                        '`stealth: "cloak"` in the /navigate payload for every call — '
+                        'set `STEALTH = "cloak"` at the top of the scraper so it is the '
                         "default. The browser_service /navigate endpoint applies "
                         "CloakBrowser's stealth Chromium (C++ fingerprint patches) "
                         "server-side per call. Do NOT import playwright or selenium, do "
@@ -3757,15 +3959,15 @@ def build_code_writer_message(state: dict) -> list:
                         "strategy.\n"
                         "**ANTI-BOT PLAYBOOK (both phases via /navigate + cloak):**\n"
                         "- **Discovery (Phase 1):** call `_navigate(SEARCH_URL, "
-                        "actions=[fill, click, wait, sleep], stealth=\"cloak\")` to drive "
+                        'actions=[fill, click, wait, sleep], stealth="cloak")` to drive '
                         "the search form; extract product links from the returned HTML "
-                        "(`_extract_item_links(r[\"html\"])`) — keep SAME-DOMAIN links, "
+                        '(`_extract_item_links(r["html"])`) — keep SAME-DOMAIN links, '
                         "drop nav/category/account/help. Verify `len(product_urls) > 0` "
                         "before Phase 2. Do NOT use a backend HTTP API for discovery on "
                         "an anti-bot site (likely protected: HTTP 400/403).\n"
                         "- **Extraction (Phase 2):** for each product URL, call "
-                        "`_navigate(url, stealth=\"cloak\")` + read JSON-LD from the "
-                        "returned HTML (`<script type=\"application/ld+json\">` → Product "
+                        '`_navigate(url, stealth="cloak")` + read JSON-LD from the '
+                        'returned HTML (`<script type="application/ld+json">` → Product '
                         "schema: Offers.price / priceCurrency / availability). Cloak "
                         "renders JSON-LD reliably.\n"
                     )
@@ -3790,7 +3992,7 @@ def build_code_writer_message(state: dict) -> list:
                         "`len(product_urls) > 0` before Phase 2. Do NOT use a backend HTTP API "
                         "for discovery on an anti-bot site (likely protected: HTTP 400/403).\n"
                         "- **Extraction (Phase 2):** for each product URL, render via cloak + "
-                        "read JSON-LD (`<script type=\"application/ld+json\">` → Product schema: "
+                        'read JSON-LD (`<script type="application/ld+json">` → Product schema: '
                         "Offers.price / priceCurrency / availability). Cloak renders JSON-LD "
                         "reliably.\n"
                     )
@@ -3841,9 +4043,11 @@ def build_code_writer_message(state: dict) -> list:
         _recipe = scraper_analysis.get("access_recipe")
         if not isinstance(_recipe, dict):
             _recipe = {}
-        _probe_t14 = state.get("probe_result") if isinstance(
-            state.get("probe_result"), dict
-        ) else {}
+        _probe_t14 = (
+            state.get("probe_result")
+            if isinstance(state.get("probe_result"), dict)
+            else {}
+        )
         _listing_t14 = (
             _probe_t14.get("listing_connectivity")
             or scraper_analysis.get("listing_connectivity")
@@ -3920,7 +4124,8 @@ def build_code_writer_message(state: dict) -> list:
                 "Do NOT strip the recipe's stealth/proxy settings from the draft "
                 "even when a simpler path looks plausible — a recipe the probe "
                 "proved is the only one guaranteed to work.\n"
-                + "\n".join(_recipe_lines) + "\n"
+                + "\n".join(_recipe_lines)
+                + "\n"
             )
         no_proxy = scraper_analysis.get("no_proxy_flag", proxy_tier == "none")
 
@@ -3932,19 +4137,23 @@ def build_code_writer_message(state: dict) -> list:
             # writer "direct connection works" then shipped bare
             # requests.get() paths against sites the probe only reached through
             # a browser (the job-62 birkenstock 200-challenge soft block).
-            _conn_t35 = site_analysis.get("connectivity") if isinstance(
-                site_analysis.get("connectivity"), dict
-            ) else {}
-            _probe_t35 = state.get("probe_result") if isinstance(
-                state.get("probe_result"), dict
-            ) else {}
-            _conn_t35 = _conn_t35 or (_probe_t35.get("connectivity") if isinstance(
-                _probe_t35.get("connectivity"), dict
-            ) else {})
+            _conn_t35 = (
+                site_analysis.get("connectivity")
+                if isinstance(site_analysis.get("connectivity"), dict)
+                else {}
+            )
+            _probe_t35 = (
+                state.get("probe_result")
+                if isinstance(state.get("probe_result"), dict)
+                else {}
+            )
+            _conn_t35 = _conn_t35 or (
+                _probe_t35.get("connectivity")
+                if isinstance(_probe_t35.get("connectivity"), dict)
+                else {}
+            )
             _method_t35 = str(
-                _conn_t35.get("method_that_worked")
-                or _probe_t35.get("method")
-                or ""
+                _conn_t35.get("method_that_worked") or _probe_t35.get("method") or ""
             )
             if _method_t35.startswith("direct_http"):
                 # [wave-17 S4] Recipe overrides the blanket "no proxy" text
@@ -4035,24 +4244,24 @@ def build_code_writer_message(state: dict) -> list:
                 "\n### SeleniumBase UC Mode — MANDATORY API Constraints\n"
                 "The scraper MUST use SeleniumBase with UC Mode. Follow these rules EXACTLY:\n\n"
                 "**SB() constructor — ONLY valid kwargs (SeleniumBase 4.44+):**\n"
-            "```python\n"
-            "with SB(uc=True, xvfb=args.xvfb, locale_code='en-gb') as sb:\n"
-            "    driver = sb.driver\n"
-            "```\n"
-            "Valid kwargs: `uc`, `xvfb`, `locale_code`, `proxy`, `chromium_arg`, "
-            "`page_load_strategy`, `driver_type`, `extension_zip`, `extension_dir`, "
-            "`use_auto_ext`\n"
-            "The run_scraper tool auto-injects `--xvfb` CLI flag. "
-            "Your argparse MUST accept `--xvfb` (action='store_true') and use "
-            "`args.xvfb` in SESSION_KWARGS — otherwise argparse rejects the flag and the scraper crashes.\n\n"
-            "**INVALID kwargs (NEVER use):** `browser_args` (wrong → use `chromium_arg`), "
-            "`chrome_args` (wrong → use `chromium_arg`), "
-            "`headless=True` with `uc=True` (unreliable → use `xvfb=True`), "
-            "`driver_kwargs` (doesn't exist)\n\n"
-            "**Proxy with auth:** Use `extension_zip=/path/to/auth.zip` kwarg "
-            "(NOT `use_auto_ext` — that enables Chrome's built-in automation extension). "
-            "The template already has `_make_proxy_auth_extension()` — call it and pass "
-            "the result as `extension_zip`. Use `chromium_arg` for `--proxy-server` flag.\n\n"
+                "```python\n"
+                "with SB(uc=True, xvfb=args.xvfb, locale_code='en-gb') as sb:\n"
+                "    driver = sb.driver\n"
+                "```\n"
+                "Valid kwargs: `uc`, `xvfb`, `locale_code`, `proxy`, `chromium_arg`, "
+                "`page_load_strategy`, `driver_type`, `extension_zip`, `extension_dir`, "
+                "`use_auto_ext`\n"
+                "The run_scraper tool auto-injects `--xvfb` CLI flag. "
+                "Your argparse MUST accept `--xvfb` (action='store_true') and use "
+                "`args.xvfb` in SESSION_KWARGS — otherwise argparse rejects the flag and the scraper crashes.\n\n"
+                "**INVALID kwargs (NEVER use):** `browser_args` (wrong → use `chromium_arg`), "
+                "`chrome_args` (wrong → use `chromium_arg`), "
+                "`headless=True` with `uc=True` (unreliable → use `xvfb=True`), "
+                "`driver_kwargs` (doesn't exist)\n\n"
+                "**Proxy with auth:** Use `extension_zip=/path/to/auth.zip` kwarg "
+                "(NOT `use_auto_ext` — that enables Chrome's built-in automation extension). "
+                "The template already has `_make_proxy_auth_extension()` — call it and pass "
+                "the result as `extension_zip`. Use `chromium_arg` for `--proxy-server` flag.\n\n"
                 "**Page navigation — ALWAYS use driver.uc_open_with_reconnect():**\n"
                 "```python\n"
                 "driver.uc_open_with_reconnect(url, reconnect_time=4)\n"
@@ -4067,8 +4276,8 @@ def build_code_writer_message(state: dict) -> list:
                 "`sb.driver.execute_script()` (can crash CDP). "
                 "Just `driver.execute_script()` — it's the raw WebDriver API.\n\n"
                 "**Pattern summary:**\n"
-            "```python\n"
-            "with SB(uc=True, xvfb=args.xvfb) as sb:\n"
+                "```python\n"
+                "with SB(uc=True, xvfb=args.xvfb) as sb:\n"
                 "    driver = sb.driver\n"
                 "    driver.uc_open_with_reconnect(url, reconnect_time=4)\n"
                 "    time.sleep(3)\n"
@@ -4109,8 +4318,11 @@ def build_code_writer_message(state: dict) -> list:
             import os as _os_nf
 
             from django.conf import settings
+
             _slug = state.get("site_slug", "")
-            _nf_path = _os_nf.join(settings.PROJECT_ROOT, "workspace", _slug, "navigation_findings.json")
+            _nf_path = _os_nf.join(
+                settings.PROJECT_ROOT, "workspace", _slug, "navigation_findings.json"
+            )
             if _os_nf.isfile(_nf_path):
                 _nf = _json_nf.load(open(_nf_path))
                 _lp = _nf.get("listing_page") or {}
@@ -4125,11 +4337,16 @@ def build_code_writer_message(state: dict) -> list:
                     _il = navigation_analysis.get("item_links")
                     if not isinstance(_il, dict):
                         _il = {}
-                    _existing = [u for u in (_il.get("urls") or []) if isinstance(u, str)]
+                    _existing = [
+                        u for u in (_il.get("urls") or []) if isinstance(u, str)
+                    ]
                     if len(_existing) < len(_purls):
                         _il["urls"] = list(dict.fromkeys(_existing + _purls))
                         navigation_analysis["item_links"] = _il
-                        logger.info("build_code_writer_message: merged %d product URLs from findings → nav_analysis", len(_purls))
+                        logger.info(
+                            "build_code_writer_message: merged %d product URLs from findings → nav_analysis",
+                            len(_purls),
+                        )
         except Exception:
             pass
         input_mode = state.get("input_mode", "url_list")
@@ -4147,13 +4364,27 @@ def build_code_writer_message(state: dict) -> list:
 
         if search_info.get("has_search") or search_info.get("has_url_search"):
             nav_lines.append("**Search:** supported")
-            working_search_url = search_info.get("working_url") or search_info.get("listing_url_used")
+            working_search_url = search_info.get("working_url") or search_info.get(
+                "listing_url_used"
+            )
             if working_search_url:
-                nav_lines.append(f"  - **Working search URL (USE THIS):** `{working_search_url}`")
-            if search_info.get("url_pattern") and search_info.get("url_pattern") != working_search_url:
-                nav_lines.append(f"  - URL pattern (from form action — may be WRONG): `{search_info['url_pattern']}`")
-            if search_info.get("search_url_pattern") and search_info.get("search_url_pattern") != working_search_url:
-                nav_lines.append(f"  - Search URL pattern (may be WRONG): `{search_info['search_url_pattern']}`")
+                nav_lines.append(
+                    f"  - **Working search URL (USE THIS):** `{working_search_url}`"
+                )
+            if (
+                search_info.get("url_pattern")
+                and search_info.get("url_pattern") != working_search_url
+            ):
+                nav_lines.append(
+                    f"  - URL pattern (from form action — may be WRONG): `{search_info['url_pattern']}`"
+                )
+            if (
+                search_info.get("search_url_pattern")
+                and search_info.get("search_url_pattern") != working_search_url
+            ):
+                nav_lines.append(
+                    f"  - Search URL pattern (may be WRONG): `{search_info['search_url_pattern']}`"
+                )
             if search_info.get("input_selector"):
                 nav_lines.append(f"  - Search input: `{search_info['input_selector']}`")
             if search_criteria:
@@ -4169,12 +4400,10 @@ def build_code_writer_message(state: dict) -> list:
                 )
             if pagination_info.get("next_text"):
                 nav_lines.append(
-                    f"  - Next button text: \"{pagination_info['next_text']}\""
+                    f'  - Next button text: "{pagination_info["next_text"]}"'
                 )
             if pagination_info.get("next_href"):
-                nav_lines.append(
-                    f"  - Next href: `{pagination_info['next_href']}`"
-                )
+                nav_lines.append(f"  - Next href: `{pagination_info['next_href']}`")
             if pagination_info.get("page_param_name"):
                 nav_lines.append(
                     f"  - Page param: `{pagination_info['page_param_name']}`"
@@ -4185,7 +4414,7 @@ def build_code_writer_message(state: dict) -> list:
                 nav_lines.append(f"  - Note: {pagination_info['note']}")
             if pagination_info.get("page_indicator_text"):
                 nav_lines.append(
-                    f"  - Page indicator: \"{pagination_info['page_indicator_text']}\""
+                    f'  - Page indicator: "{pagination_info["page_indicator_text"]}"'
                 )
 
         # Strong directive: paginate the FULL catalog (don't stop at page 1).
@@ -4227,7 +4456,9 @@ def build_code_writer_message(state: dict) -> list:
             "- Phase 1 MUST start from the listing URL in navigation_analysis.search\n"
         )
 
-        working_first_url = search_info.get("working_url") or search_info.get("listing_url_used")
+        working_first_url = search_info.get("working_url") or search_info.get(
+            "listing_url_used"
+        )
 
         if working_first_url:
             nav_lines.append(
@@ -4239,11 +4470,12 @@ def build_code_writer_message(state: dict) -> list:
                 f"- First URL: `{search_info['search_url_pattern']}` (replace `{{criteria}}` with `{search_criteria}`)\n"
             )
         elif search_info.get("url_pattern"):
-            nav_lines.append(
-                f"- First URL: `{search_info['url_pattern']}`\n"
-            )
+            nav_lines.append(f"- First URL: `{search_info['url_pattern']}`\n")
 
-        if item_links_info.get("link_selector") and item_links_info.get("link_selector") != "a[href]":
+        if (
+            item_links_info.get("link_selector")
+            and item_links_info.get("link_selector") != "a[href]"
+        ):
             nav_lines.append(
                 f"- Extract product links using selector: `{item_links_info['link_selector']}` "
                 f"within container: `{item_links_info['container_selector']}`\n"
@@ -4281,7 +4513,8 @@ def build_code_writer_message(state: dict) -> list:
             _nav_template_file = select_template_file(state)
         except Exception:
             _nav_template_file = (
-                "http_navigation_scraper.py" if mechanism == "http_navigation"
+                "http_navigation_scraper.py"
+                if mechanism == "http_navigation"
                 else "playwright_scraper.py"
             )
         # T2.5 (nav half): same edit-over-write suppression as the url_list hint —
@@ -4323,10 +4556,14 @@ def build_code_writer_message(state: dict) -> list:
         api_section = ""
 
         if api_endpoint.get("url") or api_endpoint.get("api_url"):
-            api_base = api_endpoint.get("base") or str(api_endpoint.get("url", "")).split("?")[0]
+            api_base = (
+                api_endpoint.get("base")
+                or str(api_endpoint.get("url", "")).split("?")[0]
+            )
             api_params = api_endpoint.get("query_params") or []
             page_param = api_endpoint.get("pagination_param") or (
-                "PageNumber" if "PageNumber" in api_params
+                "PageNumber"
+                if "PageNumber" in api_params
                 else ("page" if "page" in api_params else "page")
             )
             page_size_param = api_endpoint.get("page_size_param") or "PageSize"
@@ -4374,7 +4611,7 @@ def build_code_writer_message(state: dict) -> list:
                         "items or an error, do NOT keep retrying it — SWITCH to rendering each "
                         "page with the cloak browser (`p.chromium.launch()`; stealth is applied "
                         "automatically via STEALTH_BROWSER=cloak) and extract fields from JSON-LD "
-                        "(`<script type=\"application/ld+json\">` — Product schema → Offers.price / "
+                        '(`<script type="application/ld+json">` — Product schema → Offers.price / '
                         "priceCurrency / availability), which the cloak browser renders reliably. "
                         "The browser path is the reliable fallback for anti-bot sites.\n"
                     )
@@ -4485,7 +4722,12 @@ def build_code_writer_message(state: dict) -> list:
             )
             if _emb_section:
                 _emb_strategy = (scraper_analysis.get("strategy") or "").lower()
-                if _emb_strategy in ("http_requests", "requests", "internal_api", "api"):
+                if _emb_strategy in (
+                    "http_requests",
+                    "requests",
+                    "internal_api",
+                    "api",
+                ):
                     nav_template_hint = (
                         "\n### Template\nRead templates/requests_scraper.py as your base (HTTP "
                         "fetch). The scraper fetches each listing/category page over HTTP, extracts "
@@ -4510,7 +4752,9 @@ def build_code_writer_message(state: dict) -> list:
         # fmethod is set inside the has_filters block below, but referenced by
         # the form/classic-search check further down — initialise it so a
         # navigation job with NO detected filters doesn't NameError there.
-        fmethod = filters_info.get("method") if filters_info.get("has_filters") else None
+        fmethod = (
+            filters_info.get("method") if filters_info.get("has_filters") else None
+        )
         if filters_info.get("has_filters"):
             fmethod = filters_info.get("method", "url")
             # When a precedence data model replaced the two-phase text, keep
@@ -4555,13 +4799,14 @@ def build_code_writer_message(state: dict) -> list:
                 # pin → use the specific value from the query; iterate → loop options + dedup.
                 if _strategy == "pin" and _sval:
                     filter_lines.append(
-                        f"- **{label}**: PIN to `{_sval}` ({fcfg.get('reason','')}). "
+                        f"- **{label}**: PIN to `{_sval}` ({fcfg.get('reason', '')}). "
                         f"{', '.join(detail)}.\n"
                     )
-                elif _strategy == "iterate" or (not _strategy and _dval in ("all", "any", "", None) and _values):
+                elif _strategy == "iterate" or (
+                    not _strategy and _dval in ("all", "any", "", None) and _values
+                ):
                     _opts = [
-                        (v.get("v", "") if isinstance(v, dict) else v)
-                        for v in _values
+                        (v.get("v", "") if isinstance(v, dict) else v) for v in _values
                     ]
                     _opts = [o for o in _opts if o and o not in ("all", "any")]
                     filter_lines.append(
@@ -4599,7 +4844,9 @@ def build_code_writer_message(state: dict) -> list:
         # browser fetch is genuinely needed there, the embedded section's
         # http_navigation template hint already says to adapt Phase 1 to
         # `_navigate` — that covers it without re-introducing the conflict.
-        classic = (navigation_analysis.get("homepage_nav", {}) or {}).get("classic_search")
+        classic = (navigation_analysis.get("homepage_nav", {}) or {}).get(
+            "classic_search"
+        )
         if not _dm_replaced and (fmethod == "form" or classic):
             navigation_section += (
                 "\n**CRITICAL — browser-driven Phase 1 (form/classic search):** "
@@ -4642,13 +4889,20 @@ def build_code_writer_message(state: dict) -> list:
         # <select> filter (e.g. locumtenens Specialty), tell code_writer to
         # fill in FORM_ACTION + FORM_SELECT_NAME so the template iterates
         # through ALL options (not just one).
-        _nav_form_data = (navigation_analysis.get("search") or {}).get("form_data") or {}
-        _nav_form_action = (navigation_analysis.get("search") or {}).get("form_action") or ""
+        _nav_form_data = (navigation_analysis.get("search") or {}).get(
+            "form_data"
+        ) or {}
+        _nav_form_action = (navigation_analysis.get("search") or {}).get(
+            "form_action"
+        ) or ""
         if _nav_form_action and _nav_form_data:
             # Find the select field name (the key in form_data that's a filter)
             _select_name = ""
             for k in _nav_form_data:
-                if any(t in k.lower() for t in ("special", "discipline", "category", "profession", "role")):
+                if any(
+                    t in k.lower()
+                    for t in ("special", "discipline", "category", "profession", "role")
+                ):
                     _select_name = k
                     break
             if not _select_name and _nav_form_data:
@@ -4670,13 +4924,15 @@ def build_code_writer_message(state: dict) -> list:
         _ab = _sa.get("anti_bot")
         _conn = _sa.get("connectivity")
         _method = _conn.get("method_that_worked", "") if isinstance(_conn, dict) else ""
-        _nav_anti_bot = (isinstance(_ab, dict) and bool(_ab.get("detected"))) or _method.startswith("uc_chrome")
+        _nav_anti_bot = (
+            isinstance(_ab, dict) and bool(_ab.get("detected"))
+        ) or _method.startswith("uc_chrome")
         if _nav_anti_bot:
             if mechanism == "http_navigation":
                 template_hint += (
                     "\n**STEALTH:** Anti-bot/Akamai detected. Pass "
-                    "`stealth: \"cloak\"` in every /navigate payload (set "
-                    "`STEALTH = \"cloak\"` at the top of the scraper). The "
+                    '`stealth: "cloak"` in every /navigate payload (set '
+                    '`STEALTH = "cloak"` at the top of the scraper). The '
                     "/navigate server applies CloakBrowser server-side — do NOT "
                     "import playwright or set the STEALTH_BROWSER env var. Use "
                     "the `http_navigation` strategy.\n"
@@ -4711,8 +4967,7 @@ def build_code_writer_message(state: dict) -> list:
         _cw_strategy = (_cw_sa.get("strategy") or "").strip().lower()
     _cw_flags = required_cli_flags(_cw_input_mode, _cw_strategy)
     _discovery_flags = [
-        f for f in _cw_flags
-        if f not in ("--input", "--urls", "--sample", "--limit")
+        f for f in _cw_flags if f not in ("--input", "--urls", "--sample", "--limit")
     ]
     _cli_contract_tail = ""
     if _discovery_flags:
@@ -4814,7 +5069,7 @@ def build_code_writer_message(state: dict) -> list:
         'currency symbol like `"$2,000.00"`\n'
         '- **availability**: Normalize to the exact tokens `"in_stock"` or '
         '`"out_of_stock"` (lowercase snake_case — pass schema.org '
-        '`http://schema.org/InStock` URIs through the same normalizer)\n'
+        "`http://schema.org/InStock` URIs through the same normalizer)\n"
         '- **currency**: ISO 4217 code e.g. `"USD"`, `"EUR"`\n\n'
         "### Soft 404 Detection (CRITICAL)\n"
         "Many e-commerce sites return HTTP 200 for deleted/expired products but show "
@@ -4893,8 +5148,8 @@ def build_code_writer_message(state: dict) -> list:
             "The field-extraction map and navigation mechanics above are COMPLETE. "
             "Do NOT call read_file on product_analysis.json, navigation_analysis.json, "
             "or scraper_analysis.json — re-reading them bloats context and slows you "
-                "down. The template (templates/*.py) is the only file you need to read.\n"
-            )
+            "down. The template (templates/*.py) is the only file you need to read.\n"
+        )
         content = content + pa_summary
     elif _pa_raw:
         # Non-empty analysis the summarizer couldn't render (unknown shape or
@@ -4947,7 +5202,7 @@ def build_code_writer_message(state: dict) -> list:
         _rem_start = content.find("REMEDIATION INSTRUCTION")
         _rem_end = content.find("Read the full test report", _rem_start)
         _rem_text = content[
-            _rem_start: _rem_end if _rem_end != -1 else _rem_start + 1500
+            _rem_start : _rem_end if _rem_end != -1 else _rem_start + 1500
         ].lower()
         if "discovery" in _rem_text:
             _fidelity += (
@@ -5007,13 +5262,17 @@ def build_code_tester_message(state: dict) -> list:
     # never sees (execution filters first). Only flags the draft declares are
     # passed; --limit stays (http_navigation's --discover-only runs Phase 1 to
     # exhaustion vs a 300s deadline — the cap keeps the probe bounded).
-    _tester_phase1_instruction = " `run_scraper(args=['--discover-only','--limit','50'])`."
+    _tester_phase1_instruction = (
+        " `run_scraper(args=['--discover-only','--limit','50'])`."
+    )
     try:
         import os as _os
 
         _draft_p = _os.path.join(
             _os.environ.get("PROJECT_ROOT", "/app"),
-            "workspace", slug, "scraper_draft.py",
+            "workspace",
+            slug,
+            "scraper_draft.py",
         )
         if _os.path.isfile(_draft_p):
             from .nodes.run_execution import _accepted_cli_flags
@@ -5024,28 +5283,21 @@ def build_code_tester_message(state: dict) -> list:
                 _p1_flags = ["--query", search_criteria]
             elif "listing-url" in _accepted:
                 _listing = (
-                    ((state.get("navigation_analysis") or {}).get("discovery") or {})
-                    .get("listing_url")
-                    or ""
-                )
+                    (state.get("navigation_analysis") or {}).get("discovery") or {}
+                ).get("listing_url") or ""
                 _p1_flags = ["--listing-url", _listing] if _listing else []
             if "fresh-discovery" in _accepted:
                 _p1_flags.append("--fresh-discovery")
             if "discover-only" in _accepted:
                 _p1_flags.append("--discover-only")
             _has_discovery_flag = bool(
-                {"fresh-discovery", "discover-only", "listing-url", "query"}
-                & _accepted
+                {"fresh-discovery", "discover-only", "listing-url", "query"} & _accepted
             )
             if "limit" in _accepted:
                 _p1_flags += ["--limit", "50"]
             if _has_discovery_flag and _p1_flags:
-                _args_rendered = ",".join(
-                    repr(f) for f in _p1_flags
-                )
-                _tester_phase1_instruction = (
-                    f" `run_scraper(args=[{_args_rendered}])`."
-                )
+                _args_rendered = ",".join(repr(f) for f in _p1_flags)
+                _tester_phase1_instruction = f" `run_scraper(args=[{_args_rendered}])`."
             else:
                 _tester_phase1_instruction = (
                     " the draft declares NO discovery flags (no --listing-url/"
@@ -5134,7 +5386,9 @@ def build_code_tester_message(state: dict) -> list:
         cov_dims = cov_target.get("dimensions") or []
         cov_raw = cov_target.get("raw_count_string")
         if cov_total is not None and cov_source == "site_reported":
-            dims_repr = ", ".join(f"{d['name']}={d['count']}" for d in cov_dims) or "none"
+            dims_repr = (
+                ", ".join(f"{d['name']}={d['count']}" for d in cov_dims) or "none"
+            )
             nav_validation += (
                 "\n### Coverage Target (Tier 3 active — site-reported total)\n"
                 f"The site reports a trusted item total of **{cov_total}** "
@@ -5142,7 +5396,7 @@ def build_code_tester_message(state: dict) -> list:
                 "- This activates the Tier 3 ratio gate. If Phase 1 discovers "
                 f"far fewer than {cov_total} URLs (e.g. tens vs thousands), "
                 "treat it as a HIGH severity coverage gap and set "
-                "`target: \"strategy\"` with reason `discovery incomplete: "
+                '`target: "strategy"` with reason `discovery incomplete: '
                 "ratio <threshold>` — the scraper is giving up, not exhausting.\n"
                 "- The Phase 1 probe in this test run is capped; you may not "
                 "see the full ratio manifest here. If you see `stop_reason: "
@@ -5159,7 +5413,7 @@ def build_code_tester_message(state: dict) -> list:
                 "- If the scraper iterates only ONE value of a dimension that "
                 f"has {cov_dims[0]['count']}+ options (e.g. 1 specialty of "
                 "207), that is a HIGH severity coverage gap → set "
-                "`target: \"strategy\"` with reason `dimensions 1/"
+                '`target: "strategy"` with reason `dimensions 1/'
                 f"{cov_dims[0]['count']}`.\n"
             )
         else:
@@ -5174,7 +5428,10 @@ def build_code_tester_message(state: dict) -> list:
 
     # Job-portal filter validation: verify date/location filtering was applied
     page_type = state.get("page_type", "")
-    if page_type in ("job_navigation", "job_posting") or state.get("site_type") == "jobs":
+    if (
+        page_type in ("job_navigation", "job_posting")
+        or state.get("site_type") == "jobs"
+    ):
         nav_analysis = state.get("navigation_analysis") or {}
         filters_info = nav_analysis.get("filters", {}) or {}
         if filters_info.get("has_filters"):
@@ -5200,11 +5457,11 @@ def build_code_tester_message(state: dict) -> list:
             f"\n### Strategy Constraint (CRITICAL for remediation)\n"
             f"The scraping strategy was chosen upstream by scraper_analyzer as **{strategy}**. "
             f"Default: work WITHIN this strategy — if the scraper used the wrong selectors or "
-            f"missed a field, say so with `target: \"mapping\"` or `target: \"scraper\"`.\n\n"
+            f'missed a field, say so with `target: "mapping"` or `target: "scraper"`.\n\n'
             f"EXCEPTION — access/strategy failure: if the scraper extracted ~0 items BECAUSE "
             f"the strategy itself can't reach the content (e.g. `http_requests`/`api` returned "
             f"empty/403/blocked, or `playwright` TIMED OUT trying to drive a heavy form), set "
-            f"`target: \"strategy\"` and name the cause in `reason` (timeout / blocked / api-400 "
+            f'`target: "strategy"` and name the cause in `reason` (timeout / blocked / api-400 '
             f"/ http-empty). The pipeline will switch to a different strategy. Use `strategy` "
             f"ONLY for these access-class failures — never for a field-mapping or selector bug.\n"
         )
@@ -5213,7 +5470,7 @@ def build_code_tester_message(state: dict) -> list:
         "\n### If the Scraper CRASHED\n"
         "If `run_scraper` shows the scraper exited non-zero, raised an exception, or hit a "
         "syntax/argparse/import error (it never produced valid output), set "
-        "`overall_assessment: \"CRASH\"` and put the EXACT stderr/traceback verbatim in a "
+        '`overall_assessment: "CRASH"` and put the EXACT stderr/traceback verbatim in a '
         "top-level `crash_error` field. A crash is a code bug — the pipeline routes it to a "
         "targeted bug fix, not a full rewrite, so the verbatim error is essential.\n"
     )
@@ -5238,7 +5495,7 @@ def build_code_tester_message(state: dict) -> list:
         f"{_tester_volume_rule} If argparse "
         f"rejects a flag (exit 2, `unrecognized arguments: ...`), that is a HIGH severity "
         f"issue whose problem text MUST start with `CLI CONTRACT VIOLATION:` and name the "
-        f"missing flags — set `target: \"scraper\"`. For url_list jobs, skip this (no Phase 1).\n"
+        f'missing flags — set `target: "scraper"`. For url_list jobs, skip this (no Phase 1).\n'
         f"2. Read `workspace/{slug}/product_analysis.json` for field expectations (1 call)\n"
         f"3. Read the output JSON file(s) that run_scraper produced (1 call)\n"
         f"4. Write test_report.json — include `phases_tested: {{phase1_discovery: <bool>, "
@@ -5285,27 +5542,27 @@ def build_code_tester_message(state: dict) -> list:
         f"After assessing the scraper, add a top-level `remediation` object telling the pipeline "
         f"WHERE the fix should happen:\n"
         f"```json\n"
-        f"\"remediation\": {{\n"
-        f"  \"target\": \"mapping\" | \"scraper\" | \"strategy\",\n"
-        f"  \"fields\": [\"price\"],\n"
-        f"  \"reason\": \"...\"\n"
+        f'"remediation": {{\n'
+        f'  "target": "mapping" | "scraper" | "strategy",\n'
+        f'  "fields": ["price"],\n'
+        f'  "reason": "..."\n'
         f"}}\n"
         f"```\n"
         f"Decision rule — for each FAILED **required** field, compare the scraper output against "
         f"`product_analysis.json`'s mapping for that field:\n"
-        f"- If the field's mapping is **missing / `tested: false` / `tested: \"empty\"` (the "
+        f'- If the field\'s mapping is **missing / `tested: false` / `tested: "empty"` (the '
         f"live-render check found the source dead) / selector looks wrong or "
-        f"unverified** → the root cause is the MAPPING → set `target: \"mapping\"` and list those "
+        f'unverified** → the root cause is the MAPPING → set `target: "mapping"` and list those '
         f"fields. The pipeline re-runs product_analyzer to fix the mapping (not just regenerate the "
         f"scraper with the same bad input).\n"
         f"- If the mapping looks correct (right selector/method, `tested: true`) but the scraper "
-        f"didn't implement it → `target: \"scraper\"`.\n"
+        f'didn\'t implement it → `target: "scraper"`.\n'
         f"- If the scraper extracted ~0 items because the STRATEGY can't access the content "
-        f"(http/api empty or 403/blocked; playwright timed out) → `target: \"strategy\"` with the "
+        f'(http/api empty or 403/blocked; playwright timed out) → `target: "strategy"` with the '
         f"cause in `reason` (timeout / blocked / api-400 / http-empty). The pipeline switches "
         f"strategy. Do NOT use `strategy` for selector or field-mapping bugs.\n"
-        f"- If everything passes → `target: \"scraper\"` (no real remediation needed).\n"
-        f"When unsure, default to `\"scraper\"`. Only list fields that are required AND failed.\n\n"
+        f'- If everything passes → `target: "scraper"` (no real remediation needed).\n'
+        f'When unsure, default to `"scraper"`. Only list fields that are required AND failed.\n\n'
         f"{strategy_constraint}{crash_capture}"
         f"**CRITICAL: You MUST call write_file to save your test report to "
         f"workspace/{slug}/test_report.json as your LAST action.**"

@@ -725,3 +725,22 @@ that fetches only the SSR shell must report LISTING-BODY renderability, not URL
 reachability (498,588,589,605). And verify a captured 'API' actually returns product
 fields before spending budget on it - captured payloads have been UseInsider currency
 configs (173) and analytics beacons (142,269).
+
+## Learned: Soft-404 phrase scans die on commerce - never scan body text; 'sold out' is inventory
+**Source:** jobs 678 (Merrell AU), 607 (La Ligne)
+**Applicability:** any commerce PDP writer reusing the job-board soft-404 pattern above
+
+The soft-404 pattern earlier in this file was built for job boards and scans h1+title
+only. What propagates badly is the phrase LIST: writers generalize 'unavailable'/
+'discontinued'-style tokens into a BODY-TEXT scan, and commerce PDPs legitimately
+contain those words in per-variant copy - live products get classified dead. Merrell
+AU: the writer's own body-text scan flagged 'sold out' anywhere in page text and had to
+be REMOVED entirely - restrict soft-404 markers to standalone not-found H1/title pages
+(678). La Ligne: the marker list deliberately EXCLUDES 'sold out' - a sold-out product
+is a real product; its ProductGroup carries 6 hasVariant offers with InStock/OutOfStock
+values, so sold-out is a legitimate per-variant inventory state (607). Rule: soft-404 =
+standalone error page (h1/title/redirect target), never a substring of body text; and
+an inventory state is data, not a defect - emit it, don't drop the row. WebSphere/
+Aurora stores are the sharpest case: dead products ship HTTP 200 with full markup
+(810), so status proves nothing - and per-size stock truth lives in
+invAvailablityJSON_<catentry>, not the swatch labels (601,542).

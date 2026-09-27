@@ -759,7 +759,7 @@ SFCC ships THREE shapes; probe which before writing selectors. (1) SSR tiles, no
 JSON-LD: parse div[data-pid] tiles, paginate ?start=<n> (jobs 121,390,836,855,863,872,
 878,882). (2) JSON-LD builds: ProductGroup.hasVariant[] carries per-variant price/
 availability; group-level offers is often EMPTY, h1 empty; JSON-LD availability can be
-a stale-trap (InStock for 24 while DOM showed 7 OOS, job 967) - fall back offers ->
+a stale-trap (InStock for 24 while DOM showed 7 OOS, job 954) - fall back offers ->
 DOM CTA -> documented default + remarks (job 809). (3) SiteGenesis: ZERO JSON-LD - use
 microdata + GTM dataLayer; price can appear duplicated as 175.00 and 17500 (Merrell
 678,785). Mobify PWA: script[type=application/json] __PRELOADED_STATE__ (__reactQuery)

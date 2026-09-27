@@ -939,11 +939,30 @@ products) or URL-only (Dune); a whole graph in ONE script tag where Product =
 element[4] (922); a named #json-product block (917); @graph containers. Headless
 Shopify with ZERO JSON-LD and zero anchors: use the Elevar dataLayer +
 hydration-payload regex - bs4 get_text() DROPS script data (698). Microdata (itemprop)
-appears only on SFCC commerce layers. TRAPS: JSON-LD availability is often STALE vs the
+is a cross-platform third source, NOT SFCC-only (171,542,692,858,892,899,361);
+SiteGenesis SFCC uses it INSTEAD of JSON-LD (785). TRAPS: JSON-LD availability is often
+STALE vs the
 commerce payload - no-JS HTML and the commerce payload outrank the rendered DOM (the
 canonical stale-availability numbers live on sfcc-detection, the live-injected home); description can be null (275) or
 variant-empty (280); raw newlines inside the JSON need a sanitize pass before a strict
 parse; JSON-LD prices beat DOM when coupons apply ($27.9 vs 31.0); global stores
 localize currency at request time (968: JSON-LD said USD, shipped IDR). Fanatics
-nests price at offers[0].priceSpecification.price - a reader of offers.price silently
-drops it (545); NFL Shop is JSON-LD-free and rides OG meta tags (792).
+nests price at offers[0].priceSpecification.price - an offers.price reader drops it
+(545); NFL Shop is JSON-LD-free, rides OG metas (792).
+
+## Learned: offers[] entries are per-variant/per-size/per-fulfilment - offers[0] is arbitrary
+**Source:** jobs 292, 358, 638, 284, 676; counter-cases 380, 616, 941, 404
+**Applicability:** any JSON-LD Product whose offers is an array
+
+The baseline 'Handling Array vs Object' snippet (offers = offers[0]) is a parse
+convenience, not semantics: when offers is a list, entries are per-variant, per-size or
+per-fulfilment, and offers[0] picks whichever the site listed first. Verified: several
+price-shaped values can share one offers array - collect all and choose by availability/
+context, never offers[0].price (292); Kingfisher offers carry conflicting per-fulfilment
+availability (Home Delivery InStock, others OutOfStock) - roll up by a fulfilment rule
+(358); Nelly ships 7 per-size offers sharing price/currency - take offers[0] ONLY after
+verifying all agree (638); sale items: offers.price holds the DEFAULT variant while the
+DOM shows the discounted one (284); Soma prices are per-color - select the offers node
+with the URL's ?color= param (676). And group-level offers may be EMPTY entirely with
+price in hasVariant[n].offers, where offers[0] is just a KeyError/IndexError: Tory Burch
+(380), A Retro Tale (616), Zalando (941), fanatics.com (404).

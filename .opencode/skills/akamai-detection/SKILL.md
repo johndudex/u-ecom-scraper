@@ -143,3 +143,14 @@ families - CloakBrowser rungs failed where curl_cffi passed and vice versa (292)
 flip to 200 seconds later on the same rung (809,781), so retry-before-escalate - but
 read-timeout blocking costs ~4 min per cold discovery vs an instant 403 (797). Cached
 anti_bot:false verdicts contradicted live 403s (332,335,336,338).
+
+## Learned: Inditex on Akamai - the itxrest API grammar and the pelement variant param
+**Source:** jobs 246, 873
+**Applicability:** Inditex-family storefronts (Zara, Bershka, Stradivarius, Massimo Dutti...) behind Akamai
+
+Inditex fronts its stores with Akamai but exposes a clean JSON lane: the
+itxrest service (`/itxrest/2/catalog/store/<storeId>/...`) returns structured
+product/category payloads - when the browser lane thrashes, probe the itxrest
+grammar before escalating proxies (246). Variant selection rides `?pelement=`
+and variant-level price/availability only resolves when that param is carried
+into Phase 2 - a PDP fetched without it answers with the default variant (873).

@@ -366,7 +366,8 @@ while /products/{handle}.js or /collections/{handle}/products.json still work
 /products.json works (387,883); Mejuri (Hydrogen) 404s .json entirely so SSR JSON-LD
 is the path (884). Cloudflare can block /products.json yet leave the 408KB SSR HTML
 open. UNITS: .js/.json price is CENTS with no currency, while product-level price may
-be dollars in the SAME payload - normalize per node. Hydrogen/Remix exposes the model
+be dollars in the SAME payload - normalize per node; per-node is cross-platform,
+not Shopify-only (Hybris 269, SFCC 785, DoorDash 960). Hydrogen/Remix exposes the model
 twice: AggregateOffer with 'COLOR SIZE' offer names AND window.__remixContext...
 loaderData (969); Hydrogen wraps JSON-LD as {'script:ld+json': ...}, which defeats
 naive @type scans (651). Colour-suffixed handles + CORS-allowed slug API with
