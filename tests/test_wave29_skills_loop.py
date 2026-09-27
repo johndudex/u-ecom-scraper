@@ -9,6 +9,7 @@ _audit.jsonl`` shows zero production appends since the 2026-08-19 FM
 migration. The prompt/tool mismatch made every nav_skill_review run a
 no-op write-side.
 """
+
 from __future__ import annotations
 
 import os
@@ -61,7 +62,9 @@ class TestLoadSkillTelemetry:
     def test_load_skill_summary_covers_skill_name_kwarg(self):
         from agents.graph import _summarize_tool_args
 
-        summary = _summarize_tool_args("load_skill", {"skill_name": "jsonld-extraction"})
+        summary = _summarize_tool_args(
+            "load_skill", {"skill_name": "jsonld-extraction"}
+        )
         assert "jsonld-extraction" in summary, summary
 
     def test_load_skill_summary_still_accepts_name_kwarg(self):
@@ -83,13 +86,17 @@ class TestSkillBlurbGating:
     def test_blurb_omitted_when_toolset_lacks_load_skill(self):
         from agents.subagents import _append_skill_descriptions
 
-        out = _append_skill_descriptions("BASE PROMPT", tool_names={"read_file", "run_scraper"})
+        out = _append_skill_descriptions(
+            "BASE PROMPT", tool_names={"read_file", "run_scraper"}
+        )
         assert out == "BASE PROMPT"
 
     def test_blurb_present_when_toolset_has_load_skill(self):
         from agents.subagents import _append_skill_descriptions
 
-        out = _append_skill_descriptions("BASE PROMPT", tool_names={"load_skill", "list_skills"})
+        out = _append_skill_descriptions(
+            "BASE PROMPT", tool_names={"load_skill", "list_skills"}
+        )
         assert "Available Skills" in out
         assert out.startswith("BASE PROMPT")
 
@@ -109,7 +116,9 @@ class TestSkillBlurbGating:
         from agents.tools import AGENT_TOOL_MAP
 
         def fake_tools(agent_name, workspace_scope=None):
-            return [type("T", (), {"name": n})() for n in AGENT_TOOL_MAP.get(agent_name, [])]
+            return [
+                type("T", (), {"name": n})() for n in AGENT_TOOL_MAP.get(agent_name, [])
+            ]
 
         def fake_react(*a, **k):
             # production calls create_react_agent(llm, tools=..., prompt=...)
@@ -136,7 +145,12 @@ class TestSkillBlurbGating:
         import re
         from pathlib import Path
 
-        md = Path(__file__).resolve().parents[1] / ".opencode" / "agents" / "site-analyzer.md"
+        md = (
+            Path(__file__).resolve().parents[1]
+            / ".opencode"
+            / "agents"
+            / "site-analyzer.md"
+        )
         text = md.read_text(encoding="utf-8")
         assert not re.search(r"load_skill", text), (
             "site-analyzer.md still advertises load_skill while "
@@ -193,7 +207,10 @@ class TestLearnedSectionSurfacing:
 
         p = (
             Path(__file__).resolve().parents[1]
-            / ".opencode" / "skills" / "jsonld-extraction" / "SKILL.md"
+            / ".opencode"
+            / "skills"
+            / "jsonld-extraction"
+            / "SKILL.md"
         )
         text = p.read_text(encoding="utf-8")
         assert len(text) > 20_000, "fixture drifted — expected the real 33KB file"
@@ -205,7 +222,9 @@ class TestLearnedSectionSurfacing:
     def test_no_learned_sections_returns_empty(self):
         import src.skills_store as store
 
-        out = store.render_learned_sections("x", _text="---\nname: x\ndescription: d\n---\n\nno learnings\n")
+        out = store.render_learned_sections(
+            "x", _text="---\nname: x\ndescription: d\n---\n\nno learnings\n"
+        )
         assert out == ""
 
     def test_platform_distillation_includes_learned_sections(self, monkeypatch):
@@ -214,9 +233,12 @@ class TestLearnedSectionSurfacing:
         import src.skills_store as store
 
         monkeypatch.setattr(
-            store, "read_skill",
-            lambda name: "---\nname: x\ndescription: d\n---\n\n"
-                         "## Learned: shopify pagination\nuse cursor pagination\n",
+            store,
+            "read_skill",
+            lambda name: (
+                "---\nname: x\ndescription: d\n---\n\n"
+                "## Learned: shopify pagination\nuse cursor pagination\n"
+            ),
         )
         state = {
             "site_analysis": {"platform": "shopify"},
@@ -226,12 +248,45 @@ class TestLearnedSectionSurfacing:
         assert "LEARNED SKILL NOTES" in out
         assert "use cursor pagination" in out
 
-    def test_platform_without_skill_stays_silent(self):
+    def test_platform_without_skill_gets_no_platform_skill(self, monkeypatch):
         from agents.subagents import _platform_distillation
 
+        # [wave-45b] The env gate is gone; silence is only guaranteed when
+        # the store renders nothing — so pin the store, not the environment.
+        import src.skills_store as store
+
+        monkeypatch.setattr(store, "read_skill", lambda name: None)
         state = {
             "site_analysis": {"platform": "custom-cms"},
             "scraper_analysis": {"strategy": "http_requests"},
         }
         out = _platform_distillation(state)
         assert "LEARNED SKILL NOTES" not in out
+
+    def test_unmatched_platform_still_gets_schema_skill(self, monkeypatch):
+        """[wave-43] Cross-cutting output-schema-integrity injects even on
+        platforms with no matching skill — store-pinned so FM contents can't
+        flip the verdict."""
+        from agents.subagents import _platform_distillation
+
+        import src.skills_store as store
+
+        monkeypatch.setattr(
+            store,
+            "read_skill",
+            lambda name: (
+                "---\nname: output-schema-integrity\ndescription: d\n---\n\n"
+                "## Learned: honest empty\nempty means empty\n"
+                if name == "output-schema-integrity"
+                else None
+            ),
+        )
+        state = {
+            "site_analysis": {"platform": "custom-cms"},
+            "scraper_analysis": {"strategy": "http_requests"},
+        }
+        out = _platform_distillation(state)
+        assert "output-schema-integrity" in out
+        assert "empty means empty" in out
+        assert "shopify-detection" not in out
+        assert "magento-detection" not in out
