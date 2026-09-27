@@ -364,3 +364,20 @@ for i, url in enumerate(page_urls):
 - Always try to close old context/browser before relaunching; wrap in try/except since they may already be dead.
 - The retry is for the **same URL** that failed, so no items are lost.
 - This complements the browser rotation pattern: use rotation proactively every N pages for memory, and this recovery reactively when closed errors occur.
+
+## Learned: Hydration/interaction-gated fields: when to switch mechanism, and guards
+**Source:** 408-job prod harvest (2026-09-26), _harvest/jobs/ job ids cited inline
+**Applicability:** CSR sites and any shared-browser execution
+
+Two override directions, both decided by live probes rather than platform
+assumptions: (a) interaction-gated - Bardot's .availability-msg stays empty until a
+size-swatch click fires Product-Variation AJAX, so use playwright + swatch click (926);
+(b) browser used where HTTP sufficed - Drakes' Angular panel never populates
+(store-session gated) but JSON-LD sits in the raw HTML, so override to http_requests
+(903,923). networkidle HANGS Adobe Commerce: domcontentloaded took extraction from a
+420s timeout to 15.4s (808). Wrap every browser read in a document.title/URL
+assertion - shared-session drift landed a tab on a different tenant's host
+mid-analysis (963; 918's HIJACKED guard caught platypusshoes, which was job 919's
+seed). Some post-hydration fields are genuinely unfixable: Frontgate's requested
+`color` existed only in client state and shipped EMPTY after 3 probes + a REST
+fallback (966) - flag it, don't fake it.

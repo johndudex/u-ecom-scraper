@@ -773,3 +773,21 @@ if status_code == 404:
 - Need real-time stock updates faster than 2-3s per request
 - Scraping Amazon search/listing pages (not covered by this skill — only product pages)
 - Need variant-level data beyond the default selected variant
+
+## Learned: Amazon transport pinning and per-pair captcha gates
+**Source:** 408-job prod harvest (2026-09-26), _harvest/jobs/ job ids cited inline
+**Applicability:** Amazon locales, esp. marketplaces with geo/captcha gating
+
+Amazon's wall is LOCALE-specific: Amazon.es's plain requests rung drew a
+manual_verification captcha MID-JOB despite a clean probe - pin the measured rung
+instead of rediscovering it (757; curl_cffi TLS impersonation alone cleared it, no
+proxy), and a 200 carrying hundreds of anchors but ZERO /dp/ links is a challenge
+page, not a listing. Amazon.com.br returns buybox-less 200s on every transport until
+canonical /dp/{ASIN} + curl_cffi safari18_0 (924; FAIL 0.45 -> 0.40 -> PASS 0.92).
+Read ASIN from the asin input/attribute rather than parsing it out of the URL (591).
+
+## Learned: amazon.ie TLD parity
+**Source:** job 460
+**Applicability:** any amazon.<tld> host, not just the TLDs in the table
+
+amazon.ie is absent from this skill's TLD table but behaves like the listed TLDs: PDPs are /dp/{ASIN}, direct HTTP returned real content and fingerprint_chrome_none succeeded with no captcha and no proxy (job 460 probe, 200s). When a candidate host matches amazon.<tld>, treat it as amazon even if the TLD is missing from the table.

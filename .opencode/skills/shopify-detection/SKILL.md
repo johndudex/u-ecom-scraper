@@ -355,3 +355,22 @@ Shopify's public JSON API does not have documented rate limits, but be respectfu
 - JSON API returns 403 or empty responses
 - Store uses custom product pages that override Shopify templates
 - Structured data in JSON is incomplete compared to rendered page
+
+## Learned: Shopify endpoint degradation + Hydrogen/Remix double exposure
+**Source:** 408-job prod harvest (2026-09-26), _harvest/jobs/ job ids cited inline
+**Applicability:** Any Shopify site, incl. Hydrogen/Oxygen/Remix and headless-Next.js fronts
+
+Shopify endpoints degrade SILENTLY - tier them. /products.json may be 404/disabled
+while /products/{handle}.js or /collections/{handle}/products.json still work
+(52,55,217,247,259,331,334,399,453,521). Yoto 404s /products/{handle}.json but
+/products.json works (387,883); Mejuri (Hydrogen) 404s .json entirely so SSR JSON-LD
+is the path (884). Cloudflare can block /products.json yet leave the 408KB SSR HTML
+open. UNITS: .js/.json price is CENTS with no currency, while product-level price may
+be dollars in the SAME payload - normalize per node. Hydrogen/Remix exposes the model
+twice: AggregateOffer with 'COLOR SIZE' offer names AND window.__remixContext...
+loaderData (969); Hydrogen wraps JSON-LD as {'script:ld+json': ...}, which defeats
+naive @type scans (651). Colour-suffixed handles + CORS-allowed slug API with
+presentmentPrices give currency-correct prices (138,310,311,772). Headless Shopify on
+Next.js still serves .js/.json (288,297,306). SHOPLINE TRAP: clones Shopify's URL
+grammar but /products/{handle}.json returns the HOMEPAGE HTML - the .json probe is a
+POSITIVE Shopify test, not a default (549,142,296; tell: myshopline.com CDN).

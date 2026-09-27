@@ -750,3 +750,20 @@ Some SFCC sites have migrated to headless commerce with a Next.js frontend while
 | apac.christianlouboutin.com | APAC (5-letter) | Informed this skill |
 | calvinklein.co.uk | Headless Next.js | No locale prefix, no .html, Akamai |
 | (add more sites as they are scraped) | | |
+
+## Learned: SFCC runtime sub-patterns (3 shapes + Mobify island)
+**Source:** 408-job prod harvest (2026-09-26), _harvest/jobs/ job ids cited inline
+**Applicability:** Any Salesforce Commerce Cloud / Demandware site, incl. Nuxt and Mobify PWA fronts
+
+SFCC ships THREE shapes; probe which before writing selectors. (1) SSR tiles, no
+JSON-LD: parse div[data-pid] tiles, paginate ?start=<n> (jobs 121,390,836,855,863,872,
+878,882). (2) JSON-LD builds: ProductGroup.hasVariant[] carries per-variant price/
+availability; group-level offers is often EMPTY, h1 empty; JSON-LD availability can be
+a stale-trap (InStock for 24 while DOM showed 7 OOS, job 967) - fall back offers ->
+DOM CTA -> documented default + remarks (job 809). (3) SiteGenesis: ZERO JSON-LD - use
+microdata + GTM dataLayer; price can appear duplicated as 175.00 and 17500 (Merrell
+678,785). Mobify PWA: script[type=application/json] __PRELOADED_STATE__ (__reactQuery)
+holds the WHOLE search response - richest source, beats DOM (496,818,826,889,967).
+/dw/image/ tell survives Nuxt fronts (380,399,413); dwvar= params encode colour/size
+(469,472). PDP often plain direct_http while the listing needs a higher rung
+(326,327,329).

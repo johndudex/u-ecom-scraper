@@ -707,3 +707,21 @@ headers = {
 - GET fallback: if POST returns 405/403, try GET with query params (`?q=&firstResult=0&numberOfResults=100`).
 - Some Coveo setups require an `authorization` header or access token — check page source for `coveoAccessToken` or similar.
 - Rate limit: use 300-500ms delays between requests.
+
+## Learned: Headless/SPA shells: framework JSON goldmines + strategy switch
+**Source:** 408-job prod harvest (2026-09-26), _harvest/jobs/ job ids cited inline
+**Applicability:** Any Next.js/Remix/Gatsby/SvelteKit/Angular site where listing anchors are absent
+
+A ~85KB SSR shell that returns 200 with zero item anchors is NOT an empty category -
+data arrives post-hydration (Next.js app-router 913,917,919,920,925; Remix 918,919,921;
+Angular 923; Magento PWA 498; boohoo). Anchor discovery structurally CANNOT work there:
+switch strategy instead of burning retries (967: tester FAIL -> http_navigation cascade
+-> 15 records). Goldmines in order: __NEXT_DATA__ props.pageProps ships the full
+catalog (787,815); /_next/data/<buildId>/<route>.json (282,313,331); Gatsby
+/page-data/<route>/page-data.json (697,874); SvelteKit /__data.json (502,698);
+escaped RSC JSON-LD inside __next_f that a naive <script type=ld+json> query misses
+(284); grep lazy /_next/static/ chunks for route literals when hydration fails. A probe
+that fetches only the SSR shell must report LISTING-BODY renderability, not URL
+reachability (498,588,589,605). And verify a captured 'API' actually returns product
+fields before spending budget on it - captured payloads have been UseInsider currency
+configs (173) and analytics beacons (142,269).

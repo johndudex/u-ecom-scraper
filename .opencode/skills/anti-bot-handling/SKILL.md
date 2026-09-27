@@ -405,3 +405,19 @@ html = response.content.decode('utf-8')
 **When to check:** If any extracted text contains `Â£`, `â€`, or similar mojibake artifacts, the response encoding is wrong. The numeric values in the data will be correct — only non-ASCII characters are corrupted.
 
 **Note:** This is NOT an anti-bot issue, but it commonly appears alongside anti-bot work because scraping libraries often need encoding fixes.
+
+## Learned: Anti-bot blocks are per-request / per-pair; verdicts need field evidence
+**Source:** 408-job prod harvest (2026-09-26), _harvest/jobs/ job ids cited inline
+**Applicability:** Any site with Cloudflare/Akamai/PX/captcha gating
+
+Blocks are per-request and per-(fingerprint, proxy) PAIR, not per-tier: identical
+rungs returned 403 then 200 seconds apart (809,781); Amazon FR's captcha hit
+chrome-none/safari-none/datacenter but NOT chrome-datacenter (398); hydroflask 403'd
+EVERY proxy tier and passed only the curl_cffi fingerprint rung (408) while theiconic
+needed residential for raw HTTP yet passed browser-TLS with no proxy. Cached
+anti_bot:false verdicts contradicted live 403s on 4+ jobs (332,335,336,338) - re-probe
+at execution. Byte-count 'real content' verdicts are untrustworthy: an 85KB shell and a
+'scripts disabled' shell both passed with zero field data; a 38KB body is a geo
+interstitial, not an empty category (963). Cloudflare Turnstile is IP-bound, not
+TLS-bound (292 vs 304). Intermittent HTTP-202-empty challenges need retry-with-backoff
+and SERIALIZED fetches (970).

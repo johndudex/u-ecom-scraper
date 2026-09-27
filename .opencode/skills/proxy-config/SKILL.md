@@ -165,3 +165,19 @@ headers = {"User-Agent": get_random_user_agent()}
 3. **Residential cost:** ALWAYS ask before using residential proxies
 4. **SSL verify:** Set to `false` for Bright Data proxies (self-signed certs)
 5. **Timeout:** Use 30s timeout with proxies (slower than direct requests)
+
+## Learned: Transport is per-surface and must be pinned to the measured rung
+**Source:** 408-job prod harvest (2026-09-26), _harvest/jobs/ job ids cited inline
+**Applicability:** Any two-phase scraper (discovery + PDP extraction)
+
+Transport is per SURFACE, not per site: PDPs often pass on direct_http while the
+listing needs a higher rung (326,327,329; 320 sephora.de cloak_residential after two
+failures; 805 fingerprint-chrome PDP vs cloak-datacenter listing; 918). Never hard-pin
+the probe's rung into the scraper: PROXY_TIER=none + --no-proxy defeated runtime
+escalation and produced 0 URLs for 98 minutes (301). Pin fetch_page.min_tier_floor to
+the MEASURED tier - 999 silently emptied the ladder (655); hardwired
+residential-on-fingerprint broke Sports Direct when container proxies were dead (797);
+missing config/proxy.json silently degrades ProxyConfig to direct. Harvey Nichols' plain
+TLS HANGS instead of erroring, so pin rather than rediscover (674). TRAP:
+create_fetch_json returns a TUPLE - isinstance(payload, dict) is always False so the
+code silently falls back to og tags (611; same trap 665,798,837).

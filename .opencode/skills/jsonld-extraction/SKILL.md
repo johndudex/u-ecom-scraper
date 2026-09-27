@@ -928,3 +928,22 @@ if ar and isinstance(ar, dict):
 - Structured data doesn't match visible product info (site may inject fake SEO data)
 
 Base directory for this skill: file:///mnt/d/John/u-ecom-scraper/.opencode/skills/jsonld-extraction
+
+## Learned: JSON-LD shapes beyond the baseline + the stale-availability trap
+**Source:** 408-job prod harvest (2026-09-26), _harvest/jobs/ job ids cited inline
+**Applicability:** Any site emitting schema.org JSON-LD, esp. enterprise and headless commerce
+
+Shapes beyond the baseline: ProductGroup.hasVariant[] per-variant walk
+(163,259,904,927); listing ItemLists either complete with prices (Chloe 954: 24
+products) or URL-only (Dune); a whole graph in ONE script tag where Product =
+element[4] (922); a named #json-product block (917); @graph containers. Headless
+Shopify with ZERO JSON-LD and zero anchors: use the Elevar dataLayer +
+hydration-payload regex - bs4 get_text() DROPS script data (698). Microdata (itemprop)
+appears only on SFCC commerce layers. TRAPS: JSON-LD availability is often STALE vs the
+commerce payload - no-JS HTML and the commerce payload outrank the rendered DOM (the
+canonical stale-availability numbers live on sfcc-detection, the live-injected home); description can be null (275) or
+variant-empty (280); raw newlines inside the JSON need a sanitize pass before a strict
+parse; JSON-LD prices beat DOM when coupons apply ($27.9 vs 31.0); global stores
+localize currency at request time (968: JSON-LD said USD, shipped IDR). Fanatics
+nests price at offers[0].priceSpecification.price - a reader of offers.price silently
+drops it (545); NFL Shop is JSON-LD-free and rides OG meta tags (792).

@@ -193,3 +193,15 @@ Kibo sites commonly include:
 - JSON-LD is absent (fall back to CSS-only extraction)
 
 Base directory for this skill: file:///mnt/d/John/u-ecom-scraper/.opencode/skills/kibo-detection
+
+## Learned: Kibo/Mozu: preload script + unauthenticated storefront API
+**Source:** 408-job prod harvest (2026-09-26), _harvest/jobs/ job ids cited inline
+**Applicability:** Kibo / Mozu Commerce storefronts
+
+Kibo (Mozu) storefronts embed the product payload in a `<script
+id="data-mz-preload-product">` block AND expose an unauthenticated REST endpoint
+`/api/commerce/catalog/storefront/products/<productId>` - either beats DOM parsing, and
+both work over plain chrome-TLS HTTP (493). Ace Hardware's department listing probed at
+2,143,217 bytes and was still ONE direct fetch: a large SSR listing is not a reason to
+switch to browser pagination (493). Kibo-family JSON-LD offers need explicit sale-vs-
+list price orientation rather than taking offers[0] (404).

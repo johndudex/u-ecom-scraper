@@ -129,3 +129,17 @@ Response format matches `/probe` response:
   "error": ""
 }
 ```
+
+## Learned: Akamai: ladder collapse to one rung, probe both families, verdict hygiene
+**Source:** 408-job prod harvest (2026-09-26), _harvest/jobs/ job ids cited inline
+**Applicability:** Akamai-fronted commerce sites
+
+On Akamai the ladder often collapses to ONE survivor: direct HTTP 403 domain-wide
+INCLUDING the JSON APIs, playwright_none fails, and only the cloak/stealth-browser rung
+works (473 Next Ireland, 479 The North Face, 499
+Brooks Brothers India). Probe BOTH
+families - CloakBrowser rungs failed where curl_cffi passed and vice versa (292).
+'Blocked by Akamai, trying bypass' mid-ladder is NOT a verdict (792,800); a 403 can
+flip to 200 seconds later on the same rung (809,781), so retry-before-escalate - but
+read-timeout blocking costs ~4 min per cold discovery vs an instant 403 (797). Cached
+anti_bot:false verdicts contradicted live 403s (332,335,336,338).
