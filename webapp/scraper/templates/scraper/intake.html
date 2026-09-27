@@ -806,6 +806,12 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     </div>
     </div>
 
+    <!-- SKILL PROVENANCE [wave-44] -->
+    <div class="panel hidden" id="skills-panel">
+      <div class="panel-head"><h3>Skills</h3><span class="panel-sub">Which skills this job used and wrote — derived from its own logs</span></div>
+      <div id="skills-groups"></div>
+    </div>
+
     <!-- RUN HISTORY -->
     <div class="panel">
       <div class="panel-head"><h3>Run history</h3><span class="panel-sub">Previous executions of this job</span></div>
@@ -1885,6 +1891,28 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       if(intakeState.job){ refreshJobData(intakeState.job.api_url, intakeState.job.tool_calls_url); }
     }
   }
+  // [wave-44] Skills provenance panel. Four honest groups: what reached the
+  // writer's prompt, what agents loaded explicitly, what was actually written
+  // back, and what the learner only proposed (it has no write tools).
+  function renderSkillsPanel(skills){
+    var panel = X('#skills-panel'); if(!panel) return;
+    if(!skills){ panel.classList.add('hidden'); return; }
+    var groups = [
+      ['Injected into writer prompt', (skills.injected||[]), 'the writer started with these lessons'],
+      ['Loaded via load_skill', (skills.loaded||[]).map(function(l){ return l.skill + (l.agent ? ' — by ' + l.agent : ''); }), 'explicitly opened by an agent'],
+      ['Written back', (skills.written||[]), 'new Learned sections appended to the skill file'],
+      ['Proposed (not written)', (skills.proposed||[]), 'learner suggested, no write tool ran']
+    ];
+    var html = groups.filter(function(g){ return g[1] && g[1].length; }).map(function(g){
+      var chips = g[1].map(function(name){
+        return '<span style="display:inline-block;margin:2px 6px 2px 0;padding:2px 9px;border:1px solid var(--line);border-radius:999px;font-family:var(--mono);font-size:12px">' + escHtml(name) + '</span>';
+      }).join('');
+      return '<div style="margin-bottom:10px"><div class="panel-sub" style="margin-bottom:4px">' + escHtml(g[0]) + ' <span style="opacity:.65">· ' + escHtml(g[2]) + '</span></div>' + chips + '</div>';
+    }).join('');
+    if(!html){ panel.classList.add('hidden'); return; }
+    X('#skills-groups').innerHTML = html;
+    panel.classList.remove('hidden');
+  }
   function refreshJobData(apiUrl, toolCallsUrl){
     if(!apiUrl) return;
     fetch(apiUrl).then(function(r){ return r.json(); }).then(function(j){
@@ -1950,6 +1978,10 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       if(j.url) det.push(['Source', j.url]);
       if(j.error_message) det.push(['Error', j.error_message]);
       X('#details-kv').innerHTML = det.map(function(r){ return '<div class="kv"><span class="kk">'+escHtml(r[0])+'</span><span class="kv-v">'+escHtml(String(r[1]))+'</span></div>'; }).join('');
+      // [wave-44] Skills provenance — used (injected into the writer prompt /
+      // loaded via load_skill) and written (actual tool calls vs skill_learner
+      // proposals, which have no write tools).
+      renderSkillsPanel(j.skills);
       // Run history — real jobs for this site (includes the current run, so it
       // appears and updates to COMPLETED + record count when it finishes).
       if(j.run_history && j.run_history.length){
