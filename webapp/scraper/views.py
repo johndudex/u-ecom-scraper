@@ -30,6 +30,7 @@ from src.schema_validation import validate_user_schema
 
 from .forms import SiteForm
 from .models import Approval, JobListing, ProbeCache, ScrapeJob, SessionLog, Site
+from .skills_summary import summarize_job_skills
 
 logger = logging.getLogger(__name__)
 
@@ -1247,6 +1248,10 @@ def job_api(request, job_id):
             "site_folder": job.site_folder,
             "full_extraction": job.full_extraction,
             "error_message": job.error_message,
+            # [wave-44] skill provenance for the intake deep-link Skills panel
+            # (derived read-only from SessionLog/ToolCallLog — see
+            # skills_summary.summarize_job_skills)
+            "skills": summarize_job_skills(job.id),
             "created_at": job.created_at.isoformat(),
             "started_at": job.started_at.isoformat() if job.started_at else None,
             "completed_at": job.completed_at.isoformat() if job.completed_at else None,
@@ -3731,7 +3736,10 @@ def learnt_skills(request):
         want = context["edit_title"]
         for p in parts:
             first = p.strip().splitlines()[0]
-            if first.lstrip("# ").strip().lstrip("Learned: ").strip() == want:
+            # removeprefix, NOT lstrip — lstrip takes a charset, so a title
+            # starting with any of "Learned: " chars (e.g. "aggregateRating…")
+            # mangled the compare and prefilled empty (save = data loss).
+            if first.lstrip("# ").strip().removeprefix("Learned: ").strip() == want:
                 context["edit_body"] = p.strip()
                 break
         else:
