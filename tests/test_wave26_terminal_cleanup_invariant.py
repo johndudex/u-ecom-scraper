@@ -148,3 +148,29 @@ class TestWiring:
         body = src[i: i + 2600]
         assert "min_count=1" in body
         assert "W26-3" in body or "prod-410" in body
+
+
+class TestKnownYieldGapVeto:
+    """[wave-48 T4] The seventh ground-truth veto.
+
+    A known-yield-gap run PROVED the source offers more than it shipped
+    (job 1082: client-rendered listing, http_requests shipped 2 of 10). The
+    exhausted arms' working-scraper rescue would re-run execution with the
+    SAME strategy — re-applying exactly the starvation the veto exists to
+    block. kyg must veto the rescue like every other ground-truth axis.
+    """
+
+    def test_kyg_blocks_rescue_even_with_real_items(self):
+        assert (
+            _guard(_state(), "cleanup", known_yield_gap=True) == "cleanup"
+        ), "kyg run must not ride the working-scraper rescue into a re-run"
+
+    def test_wiring_all_three_arms_pass_the_seventh_veto(self):
+        src = open(ROUTER_SRC).read()
+        assert src.count("known_yield_gap=_known_yield_gap") == 3, (
+            "each of the three exhausted call sites must pass the kyg veto"
+        )
+
+    def test_wiring_router_computes_the_veto_from_the_report(self):
+        src = open(ROUTER_SRC).read()
+        assert "_known_yield_gap = bool(" in src

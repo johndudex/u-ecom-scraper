@@ -7,6 +7,7 @@ import threading
 import time
 from collections import deque
 from typing import Any, Optional
+from urllib.parse import urljoin, urlparse
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -554,6 +555,64 @@ def _detect_spa(html: str, body_text: str) -> tuple[bool, str]:
         return True, "unknown-large-shell"
 
     return False, ""
+
+
+def _count_item_links(html: str, base_url: str) -> Optional[int]:
+    """Count PDP-ish ``<a href>`` anchors in raw listing HTML.
+
+    [wave-48 T1] The probe's success gate is a byte floor, which a
+    client-rendered shell (Astro/Algolia — job 1082 wonderbly) passes with
+    zero real item anchors. This count is the yield signal the listing probe
+    stamps downstream as ``listing_client_rendered``. Scoring reuses
+    src.discovery's job-318-hardened PDP scorer instead of a local heuristic.
+
+    BeautifulSoup (not a regex) is load-bearing: the escaped ``<a>`` strings
+    that motivated this check live inside ``<script>`` bodies, which BS4
+    correctly treats as text — a regex scan counts them and silently defeats
+    the flag.
+
+    Returns None when bs4/src.discovery is unavailable — consumers must treat
+    missing as "no measurement", never as 0. Imports stay function-local per
+    this module's dependency doctrine.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return None
+    try:
+        from src.discovery import _pdp_score
+    except ImportError:
+        return None
+
+    parser = "html.parser"
+    try:
+        import lxml  # noqa: F401
+
+        parser = "lxml"
+    except ImportError:
+        pass
+
+    try:
+        base_host = (urlparse(base_url).netloc or "").lower().removeprefix("www.")
+        soup = BeautifulSoup(html or "", parser)
+    except Exception:
+        return None
+
+    count = 0
+    for anchor in soup.find_all("a"):
+        href = (anchor.get("href") or "").strip()
+        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+        absolute = urljoin(base_url, href)
+        parsed = urlparse(absolute)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        host = (parsed.netloc or "").lower().removeprefix("www.")
+        if base_host and host and host != base_host:
+            continue
+        if _pdp_score(absolute) > 0:
+            count += 1
+    return count
 
 
 # ── Reusable browser helpers (shared by /probe and /navigate) ────────────
@@ -1242,6 +1301,9 @@ def _try_direct_http(url: str, timeout: int = 15, proxy_tier: str = "none", coun
                 "error": "",
                 "spa_detected": spa_detected,
                 "spa_framework": spa_framework,
+                # [wave-48 T1] yield signal — PDP-ish anchors in the non-JS
+                # HTML. 0 on a content-rich shell = client-rendered listing.
+                "item_link_count": _count_item_links(html, url),
             }
 
         # [wave-21 T4] Fetched-but-rejected returns a dict (not None) so the
@@ -1380,6 +1442,8 @@ def _try_fingerprint(
             "error": "",
             "spa_detected": spa_detected,
             "spa_framework": spa_framework,
+            # [wave-48 T1] yield signal — same contract as _try_direct_http.
+            "item_link_count": _count_item_links(html, url),
             "fingerprint_profile": profile,
         }
 

@@ -79,6 +79,29 @@ def _publish_job_status(job_id: int, status: str) -> None:
         pass
 
 
+def _scope_shortfall_row(scope, scope_value, product_count) -> str:
+    """[wave-48 T6] The [SCOPE-SHORTFALL] honesty note row, "" when no shortfall.
+
+    Intake asked firstn/N and the run shipped fewer — make the gap visible
+    on the job record (intake board) instead of a COMPLETED row that reads
+    as success (job 1082: asked 10, shipped 2). Partial starvation only: a
+    zero-item run already fails loudly through the zero-yield gates.
+    """
+    try:
+        if str(scope or "").strip().lower() != "firstn":
+            return ""
+        target = int(str(scope_value or "").strip() or 0)
+    except (TypeError, ValueError):
+        return ""
+    try:
+        count = int(product_count or 0)
+    except (TypeError, ValueError):
+        return ""
+    if target <= 0 or count <= 0 or count >= target:
+        return ""
+    return f"[SCOPE-SHORTFALL] asked {target}, shipped {count}"
+
+
 def _finalize_job_failed(job_id: int, error_message: str, close_steps: bool = False) -> None:
     """Persist an honest FAILED row for *job_id* (F4-safe).
 
@@ -1231,7 +1254,11 @@ def _build_initial_state(job: ScrapeJob) -> dict[str, Any]:
         "field_notes": _mapped_notes,
         "scope": job.scope or "",
         "scope_value": job.scope_value or "",
-        "user_notes": job.notes or "",
+        "user_notes": "\n".join(
+            ln
+            for ln in (job.notes or "").splitlines()
+            if "[SCOPE-SHORTFALL]" not in ln
+        ),
         "site_slug": _generate_slug(job.url),
         "site_name": "",
         "site_status": "new",
@@ -2415,6 +2442,20 @@ def _finalize_job(job: ScrapeJob) -> None:
                         if has_substantive_field(prod) and prod.get("status_code", 0) > 0
                     ]
                     job.product_count = len(successful)
+                    # [wave-48 T6] Scope-shortfall marker (job 1082 class):
+                    # asked firstn/N, shipped fewer — surface the gap on the
+                    # job record. Same env gate as the kyg checker; the
+                    # retry seed strips ONLY these rows (line-scoped, the
+                    # [FIELD-MAP] audit rows keep flowing).
+                    if str(os.environ.get("LISTING_YIELD_GATE", "0")).strip().lower() in (
+                        "1", "true", "yes", "on",
+                    ):
+                        _ss_row = _scope_shortfall_row(
+                            job.scope, job.scope_value, job.product_count
+                        )
+                        if _ss_row and "[SCOPE-SHORTFALL]" not in (job.notes or ""):
+                            job.notes = (job.notes or "") + f"\n{_ss_row}"
+                            job.save(update_fields=["notes"])
                 if site_block.get("name"):
                     job.site_name = site_block["name"]
                 logger.info(

@@ -4497,6 +4497,15 @@ def _invoke_navigation_traverse(
             # navigator ALREADY detects these; the graph must not drop them.
             "discovery": _disc_fb,
             "pagination": _disc_fb.get("pagination") or {},
+            # [wave-48 T4a] Honest traverse signals, persisted at last. The
+            # root fallback above fabricates discovery.listing_reached=True —
+            # downstream gates need what the TRAVERSE itself concluded (its
+            # reached verdict, notes, and the wrong-site abort flag), which
+            # the artifact never carried.
+            "traverse_reached": bool(result.reached),
+            "traverse_notes": str(getattr(result, "notes", "") or "")[:200],
+            "wrong_site_abort": bool(getattr(result, "wrong_site_abort", False)),
+            "wrong_site_url": str(getattr(result, "wrong_site_url", "") or ""),
         }
 
         # F17: blank cross-registrable-domain artifacts before persisting.
@@ -4993,6 +5002,7 @@ def _decide_strategy(state: ScrapeState) -> dict[str, Any]:
             _prior_report.get("overall_assessment") not in (None, "PASS")
             or _cov_bad
             or _prior_false_pass
+            or _prior_report.get("known_yield_gap")
         ):
             try:
                 from .nodes.route_after_testing import classify_test_failure
@@ -5623,6 +5633,20 @@ def _route_after_execution(state: ScrapeState):
     return Command(goto="scraper_analyzer", update=update)
 
 
+def _listing_anchor_floor_enabled() -> bool:
+    """Wave-48 T2 gate — upgrade http_requests discovery on a measured
+    client-rendered listing (content-rich shell, zero PDP-ish anchors).
+
+    OFF by default: it changes which template phase 1 rides, so it ships as
+    a controlled experiment (``LISTING_ANCHOR_FLOOR=1``) per the wave-40
+    env-gate discipline. The telemetry stamp that feeds it
+    (``listing_client_rendered``) is always-on.
+    """
+    return str(os.environ.get("LISTING_ANCHOR_FLOOR", "0")).strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
     """Map probe_result.connectivity.method_that_worked to a scraping strategy.
 
@@ -5665,6 +5689,13 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
         _probe_listing = {}
     _listing_method = str(_probe_listing.get("method_that_worked") or "")
     _listing_needs_browser = bool(_probe_listing.get("needs_browser"))
+    # [wave-48 T2] yield verdict from the advisory listing probe (stamped
+    # always-on by run_listing_probe_advisory). Read in BOTH duplicated
+    # listing-evidence blocks on purpose — this function carries a known
+    # copy-paste of the block (5667/5721) and any consumer of it must stay
+    # copy-identical so a future de-duplication can't strand one side.
+    _lcr = bool(_probe_listing.get("listing_client_rendered"))
+    _lcr_reason = str(_probe_listing.get("client_rendered_reason") or "")
 
     # Proxy tier from the method suffix (mirrors the prompt mapping).
     if "residential" in method:
@@ -5719,6 +5750,13 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
         _probe_listing = {}
     _listing_method = str(_probe_listing.get("method_that_worked") or "")
     _listing_needs_browser = bool(_probe_listing.get("needs_browser"))
+    # [wave-48 T2] yield verdict from the advisory listing probe (stamped
+    # always-on by run_listing_probe_advisory). Read in BOTH duplicated
+    # listing-evidence blocks on purpose — this function carries a known
+    # copy-paste of the block (5667/5721) and any consumer of it must stay
+    # copy-identical so a future de-duplication can't strand one side.
+    _lcr = bool(_probe_listing.get("listing_client_rendered"))
+    _lcr_reason = str(_probe_listing.get("client_rendered_reason") or "")
 
     meth = method.lower()
     # Listing-page JS-rendering signal (navigate_explore._verify_rendering, propagated
@@ -5981,6 +6019,32 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
             "while a browser rung reached it — discovery rides the browser rung"
         )
 
+    # [wave-48 T2] A CLIENT-RENDERED listing starves http_requests' phase 1
+    # exactly like a blocked one — the listing probe's byte floor measured
+    # reachability, not yield (job 1082 wonderbly: 142KB Astro+Algolia shell,
+    # 0 grid anchors, shipped 2 of firstn/10 as COMPLETED). Same upgrade
+    # shape as the seam above, env-gated. Guards:
+    #   - strategy == "http_requests" only — never touches internal_api
+    #     (API evidence outranks) or a strategy already browser-lane;
+    #   - NOT on a stealth/fingerprint-proven method (job-524 revolve): a
+    #     fingerprint win measures that plain HTTP was REJECTED and
+    #     TLS-impersonated HTTP answered — upgrading discovery to a vanilla
+    #     browser lane the probe never proved repeats that burn.
+    if (
+        _listing_anchor_floor_enabled()
+        and _lcr
+        and strategy == "http_requests"
+        and not method.startswith(
+            (*STEALTH_METHOD_PREFIXES, *FINGERPRINT_METHOD_PREFIXES)
+        )
+    ):
+        strategy = "http_navigation"
+        _strategy_source += (
+            "; listing probe measured ZERO item anchors in a content-rich "
+            "non-JS shell — client-rendered listing (job-1082 class), "
+            "discovery rides the browser lane"
+        )
+
     # Discovery config: propagate the navigator's pagination detection so the
     # template uses the RIGHT config_for_* preset (load_more vs page_param vs
     # next_button) — deterministic, not code_writer's guess.
@@ -6080,6 +6144,11 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
             "evidence": (
                 f"pdp_method={method or 'none'}; listing_method="
                 f"{_listing_method or ('blocked' if _probe_listing else 'not_probed')}"
+                + (
+                    f"; listing_client_rendered={_lcr_reason or 'yes'}"
+                    if _lcr
+                    else ""
+                )
             ),
         },
         "connectivity": {"method_that_worked": method},
@@ -9300,6 +9369,23 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                         )
             except Exception as _dexc:
                 logger.debug("_invoke_code_tester: deterministic checks skipped: %s", _dexc)
+            # [wave-48 T4b] Known-yield-gap stamp (job 1082 class): a
+            # TOP-LEVEL report key — deliberately NOT inside
+            # deterministic_gate, whose truthy read is the CLI-contract
+            # bounce (route_after_testing belt). Gated on LISTING_YIELD_GATE
+            # inside the checker; absent (no state change) when it declines.
+            try:
+                from .nodes.route_after_testing import known_yield_gap_issue
+
+                _kyg = known_yield_gap_issue(state, report)
+                if _kyg:
+                    report["known_yield_gap"] = _kyg["description"]
+                    logger.warning(
+                        "_invoke_code_tester: known yield gap stamped: %s",
+                        str(_kyg.get("description", ""))[:140],
+                    )
+            except Exception as _kexc:
+                logger.debug("_invoke_code_tester: kyg check skipped: %s", _kexc)
             update["test_report"] = report
             logger.info(
                 "_invoke_code_tester: loaded test_report from workspace/%s/", slug

@@ -945,6 +945,20 @@ def run_listing_probe_advisory(
     # impersonation, no browser), not needs_browser=True.
     http_ok = _is_http_method(winner_method)
     browser_ok = bool(winner_method) and not http_ok
+    # [wave-48 T2] yield verdict — a content-rich HTTP win with ZERO PDP-ish
+    # anchors in the non-JS HTML is a client-rendered listing (job 1082
+    # wonderbly: 142KB Astro+Algolia shell passed the byte floor with 0 grid
+    # anchors and shipped 2 of firstn/10). A missing count (older
+    # browser-service) is UNKNOWN — treated as False, never as zero. jsonld
+    # is deliberately NOT propagated: _pdp_listing_swap's guard
+    # (graph.py:2124) reads this dict's "jsonld" key and would revive a
+    # live-but-inert wave-39 veto.
+    _winner_count = (winner or {}).get("item_link_count")
+    _client_rendered = bool(
+        http_ok
+        and _winner_count == 0
+        and int((winner or {}).get("body_length") or 0) >= 20_000
+    )
     result: dict = {
         "probed_url": listing_url,
         "advisory": True,
@@ -962,7 +976,18 @@ def run_listing_probe_advisory(
         # [wave-33 C1a] present-and-True only when a 429 parked the rungs.
         "throttled": throttled_after is not None,
         "retry_after_s": round(throttled_after, 1) if throttled_after else None,
+        # [wave-48 T2] yield verdict (None = unknown — no measurement).
+        "item_link_count": _winner_count,
+        "listing_client_rendered": _client_rendered,
+        "client_rendered_reason": (
+            "http_rung_zero_item_links" if _client_rendered else ""
+        ),
     }
+    if _client_rendered:
+        _log(
+            "listing stamped CLIENT-RENDERED (http win, 0 item anchors, "
+            f"{(winner or {}).get('body_length')} bytes)"
+        )
     if throttled_after is not None and not winner_method:
         _log("listing advisory PARKED on browser-service 429 — no site verdict")
     if not winner_method:

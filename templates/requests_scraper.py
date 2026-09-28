@@ -573,6 +573,10 @@ def main():
         # Hidden-SSR observability [job-65 citybeach]: how many listing pages
         # were read from their JSON-LD ItemList instead of anchors.
         "jsonld_fallback_pages": discovery_meta.get("jsonld_fallback_pages", 0),
+        # [wave-48 T3] telemetry only — the exhausting page served the SAME
+        # link set as its predecessor (client-rendered shell signature, job
+        # 1082). Never a gate input: legit for a true 1-page catalog.
+        "identical_last_page": discovery_meta.get("identical_last_page", False),
         # [T3.13c/job-76 myhouse] True when Phase 2 finished faster than its
         # per-fetch delay floor allows — the fetches never actually happened.
         "phase2_instant_fail": phase2_instant,

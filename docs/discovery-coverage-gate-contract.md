@@ -25,7 +25,11 @@ output JSON (alongside `scraping_duration_seconds`, `discovered_urls`, etc.):
     "dimensions_total": 207,       # int — total dimensions known; 0 if unknown
     "max_pages_hit": false,        # bool — did the loop stop because it hit a NON-None MAX_PAGES cap?
     "ran_phase1": true,            # bool — did Phase 1 discovery actually run (false if skipped via checkpoint/resume)
-    "skipped_reason": null         # str | None — if ran_phase1 is false, why: "checkpoint_loaded" | "discover_only_input" | "url_list_mode"
+    "skipped_reason": null,        # str | None — if ran_phase1 is false, why: "checkpoint_loaded" | "discover_only_input" | "url_list_mode"
+    "identical_last_page": false   # bool — [wave-48 T3] telemetry: the exhausting page served the SAME
+                                   #        link set as its predecessor (client-rendered shell re-serving
+                                   #        page 1 — job 1082). OPTIONAL (requests_scraper only today);
+                                   #        never a gate/fail-set input — legit for a true 1-page catalog.
 }
 ```
 

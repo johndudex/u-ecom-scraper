@@ -4,6 +4,7 @@
 """
 
 import logging
+import os
 import re
 
 from ..constants import (
@@ -360,6 +361,24 @@ def classify_test_failure(
             and str(_skcov.get("stop_reason") or "") == "phase1_skipped"
         ):
             return ("scraper", "discovery: draft skipped Phase 1 (phase1_skipped)")
+    # [wave-48 T4] Known-yield gap (job 1082 class): the source provably
+    # offers more than discovery shipped (probe-measured client-rendered
+    # shell, or an honest traverse reaching a rich listing). The current
+    # http_requests approach cannot see the content — switch strategy.
+    # Placement: AFTER the unproven-run guards (throttle/gateway-down
+    # outrank — a throttled run's low yield proves nothing) and read from
+    # the report stamp so the two-arg caller in graph._decide_strategy
+    # (which passes no state) works. Only http_requests has a flip target
+    # worth a cycle (ladder: http_navigation → playwright).
+    if (
+        isinstance(report, dict)
+        and report.get("known_yield_gap")
+        and strat == "http_requests"
+    ):
+        return (
+            "strategy",
+            f"known yield gap: {str(report.get('known_yield_gap'))[:120]}",
+        )
     if items == 0 and is_http_like and not is_traceback:
         return ("strategy", f"{strat} returned no items ({is_blocked and 'blocked' or 'empty'})")
     if items == 0 and is_blocked and not is_traceback:
@@ -1253,6 +1272,149 @@ def draft_file_fp(path: str) -> str:
         return ""
 
 
+def _gate_is_contract_bad(gate) -> bool:
+    """[wave-48 T4] Is the tester's ``deterministic_gate`` stamp a CLI-contract
+    violation? Narrowed from whole-value truthiness so the belt cannot be
+    hijacked by a non-contract annotation riding the same key: legacy STRING
+    stamps (tests/test_cli_contract.py:329) and dicts carrying
+    ``violation_kind`` (wave-40 call gate) stay contract-bad; any other dict
+    is diagnostic, not a violation."""
+    if not gate:
+        return False
+    if isinstance(gate, str):
+        return True
+    if isinstance(gate, dict):
+        # Key presence, not value truthiness (a stamped kind is never empty).
+        is_violation = "violation_kind" in gate
+        return is_violation
+    return True
+
+
+# [wave-48 T4] Coverage verdicts the LADDER already owns — a known-yield-gap
+# stamp must never fire on top of them (navigate_error/dedup_flat are FAIL
+# verdicts with their own routing; phase1_skipped is a code verdict;
+# checkpoint_reused means the yield lives in the reused set, not the
+# coverage block; skipped means Phase 1 never ran).
+_KYG_BLOCKED_STOP_REASONS = frozenset(
+    {"navigate_error", "dedup_flat", "phase1_skipped", "checkpoint_reused", "skipped"}
+)
+
+
+def _listing_yield_gate_enabled() -> bool:
+    """[wave-48 T4] LISTING_YIELD_GATE arms the known-yield-gap checker and
+    its routing (default off — identical behavior when unset)."""
+    return str(os.environ.get("LISTING_YIELD_GATE", "0")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def known_yield_gap_issue(state: ScrapeState, report: dict) -> dict | None:
+    """[wave-48 T4] Deterministic known-yield-gap detector (job 1082 class).
+
+    Fires only when the run PROVED the source offers more than discovery
+    shipped, via one of two independent measurements:
+
+    - Source A ("probe"): the listing probe measured the HTML as a
+      client-rendered shell (``listing_client_rendered`` — zero item
+      anchors, rich body, HTTP rung won). An http_requests draft built on
+      that HTML can only ever see what the shell embeds, so expected yield
+      is the intake scope.
+    - Source B ("traverse"): the browser traverse HONESTLY reached the
+      listing (``traverse_reached`` — NOT the fabricated
+      ``discovery.listing_reached`` the root fallback stamps True) with >= 5
+      same-host item URLs in view, yet extraction shipped fewer than
+      min(len(examples), scope_target).
+
+    Returns a HIGH-severity issue dict for the router, or None. Never
+    raises: ``discovered_urls`` is an INT in the templates, so ``len()`` of
+    it would TypeError inside the router (the _volume_gap precedent). Gated
+    on LISTING_YIELD_GATE (default off).
+    """
+    if not _listing_yield_gate_enabled():
+        return None
+    if not isinstance(state, dict) or not isinstance(report, dict):
+        return None
+    if (state.get("input_mode") or "") not in (
+        "navigation",
+        "list_page",
+        "search_term",
+    ):
+        return None
+    cov = report.get("discovery_coverage")
+    if not isinstance(cov, dict):
+        return None
+    stop = str(cov.get("stop_reason") or "")
+    if not stop or stop in _KYG_BLOCKED_STOP_REASONS:
+        return None
+    raw = cov.get("found")
+    if raw is None:
+        raw = cov.get("discovered_urls")
+    try:
+        discovered = int(raw or 0)
+    except (TypeError, ValueError):
+        discovered = 0
+    if discovered < 0:
+        discovered = 0
+
+    def _scope_floor() -> int:
+        try:
+            from .run_execution import _scope_target
+
+            return max(1, int(_scope_target(state)))
+        except Exception:
+            return 1
+
+    source = ""
+    expected = None
+    probe = state.get("probe_result")
+    probe = probe if isinstance(probe, dict) else {}
+    lc = probe.get("listing_connectivity")
+    lc = lc if isinstance(lc, dict) else {}
+    if lc.get("listing_client_rendered"):
+        # Source A: the probe MEASURED the shell.
+        source, expected = "probe", _scope_floor()
+    else:
+        # Source B: the traverse's own verdict. The root fallback fabricates
+        # discovery.listing_reached=True — keying on that would arm the gate
+        # on exactly the jobs where the listing was NEVER reached.
+        nav = state.get("navigation_analysis")
+        nav = nav if isinstance(nav, dict) else {}
+        notes = str(nav.get("traverse_notes") or "").lower()
+        if (
+            nav.get("traverse_reached")
+            and not nav.get("wrong_site_abort")
+            and "wrong-site" not in notes
+            and "wrong site" not in notes
+        ):
+            links = nav.get("item_links")
+            examples = links.get("url_examples") if isinstance(links, dict) else None
+            examples = [
+                u for u in (examples or []) if isinstance(u, str) and u.startswith("http")
+            ]
+            if len(examples) >= 5:
+                source = "traverse"
+                expected = min(len(examples), _scope_floor())
+    if not source or expected is None:
+        return None
+    if discovered >= expected:
+        return None
+    return {
+        "severity": "high",
+        "field": "discovery",
+        "source": source,
+        "expected": expected,
+        "discovered": discovered,
+        "description": (
+            f"Deterministic check: known yield gap — discovery shipped "
+            f"{discovered} of >= {expected} items the source demonstrably "
+            f"offers (stop_reason={stop}, source={source})"
+        ),
+    }
+
+
 def _exhausted_cleanup_redirect(
     state: ScrapeState,
     dest: str,
@@ -1263,19 +1425,26 @@ def _exhausted_cleanup_redirect(
     count_regression=None,
     volume_reason=None,
     det_blockers=None,
+    known_yield_gap=False,
 ) -> str:
     """[W26-3/prod-410] Terminal-cleanup invariant: an exhausted arm may not
     end the job while a working scraper sits on disk.
 
-    When ALL SIX ground-truth vetoes are clean (the same axes the
+    When ALL SEVEN ground-truth vetoes are clean (the same axes the
     GROUND-TRUTH PASS arm checks: discovery-coverage, empty-core,
-    CLI-contract, count-regression, volume-gap, deterministic blockers) AND
+    CLI-contract, count-regression, volume-gap, deterministic blockers —
+    plus wave-48's known-yield-gap) AND
     ``_scraper_has_real_items(min_count=1)`` holds, ``cleanup`` is a
     contradiction — the job just proved it works. Route to execution
     instead. Prod 410: tester PASS 0.82 + 1 real product + 48 URLs died in
     the exhausted-cascade arm because the freshness floor (W26-10) blinded
     every min_count>=1 rescue. This invariant is the belt behind those
     rescues: vetoes clean ⇒ cleanup is unreachable.
+
+    [wave-48 T4] ``known_yield_gap`` is the seventh veto: the rescue would
+    re-run execution with the SAME strategy and re-apply exactly the
+    starvation the override veto just blocked — buying nothing. A kyg run
+    terminates honestly instead.
     """
     if dest != "cleanup":
         return dest
@@ -1286,16 +1455,17 @@ def _exhausted_cleanup_redirect(
         and not count_regression
         and not volume_reason
         and not det_blockers
+        and not known_yield_gap
         and _scraper_has_real_items(state, min_count=1)
     ):
         logger.warning(
-            "route_after_testing: exhausted arm tried cleanup but the six "
+            "route_after_testing: exhausted arm tried cleanup but the seven "
             "vetoes are clean and the output holds real items — routing to "
             "run_execution (terminal-cleanup invariant)"
         )
         _log_cascade(
             state, "working-scraper-rescue",
-            "exhausted-arm cleanup vetoed: six vetoes clean + real items on "
+            "exhausted-arm cleanup vetoed: seven vetoes clean + real items on "
             "disk → run_execution",
         )
         return "run_execution"
@@ -1725,6 +1895,13 @@ def route_after_testing(state: ScrapeState) -> str:
             "ratings", "rating", "average_rating")
     ]
 
+    # [wave-48 T4] Seventh ground-truth veto: the known-yield-gap stamp (the
+    # graph's tester path stamps report["known_yield_gap"] via
+    # known_yield_gap_issue; read here from the report).
+    _known_yield_gap = bool(
+        isinstance(report, dict) and report.get("known_yield_gap")
+    )
+
     # L2 CLI-contract signal (docs/cli-contract-plan.md): static re-check of the
     # DRAFT — a violation means execution would be seed-only. Belt-and-braces
     # alongside the tester-side force-FAIL (the load-bearing closure lives in
@@ -1759,11 +1936,14 @@ def route_after_testing(state: ScrapeState) -> str:
                 # ground-truth override rescued a job run_execution then
                 # refused — zero fix cycles. Belt: the tester also stamps
                 # report["deterministic_gate"] when it zeroes the report.
+                # [wave-48 T4] The read is NARROWED (_gate_is_contract_bad):
+                # legacy string stamps + violation_kind dicts stay
+                # contract-bad; other annotations riding the key are
+                # diagnostic only.
                 if not _contract_bad:
                     _report_cb = state.get("test_report")
-                    if (
-                        isinstance(_report_cb, dict)
-                        and _report_cb.get("deterministic_gate")
+                    if isinstance(_report_cb, dict) and _gate_is_contract_bad(
+                        _report_cb.get("deterministic_gate")
                     ):
                         _contract_bad = True
                 if not _contract_bad:
@@ -2017,6 +2197,7 @@ def route_after_testing(state: ScrapeState) -> str:
                     count_regression=_count_regression,
                     volume_reason=_volume_reason,
                     det_blockers=_det_blockers,
+                    known_yield_gap=_known_yield_gap,
                 )
             logger.error(
                 "route_after_testing: CLI contract violation + retries "
@@ -2076,6 +2257,7 @@ def route_after_testing(state: ScrapeState) -> str:
                 count_regression=_count_regression,
                 volume_reason=_volume_reason,
                 det_blockers=_det_blockers,
+                known_yield_gap=_known_yield_gap,
             )
         logger.error(
             "route_after_testing: FINAL attempt FAILED (assessment=%s, confidence=%.2f) "
@@ -2264,6 +2446,7 @@ def route_after_testing(state: ScrapeState) -> str:
                 count_regression=_count_regression,
                 volume_reason=_volume_reason,
                 det_blockers=_det_blockers,
+                known_yield_gap=_known_yield_gap,
             )
         logger.warning(
             "route_after_testing: retries exhausted in cascade (count=%d, "

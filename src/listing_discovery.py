@@ -311,6 +311,12 @@ def discover_listing_urls(
     # is treated as "ran off the end of pagination" (no next link).
     stop_reason = "no_next_link"
     saw_navigate_error = False
+    # [wave-48 T3] telemetry only — True when the exhausting page served the
+    # SAME link set as its predecessor (a client-rendered shell re-serving
+    # page 1 for every ?page=N). Never a fail-set input: byte-identical page
+    # 2 is legitimate for a true 1-page catalog.
+    identical_last_page = False
+    prev_links: list = []
     deadline_start = time.monotonic()
     # [job-62 birkenstock] Soft-block escalation state: the proxy tier index
     # the next fetch starts from, and how many times a 200-but-zero-links
@@ -351,6 +357,9 @@ def discover_listing_urls(
     # identical to a plain ?page=N loop.
     for listing_url in listing_urls:
         page = 1
+        # [wave-48 T3] per-listing reset: listing N's tail must never leak
+        # into listing N+1's comparison.
+        prev_links = []
         while True:
             # Fail-fast: a blocked/slow discovery must not run unbounded.
             if time.monotonic() - deadline_start > deadline_s:
@@ -490,6 +499,10 @@ def discover_listing_urls(
 
             # Dedup worked: page returned items but none were new → exhausted.
             if new_on_page == 0:
+                # [wave-48 T3] identical LINK SET with the previous page is
+                # the client-rendered-shell signature. Telemetry only —
+                # stop_reason stays no_new_items.
+                identical_last_page = page_urls == prev_links
                 stop_reason = "no_new_items"
                 break
 
@@ -498,6 +511,14 @@ def discover_listing_urls(
                 stop_reason = "max_pages_hit"
                 logger.info(f"Hit MAX_PAGES cap ({max_pages}) at {listing_url}, stopping")
                 break
+
+            # [wave-48 T3] remember this page's link set for the NEXT
+            # iteration's exhaustion check ("page N served the SAME links as
+            # page N-1" — client shell re-serving page 1, job 1082 — vs
+            # "different links that all happened to be seen"). Captured here,
+            # after every compare/break branch, so the exhausting page never
+            # compares against itself.
+            prev_links = list(page_urls)
 
             page += 1
 
@@ -522,6 +543,12 @@ def discover_listing_urls(
         "pages_fetched": pages_fetched,
         "jsonld_fallback_pages": jsonld_fallback_pages,
         "ladder_aware": ladder_aware,
+        # [wave-48 T3] only meaningful when the loop actually stopped on the
+        # no_new_items branch — a later listing's short_page/navigate_error
+        # must not inherit an earlier listing's duplicate-shell verdict.
+        "identical_last_page": (
+            identical_last_page if stop_reason == "no_new_items" else False
+        ),
     }
     return all_urls, discovery_meta
 

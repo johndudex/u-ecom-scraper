@@ -456,7 +456,7 @@ class TestDiscoveryCoverageEmitted:
                 missing = CONTRACT_KEYS - got
                 assert not missing, f"{name} discovery_coverage missing {missing}"
                 extra = got - CONTRACT_KEYS
-                assert extra <= {"pages_visited"}, (
+                assert extra <= {"pages_visited", "identical_last_page"}, (
                     f"{name} invented contract keys {extra - {'pages_visited'}}"
                 )
 
