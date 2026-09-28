@@ -12,7 +12,7 @@ The pipeline measures listing **reachability** (byte-floor) but never listing **
 
 1. **Prevention before detection**: fix the strategy decision first (T2), then the test-time net (T4), then honesty surfaces (T6).
 2. **No new stop-reason vocabulary in any fail set.** Byte-identical page 2 is *legitimate* for a true 1-page catalog. Discovery enrichment (T3) is metadata-only.
-3. **Default-off env gates** for anything that changes strategy/routing behavior. Recording/telemetry is always-on.
+3. **The reviewed merge is the switch** ([wave-48b] wave-45b rule — env gates REMOVED): behavior-changing fixes land unconditionally; rollback = revert the commit. Recording/telemetry is always-on.
 4. **Reuse honored channels** — but verify each channel's consumers first (critique found 2 channels that look honored but aren't: `deterministic_gate` is presence-truthy-read, `navigation_analysis.notes/listing_reached` don't survive to the artifact).
 5. **TDD every change**; full suite + ruff gate (`webapp/ src/` only); local wonderbly e2e as acceptance.
 
@@ -49,7 +49,7 @@ Implementation constraints (critique-verified):
 
 `webapp/agents/graph.py` `_derive_strategy` (BOTH copies of the duplicated listing-probe block — 5656-5667 ≡ 5710-5721, confirmed byte-identical; the first copy feeds `_discovery_tier` at 5704-5708, the second gates the flip — edit both identically):
 - Read `_lcr = (probe.listing_connectivity or {}).get("listing_client_rendered")`.
-- **Env-gated flip** (`LISTING_ANCHOR_FLOOR=1`, default off): upgrade `http_requests → http_navigation` exactly like the existing `_listing_needs_browser` seam at 5977-5982, **guarded by**:
+- **Unconditional flip** ([wave-48b] env gate removed): upgrade `http_requests → http_navigation` exactly like the existing `_listing_needs_browser` seam at 5977-5982, **guarded by** (plus the wave-48b POST-form exclusion — see the execution record):
   ```python
   strategy == "http_requests"
   and not method.startswith((*STEALTH_METHOD_PREFIXES, *FINGERPRINT_METHOD_PREFIXES))
@@ -69,9 +69,9 @@ Implementation constraints (critique-verified):
 - **Contract pins move in the same commit:** `tests/test_discovery_ladder.py:48-58` `CONTRACT_KEYS` allowed-extra set, `:458-461` extra assertion, and a `docs/discovery-coverage-gate-contract.md` §1 row.
 - Adding identical-page detection to the 3 navigation-family templates' own loops is a wave-49 candidate (out of scope).
 
-### T4 — known-yield cross-check (webapp, env-gated routing)
+### T4 — known-yield cross-check (webapp, unconditional routing [wave-48b])
 
-**Checker** `known_yield_gap_issue(state, report) -> dict | None` in `route_after_testing.py`, beside `deterministic_output_issues`. Runs only when `LISTING_YIELD_GATE=1` (with the gate off the checker does not run at all — no telemetry-only mode, since the report write itself steers the writer).
+**Checker** `known_yield_gap_issue(state, report) -> dict | None` in `route_after_testing.py`, beside `deterministic_output_issues`. Runs always ([wave-48b] — no telemetry-only mode exists, since the report write itself steers the writer).
 
 **Dual-source arming** (critique finding: the traverse source alone is unprotected — a wrong-site abort yields only the ~2-link HTTP-fallback capture, below the floor, and the motivating case's own two facts were mutually exclusive):
 
@@ -107,7 +107,7 @@ Known cosmetic side effect: `severity: "high"` sets `high_severity` (1587), disa
 
 Both critics independently recommended cutting. Verified defects: (a) clearing `skip_site_analysis` at the skip-cascade consumption point (2145-2152) does not route to `site_analyzer` — a falsy flag falls through to `_accessibility_goto`, which for nav-family modes **re-sets the skip and goes to `browser_traverse`** (1943-1951) — a full MCP re-navigation that overwrites exactly the fields T4 reads; (b) where site_analyzer does run, its `_on_success` **replaces `probe_result`** with a slim LLM-authored dict (3450-3461), destroying `listing_connectivity.listing_client_rendered`; (c) it would not change the strategy anyway — `_derive_strategy` reads `site_analysis` only as a connectivity fallback (5641-5647), never `scraping_method`/platform; the stale pin lives in `probe_result.connectivity.method_that_worked`, which re-running site_analyzer does not touch; (d) "once per job" is not structural (`check_accessibility` re-enters after every human_approval resume). The real gap T5 gestured at — stale platform pin starving wave-43 skill injection — is recorded as a wave-49 candidate (bounded deterministic injection hint + state latch, no phase reopen).
 
-### T6 — scope-shortfall honesty (webapp, always-on, no behavior change)
+### T6 — scope-shortfall honesty (webapp, always-on [wave-48b made this literally true — it shipped env-gated], no behavior change)
 
 `webapp/scraper/tasks.py` `_finalize_job` ground-truth block (2376-2430, after `job.product_count = len(successful)` at 2417): when `scope == "firstn"` and `0 < job.product_count < _scope_target(final_state)` → append `[SCOPE-SHORTFALL] asked {N}, delivered {job.product_count}` to `job.notes` + a SessionLog row.
 
@@ -128,15 +128,12 @@ Both critics independently recommended cutting. Verified defects: (a) clearing `
 2. **False-positive replay — two tiers** (original single-tier replay infeasible: `/jobs/<id>/api/` exposes scope/product_count/input_mode/notes but NOT navigation_analysis/probe_result):
    - **Tier 1 (prod API-servable):** recent ~50 completed `list_page` jobs — pull product_count + scope + notes via `/jobs/<id>/api/`; pull `metadata.discovery_coverage` from `/jobs/<id>/output/<fname>/download/`; grep `[LISTING-PROBE]` rows from the api/ logs. Emulate: Source A (body_length ≥ 20k in [LISTING-PROBE] + zero-anchor inference is NOT available retroactively → Tier 1 can only emulate Source B where navigation_analysis was persisted locally, plus the discovered<scope trigger) — hand-verify any hit.
    - **Tier 2 (local artifacts):** local workspace `scrapers/{slug}/analysis/` artifacts for recent local jobs — full emulation of both sources. Expect ≈0 trips on healthy jobs.
-3. **Local wonderbly e2e (acceptance):** local `list_page` job, wonderbly kids/0-3, scope firstn/10, gates ON → strategy leaves pure-HTTP discovery AND (Phase-1 discovers ≥10 item URLs **OR** the ladder visibly escalates toward playwright in the logs); output items ≥ what discovery found, never silently 2. Gates OFF → reproduces current behavior (2 items + new telemetry fields + `[SCOPE-SHORTFALL]` note).
+3. **Local wonderbly e2e (acceptance):** local `list_page` job, wonderbly kids/0-3, scope firstn/10, gates ON → strategy leaves pure-HTTP discovery AND (Phase-1 discovers ≥10 item URLs **OR** the ladder visibly escalates toward playwright in the logs); output items ≥ what discovery found, never silently 2. ([wave-48b] the gates-OFF mode no longer exists.)
 4. **Deploy order** (when merged): django + celery-worker FIRST, browser-service LAST.
 
-## Env levers
+## Levers
 
-| Lever | Default | Controls |
-|---|---|---|
-| `LISTING_ANCHOR_FLOOR` | off | T2 strategy flip (telemetry stamp always on) |
-| `LISTING_YIELD_GATE` | off | T4 checker + `known_yield_gap` stamp + all 5 routing touchpoints |
+None. [wave-48b] No env switch (wave-45b rule: the reviewed merge is the switch). Rollback = revert the commit.
 
 ## Tasks
 
@@ -173,8 +170,8 @@ T5 CUT per critique.
   fires on this wall-shaped page. **Accepted:** the stamp's operational claim
   ("this HTTP response carries zero item anchors — an http_requests draft on
   it starves") is TRUE for that response, the always-on stamp is
-  telemetry-only, and the gated flip would push such a job toward the browser
-  lane, which is the correct remedy for a wall. Not a false positive in any
+  telemetry-only, and the flip pushes such a job toward the browser lane,
+  which is the correct remedy for a wall. Not a false positive in any
   behavior-changing sense.
 - `wonderbly` listing from THIS network: direct_http rung 406s (prod job
   1082's probe got 200 — egress difference). The Source-A shell case stays
@@ -183,7 +180,7 @@ T5 CUT per critique.
 - Operational note: `browser_service` has NO `--reload` — the T1 probe change
   requires a browser-service restart to go live (volume-mounted code).
 
-**Local wonderbly e2e (job 466, gates ON via docker-compose.override.yml):**
+**Local wonderbly e2e (job 466; pre-removal — the env names were later retired in wave-48b and the override no longer arms anything):**
 the local probe's listing rung is `fingerprint_safari184_none` — a REAL
 Chrome fetch, so the Algolia grid renders (55 anchors on the 142KB DOM) and
 the T2 stamp is correctly SUPPRESSED (the fetcher saw rendered content).
@@ -207,3 +204,49 @@ Wave-49 candidates observed live: fingerprint winners render the real DOM —
 strategy derivation maps them to http_requests, which fetches the UNrendered
 HTML (capture raw-HTML anchor count pre-render to arm the floor on this
 path); writer no-op fix cycles still burn a retry against walls.
+
+## Execution record — wave-48b: env gates REMOVED (2026-09-28)
+
+Owner call: "i dnt like env variables, get this to work properly." Three RCA
+subagents (blast-radius + RED set, adversarial always-on safety hunt,
+wave-45b precedent + docs audit) converged on GO: the containment
+architecture (input-mode gate, PASS/ground-truth precedence, MAX_TEST_RETRIES
+cap, terminal cleanup, skip_approvals-only veto, missing-key-≠-zero) makes
+always-on safe, and the veto's marginal population is nav/search_term jobs
+holding exactly 1-2 real rows. Wave-45b rule applied: the reviewed merge is
+the switch; rollback = revert the commit.
+
+Removed: `_listing_anchor_floor_enabled` (graph.py), `_listing_yield_gate_enabled`
++ its early return + the orphaned `import os` (route_after_testing.py), the
+inline env read in tasks.py T6. History comments name the dead vars.
+
+Guards landed WITH the removal (adversarial RCA findings):
+- **H2 (HIGH)**: the kyg checker's Source A now declines when
+  `probe_result.connectivity.method_that_worked` is stealth/fingerprint-
+  prefixed — the listing probe's rung list rides the PDP winner, so on a
+  fingerprint-proven site a 0-anchor shell stamps `listing_client_rendered`
+  with no browser rung having measured the lane; steering discovery there
+  repeats the job-524 2×1800s burn. Source B deliberately unguarded (an
+  honest traverse_reached IS the browser-lane proof) and becomes the
+  fallback when Source A declines.
+- **H3 (MED)**: the T2 flip skips form-POST-discovered listings
+  (locumtenens replay contract — http_navigation's phase 1 cannot replay
+  the POST).
+- **H5 (LOW)**: `job_restart` strips inherited `[SCOPE-SHORTFALL]` rows from
+  the copied notes (`_strip_scope_shortfall_notes` in views.py) — the row is
+  a verdict about the parent run, not provenance to carry forward.
+
+Documented, not blocked (wave-49 candidates): Source A's `expected` is the
+intake scope, not measured source yield (bounded: ≤2 extra cycles, honest
+FAILED, operator-retriable); the flip forecloses the cheap `http_requests`
+ladder rung on a stamp false-positive; a vetoed FAILED row links no output
+file. Known accepted behavior change at merge: prod jobs on measured
+zero-anchor shells re-route discovery to the browser lane (including the
+jomashop wall-shaped-200 accepted verdict), kyg-verdict jobs terminate
+honestly instead of riding the exhausted rescue, and `[SCOPE-SHORTFALL]`
+rows appear on partial-starvation finalize.
+
+Verification: RED→GREEN TDD (13 failing → 130 passed incl. f13 topology +
+cli_contract + wave-26 invariants); TestEnvVarIsDead pins the dead vars in
+BOTH directions + helpers deleted (not stubbed) + mentions only in comment
+lines; full suite + ruff green.

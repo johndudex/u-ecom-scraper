@@ -2442,20 +2442,17 @@ def _finalize_job(job: ScrapeJob) -> None:
                         if has_substantive_field(prod) and prod.get("status_code", 0) > 0
                     ]
                     job.product_count = len(successful)
-                    # [wave-48 T6] Scope-shortfall marker (job 1082 class):
-                    # asked firstn/N, shipped fewer — surface the gap on the
-                    # job record. Same env gate as the kyg checker; the
-                    # retry seed strips ONLY these rows (line-scoped, the
-                    # [FIELD-MAP] audit rows keep flowing).
-                    if str(os.environ.get("LISTING_YIELD_GATE", "0")).strip().lower() in (
-                        "1", "true", "yes", "on",
-                    ):
-                        _ss_row = _scope_shortfall_row(
-                            job.scope, job.scope_value, job.product_count
-                        )
-                        if _ss_row and "[SCOPE-SHORTFALL]" not in (job.notes or ""):
-                            job.notes = (job.notes or "") + f"\n{_ss_row}"
-                            job.save(update_fields=["notes"])
+                    # [wave-48 T6 → wave-48b] Scope-shortfall marker (job 1082
+                    # class): asked firstn/N, shipped fewer — surface the gap
+                    # on the job record. Unconditional (wave-45b: the merge is
+                    # the switch); the retry seed strips ONLY these rows
+                    # (line-scoped, the [FIELD-MAP] audit rows keep flowing).
+                    _ss_row = _scope_shortfall_row(
+                        job.scope, job.scope_value, job.product_count
+                    )
+                    if _ss_row and "[SCOPE-SHORTFALL]" not in (job.notes or ""):
+                        job.notes = (job.notes or "") + f"\n{_ss_row}"
+                        job.save(update_fields=["notes"])
                 if site_block.get("name"):
                     job.site_name = site_block["name"]
                 logger.info(

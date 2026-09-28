@@ -35,6 +35,19 @@ from .skills_summary import summarize_job_skills
 logger = logging.getLogger(__name__)
 
 
+def _strip_scope_shortfall_notes(value) -> str:
+    """[wave-48b H5] job_restart copies the old job's notes into the new row.
+    A ``[SCOPE-SHORTFALL]`` row is a VERDICT about the parent run — inherited
+    onto the re-run's own row it reads as a fresh lie, so restart strips
+    exactly those lines (the ``[FIELD-MAP]`` audit rows keep flowing). The
+    same line-scoped idiom as the retry seed's user_notes strip in tasks.py."""
+    return "\n".join(
+        ln
+        for ln in str(value or "").splitlines()
+        if "[SCOPE-SHORTFALL]" not in ln
+    )
+
+
 def _get_job(request, job_id):
     """Fetch a ScrapeJob. Superusers can access ANY job (regardless of owner);
     regular users can only access their own. Returns the job or raises Http404."""
@@ -729,7 +742,9 @@ def job_restart(request, job_id):
             scope=_post_or_old("scope", job.scope),
             scope_value=_post_or_old("scope_value", job.scope_value),
             schema_text=_post_or_old("schema_text", job.schema_text or ""),
-            notes=(rerun_prompt or _post_or_old("notes", job.notes)),
+            notes=_strip_scope_shortfall_notes(
+                rerun_prompt or _post_or_old("notes", job.notes)
+            ),
             full_extraction=job.full_extraction,
             skip_approvals=job.skip_approvals,
             # Dagster opt-in carries to the re-run: the intake re-run form posts

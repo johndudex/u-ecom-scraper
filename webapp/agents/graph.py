@@ -5633,18 +5633,11 @@ def _route_after_execution(state: ScrapeState):
     return Command(goto="scraper_analyzer", update=update)
 
 
-def _listing_anchor_floor_enabled() -> bool:
-    """Wave-48 T2 gate — upgrade http_requests discovery on a measured
-    client-rendered listing (content-rich shell, zero PDP-ish anchors).
-
-    OFF by default: it changes which template phase 1 rides, so it ships as
-    a controlled experiment (``LISTING_ANCHOR_FLOOR=1``) per the wave-40
-    env-gate discipline. The telemetry stamp that feeds it
-    (``listing_client_rendered``) is always-on.
-    """
-    return str(os.environ.get("LISTING_ANCHOR_FLOOR", "0")).strip().lower() in (
-        "1", "true", "yes", "on",
-    )
+# [wave-48 T2 → wave-48b] Client-rendered-listing flip — originally gated
+# behind LISTING_ANCHOR_FLOOR for the local e2e. The env gate was REMOVED
+# (owner call, wave-45b rule: an env var is not a proper switch — the
+# reviewed merge/deploy is the switch; revert the commit to disable). The
+# telemetry stamp that feeds it (``listing_client_rendered``) is always-on.
 
 
 def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
@@ -6019,24 +6012,31 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
             "while a browser rung reached it — discovery rides the browser rung"
         )
 
-    # [wave-48 T2] A CLIENT-RENDERED listing starves http_requests' phase 1
-    # exactly like a blocked one — the listing probe's byte floor measured
-    # reachability, not yield (job 1082 wonderbly: 142KB Astro+Algolia shell,
-    # 0 grid anchors, shipped 2 of firstn/10 as COMPLETED). Same upgrade
-    # shape as the seam above, env-gated. Guards:
+    # [wave-48 T2 → wave-48b] A CLIENT-RENDERED listing starves http_requests'
+    # phase 1 exactly like a blocked one — the listing probe's byte floor
+    # measured reachability, not yield (job 1082 wonderbly: 142KB Astro+Algolia
+    # shell, 0 grid anchors, shipped 2 of firstn/10 as COMPLETED). Same upgrade
+    # shape as the seam above, unconditional (wave-45b: the merge is the
+    # switch). Guards:
     #   - strategy == "http_requests" only — never touches internal_api
     #     (API evidence outranks) or a strategy already browser-lane;
     #   - NOT on a stealth/fingerprint-proven method (job-524 revolve): a
     #     fingerprint win measures that plain HTTP was REJECTED and
     #     TLS-impersonated HTTP answered — upgrading discovery to a vanilla
-    #     browser lane the probe never proved repeats that burn.
+    #     browser lane the probe never proved repeats that burn;
+    #   - NOT on a form-POST-discovered listing (locumtenens replay
+    #     contract): the cascade deliberately keeps those on http_requests
+    #     because http_navigation's phase 1 cannot replay the POST.
+    _flip_search = (
+        _nav.get("search") if isinstance(_nav, dict) else None
+    ) or {}
     if (
-        _listing_anchor_floor_enabled()
-        and _lcr
+        _lcr
         and strategy == "http_requests"
         and not method.startswith(
             (*STEALTH_METHOD_PREFIXES, *FINGERPRINT_METHOD_PREFIXES)
         )
+        and str(_flip_search.get("form_method") or "").upper() != "POST"
     ):
         strategy = "http_navigation"
         _strategy_source += (
@@ -9369,11 +9369,12 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                         )
             except Exception as _dexc:
                 logger.debug("_invoke_code_tester: deterministic checks skipped: %s", _dexc)
-            # [wave-48 T4b] Known-yield-gap stamp (job 1082 class): a
-            # TOP-LEVEL report key — deliberately NOT inside
+            # [wave-48 T4b → wave-48b] Known-yield-gap stamp (job 1082 class):
+            # a TOP-LEVEL report key — deliberately NOT inside
             # deterministic_gate, whose truthy read is the CLI-contract
-            # bounce (route_after_testing belt). Gated on LISTING_YIELD_GATE
-            # inside the checker; absent (no state change) when it declines.
+            # bounce (route_after_testing belt). Unconditional (wave-45b: the
+            # merge is the switch); absent (no state change) when the checker
+            # declines.
             try:
                 from .nodes.route_after_testing import known_yield_gap_issue
 

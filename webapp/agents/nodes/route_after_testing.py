@@ -4,12 +4,12 @@
 """
 
 import logging
-import os
 import re
 
 from ..constants import (
     DEAD_STATUS_CODES,
     FINAL_RETRY_SENTINEL,
+    FINGERPRINT_METHOD_PREFIXES,
     MAX_REMAPS,
     MAX_TEST_RETRIES,
     SOFT_404_MARKERS,
@@ -1299,16 +1299,10 @@ _KYG_BLOCKED_STOP_REASONS = frozenset(
     {"navigate_error", "dedup_flat", "phase1_skipped", "checkpoint_reused", "skipped"}
 )
 
-
-def _listing_yield_gate_enabled() -> bool:
-    """[wave-48 T4] LISTING_YIELD_GATE arms the known-yield-gap checker and
-    its routing (default off — identical behavior when unset)."""
-    return str(os.environ.get("LISTING_YIELD_GATE", "0")).strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+# [wave-48 T4 → wave-48b] The known-yield-gap checker and its routing were
+# originally gated behind LISTING_YIELD_GATE for the local e2e. The env gate
+# was REMOVED (owner call, wave-45b rule: an env var is not a proper switch —
+# the reviewed merge/deploy is the switch; revert the commit to disable).
 
 
 def known_yield_gap_issue(state: ScrapeState, report: dict) -> dict | None:
@@ -1330,11 +1324,9 @@ def known_yield_gap_issue(state: ScrapeState, report: dict) -> dict | None:
 
     Returns a HIGH-severity issue dict for the router, or None. Never
     raises: ``discovered_urls`` is an INT in the templates, so ``len()`` of
-    it would TypeError inside the router (the _volume_gap precedent). Gated
-    on LISTING_YIELD_GATE (default off).
+    it would TypeError inside the router (the _volume_gap precedent).
+    Unconditional since wave-48b (wave-45b: the merge is the switch).
     """
-    if not _listing_yield_gate_enabled():
-        return None
     if not isinstance(state, dict) or not isinstance(report, dict):
         return None
     if (state.get("input_mode") or "") not in (
@@ -1374,12 +1366,29 @@ def known_yield_gap_issue(state: ScrapeState, report: dict) -> dict | None:
     lc = probe.get("listing_connectivity")
     lc = lc if isinstance(lc, dict) else {}
     if lc.get("listing_client_rendered"):
-        # Source A: the probe MEASURED the shell.
-        source, expected = "probe", _scope_floor()
-    else:
+        # [wave-48b H2] job-524 revolve guard, mirroring the T2 flip in
+        # graph._derive_strategy: the listing probe's rung list rides the PDP
+        # winner, and _is_http_method counts fingerprint_* as HTTP-flavoured —
+        # so on a fingerprint/stealth-proven site a content-rich 0-anchor
+        # shell stamps ``listing_client_rendered`` without any browser rung
+        # having measured the lane. Steering discovery to a vanilla browser
+        # lane there repeats the documented 2×1800s burn. Source B is
+        # intentionally NOT guarded: an honest traverse_reached IS positive
+        # evidence the browser lane reaches.
+        _pdp_method = str(
+            ((probe.get("connectivity") or {}).get("method_that_worked")) or ""
+        )
+        if not _pdp_method.startswith(
+            (*STEALTH_METHOD_PREFIXES, *FINGERPRINT_METHOD_PREFIXES)
+        ):
+            # Source A: the probe MEASURED the shell.
+            source, expected = "probe", _scope_floor()
+    if not source:
         # Source B: the traverse's own verdict. The root fallback fabricates
         # discovery.listing_reached=True — keying on that would arm the gate
-        # on exactly the jobs where the listing was NEVER reached.
+        # on exactly the jobs where the listing was NEVER reached. Also the
+        # fallback when Source A declined (H2): the traverse itself is
+        # positive evidence the browser lane reaches.
         nav = state.get("navigation_analysis")
         nav = nav if isinstance(nav, dict) else {}
         notes = str(nav.get("traverse_notes") or "").lower()

@@ -11,6 +11,17 @@ COMPLETED). These tests pin the fix chain:
 - T3 — ``identical_last_page`` telemetry (src/listing_discovery.py)
 - T4 — known-yield-gap checker + routing touchpoints
 - T6 — [SCOPE-SHORTFALL] finalize honesty note
+
+[wave-48b] Originally gated behind LISTING_ANCHOR_FLOOR / LISTING_YIELD_GATE
+for the local e2e. Owner decision (wave-45b rule): an env var is not a
+proper switch — the gates are REMOVED and the reviewed merge/deploy is the
+switch; rollback = revert the commit. These tests pin the unconditional
+behavior. TestEnvVarIsDead asserts the old vars are inert in BOTH
+directions; those tests would have passed the OPPOSITE way under the old
+flag-OFF contract. The guards added alongside the removal: a
+fingerprint-proven PDP transport declines Source A (job-524), POST-form
+discovery is excluded from the flip (locumtenens replay contract), and
+job_restart strips inherited [SCOPE-SHORTFALL] rows.
 """
 
 import importlib.util
@@ -338,35 +349,36 @@ def _lcr_listing(method="direct_http"):
 
 
 class TestAnchorFloorStrategyFlip:
-    def test_gate_off_no_flip(self, monkeypatch):
+    """[wave-48b] The flip is unconditional — no env gate (wave-45b rule)."""
+
+    def test_delenv_still_flips(self, monkeypatch):
+        # The gate is gone: with the var DELETED the flip still fires. Under
+        # the old flag-OFF contract this test asserted the opposite.
         monkeypatch.delenv("LISTING_ANCHOR_FLOOR", raising=False)
         from agents.graph import _derive_strategy
 
         assert _derive_strategy(_flip_state(listing=_lcr_listing()))["strategy"] == (
-            "http_requests"
+            "http_navigation"
         )
 
-    def test_gate_on_flips_http_requests_to_http_navigation(self, monkeypatch):
-        monkeypatch.setenv("LISTING_ANCHOR_FLOOR", "1")
+    def test_flips_http_requests_to_http_navigation(self):
         from agents.graph import _derive_strategy
 
         a = _derive_strategy(_flip_state(listing=_lcr_listing()))
         assert a["strategy"] == "http_navigation"
         assert "client_rendered" in a["access_recipe"]["evidence"]
 
-    def test_evidence_stamp_always_on_even_with_gate_off(self, monkeypatch):
-        monkeypatch.delenv("LISTING_ANCHOR_FLOOR", raising=False)
+    def test_evidence_stamp_rides_the_flip(self):
         from agents.graph import _derive_strategy
 
         a = _derive_strategy(_flip_state(listing=_lcr_listing()))
-        assert a["strategy"] == "http_requests"
+        assert a["strategy"] == "http_navigation"
         assert "client_rendered" in a["access_recipe"]["evidence"]
 
-    def test_fingerprint_proven_pdp_never_flips(self, monkeypatch):
+    def test_fingerprint_proven_pdp_never_flips(self):
         # job-524 revolve guard: a fingerprint win means plain HTTP was
         # REJECTED and TLS-impersonated HTTP answered — no upgrade to a
         # vanilla browser lane the probe never proved.
-        monkeypatch.setenv("LISTING_ANCHOR_FLOOR", "1")
         from agents.graph import _derive_strategy
 
         a = _derive_strategy(
@@ -377,8 +389,23 @@ class TestAnchorFloorStrategyFlip:
         )
         assert a["strategy"] == "http_requests"
 
-    def test_not_stamped_no_flip_even_with_gate_on(self, monkeypatch):
+    def test_post_form_discovery_never_flips(self, monkeypatch):
+        # [wave-48b H3] locumtenens replay contract: a form-POST→SSR listing
+        # is HTTP-reachable via POST replay and http_navigation's phase 1
+        # cannot replay the POST — the flip must not override the cascade's
+        # deliberate http_requests pick. (setenv kept only so this test fails
+        # for the RIGHT reason while the env gate still exists.)
         monkeypatch.setenv("LISTING_ANCHOR_FLOOR", "1")
+        from agents.graph import _derive_strategy
+
+        st = _flip_state(listing=_lcr_listing())
+        st["navigation_analysis"] = {
+            "rendering_verified": "ssr",
+            "search": {"form_method": "POST", "action": "/search"},
+        }
+        assert _derive_strategy(st)["strategy"] == "http_requests"
+
+    def test_not_stamped_no_flip(self):
         from agents.graph import _derive_strategy
 
         listing = _lcr_listing()
@@ -387,10 +414,9 @@ class TestAnchorFloorStrategyFlip:
             "http_requests"
         )
 
-    def test_internal_api_never_flipped(self, monkeypatch):
+    def test_internal_api_never_flipped(self):
         # API evidence outranks — the count gate already decided with content
         # proof; the flip only ever touches http_requests.
-        monkeypatch.setenv("LISTING_ANCHOR_FLOOR", "1")
         from agents.graph import _derive_strategy
 
         st = _flip_state(listing=_lcr_listing())
@@ -561,14 +587,19 @@ def _kyg_report(stop="no_new_items", found=2, **over):
 
 
 class TestKnownYieldGapIssue:
-    def test_gate_off_checker_does_not_run(self, monkeypatch):
+    """[wave-48b] The checker runs unconditionally — no env gate."""
+
+    def test_delenv_checker_still_runs(self, monkeypatch):
+        # The gate is gone: with the var DELETED the checker still arms.
+        # Under the old flag-OFF contract this test asserted the opposite.
         monkeypatch.delenv("LISTING_YIELD_GATE", raising=False)
         from agents.nodes.route_after_testing import known_yield_gap_issue
 
-        assert known_yield_gap_issue(_kyg_state(), _kyg_report()) is None
+        issue = known_yield_gap_issue(_kyg_state(), _kyg_report())
+        assert issue is not None
+        assert issue["source"] == "probe"
 
-    def test_source_a_probe_arms_and_fires(self, monkeypatch):
-        monkeypatch.setenv("LISTING_YIELD_GATE", "1")
+    def test_source_a_probe_arms_and_fires(self):
         from agents.nodes.route_after_testing import known_yield_gap_issue
 
         issue = known_yield_gap_issue(_kyg_state(), _kyg_report(found=2))
@@ -580,39 +611,92 @@ class TestKnownYieldGapIssue:
         assert issue["discovered"] == 2
         assert issue["description"].startswith("Deterministic check:")
 
-    def test_source_a_no_gap_when_scope_met(self, monkeypatch):
-        monkeypatch.setenv("LISTING_YIELD_GATE", "1")
+    def test_fingerprint_proven_pdp_declines_source_a(self, monkeypatch):
+        # [wave-48b H2] job-524 revolve: the listing probe's rung list rides
+        # the PDP winner — a fingerprint_* PDP win makes pdp_http the
+        # fingerprint rung, and _is_http_method counts it as HTTP-flavoured,
+        # so a ≥20KB 0-anchor shell there stamps listing_client_rendered.
+        # Steering discovery to a vanilla browser lane then repeats the
+        # documented 2×1800s burn. Source A must decline; Source B (an
+        # HONEST browser traverse) stays armed — the traverse itself proves
+        # the browser lane reaches.
+        monkeypatch.setenv("LISTING_YIELD_GATE", "1")  # inert post-removal
+        from agents.nodes.route_after_testing import known_yield_gap_issue
+
+        st = _kyg_state()
+        st["probe_result"]["connectivity"] = {
+            "method_that_worked": "fingerprint_chrome124"
+        }
+        assert known_yield_gap_issue(st, _kyg_report(found=2)) is None
+
+    def test_stealth_proven_pdp_declines_source_a(self, monkeypatch):
+        # Same guard for the stealth (uc_chrome/cloak) family.
+        monkeypatch.setenv("LISTING_YIELD_GATE", "1")  # inert post-removal
+        from agents.nodes.route_after_testing import known_yield_gap_issue
+
+        st = _kyg_state()
+        st["probe_result"]["connectivity"] = {"method_that_worked": "cloak_residential"}
+        assert known_yield_gap_issue(st, _kyg_report(found=2)) is None
+
+    def test_source_b_still_arms_when_pdp_fingerprint_proven(self, monkeypatch):
+        # The H2 guard is Source-A-scoped: an honest browser traverse that
+        # REACHED the listing is positive evidence the browser lane works.
+        monkeypatch.setenv("LISTING_YIELD_GATE", "1")  # inert post-removal
+        from agents.nodes.route_after_testing import known_yield_gap_issue
+
+        st = _kyg_state()
+        st["probe_result"] = {
+            "connectivity": {"method_that_worked": "fingerprint_chrome124"},
+            "listing_connectivity": {
+                "method_that_worked": "direct_http",
+                "http_ok": True,
+                "needs_browser": False,
+                "body_length": 142_745,
+                "item_link_count": 0,
+                "listing_client_rendered": True,
+            },
+        }
+        st["navigation_analysis"] = {
+            "traverse_reached": True,
+            "item_links": {
+                "url_examples": [
+                    f"https://www.wonderbly.com/personalized-products/book-{i}"
+                    for i in range(20)
+                ]
+            },
+        }
+        issue = known_yield_gap_issue(st, _kyg_report(found=2))
+        assert issue is not None
+        assert issue["source"] == "traverse"
+
+    def test_source_a_no_gap_when_scope_met(self):
         from agents.nodes.route_after_testing import known_yield_gap_issue
 
         assert known_yield_gap_issue(_kyg_state(), _kyg_report(found=10)) is None
 
-    def test_url_list_never_arms(self, monkeypatch):
-        monkeypatch.setenv("LISTING_YIELD_GATE", "1")
+    def test_url_list_never_arms(self):
         from agents.nodes.route_after_testing import known_yield_gap_issue
 
         assert known_yield_gap_issue(_kyg_state(input_mode="url_list"), _kyg_report()) is None
 
-    def test_coverage_fail_stop_reason_ladder_owns_it(self, monkeypatch):
-        monkeypatch.setenv("LISTING_YIELD_GATE", "1")
+    def test_coverage_fail_stop_reason_ladder_owns_it(self):
         from agents.nodes.route_after_testing import known_yield_gap_issue
 
         assert known_yield_gap_issue(
             _kyg_state(), _kyg_report(stop="navigate_error")
         ) is None
 
-    def test_checkpoint_reused_never_fires(self, monkeypatch):
+    def test_checkpoint_reused_never_fires(self):
         # Fresh zero discovered on a rescued run — the yield lives in the
         # checkpoint, not the coverage block. Not starvation evidence.
-        monkeypatch.setenv("LISTING_YIELD_GATE", "1")
         from agents.nodes.route_after_testing import known_yield_gap_issue
 
         assert known_yield_gap_issue(
             _kyg_state(), _kyg_report(stop="checkpoint_reused")
         ) is None
 
-    def test_non_firstn_degenerates_to_zero_yield_only(self, monkeypatch):
+    def test_non_firstn_degenerates_to_zero_yield_only(self):
         # scope_target()=1 without firstn — the trigger becomes discovered<1.
-        monkeypatch.setenv("LISTING_YIELD_GATE", "1")
         from agents.nodes.route_after_testing import known_yield_gap_issue
 
         st = _kyg_state()
@@ -620,8 +704,7 @@ class TestKnownYieldGapIssue:
         assert known_yield_gap_issue(st, _kyg_report(found=2)) is None
         assert known_yield_gap_issue(st, _kyg_report(found=0)) is not None
 
-    def test_source_b_traverse_measured_arms(self, monkeypatch):
-        monkeypatch.setenv("LISTING_YIELD_GATE", "1")
+    def test_source_b_traverse_measured_arms(self):
         from agents.nodes.route_after_testing import known_yield_gap_issue
 
         st = _kyg_state()
@@ -643,10 +726,9 @@ class TestKnownYieldGapIssue:
         assert issue["source"] == "traverse"
         assert issue["expected"] == 10  # min(len(url_examples)=20, scope=10)
 
-    def test_source_b_blocked_without_honest_reached(self, monkeypatch):
+    def test_source_b_blocked_without_honest_reached(self):
         # discovery.listing_reached is fabricated True by the fallback — the
         # gate keys on traverse_reached, which the fallback does not set.
-        monkeypatch.setenv("LISTING_YIELD_GATE", "1")
         from agents.nodes.route_after_testing import known_yield_gap_issue
 
         st = _kyg_state()
@@ -659,8 +741,7 @@ class TestKnownYieldGapIssue:
         }
         assert known_yield_gap_issue(st, _kyg_report()) is None
 
-    def test_source_b_blocked_below_five_examples(self, monkeypatch):
-        monkeypatch.setenv("LISTING_YIELD_GATE", "1")
+    def test_source_b_blocked_below_five_examples(self):
         from agents.nodes.route_after_testing import known_yield_gap_issue
 
         st = _kyg_state()
@@ -674,8 +755,7 @@ class TestKnownYieldGapIssue:
         }
         assert known_yield_gap_issue(st, _kyg_report()) is None
 
-    def test_source_b_wrong_site_notes_block(self, monkeypatch):
-        monkeypatch.setenv("LISTING_YIELD_GATE", "1")
+    def test_source_b_wrong_site_notes_block(self):
         from agents.nodes.route_after_testing import known_yield_gap_issue
 
         st = _kyg_state()
@@ -689,10 +769,9 @@ class TestKnownYieldGapIssue:
         }
         assert known_yield_gap_issue(st, _kyg_report()) is None
 
-    def test_int_coverage_read_never_raises(self, monkeypatch):
+    def test_int_coverage_read_never_raises(self):
         # discovered_urls is an INT in the templates — len() on it would
         # TypeError inside the router (the _volume_gap latent bug).
-        monkeypatch.setenv("LISTING_YIELD_GATE", "1")
         from agents.nodes.route_after_testing import known_yield_gap_issue
 
         r = _kyg_report()
@@ -700,6 +779,64 @@ class TestKnownYieldGapIssue:
         r.pop("successful_extractions")
         issue = known_yield_gap_issue(_kyg_state(), r)
         assert issue is not None and issue["discovered"] == 2
+
+
+class TestEnvVarIsDead:
+    """[wave-48b] The old vars are inert in BOTH directions — these tests
+    would have passed the OPPOSITE way under the old flag-OFF contract."""
+
+    def _rat_mod(self):
+        # agents/nodes/__init__ re-exports the NODE function under the same
+        # name, shadowing the module — resolve the module via sys.modules.
+        import sys
+
+        import agents.nodes.route_after_testing  # noqa: F401  (ensures import)
+
+        return sys.modules["agents.nodes.route_after_testing"]
+
+    def test_env_zero_checker_still_fires(self, monkeypatch):
+        monkeypatch.setenv("LISTING_YIELD_GATE", "0")
+        from agents.nodes.route_after_testing import known_yield_gap_issue
+
+        assert known_yield_gap_issue(_kyg_state(), _kyg_report()) is not None
+
+    def test_env_one_changes_nothing(self, monkeypatch):
+        monkeypatch.setenv("LISTING_YIELD_GATE", "1")
+        from agents.nodes.route_after_testing import known_yield_gap_issue
+
+        issue = known_yield_gap_issue(_kyg_state(), _kyg_report())
+        assert issue is not None and issue["expected"] == 10
+
+    def test_anchor_floor_zero_still_flips(self, monkeypatch):
+        monkeypatch.setenv("LISTING_ANCHOR_FLOOR", "0")
+        from agents.graph import _derive_strategy
+
+        assert _derive_strategy(_flip_state(listing=_lcr_listing()))["strategy"] == (
+            "http_navigation"
+        )
+
+    def test_gate_symbols_are_gone(self):
+        import agents.graph as graph_mod
+
+        assert not hasattr(graph_mod, "_listing_anchor_floor_enabled"), (
+            "the env gate helper must be DELETED, not stubbed True (wave-45b: "
+            "the reviewed merge is the switch)"
+        )
+        assert not hasattr(self._rat_mod(), "_listing_yield_gate_enabled")
+
+    def test_env_names_survive_only_in_comments(self):
+        # The wave-45b history comments NAME the dead var (that is the
+        # record); nothing else may reference it — every surviving mention
+        # must be a comment line, never a read.
+        for rel in (
+            ("webapp", "agents", "graph.py"),
+            ("webapp", "agents", "nodes", "route_after_testing.py"),
+            ("webapp", "scraper", "tasks.py"),
+        ):
+            src = open(os.path.join(ROOT, *rel), encoding="utf-8").read()
+            for ln in src.splitlines():
+                if "LISTING_ANCHOR_FLOOR" in ln or "LISTING_YIELD_GATE" in ln:
+                    assert ln.lstrip().startswith("#"), (rel, ln)
 
 
 class TestKygBeltAndClassify:
@@ -957,9 +1094,9 @@ class TestScopeShortfallRow:
 
 
 class TestScopeShortfallWiring:
-    def test_finalize_appends_row_when_gate_on(self, monkeypatch):
-        # Source pins: the append site sits after the ground-truth
-        # product_count read, gated on the same env idiom as the checker.
+    def test_finalize_appends_row_unconditional(self):
+        # [wave-48b] Source pins: the append site sits after the ground-truth
+        # product_count read, NO env gate in front of it.
         src = open(
             os.path.join(ROOT, "webapp", "scraper", "tasks.py"), encoding="utf-8"
         ).read()
@@ -967,10 +1104,7 @@ class TestScopeShortfallWiring:
         assert i != -1, "ground-truth product_count site moved"
         window = src[i: i + 2000]
         assert "_scope_shortfall_row(" in window
-        assert "[SCOPE-SHORTFALL]" not in src[:i].replace(
-            "_scope_shortfall_row", ""
-        ) or True  # row text lives in the helper, not scattered
-        assert 'LISTING_YIELD_GATE' in window
+        assert "_scope_shortfall_row" in src[:i]  # row text lives in the helper
 
     def test_retry_seed_strips_only_shortfall_rows(self):
         # Targeted strip: [SCOPE-SHORTFALL] lines never reach the retry
@@ -980,4 +1114,45 @@ class TestScopeShortfallWiring:
         ).read()
         assert '"[SCOPE-SHORTFALL]" not in ln' in src, (
             "user_notes seed must drop [SCOPE-SHORTFALL] lines only"
+        )
+
+
+class TestScopeShortfallRestartStrip:
+    """[wave-48b H5] job_restart copies the old job's notes into the new row
+    (views.py). A [SCOPE-SHORTFALL] row is a VERDICT about the parent run —
+    inherited onto the re-run's own row it reads as a fresh lie, so restart
+    strips exactly those lines ([FIELD-MAP] audit rows keep flowing)."""
+
+    def test_strip_helper(self):
+        from scraper.views import _strip_scope_shortfall_notes
+
+        notes = (
+            "[FIELD-MAP] keep me\n"
+            "[SCOPE-SHORTFALL] asked 10, shipped 2\n"
+            "plain line"
+        )
+        out = _strip_scope_shortfall_notes(notes)
+        assert "[SCOPE-SHORTFALL]" not in out
+        assert "[FIELD-MAP] keep me" in out
+        assert "plain line" in out
+
+    def test_strip_helper_none_and_empty(self):
+        from scraper.views import _strip_scope_shortfall_notes
+
+        assert _strip_scope_shortfall_notes(None) == ""
+        assert _strip_scope_shortfall_notes("") == ""
+        assert (
+            _strip_scope_shortfall_notes("only\n[SCOPE-SHORTFALL] asked 3, shipped 1")
+            == "only"
+        )
+
+    def test_job_restart_routes_notes_through_the_strip(self):
+        src = open(
+            os.path.join(ROOT, "webapp", "scraper", "views.py"), encoding="utf-8"
+        ).read()
+        i = src.find("def job_restart(")
+        assert i != -1, "job_restart moved"
+        assert "_strip_scope_shortfall_notes" in src[i: i + 9000], (
+            "job_restart must strip inherited [SCOPE-SHORTFALL] rows from the "
+            "copied notes"
         )
