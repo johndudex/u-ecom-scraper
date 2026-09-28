@@ -152,9 +152,10 @@ tags:
     description: >-
       Optional pure helpers mirroring the /intake UI's pre-submit checks.
       Recommended ONLY for validate-schema (see its notes). check-site IS
-      exposed but deliberately metadata-only — `known_site` true is a bounded
-      cross-tenant signal (boolean + platform string; never fields or other
-      tenants' data — see design rationale).
+      exposed and, since wave-47 (owner decision 2026-09-28), returns the
+      same shared field knowledge the internal /intake UI preloads for
+      KNOWN sites — the cross-tenant metadata-only guard was deliberately
+      reversed (see check-site's operation notes).
   - name: field-discovery
     description: >-
       Live field discovery for a sample item page (wave-41): renders the URL
@@ -178,17 +179,20 @@ paths:
     post:
       tags: [jobs]
       operationId: checkSite
-      summary: Scope-limited site pre-check
+      summary: Site knowledge pre-check (metadata + known field names)
       description: |
-        SECURITY NOTE: `known_site: true` is an accepted, bounded
-        cross-tenant signal — it discloses that *some* tenant scraped this
-        host (boolean + platform string only; never fields or outputs).
+        [wave-47 intake parity — owner decision 2026-09-28] For a KNOWN host
+        the response now carries the SAME shared field knowledge the
+        internal /intake UI preloads (intake_check_site semantics): the
+        sorted union of Site.output_schema field names, Site.fields_extracted,
+        and ALL users' ScrapeJob.target_fields for the host, plus the
+        output_schema content_type. This deliberately reverses the earlier
+        metadata-only cross-tenant guard — API keys are treated as internal
+        team members, matching intake's "shared field knowledge" model.
 
-        Answers "has this site been scraped before" WITHOUT the cross-tenant
-        leak that excluded the internal `intake_check_site` (which reads
-        every user's target_fields for the host — views.py:2331-2337).
-        Returns Site-level metadata only — no field names, no other
-        tenants' data. Pure read; no side effects.
+        For an UNKNOWN host the body stays exactly the bounded two-key
+        `{known_site: false, platform: null}` — nothing about the host is
+        disclosed. Pure read; no side effects.
       security:
         - ApiKeyAuth: []
       requestBody:
@@ -206,9 +210,11 @@ paths:
       responses:
         "200":
           description: |
-            Site knowledge summary (scope-limited). For an UNKNOWN host the
-            handler returns exactly `{known_site: false, platform: null}` —
-            the four other properties are absent, not null.
+            Site knowledge summary. For an UNKNOWN host the handler returns
+            exactly `{known_site: false, platform: null}` — every other
+            property (including `fields`) is absent, not null. For a KNOWN
+            host all properties appear; `fields` and `content_type` were
+            added in wave-47 (intake parity).
           content:
             application/json:
               schema:
@@ -248,6 +254,26 @@ paths:
                     type: [string, "null"]
                     format: date-time
                     description: When the site was last scraped to completion, null when never.
+                  fields:
+                    type: array
+                    items: { type: string }
+                    description: |
+                      Sorted union of every field name ever learned for this
+                      host — Site.output_schema field names +
+                      Site.fields_extracted + all users' ScrapeJob
+                      target_fields (intake_check_site parity). Empty list
+                      when a Site record exists but nothing was learned yet.
+                    example: ["availability", "currency", "price", "title"]
+                  content_type:
+                    type: string
+                    description: |
+                      Content type recorded on Site.output_schema (the
+                      src/content_types.py vocabulary, e.g. "product");
+                      empty string when the Site has no output_schema yet.
+                      Named `content_type` — matching intake_check_site —
+                      not `site_type` (which remains the nullable Site
+                      column).
+                    example: "product"
         "401": { $ref: "#/components/responses/Unauthorized" }
         "422":
           description: "Bad `url` — not absolute http(s)."

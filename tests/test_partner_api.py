@@ -28,8 +28,7 @@ django.setup()
 
 import pytest  # noqa: E402
 from django.contrib.auth.models import User  # noqa: E402
-from django.test import RequestFactory, override_settings  # noqa: E402
-
+from django.test import RequestFactory  # noqa: E402
 from scraper import models  # noqa: E402
 from scraper.api import errors, state  # noqa: E402
 from scraper.api.auth import resolve_api_key  # noqa: E402
@@ -234,8 +233,16 @@ class TestAuth:
 
 class TestEndpoints:
     def test_check_site_known(self, db, api_request, partner_user):
+        # [wave-47 intake parity] Known sites return the SAME shared field
+        # knowledge the /intake UI preloads (owner decision 2026-09-28):
+        # output_schema field names + fields_extracted + content_type.
         models.Site.objects.create(
-            url="https://www.known.example/", platform="Shopify", name="Known"
+            url="https://www.known.example/", platform="Shopify", name="Known",
+            output_schema={
+                "content_type": "product",
+                "fields": [{"name": "title"}, {"name": "price"}, {"nope": 1}],
+            },
+            fields_extracted=["currency", "title"],
         )
         req = api_request(
             "POST", "/api/v1/check-site",
@@ -248,14 +255,51 @@ class TestEndpoints:
         body = json.loads(r.content)
         assert body["known_site"] is True
         assert body["platform"] == "Shopify"
-        assert "fields" not in body  # NEVER cross-tenant field lists
+        assert body["fields"] == ["currency", "price", "title"]  # sorted union
+        assert body["content_type"] == "product"
+
+    def test_check_site_known_no_field_knowledge(self, db, api_request):
+        # Site record exists but nothing learned yet -> fields present, empty.
+        models.Site.objects.create(url="https://bare.example/", platform="Custom")
+        req = api_request(
+            "POST", "/api/v1/check-site", body='{"url": "https://bare.example/p/1"}'
+        )
+        r = check_site(req)
+        import json
+
+        body = json.loads(r.content)
+        assert body["known_site"] is True
+        assert body["fields"] == []
+        assert body["content_type"] == ""
+
+    def test_check_site_fields_include_all_users_target_fields(
+        self, db, api_request, partner_user, other_user
+    ):
+        # The intake union is deliberately cross-USER ("shared field
+        # knowledge"): another user's target_fields for this host count too.
+        models.Site.objects.create(
+            url="https://shared.example/",
+            output_schema={"content_type": "product", "fields": [{"name": "title"}]},
+        )
+        _partner_job(other_user, url="https://shared.example/p/1", target_fields=["size", "color"])
+        req = api_request(
+            "POST", "/api/v1/check-site", body='{"url": "https://shared.example/p/1"}'
+        )
+        r = check_site(req)
+        import json
+
+        body = json.loads(r.content)
+        assert body["fields"] == ["color", "size", "title"]
 
     def test_check_site_unknown(self, db, api_request):
         req = api_request("POST", "/api/v1/check-site", body='{"url": "https://nope.example/"}')
         r = check_site(req)
         import json
 
-        assert json.loads(r.content)["known_site"] is False
+        body = json.loads(r.content)
+        assert body["known_site"] is False
+        # Unknown host stays EXACTLY the bounded two-key body (spec promise):
+        assert set(body) == {"known_site", "platform"}
 
     def test_check_site_bad_url(self, db, api_request):
         req = api_request("POST", "/api/v1/check-site", body='{"url": "garbage"}')
@@ -323,11 +367,10 @@ class TestEndpoints:
 class TestRateLimit:
     def test_burst_429(self, db, api_request, partner_key):
         key_prefix = partner_key[0].prefix
-        from scraper.api.ratelimit import check_rate_limit
-
         # simulate an already-bursting window
         import time
 
+        from scraper.api.ratelimit import check_rate_limit
         from scraper.services import _get_redis
 
         conn = _get_redis()

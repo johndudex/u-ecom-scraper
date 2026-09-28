@@ -1,9 +1,11 @@
 """Read-only partner endpoints (slice 1a-i).
 
-check-site  POST /api/v1/check-site        — Site metadata only, NO
-                                             cross-tenant field lists
-                                             (internal intake_check_site's
-                                             leak, by design absent here)
+check-site  POST /api/v1/check-site        — Site metadata +, since wave-47,
+                                             intake-parity shared field
+                                             knowledge for KNOWN sites
+                                             (union of output_schema names,
+                                             fields_extracted, all users'
+                                             target_fields for the host)
 validate-schema  POST /api/v1/validate-schema
 status      GET  /api/v1/jobs/{id}
 list        GET  /api/v1/jobs
@@ -49,13 +51,41 @@ def check_site(request):
 
     site = (
         Site.objects.filter(url__icontains=host)
-        .only("platform", "scraping_method", "site_type", "name", "last_scraped_at")
+        .only(
+            "platform",
+            "scraping_method",
+            "site_type",
+            "name",
+            "last_scraped_at",
+            "output_schema",
+            "fields_extracted",
+        )
         .first()
     )
-    # Security note (sync spec): known_site is an accepted, bounded
-    # cross-tenant signal — boolean + platform string only, never fields.
     if site is None:
         return JsonResponse({"known_site": False, "platform": None})
+    # [wave-47 intake parity] Owner decision 2026-09-28: known sites return
+    # the SAME shared field knowledge the /intake UI preloads — the union of
+    # output_schema field names, fields_extracted, and ALL users'
+    # target_fields for this host (intake_check_site semantics). Reverses the
+    # earlier metadata-only cross-tenant guard on purpose; the UNKNOWN-host
+    # body stays exactly {known_site, platform}.
+    fields: set = set()
+    content_type = ""
+    if site.output_schema:
+        content_type = site.output_schema.get("content_type", "")
+        for f in site.output_schema.get("fields") or []:
+            if isinstance(f, dict) and f.get("name"):
+                fields.add(f["name"])
+    if site.fields_extracted:
+        fields.update(site.fields_extracted)
+    bare_host = host.replace("www.", "")
+    if bare_host:
+        for tf in ScrapeJob.objects.filter(url__icontains=bare_host).values_list(
+            "target_fields", flat=True
+        ):
+            if tf:
+                fields.update(tf)
     return JsonResponse(
         {
             "known_site": True,
@@ -64,6 +94,8 @@ def check_site(request):
             "site_name": site.name or None,
             "scraping_method": site.scraping_method or None,
             "last_scraped_at": site.last_scraped_at,
+            "fields": sorted(fields),
+            "content_type": content_type,
         }
     )
 

@@ -57,7 +57,7 @@ Job state model (sync spec): `inprogress` → `sample_ready` → `scraper_ready`
 | `GET /api/v1/jobs/{id}/events` | SSE stream of job events. |
 | `GET /api/v1/ws-token` | Short-lived token for the AsyncAPI WebSocket channel. |
 | `POST /api/v1/validate-schema` | `{"schema": <object>}` → **200 always** `{valid, issues, derived_fields, detected_content_type, fields: [{name, description?}]}`. `fields` carries per-field instructions (wave-27). Pure function, no writes. |
-| `GET/POST /api/v1/check-site` | Metadata-only site recognition: `{known_site, platform, site_type, site_name, scraping_method, last_scraped_at}`. Deliberately does **not** return known fields (cross-tenant leak guard). |
+| `GET/POST /api/v1/check-site` | Site knowledge pre-check: `{known_site, platform, site_type, site_name, scraping_method, last_scraped_at}` — and since wave-47 (owner decision 2026-09-28) known sites also return `fields` (sorted union of output_schema names + fields_extracted + all users' target_fields for the host) and `content_type`, matching the /intake preload exactly. Unknown hosts stay `{known_site: false, platform: null}`. |
 | `POST /api/v1/discover-fields` | **Live field discovery** (wave-41) — renders the URL in the platform browser (stealth) and returns the fields the Extractor Builder shows as "available fields": `200 {url, fields: [..], json_schema, source: llm\|jsonld\|none, content_type}`. **Constraints (all enforced):** `url` must be an absolute http(s) URL of a sample *item* page — homepage-only → 422 `homepage_url`; the host must be public (private/reserved IPs and non-public DNS → 422 `blocked_host`); **6 req/min per key** and **1 concurrent request per key** → 429 with `Retry-After`; **~45s wall-clock ceiling** (25s render + 20s LLM) — budget client timeouts. `fields: []` with `source: "none"` is a success (nothing extractable). Infrastructure failures: 502 `site_blocked`, 503 `discovery_unavailable`, 504 `discovery_timeout`. No cross-tenant surface — nothing persisted, no job created. |
 | `GET /api/v1/extractors` | Paginated list of Sites reachable from THIS key's jobs (trailing-slash tolerant), most recently updated first — `{extractors: [ExtractorSummary], page, page_size, total_items, total_pages}`. Other partners' sites and job-less sites never appear (no oracle). |
 | `GET /api/v1/extractors/{slug}` | Detail: summary fields + `platform`, `scraping_method`, `input_urls_count`, `fields: [{name, type?, description?}]` (the stored output schema). Cross-tenant slug → 404. |
@@ -164,7 +164,7 @@ Order was already preserved through storage; wave-27 made it matter at the outpu
 
 1. ~~Edit form posts to the wrong endpoint~~ → `site_form.html` action is conditional on `site.id` (fixed).
 2. ~~`site_delete` is dangerous as shipped~~ → superuser-only + typed confirm + UI wiring (fixed).
-3. ~~Spec/code drift on `check-site`~~ → sync_api.yaml now describes the shipped metadata-only contract (fixed).
+3. ~~Spec/code drift on `check-site`~~ → sync_api.yaml now describes the shipped contract (fixed; wave-47 later reversed metadata-only → intake-parity `fields` on known sites, owner decision 2026-09-28).
 
 ## 6. Pointers
 
