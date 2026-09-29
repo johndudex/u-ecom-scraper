@@ -496,6 +496,22 @@ def assess_query_match(query: str, items: list, title_field: str = "title") -> d
 _ALWAYS_PRESENT_FIELDS = {"title", "url", "src_url", "scraped_at", "status_code", "remarks", "id"}
 
 
+def _field_has_value(v) -> bool:
+    """[wave-49 F1] Does this field carry data, as opposed to absence?
+
+    A typed numeric zero is DATA, not absence (job 468: five real $0.00
+    1-ml sample PDPs were zeroed because ``price: 0.0`` is falsy). Booleans
+    stay truthiness — bool is an int subclass, and a lone ``False`` flag is
+    the shape of an unpopulated field, not of a meaningful zero. Strings,
+    lists and everything else keep bare truthiness.
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return True
+    return bool(v)
+
+
 def has_substantive_field(item: dict) -> bool:
     """True if the item has ≥1 substantive (non-bookkeeping) field with a value.
 
@@ -506,11 +522,15 @@ def has_substantive_field(item: dict) -> bool:
     — NOT 'title'. The pipeline's ~7 hardcoded title/price success gates silently
     discard their extractions, scoring a 20/20 perfect extraction as 0/FAIL.
     This predicate replaces those gates so success is recognized regardless of
-    the content type.
+    the content type. [wave-49 F1] "with a value" means ``_field_has_value``:
+    numeric zeros count; empty strings/None still don't.
     """
     if not isinstance(item, dict):
         return False
-    return any(k not in _ALWAYS_PRESENT_FIELDS and v for k, v in item.items())
+    return any(
+        k not in _ALWAYS_PRESENT_FIELDS and _field_has_value(v)
+        for k, v in item.items()
+    )
 
 
 def output_filter_fields(content_type: str) -> list[str]:

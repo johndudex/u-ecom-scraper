@@ -140,8 +140,12 @@ def test_770_finalize_completes_with_19_from_fm_output(monkeypatch, tmp_path):
         status=ScrapeJob.STATUS_RUNNING,
         started_at=timezone.now() - timezone.timedelta(hours=2))
     key = "scrapers/sephora-cz/output_2026-09-20_235455_000001_99.json"
+    # [wave-49 F3] 770 is a same-run publish — the payload is stamped at
+    # write time even though its NAME predates the window
+    # (docs/plans/wave49-honest-recording-plan.md).
     _fm(monkeypatch, [key], {key: json.dumps(
-        {"products": [{"title": f"p{i}", "price": "9",
+        {"site": {"scraped_at": timezone.now().isoformat()},
+         "products": [{"title": f"p{i}", "price": "9",
                        "url": f"https://x/p/{i}"} for i in range(19)]})})
     monkeypatch.setattr(settings, "PROJECT_ROOT", str(tmp_path))
     (tmp_path / "workspace" / "sephora-cz").mkdir(parents=True)
@@ -194,10 +198,14 @@ def test_promotion_skips_an_uncompilable_draft(monkeypatch, tmp_path):
     slug = "x-example"
     draft_key = f"scrapers/{slug}/jobs/scraper-{job.id}.py"
     out_key = f"scrapers/{slug}/output_2026-09-20_040000_000001_1.json"
+    # [wave-49 F3] payload stamped in-window — this test pins the promotion
+    # gate, not the window (docs/plans/wave49-honest-recording-plan.md).
     _fm(monkeypatch, [draft_key, out_key], {
         draft_key: "def broken(:\n    pass\n",   # SyntaxError
-        out_key: json.dumps({"products": [
-            {"title": "p", "price": "1", "url": "https://x/p/1"}]})})
+        out_key: json.dumps({
+            "site": {"scraped_at": timezone.now().isoformat()},
+            "products": [
+                {"title": "p", "price": "1", "url": "https://x/p/1"}]})})
     monkeypatch.setattr(settings, "PROJECT_ROOT", str(tmp_path))
     _freeze_state(monkeypatch, {
         "execution_status": "FAILED", "product_count": 0,
@@ -226,10 +234,14 @@ def test_promotion_publishes_a_compiling_draft(monkeypatch, tmp_path):
     draft_key = f"scrapers/{slug}/jobs/scraper-{job.id}.py"
     out_key = f"scrapers/{slug}/output_2026-09-20_040000_000001_2.json"
     source = "RESULT_LIMIT = 10\n"
+    # [wave-49 F3] payload stamped in-window — this test pins the promotion
+    # gate, not the window (docs/plans/wave49-honest-recording-plan.md).
     writes = _fm(monkeypatch, [draft_key, out_key], {
         draft_key: source,
-        out_key: json.dumps({"products": [
-            {"title": "p", "price": "1", "url": "https://y/p/1"}]})})
+        out_key: json.dumps({
+            "site": {"scraped_at": timezone.now().isoformat()},
+            "products": [
+                {"title": "p", "price": "1", "url": "https://y/p/1"}]})})
     monkeypatch.setattr(settings, "PROJECT_ROOT", str(tmp_path))
     _freeze_state(monkeypatch, {
         "execution_status": "FAILED", "product_count": 0,

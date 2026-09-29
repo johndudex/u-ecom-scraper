@@ -80,12 +80,14 @@ def _publish_job_status(job_id: int, status: str) -> None:
 
 
 def _scope_shortfall_row(scope, scope_value, product_count) -> str:
-    """[wave-48 T6] The [SCOPE-SHORTFALL] honesty note row, "" when no shortfall.
+    """[wave-48 T6 → wave-49 F2] The [SCOPE-SHORTFALL] honesty note row.
 
     Intake asked firstn/N and the run shipped fewer — make the gap visible
     on the job record (intake board) instead of a COMPLETED row that reads
-    as success (job 1082: asked 10, shipped 2). Partial starvation only: a
-    zero-item run already fails loudly through the zero-yield gates.
+    as success (job 1082: asked 10, shipped 2). Wave-49: the ``count <= 0``
+    exemption is GONE — job 468 proved a zero-item run can be recorded
+    COMPLETED (the override's zero-blindness), so asked-N-shipped-0 is
+    precisely the shape this marker exists to expose.
     """
     try:
         if str(scope or "").strip().lower() != "firstn":
@@ -97,9 +99,34 @@ def _scope_shortfall_row(scope, scope_value, product_count) -> str:
         count = int(product_count or 0)
     except (TypeError, ValueError):
         return ""
-    if target <= 0 or count <= 0 or count >= target:
+    if target <= 0 or count >= target:
         return ""
     return f"[SCOPE-SHORTFALL] asked {target}, shipped {count}"
+
+
+def _override_count_items(items) -> int:
+    """[wave-49 F1] The finalize ground-truth override's row counter.
+
+    Job 468: five real $0.00 sample PDPs (``status_code: 200``) were zeroed
+    because ``has_substantive_field`` tested their only payload field with
+    bare truthiness. The predicate itself is fixed at the source
+    (``src/content_types._field_has_value``: a typed numeric zero IS data);
+    this wrapper adds the override's own invariant — a **missing**
+    ``status_code`` key is not evidence of a failed fetch (only a written
+    ``<= 0`` is), so absence no longer zeroes an honest extraction.
+    """
+    from src.content_types import has_substantive_field
+
+    kept = 0
+    for prod in items:
+        if not isinstance(prod, dict):
+            continue
+        _sc = prod.get("status_code")
+        if _sc is not None and _sc <= 0:
+            continue  # written fetch failure
+        if has_substantive_field(prod):
+            kept += 1
+    return kept
 
 
 def _finalize_job_failed(job_id: int, error_message: str, close_steps: bool = False) -> None:
@@ -1734,6 +1761,60 @@ def _output_name_epoch(name: str) -> float | None:
     return stamp.replace(tzinfo=_dttz.utc).timestamp()
 
 
+def _parse_iso_epoch(value) -> float | None:
+    """ISO-8601 timestamp → UTC epoch seconds, else None. [wave-49 F3]
+
+    Generated outputs stamp ``datetime.isoformat()`` strings. A ``Z`` suffix
+    becomes ``+00:00``; a naive stamp (no tzinfo) is read as UTC — the
+    templates stamp ``timezone.now()`` (aware), but hand-written payloads may
+    not be.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    from datetime import datetime as _datetime
+    from datetime import timezone as _dttz
+
+    try:
+        stamp = _datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=_dttz.utc)
+    return stamp.timestamp()
+
+
+def _payload_freshness_epoch(payload: object, output_key: str) -> float | None:
+    """Best in-payload write timestamp of one output file, else None.
+
+    [wave-49 F3] Preference: ``site.scraped_at`` (every generated template
+    stamps it at write time — http_navigation/api/navigation/playwright),
+    else the newest row-level ``scraped_at`` across the known output keys.
+    The in-payload stamp outranks the filename in BOTH directions — a fresh
+    payload with an old name admits (prod-770's same-run publish), a stale
+    payload with a fresh name excludes (the job-468 phantom bleed).
+    """
+    if not isinstance(payload, dict):
+        return None
+    site = payload.get("site")
+    if isinstance(site, dict):
+        epoch = _parse_iso_epoch(site.get("scraped_at"))
+        if epoch is not None:
+            return epoch
+    newest = None
+    keys = [output_key] + [k for k in _RESCUE_ROW_KEYS if k != output_key]
+    for key in keys:
+        value = payload.get(key)
+        if not isinstance(value, list):
+            continue
+        for row in value:
+            if not isinstance(row, dict):
+                continue
+            epoch = _parse_iso_epoch(row.get("scraped_at"))
+            if epoch is not None and (newest is None or epoch > newest):
+                newest = epoch
+    return newest
+
+
 def _rescue_dead_row(row: dict) -> bool:
     """Dead-row predicate — `route_after_testing._is_dead_product`, imported so
     the rescue can never drift from the router's definition (redirect/404/410
@@ -1816,8 +1897,8 @@ def _real_items_evidence(
     ``(0, "")`` when nothing qualifies. Three sources, best-of-N: (a)
     ``workspace/{slug}/output_*.json`` (mtime), (b) local
     ``scrapers/{slug}/output_*.json`` (mtime — dev bind-mount only), (c) FM
-    keys ``scrapers/{slug}/output_*.json`` (filename epoch) via
-    ``src.artifacts``.
+    keys ``scrapers/{slug}/output_*.json`` (payload-timestamp-first window,
+    name epoch as fallback) via ``src.artifacts``.
 
     Deliberately JOB-scoped, not attempt-scoped: the wave-37 rescue predicate
     (`_scraper_has_real_items`) scans workspace-only and gates on the current
@@ -1833,12 +1914,18 @@ def _real_items_evidence(
     retroactively — the trace guard instead requires draft provenance for this
     job (state ``tested_draft_sha256`` / ``last_tested_draft_fp``, or this
     job's per-job FM draft key ``scrapers/{slug}/jobs/scraper-{job_id}.py``).
-    (2) An FM key is admitted on its name alone, not window-gated: prod 770's
-    output was published by the job's own cleanup agent yet the FM exposes no
-    mtime, and a same-run publish can carry an earlier-stamped name — gating
-    FM keys on the name epoch would have re-killed 770. Cross-job exclusion on
-    the FM path therefore rests entirely on the trace guard (state provenance
-    is this job's checkpoint; the per-job draft key is this job's). (3) A
+    (2) An FM key is window-gated on its PAYLOAD timestamp first
+    (``site.scraped_at``, then newest row ``scraped_at``), falling back to the
+    name epoch only when the payload is unstamped — [wave-49 F3], after job
+    468 proved a prior job's stale output left in the FM (immortal under the
+    prune's partner-owned exemption) admitted on its fresh-looking name and
+    read as phantom rows. The in-payload stamp outranks the name in BOTH
+    directions, so prod 770's same-run publish (earlier-stamped name,
+    payload stamped at write time) still admits. An unstamped payload with a
+    pre-window name is excluded — the honest under-credit. Cross-job
+    exclusion on the FM path rests on this gate plus the trace guard (state
+    provenance is this job's checkpoint; the per-job draft key is this
+    job's). (3) A
     local output whose stamped name already proves it predates this job is a
     prior job's leftover re-hydrated into this workspace — its mtime is only
     the copy time — so it counts only when this job's own draft sits beside it
@@ -2001,28 +2088,36 @@ def _real_items_evidence(
         if source_total:
             _consider(source_total, source_fresh, source_loc)
 
-    # ── Source (c): File Master output keys, freshness from the name ────────
+    # ── Source (c): File Master output keys, payload-first freshness ────────
     if artifacts is not None and fm_keys:
         fm_total, fm_rows, fm_loc, fm_fresh = 0, 0, "", 0.0
         for key in fm_keys:
             name = key.rsplit("/", 1)[-1]
             if not (name.startswith("output_") and name.endswith(".json")):
                 continue
-            name_epoch = _output_name_epoch(name)
-            if name_epoch is None:
-                continue  # not a stamped output name — cannot attribute it
             try:
                 payload = json.loads(artifacts.read_text(key))
             except Exception:
                 continue  # one unreadable key must not discard the others
+            # [wave-49 F3] The window gate runs on the PAYLOAD timestamp when
+            # the payload carries one, falling back to the name epoch only
+            # when it doesn't. A stale payload is excluded even behind a
+            # fresh name (job-468: a Sep-16 file a prior job left in the FM
+            # read as 81 phantom rows); a fresh payload admits despite an
+            # old name (prod-770's same-run publish). No payload stamp AND a
+            # name-less key is excluded — nothing attributes it to this job.
+            name_epoch = _output_name_epoch(name)
+            fresh = _payload_freshness_epoch(payload, output_key) or name_epoch
+            if fresh is None or fresh < floor:
+                continue
             rows = _good_rows(payload, fields, output_key)
             if not rows:
                 continue
             fm_total += len(rows)
             if len(rows) > fm_rows or (
-                len(rows) == fm_rows and name_epoch > fm_fresh
+                len(rows) == fm_rows and fresh > fm_fresh
             ):
-                fm_rows, fm_loc, fm_fresh = len(rows), key, name_epoch
+                fm_rows, fm_loc, fm_fresh = len(rows), key, fresh
         if fm_total:
             _consider(fm_total, fm_fresh, fm_loc)
 
@@ -2435,13 +2530,7 @@ def _finalize_job(job: ScrapeJob) -> None:
                         items = _v
                         break
                 if items:
-                    from src.content_types import has_substantive_field
-                    successful = [
-                        prod
-                        for prod in items
-                        if has_substantive_field(prod) and prod.get("status_code", 0) > 0
-                    ]
-                    job.product_count = len(successful)
+                    job.product_count = _override_count_items(items)
                     # [wave-48 T6 → wave-48b] Scope-shortfall marker (job 1082
                     # class): asked firstn/N, shipped fewer — surface the gap
                     # on the job record. Unconditional (wave-45b: the merge is

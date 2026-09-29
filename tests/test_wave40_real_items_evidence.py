@@ -65,7 +65,13 @@ def _fm(monkeypatch, keys, payloads):
 def test_770_shape_fm_output_rescued_workspace_empty(tmp_path, monkeypatch):
     started = timezone.now() - timezone.timedelta(hours=2)
     key = f"scrapers/sephora-cz/{OUT_NAME}"
-    _fm(monkeypatch, [key], {key: json.dumps({"products": _rows(19)})})
+    # [wave-49 F3] The 770 class is a same-run publish: the payload is stamped
+    # at write time (site.scraped_at) even though its NAME is older than the
+    # window. The original fixture predated payload-stamping awareness —
+    # docs/plans/wave49-honest-recording-plan.md.
+    _fm(monkeypatch, [key], {key: json.dumps({
+        "site": {"scraped_at": timezone.now().isoformat()},
+        "products": _rows(19)})})
     (tmp_path / "workspace" / "sephora-cz").mkdir(parents=True)  # no outputs
     _root(monkeypatch, tmp_path)
     n, loc = tasks._real_items_evidence(
@@ -238,8 +244,12 @@ def test_fm_draft_key_alone_satisfies_the_trace_guard(monkeypatch):
     started = timezone.now() - timezone.timedelta(hours=1)
     out_key = "scrapers/p/output_2026-09-20_040000_000001_1.json"
     draft_key = "scrapers/p/jobs/scraper-7.py"
+    # [wave-49 F3] payload stamped inside the job window (this test pins the
+    # TRACE GUARD arm, not the window — keep it testing the trace guard).
     _fm(monkeypatch, [out_key, draft_key],
-        {out_key: json.dumps({"products": _rows(2)})})
+        {out_key: json.dumps({
+            "site": {"scraped_at": timezone.now().isoformat()},
+            "products": _rows(2)})})
     n, loc = tasks._real_items_evidence(
         "p", _job(started, id=7), final_state=None)
     assert n == 2 and loc == out_key

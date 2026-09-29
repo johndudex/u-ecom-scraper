@@ -1073,12 +1073,17 @@ class TestScopeShortfallRow:
         assert _scope_shortfall_row("firstn", "10", 10) == ""
         assert _scope_shortfall_row("firstn", "10", 12) == ""
 
-    def test_zero_shipped_no_row(self):
-        # A zero-item run already fails loudly elsewhere; the marker is for
-        # PARTIAL starvation (job 1082: 2 of 10 shipped as COMPLETED).
+    def test_zero_shipped_fires_row(self):
+        # [wave-49 F2 — deliberate reversal] The old premise ("a zero-item run
+        # already fails loudly elsewhere") is falsified by job 468: five real
+        # $0.00 rows were recorded COMPLETED/0 by the finalize override. The
+        # marker exists precisely for that shape now.
+        # docs/plans/wave49-honest-recording-plan.md
         from scraper.tasks import _scope_shortfall_row
 
-        assert _scope_shortfall_row("firstn", "10", 0) == ""
+        row = _scope_shortfall_row("firstn", "10", 0)
+        assert row.startswith("[SCOPE-SHORTFALL]")
+        assert "asked 10" in row and "shipped 0" in row
 
     def test_non_firstn_no_row(self):
         from scraper.tasks import _scope_shortfall_row
@@ -1096,11 +1101,13 @@ class TestScopeShortfallRow:
 class TestScopeShortfallWiring:
     def test_finalize_appends_row_unconditional(self):
         # [wave-48b] Source pins: the append site sits after the ground-truth
-        # product_count read, NO env gate in front of it.
+        # product_count read, NO env gate in front of it. [wave-49 F1] The
+        # ground-truth read moved into `_override_count_items(items)` —
+        # docs/plans/wave49-honest-recording-plan.md — same site, new anchor.
         src = open(
             os.path.join(ROOT, "webapp", "scraper", "tasks.py"), encoding="utf-8"
         ).read()
-        i = src.find("job.product_count = len(successful)")
+        i = src.find("job.product_count = _override_count_items(items)")
         assert i != -1, "ground-truth product_count site moved"
         window = src[i: i + 2000]
         assert "_scope_shortfall_row(" in window
