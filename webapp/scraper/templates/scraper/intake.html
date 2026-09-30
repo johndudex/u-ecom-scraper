@@ -971,10 +971,15 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     if(typeof refreshRunSampleGate === 'function') refreshRunSampleGate();
   }
   function addChip(name){
-    name = (name||'').trim(); if(!name) return;
-    if(fieldsArr.some(function(f){ return f.toLowerCase() === name.toLowerCase(); })) return;
+    name = (name||'').trim(); if(!name) return false;
+    // [team-feedback fix] report the skip to the caller: silently ignoring an
+    // already-present field read as "the button does nothing" when every
+    // discovered field was already a chip (the common case — discovery
+    // returns title/price/availability/currency, which are the defaults).
+    if(fieldsArr.some(function(f){ return f.toLowerCase() === name.toLowerCase(); })) return false;
     fieldsArr.push(name);
     renderFieldsAll();
+    return true;
   }
   function clearChips(){ fieldsArr = []; renderFieldsAll(); }
 
@@ -2785,10 +2790,22 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     if(e.key === 'Escape' && !X('#discover-modal').classList.contains('hidden')) closeDiscoverModal();
   });
   X('#discover-add-chips-btn').addEventListener('click', function(){
+    // [team-feedback fix] count the outcome and SAY it: "Added 2 · 4 already
+    // in your fields" beats a silent modal close the user reads as broken.
+    var added = 0, dupes = 0;
     X('#discover-chips').querySelectorAll('button.on').forEach(function(b){
-      if(window.addChip) addChip(b.dataset.field);
+      if(window.addChip){ if(addChip(b.dataset.field)) added++; else dupes++; }
     });
-    closeDiscoverModal();
+    if(!added && !dupes){ closeDiscoverModal(); return; }
+    var btn = X('#discover-add-chips-btn');
+    btn.textContent = added
+      ? ('Added ' + added + (dupes ? ' · ' + dupes + ' already in your fields' : ''))
+      : ('All ' + dupes + ' already in your fields');
+    btn.disabled = true;
+    setTimeout(function(){
+      btn.disabled = false;
+      closeDiscoverModal();
+    }, 1200);
   });
   X('#discover-add-schema-btn').addEventListener('click', function(){
     if(!discoverData.json_schema){ closeDiscoverModal(); return; }
