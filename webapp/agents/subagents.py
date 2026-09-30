@@ -3885,8 +3885,84 @@ def build_code_writer_message(state: dict) -> list:
             f"the root cause that automated testing missed.\n"
         )
 
+    # [wave-50 T2] The probe MEASURES client-rendered listings but the fact
+    # never reached this brief — job 1116: the writer extracted wonderbly's
+    # Algolia creds yet still shipped SSR nav anchors, because the brief below
+    # FORBADE discovery and no template could convert Algolia hits to URLs.
+    # [wave-50 T5b] Two e2e (job 485) corrections to the original gate:
+    #  - the advisory listing probe lives at probe_result.LISTING_CONNECTIVITY
+    #    (graph.py:2381), not "listing" — the original read was a dead key;
+    #  - the narrow gate (site_analysis.algolia AND lcr) never fires on the
+    #    wonderbly shape itself: site_analysis is often EMPTY (the key is
+    #    LLM-authored) and the anchor counter counts nav links (55 on
+    #    wonderbly's shell → lcr False). Any discovery-mode job whose listing
+    #    is HTTP-reachable gets the cheap deterministic CHECK-FIRST
+    #    prescription instead: extract creds, prefer the catalog, fall back.
+    _listing_probe = ((state.get("probe_result") or {})
+                      .get("listing_connectivity")) or {}
+    if not isinstance(_listing_probe, dict):
+        _listing_probe = {}
+    _lcr = bool(_listing_probe.get("listing_client_rendered"))
+    # [wave-50 T5d] the CHECK-FIRST decision is now THE shared predicate
+    # (`agents.draft_safety.algolia_gate_prescribed`) — the tester-entry gate
+    # repair keys on the same definition, so the brief and the guard cannot
+    # drift (job 488: the brief prescribed, the writer gutted, nothing
+    # enforced).
+    from .draft_safety import algolia_gate_prescribed
+
+    _check_first = algolia_gate_prescribed(state)
     algolia_section = ""
-    if algolia and algolia.get("detected"):
+    if algolia and algolia.get("detected") and _lcr:
+        app_id = algolia.get("application_id", "")
+        algolia_section = (
+            f"\n### Algolia catalog discovery (client-rendered listing)\n"
+            f"The listing page is CLIENT-RENDERED: the probe measured that its "
+            f"server HTML carries no product links. Nav/collection anchors are "
+            f"NOT product URLs — the catalog lives in Algolia. Implement "
+            f"discovery against it:\n"
+            f"- The template's Phase-1 pre-step does this via "
+            f"`src.algolia_discovery` (`extract_algolia_creds`, "
+            f"`build_taxon_filter`, `discover_catalog_urls`, "
+            f"`extract_taxon_query`): it pulls the public search creds from the "
+            f"page HTML (astro-island props / inline config), walks the index "
+            f"pages, and converts hits to PDP URLs. Keep it.\n"
+            f"- Endpoint: multi-query envelope "
+            f"https://{str(app_id).lower() or '<app>'}-dsn.algolia.net/1/indexes/*/queries"
+            f" (App ID: {app_id}, Index: {algolia.get('index_name', '')})\n"
+            f"- Convert EVERY hit to a URL through the wide-key fallback: "
+            f"solidusSlug, prismicProductSlug, productUrl, product_url, url, "
+            f"slug, handle, permalink, pathname — objectID last. Indices differ "
+            f"in which key carries the slug (wonderbly: solidusSlug); never "
+            f"assume `url` exists.\n"
+            f"- Bare slugs need the site's PDP path prefix — resolve it from "
+            f"sitemap.xml or HEAD-verify candidates, then reuse the prefix.\n"
+            f"- Phase 2 then extracts fields from each discovered PDP.\n"
+            f"- If Algolia yields zero URLs, fall back to HTML anchor "
+            f"discovery — never ship nav links as products.\n"
+        )
+    elif _check_first:
+        algolia_section = (
+            "\n### Algolia catalog discovery — CHECK FIRST (job-1116 class)\n"
+            "Anchor-based discovery can silently ship junk on this listing "
+            "class: the SSR HTML may look anchor-rich (nav/collection links) "
+            "while the product grid itself is client-rendered, so Phase 2 "
+            "extracts shells (titles with empty prices). BEFORE committing to "
+            "anchor discovery:\n"
+            "1. Fetch the listing HTML once with your normal fetch path.\n"
+            "2. Run `src.algolia_discovery.extract_algolia_creds(html)` — the "
+            "public search creds ship to every visitor (astro-island props "
+            "attributes / inline `algoliasearch(...)` config).\n"
+            "3. If creds are present, the catalog IS your Phase 1: "
+            "`extract_taxon_query` + `build_taxon_filter` + "
+            "`discover_catalog_urls` from the same module. Convert EVERY hit "
+            "to a URL via the wide-key fallback (productUrl, product_url, "
+            "url, permalink, pathname, solidusSlug, prismicProductSlug, "
+            "slug, handle — objectID last); never assume `url` exists.\n"
+            "4. If creds are absent OR discovery yields zero URLs, fall back "
+            "to anchor/pagination discovery — but never ship nav links as "
+            "products.\n"
+        )
+    elif algolia and algolia.get("detected"):
         algolia_section = (
             f"\n### Algolia API\n"
             f"If the site uses Algolia for product data:\n"

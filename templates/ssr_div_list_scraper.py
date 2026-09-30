@@ -21,7 +21,7 @@ import os
 import re
 import sys
 import time
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -91,7 +91,8 @@ def _get_proxy():
     if PROXY_TIER == "none":
         return None
     try:
-        import sys as _sys, os as _os
+        import os as _os
+        import sys as _sys
         _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".."))
         from src.geo import detect_country
         from src.proxy import build_proxy_url

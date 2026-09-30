@@ -25,7 +25,6 @@ import tempfile
 import time
 import zipfile
 from datetime import datetime, timezone
-from typing import Optional
 
 from playwright.sync_api import sync_playwright
 
@@ -93,7 +92,7 @@ TOTAL_COUNT_SELECTOR = "{TOTAL_COUNT_SELECTOR}"  # e.g. ".results-count"
 # from navigation_analysis). None when unknown → the discovery-coverage gate
 # falls back to Tier 1 (stop_reason) only. code_writer may replace the None
 # below with a concrete int when a trusted site-reported total exists.
-COVERAGE_TARGET_TOTAL: Optional[int] = None
+COVERAGE_TARGET_TOTAL: int | None = None
 
 # Phase 1: Item Link Extraction
 ITEM_CONTAINER_SELECTOR = "{ITEM_CONTAINER_SELECTOR}"  # e.g. ".product-grid"
@@ -128,7 +127,7 @@ def _write_checkpoint(urls: list[str]) -> None:
         if not urls:
             try:
                 if os.path.isfile(_CHECKPOINT_PATH):
-                    with open(_CHECKPOINT_PATH, "r") as f:
+                    with open(_CHECKPOINT_PATH) as f:
                         prev = json.load(f)
                     if prev.get("urls"):
                         logger.warning(
@@ -150,7 +149,7 @@ def _load_checkpoint() -> list[str]:
     """Load discovered URLs from a previous run's checkpoint (if any)."""
     try:
         if os.path.isfile(_CHECKPOINT_PATH):
-            with open(_CHECKPOINT_PATH, "r") as f:
+            with open(_CHECKPOINT_PATH) as f:
                 data = json.load(f)
             urls = data.get("urls", [])
             if urls:
@@ -271,8 +270,8 @@ def _discover_urls_via_search(
     page,
     query: str,
     state: dict,
-    max_pages: Optional[int] = None,
-    limit: Optional[int] = None,
+    max_pages: int | None = None,
+    limit: int | None = None,
 ) -> list[str]:
     """Phase 1a: Discover item URLs by searching the site.
 
@@ -356,8 +355,8 @@ def _discover_urls_via_category(
     page,
     category_url: str,
     state: dict,
-    max_pages: Optional[int] = None,
-    limit: Optional[int] = None,
+    max_pages: int | None = None,
+    limit: int | None = None,
 ) -> list[str]:
     """Phase 1b: Discover item URLs from a category page.
 
@@ -535,7 +534,7 @@ def _set_query_param(url: str, param: str, value) -> str:
     (``?pgNum=2&pgNum=3``) which servers resolve inconsistently and which
     caused pagination to re-fetch earlier pages. Generic for any param name.
     """
-    from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+    from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
     p = urlparse(url)
     qs = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if k != param]
@@ -547,7 +546,7 @@ def _set_query_param(url: str, param: str, value) -> str:
 _OFFSET_PARAMS = {"offset", "start", "skip", "begin", "from"}
 
 
-def _get_next_page_url(page, next_page_num: int) -> Optional[str]:
+def _get_next_page_url(page, next_page_num: int) -> str | None:
     """Determine the URL for the next page of results.
 
     PREFERRED: construct ``?{PAGE_PARAM_NAME}=N`` directly when a page param
@@ -732,7 +731,7 @@ def _error_item(url: str, src_url: str, error: str) -> dict:
 # there until that image is rebuilt, so the ~25 lines live in each python-side
 # template verbatim (playwright/UC normalize in-page via JS and don't need them).
 
-def _norm_price(value) -> Optional[float]:
+def _norm_price(value) -> float | None:
     """Strip currency symbols/whitespace from a price.
 
     "£1,234.56" → 1234.56 (a float), "1.234,56 €" → 1234.56, 24.99 (a
@@ -761,7 +760,7 @@ def _norm_price(value) -> Optional[float]:
         return None
 
 
-def _norm_availability(value) -> Optional[str]:
+def _norm_availability(value) -> str | None:
     """Normalize availability to ``in_stock`` / ``out_of_stock``.
 
     Accepts the schema.org URI form, InStock / In Stock / in_stock / Available
@@ -804,7 +803,7 @@ def _browser_alive(page) -> bool:
 
 def _make_proxy_auth_extension(
     proxy_host: str, proxy_port, proxy_user: str, proxy_pass: str
-) -> Optional[str]:
+) -> str | None:
     """Build a Chrome extension ZIP that answers proxy auth challenges.
 
     Modeled on ``undetected_chromedriver_scraper._make_proxy_auth_extension``.
@@ -949,7 +948,7 @@ def main():
     # from a scraper that gave up (H4). `navigate_error` is sticky.
     discovery_state = _new_discovery_state()
     ran_phase1 = False
-    skipped_reason: Optional[str] = None
+    skipped_reason: str | None = None
 
     # B-core: check for checkpoint from a previous (crashed) run.
     # If found (and --fresh-discovery not passed), skip Phase 1 entirely and
@@ -1091,8 +1090,10 @@ def main():
                         and not args.discover_only
                         and os.getenv("SCRAPER_CHECKPOINT_REUSE") == "1"):
                     from urllib.parse import urlparse as _urlparse
+
                     from src.listing_discovery import (
-                        checkpoint_coverage_patch, load_discovery_checkpoint,
+                        checkpoint_coverage_patch,
+                        load_discovery_checkpoint,
                     )
                     ckpt = load_discovery_checkpoint(
                         _CHECKPOINT_PATH, "navigation",

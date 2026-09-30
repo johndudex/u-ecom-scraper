@@ -81,7 +81,10 @@ class TestNormPriceReturnsFloat:
 
     def test_annotation_is_optional_float(self, template):
         src = (TEMPLATES / f"{template}.py").read_text(encoding="utf-8")
-        assert "def _norm_price(value) -> Optional[float]:" in src
+        # [wave-50 supersession] the templates moved to PEP-604 union syntax;
+        # the wave-25 pin's intent is "float-or-None, never str" and the
+        # modern spelling preserves it verbatim.
+        assert "def _norm_price(value) -> float | None:" in src
 
 
 def test_writer_prompt_price_numeric_gotcha():

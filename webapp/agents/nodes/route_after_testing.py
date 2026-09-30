@@ -620,7 +620,7 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
     except Exception:
         pass
     try:
-        from src.content_types import has_substantive_field
+        from src.content_types import _field_has_value, has_substantive_field
     except Exception:
 
         def has_substantive_field(p):  # type: ignore
@@ -695,7 +695,8 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
                         _items = _data.get(output_key) or _data.get("products", [])
                         _live_i = [p for p in _items if not _is_dead_product(p)]
                         _good_i = (
-                            [p for p in _live_i if any(p.get(f) for f in fields)]
+                            [p for p in _live_i
+                             if any(_field_has_value(p.get(f)) for f in fields)]
                             if fields
                             else [p for p in _live_i if has_substantive_field(p)]
                         )
@@ -719,7 +720,11 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
         # (the ground-truth override then blessed a FAIL/0.35 test report).
         # `any(filter_fields)` (not all-fields) so a product missing only
         # availability/currency still counts — 320's 511 rows stay safe.
-        good = [p for p in live if any(p.get(f) for f in fields)]
+        # [wave-50 T3] `_field_has_value`: typed numeric zero is data (468),
+        # empty string is not — a defaulted currency no longer papers over
+        # an unpopulated price (1116's five junk rows).
+        good = [p for p in live
+                if any(_field_has_value(p.get(f)) for f in fields)]
     else:
         good = [p for p in live if has_substantive_field(p)]
     if len(good) >= min_count:
@@ -766,7 +771,8 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
                             # predicate — a file full of brand-only rows must
                             # not rescue a failing test (job 337 pattern).
                             if fields:
-                                _good = [p for p in _live if any(p.get(f) for f in fields)]
+                                _good = [p for p in _live
+                                         if any(_field_has_value(p.get(f)) for f in fields)]
                             else:
                                 _good = [p for p in _live if has_substantive_field(p)]
                             if len(_good) >= min_count:

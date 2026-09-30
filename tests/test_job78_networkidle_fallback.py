@@ -168,11 +168,20 @@ class TestChallengeInterstitialHonestFailure:
 class TestSourcePins:
     def test_template_imports_playwright_timeout_error(self):
         src = open(TEMPLATE).read()
-        assert re.search(
+        # [wave-50 supersession] ruff's import sorting split the binding into
+        # two lines — same real TimeoutError, same contract, so accept either
+        # shape.
+        combined = re.search(
             r"from playwright\.sync_api import sync_playwright,\s*"
             r"TimeoutError as PlaywrightTimeoutError",
             src,
-        ), (
+        )
+        split = (
+            "from playwright.sync_api import sync_playwright" in src
+            and "from playwright.sync_api import TimeoutError"
+            " as PlaywrightTimeoutError" in src
+        )
+        assert combined or split, (
             "the template must bind playwright's real TimeoutError — the exec'd "
             "behavior tests use a stand-in class and cannot prove this"
         )

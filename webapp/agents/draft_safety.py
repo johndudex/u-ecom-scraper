@@ -317,6 +317,117 @@ def repair_ladder_violation(text: str, strategy: str) -> str | None:
     return src
 
 
+def algolia_gate_prescribed(state: dict) -> bool:
+    """[wave-50 T5d] Should THIS job's draft carry the algolia-first gate?
+
+    The single predicate behind both the writer brief's CHECK-FIRST section
+    and the tester-entry gate repair — one definition so the two cannot
+    drift. Mirrors the brief exactly: discovery-mode jobs (navigation /
+    list_page / search_term) whose listing probe won on an HTTP-flavoured
+    tier (direct_http*/fingerprint_* → ``http_ok``) or whose listing is
+    client-rendered. Cloak-only winners (job-1107 jcrew: ``cloak_none``) are
+    browser-flavoured — ``http_ok`` is False there and no creds hunt is
+    prescribed.
+    """
+    if not isinstance(state, dict):
+        return False
+    mode = str(state.get("input_mode") or "").lower()
+    if mode not in ("navigation", "list_page", "search_term"):
+        return False
+    probe = state.get("probe_result")
+    listing = probe.get("listing_connectivity") if isinstance(probe, dict) else None
+    if not isinstance(listing, dict):
+        return False
+    return bool(listing.get("listing_client_rendered")) or bool(
+        listing.get("http_ok")
+    )
+
+
+def _template_fn_block(src: str, name: str) -> str | None:
+    """One top-level ``def <name>(...)`` block from module source, or None."""
+    match = re.search(
+        rf"^def {re.escape(name)}\(.*?(?=^def |^class |\Z)", src, re.S | re.M
+    )
+    return match.group(0) if match else None
+
+
+def repair_algolia_gate_violation(draft_src: str, template_src: str) -> str | None:
+    """[wave-50 T5d] Deterministic algolia-gate re-injection; repaired source
+    or None when the draft is unrepairable.
+
+    Job 488: the writer kept ``_discover_phase1``'s NAME but deleted its body
+    — no ``_discover_urls_via_algolia``, no ``src.algolia_discovery`` import —
+    so the anchor path shipped 5 nav/collection links as products with the
+    CHECK-FIRST brief verifiably live in the writer context. Same doctrine as
+    ``repair_ladder_violation``: repairing costs ~0 while a force-FAIL plus a
+    writer fix cycle burns a full tester window (job 1107: 3.5 h).
+
+    Splices two render-safe blocks from the template — the ``_discover_urls_via_algolia``
+    pre-step and the algolia-first ``_discover_phase1`` gate — plus the
+    ``src.algolia_discovery`` import. The splice is safe because the draft
+    provably has every name the gate references (it called the gutted gate,
+    which closes over the same module globals).
+
+    Honesty guards, each returning None so the caller keeps today's path:
+      - draft unparseable (the syntax fixer owns those);
+      - the gate is ALREADY wired (``extract_algolia_creds`` present);
+      - the template lacks the splice pieces (never in practice — pinned);
+      - no ``def _discover_phase1`` to replace (different draft shape);
+      - the repaired source is unparseable or the gate did not come out
+        algolia-first.
+    """
+    if not draft_src or not draft_src.strip():
+        return None
+    if "extract_algolia_creds" in draft_src:
+        return None  # gate alive (the writer wired it) — nothing to repair
+    try:
+        ast.parse(draft_src)
+    except SyntaxError:
+        return None
+    prestep = _template_fn_block(template_src, "_discover_urls_via_algolia")
+    gate = _template_fn_block(template_src, "_discover_phase1")
+    if not (prestep and gate):
+        return None
+    import_match = re.search(
+        r"^from src\.algolia_discovery import \([^)]*\)"
+        r"|^from src\.algolia_discovery import [^\n]+",
+        template_src,
+        re.M,
+    )
+    if not import_match:
+        return None
+    import_line = import_match.group(0)
+
+    def _splice(_match: "re.Match") -> str:
+        return prestep.rstrip() + "\n\n\n" + gate.rstrip() + "\n\n\n"
+
+    new = re.sub(
+        r"^def _discover_phase1\(.*?(?=^def |^class |\Z)",
+        _splice,
+        draft_src,
+        count=1,
+        flags=re.S | re.M,
+    )
+    if new == draft_src:
+        return None  # no gate block to replace — a shape we don't understand
+    if "from src.algolia_discovery import" not in new:
+        anchor = re.search(r"^from src\.listing_discovery import .*$", new, re.M)
+        if anchor:
+            new = new[: anchor.end()] + "\n" + import_line + new[anchor.end():]
+        else:
+            new = import_line + "\n" + new
+    try:
+        ast.parse(new)
+    except SyntaxError:
+        return None
+    gate_new = _template_fn_block(new, "_discover_phase1") or ""
+    algolia_at = gate_new.find("_discover_urls_via_algolia(")
+    retry_at = gate_new.find("discover_listing_urls_with_retry(")
+    if not (0 <= algolia_at < retry_at):
+        return None
+    return new
+
+
 def restore_job_draft(root: str, slug: str, job_id) -> str | None:
     """Restore THIS job's own draft archive into the workspace.
 

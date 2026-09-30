@@ -97,7 +97,12 @@ def test_762_shape_workspace_outputs_from_earlier_attempt_admitted(
     n, loc = tasks._real_items_evidence(
         "marimekko", _job(started),
         final_state={"last_tested_draft_fp": "fp"})
-    assert n == 4 and "marimekko" in loc
+    # [wave-50 T4] Supersedes the wave-40 sum (n == 4): crediting the SUM of
+    # four 1-row files while naming ONE of them is the job-1116 vice — the
+    # recorded count must equal the rows in the file that becomes output_file.
+    # Four distinct outputs from an earlier attempt still rescue the job, but
+    # honestly: it completes with what the named file holds (1).
+    assert n == 1 and "marimekko" in loc and loc.endswith(".json")
 
 
 def test_prior_job_output_never_rescues(tmp_path, monkeypatch):

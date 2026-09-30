@@ -621,11 +621,11 @@ def _patch_scraper_output_filter(
         if "_OUTPUT_PRICE_FILTER_APPLIED" in code:
             return
         if target_fields:
-            checks = " or ".join(f"p.get({f!r})" for f in fields)
+            checks = " or ".join(f"_wv(p.get({f!r}))" for f in fields)
             cond = checks
             label = f"any of {','.join(fields)}"
         elif fields:
-            checks = " or ".join(f"p.get({f!r})" for f in fields)
+            checks = " or ".join(f"_wv(p.get({f!r}))" for f in fields)
             cond = f"p.get('title') and ({checks})"
             label = f"title+{','.join(fields)}"
         else:
@@ -642,6 +642,15 @@ def _patch_scraper_output_filter(
         filter_code = (
             f"# _OUTPUT_FILTER_APPLIED:{stamp} — drop non-item pages (content-type aware)\n"
             f"_FILTER_FIELDS = {fields!r}\n"
+            # [wave-50 T3] value semantics inside the generated code: typed
+            # numeric zero is data (468), "" is not (1116's defaulted-currency
+            # junk rows). Self-contained — the draft must not import src.*.
+            "def _wv(v):\n"
+            "    if isinstance(v, bool):\n"
+            "        return v\n"
+            "    if isinstance(v, (int, float)):\n"
+            "        return True\n"
+            "    return bool(v)\n"
             "try:\n"
             "    _OUTPUT_KEY = OUTPUT_KEY if 'OUTPUT_KEY' in dir() else next(\n"
             "        (k for k, v in output.items() if isinstance(v, list)\n"
@@ -8975,6 +8984,57 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             "_invoke_code_tester: ladder repair check failed (job %s): %s",
             job_id, _lr_exc,
         )
+    # [wave-50 T5d] ONE deterministic algolia-gate repair BEFORE the window is
+    # spent: a prescribed job's writer can gut `_discover_phase1` (job 488
+    # kept the NAME and deleted the pre-step — 5 nav links shipped as
+    # products). Same doctrine as the ladder repair above: splice costs ~0,
+    # a force-FAIL plus a writer fix cycle burns a full tester window. Budget
+    # 1 per job via state.gate_repairs — the second violation keeps today's
+    # honest path. Runs BEFORE the entry fingerprint so the repaired bytes
+    # are what this pass tests.
+    _gr_repaired_here = False
+    try:
+        if _te_draft and int(state.get("gate_repairs") or 0) < 1:
+            from .draft_safety import (
+                algolia_gate_prescribed,
+                repair_algolia_gate_violation,
+            )
+
+            if algolia_gate_prescribed(state):
+                _gr_strategy = (
+                    (state.get("scraper_analysis") or {}).get("strategy") or ""
+                    if isinstance(state.get("scraper_analysis"), dict) else ""
+                )
+                _gr_tpl_name = (
+                    "requests_scraper.py"
+                    if _gr_strategy == "http_requests"
+                    else "http_navigation_scraper.py"
+                )
+                _gr_tpl_path = os.path.join(
+                    _get_project_root(), "templates", _gr_tpl_name
+                )
+                if os.path.isfile(_gr_tpl_path):
+                    with open(_te_draft, encoding="utf-8", errors="replace") as _gr_fh:
+                        _gr_src = _gr_fh.read()
+                    with open(_gr_tpl_path, encoding="utf-8") as _gr_tf:
+                        _gr_new = repair_algolia_gate_violation(
+                            _gr_src, _gr_tf.read()
+                        )
+                    if _gr_new and _gr_new != _gr_src:
+                        with open(_te_draft, "w", encoding="utf-8") as _gr_fh:
+                            _gr_fh.write(_gr_new)
+                        _gr_repaired_here = True
+                        logger.warning(
+                            "_invoke_code_tester: algolia-gate repair applied "
+                            "at entry (job %s, strategy=%s, template=%s) — "
+                            "the writer's gutted _discover_phase1 spliced back",
+                            job_id, _gr_strategy or "unknown", _gr_tpl_name,
+                        )
+    except Exception as _gr_exc:
+        logger.warning(
+            "_invoke_code_tester: gate repair check failed (job %s): %s",
+            job_id, _gr_exc,
+        )
     # [wave-24 W24-1] Fingerprint the draft AT ENTRY (after the presence guard
     # may have restored it — this is exactly what the tester will run). If the
     # exit fingerprint differs, the draft moved under the live test and the
@@ -9090,6 +9150,10 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             # [wave-37 W37-NEW-D] the job's ONE ladder repair is spent win or
             # lose (B2 semantics) — a repeating violation keeps the honest path.
             update["ladder_repairs"] = int(state.get("ladder_repairs") or 0) + 1
+        if _gr_repaired_here:
+            # [wave-50 T5d] the job's ONE gate repair is spent win or lose
+            # (same B2 semantics) — a repeating violation keeps the honest path.
+            update["gate_repairs"] = int(state.get("gate_repairs") or 0) + 1
         if bool(state.get("draft_mutated_during_test")):
             # [wave-24 W24-1] Entering with the un-proven flag set: consume the
             # router's one-mutated-verdict re-test allowance so a repeating

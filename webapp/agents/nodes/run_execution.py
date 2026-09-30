@@ -1983,6 +1983,24 @@ def _run_via_browser_service(
                 "error_message": _q,
             }
 
+        # [wave-50 T5e] Nav-tree junk bar: junk rows carry core fields (a nav
+        # title + the template's defaulted price), so F9 alone cannot see them
+        # — this gate is its own verdict, and it fails the run rather than
+        # editing rows (honest FAILED beats junk shipped as COMPLETED).
+        _sh = _shallow_section_gate(
+            output_file, state.get("url") or "", state.get("input_mode", ""),
+        )
+        if _sh:
+            logger.error("run_execution: %s", _sh)
+            _notify_phase(_exec_job_id, "execution", "failed")
+            return {
+                "execution_status": "FAILED",
+                "output_file": output_file,
+                "product_count": result.get("product_count", 0),
+                "discovery_coverage": discovery_coverage,
+                "error_message": _sh,
+            }
+
         _notify_phase(_exec_job_id, "execution", "done")
         return {
             "execution_status": "SUCCESS",
@@ -2031,6 +2049,8 @@ def _substantive_item_count(path: str, fields: list[str] | None = None) -> int:
     soft failures still carry (337's rows all had titles).
     """
     try:
+        from src.content_types import _field_has_value
+
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         if not isinstance(data, dict):
@@ -2045,8 +2065,10 @@ def _substantive_item_count(path: str, fields: list[str] | None = None) -> int:
             except Exception:
                 use_fields = []
             if not use_fields:
+                # [wave-50 T3] currency dropped: every template default-fills
+                # it, so it can't certify a row.
                 use_fields = [
-                    "price", "availability", "currency",
+                    "price", "availability",
                     "author", "publish_date", "company", "location",
                     "content", "snippet", "rank", "posts",
                     "current_price", "previous_price", "list_price",
@@ -2059,7 +2081,7 @@ def _substantive_item_count(path: str, fields: list[str] | None = None) -> int:
                 for item in val:
                     if not isinstance(item, dict):
                         continue
-                    if any(item.get(f) for f in use_fields):
+                    if any(_field_has_value(item.get(f)) for f in use_fields):
                         count += 1
                 break
         return count
@@ -2075,6 +2097,9 @@ def prune_empty_records(output_file: str, target_fields: list[str] | None = None
     Applied post-run, zero LLM cost. Returns rows removed."""
     import json as _json
     import os as _os
+
+    from src.content_types import _field_has_value
+
     if not output_file or not _os.path.isfile(output_file):
         return 0
     try:
@@ -2095,8 +2120,9 @@ def prune_empty_records(output_file: str, target_fields: list[str] | None = None
         except Exception:
             fields = []
     if not fields:
+        # [wave-50 T3] currency dropped — defaulted by every template.
         fields = [
-            "price", "availability", "currency",
+            "price", "availability",
             "author", "publish_date", "company", "location",
             "content", "snippet", "rank", "posts",
             "current_price", "previous_price", "list_price",
@@ -2105,7 +2131,9 @@ def prune_empty_records(output_file: str, target_fields: list[str] | None = None
     for key in ("products", "jobs", "articles", "results", "items", "threads", "pages"):
         val = data.get(key)
         if isinstance(val, list) and val:
-            kept = [it for it in val if isinstance(it, dict) and any(it.get(f) for f in fields)]
+            kept = [it for it in val
+                    if isinstance(it, dict)
+                    and any(_field_has_value(it.get(f)) for f in fields)]
             removed = len(val) - len(kept)
             if removed:
                 data[key] = kept
@@ -2151,6 +2179,88 @@ def _hygiene_diagnosis(output_file: str, anchor_url: str) -> str:
     except Exception:
         pass
     return ""
+
+
+_OUTPUT_ROW_KEYS = ("products", "jobs", "articles", "results", "items", "threads", "pages")
+_ROW_URL_KEYS = ("url", "product_url", "item_url", "link", "page_url")
+
+
+def _output_row_urls(output_file: str) -> list:
+    """Best-effort URL harvest from the run's own output rows (T5e
+    candidates). No key match or unparseable file → empty; the gate no-ops."""
+    try:
+        with open(output_file, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    for key in _OUTPUT_ROW_KEYS:
+        val = data.get(key)
+        if isinstance(val, list) and val:
+            urls = []
+            for it in val:
+                if isinstance(it, dict):
+                    for uk in _ROW_URL_KEYS:
+                        v = it.get(uk)
+                        if isinstance(v, str) and v.strip():
+                            urls.append(v.strip())
+                            break
+            return urls
+    return []
+
+
+def _shallow_section_gate(
+    output_file: str, listing_url: str, input_mode: str,
+) -> str:
+    """[wave-50 T5e] Generic nav-tree junk bar: fail list_page runs whose
+    output rows are overwhelmingly sibling section links shallower in the tree
+    than the listing itself (the job-1116/488 shape — navigation shipped as
+    products). Detection is structural (src/discovery_quality.py), site
+    agnostic.
+
+    list_page ONLY: its anchor URL is exactly the page discovery walked, so
+    the depth comparison is grounded. navigation/search_term anchors are the
+    submitted URL (often a deep category picked by search), not necessarily
+    the walked listing — a depth comparison there could false-fire on sites
+    whose real PDPs sit in a flat namespace under a shared first segment, so
+    those modes keep their own junk nets (T5d gate, core-value bar, F9).
+    url_list is out of scope: its seeds are user-provided.
+
+    Returns the diagnostic sentence, empty when healthy (gate no-ops)."""
+    if str(input_mode or "").lower() != "list_page":
+        return ""
+    urls = _output_row_urls(output_file)
+    seed_p = os.path.join(os.path.dirname(output_file or ""), "input_urls.json")
+    if os.path.isfile(seed_p):
+        try:
+            with open(seed_p, encoding="utf-8") as fh:
+                seed = json.load(fh)
+            if isinstance(seed, dict) and isinstance(seed.get("urls"), list):
+                seen = set(urls)
+                urls += [u for u in seed["urls"]
+                         if isinstance(u, str) and u not in seen]
+        except Exception:
+            pass
+    if not urls:
+        return ""
+    try:
+        from src.discovery_quality import shallow_section_links
+
+        res = shallow_section_links(listing_url or "", urls)
+    except Exception:
+        return ""
+    if not res.get("fired"):
+        return ""
+    example = (res.get("examples") or [""])[0]
+    return (
+        f"Nav-tree junk bar: {res['suspicious']}/{res['checked']} discovered "
+        f"URLs are shallower section links under the listing's own first "
+        f"path segment '/{res['segment']}' (e.g. {example[:100]!r}) — phase 1 "
+        f"returned the listing's navigation tree, not item pages, and the "
+        f"extraction counted navigation as products. Fix discovery (item-level "
+        f"URL shape / platform catalog path), not the field selectors."
+    )
 
 
 def _extraction_quality_gate(
@@ -2268,14 +2378,17 @@ def _item_has_core_field(item: dict) -> bool:
     if not fields:
         # inlined (not the module global): these functions are exec-extracted
         # into bare namespaces by test_f8_f16 — module globals aren't there
+        # [wave-50 T3] currency dropped — defaulted by every template.
         fields = [
-            "price", "availability", "currency",
+            "price", "availability",
             "author", "publish_date", "company", "location",
             "content", "snippet", "rank", "posts",
             "current_price", "previous_price", "list_price",
             "sale_price", "was_price", "regular_price",
         ]
-    return any(item.get(f) for f in fields)
+    from src.content_types import _field_has_value
+
+    return any(_field_has_value(item.get(f)) for f in fields)
 
 
 # Price aliases generated scrapers legitimately emit (job-9 Priceline:
@@ -2284,8 +2397,9 @@ def _item_has_core_field(item: dict) -> bool:
 _PRICE_ALIASES = ("price", "current_price", "previous_price", "list_price",
                   "sale_price", "was_price", "regular_price")
 # The no-registry fallback list (was inline in _item_has_core_field).
+# [wave-50 T3] currency dropped — defaulted by every template.
 _FALLBACK_CORE_FIELDS = [
-    "price", "availability", "currency",
+    "price", "availability",
     "author", "publish_date", "company", "location",
     "content", "snippet", "rank", "posts",
 ] + list(_PRICE_ALIASES[1:])

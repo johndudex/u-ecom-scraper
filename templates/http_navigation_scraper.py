@@ -32,8 +32,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Optional
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 
@@ -125,6 +124,12 @@ from bs4 import BeautifulSoup
 
 # Make src.* importable (scraper runs from scrapers/{slug}/).
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from src.algolia_discovery import (  # noqa: E402  [wave-50] client-rendered catalogs
+    build_taxon_filter,
+    discover_catalog_urls,
+    extract_algolia_creds,
+    extract_taxon_query,
+)
 from src.page_analysis import (  # noqa: E402  (pure-python helper, no browser import)
     extract_jsonld,
     phase2_instant_fail,
@@ -237,7 +242,7 @@ DISCOVERY_DEADLINE_SECONDS = 300
 # deterministically known from analysis (e.g. site-reported "3771 jobs across
 # 207 specialties"). None → the Tier 3 ratio gate stays a no-op. code_writer
 # may populate this per-site; Phase 1 ships None (unknown).
-COVERAGE_TARGET_TOTAL: Optional[int] = None
+COVERAGE_TARGET_TOTAL: int | None = None
 
 # ── Phase 1: Item link extraction ───────────────────────────────────────────
 ITEM_CONTAINER_SELECTOR = "{ITEM_CONTAINER_SELECTOR}"  # e.g. ".product-grid"
@@ -308,7 +313,7 @@ def _write_checkpoint(urls: list[str]) -> None:
         if not urls:
             try:
                 if os.path.isfile(_CHECKPOINT_PATH):
-                    with open(_CHECKPOINT_PATH, "r") as f:
+                    with open(_CHECKPOINT_PATH) as f:
                         prev = json.load(f)
                     if prev.get("urls"):
                         logger.warning(
@@ -330,7 +335,7 @@ def _load_checkpoint() -> list[str]:
     """Load discovered URLs from a previous run's checkpoint (if any)."""
     try:
         if os.path.isfile(_CHECKPOINT_PATH):
-            with open(_CHECKPOINT_PATH, "r") as f:
+            with open(_CHECKPOINT_PATH) as f:
                 data = json.load(f)
             urls = data.get("urls", [])
             if urls:
@@ -591,7 +596,7 @@ def _set_query_param(url: str, param: str, value) -> str:
 _OFFSET_PARAMS = {"offset", "start", "skip", "begin", "from"}
 
 
-def _extract_next_href(html: str) -> Optional[str]:
+def _extract_next_href(html: str) -> str | None:
     """Find a 'next page' href in listing HTML via semantic selectors."""
     if not html:
         return None
@@ -618,7 +623,7 @@ def _extract_next_href(html: str) -> Optional[str]:
     return None
 
 
-def _get_next_page_url(final_url: str, next_page_num: int, html: str = None) -> Optional[str]:
+def _get_next_page_url(final_url: str, next_page_num: int, html: str = None) -> str | None:
     """Construct the URL for the next page of results.
 
     PREFERRED: construct ``?{PAGE_PARAM_NAME}=N`` directly on the post-action
@@ -793,8 +798,8 @@ def _extract_item_links(html: str) -> list[str]:
 
 def _discover_urls_via_search(
     query: str,
-    max_pages: Optional[int] = None,
-    limit: Optional[int] = None,
+    max_pages: int | None = None,
+    limit: int | None = None,
 ) -> tuple[list[str], str]:
     """Phase 1a: Discover item URLs by submitting the site's search form.
 
@@ -902,8 +907,8 @@ def _discover_urls_via_search(
 
 
 def _discover_urls_via_form_search(
-    max_pages: Optional[int] = None,
-    limit: Optional[int] = None,
+    max_pages: int | None = None,
+    limit: int | None = None,
 ) -> tuple[list[str], str]:
     """Phase 1c: Discover item URLs by iterating through ALL options of a <select>.
 
@@ -916,6 +921,7 @@ def _discover_urls_via_form_search(
     Returns ``(urls, stop_reason)``.
     """
     from urllib.parse import urljoin
+
     from bs4 import BeautifulSoup
 
     all_urls: list[str] = []
@@ -1079,10 +1085,58 @@ def _discover_urls_via_form_search(
     return unique_urls, stop_reason
 
 
+def _discover_urls_via_algolia(
+    listing_url: str,
+    limit: int | None = None,
+) -> tuple[list[str], str]:
+    """[wave-50] Phase-1 pre-step for Algolia-backed CLIENT-RENDERED listings.
+
+    The SSR HTML of such listings carries zero product hrefs (job 1116:
+    wonderbly), so HTML anchor discovery cannot work — but the page ships its
+    own Algolia search creds. Extract them, walk the index, convert hits to
+    PDP URLs (wide-key fallback: solidusSlug/prismicProductSlug/…). Any
+    failure — no creds, query error, zero URLs — degrades to
+    ``([], "algolia_unavailable")`` and the caller falls back to HTML
+    discovery, never crashes.
+    """
+    html, status = _http_get(listing_url)
+    if not html or status >= 400:
+        return [], "algolia_unavailable"
+    try:
+        creds = extract_algolia_creds(html)
+        if not creds:
+            return [], "algolia_unavailable"
+        taxon = extract_taxon_query(html)
+        filter_str = build_taxon_filter(creds, taxon) if taxon else ""
+        logger.info(
+            "Phase 1 (algolia): creds found (index=%s, taxon=%r) — catalog discovery",
+            creds.get("index_name") or "?", taxon or "",
+        )
+        result = discover_catalog_urls(
+            listing_url, creds, max_items=limit or 20,
+            filter_str=filter_str,
+        )
+        urls = result.get("urls") or []
+        if not urls:
+            logger.warning(
+                "Phase 1 (algolia): %s — falling back to HTML discovery",
+                result.get("stop_reason") or "no_urls",
+            )
+            return [], "algolia_unavailable"
+        logger.info(
+            "Phase 1 (algolia): %d PDP URLs (nbHits=%s, stop=%s)",
+            len(urls), result.get("nbHits"), result.get("stop_reason"),
+        )
+        return urls, result.get("stop_reason") or "max_items"
+    except Exception as exc:  # never let the pre-step kill discovery
+        logger.warning("Phase 1 (algolia): pre-step failed: %s", exc)
+        return [], "algolia_unavailable"
+
+
 def _discover_urls_via_category(
     category_url: str,
-    max_pages: Optional[int] = None,
-    limit: Optional[int] = None,
+    max_pages: int | None = None,
+    limit: int | None = None,
 ) -> tuple[list[str], str]:
     """Phase 1b: Discover item URLs from a category/listing page.
 
@@ -1160,7 +1214,7 @@ def _discover_urls_via_category(
 # there until that image is rebuilt, so the ~25 lines live in each python-side
 # template verbatim (playwright/UC normalize in-page via JS and don't need them).
 
-def _norm_price(value) -> Optional[float]:
+def _norm_price(value) -> float | None:
     """Strip currency symbols/whitespace from a price.
 
     "£1,234.56" → 1234.56 (a float), "1.234,56 €" → 1234.56, 24.99 (a
@@ -1189,7 +1243,7 @@ def _norm_price(value) -> Optional[float]:
         return None
 
 
-def _norm_availability(value) -> Optional[str]:
+def _norm_availability(value) -> str | None:
     """Normalize availability to ``in_stock`` / ``out_of_stock``.
 
     Accepts the schema.org URI form, InStock / In Stock / in_stock / Available
@@ -1536,7 +1590,7 @@ def main():
     # ── Coverage-gate state (contract §1) ───────────────────────────────────
     # ran_phase1=False emits stop_reason="skipped" + skipped_reason.
     ran_phase1 = True
-    skipped_reason: Optional[str] = None
+    skipped_reason: str | None = None
     aggregate_stop_reason = "no_next_link"  # default per contract §2
     max_pages_hit = False
     dimensions_iterated = 0
@@ -1572,14 +1626,22 @@ def main():
             max_pages_hit = max_pages_hit or primary_reason == "max_pages_hit"
         elif args.category_url:
             logger.info("Phase 1: discovering via category %s", args.category_url[:50])
-            discovered_urls, primary_reason = _discover_urls_via_category(args.category_url, MAX_PAGES, limit)
             src_url_base = args.category_url
+            # [wave-50] Algolia-backed client-rendered catalogs first; HTML
+            # discovery remains the fallback (and the path for plain sites).
+            discovered_urls, primary_reason = _discover_urls_via_algolia(args.category_url, limit)
+            if not discovered_urls:
+                discovered_urls, primary_reason = _discover_urls_via_category(args.category_url, MAX_PAGES, limit)
             aggregate_stop_reason = _merge_stop_reason(aggregate_stop_reason, primary_reason)
             max_pages_hit = max_pages_hit or primary_reason == "max_pages_hit"
         elif args.listing_url:
             logger.info("Phase 1: discovering via listing %s", args.listing_url[:50])
-            discovered_urls, primary_reason = _discover_urls_via_category(args.listing_url, MAX_PAGES, limit)
             src_url_base = args.listing_url
+            # [wave-50] Same pre-step as categories — client-rendered listings
+            # (Astro/InstantSearch) have no SSR product hrefs to anchor-discover.
+            discovered_urls, primary_reason = _discover_urls_via_algolia(args.listing_url, limit)
+            if not discovered_urls:
+                discovered_urls, primary_reason = _discover_urls_via_category(args.listing_url, MAX_PAGES, limit)
             aggregate_stop_reason = _merge_stop_reason(aggregate_stop_reason, primary_reason)
             max_pages_hit = max_pages_hit or primary_reason == "max_pages_hit"
         else:
@@ -1673,7 +1735,8 @@ def main():
                     and not args.discover_only
                     and os.getenv("SCRAPER_CHECKPOINT_REUSE") == "1"):
                 from src.listing_discovery import (  # lazy, point of use
-                    checkpoint_coverage_patch, load_discovery_checkpoint,
+                    checkpoint_coverage_patch,
+                    load_discovery_checkpoint,
                 )
                 ckpt = load_discovery_checkpoint(
                     _CHECKPOINT_PATH, "list_page",

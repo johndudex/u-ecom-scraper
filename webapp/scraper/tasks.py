@@ -1874,7 +1874,12 @@ def _good_rows(data: object, fields: list[str], output_key: str) -> list[dict]:
             return []
         live = [r for r in rows if not _rescue_dead_row(r)]
         if fields:
-            return [r for r in live if any(r.get(field) for field in fields)]
+            from src.content_types import _field_has_value
+
+            # [wave-50 T4] Core-value bar: typed numeric zero is data (468),
+            # empty string is not (1116's defaulted-currency junk rows).
+            return [r for r in live
+                    if any(_field_has_value(r.get(field)) for field in fields)]
         try:
             from src.content_types import has_substantive_field
         except Exception:
@@ -2057,7 +2062,11 @@ def _real_items_evidence(
             names = sorted(os.listdir(directory)) if directory.is_dir() else []
         except OSError:
             names = []
-        source_total, source_rows, source_loc, source_fresh = 0, 0, "", 0.0
+        # [wave-50 T4] The credited count is the NAMED file's row count —
+        # per-file max, never a sum across cycle files. Job 1116 recorded 15
+        # (5+0+5+0+… across 9 cycle outputs) while the named evidence file
+        # held 5; product_count and output_file must describe the same bytes.
+        source_rows, source_loc, source_fresh = 0, "", 0.0
         for name in names:
             if not (name.startswith("output_") and name.endswith(".json")):
                 continue
@@ -2079,18 +2088,17 @@ def _real_items_evidence(
             rows = _good_rows(data, fields, output_key)
             if not rows:
                 continue
-            source_total += len(rows)
             fresh = name_epoch if name_epoch is not None else mtime
             if len(rows) > source_rows or (
                 len(rows) == source_rows and fresh > source_fresh
             ):
                 source_rows, source_loc, source_fresh = len(rows), str(path), fresh
-        if source_total:
-            _consider(source_total, source_fresh, source_loc)
+        if source_rows:
+            _consider(source_rows, source_fresh, source_loc)
 
     # ── Source (c): File Master output keys, payload-first freshness ────────
     if artifacts is not None and fm_keys:
-        fm_total, fm_rows, fm_loc, fm_fresh = 0, 0, "", 0.0
+        fm_rows, fm_loc, fm_fresh = 0, "", 0.0
         for key in fm_keys:
             name = key.rsplit("/", 1)[-1]
             if not (name.startswith("output_") and name.endswith(".json")):
@@ -2113,13 +2121,13 @@ def _real_items_evidence(
             rows = _good_rows(payload, fields, output_key)
             if not rows:
                 continue
-            fm_total += len(rows)
+            # [wave-50 T4] per-file max — see the workspace-source note.
             if len(rows) > fm_rows or (
                 len(rows) == fm_rows and fresh > fm_fresh
             ):
                 fm_rows, fm_loc, fm_fresh = len(rows), key, fresh
-        if fm_total:
-            _consider(fm_total, fm_fresh, fm_loc)
+        if fm_rows:
+            _consider(fm_rows, fm_fresh, fm_loc)
 
     if best_count:
         return best_count, best_loc
@@ -2737,6 +2745,19 @@ def _finalize_job(job: ScrapeJob) -> None:
             "failure verdict; COMPLETED with product_count=%d",
             job.id, rescue_count, rescue_file, rescue_count,
         )
+        # [wave-50 T4] The rescue arm completes short-shipped jobs silently —
+        # [SCOPE-SHORTFALL] was wired only at the ground-truth override arm
+        # (wave-48 T6). A rescue COMPLETED owes the same honesty (476: asked
+        # 5, rescued 2, unmarked).
+        try:
+            _ss_row = _scope_shortfall_row(
+                job.scope, job.scope_value, rescue_count)
+            if _ss_row and "[SCOPE-SHORTFALL]" not in (job.notes or ""):
+                job.notes = (job.notes or "") + f"\n{_ss_row}"
+                job.save(update_fields=["notes"])
+        except Exception as exc:
+            logger.warning("Job %d: rescue shortfall marker failed: %s",
+                           job.id, exc)
         try:
             _promote_rescued_draft(evidence_slug, job.id)
         except Exception as exc:

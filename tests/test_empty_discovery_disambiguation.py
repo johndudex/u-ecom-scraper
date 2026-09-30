@@ -528,8 +528,17 @@ class TestRequestsTemplateCallSites:
     def test_both_discovery_call_sites_use_the_shared_module(self):
         with open(REQ) as fh:
             src = fh.read()
-        # --discover-only/env-gate branch + no-input branch.
-        assert len(re.findall(r"= discover_listing_urls_with_retry\(", src)) == 2
+        # [wave-50 T5b supersession] Both main() discovery arms used to assign
+        # `= discover_listing_urls_with_retry(` directly; they now route
+        # through the algolia-first gate (`_discover_phase1`), and the shared
+        # module call lives ONCE inside the gate as the anchor fallback. The
+        # invariant is unchanged and now enforced one level deeper: no arm
+        # invents its own anchor loop — everything goes through the gate,
+        # and only the gate touches the shared module.
+        assert len(re.findall(r"= _discover_phase1\(", src)) == 2
+        gate_src = _grab(src, "_discover_phase1")
+        assert len(re.findall(
+            r"discover_listing_urls_with_retry\(", gate_src)) == 1
         # The inline loop is gone — nothing left for code_writer to rewrite.
         assert "def discover_product_urls" not in src
         assert "def discover_listing" not in src

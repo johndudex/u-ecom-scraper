@@ -23,8 +23,6 @@ import sys
 import time
 from datetime import datetime, timezone
 from html import unescape
-from typing import Optional
-from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -97,7 +95,7 @@ def clean_html(html_str: str) -> str:
 # there until that image is rebuilt, so the ~25 lines live in each python-side
 # template verbatim (playwright/UC normalize in-page via JS and don't need them).
 
-def _norm_price(value) -> Optional[float]:
+def _norm_price(value) -> float | None:
     """Strip currency symbols/whitespace from a price.
 
     "£1,234.56" → 1234.56 (a float), "1.234,56 €" → 1234.56, 24.99 (a
@@ -126,7 +124,7 @@ def _norm_price(value) -> Optional[float]:
         return None
 
 
-def _norm_availability(value) -> Optional[str]:
+def _norm_availability(value) -> str | None:
     """Normalize availability to ``in_stock`` / ``out_of_stock``.
 
     Accepts the schema.org URI form, InStock / In Stock / in_stock / Available
@@ -177,7 +175,7 @@ def make_product(product_data: dict, index: int, src_url: str, status_code: int 
 # API FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def fetch_with_retry(url: str, params: Optional[dict] = None) -> Optional[dict]:
+def fetch_with_retry(url: str, params: dict | None = None) -> dict | None:
     ssl_verify = proxy_config.config.get("strategy", {}).get("ssl_verify", False)
     escalation = proxy_config.get_escalation_tier()
 
@@ -263,7 +261,7 @@ def _get_fetch_json():
     return _FETCH_JSON
 
 
-def scrape_product(url: str, src_url: str) -> Optional[dict]:
+def scrape_product(url: str, src_url: str) -> dict | None:
     try:
         handle = url.rstrip("/").split("/")[-1]
         api_url = f"{SITE_URL}/products/{handle}.json"
@@ -295,7 +293,7 @@ def scrape_product(url: str, src_url: str) -> Optional[dict]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_urls_from_file(filepath: str) -> list[str]:
-    with open(filepath, "r", encoding="utf-8") as f:
+    with open(filepath, encoding="utf-8") as f:
         data = json.load(f)
     return data.get("urls", [])
 

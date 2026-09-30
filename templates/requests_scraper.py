@@ -23,7 +23,6 @@ import sys
 import time
 from datetime import datetime, timezone
 from html import unescape
-from typing import Optional
 from urllib.parse import urljoin
 
 import requests  # noqa: F401 -- drafts' Phase-2 helpers commonly need it
@@ -99,10 +98,14 @@ HEADERS = {
 # session (cookies round-trip — a bare requests.get() is a cookieless one-shot
 # that re-raises the bot score on every hit) and the soft-block proxy-tier
 # mechanism the shared discovery module drives. Full rationale: src/http_fetch.py.
-from src.http_fetch import create_fetch_page
+from src.http_fetch import create_fetch_page, create_fetch_text
 from src.page_analysis import phase2_instant_fail
 
 fetch_page = create_fetch_page(delay_s=DELAY_BETWEEN_REQUESTS, headers=HEADERS)
+# [wave-50] Raw-HTML fetch through the SAME ladder — the Algolia pre-step
+# needs the un-parsed page (creds ride script/attribute text a soup would
+# re-escape) on the transport identity that actually reaches this site.
+fetch_text = create_fetch_text(delay_s=DELAY_BETWEEN_REQUESTS, headers=HEADERS)
 
 # ── LISTING DISCOVERY — SHARED MODULE, NOT YOURS TO REIMPLEMENT (CRITICAL) ───
 # code_writer: keep the import + the main() call VERBATIM. The pagination
@@ -114,6 +117,17 @@ fetch_page = create_fetch_page(delay_s=DELAY_BETWEEN_REQUESTS, headers=HEADERS)
 # execution-window soft block had no trigger and the job finalized 0 items).
 # The ONLY discovery code you adapt is _extract_listing_links below, plus
 # the data constants.
+# [wave-50] Client-rendered catalog pre-step (job 1116 wonderbly): the SSR
+# HTML of Astro/React listing shells carries zero product hrefs while the
+# real catalog lives in an Algolia index the page itself queries. The
+# pre-step below extracts the page's public search creds and walks the
+# index; anchor discovery stays as the fallback.
+from src.algolia_discovery import (  # noqa: E402
+    build_taxon_filter,
+    discover_catalog_urls,
+    extract_algolia_creds,
+    extract_taxon_query,
+)
 from src.listing_discovery import discover_listing_urls_with_retry
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -173,7 +187,7 @@ def make_absolute_url(url: str, base: str = SITE_URL) -> str:
 # there until that image is rebuilt, so the ~25 lines live in each python-side
 # template verbatim (playwright/UC normalize in-page via JS and don't need them).
 
-def _norm_price(value) -> Optional[float]:
+def _norm_price(value) -> float | None:
     """Strip currency symbols/whitespace from a price.
 
     "£1,234.56" → 1234.56 (a float), "1.234,56 €" → 1234.56, 24.99 (a
@@ -202,7 +216,7 @@ def _norm_price(value) -> Optional[float]:
         return None
 
 
-def _norm_availability(value) -> Optional[str]:
+def _norm_availability(value) -> str | None:
     """Normalize availability to ``in_stock`` / ``out_of_stock``.
 
     Accepts the schema.org URI form, InStock / In Stock / in_stock / Available
@@ -230,7 +244,7 @@ def _norm_availability(value) -> Optional[str]:
 # EXTRACTION - CUSTOMIZE selectors below
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def extract_jsonld(soup: BeautifulSoup) -> Optional[dict]:
+def extract_jsonld(soup: BeautifulSoup) -> dict | None:
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string)
@@ -337,12 +351,87 @@ def _extract_listing_links(soup: BeautifulSoup) -> list[str]:
     return urls
 
 
+def _discover_urls_via_algolia(
+    listing_url: str,
+    limit: int | None = None,
+) -> tuple[list[str], str]:
+    """[wave-50] Phase-1 pre-step for Algolia-backed CLIENT-RENDERED listings.
+
+    The SSR HTML of such listings can carry zero product hrefs even when the
+    page looks anchor-rich (nav links dominate — job 485 wonderbly), so HTML
+    anchor discovery ships junk. The page ships its own Algolia search creds:
+    extract them, walk the index, convert hits to PDP URLs through the
+    wide-key fallback (solidusSlug/prismicProductSlug/…, objectID last). Any
+    failure — fetch, no creds, query error, zero URLs — degrades to
+    ``([], "algolia_unavailable")`` and the caller falls back to anchor
+    discovery, never crashes.
+    """
+    if not listing_url:
+        return [], "algolia_unavailable"
+    try:
+        html, status = fetch_text(listing_url)
+    except Exception as exc:
+        logger.warning("Phase 1 (algolia): listing fetch failed: %s", exc)
+        return [], "algolia_unavailable"
+    if not html or status >= 400:
+        return [], "algolia_unavailable"
+    try:
+        creds = extract_algolia_creds(html)
+        if not creds:
+            return [], "algolia_unavailable"
+        taxon = extract_taxon_query(html)
+        filter_str = build_taxon_filter(creds, taxon) if taxon else ""
+        logger.info(
+            "Phase 1 (algolia): creds found (index=%s, taxon=%r) — catalog discovery",
+            creds.get("index_name") or "?", taxon or "",
+        )
+        result = discover_catalog_urls(
+            listing_url, creds, max_items=limit or 20,
+            filter_str=filter_str,
+        )
+        urls = result.get("urls") or []
+        if not urls:
+            logger.warning(
+                "Phase 1 (algolia): %s — falling back to HTML discovery",
+                result.get("stop_reason") or "no_urls",
+            )
+            return [], "algolia_unavailable"
+        logger.info(
+            "Phase 1 (algolia): %d PDP URLs (nbHits=%s, stop=%s)",
+            len(urls), result.get("nbHits"), result.get("stop_reason"),
+        )
+        return urls, result.get("stop_reason") or "max_items"
+    except Exception as exc:  # never let the pre-step kill discovery
+        logger.warning("Phase 1 (algolia): pre-step failed: %s", exc)
+        return [], "algolia_unavailable"
+
+
+def _discover_phase1(
+    discovery_cfg: dict,
+    limit: int | None = None,
+) -> tuple[list[str], dict]:
+    """[wave-50] THE Phase-1 gate: Algolia catalog first, anchors second.
+
+    Every discovery arm in main() routes through here so the client-rendered
+    class is served deterministically — the writer cannot strip the pre-step
+    without deleting the gate itself.
+    """
+    seed = PRODUCT_LISTING_URLS[0] if PRODUCT_LISTING_URLS else ""
+    urls, reason = _discover_urls_via_algolia(seed, limit)
+    if urls:
+        return urls, {"stop_reason": f"algolia:{reason}", "max_pages_hit": False}
+    return discover_listing_urls_with_retry(
+        fetch_page, PRODUCT_LISTING_URLS, _extract_listing_links,
+        **discovery_cfg,
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # INPUT HANDLING
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_urls_from_file(filepath: str) -> list[str]:
-    with open(filepath, "r", encoding="utf-8") as f:
+    with open(filepath, encoding="utf-8") as f:
         data = json.load(f)
     return data.get("urls", [])
 
@@ -418,7 +507,7 @@ def main():
     product_urls = []
     discovered_urls_raw = 0
     ran_phase1 = False
-    skipped_reason: Optional[str] = None
+    skipped_reason: str | None = None
     discovery_meta: dict = {"stop_reason": "skipped", "max_pages_hit": False}
 
     # Shared-module discovery config (data, not code — see the import banner).
@@ -450,10 +539,7 @@ def main():
     if args.discover_only or _env_listing:
         logger.info("Discovery mode (%s): running Phase 1, skipping Phase 2 extraction",
                     "env-gate" if _env_listing else "--discover-only")
-        product_urls, discovery_meta = discover_listing_urls_with_retry(
-            fetch_page, PRODUCT_LISTING_URLS, _extract_listing_links,
-            **_discovery_cfg,
-        )
+        product_urls, discovery_meta = _discover_phase1(_discovery_cfg, args.limit)
         discovered_urls_raw = len(product_urls)
         ran_phase1 = True
         save_urls_to_file(INPUT_FILE, product_urls)
@@ -471,10 +557,7 @@ def main():
         skipped_reason = "checkpoint_loaded"
     else:
         logger.info("No input_urls.json found. Discovering products from listing page...")
-        product_urls, discovery_meta = discover_listing_urls_with_retry(
-            fetch_page, PRODUCT_LISTING_URLS, _extract_listing_links,
-            **_discovery_cfg,
-        )
+        product_urls, discovery_meta = _discover_phase1(_discovery_cfg, args.limit)
         discovered_urls_raw = len(product_urls)
         ran_phase1 = True
         save_urls_to_file(INPUT_FILE, product_urls)

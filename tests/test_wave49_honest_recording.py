@@ -251,7 +251,12 @@ class TestFmRescueWindow:
         from scraper import tasks
 
         started = timezone.now() - timezone.timedelta(hours=2)
-        key = f"scrapers/sephora-cz/output_2026-09-29_235455_000001_99.json"
+        # Relative fresh NAME — the fixed "…_235455" stamp was a second time
+        # bomb in this file (it slid out of the 2h window once real time
+        # passed 01:54 UTC, same failure mode as the "…_140000" bomb below).
+        fresh_name = (timezone.now() - timezone.timedelta(minutes=30)).strftime(
+            "output_%Y-%m-%d_%H%M%S")
+        key = f"scrapers/sephora-cz/{fresh_name}_000001_99.json"
         _fm(monkeypatch, [key], {key: json.dumps({"products": _rows(19)})})
         _root(monkeypatch, tmp_path)
         n, loc = tasks._real_items_evidence(
@@ -264,7 +269,11 @@ class TestFmRescueWindow:
         from scraper import tasks
 
         started = timezone.now() - timezone.timedelta(hours=2)
-        key = "scrapers/x-com/output_2026-09-29_140000_000001_3.json"
+        # In-window NAME (1h ago) — the original fixed "…_140000" stamp was a
+        # time bomb: it left the window whenever the suite ran after 16:00 UTC.
+        stamp = (timezone.now() - timezone.timedelta(hours=1)).strftime(
+            "%Y-%m-%d_%H%M%S")
+        key = f"scrapers/x-com/output_{stamp}_000001_3.json"
         _fm(monkeypatch, [key], {key: json.dumps(
             {"site": {"scraped_at": "not-a-date"}, "products": _rows(3)})})
         _root(monkeypatch, tmp_path)

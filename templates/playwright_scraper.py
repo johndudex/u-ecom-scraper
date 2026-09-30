@@ -24,14 +24,14 @@ import sys
 import time
 from datetime import datetime, timezone
 from html import unescape
-from typing import Optional
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from src.proxy import ProxyConfig, build_playwright_proxy
+from src.discovery import config_for_load_more, config_from_dict, discover_item_urls
 from src.geo import detect_country
-from src.discovery import discover_item_urls, config_for_load_more, config_from_dict
+from src.proxy import ProxyConfig, build_playwright_proxy
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION - Update these values
@@ -469,7 +469,7 @@ def discover_product_urls(page) -> list[str]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_urls_from_file(filepath: str) -> list[str]:
-    with open(filepath, "r", encoding="utf-8") as f:
+    with open(filepath, encoding="utf-8") as f:
         data = json.load(f)
     return data.get("urls", [])
 

@@ -22,12 +22,13 @@ import re
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Optional
 
 import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from src.proxy import ProxyConfig  # noqa: F401  (tier ladder lives in src.http_fetch now)
+from src.proxy import (
+    ProxyConfig,  # noqa: F401  (tier ladder lives in src.http_fetch now)
+)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION - Update these values
@@ -88,7 +89,7 @@ proxy_config = ProxyConfig.get_instance()
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def load_urls_from_file(filepath: str) -> list[str]:
-    with open(filepath, "r", encoding="utf-8") as f:
+    with open(filepath, encoding="utf-8") as f:
         data = json.load(f)
     return data.get("urls", [])
 
@@ -110,7 +111,7 @@ def save_urls_to_file(filepath: str, urls: list[str]) -> None:
 # API FUNCTIONS - CUSTOMIZE response parsing below
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def fetch_api(endpoint: str, params: Optional[dict] = None):
+def fetch_api(endpoint: str, params: dict | None = None):
     """Phase-1 API fetch — rides the SAME shared ladder as Phase 2 [T1.3].
 
     The inline per-tier ladder this used to be had no challenge detection: a
@@ -142,7 +143,7 @@ def fetch_api(endpoint: str, params: Optional[dict] = None):
 # there until that image is rebuilt, so the ~25 lines live in each python-side
 # template verbatim (playwright/UC normalize in-page via JS and don't need them).
 
-def _norm_price(value) -> Optional[float]:
+def _norm_price(value) -> float | None:
     """Strip currency symbols/whitespace from a price.
 
     "£1,234.56" → 1234.56 (a float), "1.234,56 €" → 1234.56, 24.99 (a
@@ -171,7 +172,7 @@ def _norm_price(value) -> Optional[float]:
         return None
 
 
-def _norm_availability(value) -> Optional[str]:
+def _norm_availability(value) -> str | None:
     """Normalize availability to ``in_stock`` / ``out_of_stock``.
 
     Accepts the schema.org URI form, InStock / In Stock / in_stock / Available
@@ -379,7 +380,7 @@ def _get_fetch_json():
     return _FETCH_JSON
 
 
-def scrape_product(url: str, src_url: str) -> Optional[dict]:
+def scrape_product(url: str, src_url: str) -> dict | None:
     try:
         time.sleep(DELAY_BETWEEN_REQUESTS)
         # [wave-15 3.4] Per-item JSON fetch rides the SAME proxy ladder as

@@ -176,8 +176,12 @@ class TestRunExecutionDiagnosis:
         ) as fh:
             src = fh.read()
         # the wiring sits at the CALL SITE, immediately before the gate fires
+        # [wave-50] the T5e junk-gate helpers inserted above the gate pushed
+        # `_hygiene_diagnosis`'s graph import past the old -4000 window —
+        # widened; the contract ("hygiene diagnosis is wired beside the
+        # quality gate") is unchanged.
         gate_at = src.index("Extraction quality gate")
-        window = src[max(0, gate_at - 4000) : gate_at + 500]
+        window = src[max(0, gate_at - 7000) : gate_at + 500]
         assert "_discovered_url_issues(" in window
 
 

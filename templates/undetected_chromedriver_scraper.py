@@ -466,7 +466,7 @@ def discover_product_urls(driver, category_url: str) -> list[str]:
 
 
 def load_urls_from_file(filepath: str) -> list[str]:
-    with open(filepath, "r", encoding="utf-8") as f:
+    with open(filepath, encoding="utf-8") as f:
         data = json.load(f)
     return data.get("urls", [])
 
@@ -559,7 +559,7 @@ def main():
         sys.exit(1)
 
     logger.info(f"Total products to scrape: {len(product_urls)}")
-    logger.info(f"Using PER-PAGE SESSION architecture (new SB() per product page)")
+    logger.info("Using PER-PAGE SESSION architecture (new SB() per product page)")
 
     for i, url in enumerate(product_urls):
         try:

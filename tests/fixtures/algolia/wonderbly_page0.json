@@ -1,0 +1,4796 @@
+{
+ "results": [
+  {
+   "hits": [
+    {
+     "solidusSlug": "newspaper-birthday-book",
+     "solidusSlugUnhyphenated": "newspaperbirthdaybook",
+     "prismicProductSlug": "newspaper-birthday-book",
+     "title": "Your Life in Newspaper Headlines",
+     "description": null,
+     "imageURL": "https://images.prismic.io/wonderbly/aQCPVbpReVYa3vTY_YLHN_YourLifeinNewspaperHeadlines_i_US.png?auto=format,compress&rect=0,0,1700,1700&w=410&h=410",
+     "productBadgeContent": "Discover a lifetime of front-page history",
+     "minimumAge": "- Grownups",
+     "maximumAge": null,
+     "price": "$89.99 USD",
+     "wasPrice": null,
+     "wasPriceFormatted": null,
+     "category": "print-on-demand",
+     "categories": {
+      "lvl0": [
+       "Adults",
+       "Email Opt In",
+       "Occasions",
+       "Email mystery sends",
+       "ChristmasTV"
+      ],
+      "lvl1": [
+       "Adults > Recipients",
+       "Adults > Themes",
+       "Occasions > Father's Day",
+       "Occasions > Birthday",
+       "Occasions > Just Because",
+       "Occasions > Black Friday",
+       "Occasions > Christmas",
+       "Adults > Occasions",
+       "Occasions > Mother's Day"
+      ],
+      "lvl2": [
+       "Adults > Recipients > Dads",
+       "Adults > Recipients > Grandparents",
+       "Adults > Themes > Newspaper",
+       "Adults > Recipients > Him",
+       "Adults > Themes > Gifts book lovers",
+       "Adults > Themes > Newspaper for Christmas",
+       "Adults > Recipients > Partner",
+       "Occasions > Christmas > New in",
+       "Adults > Recipients > Parents",
+       "Adults > Occasions > Milestone Birthday",
+       "Adults > Recipients > Moms",
+       "Occasions > Mother's Day > For your mom",
+       "Occasions > Father's Day > For your dad",
+       "Adults > Occasions > Birthday"
+      ]
+     },
+     "productCatalogueCategories": [
+      "Adults > Recipients > Dads",
+      "Adults > Recipients",
+      "Adults",
+      "Adults > Recipients > Grandparents",
+      "Email Opt In",
+      "Adults > Themes > Newspaper",
+      "Adults > Themes",
+      "Adults > Recipients > Him",
+      "Adults > Themes > Gifts book lovers",
+      "Occasions > Father's Day",
+      "Occasions",
+      "Occasions > Birthday",
+      "Occasions > Just Because",
+      "Email mystery sends",
+      "Occasions > Black Friday",
+      "Adults > Themes > Newspaper for Christmas",
+      "Adults > Recipients > Partner",
+      "Occasions > Christmas > New in",
+      "Occasions > Christmas",
+      "Adults > Recipients > Parents",
+      "ChristmasTV",
+      "Adults > Occasions > Milestone Birthday",
+      "Adults > Occasions",
+      "Adults > Recipients > Moms",
+      "Occasions > Mother's Day > For your mom",
+      "Occasions > Mother's Day",
+      "Occasions > Father's Day > For your dad",
+      "Adults > Occasions > Birthday"
+     ],
+     "age": [
+      "Adult"
+     ],
+     "occasion": [
+      "Black Friday",
+      "Just because",
+      "Birthday",
+      "Retirement"
+     ],
+     "theme": [
+      "Newspaper",
+      "History"
+     ],
+     "sentiment": [],
+     "recipient": [
+      "Grandparents",
+      "Dad",
+      "Adults",
+      "Uncle"
+     ],
+     "series": [],
+     "characterCount": [
+      "1 adult"
+     ],
+     "gender": [
+      "Male",
+      "Female",
+      "Neutral"
+     ],
+     "language": [],
+     "segment": [
+      "Adults"
+     ],
+     "photoUpload": [],
+     "objectID": "newspaper-birthday",
+     "_highlightResult": {
+      "title": {
+       "value": "Your Life in Newspaper Headlines",
+       "matchLevel": "none",
+       "matchedWords": []
+      },
+      "categories": {
+       "lvl0": [
+        {
+         "value": "Adults",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Email Opt In",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Email mystery sends",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "ChristmasTV",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl1": [
+        {
+         "value": "Adults > Recipients",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Father's Day",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Birthday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Just Because",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Black Friday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Christmas",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Occasions",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Mother's Day",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl2": [
+        {
+         "value": "Adults > Recipients > Dads",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Recipients > Grandparents",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Themes > Newspaper",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Recipients > Him",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Themes > Gifts book lovers",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Themes > Newspaper for Christmas",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Recipients > Partner",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Christmas > New in",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Recipients > Parents",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Occasions > Milestone Birthday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Recipients > Moms",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Mother's Day > For your mom",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Father's Day > For your dad",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Occasions > Birthday",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ]
+      },
+      "age": [
+       {
+        "value": "Adult",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "occasion": [
+       {
+        "value": "Black Friday",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Just because",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Birthday",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Retirement",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "theme": [
+       {
+        "value": "Newspaper",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "History",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "recipient": [
+       {
+        "value": "Grandparents",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Dad",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Adults",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Uncle",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "characterCount": [
+       {
+        "value": "1 adult",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "gender": [
+       {
+        "value": "Male",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Female",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Neutral",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "segment": [
+       {
+        "value": "Adults",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ]
+     }
+    },
+    {
+     "solidusSlug": "together-at-christmas-book",
+     "solidusSlugUnhyphenated": "togetheratchristmasbook",
+     "prismicProductSlug": "together-at-christmas-book",
+     "title": "Together at Christmas",
+     "description": null,
+     "imageURL": "https://images.prismic.io/wonderbly/aFnX3nfc4bHWio_e_TAC_range_card_thumbnail_i_EN.png?auto=format,compress&rect=0,0,820,820&w=410&h=410",
+     "productBadgeContent": "A festive sibling story",
+     "minimumAge": "0",
+     "maximumAge": "8",
+     "price": "$29.99 USD",
+     "wasPrice": null,
+     "wasPriceFormatted": null,
+     "category": "print-on-demand",
+     "categories": {
+      "lvl0": [
+       "Email Opt In",
+       "Occasions",
+       "Kids",
+       "Themes",
+       "Email mystery sends"
+      ],
+      "lvl1": [
+       "Occasions > Black Friday",
+       "Kids > Recipients",
+       "Kids > Themes",
+       "Kids > Age",
+       "Themes > Christmas",
+       "Occasions > Christmas"
+      ],
+      "lvl2": [
+       "Kids > Recipients > Family",
+       "Kids > Themes > Christmas",
+       "Kids > Age > 5 year olds",
+       "Kids > Age > 0-6",
+       "Kids > Recipients > Boys",
+       "Kids > Themes > Rhyming",
+       "Kids > Themes > Family Stories",
+       "Kids > Age > 3 year olds",
+       "Kids > Age > 4 year olds",
+       "Kids > Recipients > Girls",
+       "Kids > Age > 6 year olds",
+       "Occasions > Christmas > New in",
+       "Kids > Recipients > Siblings",
+       "Kids > Age > 3-6"
+      ]
+     },
+     "productCatalogueCategories": [
+      "Email Opt In",
+      "Occasions > Black Friday",
+      "Occasions",
+      "Kids > Recipients > Family",
+      "Kids > Recipients",
+      "Kids",
+      "Kids > Themes > Christmas",
+      "Kids > Themes",
+      "Kids > Age > 5 year olds",
+      "Kids > Age",
+      "Kids > Age > 0-6",
+      "Kids > Recipients > Boys",
+      "Themes > Christmas",
+      "Themes",
+      "Occasions > Christmas",
+      "Kids > Themes > Rhyming",
+      "Kids > Themes > Family Stories",
+      "Kids > Age > 3 year olds",
+      "Kids > Age > 4 year olds",
+      "Kids > Recipients > Girls",
+      "Kids > Age > 6 year olds",
+      "Occasions > Christmas > New in",
+      "Kids > Recipients > Siblings",
+      "Kids > Age > 3-6",
+      "Email mystery sends"
+     ],
+     "age": [
+      "Kids",
+      "Age 3",
+      "Age 4",
+      "Age 5",
+      "Age 6",
+      "3-6"
+     ],
+     "occasion": [
+      "Black Friday",
+      "Christmas"
+     ],
+     "theme": [
+      "Relationship",
+      "Love"
+     ],
+     "sentiment": [
+      "Encouragement",
+      "Empowering",
+      "Emotional",
+      "Celebration",
+      "Support"
+     ],
+     "recipient": [
+      "Son",
+      "Daughter",
+      "Grandchild",
+      "Granddaughter",
+      "Grandkid",
+      "Niece",
+      "Nephew",
+      "Family",
+      "Multi-character",
+      "Kids"
+     ],
+     "series": [],
+     "characterCount": [
+      "2 children",
+      "Multi-child",
+      "3 children"
+     ],
+     "gender": [
+      "Boy",
+      "Neutral",
+      "Girl"
+     ],
+     "language": [],
+     "segment": [
+      "Family"
+     ],
+     "photoUpload": [
+      "Yes"
+     ],
+     "objectID": "together-at-christmas",
+     "_highlightResult": {
+      "title": {
+       "value": "Together at Christmas",
+       "matchLevel": "none",
+       "matchedWords": []
+      },
+      "categories": {
+       "lvl0": [
+        {
+         "value": "Email Opt In",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Email mystery sends",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl1": [
+        {
+         "value": "Occasions > Black Friday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Themes > Christmas",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Christmas",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl2": [
+        {
+         "value": "Kids > Recipients > Family",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Christmas",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 5 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 0-6",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Boys",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Rhyming",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Family Stories",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 3 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 4 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Girls",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 6 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Christmas > New in",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Siblings",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 3-6",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ]
+      },
+      "age": [
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 3",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 4",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 5",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 6",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "3-6",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "occasion": [
+       {
+        "value": "Black Friday",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Christmas",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "theme": [
+       {
+        "value": "Relationship",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Love",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "sentiment": [
+       {
+        "value": "Encouragement",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Empowering",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Emotional",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Celebration",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Support",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "recipient": [
+       {
+        "value": "Son",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Daughter",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Grandchild",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Granddaughter",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Grandkid",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Niece",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Nephew",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Family",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Multi-character",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "characterCount": [
+       {
+        "value": "2 children",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Multi-child",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "3 children",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "gender": [
+       {
+        "value": "Boy",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Neutral",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Girl",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "segment": [
+       {
+        "value": "Family",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "photoUpload": [
+       {
+        "value": "Yes",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ]
+     }
+    },
+    {
+     "solidusSlug": "when-you-were-born-book",
+     "solidusSlugUnhyphenated": "whenyouwerebornbook",
+     "prismicProductSlug": "when-you-were-born-book",
+     "title": "When You Were Born",
+     "description": null,
+     "imageURL": "https://images.prismic.io/wonderbly/48505f52-73c0-49b7-803d-62178f2dadea_WYWB_range_card_thumbnail_i_EN.png?auto=compress,format&rect=0,0,1708,1708&w=410&h=410",
+     "productBadgeContent": "A story to celebrate a new baby",
+     "minimumAge": "0",
+     "maximumAge": "3",
+     "price": "$34.99 USD",
+     "wasPrice": null,
+     "wasPriceFormatted": null,
+     "category": "print-on-demand",
+     "categories": {
+      "lvl0": [
+       "Email Opt In",
+       "Kids",
+       "Occasions",
+       "Themes",
+       "Email mystery sends",
+       "ChristmasTV"
+      ],
+      "lvl1": [
+       "Kids > Recipients",
+       "Kids > Themes",
+       "Occasions > Read Across America",
+       "Kids > Age",
+       "Kids > Occasions",
+       "Occasions > Baby shower",
+       "Occasions > Christmas",
+       "Occasions > Black Friday",
+       "Occasions > New Baby",
+       "Occasions > Dia de Reyes",
+       "Occasions > Birthday",
+       "Kids > Ages"
+      ],
+      "lvl2": [
+       "Kids > Recipients > Nieces and nephews",
+       "Kids > Themes > Animals",
+       "Kids > Recipients > Boys",
+       "Kids > Age > 0-3",
+       "Kids > Age > Toddler",
+       "Kids > Age > 2 year olds",
+       "Kids > Age > 3 year olds",
+       "Kids > Occasions > First birthday",
+       "Kids > Occasions > Birthday",
+       "Kids > Age > 0-6",
+       "Kids > Occasions > Christening",
+       "Kids > Themes > Bedtime",
+       "Kids > Recipients > Girls",
+       "Kids > Themes > Gifts"
+      ]
+     },
+     "productCatalogueCategories": [
+      "Email Opt In",
+      "Kids > Recipients > Nieces and nephews",
+      "Kids > Recipients",
+      "Kids",
+      "Kids > Themes > Animals",
+      "Kids > Themes",
+      "Occasions > Read Across America",
+      "Occasions",
+      "Kids > Age",
+      "Kids > Recipients > Boys",
+      "Kids > Age > 0-3",
+      "Themes",
+      "Kids > Age > Toddler",
+      "Kids > Age > 2 year olds",
+      "Kids > Age > 3 year olds",
+      "Kids > Occasions > First birthday",
+      "Kids > Occasions",
+      "Occasions > Baby shower",
+      "Kids > Occasions > Birthday",
+      "Occasions > Christmas",
+      "Kids > Age > 0-6",
+      "Occasions > Black Friday",
+      "Kids > Occasions > Christening",
+      "Occasions > New Baby",
+      "Occasions > Dia de Reyes",
+      "Occasions > Birthday",
+      "Kids > Themes > Bedtime",
+      "Email mystery sends",
+      "Kids > Recipients > Girls",
+      "Kids > Themes > Gifts",
+      "ChristmasTV",
+      "Kids > Ages"
+     ],
+     "age": [
+      "Age 1",
+      "Age 2",
+      "Baby",
+      "Age 3",
+      "Toddler",
+      "Newborn",
+      "0-3"
+     ],
+     "occasion": [
+      "1st birthday",
+      "Baby shower",
+      "New baby",
+      "Christening",
+      "Baptism",
+      "Easter",
+      "Black Friday"
+     ],
+     "theme": [
+      "Educational",
+      "Bedtime",
+      "Nature",
+      "Animals",
+      "Name"
+     ],
+     "sentiment": [
+      "Love",
+      "Emotional",
+      "Celebration"
+     ],
+     "recipient": [
+      "Niece",
+      "Nephew",
+      "Granddaughter",
+      "Grandkid",
+      "Kids",
+      "Son",
+      "Daughter",
+      "Grandchild"
+     ],
+     "series": [],
+     "characterCount": [
+      "1 child"
+     ],
+     "gender": [
+      "Boy",
+      "Girl"
+     ],
+     "language": [
+      "Spanish",
+      "French"
+     ],
+     "segment": [
+      "Kids"
+     ],
+     "photoUpload": [
+      "Yes"
+     ],
+     "objectID": "when-you-were-born",
+     "_highlightResult": {
+      "title": {
+       "value": "When You Were Born",
+       "matchLevel": "none",
+       "matchedWords": []
+      },
+      "categories": {
+       "lvl0": [
+        {
+         "value": "Email Opt In",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Email mystery sends",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "ChristmasTV",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl1": [
+        {
+         "value": "Kids > Recipients",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Read Across America",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Occasions",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Baby shower",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Christmas",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Black Friday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > New Baby",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Dia de Reyes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Birthday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Ages",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl2": [
+        {
+         "value": "Kids > Recipients > Nieces and nephews",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Animals",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Boys",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 0-3",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > Toddler",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 2 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 3 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Occasions > First birthday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Occasions > Birthday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 0-6",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Occasions > Christening",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Bedtime",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Girls",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Gifts",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ]
+      },
+      "age": [
+       {
+        "value": "Age 1",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 2",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Baby",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 3",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Toddler",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Newborn",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "0-3",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "occasion": [
+       {
+        "value": "1st birthday",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Baby shower",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "New baby",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Christening",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Baptism",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Easter",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Black Friday",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "theme": [
+       {
+        "value": "Educational",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Bedtime",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Nature",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Animals",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Name",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "sentiment": [
+       {
+        "value": "Love",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Emotional",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Celebration",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "recipient": [
+       {
+        "value": "Niece",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Nephew",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Granddaughter",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Grandkid",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Son",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Daughter",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Grandchild",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "characterCount": [
+       {
+        "value": "1 child",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "gender": [
+       {
+        "value": "Boy",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Girl",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "language": [
+       {
+        "value": "Spanish",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "French",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "segment": [
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "photoUpload": [
+       {
+        "value": "Yes",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ]
+     }
+    },
+    {
+     "solidusSlug": "my-big-sibling-book",
+     "solidusSlugUnhyphenated": "mybigsiblingbook",
+     "prismicProductSlug": "my-big-sibling-book",
+     "title": "Me and My Big Brother / My Big Sister",
+     "description": null,
+     "imageURL": "https://images.prismic.io/wonderbly/8b24305d-135a-47a5-98b9-39a6bdc509b0_MBS_range_card_thumbnail_i_UK.png?auto=compress,format&rect=0,0,1708,1708&w=410&h=410",
+     "productBadgeContent": "A story about growing up together",
+     "minimumAge": "0",
+     "maximumAge": "8",
+     "price": "$29.99 USD",
+     "wasPrice": "34.99",
+     "wasPriceFormatted": "$34.99 USD",
+     "category": "print-on-demand",
+     "categories": {
+      "lvl0": [
+       "Email Opt In",
+       "Kids",
+       "Occasions",
+       "Themes",
+       "Email mystery sends",
+       "ChristmasTV"
+      ],
+      "lvl1": [
+       "Kids > Age",
+       "Kids > Recipients",
+       "Kids > Collections",
+       "Occasions > Read Across America",
+       "Kids > Occasions",
+       "Occasions > Black Friday",
+       "Occasions > Birthday",
+       "Occasions > Dia de Reyes",
+       "Occasions > New Baby",
+       "Kids > Ages",
+       "Kids > Themes",
+       "Occasions > Christmas"
+      ],
+      "lvl2": [
+       "Kids > Recipients > Nieces and nephews",
+       "Kids > Collections > Pelin",
+       "Kids > Age > 2 year olds",
+       "Kids > Age > 3 year olds",
+       "Kids > Age > 4 year olds",
+       "Kids > Age > 5 year olds",
+       "Kids > Age > 6 year olds",
+       "Kids > Age > 7 year olds",
+       "Kids > Age > Toddler",
+       "Kids > Age > 0-6",
+       "Kids > Age > 0-3",
+       "Kids > Age > 3-6",
+       "Kids > Occasions > Birthday",
+       "Kids > Age > 6 up",
+       "Kids > Recipients > Siblings",
+       "Kids > Themes > Gifts",
+       "Kids > Themes > Family Stories"
+      ]
+     },
+     "productCatalogueCategories": [
+      "Email Opt In",
+      "Kids > Age",
+      "Kids",
+      "Kids > Recipients > Nieces and nephews",
+      "Kids > Recipients",
+      "Kids > Collections > Pelin",
+      "Kids > Collections",
+      "Occasions > Read Across America",
+      "Occasions",
+      "Kids > Age > 2 year olds",
+      "Kids > Age > 3 year olds",
+      "Kids > Age > 4 year olds",
+      "Kids > Age > 5 year olds",
+      "Kids > Age > 6 year olds",
+      "Kids > Age > 7 year olds",
+      "Kids > Age > Toddler",
+      "Kids > Age > 0-6",
+      "Themes",
+      "Kids > Age > 0-3",
+      "Kids > Age > 3-6",
+      "Kids > Occasions > Birthday",
+      "Kids > Occasions",
+      "Occasions > Black Friday",
+      "Kids > Age > 6 up",
+      "Kids > Recipients > Siblings",
+      "Occasions > Birthday",
+      "Occasions > Dia de Reyes",
+      "Occasions > New Baby",
+      "Kids > Ages",
+      "Email mystery sends",
+      "ChristmasTV",
+      "Kids > Themes > Gifts",
+      "Kids > Themes",
+      "Occasions > Christmas",
+      "Kids > Themes > Family Stories"
+     ],
+     "age": [
+      "Age 1",
+      "Age 2",
+      "Toddler",
+      "Age 4",
+      "Age 5",
+      "Age 6",
+      "Age 7",
+      "6 and up",
+      "3-6",
+      "Age 3",
+      "0-3",
+      "Kids",
+      "Newborn",
+      "Baby"
+     ],
+     "occasion": [
+      "Baptism",
+      "Black Friday"
+     ],
+     "theme": [
+      "Relationship",
+      "Love",
+      "Bedtime"
+     ],
+     "sentiment": [
+      "Love",
+      "Nostalgia",
+      "Emotional"
+     ],
+     "recipient": [
+      "Multi-character",
+      "Family",
+      "Siblings",
+      "Sister",
+      "Brother",
+      "Granddaughter",
+      "Grandkid",
+      "Kids",
+      "Son",
+      "Daughter",
+      "Grandchild"
+     ],
+     "series": [],
+     "characterCount": [
+      "2 children",
+      "Multi-child"
+     ],
+     "gender": [
+      "Boy",
+      "Girl"
+     ],
+     "language": [
+      "German",
+      "Dutch",
+      "Italian",
+      "Japanese",
+      "Spanish",
+      "French"
+     ],
+     "segment": [
+      "Family",
+      "Kids"
+     ],
+     "photoUpload": [
+      "Yes"
+     ],
+     "objectID": "my-big-sibling",
+     "_highlightResult": {
+      "title": {
+       "value": "Me and My Big Brother / My Big Sister",
+       "matchLevel": "none",
+       "matchedWords": []
+      },
+      "categories": {
+       "lvl0": [
+        {
+         "value": "Email Opt In",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Email mystery sends",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "ChristmasTV",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl1": [
+        {
+         "value": "Kids > Age",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Collections",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Read Across America",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Occasions",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Black Friday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Birthday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Dia de Reyes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > New Baby",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Ages",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Christmas",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl2": [
+        {
+         "value": "Kids > Recipients > Nieces and nephews",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Collections > Pelin",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 2 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 3 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 4 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 5 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 6 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 7 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > Toddler",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 0-6",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 0-3",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 3-6",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Occasions > Birthday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 6 up",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Siblings",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Gifts",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Family Stories",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ]
+      },
+      "age": [
+       {
+        "value": "Age 1",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 2",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Toddler",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 4",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 5",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 6",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 7",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "6 and up",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "3-6",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 3",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "0-3",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Newborn",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Baby",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "occasion": [
+       {
+        "value": "Baptism",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Black Friday",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "theme": [
+       {
+        "value": "Relationship",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Love",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Bedtime",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "sentiment": [
+       {
+        "value": "Love",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Nostalgia",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Emotional",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "recipient": [
+       {
+        "value": "Multi-character",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Family",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Siblings",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Sister",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Brother",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Granddaughter",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Grandkid",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Son",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Daughter",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Grandchild",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "characterCount": [
+       {
+        "value": "2 children",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Multi-child",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "gender": [
+       {
+        "value": "Boy",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Girl",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "language": [
+       {
+        "value": "German",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Dutch",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Italian",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Japanese",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Spanish",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "French",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "segment": [
+       {
+        "value": "Family",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "photoUpload": [
+       {
+        "value": "Yes",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ]
+     }
+    },
+    {
+     "solidusSlug": "personalised-dinosaur-book",
+     "solidusSlugUnhyphenated": "personaliseddinosaurbook",
+     "prismicProductSlug": "personalised-dinosaur-book",
+     "title": "I'm a Name-O-Saurus",
+     "description": "Turn a child into a dinosaur in this romping, stomping adventure!",
+     "imageURL": "https://images.prismic.io/wonderbly/932abc63-efe7-491a-96c7-86712943429f_NOS_range_page_thumbnail_i_UK.png?auto=compress,format&rect=0,0,410,410&w=410&h=410",
+     "productBadgeContent": "A stomping, romping dinosaur adventure",
+     "minimumAge": "2",
+     "maximumAge": "5",
+     "price": "$24.99 USD",
+     "wasPrice": null,
+     "wasPriceFormatted": null,
+     "category": "print-on-demand",
+     "categories": {
+      "lvl0": [
+       "Email Opt In",
+       "Kids",
+       "Occasions",
+       "Themes",
+       "Email mystery sends",
+       "ChristmasTV"
+      ],
+      "lvl1": [
+       "Kids > Themes",
+       "Occasions > Back to School",
+       "Occasions > World Book Day",
+       "Kids > Recipients",
+       "Kids > Age",
+       "Kids > Occasions",
+       "Occasions > Just Because",
+       "Occasions > Dia de Reyes",
+       "Occasions > Birthday",
+       "Occasions > Christmas",
+       "Occasions > Black Friday",
+       "Kids > Ages"
+      ],
+      "lvl2": [
+       "Kids > Themes > Rhyming",
+       "Kids > Themes > Gifts",
+       "Kids > Themes > Everyday Adventures",
+       "Kids > Themes > Classic kids",
+       "Kids > Recipients > Nieces and nephews",
+       "Kids > Age > Toddler",
+       "Kids > Age > 3 year olds",
+       "Kids > Age > 4 year olds",
+       "Kids > Age > 5 year olds",
+       "Kids > Age > 2 year olds",
+       "Kids > Age > 0-6",
+       "Kids > Occasions > Birthday",
+       "Kids > Age > 0-3",
+       "Kids > Age > 3-6",
+       "Kids > Themes > Dinosaurs",
+       "Kids > Themes > Imagination",
+       "Kids > Themes > Empowerment",
+       "Kids > Occasions > Halloween",
+       "Kids > Recipients > Boys"
+      ]
+     },
+     "productCatalogueCategories": [
+      "Email Opt In",
+      "Kids > Themes > Rhyming",
+      "Kids > Themes",
+      "Kids",
+      "Kids > Themes > Gifts",
+      "Occasions > Back to School",
+      "Occasions",
+      "Kids > Themes > Everyday Adventures",
+      "Occasions > World Book Day",
+      "Kids > Themes > Classic kids",
+      "Kids > Recipients > Nieces and nephews",
+      "Kids > Recipients",
+      "Kids > Age",
+      "Kids > Age > Toddler",
+      "Kids > Age > 3 year olds",
+      "Kids > Age > 4 year olds",
+      "Kids > Age > 5 year olds",
+      "Kids > Age > 2 year olds",
+      "Themes",
+      "Kids > Age > 0-6",
+      "Kids > Occasions > Birthday",
+      "Kids > Occasions",
+      "Kids > Age > 0-3",
+      "Kids > Age > 3-6",
+      "Occasions > Just Because",
+      "Occasions > Dia de Reyes",
+      "Occasions > Birthday",
+      "Kids > Themes > Dinosaurs",
+      "Kids > Themes > Imagination",
+      "Kids > Themes > Empowerment",
+      "Occasions > Christmas",
+      "Occasions > Black Friday",
+      "Kids > Occasions > Halloween",
+      "Email mystery sends",
+      "Kids > Ages",
+      "ChristmasTV",
+      "Kids > Recipients > Boys"
+     ],
+     "age": [
+      "Kids",
+      "Age 2",
+      "Age 3",
+      "Age 4",
+      "Age 5",
+      "3-6",
+      "Toddler",
+      "0-3"
+     ],
+     "occasion": [
+      "Just because"
+     ],
+     "theme": [
+      "Bedtime",
+      "Rhyming",
+      "Dinosaurs",
+      "Imaginative",
+      "Adventure"
+     ],
+     "sentiment": [
+      "Funny"
+     ],
+     "recipient": [
+      "Daughter",
+      "Son",
+      "Niece",
+      "Nephew",
+      "Granddaughter",
+      "Cousin",
+      "Grandchild",
+      "Grandkid",
+      "Kids"
+     ],
+     "series": [],
+     "characterCount": [
+      "1 child"
+     ],
+     "gender": [
+      "Girl",
+      "Boy"
+     ],
+     "language": [
+      "German",
+      "Dutch",
+      "Italian",
+      "Japanese",
+      "Spanish",
+      "French"
+     ],
+     "segment": [
+      "Kids"
+     ],
+     "photoUpload": [
+      "Yes"
+     ],
+     "objectID": "dinosaur-book",
+     "_highlightResult": {
+      "title": {
+       "value": "I'm a Name-O-Saurus",
+       "matchLevel": "none",
+       "matchedWords": []
+      },
+      "categories": {
+       "lvl0": [
+        {
+         "value": "Email Opt In",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Email mystery sends",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "ChristmasTV",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl1": [
+        {
+         "value": "Kids > Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Back to School",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > World Book Day",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Occasions",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Just Because",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Dia de Reyes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Birthday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Christmas",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Black Friday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Ages",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl2": [
+        {
+         "value": "Kids > Themes > Rhyming",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Gifts",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Everyday Adventures",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Classic kids",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Nieces and nephews",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > Toddler",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 3 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 4 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 5 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 2 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 0-6",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Occasions > Birthday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 0-3",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 3-6",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Dinosaurs",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Imagination",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Empowerment",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Occasions > Halloween",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Boys",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ]
+      },
+      "age": [
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 2",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 3",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 4",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 5",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "3-6",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Toddler",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "0-3",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "occasion": [
+       {
+        "value": "Just because",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "theme": [
+       {
+        "value": "Bedtime",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Rhyming",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Dinosaurs",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Imaginative",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Adventure",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "sentiment": [
+       {
+        "value": "Funny",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "recipient": [
+       {
+        "value": "Daughter",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Son",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Niece",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Nephew",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Granddaughter",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Cousin",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Grandchild",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Grandkid",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "characterCount": [
+       {
+        "value": "1 child",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "gender": [
+       {
+        "value": "Girl",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Boy",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "language": [
+       {
+        "value": "German",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Dutch",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Italian",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Japanese",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Spanish",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "French",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "segment": [
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "photoUpload": [
+       {
+        "value": "Yes",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ]
+     }
+    },
+    {
+     "solidusSlug": "this-months-child-book",
+     "solidusSlugUnhyphenated": "thismonthschildbook",
+     "prismicProductSlug": "this-months-child-book",
+     "title": "This Month's Child",
+     "description": null,
+     "imageURL": "https://images.prismic.io/wonderbly/aUE-_XNYClf9oQDw_MC_range_page_thumbnail_i_UK.png?auto=format,compress&rect=0,0,410,410&w=410&h=410",
+     "productBadgeContent": "A story to celebrate a child every day",
+     "minimumAge": "1",
+     "maximumAge": "9",
+     "price": "$24.99 USD",
+     "wasPrice": null,
+     "wasPriceFormatted": null,
+     "category": "print-on-demand",
+     "categories": {
+      "lvl0": [
+       "Email Opt In",
+       "Kids",
+       "Occasions",
+       "Themes",
+       "Email mystery sends",
+       "ChristmasTV"
+      ],
+      "lvl1": [
+       "Kids > Themes",
+       "Kids > Recipients",
+       "Occasions > Black Friday",
+       "Kids > Age",
+       "Kids > Collections",
+       "Kids > Occasions",
+       "Occasions > Birthday",
+       "Kids > Ages",
+       "Occasions > Back to School"
+      ],
+      "lvl2": [
+       "Kids > Themes > Rhyming",
+       "Kids > Themes > Classic kids",
+       "Kids > Recipients > Nieces and nephews",
+       "Kids > Collections > Pelin",
+       "Kids > Age > 3 year olds",
+       "Kids > Age > 3-6",
+       "Kids > Age > 0-3",
+       "Kids > Age > 2 year olds",
+       "Kids > Age > 4 year olds",
+       "Kids > Age > 5 year olds",
+       "Kids > Age > Toddler",
+       "Kids > Occasions > First birthday",
+       "Kids > Age > 6 year olds",
+       "Kids > Age > 7 year olds",
+       "Kids > Age > 0-6",
+       "Kids > Themes > Empowerment",
+       "Kids > Occasions > Christening",
+       "Kids > Occasions > Birthday",
+       "Kids > Recipients > Girls",
+       "Kids > Recipients > Boys",
+       "Kids > Themes > Gifts"
+      ]
+     },
+     "productCatalogueCategories": [
+      "Email Opt In",
+      "Kids > Themes > Rhyming",
+      "Kids > Themes",
+      "Kids",
+      "Kids > Themes > Classic kids",
+      "Kids > Recipients > Nieces and nephews",
+      "Kids > Recipients",
+      "Occasions > Black Friday",
+      "Occasions",
+      "Kids > Age",
+      "Kids > Collections > Pelin",
+      "Kids > Collections",
+      "Kids > Age > 3 year olds",
+      "Kids > Age > 3-6",
+      "Kids > Age > 0-3",
+      "Kids > Age > 2 year olds",
+      "Kids > Age > 4 year olds",
+      "Kids > Age > 5 year olds",
+      "Kids > Age > Toddler",
+      "Kids > Occasions > First birthday",
+      "Kids > Occasions",
+      "Themes",
+      "Kids > Age > 6 year olds",
+      "Kids > Age > 7 year olds",
+      "Kids > Age > 0-6",
+      "Kids > Themes > Empowerment",
+      "Kids > Occasions > Christening",
+      "Occasions > Birthday",
+      "Kids > Occasions > Birthday",
+      "Kids > Recipients > Girls",
+      "Kids > Recipients > Boys",
+      "Email mystery sends",
+      "Kids > Themes > Gifts",
+      "ChristmasTV",
+      "Kids > Ages",
+      "Occasions > Back to School"
+     ],
+     "age": [
+      "Age 1",
+      "Age 2",
+      "Age 4",
+      "Age 5",
+      "Age 6",
+      "Age 7",
+      "6 and up",
+      "Age 3",
+      "3-6",
+      "Toddler",
+      "Kids",
+      "0-3"
+     ],
+     "occasion": [
+      "1st birthday",
+      "Black Friday",
+      "Christening",
+      "Communion",
+      "Birthday"
+     ],
+     "theme": [
+      "Nature",
+      "Rhyming"
+     ],
+     "sentiment": [
+      "Love",
+      "Encouragement",
+      "Empowering",
+      "Confidence",
+      "Emotional",
+      "Self discovery"
+     ],
+     "recipient": [
+      "Granddaughter",
+      "Niece",
+      "Nephew",
+      "Cousin",
+      "Grandkid",
+      "Kids",
+      "Son",
+      "Daughter",
+      "Grandchild"
+     ],
+     "series": [],
+     "characterCount": [
+      "1 child"
+     ],
+     "gender": [
+      "Boy",
+      "Girl"
+     ],
+     "language": [],
+     "segment": [
+      "Kids"
+     ],
+     "photoUpload": [
+      "Yes"
+     ],
+     "objectID": "this-months-child",
+     "_highlightResult": {
+      "title": {
+       "value": "This Month's Child",
+       "matchLevel": "none",
+       "matchedWords": []
+      },
+      "categories": {
+       "lvl0": [
+        {
+         "value": "Email Opt In",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Email mystery sends",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "ChristmasTV",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl1": [
+        {
+         "value": "Kids > Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Black Friday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Collections",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Occasions",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Birthday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Ages",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Back to School",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl2": [
+        {
+         "value": "Kids > Themes > Rhyming",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Classic kids",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Nieces and nephews",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Collections > Pelin",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 3 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 3-6",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 0-3",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 2 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 4 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 5 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > Toddler",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Occasions > First birthday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 6 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 7 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 0-6",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Empowerment",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Occasions > Christening",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Occasions > Birthday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Girls",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Boys",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Gifts",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ]
+      },
+      "age": [
+       {
+        "value": "Age 1",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 2",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 4",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 5",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 6",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 7",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "6 and up",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 3",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "3-6",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Toddler",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "0-3",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "occasion": [
+       {
+        "value": "1st birthday",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Black Friday",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Christening",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Communion",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Birthday",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "theme": [
+       {
+        "value": "Nature",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Rhyming",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "sentiment": [
+       {
+        "value": "Love",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Encouragement",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Empowering",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Confidence",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Emotional",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Self discovery",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "recipient": [
+       {
+        "value": "Granddaughter",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Niece",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Nephew",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Cousin",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Grandkid",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Son",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Daughter",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Grandchild",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "characterCount": [
+       {
+        "value": "1 child",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "gender": [
+       {
+        "value": "Boy",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Girl",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "segment": [
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "photoUpload": [
+       {
+        "value": "Yes",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ]
+     }
+    },
+    {
+     "solidusSlug": "i-spy-you-search-and-find-book",
+     "solidusSlugUnhyphenated": "ispyyousearchandfindbook",
+     "prismicProductSlug": "i-spy-you-search-and-find-book",
+     "title": "I Spy You!",
+     "description": null,
+     "imageURL": "https://images.prismic.io/wonderbly/aN55PJ5xUNkB1aXS_ISPY_range_card_thumbnail_girl_ii_EN.png?auto=format,compress&rect=0,0,820,820&w=410&h=410",
+     "productBadgeContent": "A personalized search-and-find book for little ones",
+     "minimumAge": "2",
+     "maximumAge": "5",
+     "price": "$34.99 USD",
+     "wasPrice": null,
+     "wasPriceFormatted": null,
+     "category": "print-on-demand",
+     "categories": {
+      "lvl0": [
+       "Email Opt In",
+       "Occasions",
+       "Kids",
+       "Themes",
+       "Email mystery sends",
+       "ChristmasTV"
+      ],
+      "lvl1": [
+       "Occasions > Back to School",
+       "Kids > Recipients",
+       "Kids > Collections",
+       "Kids > Themes",
+       "Kids > Age",
+       "Kids > Occasions",
+       "Occasions > Just Because",
+       "Occasions > Christmas",
+       "Occasions > Black Friday",
+       "Kids > Ages"
+      ],
+      "lvl2": [
+       "Kids > Recipients > Nieces and nephews",
+       "Kids > Collections > Early Learning",
+       "Kids > Themes > Rhyming",
+       "Kids > Themes > Gifts",
+       "Kids > Themes > Activity",
+       "Kids > Age > Toddler",
+       "Kids > Age > 2 year olds",
+       "Kids > Age > 3 year olds",
+       "Kids > Occasions > Easter",
+       "Kids > Age > 0-6",
+       "Kids > Recipients > Girls",
+       "Kids > Recipients > Boys",
+       "Kids > Themes > Search and Find",
+       "Kids > Themes > Educational",
+       "Kids > Themes > Empowerment",
+       "Kids > Age > 0-3",
+       "Occasions > Christmas > New in",
+       "Kids > Age > 3-6",
+       "Kids > Age > 5 year olds"
+      ]
+     },
+     "productCatalogueCategories": [
+      "Email Opt In",
+      "Occasions > Back to School",
+      "Occasions",
+      "Kids > Recipients > Nieces and nephews",
+      "Kids > Recipients",
+      "Kids",
+      "Kids > Collections > Early Learning",
+      "Kids > Collections",
+      "Kids > Themes > Rhyming",
+      "Kids > Themes",
+      "Kids > Themes > Gifts",
+      "Kids > Themes > Activity",
+      "Kids > Age",
+      "Kids > Age > Toddler",
+      "Kids > Age > 2 year olds",
+      "Kids > Age > 3 year olds",
+      "Kids > Occasions > Easter",
+      "Kids > Occasions",
+      "Occasions > Just Because",
+      "Themes",
+      "Kids > Age > 0-6",
+      "Occasions > Christmas",
+      "Occasions > Black Friday",
+      "Kids > Recipients > Girls",
+      "Kids > Recipients > Boys",
+      "Kids > Themes > Search and Find",
+      "Kids > Themes > Educational",
+      "Kids > Themes > Empowerment",
+      "Kids > Age > 0-3",
+      "Email mystery sends",
+      "Occasions > Christmas > New in",
+      "Kids > Ages",
+      "Kids > Age > 3-6",
+      "Kids > Age > 5 year olds",
+      "ChristmasTV"
+     ],
+     "age": [
+      "Toddler",
+      "Age 2",
+      "0-3",
+      "3-6",
+      "Age 4",
+      "Age 5",
+      "Age 3"
+     ],
+     "occasion": [
+      "Just because",
+      "Black Friday"
+     ],
+     "theme": [
+      "Activity",
+      "Search-and-find",
+      "Educational",
+      "Adventure",
+      "Rhyming"
+     ],
+     "sentiment": [
+      "Problem solving",
+      "Empowering",
+      "Nostalgia"
+     ],
+     "recipient": [
+      "Granddaughter",
+      "Kids",
+      "Grandkid",
+      "Nephew",
+      "Daughter",
+      "Grandchild",
+      "Son",
+      "Niece"
+     ],
+     "series": [],
+     "characterCount": [
+      "1 child"
+     ],
+     "gender": [
+      "Girl",
+      "Boy"
+     ],
+     "language": [],
+     "segment": [
+      "Kids"
+     ],
+     "photoUpload": [
+      "Yes"
+     ],
+     "objectID": "i-spy-you-search-and-find",
+     "_highlightResult": {
+      "title": {
+       "value": "I Spy You!",
+       "matchLevel": "none",
+       "matchedWords": []
+      },
+      "categories": {
+       "lvl0": [
+        {
+         "value": "Email Opt In",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Email mystery sends",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "ChristmasTV",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl1": [
+        {
+         "value": "Occasions > Back to School",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Collections",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Occasions",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Just Because",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Christmas",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Black Friday",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Ages",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl2": [
+        {
+         "value": "Kids > Recipients > Nieces and nephews",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Collections > Early Learning",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Rhyming",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Gifts",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Activity",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > Toddler",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 2 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 3 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Occasions > Easter",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 0-6",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Girls",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Boys",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Search and Find",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Educational",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Empowerment",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 0-3",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Christmas > New in",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 3-6",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 5 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ]
+      },
+      "age": [
+       {
+        "value": "Toddler",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 2",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "0-3",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "3-6",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 4",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 5",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 3",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "occasion": [
+       {
+        "value": "Just because",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Black Friday",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "theme": [
+       {
+        "value": "Activity",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Search-and-find",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Educational",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Adventure",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Rhyming",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "sentiment": [
+       {
+        "value": "Problem solving",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Empowering",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Nostalgia",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "recipient": [
+       {
+        "value": "Granddaughter",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Grandkid",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Nephew",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Daughter",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Grandchild",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Son",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Niece",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "characterCount": [
+       {
+        "value": "1 child",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "gender": [
+       {
+        "value": "Girl",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Boy",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "segment": [
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "photoUpload": [
+       {
+        "value": "Yes",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ]
+     }
+    },
+    {
+     "solidusSlug": "oh-what-parents-youll-be-book",
+     "solidusSlugUnhyphenated": "ohwhatparentsyoullbebook",
+     "prismicProductSlug": "oh-what-parents-youll-be-book",
+     "title": "Oh, What Parents You\u2019ll Be!",
+     "description": null,
+     "imageURL": "https://images.prismic.io/wonderbly/7a92293c-9d38-48bf-875c-f5e613285482_OWPYB_range_card_thumbnail_i_EN.png?auto=compress,format&rect=0,0,820,820&w=410&h=410",
+     "productBadgeContent": "One new baby gift that puts parents first",
+     "minimumAge": "- Grownups",
+     "maximumAge": null,
+     "price": "$34.99 USD",
+     "wasPrice": "39.99",
+     "wasPriceFormatted": "$39.99 USD",
+     "category": "print-on-demand",
+     "categories": {
+      "lvl0": [
+       "Email Opt In",
+       "Occasions",
+       "Kids",
+       "Adults",
+       "Themes",
+       "Email mystery sends"
+      ],
+      "lvl1": [
+       "Occasions > Read Across America",
+       "Kids > Themes",
+       "Adults > Occasions",
+       "Occasions > Baby shower",
+       "Occasions > New Baby",
+       "Adults > Recipients"
+      ],
+      "lvl2": [
+       "Kids > Themes > Rhyming",
+       "Adults > Occasions > New dads",
+       "Adults > Occasions > New moms",
+       "Adults > Recipients > Dads",
+       "Adults > Recipients > Moms",
+       "Adults > Recipients > Parents",
+       "Adults > Occasions > New parents"
+      ]
+     },
+     "productCatalogueCategories": [
+      "Email Opt In",
+      "Occasions > Read Across America",
+      "Occasions",
+      "Kids > Themes > Rhyming",
+      "Kids > Themes",
+      "Kids",
+      "Adults > Occasions > New dads",
+      "Adults > Occasions",
+      "Adults",
+      "Occasions > Baby shower",
+      "Adults > Occasions > New moms",
+      "Themes",
+      "Occasions > New Baby",
+      "Adults > Recipients > Dads",
+      "Adults > Recipients",
+      "Adults > Recipients > Moms",
+      "Adults > Recipients > Parents",
+      "Email mystery sends",
+      "Adults > Occasions > New parents"
+     ],
+     "age": [],
+     "occasion": [
+      "New mom",
+      "New baby",
+      "New dad",
+      "Mom to be",
+      "Dad to be",
+      "New parents",
+      "Baby shower"
+     ],
+     "theme": [
+      "Relationship",
+      "Rhyming"
+     ],
+     "sentiment": [
+      "Support",
+      "Encouragement",
+      "Confidence",
+      "Celebration",
+      "Love"
+     ],
+     "recipient": [
+      "Multi-character",
+      "Family",
+      "Parents",
+      "Adults"
+     ],
+     "series": [],
+     "characterCount": [
+      "2 children",
+      "2 adults"
+     ],
+     "gender": [
+      "Neutral"
+     ],
+     "language": [],
+     "segment": [
+      "Kids",
+      "Family"
+     ],
+     "photoUpload": [
+      "Yes"
+     ],
+     "objectID": "oh-what-parents-youll-be",
+     "_highlightResult": {
+      "title": {
+       "value": "Oh, What Parents You\u2019ll Be!",
+       "matchLevel": "none",
+       "matchedWords": []
+      },
+      "categories": {
+       "lvl0": [
+        {
+         "value": "Email Opt In",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Email mystery sends",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl1": [
+        {
+         "value": "Occasions > Read Across America",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Occasions",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Baby shower",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > New Baby",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Recipients",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl2": [
+        {
+         "value": "Kids > Themes > Rhyming",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Occasions > New dads",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Occasions > New moms",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Recipients > Dads",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Recipients > Moms",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Recipients > Parents",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Adults > Occasions > New parents",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ]
+      },
+      "occasion": [
+       {
+        "value": "New mom",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "New baby",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "New dad",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Mom to be",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Dad to be",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "New parents",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Baby shower",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "theme": [
+       {
+        "value": "Relationship",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Rhyming",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "sentiment": [
+       {
+        "value": "Support",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Encouragement",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Confidence",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Celebration",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Love",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "recipient": [
+       {
+        "value": "Multi-character",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Family",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Parents",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Adults",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "characterCount": [
+       {
+        "value": "2 children",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "2 adults",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "gender": [
+       {
+        "value": "Neutral",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "segment": [
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Family",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "photoUpload": [
+       {
+        "value": "Yes",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ]
+     }
+    },
+    {
+     "solidusSlug": "abc-for-you-book",
+     "solidusSlugUnhyphenated": "abcforyoubook",
+     "prismicProductSlug": "abc-for-you-book",
+     "title": "ABC For You",
+     "description": null,
+     "imageURL": "https://images.prismic.io/wonderbly/4d0953fc-f0bc-41e3-b9a3-c883a0adccf0_ABC_range_card_thumbnail_iv_UK.png?auto=compress,format&rect=0,0,410,410&w=410&h=410",
+     "productBadgeContent": "The most amazing way to learn the alphabet",
+     "minimumAge": "0",
+     "maximumAge": "3",
+     "price": "$24.99 USD",
+     "wasPrice": null,
+     "wasPriceFormatted": null,
+     "category": "print-on-demand",
+     "categories": {
+      "lvl0": [
+       "Email Opt In",
+       "Kids",
+       "Themes",
+       "Email mystery sends"
+      ],
+      "lvl1": [
+       "Kids > Recipients",
+       "Kids > Age",
+       "Kids > Ages",
+       "Kids > Collections",
+       "Kids > Themes"
+      ],
+      "lvl2": [
+       "Kids > Recipients > Girls",
+       "Kids > Age > Toddler",
+       "Kids > Age > 2 year olds",
+       "Kids > Age > 3 year olds",
+       "Kids > Collections > Early Learning",
+       "Kids > Themes > Educational",
+       "Kids > Age > 0-3",
+       "Kids > Themes > Gifts"
+      ]
+     },
+     "productCatalogueCategories": [
+      "Email Opt In",
+      "Kids > Recipients > Girls",
+      "Kids > Recipients",
+      "Kids",
+      "Themes",
+      "Kids > Age > Toddler",
+      "Kids > Age",
+      "Kids > Age > 2 year olds",
+      "Kids > Age > 3 year olds",
+      "Kids > Ages",
+      "Kids > Collections > Early Learning",
+      "Kids > Collections",
+      "Kids > Themes > Educational",
+      "Kids > Themes",
+      "Kids > Age > 0-3",
+      "Kids > Themes > Gifts",
+      "Email mystery sends"
+     ],
+     "age": [
+      "Kids",
+      "Age 1",
+      "Age 2",
+      "Age 3",
+      "Toddler",
+      "0-3",
+      "Baby"
+     ],
+     "occasion": [],
+     "theme": [
+      "Educational",
+      "Alphabet"
+     ],
+     "sentiment": [
+      "Encouragement"
+     ],
+     "recipient": [
+      "Cousin",
+      "Baby",
+      "Kids"
+     ],
+     "series": [],
+     "characterCount": [
+      "1 child"
+     ],
+     "gender": [
+      "Boy",
+      "Girl"
+     ],
+     "language": [
+      "Spanish",
+      "French"
+     ],
+     "segment": [
+      "Kids"
+     ],
+     "photoUpload": [],
+     "objectID": "y-is-for-you",
+     "_highlightResult": {
+      "title": {
+       "value": "ABC For You",
+       "matchLevel": "none",
+       "matchedWords": []
+      },
+      "categories": {
+       "lvl0": [
+        {
+         "value": "Email Opt In",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Email mystery sends",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl1": [
+        {
+         "value": "Kids > Recipients",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Ages",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Collections",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl2": [
+        {
+         "value": "Kids > Recipients > Girls",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > Toddler",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 2 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 3 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Collections > Early Learning",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Educational",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 0-3",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Gifts",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ]
+      },
+      "age": [
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 1",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 2",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 3",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Toddler",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "0-3",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Baby",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "theme": [
+       {
+        "value": "Educational",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Alphabet",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "sentiment": [
+       {
+        "value": "Encouragement",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "recipient": [
+       {
+        "value": "Cousin",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Baby",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "characterCount": [
+       {
+        "value": "1 child",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "gender": [
+       {
+        "value": "Boy",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Girl",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "language": [
+       {
+        "value": "Spanish",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "French",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "segment": [
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ]
+     }
+    },
+    {
+     "solidusSlug": "santa-search-and-find-book",
+     "solidusSlugUnhyphenated": "santasearchandfindbook",
+     "prismicProductSlug": "santa-search-and-find-book",
+     "title": "The Search for Santa",
+     "description": null,
+     "imageURL": "https://images.prismic.io/wonderbly/-hG7Nx8ivBQOqK9E_SFS_range_card_thumbnail_i_EN_New.png?auto=format,compress&rect=0,0,820,820&w=410&h=410",
+     "productBadgeContent": "Festive search-and-find for siblings",
+     "minimumAge": "5",
+     "maximumAge": "11",
+     "price": "$39.99 USD",
+     "wasPrice": null,
+     "wasPriceFormatted": null,
+     "category": "print-on-demand",
+     "categories": {
+      "lvl0": [
+       "Kids",
+       "Occasions",
+       "Themes",
+       "Email mystery sends",
+       "Email Opt In"
+      ],
+      "lvl1": [
+       "Kids > Age",
+       "Kids > Recipients",
+       "Kids > Themes",
+       "Occasions > Christmas",
+       "Themes > Christmas",
+       "Occasions > Black Friday"
+      ],
+      "lvl2": [
+       "Kids > Age > 5 year olds",
+       "Kids > Age > 6 year olds",
+       "Kids > Age > 6 up",
+       "Kids > Age > 3-6",
+       "Kids > Recipients > Siblings",
+       "Kids > Age > 7 year olds",
+       "Kids > Age > 6-9",
+       "Kids > Age > 9-12",
+       "Kids > Themes > Christmas",
+       "Kids > Themes > Search and Find",
+       "Kids > Recipients > Nieces and nephews",
+       "Kids > Themes > Educational",
+       "Kids > Themes > Imagination",
+       "Kids > Age > 6-12",
+       "Kids > Recipients > Girls",
+       "Kids > Recipients > Boys",
+       "Kids > Themes > Activity"
+      ]
+     },
+     "productCatalogueCategories": [
+      "Kids > Age",
+      "Kids",
+      "Kids > Age > 5 year olds",
+      "Kids > Age > 6 year olds",
+      "Kids > Age > 6 up",
+      "Kids > Age > 3-6",
+      "Kids > Recipients > Siblings",
+      "Kids > Recipients",
+      "Kids > Age > 7 year olds",
+      "Kids > Age > 6-9",
+      "Kids > Age > 9-12",
+      "Kids > Themes > Christmas",
+      "Kids > Themes",
+      "Occasions > Christmas",
+      "Occasions",
+      "Themes > Christmas",
+      "Themes",
+      "Kids > Themes > Search and Find",
+      "Kids > Recipients > Nieces and nephews",
+      "Kids > Themes > Educational",
+      "Kids > Themes > Imagination",
+      "Kids > Age > 6-12",
+      "Kids > Recipients > Girls",
+      "Kids > Recipients > Boys",
+      "Occasions > Black Friday",
+      "Email mystery sends",
+      "Email Opt In",
+      "Kids > Themes > Activity"
+     ],
+     "age": [
+      "Age 7",
+      "Age 8",
+      "Age 18",
+      "Age 9",
+      "6-9",
+      "9-12",
+      "Age 10"
+     ],
+     "occasion": [
+      "Christmas",
+      "Black Friday"
+     ],
+     "theme": [
+      "Adventure",
+      "Search-and-find",
+      "Imaginative",
+      "Activity"
+     ],
+     "sentiment": [
+      "Creativity"
+     ],
+     "recipient": [
+      "Niece",
+      "Nephew",
+      "Son",
+      "Grandkid",
+      "Daughter",
+      "Granddaughter",
+      "Grandchild"
+     ],
+     "series": [],
+     "characterCount": [
+      "1 child",
+      "2 children",
+      "Multi-child"
+     ],
+     "gender": [],
+     "language": [],
+     "segment": [
+      "Kids"
+     ],
+     "photoUpload": [],
+     "objectID": "santa-search-and-find",
+     "_highlightResult": {
+      "title": {
+       "value": "The Search for Santa",
+       "matchLevel": "none",
+       "matchedWords": []
+      },
+      "categories": {
+       "lvl0": [
+        {
+         "value": "Kids",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Email mystery sends",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Email Opt In",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl1": [
+        {
+         "value": "Kids > Age",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Christmas",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Themes > Christmas",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Occasions > Black Friday",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ],
+       "lvl2": [
+        {
+         "value": "Kids > Age > 5 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 6 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 6 up",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 3-6",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Siblings",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 7 year olds",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 6-9",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 9-12",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Christmas",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Search and Find",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Nieces and nephews",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Educational",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Imagination",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Age > 6-12",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Girls",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Recipients > Boys",
+         "matchLevel": "none",
+         "matchedWords": []
+        },
+        {
+         "value": "Kids > Themes > Activity",
+         "matchLevel": "none",
+         "matchedWords": []
+        }
+       ]
+      },
+      "age": [
+       {
+        "value": "Age 7",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 8",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 18",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 9",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "6-9",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "9-12",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Age 10",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "occasion": [
+       {
+        "value": "Christmas",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Black Friday",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "theme": [
+       {
+        "value": "Adventure",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Search-and-find",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Imaginative",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Activity",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "sentiment": [
+       {
+        "value": "Creativity",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "recipient": [
+       {
+        "value": "Niece",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Nephew",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Son",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Grandkid",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Daughter",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Granddaughter",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Grandchild",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "characterCount": [
+       {
+        "value": "1 child",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "2 children",
+        "matchLevel": "none",
+        "matchedWords": []
+       },
+       {
+        "value": "Multi-child",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ],
+      "segment": [
+       {
+        "value": "Kids",
+        "matchLevel": "none",
+        "matchedWords": []
+       }
+      ]
+     }
+    }
+   ],
+   "nbHits": 228,
+   "page": 0,
+   "nbPages": 23,
+   "hitsPerPage": 10,
+   "exhaustiveNbHits": true,
+   "exhaustiveTypo": true,
+   "exhaustive": {
+    "nbHits": true,
+    "typo": true
+   },
+   "query": "",
+   "params": "hitsPerPage=10&page=0&query=",
+   "index": "products_us",
+   "queryID": "be078534131e4a7862568dc540819d80",
+   "_automaticInsights": true,
+   "renderingContent": {
+    "facetOrdering": {
+     "facets": {
+      "order": [
+       "age",
+       "recipient",
+       "occasion",
+       "theme",
+       "characterCount",
+       "photoUpload"
+      ]
+     },
+     "values": {
+      "age": {
+       "order": [
+        "Newborn",
+        "0-3",
+        "3-6",
+        "6-9",
+        "9-12",
+        "Teen"
+       ],
+       "sortRemainingBy": "hidden"
+      },
+      "characterCount": {
+       "order": [
+        "1 child",
+        "2 children",
+        "3 children",
+        "4 children",
+        "1 adult",
+        "2 adults"
+       ],
+       "sortRemainingBy": "hidden"
+      },
+      "occasion": {
+       "order": [
+        "New baby",
+        "Birthday",
+        "Christening",
+        "Graduation",
+        "Christmas",
+        "Engagement",
+        "Father's Day",
+        "Hanukkah",
+        "Just because",
+        "Self-gifting",
+        "Mother's Day",
+        "Valentine's Day"
+       ],
+       "sortRemainingBy": "hidden"
+      },
+      "photoUpload": {
+       "order": [
+        "Yes"
+       ],
+       "sortRemainingBy": "hidden"
+      },
+      "recipient": {
+       "order": [
+        "Kids",
+        "Adults",
+        "Mom",
+        "Dad",
+        "Aunt",
+        "Uncle",
+        "Siblings",
+        "Niece",
+        "Nephew",
+        "Grandparents",
+        "Partner",
+        "Family",
+        "Friends"
+       ],
+       "sortRemainingBy": "hidden"
+      },
+      "theme": {
+       "order": [
+        "Adventure",
+        "Animals",
+        "Astrology",
+        "Bedtime",
+        "Classics",
+        "Dinosaurs",
+        "Education",
+        "Fairytales",
+        "First steps",
+        "Food and drink",
+        "Humor",
+        "Imagination",
+        "Love",
+        "Newspaper",
+        "Pets",
+        "Poetry",
+        "Search-and-find",
+        "Superheroes",
+        "Sports"
+       ],
+       "sortRemainingBy": "hidden"
+      }
+     }
+    }
+   },
+   "extensions": {
+    "queryCategorization": {}
+   },
+   "processingTimeMS": 4,
+   "processingTimingsMS": {
+    "_request": {
+     "roundTrip": 199
+    },
+    "extensions": 1,
+    "getIdx": {
+     "load": {
+      "total": 1
+     },
+     "total": 1
+    },
+    "rulesProcessing": {
+     "total": 1
+    },
+    "total": 4
+   },
+   "serverTimeMS": 8
+  }
+ ]
+}

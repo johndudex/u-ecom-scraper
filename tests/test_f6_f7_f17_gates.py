@@ -95,9 +95,13 @@ class TestF6RequestsBehavior:
         (ws / "input_urls.json").write_text('{"urls": ["https://x.example/p/1"]}')
         monkeypatch.setenv("SCRAPER_LISTING_URL", "https://x.example/list")
         import subprocess
+        # [wave-50 T5b calibration] 120s was sized for ONE ladder walk on a
+        # dead listing. The algolia-first gate adds a pre-step walk (listing
+        # fetch for creds extraction) before the anchor walk — two walks on
+        # a dead domain. The env-gate CONTRACT below is unchanged.
         r = subprocess.run(
             [sys.executable, str(ws / "s.py"), "--limit", "3"],
-            capture_output=True, text=True, timeout=120, cwd=str(ws),
+            capture_output=True, text=True, timeout=300, cwd=str(ws),
             env={**os.environ},
         )
         out = r.stdout + r.stderr

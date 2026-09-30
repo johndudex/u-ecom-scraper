@@ -493,7 +493,12 @@ def assess_query_match(query: str, items: list, title_field: str = "title") -> d
 
 # Fields present on every item regardless of content type — not useful as a
 # "is this a real item" signal, so excluded from output-filter fields.
-_ALWAYS_PRESENT_FIELDS = {"title", "url", "src_url", "scraped_at", "status_code", "remarks", "id"}
+# [wave-50 T3] ``currency`` joins: every template default-fills it
+# (http_navigation_scraper/playwright/api/navigation), so a row whose only
+# populated filter field is currency is a junk row (job 1116: five
+# `{"title": …, "currency": "USD", "price": ""}` rows passed the real-item
+# bar on bare currency truthiness).
+_ALWAYS_PRESENT_FIELDS = {"title", "url", "src_url", "scraped_at", "status_code", "remarks", "id", "currency"}
 
 
 def _field_has_value(v) -> bool:

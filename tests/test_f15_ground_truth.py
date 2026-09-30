@@ -44,7 +44,11 @@ def _load_fn():
     )
 
     import logging
-    from src.content_types import output_filter_fields, has_substantive_field
+    from src.content_types import (
+        _field_has_value,
+        has_substantive_field,
+        output_filter_fields,
+    )
 
     # minimal stubs for the module-level names the two fns reference
     DEAD_STATUS_CODES = {"out of stock", "sold out", "unavailable", "discontinued"}
@@ -58,6 +62,9 @@ def _load_fn():
         "logger": logging.getLogger("t.f15"),
         "output_filter_fields": output_filter_fields,
         "has_substantive_field": has_substantive_field,
+        # [wave-50 T3] the predicate's value semantics — must be present or
+        # the fallback's broad except swallows the NameError → silent False.
+        "_field_has_value": _field_has_value,
         "ScrapeState": dict,
         "DEAD_STATUS_CODES": DEAD_STATUS_CODES,
         "SOFT_404_MARKERS": SOFT_404_MARKERS,
