@@ -2555,6 +2555,10 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
   X('#saved-back').addEventListener('click', function(){ show(lastPrimaryScreen); });
 
   X('#restart').addEventListener('click', function(){
+    // [team-feedback fix] stop the previous job's live-update poll — only
+    // cancel/terminal cleared it, so after "New extraction" mid-run the old
+    // job's /api/ was polled every 4s for nothing.
+    if(intakeState.poll){ clearInterval(intakeState.poll); intakeState.poll = null; }
     listFileState = null; renderListFileChip();
     listingFileState = null; renderListingFileChip();
     currentSchema = null;
