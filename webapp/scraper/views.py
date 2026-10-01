@@ -3133,6 +3133,25 @@ def intake_create_job(request):
         search_criteria = request.POST.get("search_keywords", "").strip()
         search_url = request.POST.get("search_url", "").strip()
 
+    # [wave-50 T6b] A termless search is a false-success machine: the graph
+    # runs, discovery walks the UNFILTERED catalog, and execution ships
+    # catalog-order rows as COMPLETED (job 492: query='' walked a 228-item
+    # index). The Partner API has refused this shape since wave-27
+    # (api/writers.py: search_term without search_criteria → 422); the UI
+    # intake is the asymmetry. A URL-shaped search (search_url alone) stays
+    # legal — the deep-link re-run path posts it.
+    if nav_method == "search" and not search_criteria and not search_url:
+        return JsonResponse(
+            {
+                "error": (
+                    "Search mode requires search keywords (or a search URL) — "
+                    "a termless search would scrape the unfiltered catalog."
+                ),
+                "missing_search_keywords": True,
+            },
+            status=422,
+        )
+
     # [wave-32 B3] Host gate — decline exactly what F17 would drop. 587:
     # intake accepted a loveamika.com listing on a marimekko.com job; F17
     # silently dropped every cross-host seed at runtime and discovery

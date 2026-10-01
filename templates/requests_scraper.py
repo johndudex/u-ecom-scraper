@@ -354,10 +354,11 @@ def _extract_listing_links(soup: BeautifulSoup) -> list[str]:
 def _discover_urls_via_algolia(
     listing_url: str,
     limit: int | None = None,
+    query: str = "",
 ) -> tuple[list[str], str]:
-    """[wave-50] Phase-1 pre-step for Algolia-backed CLIENT-RENDERED listings.
+    """[wave-50] Phase-1 pre-step for Algolia-backed CLIENT-RENDERED catalogs.
 
-    The SSR HTML of such listings can carry zero product hrefs even when the
+    The SSR HTML of such pages can carry zero product hrefs even when the
     page looks anchor-rich (nav links dominate — job 485 wonderbly), so HTML
     anchor discovery ships junk. The page ships its own Algolia search creds:
     extract them, walk the index, convert hits to PDP URLs through the
@@ -365,6 +366,11 @@ def _discover_urls_via_algolia(
     failure — fetch, no creds, query error, zero URLs — degrades to
     ``([], "algolia_unavailable")`` and the caller falls back to anchor
     discovery, never crashes.
+
+    ``query`` (search mode) turns the walk into an index SEARCH: hits come
+    back relevance-ranked for the user's term and the creds page's taxon
+    filter is skipped — a free-text search must not be narrowed to whatever
+    category the page happens to carry.
     """
     if not listing_url:
         return [], "algolia_unavailable"
@@ -372,22 +378,39 @@ def _discover_urls_via_algolia(
         html, status = fetch_text(listing_url)
     except Exception as exc:
         logger.warning("Phase 1 (algolia): listing fetch failed: %s", exc)
-        return [], "algolia_unavailable"
-    if not html or status >= 400:
+        html, status = "", 0
+    creds = extract_algolia_creds(html) if html and status < 400 else None
+    if (
+        not (creds and creds.get("index_name"))
+        and SITE_URL
+        and SITE_URL.rstrip("/") != str(listing_url).rstrip("/")
+    ):
+        # Creds without an index name cannot be queried (Algolia rejects
+        # indexName=""), and search pages sometimes ship no config island at
+        # all — one homepage fallback attempt, then give up.
+        try:
+            alt_html, alt_status = fetch_text(SITE_URL)
+        except Exception:
+            alt_html, alt_status = "", 0
+        alt_creds = (
+            extract_algolia_creds(alt_html) if alt_html and alt_status < 400 else None
+        )
+        if alt_creds and (alt_creds.get("index_name") or not creds):
+            html = alt_html
+            creds = alt_creds
+    if not creds:
         return [], "algolia_unavailable"
     try:
-        creds = extract_algolia_creds(html)
-        if not creds:
-            return [], "algolia_unavailable"
-        taxon = extract_taxon_query(html)
+        taxon = "" if query else extract_taxon_query(html or "")
         filter_str = build_taxon_filter(creds, taxon) if taxon else ""
         logger.info(
-            "Phase 1 (algolia): creds found (index=%s, taxon=%r) — catalog discovery",
-            creds.get("index_name") or "?", taxon or "",
+            "Phase 1 (algolia): creds found (index=%s, taxon=%r, query=%r) — catalog discovery",
+            creds.get("index_name") or "?", taxon or "", query or "",
         )
         result = discover_catalog_urls(
             listing_url, creds, max_items=limit or 20,
-            filter_str=filter_str,
+            query=query, filter_str=filter_str,
+            page_html=html or "",
         )
         urls = result.get("urls") or []
         if not urls:
@@ -409,15 +432,19 @@ def _discover_urls_via_algolia(
 def _discover_phase1(
     discovery_cfg: dict,
     limit: int | None = None,
+    query: str = "",
 ) -> tuple[list[str], dict]:
     """[wave-50] THE Phase-1 gate: Algolia catalog first, anchors second.
 
     Every discovery arm in main() routes through here so the client-rendered
     class is served deterministically — the writer cannot strip the pre-step
-    without deleting the gate itself.
+    without deleting the gate itself. ``query`` (search mode) makes the
+    pre-step search the index for the user's term instead of walking the
+    unfiltered catalog (job 491: the query was logged, never passed — every
+    "search" delivered arbitrary catalog order).
     """
     seed = PRODUCT_LISTING_URLS[0] if PRODUCT_LISTING_URLS else ""
-    urls, reason = _discover_urls_via_algolia(seed, limit)
+    urls, reason = _discover_urls_via_algolia(seed, limit, query=query)
     if urls:
         return urls, {"stop_reason": f"algolia:{reason}", "max_pages_hit": False}
     return discover_listing_urls_with_retry(
@@ -539,7 +566,8 @@ def main():
     if args.discover_only or _env_listing:
         logger.info("Discovery mode (%s): running Phase 1, skipping Phase 2 extraction",
                     "env-gate" if _env_listing else "--discover-only")
-        product_urls, discovery_meta = _discover_phase1(_discovery_cfg, args.limit)
+        product_urls, discovery_meta = _discover_phase1(_discovery_cfg, args.limit,
+                                  query=(args.query or ""))
         discovered_urls_raw = len(product_urls)
         ran_phase1 = True
         save_urls_to_file(INPUT_FILE, product_urls)
@@ -557,7 +585,8 @@ def main():
         skipped_reason = "checkpoint_loaded"
     else:
         logger.info("No input_urls.json found. Discovering products from listing page...")
-        product_urls, discovery_meta = _discover_phase1(_discovery_cfg, args.limit)
+        product_urls, discovery_meta = _discover_phase1(_discovery_cfg, args.limit,
+                                  query=(args.query or ""))
         discovered_urls_raw = len(product_urls)
         ran_phase1 = True
         save_urls_to_file(INPUT_FILE, product_urls)

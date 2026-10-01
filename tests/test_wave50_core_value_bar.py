@@ -32,6 +32,7 @@ def _load_real_items_fn():
         grab("_freshness_floor")
         + grab("_is_dead_product")
         + grab("_is_discovery_output")
+        + grab("_row_url_has_path")
         + grab("_scraper_has_real_items")
     )
     from src.content_types import (

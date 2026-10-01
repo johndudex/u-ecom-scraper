@@ -367,7 +367,7 @@ def _effective_proxy_tier() -> str:
     return tier if tier in ("none", "datacenter", "residential") else "none"
 
 
-def _navigate(url, actions=None, extract=None, retry=0, settle_ms=None):
+def _navigate(url, actions=None, extract=None, retry=0, settle_ms=None, deadline=None):
     """POST /navigate with exponential backoff. Returns the response dict or None.
 
     Contract (see docs/browser-service-rework-plan.md Step 1):
@@ -382,6 +382,11 @@ def _navigate(url, actions=None, extract=None, retry=0, settle_ms=None):
                               an error item without burning the retry budget
 
     The `retry` arg is a backoff-exponent floor (callers may pre-bias it).
+    ``deadline`` (a ``time.monotonic()`` timestamp, or None) bounds the retry
+    ladder: no attempt after the first starts past it, so a wall-clock-capped
+    caller (phase-1 search discovery) can't have one stuck URL eat retries
+    worth minutes. None (the default) keeps every other caller's behavior
+    byte-identical.
     Returns None only after all MAX_RETRIES attempts are exhausted — EXCEPT:
       - a 429-exhaustion returns a terminal throttled dict
         (``{"success": False, "throttled": True, "status": 429, ...}``), and
@@ -416,6 +421,12 @@ def _navigate(url, actions=None, extract=None, retry=0, settle_ms=None):
     last_throttled = False
     last_unavailable: dict = {}
     for attempt in range(MAX_RETRIES):
+        if attempt and deadline is not None and time.monotonic() >= deadline:
+            logger.warning(
+                "navigate: deadline exceeded before attempt %d on %s — stopping",
+                attempt + 1, url[:80],
+            )
+            break
         try:
             r = httpx.post(endpoint, json=payload, timeout=NAVIGATE_TIMEOUT + 30)
             if r.status_code == 200:
@@ -723,6 +734,14 @@ def _extract_item_links(html: str) -> list[str]:
     BeautifulSoup's SoupSieve supports most CSS but not engine-specific
     pseudo-classes; each tier is wrapped so a bad selector falls through to
     the next instead of aborting discovery.
+
+    [wave-51 T7] A configured ITEM_URL_PATTERN gates EVERY tier — tiers 1-2
+    used to trust the selector to be item-scoped, but a page-wide selector
+    (``a[href]`` is a legal fill) then feeds Phase 2 the rendered page's
+    header/footer anchors (/#main, /, /new-in/…), and the filtered tier 3
+    never fires because a rendered page always has >20 anchors. When the
+    site's PDP shape is known, a URL the pattern rejects is never an item.
+    Without a configured pattern the tiers behave exactly as before.
     """
     if not html:
         return []
@@ -733,6 +752,15 @@ def _extract_item_links(html: str) -> list[str]:
         return []
 
     links: list[str] = []
+
+    # [wave-51 T7] Compile the item pattern once, up front; every tier below
+    # filters through it when configured (None → legacy unfiltered behavior).
+    pattern = None
+    if ITEM_URL_PATTERN and ITEM_URL_PATTERN not in ("", "{ITEM_URL_PATTERN}"):
+        try:
+            pattern = re.compile(ITEM_URL_PATTERN)
+        except re.error:
+            pattern = None
 
     # Tier 1: container + link selector.
     if ITEM_CONTAINER_SELECTOR and ITEM_CONTAINER_SELECTOR != "{ITEM_CONTAINER_SELECTOR}":
@@ -751,7 +779,12 @@ def _extract_item_links(html: str) -> list[str]:
             for a in matches:
                 href = a.get("href", "")
                 if href:
-                    links.append(_make_absolute(href))
+                    url = _make_absolute(href)
+                    if pattern and not pattern.search(url):
+                        continue
+                    if pattern and not _is_product_url(url):
+                        continue
+                    links.append(url)
 
     # Tier 2: bare link selector (page-wide).
     if not links and ITEM_LINK_SELECTOR and ITEM_LINK_SELECTOR != "{ITEM_LINK_SELECTOR}":
@@ -759,7 +792,12 @@ def _extract_item_links(html: str) -> list[str]:
             for a in soup.select(ITEM_LINK_SELECTOR):
                 href = a.get("href", "")
                 if href:
-                    links.append(_make_absolute(href))
+                    url = _make_absolute(href)
+                    if pattern and not pattern.search(url):
+                        continue
+                    if pattern and not _is_product_url(url):
+                        continue
+                    links.append(url)
         except Exception as exc:
             logger.warning("Phase 1: bare link selector failed: %s", exc)
 
@@ -767,12 +805,6 @@ def _extract_item_links(html: str) -> list[str]:
     # Primary selectors above do the real work; this only fires when they miss,
     # and the output filter catches any non-item page that still slips through.
     if len(links) < 20:
-        pattern = None
-        if ITEM_URL_PATTERN and ITEM_URL_PATTERN not in ("", "{ITEM_URL_PATTERN}"):
-            try:
-                pattern = re.compile(ITEM_URL_PATTERN)
-            except re.error:
-                pattern = None
         existing = set(links)
         added = 0
         for a in soup.select("a[href]"):
@@ -816,8 +848,25 @@ def _discover_urls_via_search(
     )
     logger.info("Phase 1: Searching for '%s' → %s", query, search_url)
 
+    # [wave-50] Wall-clock bound — the same fail-fast 1b gives its category
+    # walk. A blocking/slow site must not turn one stuck search URL into a
+    # full retry-ladder burn (job 490: 3 consecutive 600s probe timeouts).
+    _deadline = time.monotonic() + DISCOVERY_DEADLINE_SECONDS
+
+    # [wave-50] Algolia-first search: client-rendered search pages answer the
+    # query from an index, not from SSR anchors, and on TLS-gated sites the
+    # browser phase cannot even load the page (job 490: every navigate burned
+    # its retry budget on chrome-error pages while the site's own Algolia
+    # index answered the same query over plain HTTPS). Query the index when
+    # the page ships its creds; HTML search navigation stays the fallback.
+    algolia_urls, algolia_reason = _discover_urls_via_algolia(
+        search_url, limit=limit, query=query
+    )
+    if algolia_urls:
+        return algolia_urls, algolia_reason
+
     actions = _build_search_actions(query)
-    resp = _navigate(search_url, actions=actions)
+    resp = _navigate(search_url, actions=actions, deadline=_deadline)
     if not resp or not resp.get("success"):
         blocked = bool(resp and resp.get("blocked"))
         fail_reason = _nav_fail_reason(resp)
@@ -856,7 +905,14 @@ def _discover_urls_via_search(
             break
 
         logger.info("Phase 1: Navigating to page %d", current_page + 1)
-        resp = _navigate(next_url)
+        if time.monotonic() > _deadline:
+            logger.warning(
+                "Phase 1: discovery exceeded %ss deadline — stopping (navigate_error)",
+                DISCOVERY_DEADLINE_SECONDS,
+            )
+            stop_reason = "navigate_error"
+            break
+        resp = _navigate(next_url, deadline=_deadline)
         if not resp or not resp.get("success"):
             # H4 false-pass guard: _navigate exhausted retries on 429/502/503
             # (or hit a block). This is NOT exhaustion — surface it so the
@@ -1088,33 +1144,53 @@ def _discover_urls_via_form_search(
 def _discover_urls_via_algolia(
     listing_url: str,
     limit: int | None = None,
+    query: str = "",
 ) -> tuple[list[str], str]:
-    """[wave-50] Phase-1 pre-step for Algolia-backed CLIENT-RENDERED listings.
+    """[wave-50] Phase-1 pre-step for Algolia-backed CLIENT-RENDERED catalogs.
 
-    The SSR HTML of such listings carries zero product hrefs (job 1116:
+    The SSR HTML of such pages carries zero product hrefs (job 1116:
     wonderbly), so HTML anchor discovery cannot work — but the page ships its
     own Algolia search creds. Extract them, walk the index, convert hits to
     PDP URLs (wide-key fallback: solidusSlug/prismicProductSlug/…). Any
     failure — no creds, query error, zero URLs — degrades to
     ``([], "algolia_unavailable")`` and the caller falls back to HTML
     discovery, never crashes.
+
+    ``query`` (search mode) turns the walk into an index SEARCH: hits come
+    back relevance-ranked for the user's term and the creds page's taxon
+    filter is skipped — a free-text search must not be narrowed to whatever
+    category the page happens to carry.
     """
     html, status = _http_get(listing_url)
-    if not html or status >= 400:
+    creds = extract_algolia_creds(html) if html and status < 400 else None
+    if (
+        not (creds and creds.get("index_name"))
+        and SITE_URL
+        and SITE_URL.rstrip("/") != str(listing_url).rstrip("/")
+    ):
+        # Creds without an index name cannot be queried (Algolia rejects
+        # indexName=""), and search pages sometimes ship no config island at
+        # all — one homepage fallback attempt, then give up.
+        alt_html, alt_status = _http_get(SITE_URL)
+        alt_creds = (
+            extract_algolia_creds(alt_html) if alt_html and alt_status < 400 else None
+        )
+        if alt_creds and (alt_creds.get("index_name") or not creds):
+            html = alt_html
+            creds = alt_creds
+    if not creds:
         return [], "algolia_unavailable"
     try:
-        creds = extract_algolia_creds(html)
-        if not creds:
-            return [], "algolia_unavailable"
-        taxon = extract_taxon_query(html)
+        taxon = "" if query else extract_taxon_query(html or "")
         filter_str = build_taxon_filter(creds, taxon) if taxon else ""
         logger.info(
-            "Phase 1 (algolia): creds found (index=%s, taxon=%r) — catalog discovery",
-            creds.get("index_name") or "?", taxon or "",
+            "Phase 1 (algolia): creds found (index=%s, taxon=%r, query=%r) — catalog discovery",
+            creds.get("index_name") or "?", taxon or "", query or "",
         )
         result = discover_catalog_urls(
             listing_url, creds, max_items=limit or 20,
-            filter_str=filter_str,
+            query=query, filter_str=filter_str,
+            page_html=html or "",
         )
         urls = result.get("urls") or []
         if not urls:

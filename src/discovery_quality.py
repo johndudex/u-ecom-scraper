@@ -25,6 +25,25 @@ exactly the failure this system has repeatedly shipped as COMPLETED.
 from urllib.parse import urlsplit
 
 
+def row_url_is_item_shaped(url: str) -> bool:
+    """Structural floor for an extracted ROW: its URL must point at a page.
+
+    A recurring false-success class shipped fragment-only (``/#main``) and
+    bare-origin URLs as ``products`` — a URL with no path is never an item
+    detail page on any site (there is nothing to extract but the shell).
+    Deliberately narrow: anything with a real path passes (``/new-in/?sort=``
+    is a deeper junk shape other gates own); this floor only rejects the
+    can-never-be-an-item class, so it is safe inside ground-truth counting.
+    """
+    if not url:
+        return False
+    try:
+        path = (urlsplit(str(url)).path or "").strip("/")
+    except Exception:
+        return False
+    return bool(path)
+
+
 def _path_segments(url: str) -> tuple[str, list[str]]:
     parts = urlsplit(str(url or ""))
     segs = [s for s in parts.path.split("/") if s]

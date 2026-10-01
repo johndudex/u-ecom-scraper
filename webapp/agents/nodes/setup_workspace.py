@@ -216,6 +216,28 @@ def _restore_job_draft_from_fm(state: dict, slug: str, workspace_dir: str) -> No
         logger.warning("setup_workspace: per-job draft restore failed: %s", exc)
 
 
+def _seed_urls_for_workspace(state: ScrapeState, input_urls: list[str]) -> list[str]:
+    """Seed URLs to write as ``workspace/input_urls.json`` (may be emptied).
+
+    [wave-51 T8] A search_term job's discovery is query-owned: the Site's
+    stored URL list is the PREVIOUS job's discovery (job 499 inherited 497's
+    20 electrical-category PDPs), and a stale seed poisons everything
+    downstream — the tester's seed-driven VERIFICATION run (20/20
+    real-but-wrong rows → ``PASS_VIA_SEED_ONLY``) and route_after_testing's
+    ground-truth override (>=3 "real" items overriding the tester's FAIL).
+    Never seed a search_term workspace; every other mode keeps the wave-14
+    seed contract (their workspace seed is meaningful).
+    """
+    if state.get("input_mode") == "search_term":
+        if input_urls:
+            logger.info(
+                "setup_workspace: search_term job — NOT seeding input_urls.json "
+                "(discovery is query-owned; the Site URL list belongs to prior jobs)"
+            )
+        return []
+    return input_urls
+
+
 def setup_workspace(state: ScrapeState) -> dict[str, Any]:
     """Ensure ``workspace/{slug}/`` and ``logs/`` exist (LOCAL), publish any
     leftover outputs to the File Master, and re-hydrate skipped analysis
@@ -347,6 +369,7 @@ def setup_workspace(state: ScrapeState) -> dict[str, Any]:
         _restore("test_report.json", "skip_code_generation")
 
     input_urls = _filter_seed_urls(state.get("input_urls") or [], state.get("url", ""))
+    input_urls = _seed_urls_for_workspace(state, input_urls)
     if input_urls:
         input_path = os.path.join(workspace_dir, "input_urls.json")
         try:

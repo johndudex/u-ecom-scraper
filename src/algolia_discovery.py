@@ -13,7 +13,8 @@ This module is the generic fix: extract the public search creds from the page
 HTML (they ship to every visitor's browser — Astro serializes them into
 astro-island ``props``), walk the index's pages, and convert every hit to a
 PDP URL through a wide key fallback whose slug branch resolves the site's PDP
-path prefix by sitemap grep + HEAD verification.
+path prefix by HEAD verification, an anchor-prefix vote on the creds page,
+and a sitemap grep.
 
 Transport is injectable (``fetch_fn`` / ``head_fn`` / ``sitemap_fn``) so tests
 run on recorded payloads; the defaults use ``requests``. Every failure mode
@@ -242,6 +243,28 @@ def _hit_to_url(hit: dict) -> tuple[str, str] | None:
 # ── PDP prefix resolution ────────────────────────────────────────────────────
 
 
+def _anchor_prefix_candidates(page_html: str) -> list[str]:
+    """Path-prefix candidates from a page's own anchors, most-linked first.
+
+    A client-rendered catalog's creds page (often the homepage) still links a
+    handful of featured items; the directory those anchors share is the site's
+    PDP namespace even when the queried slug itself is not on the page. Purely
+    structural — prefix strings only, each HEAD-verified by the caller before
+    use. Bounded so a link-heavy page cannot stall the walk.
+    """
+    if not page_html:
+        return []
+    counts: dict[str, int] = {}
+    for m in _re.finditer(r'href="(/[^"#?]+)"', page_html):
+        path = m.group(1)
+        if path.count("/") < 2:
+            continue
+        prefix = path.rstrip("/").rsplit("/", 1)[0] + "/"
+        counts[prefix] = counts.get(prefix, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [prefix for prefix, _ in ranked[:12]]
+
+
 def _locs_from_sitemap(body: str) -> list[str]:
     return _re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", body or "")
 
@@ -275,14 +298,17 @@ def _resolve_prefix_from_sitemap(base_url, slug, sitemap_fn) -> str:
 class _PrefixResolver:
     """Resolves and caches ONE PDP path prefix per run.
 
-    Order: cached winner → HEAD-verified candidates → sitemap grep. The first
-    slug pays the probing cost; every later slug reuses the answer.
+    Order: cached winner → HEAD-verified built-in candidates → anchor-prefix
+    vote from the creds page (each candidate HEAD-verified against the slug)
+    → sitemap grep. The first slug pays the probing cost; every later slug
+    reuses the answer.
     """
 
-    def __init__(self, base_url, head_fn, sitemap_fn):
+    def __init__(self, base_url, head_fn, sitemap_fn, page_html: str = ""):
         self.base_url = base_url
         self.head_fn = head_fn
         self.sitemap_fn = sitemap_fn
+        self.anchor_candidates = _anchor_prefix_candidates(page_html)
         self.prefix: str | None = None
         # A prefix proven by HEAD needs no further confirmation; a sitemap
         # prefix is trusted-but-verified on the first URL it produces.
@@ -295,6 +321,15 @@ class _PrefixResolver:
         prefix = ""
         if self.head_fn is not None:
             for cand in _PREFIX_CANDIDATES:
+                try:
+                    if self.head_fn(_urljoin(self.base_url, cand + slug)) == 200:
+                        prefix = cand
+                        self.prefix_head_verified = True
+                        break
+                except Exception:
+                    continue
+        if not prefix and self.anchor_candidates and self.head_fn is not None:
+            for cand in self.anchor_candidates:
                 try:
                     if self.head_fn(_urljoin(self.base_url, cand + slug)) == 200:
                         prefix = cand
@@ -437,18 +472,21 @@ def discover_catalog_urls(
     fetch_fn=None,
     head_fn=None,
     sitemap_fn=None,
+    page_html: str = "",
 ) -> dict:
     """Walk the index and return product URLs.
 
     Returns ``{"urls": [...], "nbHits": int, "collected": int,
     "stop_reason": str, "pdp_prefix": str}``. ``urls`` is deduped, in index
-    order, capped at ``max_items``. Any transport/shape surprise degrades to a
-    partial (or empty) result — never raises.
+    order, capped at ``max_items``. ``page_html`` (the page the creds were
+    extracted from) feeds the anchor-prefix vote when neither the built-in
+    candidates nor the sitemap resolve the PDP namespace. Any transport/shape
+    surprise degrades to a partial (or empty) result — never raises.
     """
     fetch = fetch_fn or _default_fetch
     heads = head_fn or _default_head
     sitemaps = sitemap_fn or _default_sitemap
-    resolver = _PrefixResolver(base_url, heads, sitemaps)
+    resolver = _PrefixResolver(base_url, heads, sitemaps, page_html=page_html)
     out: dict = {
         "urls": [],
         "nbHits": 0,

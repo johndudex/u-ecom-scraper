@@ -40,6 +40,7 @@ def _load_fn():
         grab("_freshness_floor")
         + grab("_is_dead_product")
         + grab("_is_discovery_output")
+        + grab("_row_url_has_path")
         + grab("_scraper_has_real_items")
     )
 

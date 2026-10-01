@@ -427,8 +427,22 @@ def _discover_urls_via_category(
 
 
 def _extract_item_links(page) -> list[str]:
-    """Extract item page URLs from a listing page."""
+    """Extract item page URLs from a listing page.
+
+    [wave-51 T7] A configured ITEM_URL_PATTERN gates EVERY tier — the
+    selector tiers used to trust ITEM_LINK_SELECTOR to be item-scoped, but
+    a page-wide fill (``a[href]``) then feeds Phase 2 the rendered page's
+    header/footer anchors. When the site's PDP shape is known, a URL the
+    pattern rejects is never an item. Without a configured pattern the
+    tiers behave exactly as before.
+    """
     links: list[str] = []
+    pattern = None
+    if ITEM_URL_PATTERN and ITEM_URL_PATTERN not in ("", "{ITEM_URL_PATTERN}"):
+        try:
+            pattern = re.compile(ITEM_URL_PATTERN)
+        except re.error:
+            pattern = None
     try:
         containers = page.query_selector_all(ITEM_CONTAINER_SELECTOR)
         for container in containers:
@@ -438,6 +452,10 @@ def _extract_item_links(page) -> list[str]:
                 if href:
                     if href.startswith("/"):
                         href = SITE_URL.rstrip("/") + href
+                    if pattern and not pattern.search(href):
+                        continue
+                    if pattern and not _is_product_url(href):
+                        continue
                     links.append(href)
     except Exception as exc:
         logger.warning("Phase 1: Error extracting item links: %s", exc)
@@ -450,6 +468,10 @@ def _extract_item_links(page) -> list[str]:
                 if href:
                     if href.startswith("/"):
                         href = SITE_URL.rstrip("/") + href
+                    if pattern and not pattern.search(href):
+                        continue
+                    if pattern and not _is_product_url(href):
+                        continue
                     links.append(href)
         except Exception as exc:
             logger.warning("Phase 1: Fallback link extraction failed: %s", exc)

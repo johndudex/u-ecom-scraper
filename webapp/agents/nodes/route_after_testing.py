@@ -548,6 +548,24 @@ def _zero_yield_stop(state: ScrapeState) -> bool:
     return False
 
 
+def _row_url_has_path(row: dict) -> bool:
+    """[wave-51 T9] Item-shaped URL floor for ground-truth counting: a row
+    whose URL is root-only or fragment-only (job 499's ``/#main`` shell row,
+    title+price populated) is never an item, so it must not count toward the
+    ground-truth override. Rows with no URL key at all are not this floor's
+    verdict (URL presence is other bars' job) and fail open, as does import
+    trouble — ground truth must never go blind over a broken helper."""
+    url = row.get("url") or row.get("product_url") or ""
+    if not url:
+        return True
+    try:
+        from src.discovery_quality import row_url_is_item_shaped
+
+        return row_url_is_item_shaped(url)
+    except Exception:
+        return True
+
+
 def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
     """GROUND-TRUTH check: did the scraper extract enough real items to PASS?
 
@@ -696,9 +714,12 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
                         _live_i = [p for p in _items if not _is_dead_product(p)]
                         _good_i = (
                             [p for p in _live_i
-                             if any(_field_has_value(p.get(f)) for f in fields)]
+                             if _row_url_has_path(p)
+                             and any(_field_has_value(p.get(f)) for f in fields)]
                             if fields
-                            else [p for p in _live_i if has_substantive_field(p)]
+                            else [p for p in _live_i
+                                  if _row_url_has_path(p)
+                                  and has_substantive_field(p)]
                         )
                         if len(_good_i) > _best_good:
                             _best_items = _items
@@ -724,9 +745,11 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
         # empty string is not — a defaulted currency no longer papers over
         # an unpopulated price (1116's five junk rows).
         good = [p for p in live
-                if any(_field_has_value(p.get(f)) for f in fields)]
+                if _row_url_has_path(p)
+                and any(_field_has_value(p.get(f)) for f in fields)]
     else:
-        good = [p for p in live if has_substantive_field(p)]
+        good = [p for p in live
+                if _row_url_has_path(p) and has_substantive_field(p)]
     if len(good) >= min_count:
         return True
 

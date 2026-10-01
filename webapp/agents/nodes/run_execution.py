@@ -481,6 +481,24 @@ def _url_shaped_criteria(state: ScrapeState) -> str:
     return first_criteria_url(state.get("search_criteria"))
 
 
+def _query_shaped(url: str, query: str) -> bool:
+    """True when ``url`` is the query's own search URL — the query rides in
+    it, raw, ``+``-joined, or percent-encoded. [wave-50 T6c]
+
+    A search job's discovery is owned by ``--query`` (the draft's Query-mode
+    branch builds the search URL itself); an env-gate candidate that is NOT
+    this URL is a navigator detour (a browsed category — briscoes /electrical/,
+    job 497) and must never pin the SCRAPER_LISTING_URL gate."""
+    if not (url and query):
+        return False
+    from urllib.parse import quote as _quote_q
+
+    return any(
+        needle and needle in url
+        for needle in (query, query.replace(" ", "+"), _quote_q(query))
+    )
+
+
 def _scope_target(state: ScrapeState) -> int:
     """The record count this job was ASKED for (intake scope), minimum 1.
 
@@ -1043,7 +1061,7 @@ def run_execution(state: ScrapeState) -> dict:
     # contract; working_url may be a detail page — the uindex root cause),
     # fall back to the CLI chain's value; F17 domain-guarded either way.
     _listing_url_env = ""
-    if input_mode in ("navigation", "list_page", "search_term"):
+    if input_mode in ("navigation", "list_page"):
         _nav_env = state.get("navigation_analysis") or {}
         _disc_env = (_nav_env.get("discovery") if isinstance(_nav_env, dict) else None) or {}
         # Same priority as the --listing-url chain: URL-shaped search_criteria
@@ -1054,6 +1072,41 @@ def run_execution(state: ScrapeState) -> dict:
             _env_candidate = (_disc_env.get("listing_url") if isinstance(_disc_env, dict) else "") or ""
         if not _env_candidate:
             _env_candidate = _working_url if (_listing_reached or not _respect_flag) else ""
+        _job_reg_env = _registrable_of(state.get("url", ""))
+        if _env_candidate:
+            _cand_reg = _registrable_of(_env_candidate)
+            if _job_reg_env and _cand_reg and _cand_reg != _job_reg_env:
+                logger.warning(
+                    "run_execution: F17 dropped cross-domain SCRAPER_LISTING_URL "
+                    "%s (job domain %s)", _env_candidate[:70], _job_reg_env,
+                )
+                _env_candidate = ""
+        _listing_url_env = _env_candidate
+        if _listing_url_env:
+            logger.info("run_execution: setting SCRAPER_LISTING_URL=%s (env-var, deterministic discovery)", _listing_url_env[:80])
+    elif input_mode == "search_term":
+        # [wave-50 T6c — job 497] A search job's discovery is owned by
+        # --query: the draft's Query-mode branch builds the search URL
+        # (catalogsearch/result/?q=<query>) itself. The navigator's promoted
+        # listing — often a CATEGORY it browsed en route (briscoes
+        # /electrical/) — must NOT hijack phase 1 via the env gate: the gate
+        # overrides query mode inside the draft, client-rendered categories
+        # yield 0 HTTP anchors, and the rescue arm then ships
+        # query-irrelevant rows. Pin the gate ONLY when the candidate IS the
+        # query's own search URL; F17 domain-guard still applies.
+        _nav_env = state.get("navigation_analysis") or {}
+        _disc_env = (_nav_env.get("discovery") if isinstance(_nav_env, dict) else None) or {}
+        _q_env = (state.get("search_criteria") or "").strip()
+        _env_candidate = (_disc_env.get("listing_url") if isinstance(_disc_env, dict) else "") or ""
+        if not _env_candidate:
+            _env_candidate = _working_url if (_listing_reached or not _respect_flag) else ""
+        if _env_candidate and not _query_shaped(_env_candidate, _q_env):
+            logger.info(
+                "run_execution: search_term job — NOT setting SCRAPER_LISTING_URL=%s "
+                "(not the query's search URL; --query owns discovery)",
+                _env_candidate[:70],
+            )
+            _env_candidate = ""
         _job_reg_env = _registrable_of(state.get("url", ""))
         if _env_candidate:
             _cand_reg = _registrable_of(_env_candidate)
@@ -2001,6 +2054,22 @@ def _run_via_browser_service(
                 "error_message": _sh,
             }
 
+        # [wave-51 T9] Non-item row bar: a shell URL (/#main, bare origin)
+        # carries title+price so F9 and the core-value bar read it as data;
+        # this gate is its own verdict and fails the run rather than editing
+        # rows (honest FAILED beats junk shipped as COMPLETED — job 499).
+        _ni = _nonitem_row_gate(output_file, state.get("input_mode", ""))
+        if _ni:
+            logger.error("run_execution: %s", _ni)
+            _notify_phase(_exec_job_id, "execution", "failed")
+            return {
+                "execution_status": "FAILED",
+                "output_file": output_file,
+                "product_count": result.get("product_count", 0),
+                "discovery_coverage": discovery_coverage,
+                "error_message": _ni,
+            }
+
         _notify_phase(_exec_job_id, "execution", "done")
         return {
             "execution_status": "SUCCESS",
@@ -2208,6 +2277,43 @@ def _output_row_urls(output_file: str) -> list:
                             break
             return urls
     return []
+
+
+def _nonitem_row_gate(output_file: str, input_mode: str) -> str:
+    """[wave-51 T9] Structural floor: root-only / fragment-only row URLs are
+    never items. Job 499 shipped ``https://www.briscoes.co.nz/#main`` as a
+    product (site <title> + defaulted price) — a URL with no path is a page
+    POSITION (nav anchor / shell), not a page, but it carries title+price so
+    F9 and the core-value bar read it as data. Detection is structural
+    (src/discovery_quality.row_url_is_item_shaped), site agnostic.
+
+    Fires when junk rows are half or more of the output: all-junk runs must
+    not ship COMPLETED, while a mostly-real run with one shell row is real
+    yield this gate must not punish. url_list is out of scope (user-provided
+    seeds), same scoping rule as T5e.
+
+    Returns the diagnostic sentence, empty when healthy (gate no-ops)."""
+    if str(input_mode or "").strip().lower() == "url_list":
+        return ""
+    urls = _output_row_urls(output_file)
+    if not urls:
+        return ""
+    try:
+        from src.discovery_quality import row_url_is_item_shaped
+
+        junk = [u for u in urls if not row_url_is_item_shaped(u)]
+    except Exception:
+        return ""
+    if not junk or len(junk) * 2 < len(urls):
+        return ""
+    example = junk[0]
+    return (
+        f"Non-item row bar: {len(junk)}/{len(urls)} output rows point at "
+        f"root-only or fragment-only URLs (e.g. {example[:100]!r}) — a URL "
+        f"with no path is a page position (nav anchor / page shell), not an "
+        f"item page. Discovery shipped navigation as products; fix the "
+        f"discovery item-URL filtering, not the field selectors."
+    )
 
 
 def _shallow_section_gate(
