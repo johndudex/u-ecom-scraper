@@ -2464,6 +2464,145 @@ def _writer_max_timeout() -> int:
     return _env_int("WRITER_MAX_TIMEOUT", 2700)
 
 
+def _writer_canary_payload() -> dict:
+    """[wave-52 candidate 8] The writer-shaped canary request body.
+
+    MUST reproduce the writer's prefill scale: small calls sail through Z.AI
+    windows (cleanup's 1.8-5.5K-char calls 200-OK'd seconds after the
+    writer's ~25K-token prefills died), so a `ping` canary would read GREEN
+    through a live window — the exact false-green that burned 521. Synthetic
+    but DIVERSE filler (random words), 58K system + user tail + 9 tools,
+    streaming with max_tokens=8: healthy TTFB 4-8s, window deaths ~61s.
+    """
+    import random
+    import string as _string
+
+    rnd = random.Random(7)
+    words = [
+        "".join(rnd.choices(_string.ascii_lowercase, k=rnd.randint(3, 9)))
+        for _ in range(2000)
+    ]
+    para = " ".join(rnd.choices(words, k=18000))
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": f"canary_tool_{i}",
+                "description": "Tool for scraping tasks. " + para[i * 50:(i * 50) + 400],
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        }
+        for i in range(9)
+    ]
+    try:
+        from django.conf import settings as _s
+
+        model = getattr(_s, "ZAI_MAIN_MODEL", "glm-5.3-flash")
+    except Exception:
+        model = "glm-5.3-flash"
+    return {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": para[:58000]},
+            {"role": "user", "content": "Write the scraper. " + para[58000:]},
+        ],
+        "tools": tools,
+        "max_tokens": 8,
+        "stream": True,
+    }
+
+
+def _writer_canary_ttfb(payload: dict, timeout: float = 75.0) -> float:
+    """Measure real TTFB of one writer-shaped canary. Raises on connection
+    failure (the window's ~61s middlebox reset surfaces as an exception)."""
+    import httpx
+
+    base = os.getenv("ZAI_BASE_URL", "https://api.z.ai/api/coding/paas/v4/")
+    key = os.getenv("ZAI_API_KEY", "")
+    t0 = time.time()
+    with httpx.stream(
+        "POST",
+        base.rstrip("/") + "/chat/completions",
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=timeout,
+    ) as resp:
+        got = 0
+        for chunk in resp.iter_text():
+            got += len(chunk)
+            if got > 50:
+                break
+    return time.time() - t0
+
+
+def _writer_window_gate(job_id: int) -> bool:
+    """[wave-52 candidate 8] Wait out a live Z.AI window BEFORE burning a
+    writer invocation on it.
+
+    Four writers died the same way (521/524/525/526): fire-time gate green,
+    window opened MID-JOB, both stretched invocations exhausted inside a
+    10-30 min window. This gate re-checks at invocation time — every writer
+    node entry (the scraper_analyzer bounce re-enters here too) canaries
+    first; while red it sleeps WRITER_WINDOW_GATE_SLEEP (default 300s) up to
+    WRITER_WINDOW_GATE_MAX_CYCLES-1 times, then proceeds regardless (the
+    gate must never hang the worker unbounded — bounded waiting, then let
+    the classified-retry stretch ride what remains). Any gate-internal
+    failure fails OPEN: waiting is a best-effort optimization, never a new
+    way to kill a job. ``WRITER_WINDOW_GATE=0`` disarms.
+    """
+    if os.getenv("WRITER_WINDOW_GATE", "1") == "0":
+        return True
+    try:
+        payload = _writer_canary_payload()
+    except Exception as exc:
+        logger.warning(
+            "writer window gate: canary unavailable (%s) — fail-open (job %s)",
+            exc, job_id,
+        )
+        return True
+    max_cycles = _env_int("WRITER_WINDOW_GATE_MAX_CYCLES", 3)
+    sleep_s = _env_int("WRITER_WINDOW_GATE_SLEEP", 300)
+    ttfb_max = float(os.getenv("WRITER_WINDOW_GATE_TTFB_MAX", "45"))
+    for attempt in range(1, max_cycles + 1):
+        try:
+            ttfb = _writer_canary_ttfb(payload)
+            if ttfb < ttfb_max:
+                if attempt > 1:
+                    logger.info(
+                        "writer window gate: GREEN ttfb=%.1fs after %d wait(s) (job %s)",
+                        ttfb, attempt - 1, job_id,
+                    )
+                return True
+            logger.warning(
+                "writer window gate: slow ttfb=%.1fs >= %.0fs — window open (job %s)",
+                ttfb, ttfb_max, job_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "writer window gate: canary failed (%s) — window open (job %s)",
+                type(exc).__name__, job_id,
+            )
+        if attempt < max_cycles:
+            logger.warning(
+                "writer window gate: sleeping %ds before re-canary "
+                "(attempt %d/%d, job %s)",
+                sleep_s, attempt, max_cycles, job_id,
+            )
+            time.sleep(sleep_s)
+    logger.error(
+        "writer window gate: still RED after %d cycles — proceeding anyway, "
+        "bounded (job %s)", max_cycles, job_id,
+    )
+    return True
+
+
 def _writer_progress_escalation_enabled() -> bool:
     """[wave-40 T12] Opt-in switch for the writer progress escalation.
 
@@ -7286,6 +7425,19 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
             _writer_codefix_cycle.reset(_w24_codefix_token)
             raise
 
+        # [wave-52 candidate 8] Invocation-time window gate: canary the
+        # provider with a writer-shaped prefill and wait out a live window
+        # before burning this invocation (521/524/525/526 all died to
+        # mid-job window opens the fire-time gate couldn't see). Sits BEFORE
+        # the heartbeat starts — a deliberate 5-min wait must not heartbeat
+        # as liveness, and the F5 20-line start/finally contract stays intact.
+        try:
+            _writer_window_gate(job_id)
+        except Exception as _gate_exc:
+            logger.warning(
+                "_invoke_code_writer: window gate itself failed (%s) — "
+                "proceeding (job %s)", _gate_exc, job_id,
+            )
         hb = _start_heartbeat(job_id, "code-writer")
         # F5: try/finally — an exception here previously leaked the timer chain.
         _cw_cfg = _agent_config(config, "code_writer")
