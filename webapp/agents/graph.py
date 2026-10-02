@@ -6050,11 +6050,31 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
     #     The STEALTH guard stays absolute: those rungs mean every browser
     #     tier measured BLOCKED (job-83 woolworths) — and the stealth branch
     #     above already derives http_navigation there anyway.
+    #   [wave-52 job-524 citychic] The LCR stamp is not the only browser-lane
+    #     proof. 524's traverse rendered the listing and extracted 20 item
+    #     URLs, but the raw TLS shell carried item anchors so the static LCR
+    #     detector stayed silent — the fingerprint exception then never fired
+    #     and the job shipped http_requests anyway (a template that cannot
+    #     discover in the shell it can fetch). So the flip's first gate
+    #     accepts EITHER evidence: the LCR stamp, or rendering==browser WITH
+    #     traverse-extracted item URLs. The revolve discriminator is exactly
+    #     the items: revolve's browser RENDERED but extracted NOTHING (it was
+    #     dying on VerifyHuman.jsp) — rendered-but-zero-items stays
+    #     http_requests. Fingerprint methods keep the arm (the exception
+    #     above is the only http_requests+browser shape that matters here);
+    #     the POST contract still outranks everything.
     _flip_search = (
         _nav.get("search") if isinstance(_nav, dict) else None
     ) or {}
+    _flip_il = (
+        _nav.get("item_links") if isinstance(_nav, dict) else None
+    ) or {}
+    _traverse_items = len(_flip_il.get("url_examples") or [])
     if (
-        _lcr
+        (
+            _lcr
+            or (_rendering == "browser" and _traverse_items > 0)
+        )
         and strategy == "http_requests"
         and (
             not method.startswith(
@@ -6065,11 +6085,19 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
         and str(_flip_search.get("form_method") or "").upper() != "POST"
     ):
         strategy = "http_navigation"
-        _strategy_source += (
-            "; listing probe measured ZERO item anchors in a content-rich "
-            "non-JS shell — client-rendered listing (job-1082 class), "
-            "discovery rides the browser lane"
-        )
+        if _lcr:
+            _strategy_source += (
+                "; listing probe measured ZERO item anchors in a content-rich "
+                "non-JS shell — client-rendered listing (job-1082 class), "
+                "discovery rides the browser lane"
+            )
+        else:
+            _strategy_source += (
+                "; browser traverse rendered the listing and extracted "
+                f"{_traverse_items} item URLs from it (job-524 class) — "
+                "TLS-HTTP can fetch the shell but cannot discover in it, "
+                "discovery rides the browser lane"
+            )
 
     # Discovery config: propagate the navigator's pagination detection so the
     # template uses the RIGHT config_for_* preset (load_more vs page_param vs

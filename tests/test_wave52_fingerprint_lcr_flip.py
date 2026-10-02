@@ -120,3 +120,50 @@ class TestFingerprintLcrFlip:
         recipe = analysis["access_recipe"]
         assert recipe["fingerprint_profile"], "fingerprint profile lost on flip"
         assert recipe["discovery_proxy_tier"] in ("none", "datacenter", "residential")
+
+
+def _citychic_524_state():
+    """The exact citychic-524 measurement: rendering=browser + 20 traverse-
+    extracted item URLs + fingerprint method, but NO LCR stamp (the raw TLS
+    shell carried item anchors, so the static detector stayed silent)."""
+    state = _state(lcr=False)
+    state["navigation_analysis"]["item_links"] = {
+        "url_examples": [
+            "https://www.citychic.com.au/product/12345/dress.html"
+        ] * 20,
+    }
+    return state
+
+
+class TestTraverseItemsArm:
+    """[job-524 citychic] The traverse rendering the listing and EXTRACTING
+    item URLs from it is stronger discovery evidence than the static LCR
+    stamp — the browser lane is proven end-to-end even when the raw shell
+    happens to carry anchors."""
+
+    def test_citychic_524_shape_flips_without_lcr(self):
+        from webapp.agents.graph import _derive_strategy
+
+        analysis = _derive_strategy(_citychic_524_state())
+        assert analysis["strategy"] == "http_navigation"
+        assert "traverse" in analysis["strategy_justification"].lower()
+        assert "20 item urls" in analysis["strategy_justification"].lower()
+
+    def test_rendered_but_zero_items_stays_http_requests(self):
+        """The revolve discriminator: the browser RENDERED but extracted
+        nothing (VerifyHuman.jsp death — the wave-28 measured shape). With
+        no LCR stamp either, the flip must not fire."""
+        from webapp.agents.graph import _derive_strategy
+
+        state = _state(lcr=False)
+        state["navigation_analysis"]["item_links"] = {"url_examples": []}
+        analysis = _derive_strategy(state)
+        assert analysis["strategy"] == "http_requests"
+
+    def test_lcr_alone_still_flips(self):
+        """The wave-48 static evidence alone (LCR stamp, no traverse items)
+        still flips — (7b) widens, never narrows."""
+        from webapp.agents.graph import _derive_strategy
+
+        analysis = _derive_strategy(_state())
+        assert analysis["strategy"] == "http_navigation"
