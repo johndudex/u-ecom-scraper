@@ -107,28 +107,6 @@ def _agent_llm_timeouts() -> dict[str, int]:
 _AGENT_LLM_TIMEOUTS: dict[str, int] = _agent_llm_timeouts()
 
 
-def _agent_retry_overrides() -> dict[str, dict]:
-    """[wave-52 candidate 6] Per-agent classified-retry ladder overrides (keyed
-    by prompt stem, like _agent_llm_timeouts). code_writer alone gets the
-    stretched transient ladder — Z.AI TTFB on its ~25K-token prefill crosses a
-    ~60s connection reset in load windows (jobs 514/515/517/518/519), and the
-    global 2-attempt ladder could not outlive even a short burst."""
-    try:
-        from django.conf import settings as _s
-
-        return {
-            "code-writer": {
-                "transient_max": int(getattr(_s, "LLM_RETRY_CODEWRITER_TRANSIENT_MAX", 4)),
-                "backoff_base": float(getattr(_s, "LLM_RETRY_CODEWRITER_BACKOFF_BASE", 15.0)),
-                "backoff_cap": float(getattr(_s, "LLM_RETRY_CODEWRITER_BACKOFF_CAP", 90.0)),
-            },
-        }
-    except Exception:
-        return {}
-
-
-_AGENT_RETRY_OVERRIDES: dict[str, dict] = _agent_retry_overrides()
-
 # ── Internal name mapping: agent node name → prompt file stem ─────────────
 
 AGENT_PROMPT_MAP: dict[str, str] = {
@@ -145,6 +123,33 @@ AGENT_PROMPT_MAP: dict[str, str] = {
     "skill_learner": "skill-learner",
     "dagster_converter": "dagster-converter",
 }
+
+
+def _agent_retry_overrides() -> dict[str, dict]:
+    """[wave-52 candidate 6, widened live 2026-10-02] Stretched classified-retry
+    ladder for EVERY react agent (keyed by prompt stem, like
+    _agent_llm_timeouts). First cut covered code-writer only — Z.AI TTFB on its
+    ~25K-token prefill crosses a ~60s connection reset in load windows (jobs
+    514/515/517/518/519). Job 521 then showed the same ~61s OpenAIConnectionError
+    deaths on product_analyzer and url_judge calls during a 25-min window: the
+    global 2-attempt/~2min ladder cannot outlive even a short burst, so every
+    agent rides the stretched spread (4 attempts, sleeps 15/30/60/90 — worst
+    195s, inside the 900s AGENT_INVOKE_TIMEOUT wall). Knob names keep the
+    historic LLM_RETRY_CODEWRITER_* spelling."""
+    try:
+        from django.conf import settings as _s
+
+        shared = {
+            "transient_max": int(getattr(_s, "LLM_RETRY_CODEWRITER_TRANSIENT_MAX", 4)),
+            "backoff_base": float(getattr(_s, "LLM_RETRY_CODEWRITER_BACKOFF_BASE", 15.0)),
+            "backoff_cap": float(getattr(_s, "LLM_RETRY_CODEWRITER_BACKOFF_CAP", 90.0)),
+        }
+        return {stem: dict(shared) for stem in AGENT_PROMPT_MAP.values()}
+    except Exception:
+        return {}
+
+
+_AGENT_RETRY_OVERRIDES: dict[str, dict] = _agent_retry_overrides()
 
 
 # T1.7: the dead AGENT_MAX_ITERATIONS dict ({site_analyzer: 30, code_writer:

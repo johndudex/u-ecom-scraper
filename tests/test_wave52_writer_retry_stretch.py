@@ -117,8 +117,8 @@ class TestClassifiedRetryOverrideWiring(SimpleTestCase):
 
 class TestSubagentsWiring(SimpleTestCase):
     def test_writer_build_wires_override(self):
-        """_build_agent passes the stretched ladder ONLY for the code-writer
-        stem — cleanup's get_llm call carries no retry_cfg."""
+        """_build_agent passes the stretched ladder for the code-writer stem
+        (the first cut; kept as the anchor case)."""
         captured = []
         real_get_llm = sub.get_llm
 
@@ -131,11 +131,30 @@ class TestSubagentsWiring(SimpleTestCase):
                 site_slug="x-com", template_code="x = 1",
                 embed_mode="full", embed_kind="file",
             )
-            sub.create_cleanup_agent(site_slug="x-com")
-        by_agent = [c.get("retry_cfg") for c in captured]
-        writer_cfgs = [c for c in by_agent if c and c.get("transient_max") == 4]
-        assert writer_cfgs, f"no writer call carried the stretch: {by_agent}"
+        assert captured, "code-writer build made no get_llm call"
         assert all(
-            c is None or c.get("transient_max") == 4 for c in by_agent
-        )  # cleanup calls carry None; writer carries the stretch — never the
-        # global 2-attempt dict
+            c.get("retry_cfg") and c["retry_cfg"].get("transient_max") == 4
+            for c in captured
+        ), f"writer call lost the stretch: {captured}"
+
+    def test_every_react_agent_gets_the_stretch(self):
+        """[job-521 widening] The same ~61s window deaths hit product_analyzer
+        and url_judge during a 25-min Z.AI window — EVERY stem in
+        AGENT_PROMPT_MAP must resolve to the stretched ladder."""
+        overrides = sub._agent_retry_overrides()
+        stems = set(sub.AGENT_PROMPT_MAP.values())
+        assert set(overrides) == stems, (set(overrides), stems)
+        for stem, cfg in overrides.items():
+            assert cfg["transient_max"] == 4, stem
+            assert cfg["backoff_cap"] == 90.0, stem
+        # cleanup is the regression case from the writer-only first cut
+        assert overrides["cleanup"]["transient_max"] == 4
+
+    def test_override_map_values_are_independent(self):
+        """Each stem gets its own dict — mutating one must not bleed into
+        another (shared-literal class of bug)."""
+        overrides = sub._agent_retry_overrides()
+        a, b = overrides["cleanup"], overrides["code-writer"]
+        assert a is not b
+        a["transient_max"] = 99
+        assert overrides["code-writer"]["transient_max"] == 4

@@ -350,14 +350,18 @@ LLM_RETRY_RATELIMIT_BASE = config("LLM_RETRY_RATELIMIT_BASE", default=2.0, cast=
 LLM_RETRY_BACKOFF_FLOOR = config("LLM_RETRY_BACKOFF_FLOOR", default=1.0, cast=float)   # 429 min sleep (s)
 LLM_RETRY_BACKOFF_BASE = config("LLM_RETRY_BACKOFF_BASE", default=1.5, cast=float)     # transient class
 LLM_RETRY_BACKOFF_CAP = config("LLM_RETRY_BACKOFF_CAP", default=30.0, cast=float)
-# [wave-52 candidate 6] code_writer-only transient stretch: Z.AI TTFB on the
-# writer's ~25K-token prefill spikes past ~60s in load windows and a middlebox
-# resets connections after ~60s of silence — every writer call died at ~61s
-# (jobs 514/515/517/518/519) while the 2-attempt global ladder (~2min total
-# exposure) could not outlive even a short burst. Stretched ladder for the
-# writer only: 4 attempts, sleeps spread 15/30/60s (105s worst) — still leaves
-# most of the 900s AGENT_INVOKE_TIMEOUT wall for the react loop. Global ladder
-# above stays byte-identical (test-locked).
+# [wave-52 candidate 6] transient stretch for the react agents: Z.AI TTFB on
+# big prefills spikes past ~60s in load windows and a middlebox resets
+# connections after ~60s of silence — every writer call died at ~61s (jobs
+# 514/515/517/518/519) while the 2-attempt global ladder (~2min total
+# exposure) could not outlive even a short burst. First cut covered the
+# writer only; job 521 (2026-10-02) showed the same ~61s deaths on
+# product_analyzer/url_judge calls during a 25-min window, so the widened
+# ladder now applies to EVERY react agent (subagents._agent_retry_overrides):
+# 4 attempts, sleeps 15/30/60/90 (195s worst) — still leaves most of the 900s
+# AGENT_INVOKE_TIMEOUT wall for the react loop. Global ladder above stays
+# byte-identical (test-locked). Knob names keep the historic CODEWRITER
+# spelling.
 LLM_RETRY_CODEWRITER_TRANSIENT_MAX = config("LLM_RETRY_CODEWRITER_TRANSIENT_MAX", default=4, cast=int)
 LLM_RETRY_CODEWRITER_BACKOFF_BASE = config("LLM_RETRY_CODEWRITER_BACKOFF_BASE", default=15.0, cast=float)
 LLM_RETRY_CODEWRITER_BACKOFF_CAP = config("LLM_RETRY_CODEWRITER_BACKOFF_CAP", default=90.0, cast=float)
