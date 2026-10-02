@@ -2556,6 +2556,11 @@ def _writer_window_gate(job_id: int) -> bool:
     the classified-retry stretch ride what remains). Any gate-internal
     failure fails OPEN: waiting is a best-effort optimization, never a new
     way to kill a job. ``WRITER_WINDOW_GATE=0`` disarms.
+
+    [8b] Each cycle BURSTS WRITER_WINDOW_GATE_BURST (default 3) back-to-back
+    canaries and requires ALL green: a single green request cannot see a
+    request-rate throttle (529's canaries passed silently seconds before
+    the invocation's request burst tripped the account-level rate cap).
     """
     if os.getenv("WRITER_WINDOW_GATE", "1") == "0":
         return True
@@ -2570,25 +2575,33 @@ def _writer_window_gate(job_id: int) -> bool:
     max_cycles = _env_int("WRITER_WINDOW_GATE_MAX_CYCLES", 3)
     sleep_s = _env_int("WRITER_WINDOW_GATE_SLEEP", 300)
     ttfb_max = float(os.getenv("WRITER_WINDOW_GATE_TTFB_MAX", "45"))
+    # [wave-52 8b, job-529] Burst: N back-to-back canaries, ALL must pass.
+    # A single green request cannot see a request-rate throttle — both of
+    # 529's canaries passed silently, then the invocation's request burst
+    # tripped the account-level rate cap immediately after.
+    burst = max(1, _env_int("WRITER_WINDOW_GATE_BURST", 3))
     for attempt in range(1, max_cycles + 1):
-        try:
-            ttfb = _writer_canary_ttfb(payload)
-            if ttfb < ttfb_max:
-                if attempt > 1:
-                    logger.info(
-                        "writer window gate: GREEN ttfb=%.1fs after %d wait(s) (job %s)",
-                        ttfb, attempt - 1, job_id,
-                    )
-                return True
-            logger.warning(
-                "writer window gate: slow ttfb=%.1fs >= %.0fs — window open (job %s)",
-                ttfb, ttfb_max, job_id,
-            )
-        except Exception as exc:
-            logger.warning(
-                "writer window gate: canary failed (%s) — window open (job %s)",
-                type(exc).__name__, job_id,
-            )
+        red = None
+        for i in range(burst):
+            try:
+                ttfb = _writer_canary_ttfb(payload)
+                if ttfb >= ttfb_max:
+                    red = f"slow ttfb={ttfb:.1f}s"
+                    break
+            except Exception as exc:
+                red = type(exc).__name__
+                break
+        if red is None:
+            if attempt > 1:
+                logger.info(
+                    "writer window gate: GREEN burst of %d after %d wait(s) (job %s)",
+                    burst, attempt - 1, job_id,
+                )
+            return True
+        logger.warning(
+            "writer window gate: %s on burst request %d/%d — window open "
+            "(job %s)", red, i + 1, burst, job_id,
+        )
         if attempt < max_cycles:
             logger.warning(
                 "writer window gate: sleeping %ds before re-canary "
