@@ -363,6 +363,33 @@ def _retry_budget(kind: str, cfg: dict) -> int:
     return cfg["ratelimit_max"] if kind == "rate_limit" else cfg["transient_max"]
 
 
+def _codewriter_retry_overrides() -> dict:
+    """[wave-52 candidate 6] The code_writer's stretched transient ladder.
+
+    Z.AI TTFB on the writer's ~25K-token prefill crosses a ~60s connection
+    reset in load windows (jobs 514/515/517/518/519 — five identical writer
+    deaths at ~61s); the global 2-attempt ladder (~2min exposure) cannot
+    outlive even a short burst. Only the three transient knobs move — the
+    rate-limit ladder and every other agent keep the test-locked defaults.
+    """
+    return {
+        "transient_max": int(getattr(settings, "LLM_RETRY_CODEWRITER_TRANSIENT_MAX", 4)),
+        "backoff_base": float(getattr(settings, "LLM_RETRY_CODEWRITER_BACKOFF_BASE", 15.0)),
+        "backoff_cap": float(getattr(settings, "LLM_RETRY_CODEWRITER_BACKOFF_CAP", 90.0)),
+    }
+
+
+def _effective_retry_cfg(client: ClassifiedRetryChatOpenAI) -> dict:
+    """Global retry settings merged with the client's per-instance override
+    (set via ``get_llm(retry_cfg=...)``). No override → byte-identical to
+    ``_retry_settings()``."""
+    cfg = _retry_settings()
+    override = getattr(client, "_retry_cfg_override", None)
+    if override:
+        cfg = {**cfg, **override}
+    return cfg
+
+
 def _retry_classified_sync(fn, cfg: dict, *, model: str | None = None, sleep=time.sleep):
     """Run a sync LLM call with classified retry. Raises the last exception after
     the class's retry budget is exhausted."""
@@ -493,6 +520,10 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
     # recording under anything else makes record/lookup diverge silently (the
     # critique round's key-coherence finding). Set by ``get_llm``.
     _breaker_name: str | None = PrivateAttr(default=None)
+    # [wave-52 candidate 6] Per-instance retry-ladder override (merged over
+    # _retry_settings() by _effective_retry_cfg). Set via get_llm(retry_cfg=...)
+    # for the code_writer's stretched transient ladder; None elsewhere.
+    _retry_cfg_override: dict | None = PrivateAttr(default=None)
     """``ChatOpenAI`` with classified, bounded, jittered per-call retry.
 
     Overrides of ``_generate``/``_agenerate`` (the methods langchain routes
@@ -512,7 +543,7 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
     """
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[override]
-        cfg = _retry_settings()
+        cfg = _effective_retry_cfg(self)
         # Bind the parent method OUTSIDE the lambda: zero-arg super() inside a
         # lambda doesn't get the __class__ closure cell (RuntimeError: super(): no
         # arguments). Explicit super() + a local binding is robust.
@@ -532,7 +563,7 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
         return result
 
     async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:  # type: ignore[override]
-        cfg = _retry_settings()
+        cfg = _effective_retry_cfg(self)
         _super_agenerate = super()._agenerate
 
         async def _call():
@@ -554,7 +585,7 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
         # first mid-stream transport death failed the whole phase. Retry wraps
         # the FULL consumption — a stream that dies mid-flight raises from
         # iteration, not from the call — then replays the buffered chunks.
-        cfg = _retry_settings()
+        cfg = _effective_retry_cfg(self)
         _super_stream = super()._stream
         try:
             chunks = _retry_classified_sync(
@@ -573,7 +604,7 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
 
     async def _astream(self, messages, stop=None, run_manager=None, **kwargs):  # type: ignore[override]
         # Async counterpart of ``_stream`` (LLM_ASYNC_EXECUTION path).
-        cfg = _retry_settings()
+        cfg = _effective_retry_cfg(self)
         _super_astream = super()._astream
 
         async def _consume():
@@ -636,7 +667,12 @@ def _classified_retry_enabled() -> bool:
         return True
 
 
-def get_llm(model: str | None = None, temperature: float = 0.3, timeout: int | None = None) -> ChatOpenAI:
+def get_llm(
+    model: str | None = None,
+    temperature: float = 0.3,
+    timeout: int | None = None,
+    retry_cfg: dict | None = None,
+) -> ChatOpenAI:
     """Create a ChatOpenAI instance configured for the Z.AI API (or the LiteLLM
     proxy for ``litellm/``-prefixed models — see ``_provider_for``).
 
@@ -692,6 +728,9 @@ def get_llm(model: str | None = None, temperature: float = 0.3, timeout: int | N
         # Breaker key = configured string (prefix intact), not the stripped name
         # sent to the server — keeps record/lookup coherent across the swap.
         llm._breaker_name = requested
+        # [wave-52 candidate 6] per-agent ladder override (code_writer stretch).
+        if retry_cfg:
+            llm._retry_cfg_override = dict(retry_cfg)
         return llm
     # Kill-switch off → pre-Phase-2 behavior (blind SDK retry). Breaker not
     # recorded on this path (no retry-layer interception).

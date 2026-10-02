@@ -106,6 +106,29 @@ def _agent_llm_timeouts() -> dict[str, int]:
 # Keyed by prompt stem (e.g. "code-writer" — NOT the node name "code_writer").
 _AGENT_LLM_TIMEOUTS: dict[str, int] = _agent_llm_timeouts()
 
+
+def _agent_retry_overrides() -> dict[str, dict]:
+    """[wave-52 candidate 6] Per-agent classified-retry ladder overrides (keyed
+    by prompt stem, like _agent_llm_timeouts). code_writer alone gets the
+    stretched transient ladder — Z.AI TTFB on its ~25K-token prefill crosses a
+    ~60s connection reset in load windows (jobs 514/515/517/518/519), and the
+    global 2-attempt ladder could not outlive even a short burst."""
+    try:
+        from django.conf import settings as _s
+
+        return {
+            "code-writer": {
+                "transient_max": int(getattr(_s, "LLM_RETRY_CODEWRITER_TRANSIENT_MAX", 4)),
+                "backoff_base": float(getattr(_s, "LLM_RETRY_CODEWRITER_BACKOFF_BASE", 15.0)),
+                "backoff_cap": float(getattr(_s, "LLM_RETRY_CODEWRITER_BACKOFF_CAP", 90.0)),
+            },
+        }
+    except Exception:
+        return {}
+
+
+_AGENT_RETRY_OVERRIDES: dict[str, dict] = _agent_retry_overrides()
+
 # ── Internal name mapping: agent node name → prompt file stem ─────────────
 
 AGENT_PROMPT_MAP: dict[str, str] = {
@@ -1228,6 +1251,7 @@ def _build_agent(
             model=_model_override,
             temperature=temperature,
             timeout=_AGENT_LLM_TIMEOUTS.get(prompt_stem),
+            retry_cfg=_AGENT_RETRY_OVERRIDES.get(prompt_stem),
         )
     else:
         llm = get_main_llm(temperature)
