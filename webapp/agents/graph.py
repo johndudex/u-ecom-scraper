@@ -6036,14 +6036,31 @@ def _derive_strategy(state: ScrapeState) -> dict[str, Any]:
     #   - NOT on a form-POST-discovered listing (locumtenens replay
     #     contract): the cascade deliberately keeps those on http_requests
     #     because http_navigation's phase 1 cannot replay the POST.
+    #   [wave-52 job-523 briscoes] The fingerprint guard's premise is "the
+    #     browser rungs AFTER fingerprint never ran — nothing is proven about
+    #     browsers". Inside the _rendering == "browser" cascade that premise
+    #     is false: browser_traverse rendered the listing and extracted item
+    #     URLs from it (523: 20 product URLs off the MCP browser while the
+    #     raw TLS-HTTP shell carried ZERO /product/ anchors). In that
+    #     measured shape the LCR flip fires on fingerprint methods too —
+    #     TLS-HTTP can FETCH the shell but can never DISCOVER in it. The
+    #     revolve concern stays honored: http_navigation's /navigate applies
+    #     the fingerprint server-side and access_recipe.fingerprint_profile
+    #     travels (the profile is re-derived below from the same method).
+    #     The STEALTH guard stays absolute: those rungs mean every browser
+    #     tier measured BLOCKED (job-83 woolworths) — and the stealth branch
+    #     above already derives http_navigation there anyway.
     _flip_search = (
         _nav.get("search") if isinstance(_nav, dict) else None
     ) or {}
     if (
         _lcr
         and strategy == "http_requests"
-        and not method.startswith(
-            (*STEALTH_METHOD_PREFIXES, *FINGERPRINT_METHOD_PREFIXES)
+        and (
+            not method.startswith(
+                (*STEALTH_METHOD_PREFIXES, *FINGERPRINT_METHOD_PREFIXES)
+            )
+            or (_rendering == "browser" and method.startswith(FINGERPRINT_METHOD_PREFIXES))
         )
         and str(_flip_search.get("form_method") or "").upper() != "POST"
     ):
