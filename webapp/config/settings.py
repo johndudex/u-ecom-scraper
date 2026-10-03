@@ -212,6 +212,15 @@ CELERY_BEAT_SCHEDULE = {
         "task": "scraper.tasks.resume_browser_unavailable_jobs",
         "schedule": 120.0,
     },
+    # [wave-53 candidate 10] Provider-dead park resumer: flips rows parked on
+    # a provider Connection/429 episode back to PENDING after 25 min and
+    # re-dispatches through the normal entry (preserved probe/traverse work).
+    # Cap 2 re-drives, then the resumer finalizes FAILED honestly. 120s tick;
+    # the delay gate is per-row so a tight tick costs nothing.
+    "resume-provider-dead": {
+        "task": "scraper.tasks.resume_provider_dead_jobs",
+        "schedule": 120.0,
+    },
     # Partner event delivery (async_api.yaml): 30s sweep drives the < 1m
     # backoff legs + lost-task recovery; >= 1m legs self-schedule exact.
     "dispatch-pending-callbacks": {
@@ -255,6 +264,8 @@ CELERY_TASK_ROUTES = {
     # [wave-16 B3] The park resumer polices the scrape pool — same reasoning
     # as the watchdog above, it must not queue behind the jobs it resuscitates.
     "scraper.tasks.resume_browser_unavailable_jobs": "events",
+    # [wave-53 candidate 10] Same reasoning as the park resumer above.
+    "scraper.tasks.resume_provider_dead_jobs": "events",
     # [wave-35] Retention purge is maintenance — must not occupy a scrape slot.
     "scraper.tasks.purge_retention": "events",
 }

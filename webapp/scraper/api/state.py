@@ -26,6 +26,9 @@ _STATE_MAP = {
     # once browser_service /health recovers) — the honest projection is
     # "inprogress", not the unknown-status fallback "failed".
     "browser_unavailable": "inprogress",
+    # [wave-53 candidate 10] Provider-dead park is transient the same way —
+    # the beat resumer re-dispatches after the 25-min delay window.
+    "provider_dead": "inprogress",
     "completed": "scraper_ready",
     "failed": "failed",
     "cancelled": "failed",

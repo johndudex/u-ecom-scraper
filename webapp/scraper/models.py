@@ -125,6 +125,13 @@ class ScrapeJob(models.Model):
     # (tasks.resume_browser_unavailable_jobs) re-dispatches these rows once
     # /health recovers. Deliberately NOT in _TERMINAL_JOB_STATUSES.
     STATUS_BROWSER_UNAVAILABLE = "browser_unavailable"
+    # [wave-53 candidate 10] Provider park: the code_writer died twice with no
+    # draft on a provider-class error (connection reset / 429 rate+usage
+    # limits) — the LLM gateway window is closed, not the site. NOT terminal:
+    # the beat resumer (tasks.resume_provider_dead_jobs) re-dispatches the row
+    # after PROVIDER_REDRIVE_DELAY_S; provider outages are time-slices, and the
+    # re-run resumes from the preserved probe/traverse/strategy artifacts.
+    STATUS_PROVIDER_DEAD = "provider_dead"
 
     STATUS_CHOICES = [
         (STATUS_PENDING, "Pending"),
@@ -136,6 +143,7 @@ class ScrapeJob(models.Model):
         (STATUS_CAPTCHA_BLOCKED, "Captcha Blocked"),
         (STATUS_AKAMAI_BLOCKED, "Akamai Blocked"),
         (STATUS_BROWSER_UNAVAILABLE, "Browser Service Unavailable"),
+        (STATUS_PROVIDER_DEAD, "Provider Dead (auto re-drive)"),
     ]
 
     # 1000 per sync_api.yaml (was default 200) — catalog-only widen on Postgres

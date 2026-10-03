@@ -2443,6 +2443,9 @@ def _finalize_job(job: ScrapeJob) -> None:
         ScrapeJob.STATUS_CAPTCHA_BLOCKED,
         ScrapeJob.STATUS_AKAMAI_BLOCKED,
         ScrapeJob.STATUS_BROWSER_UNAVAILABLE,
+        # [wave-53 candidate 10] A parked row is resumable work, not a
+        # terminal outcome — the provider-park resumer owns it.
+        ScrapeJob.STATUS_PROVIDER_DEAD,
     ):
         logger.info("Job %d: %s, skipping _finalize_job", job.id, job.status)
         return
@@ -3002,6 +3005,12 @@ STUCK_JOB_ACTIVITY_TIMEOUT_MINUTES = 30
 # then means a long quiet phase (browser run, probe ladder), not a corpse.
 # Only revoke such a task after a much longer silence: the wedge backstop.
 ACTIVE_SILENCE_REVOKE_MINUTES = 90
+# [wave-53 job-538] Total silence — [HEARTBEAT] rows included — for this many
+# minutes while the task still reports ACTIVE means the worker child PROCESS
+# deadlocked (a live phase emits a row at least every 300s). Killed by the
+# deadman in cleanup_stuck_jobs instead of aging to the 90-min backstop: 538
+# lost 109 min and a worker slot exactly this way.
+FROZEN_CHILD_SILENCE_MINUTES = 15
 
 
 def _task_liveness(task_id: str) -> str:
@@ -3150,69 +3159,125 @@ def cleanup_stuck_jobs() -> None:
                 (timezone.now() - last_activity).total_seconds() / 60
             )
 
-            # Liveness check BEFORE revoking ([jobs 79/80] class): silent ≠ dead.
-            _task_id = getattr(job, "celery_task_id", "") or ""
-            _liveness = _task_liveness(_task_id)
-            if _liveness == "active" and idle_minutes < ACTIVE_SILENCE_REVOKE_MINUTES:
-                logger.warning(
-                    "Stuck job %d: silent %d min but celery task %s is ACTIVE — "
-                    "not revoking (long quiet phase, not a corpse)",
-                    job.id, idle_minutes, _task_id,
+            # [wave-53 job-538] Frozen-child deadman. A live phase emits a
+            # SessionLog row at least every 300s ([HEARTBEAT] during agent
+            # phases, [EXEC-ALIVE] during execution, [TOOL]/[PROBE] rows
+            # otherwise), so when the newest row of ANY kind is as stale as
+            # the activity-filtered one, the worker child PROCESS has frozen:
+            # every in-process defense (httpx read timeout, no-chunk watchdog,
+            # the 900s invocation join, heartbeat Timers) executes no Python in
+            # a deadlocked process — 538 lost 109 min and a worker slot to
+            # exactly this while Celery's parent kept reporting the task
+            # ACTIVE. This check must sit BEFORE the ACTIVE grace below: the
+            # grace is sized for quiet-but-alive phases, which by construction
+            # keep beating.
+            _frozen_msg = None
+            if idle_minutes >= FROZEN_CHILD_SILENCE_MINUTES:
+                _last_any = (
+                    SessionLog.objects.filter(job=job)
+                    .order_by("-created_at")
+                    .first()
                 )
-                continue
+                _idle_any = (
+                    int(
+                        (timezone.now() - _last_any.created_at).total_seconds()
+                        / 60
+                    )
+                    if _last_any is not None
+                    else idle_minutes
+                )
+                if _idle_any >= FROZEN_CHILD_SILENCE_MINUTES:
+                    _task_id = getattr(job, "celery_task_id", "") or ""
+                    _liveness = _task_liveness(_task_id)
+                    if _liveness == "active":
+                        _frozen_msg = (
+                            f"Worker child frozen: no SessionLog activity of "
+                            f"any kind (heartbeats included) for {_idle_any} "
+                            f"min while the celery task still reports ACTIVE — "
+                            f"a live phase emits a row at least every 300s, so "
+                            f"total silence means the child process deadlocked "
+                            f"and no in-process timer can fire. Revoked to "
+                            f"reclaim the slot."
+                        )
+                        idle_minutes = _idle_any
+                        logger.error(
+                            "Stuck job %d: FROZEN CHILD — no rows at all "
+                            "(heartbeats included) for %d min, task %s still "
+                            "reports ACTIVE; revoking",
+                            job.id, _idle_any, _task_id,
+                        )
 
-            # Actually terminate the Celery task, not just the DB row. Without
-            # this, the worker keeps running the hung graph (LLM-phase hangs,
-            # abandoned agent threads, an in-process 200-page discovery loop)
-            # while the DB row says failed — the worker slot stays occupied
-            # until the (separate) task time_limit backstop fires.
-            # terminate=True + SIGKILL reclaims it.
-            #
-            # ORDER: mark the job FAILED BEFORE revoking. Under acks_late (if
-            # enabled) the terminated task is redelivered, and the entry claim
-            # (1.1) skips redelivery while status==RUNNING — so marking FAILED
-            # first lets the redelivery resume from the langgraph checkpoint
-            # instead of being silently dropped (and the job stuck RUNNING
-            # forever). Harmless when acks_late is off (today's default).
-            if _liveness == "absent":
-                # Report the ACTUAL broker config instead of a hardcoded
-                # assumption.
-                try:
-                    from celery import current_app as _celery_app
+            if _frozen_msg is None:
+                if last_activity >= threshold:
+                    continue
 
-                    _acks_late = bool(_celery_app.conf.task_acks_late)
-                except Exception:
-                    _acks_late = False
-                _redelivery = (
-                    "acks_late=True — a broker redelivery may still re-run it"
-                    if _acks_late
-                    else "acks_late=False means no redelivery"
-                )
-                error_msg = (
-                    f"Worker process lost: celery task {_task_id} is not active "
-                    f"on any worker (silent {idle_minutes} min; {_redelivery}). "
-                    f"Failed by the stuck-job watchdog."
-                )
-            elif _liveness == "active":
-                error_msg = (
-                    f"No activity for {idle_minutes} min while the task still "
-                    f"reports ACTIVE — treated as wedged (stalled agent phase "
-                    f"or hung scrape); celery task revoked."
+                # Liveness check BEFORE revoking ([jobs 79/80] class): silent ≠ dead.
+                _task_id = getattr(job, "celery_task_id", "") or ""
+                _liveness = _task_liveness(_task_id)
+                if _liveness == "active" and idle_minutes < ACTIVE_SILENCE_REVOKE_MINUTES:
+                    logger.warning(
+                        "Stuck job %d: silent %d min but celery task %s is ACTIVE — "
+                        "not revoking (long quiet phase, not a corpse)",
+                        job.id, idle_minutes, _task_id,
+                    )
+                    continue
+
+                # Actually terminate the Celery task, not just the DB row. Without
+                # this, the worker keeps running the hung graph (LLM-phase hangs,
+                # abandoned agent threads, an in-process 200-page discovery loop)
+                # while the DB row says failed — the worker slot stays occupied
+                # until the (separate) task time_limit backstop fires.
+                # terminate=True + SIGKILL reclaims it.
+                #
+                # ORDER: mark the job FAILED BEFORE revoking. Under acks_late (if
+                # enabled) the terminated task is redelivered, and the entry claim
+                # (1.1) skips redelivery while status==RUNNING — so marking FAILED
+                # first lets the redelivery resume from the langgraph checkpoint
+                # instead of being silently dropped (and the job stuck RUNNING
+                # forever). Harmless when acks_late is off (today's default).
+                if _liveness == "absent":
+                    # Report the ACTUAL broker config instead of a hardcoded
+                    # assumption.
+                    try:
+                        from celery import current_app as _celery_app
+
+                        _acks_late = bool(_celery_app.conf.task_acks_late)
+                    except Exception:
+                        _acks_late = False
+                    _redelivery = (
+                        "acks_late=True — a broker redelivery may still re-run it"
+                        if _acks_late
+                        else "acks_late=False means no redelivery"
+                    )
+                    error_msg = (
+                        f"Worker process lost: celery task {_task_id} is not active "
+                        f"on any worker (silent {idle_minutes} min; {_redelivery}). "
+                        f"Failed by the stuck-job watchdog."
+                    )
+                elif _liveness == "active":
+                    error_msg = (
+                        f"No activity for {idle_minutes} min while the task still "
+                        f"reports ACTIVE — treated as wedged (stalled agent phase "
+                        f"or hung scrape); celery task revoked."
+                    )
+                else:
+                    error_msg = (
+                        f"No activity for {idle_minutes} min — job appears hung "
+                        f"(stalled agent phase or wedged scrape); celery task "
+                        f"revoked."
+                    )
+                logger.error(
+                    "Stuck job %d: liveness=%s, no activity for %d min (last: %s), "
+                    "marking failed + revoking",
+                    job.id,
+                    _liveness,
+                    idle_minutes,
+                    last_activity.isoformat(timespec="seconds"),
                 )
             else:
-                error_msg = (
-                    f"No activity for {idle_minutes} min — job appears hung "
-                    f"(stalled agent phase or wedged scrape); celery task "
-                    f"revoked."
-                )
-            logger.error(
-                "Stuck job %d: liveness=%s, no activity for %d min (last: %s), "
-                "marking failed + revoking",
-                job.id,
-                _liveness,
-                idle_minutes,
-                last_activity.isoformat(timespec="seconds"),
-            )
+                # [wave-53 job-538] The deadman already named the verdict.
+                _liveness = "frozen-child"
+                error_msg = _frozen_msg
         job.status = ScrapeJob.STATUS_FAILED
         job.error_message = error_msg
         job.completed_at = timezone.now()
@@ -3303,6 +3368,113 @@ def purge_retention() -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 # [wave-16 B3] Dependency-park resumer
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+# [wave-53 candidate 10] Provider-dead park: re-drive delay and cap. The
+# owner spec: deaths become delays — re-drive 20-30 min later (25 chosen),
+# max 2 re-drives, then finalize honestly.
+PROVIDER_REDRIVE_DELAY_S = 1500
+PROVIDER_REDRIVE_MAX = 2
+PROVIDER_RESUME_BATCH = 2
+
+
+@shared_task
+def resume_provider_dead_jobs() -> dict:
+    """Re-dispatch jobs parked on provider death, once the window reopens.
+
+    The park (graph._park_provider_dead, the writer's provider-class double-
+    death arm) stamps ``last_parked_at``; this beat task flips rows back to
+    PENDING after ``PROVIDER_REDRIVE_DELAY_S`` (25 min) and re-dispatches
+    through dispatch_scrape_job — the same re-entry path as a manual re-drive,
+    so check_tracker's skip flags resume from the preserved probe/traverse/
+    strategy artifacts instead of redoing analysis. Provider outages measured
+    10-30 min on 2026-10-02 (7 writer deaths in 5 windows), so a 25-min delay
+    lands most re-drives in a fresh window; the wave-52 in-job writer window
+    gate covers the residual risk.
+
+    Guardrails: count-capped (``PROVIDER_REDRIVE_MAX`` re-drives, then an
+    honest FAILED — never an immortal park→flap loop), delay-gated per row,
+    batch-capped oldest-first so a large park queue doesn't stampede the
+    scrape pool, and each flip is claimed by status rowcount so a concurrent
+    tick (or a manual cancel) can't double-dispatch.
+    """
+    parked = list(
+        ScrapeJob.objects.filter(
+            status=ScrapeJob.STATUS_PROVIDER_DEAD
+        ).values("id", "redispatch_count", "last_parked_at").order_by("id")[
+            :PROVIDER_RESUME_BATCH
+        ]
+    )
+    if not parked:
+        return {"resumed": 0, "reason": "none parked"}
+
+    now = time.time()
+    resumed: list[int] = []
+    exhausted: list[int] = []
+    waiting: list[int] = []
+    for row in parked:
+        job_id = row["id"]
+        # Finalize rows already at the re-drive cap (a re-dispatched run that
+        # dies provider-class again parks with the count already bumped).
+        if (row["redispatch_count"] or 0) >= PROVIDER_REDRIVE_MAX:
+            claimed = ScrapeJob.objects.filter(
+                pk=job_id, status=ScrapeJob.STATUS_PROVIDER_DEAD
+            ).update(
+                status=ScrapeJob.STATUS_FAILED,
+                error_message=(
+                    "Provider-dead park exhausted "
+                    f"({row['redispatch_count']} re-drives). Finalized "
+                    "honestly — re-drive manually when the provider window "
+                    "is stable."
+                )[:4000],
+                completed_at=timezone.now(),
+            )
+            if not claimed:
+                continue
+            logger.warning(
+                "provider-park resumer: job %d EXHAUSTED %d re-drives — "
+                "finalized failed", job_id, row["redispatch_count"],
+            )
+            _publish_job_status(job_id, ScrapeJob.STATUS_FAILED)
+            exhausted.append(job_id)
+            continue
+        parked_at = row["last_parked_at"]
+        if not parked_at or (now - parked_at) < PROVIDER_REDRIVE_DELAY_S:
+            waiting.append(job_id)
+            continue
+        # Claim-by-rowcount: only a still-parked row may flip. A row that
+        # changed underneath (manual cancel/re-drive) is skipped untouched.
+        claimed = ScrapeJob.objects.filter(
+            pk=job_id, status=ScrapeJob.STATUS_PROVIDER_DEAD
+        ).update(
+            status=ScrapeJob.STATUS_PENDING,
+            redispatch_count=(row["redispatch_count"] or 0) + 1,
+        )
+        if not claimed:
+            continue
+        try:
+            dispatch_scrape_job(job_id)
+            resumed.append(job_id)
+            logger.info(
+                "provider-park resumer: job %d re-dispatched "
+                "(re-drive %d of %d, parked %.0f s)",
+                job_id, (row["redispatch_count"] or 0) + 1,
+                PROVIDER_REDRIVE_MAX, now - parked_at,
+            )
+        except Exception as exc:
+            # dispatch_scrape_job reverts its task-id stamp on failure — put
+            # the row back where the next tick can find it.
+            ScrapeJob.objects.filter(
+                pk=job_id, status=ScrapeJob.STATUS_PENDING
+            ).update(status=ScrapeJob.STATUS_PROVIDER_DEAD)
+            logger.warning(
+                "provider-park resumer: job %d dispatch failed (%s) — "
+                "still parked", job_id, exc,
+            )
+    return {
+        "resumed": len(resumed), "jobs": resumed,
+        "exhausted": exhausted, "waiting": waiting,
+    }
 
 
 @shared_task
@@ -3549,6 +3721,9 @@ def _do_schedule_next_site() -> dict:
         # back — counting them holds the auto-scheduler so an outage doesn't
         # manufacture a fresh parked job every 5-min tick.
         ScrapeJob.STATUS_BROWSER_UNAVAILABLE,
+        # [wave-53 candidate 10] Parked-on-provider rows are the resumer's
+        # work — hold the auto-scheduler while they wait out the delay.
+        ScrapeJob.STATUS_PROVIDER_DEAD,
     }
     active_count = ScrapeJob.objects.filter(status__in=active_statuses).count()
     if active_count:

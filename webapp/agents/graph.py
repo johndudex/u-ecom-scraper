@@ -5436,6 +5436,104 @@ def _park_browser_unavailable(state: ScrapeState) -> Command:
     )
 
 
+# [wave-53 candidate 10] Provider-class death notes: the LLM gateway is the
+# thing that died (connection resets, 429 rate/usage limits, provider-side
+# timeouts, 5xx), not the site and not the strategy. Provider outages are
+# time-slices (~10-30 min on 2026-10-02's measurements), so the honest move is
+# to PARK and re-drive later instead of finalizing FAILED on a fully-paid
+# probe+traverse+derivation. Deliberately narrow: "wall-clock" deaths have
+# their own escalation ladder (W30/T12) and never park, and an unclassifiable
+# note keeps the existing cleanup failure.
+_PROVIDER_DEAD_SIGNATURES = (
+    "connection error",
+    "429",
+    "rate limit",
+    "usage limit",
+    "internal server error",
+    "server error",
+    "timed out",
+    "apitimeout",
+    "overloaded",
+)
+
+
+def _is_provider_dead_note(note: str) -> bool:
+    """True when a writer-death note names the LLM gateway as the killer."""
+    text = (note or "").lower()
+    if not text or "wall-clock" in text:
+        return False
+    return any(sig in text for sig in _PROVIDER_DEAD_SIGNATURES)
+
+
+def _park_provider_dead(state: ScrapeState) -> Command:
+    """[wave-53 candidate 10] Provider park — the writer died twice on a
+    provider-class error with no draft.
+
+    Twin of _park_browser_unavailable: NON-terminal on the job row
+    (STATUS_PROVIDER_DEAD, last_parked_at stamps the episode), the beat
+    resumer (tasks.resume_provider_dead_jobs) re-dispatches after
+    PROVIDER_REDRIVE_DELAY_S, and check_tracker's skip flags make that re-run
+    resume from the preserved probe/traverse/strategy artifacts. At the
+    re-drive cap (redispatch_count >= tasks.PROVIDER_REDRIVE_MAX) the row
+    finalizes FAILED with an honest exhausted message instead of parking.
+    """
+    job_id = state.get("job_id", 0)
+    detail = str(
+        state.get("provider_dead_detail")
+        or state.get("error_message")
+        or "provider unavailable"
+    )
+    try:
+        from django.db.models import Value
+        from django.db.models.functions import Coalesce
+        from scraper.models import ScrapeJob
+        from scraper.tasks import PROVIDER_REDRIVE_MAX
+
+        job = ScrapeJob.objects.filter(pk=job_id).first()
+        if job is None:
+            logger.error(
+                "park_provider_dead: job %s row missing — falling through to "
+                "the normal failure path", job_id,
+            )
+            return Command(goto="cleanup", update={"messages": []})
+        if (job.redispatch_count or 0) >= PROVIDER_REDRIVE_MAX:
+            job.status = ScrapeJob.STATUS_FAILED
+            job.error_message = (
+                f"{detail} — provider-dead park exhausted after "
+                f"{job.redispatch_count} re-drives. Finalized honestly; "
+                f"re-drive manually when the provider window is stable."
+            )[:2000]
+            job.completed_at = timezone.now()
+            job.save(update_fields=["status", "error_message", "completed_at"])
+            logger.warning(
+                "park_provider_dead: job %s exhausted %d re-drives — "
+                "finalized failed", job_id, job.redispatch_count,
+            )
+            return Command(goto=END, update={"messages": []})
+        ScrapeJob.objects.filter(pk=job_id).update(
+            status=ScrapeJob.STATUS_PROVIDER_DEAD,
+            error_message=detail[:2000],
+            last_parked_at=Coalesce("last_parked_at", Value(float(time.time()))),
+        )
+        logger.warning(
+            "park_provider_dead: job %s parked (provider dead, re-drive %d of "
+            "%d scheduled in ~25 min): %s",
+            job_id, (job.redispatch_count or 0) + 1, PROVIDER_REDRIVE_MAX,
+            detail[:200],
+        )
+    except Exception as exc:
+        # A park that fails falls back to the normal failure path — the job
+        # must never vanish into an unparked limbo because the park itself
+        # blew up.
+        logger.error(
+            "park_provider_dead(job=%s) failed: %s — falling through to "
+            "cleanup", job_id, exc,
+        )
+        return Command(goto="cleanup", update={"messages": []})
+    _notify_phase(job_id, "parked_provider_dead", "done")
+    return Command(goto=END, update={"messages": []})
+
+
 _SHORTFALL_REMEDIATION_MAX = 1  # [wave-36 Fix 3] own budget, separate from
 # _EXECUTION_RECYCLE_MAX (transport/strategy ladder) — never consume that one.
 
@@ -7636,6 +7734,29 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 # generation") and the writer no-ops again — an unbounded
                 # auto-approve loop. Mirror the S-4 wall-clock arm.
                 if state.get("skip_approvals", False):
+                    # [wave-53 candidate 10] A provider-class double death is a
+                    # gateway time-slice, not a site verdict — PARK the row for
+                    # a delayed re-drive (probe/traverse/strategy artifacts are
+                    # preserved; check_tracker resumes from them) instead of
+                    # finalizing FAILED. Everything else keeps the honest
+                    # cleanup failure.
+                    if _is_provider_dead_note(_err_note):
+                        logger.error(
+                            "_invoke_code_writer: repeated no-draft writer failures "
+                            "on a provider-class error → park_provider_dead "
+                            "(delayed re-drive, job %s): %s", job_id, _err_note[:200],
+                        )
+                        return Command(
+                            goto="park_provider_dead",
+                            update={
+                                **update,
+                                "messages": [],
+                                "provider_dead_detail": (
+                                    f"code_writer failed twice without producing "
+                                    f"a draft ({_err_note})"
+                                ),
+                            },
+                        )
                     logger.error(
                         "_invoke_code_writer: repeated no-draft writer failures + "
                         "skip_approvals → cleanup (honest failure, job %s)", job_id,
@@ -11237,6 +11358,9 @@ def build_scrape_graph(
     # [wave-16 B3] Dependency park: browser_service itself cannot serve.
     # Command-routed terminal node — no static out-edge (like route_after_execution).
     workflow.add_node("park_browser_unavailable", _park_browser_unavailable)
+    # [wave-53 candidate 10] Provider park: the code_writer died twice on a
+    # provider-class error with no draft — same Command-routed terminal shape.
+    workflow.add_node("park_provider_dead", _park_provider_dead)
 
     # ── Wire edges ──────────────────────────────────────────────────────
 
