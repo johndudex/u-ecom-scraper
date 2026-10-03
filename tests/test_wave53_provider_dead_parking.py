@@ -167,6 +167,33 @@ class TestParkNode:
         assert job.last_parked_at >= before - 5
 
     @pytest.mark.django_db
+    def test_second_park_refreshes_the_delay_clock(self):
+        """Job-545 live finding: Coalesce kept park #1's timestamp, so park
+        #2 inherited the elapsed 25-min delay and re-drove immediately
+        instead of waiting a fresh window. Every park is an episode start —
+        the clock must restart from it."""
+        from scraper.models import ScrapeJob
+
+        import agents.graph as g
+
+        job = _make_running_job()
+        ScrapeJob.objects.filter(pk=job.pk).update(
+            last_parked_at=time.time() - 40 * 60
+        )
+        state = {
+            "job_id": job.id,
+            "provider_dead_detail": "code_writer failed twice (Connection error.)",
+        }
+        before = time.time()
+        g._park_provider_dead(state)
+
+        job.refresh_from_db()
+        assert job.last_parked_at >= before - 5, (
+            "a second park must stamp a FRESH delay clock, not inherit the "
+            "first episode's elapsed time"
+        )
+
+    @pytest.mark.django_db
     def test_park_at_cap_finalizes_failed_honestly(self):
         from scraper.models import ScrapeJob
 

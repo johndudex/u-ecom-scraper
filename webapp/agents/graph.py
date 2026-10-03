@@ -5484,8 +5484,6 @@ def _park_provider_dead(state: ScrapeState) -> Command:
         or "provider unavailable"
     )
     try:
-        from django.db.models import Value
-        from django.db.models.functions import Coalesce
         from scraper.models import ScrapeJob
         from scraper.tasks import PROVIDER_REDRIVE_MAX
 
@@ -5513,7 +5511,12 @@ def _park_provider_dead(state: ScrapeState) -> Command:
         ScrapeJob.objects.filter(pk=job_id).update(
             status=ScrapeJob.STATUS_PROVIDER_DEAD,
             error_message=detail[:2000],
-            last_parked_at=Coalesce("last_parked_at", Value(float(time.time()))),
+            # Fresh stamp EVERY park: a park is an episode start, and the
+            # resumer's 25-min delay runs from it. (Coalesce here kept park
+            # #1's timestamp — job-545 live finding: park #2 inherited the
+            # elapsed delay and re-drove immediately instead of waiting a
+            # fresh window.)
+            last_parked_at=float(time.time()),
         )
         logger.warning(
             "park_provider_dead: job %s parked (provider dead, re-drive %d of "
