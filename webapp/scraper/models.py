@@ -270,6 +270,31 @@ class ScrapeJob(models.Model):
         return 0
 
     @property
+    def is_full_extraction(self) -> bool:
+        """[wave-54] Display truth for the Mode badge: does this run extract
+        everything, or a narrowed sample?
+
+        Intake-born rows always carry ``full_extraction=False`` (only the
+        legacy /home form has that checkbox), while delivery is driven by
+        ``scope`` — so rendering the raw flag labeled every full-scope job
+        "Sample" (job-1200 RCA). This derives the verdict instead: the flag
+        OR a scope that covers everything, with the same narrowed predicate
+        the graph uses (scope in firstn/filter, or a non-empty scope_value,
+        means narrowed even under scope=all).
+
+        Deliberately display-only: ``sample_only = not full_extraction``
+        gates field_confirmation's skip and the pre-execution-approval
+        bypass, so flipping the stored flag at creation would activate HITL
+        interrupts on every scope=all job. The flag keeps its semantics;
+        only rendering derives.
+        """
+        if self.full_extraction:
+            return True
+        if (self.scope or "").strip().lower() != "all":
+            return False
+        return not (self.scope_value or "").strip()
+
+    @property
     def page_type_display(self) -> str:
         labels = {
             "product": "Product",

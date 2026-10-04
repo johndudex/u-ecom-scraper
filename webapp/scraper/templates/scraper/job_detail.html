@@ -17,7 +17,7 @@
         <div>
             <div class="flex items-center gap-2.5">
                 <h2 class="text-2xl font-extrabold text-ink font-mono">Job #{{ job.id }}</h2>
-                <span class="status-badge {% if job.full_extraction %}status-auto_queued{% else %}status-pending{% endif %}">{% if job.full_extraction %}FULL{% else %}SAMPLE{% endif %}</span>
+                <span class="status-badge {% if job.is_full_extraction %}status-auto_queued{% else %}status-pending{% endif %}">{% if job.is_full_extraction %}FULL{% else %}SAMPLE{% endif %}</span>
                 {% if job.page_type %}
                 <span class="status-badge bg-accent/10 text-accent">{{ job.page_type_display }}</span>
                 {% endif %}
@@ -245,7 +245,7 @@
                     <tr class="border-b border-line-subtle"><td class="px-4 py-2.5 text-ink-muted text-xs font-medium">Method</td><td class="px-4 py-2.5 text-ink font-medium text-xs">{{ job.scraping_method|default:"-" }}</td></tr>
                     <tr class="border-b border-line-subtle"><td class="px-4 py-2.5 text-ink-muted text-xs font-medium">Currency</td><td class="px-4 py-2.5 text-ink font-medium text-xs">{{ job.currency|default:"-" }}</td></tr>
                     <tr class="border-b border-line-subtle"><td class="px-4 py-2.5 text-ink-muted text-xs font-medium">Products</td><td class="px-4 py-2.5 text-ink font-medium text-xs font-mono">{{ job.product_count|default:"-" }}</td></tr>
-                    <tr class="border-b border-line-subtle"><td class="px-4 py-2.5 text-ink-muted text-xs font-medium">Mode</td><td class="px-4 py-2.5 text-ink font-medium text-xs">{% if job.full_extraction %}Full{% else %}Sample{% endif %}</td></tr>
+                    <tr class="border-b border-line-subtle"><td class="px-4 py-2.5 text-ink-muted text-xs font-medium">Mode</td><td class="px-4 py-2.5 text-ink font-medium text-xs">{% if job.is_full_extraction %}Full{% else %}Sample{% endif %}</td></tr>
                     <tr class="border-b border-line-subtle"><td class="px-4 py-2.5 text-ink-muted text-xs font-medium">Thread</td><td class="px-4 py-2.5"><code class="text-accent bg-accent/10 px-1.5 py-0.5 rounded text-[10px] font-mono">{{ job.graph_thread_id|default:"-" }}</code></td></tr>
                     <tr><td class="px-4 py-2.5 text-ink-muted text-xs font-medium">Started</td><td class="px-4 py-2.5 text-ink font-medium text-xs font-mono">{{ job.started_at|date:"M d, H:i" }}</td></tr>
                     {% if job.completed_at %}

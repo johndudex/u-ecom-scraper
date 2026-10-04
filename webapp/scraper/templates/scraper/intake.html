@@ -1961,6 +1961,44 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
           var navList=X('#nav-list-text'); if(navList && !navList.value.trim()) navList.value=listTxt;
           if(typeof refreshListLocks==='function'){ refreshListLocks(); }
         }
+        // [wave-54] list_page jobs: the seed listing IS j.url — the wave-41
+        // arm covers url_list and the search arms cover search_term, so a
+        // correctly-configured listing job rendered as an empty box. (The
+        // 'listing' nav card is shared with navigation jobs, whose j.url is
+        // the homepage with listings discovered at runtime — they key on
+        // input_mode, not the card.)
+        if(j.input_mode==='list_page' && j.url){
+          var cfgLst=X('#cfg-listing-text'); if(cfgLst && !cfgLst.value.trim()) cfgLst.value=j.url;
+          var navLst=X('#nav-listing-text'); if(navLst && !navLst.value.trim()) navLst.value=j.url;
+        }
+        // [wave-54] restore scope (radios + value) — the form kept its
+        // "First 10" default on a deep link, so a scope=all job read as a
+        // 10-row sample right above a Details tab saying All. No change-
+        // event dispatch: that handler focuses the input (steals scroll on
+        // load); mirror its DOM side effects instead.
+        if(j.scope && ['firstn','filter','all'].indexOf(j.scope)>=0){
+          var srad=document.querySelector('input[name="scope"][value="'+j.scope+'"]');
+          if(srad && !srad.checked){
+            srad.checked=true;
+            var srow=X('#scope-row');
+            if(srow){ srow.querySelectorAll('.navcard').forEach(function(c){c.classList.remove('sel');}); }
+            var scard=srad.closest('.navcard'); if(scard) scard.classList.add('sel');
+            var sinp=X('#scope-input'), scfg=SCOPE_CFG[j.scope];
+            if(scfg){
+              sinp.classList.remove('hidden');
+              sinp.placeholder=scfg.ph;
+              sinp.setAttribute('inputmode',scfg.mode);
+              sinp.setAttribute('aria-label',scfg.label);
+            } else {
+              sinp.classList.add('hidden');
+            }
+          }
+          var sval=(j.scope_value!=null)?String(j.scope_value).trim():'';
+          if(sval){ var svinp=X('#scope-input'); if(svinp) svinp.value=sval; }
+          if(typeof updateScopeSampleNote==='function') updateScopeSampleNote();
+          if(typeof refreshRunSampleGate==='function') refreshRunSampleGate();
+          if(typeof refreshGates==='function') refreshGates();
+        }
         intakeState.cfgPopulated=true;
       }
       if(j.started_at && j.completed_at){
@@ -1977,7 +2015,13 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       det.push(['Status', (j.status||'').replace(/_/g,' ')]);
       det.push(['Records', intakeState.recordsStr]);
       if(j.input_urls_count) det.push(['Input URLs', j.input_urls_count + (j.input_urls_truncated ? ' (showing first '+j.input_urls.length+')' : '')]);
-      if(j.full_extraction!=null) det.push(['Mode', j.full_extraction?'Full':'Sample']);
+      // [wave-54] Mode must not lie: intake-born rows carry full_extraction=
+      // False (only the legacy /home form sets it) while delivery is driven
+      // by scope — derive the same verdict ScrapeJob.is_full_extraction does
+      // (scope=all with no scope_value is Full even when the flag is False).
+      var _full=(j.full_extraction||(j.scope==='all' && !(j.scope_value||'').trim()));
+      if(j.full_extraction!=null) det.push(['Mode', _full?'Full':'Sample']);
+      if(j.scope) det.push(['Scope', j.scope==='all'?'All':(j.scope==='firstn'?('First '+((j.scope_value||'').trim()||'—')):('Filter'+(((j.scope_value||'').trim())?' ('+j.scope_value.trim()+')':'')))])
       if(j.started_at) det.push(['Started', new Date(j.started_at).toLocaleString()]);
       if(j.completed_at) det.push(['Finished', new Date(j.completed_at).toLocaleString()]);
       if(j.url) det.push(['Source', j.url]);

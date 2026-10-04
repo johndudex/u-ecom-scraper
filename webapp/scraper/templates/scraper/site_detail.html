@@ -153,8 +153,8 @@
                         {% if job.product_count %}
                         <span class="text-xs font-semibold text-accent font-mono">{{ job.product_count }}</span>
                         {% endif %}
-                        <span class="status-badge {% if job.full_extraction %}status-auto_queued{% else %}status-pending{% endif %}">
-                            {% if job.full_extraction %}Full{% else %}Sample{% endif %}
+                        <span class="status-badge {% if job.is_full_extraction %}status-auto_queued{% else %}status-pending{% endif %}">
+                            {% if job.is_full_extraction %}Full{% else %}Sample{% endif %}
                         </span>
                         <span class="status-badge status-{{ job.status }}">{{ job.get_status_display }}</span>
                     </div>
