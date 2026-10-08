@@ -519,14 +519,16 @@ def _persist_field_confirmation_sample(job_id: int, sample_text: str) -> None:
     try:
         from scraper.models import SessionLog
 
-        seq = SessionLog.objects.filter(job_id=job_id).count()
-        SessionLog.objects.create(
-            job_id=job_id,
-            role=SessionLog.ROLE_SYSTEM,
-            agent="field_confirmation",
-            content=f"Sample output presented for review:\n\n{sample_text[:4000]}",
-            seq=seq,
-        )
+        from agents.graph import _session_seq_alloc
+
+        with _session_seq_alloc(job_id) as alloc:
+            SessionLog.objects.create(
+                job_id=job_id,
+                role=SessionLog.ROLE_SYSTEM,
+                agent="field_confirmation",
+                content=f"Sample output presented for review:\n\n{sample_text[:4000]}",
+                seq=alloc(),
+            )
     except Exception as exc:
         logger.warning(
             "Failed to persist field_confirmation sample for job %s: %s", job_id, exc
@@ -545,14 +547,16 @@ def _persist_field_confirmation_decision(
         lines = [f"User decision: {choice}"]
         if feedback:
             lines.append(f"Feedback: {feedback[:500]}")
-        seq = SessionLog.objects.filter(job_id=job_id).count()
-        SessionLog.objects.create(
-            job_id=job_id,
-            role=SessionLog.ROLE_USER,
-            agent="field_confirmation",
-            content="\n".join(lines),
-            seq=seq,
-        )
+        from agents.graph import _session_seq_alloc
+
+        with _session_seq_alloc(job_id) as alloc:
+            SessionLog.objects.create(
+                job_id=job_id,
+                role=SessionLog.ROLE_USER,
+                agent="field_confirmation",
+                content="\n".join(lines),
+                seq=alloc(),
+            )
     except Exception as exc:
         logger.warning(
             "Failed to persist field_confirmation decision for job %s: %s", job_id, exc

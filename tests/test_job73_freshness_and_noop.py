@@ -60,6 +60,10 @@ def _load_scan():
         _grab(src, "_freshness_floor")
         + _grab(src, "_is_dead_product")
         + _grab(src, "_is_discovery_output")
+        # [wave-55 C3] see test_job71_output_gates: the OUTPUT-AS-TRUTH
+        # fallback applies the item-shape floor, so the helper must be in
+        # scope or the fallback's broad except reads as False.
+        + _grab(src, "_row_url_has_path")
         + _grab(src, "_scraper_has_real_items")
     )
     from src.content_types import has_substantive_field, output_filter_fields

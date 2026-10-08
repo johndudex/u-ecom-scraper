@@ -53,7 +53,9 @@ def _parked(seconds: int, episode_start: float | None = None) -> ScrapeJob:
 def test_over_budget_job_finalizes_not_redispatched(monkeypatch):
     job = _parked(seconds=BUDGET + 1)
     dispatched: list[int] = []
-    monkeypatch.setattr(st, "dispatch_scrape_job", lambda jid: dispatched.append(jid))
+    monkeypatch.setattr(
+        st, "dispatch_scrape_job", lambda jid, **kw: dispatched.append(jid)
+    )
     out = st.resume_browser_unavailable_jobs()
     assert dispatched == []
     assert job.id in {e["job_id"] for e in out.get("exhausted", [])}
@@ -65,7 +67,9 @@ def test_over_budget_job_finalizes_not_redispatched(monkeypatch):
 def test_under_budget_job_still_resumes(monkeypatch):
     job = _parked(seconds=60)
     dispatched: list[int] = []
-    monkeypatch.setattr(st, "dispatch_scrape_job", lambda jid: dispatched.append(jid))
+    monkeypatch.setattr(
+        st, "dispatch_scrape_job", lambda jid, **kw: dispatched.append(jid)
+    )
     out = st.resume_browser_unavailable_jobs()
     assert dispatched == [job.id]
     assert out["resumed"] == 1
@@ -75,7 +79,9 @@ def test_running_episode_counts_toward_budget(monkeypatch):
     # Parked 7000s historically + 301s into the CURRENT episode = over budget.
     job = _parked(seconds=7000, episode_start=time.time() - 301)
     dispatched: list[int] = []
-    monkeypatch.setattr(st, "dispatch_scrape_job", lambda jid: dispatched.append(jid))
+    monkeypatch.setattr(
+        st, "dispatch_scrape_job", lambda jid, **kw: dispatched.append(jid)
+    )
     out = st.resume_browser_unavailable_jobs()
     assert dispatched == []
     assert job.id in {e["job_id"] for e in out.get("exhausted", [])}
@@ -83,7 +89,7 @@ def test_running_episode_counts_toward_budget(monkeypatch):
 
 def test_under_budget_episode_accumulates_on_resume(monkeypatch):
     job = _parked(seconds=100, episode_start=time.time() - 60)
-    monkeypatch.setattr(st, "dispatch_scrape_job", lambda jid: None)
+    monkeypatch.setattr(st, "dispatch_scrape_job", lambda jid, **kw: None)
     st.resume_browser_unavailable_jobs()
     job.refresh_from_db()
     assert 159 <= (job.parked_seconds or 0) <= 161  # 100 + ~60s episode

@@ -3,9 +3,10 @@
 Locks:
 - only failed/cancelled (short window) + completed (long window) are purged
 - parked/resumable statuses are NEVER touched (pending, running,
-  waiting_approval, captcha_blocked, akamai_blocked, browser_unavailable) —
-  resumable jobs need their checkpoints; models._TERMINAL_JOB_STATUSES
-  deliberately counts captcha/akamai as terminal, retention must NOT
+  waiting_approval, captcha_blocked, akamai_blocked, browser_unavailable,
+  provider_dead) — resumable jobs need their checkpoints;
+  models._TERMINAL_JOB_STATUSES deliberately counts captcha/akamai as
+  terminal, retention must NOT
 - ScrapeJob rows + JobListing rows survive (history intact)
 - the id cursor terminates the loop when job rows persist (batch_size <
   expired count)
@@ -206,6 +207,7 @@ class TestPurgeSemantics:
                 "captcha_blocked",
                 "akamai_blocked",
                 "browser_unavailable",
+                "provider_dead",
             )
         ]
         _seed_checkpoints([j.id for j in parked])

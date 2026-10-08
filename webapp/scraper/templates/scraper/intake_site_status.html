@@ -53,6 +53,8 @@
   .status.st-pending { background:#fef9c3; color:#a16207; }
   .status.st-waiting_approval { background:#f3e8ff; color:#7e22ce; }
   .status.st-cancelled, .status.st-captcha_blocked, .status.st-akamai_blocked, .status.st-browser_unavailable { background:#ffedd5; color:#c2410c; }
+  {# wave-55 H1: an all-fail probe is an honest failure (retryable), not an anti-bot wall — badge it as such. #}
+  .badge.probe-failed { background:#fef9c3; color:#a16207; }
   .muted { color:var(--muted); }
   a.jl { color:#1d4ed8; }
 </style>
@@ -118,7 +120,7 @@
       <td>{{ r.site_name }}</td>
       <td class="url">{{ r.product_url }}</td>
       <td class="url listing" title="{{ r.listing }}">{{ r.listing }}</td>
-      <td><span class="status st-{{ r.final_status }}">{{ r.final_status }}</span></td>
+      <td><span class="status st-{{ r.final_status }}">{{ r.final_status }}</span>{% if r.probe_failed %} <span class="badge probe-failed" title="All probe methods failed with no captcha page — no wall, retryable">probe-failed</span>{% endif %}</td>
       <td>{{ r.attempts }}</td>
       <td>{% if r.first_try %}<span class="badge first-try">first-try</span>{% else %}<span class="muted">&mdash;</span>{% endif %}</td>
       <td>{% if r.success_job_url %}<a class="jl" href="{{ r.success_job_url }}">view job</a>{% else %}<span class="muted">&mdash;</span>{% endif %}</td>

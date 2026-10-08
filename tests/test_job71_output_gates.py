@@ -47,6 +47,10 @@ def _load():
         grab("_freshness_floor")
         + grab("_is_dead_product")
         + grab("_is_discovery_output")
+        # [wave-55 C3] the OUTPUT-AS-TRUTH fallback now applies the same
+        # item-shape floor as the primary predicate — a missing helper here
+        # is swallowed by the fallback's broad except and reads as False.
+        + grab("_row_url_has_path")
         + grab("_scraper_has_real_items")
     )
 

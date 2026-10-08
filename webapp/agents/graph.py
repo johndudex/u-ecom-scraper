@@ -695,6 +695,70 @@ def _patch_scraper_output_filter(
         logger.warning("_patch_scraper_output_filter: %s", exc)
 
 
+def _draft_base_order(code: str, draft_dir: str, project_root: str) -> list:
+    """Order the bases a staged draft imports from, per the anchor it carries.
+
+    [wave-55 C1] Python resolves ``import src`` by walking ``sys.path`` in
+    order, and the first ``src`` package on it captures the name — an
+    intervening ``src/__init__.py`` shadows the root's ``discovery.py`` even
+    though a bare file-existence test at the root still sees one. Which entry
+    leads is decided by the anchor line the draft carries:
+
+    - the shipped templates insert ``PROJECT_ROOT`` (repo root) → root first;
+    - the banned parent-relative insert (``dirname(__file__)/..`` or the
+      ``SCRIPT_DIR`` alias) puts ``workspace/`` at ``sys.path[0]`` → workspace
+      first, which is exactly the base a writer-minted ``workspace/src/`` sits
+      on;
+    - no detectable anchor → assume that same unsafe parent-first order, so a
+      draft whose path setup we cannot read gets the conservative answer.
+    """
+    workspace = os.path.dirname(draft_dir) if draft_dir else ""
+    if "sys.path.insert(0, PROJECT_ROOT)" in code:
+        return [b for b in (project_root, workspace, draft_dir) if b]
+    return [b for b in (workspace, project_root, draft_dir) if b]
+
+
+def _src_module_resolves(
+    module: str, draft_dir: str, project_root: str, bases: list | None = None
+) -> bool:
+    """Can a staged draft import *module*? Resolves it the way the interpreter
+    would, not the way the worker's own ``sys.path`` does.
+
+    [wave-55 C1] The injection runs in the celery worker, whose ``sys.path``
+    is not the subprocess's — *bases* is the ordered import path the draft's
+    own anchor line builds (``_draft_base_order``). Inside it, first-package-
+    wins: at the first base carrying a regular ``src/`` package
+    (``__init__.py``) the name is decided, and the answer is whether the rest
+    of *module* exists INSIDE that package. A ``src/`` directory without an
+    ``__init__.py`` is only a namespace portion — any regular package on any
+    entry beats it — so it is consulted only when no regular package exists.
+
+    Both failure directions are prod incidents: a ``workspace/src/`` clone
+    that reads as resolvable re-arms the 30-job ModuleNotFoundError run (1183
+    dollartree's terminal error_message IS that traceback), while the healthy
+    pipeline package reading as a shadow strips the src.discovery backstop
+    from every draft the writer ships.
+    """
+    parts = module.split(".")
+    top = parts[0]
+    if bases is None:
+        bases = [b for b in (project_root, draft_dir) if b]
+
+    def _resolves_from(base):
+        target = os.path.join(base, *parts)
+        return os.path.isfile(target + ".py") or os.path.isfile(
+            os.path.join(target, "__init__.py")
+        )
+
+    regular = [b for b in bases if os.path.isfile(os.path.join(b, top, "__init__.py"))]
+    if regular:
+        return _resolves_from(regular[0])
+    namespace = [b for b in bases if os.path.isdir(os.path.join(b, top))]
+    if namespace:
+        return _resolves_from(namespace[0])
+    return False
+
+
 def _enforce_discovery_import(slug: str) -> None:
     """Post-generation enforcement: ensure the generated scraper imports src.discovery.
 
@@ -716,6 +780,28 @@ def _enforce_discovery_import(slug: str) -> None:
 
         # Already compliant?
         if "from src.discovery import" in code and "discover_item_urls(" in code:
+            return
+
+        # [wave-55 C1] Inject only what can actually resolve. The unconditional
+        # injection turned a cosmetic workspace/src/ shadow into 27 prod
+        # ModuleNotFoundError jobs (1183 dollartree's terminal error_message IS
+        # that traceback): a draft that cannot import src.discovery keeps its
+        # inline pagination — that one runs. The draft text decides the base
+        # order: its own anchor line is what puts the root or the workspace in
+        # front of the interpreter's search path.
+        draft_dir = os.path.dirname(draft_path)
+        project_root = _get_project_root()
+        if not _src_module_resolves(
+            "src.discovery",
+            draft_dir,
+            project_root,
+            bases=_draft_base_order(code, draft_dir, project_root),
+        ):
+            logger.warning(
+                "_enforce_discovery_import: src.discovery does not resolve for %s "
+                "— leaving the draft's inline pagination in place instead of "
+                "injecting an import that would crash at startup", slug,
+            )
             return
 
         # Hand-rolled pagination detected (inline _click_load_more / _get_next_page_url)?
@@ -915,6 +1001,24 @@ def _load_test_report(slug: str, min_mtime: float | None = None) -> dict | None:
         with open(report_path, encoding="utf-8") as f:
             data = json.loads(f.read())
         if isinstance(data, dict):
+            # [wave-55 H9a] test_timestamp is a server-side stamp, not LLM
+            # prose: the prompt used to ask the model to author an ISO-8601
+            # time, so the field said whatever the model believed. The verdict
+            # is the FILE — stamp it from the mtime the staleness gate already
+            # trusts, overwriting whatever the report carried.
+            try:
+                from datetime import datetime
+                from datetime import timezone as _tz
+
+                data["test_timestamp"] = datetime.fromtimestamp(
+                    os.path.getmtime(report_path), _tz.utc
+                ).isoformat()
+            except OSError as stamp_exc:
+                logger.warning(
+                    "_load_test_report: could not stamp test_timestamp from "
+                    "%s mtime: %s",
+                    report_path, stamp_exc,
+                )
             return data
     except Exception as exc:
         logger.warning("_load_test_report: failed to parse %s: %s", report_path, exc)
@@ -1167,18 +1271,19 @@ class _ToolCallLogger(BaseCallbackHandler):
             )
             from scraper.models import SessionLog
 
-            seq = SessionLog.objects.filter(job_id=self.job_id).count()
-            SessionLog.objects.create(
-                job_id=self.job_id,
-                # P0-18: tool-call traces are NOT assistant messages. Writing
-                # them as ROLE_ASSISTANT polluted the agent-summary view (tool
-                # noise masqueraded as the agent's reasoning text). Use
-                # ROLE_SYSTEM so "assistant" means real LLM output only.
-                role=SessionLog.ROLE_SYSTEM,
-                agent=self.agent_name,
-                content=f"[TOOL] {name}: {(input_str or '')[:140]}",
-                seq=seq,
-            )
+            # [wave-55 H9b] allocated under the job lock (see helper).
+            with _session_seq_alloc(self.job_id) as alloc:
+                SessionLog.objects.create(
+                    job_id=self.job_id,
+                    # P0-18: tool-call traces are NOT assistant messages. Writing
+                    # them as ROLE_ASSISTANT polluted the agent-summary view (tool
+                    # noise masqueraded as the agent's reasoning text). Use
+                    # ROLE_SYSTEM so "assistant" means real LLM output only.
+                    role=SessionLog.ROLE_SYSTEM,
+                    agent=self.agent_name,
+                    content=f"[TOOL] {name}: {(input_str or '')[:140]}",
+                    seq=alloc(),
+                )
         except Exception:
             # A logging callback must NEVER crash the agent it observes.
             pass
@@ -1361,19 +1466,21 @@ def _start_heartbeat(
                 ),
             ).exists()
             if not _job_terminal:
-                seq = SessionLog.objects.filter(job_id=job_id).count()
-                _content = (
-                    f"{prefix} Agent {agent_name} started (beat every {interval}s)"
-                    if _first
-                    else f"{prefix} Agent {agent_name} still running..."
-                )
-                SessionLog.objects.create(
-                    job_id=job_id,
-                    role=SessionLog.ROLE_SYSTEM,
-                    agent=agent_name,
-                    content=_content,
-                    seq=seq,
-                )
+                # [wave-55 H9b] allocated under the job lock (see helper) —
+                # this Timer thread races the agent loop's batch flush.
+                with _session_seq_alloc(job_id) as alloc:
+                    _content = (
+                        f"{prefix} Agent {agent_name} started (beat every {interval}s)"
+                        if _first
+                        else f"{prefix} Agent {agent_name} still running..."
+                    )
+                    SessionLog.objects.create(
+                        job_id=job_id,
+                        role=SessionLog.ROLE_SYSTEM,
+                        agent=agent_name,
+                        content=_content,
+                        seq=alloc(),
+                    )
         except Exception as exc:
             # [wave-14 job-133] A silently-swallowed beat failure made the
             # heartbeat's OWN health unobservable — "beat didn't fire" and
@@ -1467,6 +1574,81 @@ def _notify_phase(job_id: int, node_name: str, status: str) -> None:
         pass
 
 
+# [wave-55 H9b] SessionLog seq allocation. The writers used to read
+# ``SessionLog.objects.filter(job_id=...).count()`` — a count of SURVIVING
+# rows, not the highest number handed out — so two writers that read it
+# together (the heartbeat Timer thread vs the agent loop's batch flush) wrote
+# the same seq, and the job log, which pages on ``seq__gt=since_seq``
+# (views.py:1434), never delivered the row that landed behind the cursor.
+_SESSION_SEQ_LOCK = threading.Lock()
+
+
+@contextmanager
+def _session_seq_alloc(job_id: int):
+    """Serialize SessionLog writes for one job; yields a seq allocator.
+
+    Usage — every writer creates its rows INSIDE the block, so a concurrent
+    writer cannot observe a seq until the rows holding it are committed:
+
+        with _session_seq_alloc(job_id) as alloc:
+            SessionLog.objects.create(..., seq=alloc())
+
+    The number comes from ``max(seq) + 1`` under the job-row lock (a deleted
+    row rewinds a count(), never a high-water mark); the process-local lock
+    makes the read-then-write pair atomic for the in-process racers the
+    heartbeat and the batch flush actually are. Threads outside this process
+    are serialized by the SELECT ... FOR UPDATE (a no-op on SQLite, where the
+    process lock is the whole story). When there is no lockable row or no
+    reachable DB (a stand-in manager in a unit test, a purged job) the helper
+    degrades to the process lock alone — the audit's racers were threads of
+    one worker anyway — and never to a shared counter.
+    """
+    from django.db import transaction
+    from django.db.models import Max
+    from scraper.models import ScrapeJob, SessionLog
+
+    with _SESSION_SEQ_LOCK:
+        candidate = transaction.atomic()
+        txn = None
+        try:
+            candidate.__enter__()
+            ScrapeJob.objects.select_for_update().only("pk").get(pk=job_id)
+            txn = candidate
+        except Exception:
+            try:
+                candidate.__exit__(None, None, None)
+            except Exception:
+                pass
+        try:
+            last = (
+                SessionLog.objects.filter(job_id=job_id).aggregate(
+                    _top=Max("seq")
+                )["_top"]
+                or 0
+            )
+        except Exception:
+            # A stand-in manager (unit fakes) answers only filter/count/
+            # create; real Django answers aggregate() or raises a DB error.
+            # Either way alloc() still counts up under the lock.
+            try:
+                last = SessionLog.objects.filter(job_id=job_id).count()
+            except Exception:
+                last = 0
+        next_seq = last + 1
+
+        def alloc() -> int:
+            nonlocal next_seq
+            seq = next_seq
+            next_seq += 1
+            return seq
+
+        try:
+            yield alloc
+        finally:
+            if txn is not None:
+                txn.__exit__(None, None, None)
+
+
 def _log_event_row(job_id: int, agent: str, content: str) -> None:
     """One SessionLog row for a deterministic phase event (no agent loop).
 
@@ -1478,14 +1660,15 @@ def _log_event_row(job_id: int, agent: str, content: str) -> None:
     try:
         from scraper.models import SessionLog
 
-        seq = SessionLog.objects.filter(job_id=job_id).count()
-        SessionLog.objects.create(
-            job_id=job_id,
-            role=SessionLog.ROLE_SYSTEM,
-            agent=agent,
-            content=content[:4000],
-            seq=seq,
-        )
+        # [wave-55 H9b] allocated under the job lock (see helper).
+        with _session_seq_alloc(job_id) as alloc:
+            SessionLog.objects.create(
+                job_id=job_id,
+                role=SessionLog.ROLE_SYSTEM,
+                agent=agent,
+                content=content[:4000],
+                seq=alloc(),
+            )
     except Exception:
         pass
 
@@ -2174,21 +2357,94 @@ def check_accessibility(state: ScrapeState, config: RunnableConfig) -> Command:
         _notify_phase(job_id, "accessibility_check", "done")
         return _accessibility_goto(state)
 
-    if data.get("captcha_detected"):
+    if data.get("probe_failed"):
+        # [wave-55 H1] Honest all-fail tail: every rung came back empty and
+        # NO rung showed a captcha page, so this is not a wall — the job
+        # fails as a plain, retryable failure carrying the per-rung census
+        # (check_accessibility used to stamp these rows captcha_blocked,
+        # which silently deleted 27 hosts from the retryable backlog).
+        error_msg = data.get("error") or (
+            f"[PROBE-FAILED 0/{len(data.get('methods_tried', []))} captcha] "
+            "all probe methods failed"
+        )
+        status_label = "probe_failed"
+        logger.warning(
+            "check_accessibility: %s for job %s — %s",
+            status_label,
+            job_id,
+            error_msg[:200],
+        )
+
+        try:
+            from scraper.models import ScrapeJob
+
+            ScrapeJob.objects.filter(pk=job_id).update(
+                status=ScrapeJob.STATUS_FAILED,
+                error_message=error_msg[:2000],
+                completed_at=timezone.now(),
+            )
+        except Exception as exc:
+            logger.warning("check_accessibility: failed to update job status: %s", exc)
+
+        _notify_phase(job_id, "accessibility_check", "done")
+        data.setdefault("probed_url", url)
+        return Command(
+            update={
+                "error_message": error_msg,
+                "probe_result": data,
+                "probe_url": url,
+            },
+            goto=END,
+        )
+
+    # [wave-55 H1] A captcha/akamai verdict needs evidence: at least one rung
+    # must have actually returned a captcha page (captcha_hits), or the rungs
+    # must have reported Akamai. Producers that predate the census (hand-built
+    # probe dicts) keep the legacy verdict rather than sailing through the
+    # gate on a missing key.
+    _captcha_hits = int(data.get("captcha_hits") or 0)
+    _captcha_verdict = bool(data.get("captcha_detected")) and (
+        _captcha_hits > 0 or "captcha_hits" not in data
+    )
+    if _captcha_verdict or data.get("akamai_detected"):
         methods = data.get("methods_tried", [])
         captcha_type = data.get("captcha_type", "unknown")
         reasoning = data.get("captcha_reasoning", "")
         is_akamai = data.get("akamai_detected", False)
-        error_msg = (
-            f"Akamai Bot Manager protection detected on {url}. "
-            f"All {len(methods)} probe methods across all proxy tiers "
-            f"were blocked by Akamai. Site skipped."
-            if is_akamai
-            else f"Captcha detected: {captcha_type}. "
-            f"All {len(methods)} probe methods returned captcha pages. "
-            f"Methods tried: {', '.join(methods)}. "
-            f"{reasoning}"
-        )
+        if is_akamai:
+            # [wave-55 H1 residual] akamai_detected is ">=1 rung saw an
+            # Akamai page", not "every rung did" — the old "All {n} probe
+            # methods ... blocked by Akamai" over-claimed a mixed 2-akamai +
+            # 13x403 run into a total wall. State the census the ladder
+            # measured, split out the captcha rungs (disjoint from the
+            # akamai ones) and the ordinary no-content remainder. Producers
+            # predating the census carry no akamai_method_count; they keep
+            # the all-methods reading rather than a count we do not have.
+            _akamai_hits = (
+                int(data.get("akamai_method_count") or 0)
+                if "akamai_method_count" in data
+                else len(methods)
+            )
+            _akamai_rest = max(len(methods) - _akamai_hits - _captcha_hits, 0)
+            error_msg = (
+                f"Akamai Bot Manager protection detected on {url}. "
+                f"{_akamai_hits}/{len(methods)} probe methods returned "
+                f"Akamai pages"
+            )
+            if _captcha_hits:
+                error_msg += f", {_captcha_hits} returned captcha pages"
+            if _akamai_rest:
+                error_msg += (
+                    f", {_akamai_rest} returned no content and no captcha page"
+                )
+            error_msg += ". Site skipped."
+        else:
+            error_msg = (
+                f"Captcha detected: {captcha_type}. "
+                f"{_captcha_hits}/{len(methods)} probe methods returned captcha "
+                f"pages. Methods tried: {', '.join(methods)}. "
+                f"{reasoning}"
+            )
         status_label = "akamai_blocked" if is_akamai else "captcha_blocked"
         logger.warning(
             "check_accessibility: %s for job %s — %s",
@@ -4162,18 +4418,19 @@ def _traverse_heartbeat_writer(job_id, *, renew_lock: bool = False):
         try:
             from scraper.models import SessionLog
 
-            seq = SessionLog.objects.filter(job_id=job_id).count()
-            SessionLog.objects.create(
-                job_id=job_id,
-                role=SessionLog.ROLE_SYSTEM,
-                agent="browser_traverse",
-                content=(
-                    f"[NAV-TRAVERSE] step {info.get('step', '?')} elapsed "
-                    f"{int(info.get('elapsed_s') or 0)}s actions="
-                    f"{info.get('actions', '?')} ({info.get('reason', 'step')})"
-                ),
-                seq=seq,
-            )
+            # [wave-55 H9b] allocated under the job lock (see helper).
+            with _session_seq_alloc(job_id) as alloc:
+                SessionLog.objects.create(
+                    job_id=job_id,
+                    role=SessionLog.ROLE_SYSTEM,
+                    agent="browser_traverse",
+                    content=(
+                        f"[NAV-TRAVERSE] step {info.get('step', '?')} elapsed "
+                        f"{int(info.get('elapsed_s') or 0)}s actions="
+                        f"{info.get('actions', '?')} ({info.get('reason', 'step')})"
+                    ),
+                    seq=alloc(),
+                )
         except Exception as exc:
             logger.debug("traverse heartbeat write failed (job %s): %s", job_id, exc)
         if renew_lock:
@@ -7648,9 +7905,11 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         # [jobs-79/80] Snapshot EVERY completed draft to THIS job's FM key
         # immediately — promotion to production only happens at cleanup, which
         # a wedged/killed run never reaches. setup_workspace restores from this
-        # key when the local draft is missing (watchdog re-drive after an
-        # ephemeral-volume recycle), so the job resumes with the draft its
-        # writer actually produced instead of regenerating from nothing.
+        # key when the local draft is missing (watchdog re-drive, or the
+        # end-of-run workspace cleanup racing a retry — workspace/ is a
+        # PERSISTENT Railway volume, so a redeploy does NOT reset it), so the
+        # job resumes with the draft its writer actually produced instead of
+        # regenerating from nothing.
         try:
             _cw_draft = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
             if os.path.isfile(_cw_draft):
@@ -10374,6 +10633,28 @@ def _invoke_skill_learner(state: ScrapeState, config: RunnableConfig) -> dict[st
             except Exception as exc:
                 logger.debug("skill_learner: failed to preserve reports: %s", exc)
 
+        # [wave-55 H6] The learner only REPORTS proposals (it has had no write
+        # tools since wave-29 A1) and defers to nav_skill_review — which ran
+        # long before this report existed and early-returns on most jobs, so
+        # every proposal died in this ephemeral file. Replay the high-
+        # confidence ones through the skills_store write path (actor
+        # "skill_learner:auto", capped at 2). Best-effort: this runs after a
+        # SUCCESS, so a failed apply must never fail the job.
+        try:
+            from .nodes.skill_learner import apply_learning_proposals
+
+            _auto = apply_learning_proposals(state)
+            if _auto:
+                logger.info(
+                    "_invoke_skill_learner: auto-applied %d learning proposal(s), "
+                    "%d skipped (job %s)",
+                    len(_auto.get("applied", [])), len(_auto.get("skipped", [])), job_id,
+                )
+        except Exception as exc:
+            logger.warning(
+                "_invoke_skill_learner: skill auto-apply failed (job %s): %s", job_id, exc
+            )
+
         return {"messages": []}
     except Exception:
         _notify_phase(job_id, "skill_learner", "failed")
@@ -10796,14 +11077,15 @@ def _log_agent_context(state: ScrapeState, agent_name: str, messages: list) -> N
     try:
         from scraper.models import SessionLog
 
-        seq = SessionLog.objects.filter(job_id=job_id).count()
-        SessionLog.objects.create(
-            job_id=job_id,
-            role=SessionLog.ROLE_SYSTEM,
-            agent=agent_name,
-            content=f"[CONTEXT] {context[:20000]}",
-            seq=seq,
-        )
+        # [wave-55 H9b] allocated under the job lock (see helper).
+        with _session_seq_alloc(job_id) as alloc:
+            SessionLog.objects.create(
+                job_id=job_id,
+                role=SessionLog.ROLE_SYSTEM,
+                agent=agent_name,
+                content=f"[CONTEXT] {context[:20000]}",
+                seq=alloc(),
+            )
     except Exception:
         pass
 
@@ -10888,42 +11170,46 @@ def _persist_agent_logs(
         if _model_used:
             from scraper.models import SessionLog as _SL
 
-            _seq = _SL.objects.filter(job_id=job_id).count()
-            _SL.objects.create(
-                job_id=job_id,
-                role=_SL.ROLE_SYSTEM,
-                agent=agent_name,
-                content=f"[MODEL] {_model_used}",
-                seq=_seq,
-            )
+            # [wave-55 H9b] allocated under the job lock (see helper).
+            with _session_seq_alloc(job_id) as alloc:
+                _SL.objects.create(
+                    job_id=job_id,
+                    role=_SL.ROLE_SYSTEM,
+                    agent=agent_name,
+                    content=f"[MODEL] {_model_used}",
+                    seq=alloc(),
+                )
     except Exception:
         pass
 
     try:
         from scraper.models import SessionLog, ToolCallLog
 
-        seq_start = SessionLog.objects.filter(job_id=job_id).count()
-        for i, msg in enumerate(messages):
-            if hasattr(msg, "type"):
-                role = msg.type
-                content = getattr(msg, "content", "")
-                if not content:
-                    continue
+        # [wave-55 H9b] the whole flush allocates under the job lock, so a
+        # heartbeat beat landing mid-flush cannot take a number this loop is
+        # about to write.
+        with _session_seq_alloc(job_id) as alloc:
+            for i, msg in enumerate(messages):
+                if hasattr(msg, "type"):
+                    role = msg.type
+                    content = getattr(msg, "content", "")
+                    if not content:
+                        continue
 
-                if role == "ai":
-                    log_role = SessionLog.ROLE_ASSISTANT
-                elif role == "tool":
-                    log_role = SessionLog.ROLE_TOOL
-                else:
-                    log_role = SessionLog.ROLE_USER
+                    if role == "ai":
+                        log_role = SessionLog.ROLE_ASSISTANT
+                    elif role == "tool":
+                        log_role = SessionLog.ROLE_TOOL
+                    else:
+                        log_role = SessionLog.ROLE_USER
 
-                SessionLog.objects.create(
-                    job_id=job_id,
-                    role=log_role,
-                    agent=agent_name,
-                    content=str(content)[:20000],
-                    seq=seq_start + i,
-                )
+                    SessionLog.objects.create(
+                        job_id=job_id,
+                        role=log_role,
+                        agent=agent_name,
+                        content=str(content)[:20000],
+                        seq=alloc(),
+                    )
         logger.info(
             "_persist_agent_logs: %d messages for %s (job %s)",
             len(messages),
@@ -11016,14 +11302,15 @@ def _persist_probe_summary(
                 f"  Methods tried: {', '.join(raw_data['methods_tried'])}"
             )
 
-        seq = SessionLog.objects.filter(job_id=job_id).count()
-        SessionLog.objects.create(
-            job_id=job_id,
-            role=SessionLog.ROLE_SYSTEM,
-            agent="check_accessibility",
-            content="\n".join(summary_lines),
-            seq=seq,
-        )
+        # [wave-55 H9b] allocated under the job lock (see helper).
+        with _session_seq_alloc(job_id) as alloc:
+            SessionLog.objects.create(
+                job_id=job_id,
+                role=SessionLog.ROLE_SYSTEM,
+                agent="check_accessibility",
+                content="\n".join(summary_lines),
+                seq=alloc(),
+            )
     except Exception as exc:
         logger.warning("Failed to persist probe summary for job %s: %s", job_id, exc)
 
@@ -11518,8 +11805,9 @@ def build_scrape_graph(
     compiled = workflow.compile(checkpointer=checkpointer)
 
     logger.info("Scrape graph compiled with %d nodes", len(workflow.nodes))
-    for node_name in workflow.nodes:
-        logger.info("  node: %s", node_name)
+    # No per-node INFO dump here: ~26 extra lines per compile that greps read
+    # as park/deadman events (audit M6 clause 3). The node inventory is the
+    # `workflow.nodes` iterable, not the log.
 
     return compiled
 

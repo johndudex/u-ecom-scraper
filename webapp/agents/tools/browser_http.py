@@ -450,7 +450,7 @@ HEALTH_TIMEOUT_S = 6.0
 PREFLIGHT_MAX_WAIT_S = float(os.environ.get("BROWSER_SERVICE_PREFLIGHT_WAIT_S", "120"))
 PREFLIGHT_POLL_S = 10.0
 # [wave-16 B3] Beat-resumer batch (oldest parked first) per tick — small by
-# design: the scrape worker pool is 2 slots, so a stampede only queues anyway.
+# design: the scrape worker pool is 3 slots, so a stampede only queues anyway.
 BROWSER_RESUME_BATCH = int(os.environ.get("BROWSER_RESUME_BATCH", "3"))
 # [wave-33 T33-2] Absent/unset = the safe default (accept degraded). Setting
 # it restores the wave-16 literal-"ok" semantics everywhere

@@ -238,6 +238,52 @@ def _seed_urls_for_workspace(state: ScrapeState, input_urls: list[str]) -> list[
     return input_urls
 
 
+def _sweep_foreign_src(root: str, job_created_ts: float | None) -> bool:
+    """Remove ``workspace/src/`` when it is not THIS job's work.
+
+    [wave-55 C1] Job 1156 minted a 4-module site-local ``src`` package there on
+    2026-10-01 and it was still live on 2026-10-05: ``/app/workspace`` is a
+    PERSISTENT Railway volume (on celery-worker AND celery-events), so nothing
+    in the pipeline — and nothing in the deploy — ever removed it. The
+    stale-artifact wipe below only clears ``workspace/{slug}/``, so the shadow
+    sat outside every cleanup path and its "NO proxy anywhere" ladder both
+    crashed 30/79 drafts at import and misled writers at read time.
+
+    No file in the tree at/after THIS job's created_at (same 60s grace the
+    draft guard uses) means it is cross-run residue, not live work — rmtree it
+    before this job's directory is staged. No timestamp to judge against →
+    leave it (a sweep must never guess at a concurrent job's files).
+    """
+    if not job_created_ts:
+        return False
+    shadow_dir = os.path.join(root, "workspace", "src")
+    if not os.path.isdir(shadow_dir):
+        return False
+    floor = job_created_ts - 60
+    for dirpath, _dirnames, filenames in os.walk(shadow_dir):
+        for fname in filenames:
+            try:
+                if os.path.getmtime(os.path.join(dirpath, fname)) >= floor:
+                    logger.info(
+                        "setup_workspace: workspace/src has a file written by "
+                        "THIS job (%s) — leaving it alone", fname,
+                    )
+                    return False
+            except OSError:
+                return False
+    try:
+        shutil.rmtree(shadow_dir)
+        logger.warning(
+            "setup_workspace: removed stale workspace/src/ shadow tree "
+            "(no file newer than this job) — it shadows the pipeline's src/ "
+            "package for every draft on this volume"
+        )
+        return True
+    except OSError as exc:
+        logger.warning("setup_workspace: could not remove workspace/src: %s", exc)
+        return False
+
+
 def setup_workspace(state: ScrapeState) -> dict[str, Any]:
     """Ensure ``workspace/{slug}/`` and ``logs/`` exist (LOCAL), publish any
     leftover outputs to the File Master, and re-hydrate skipped analysis
@@ -324,8 +370,14 @@ def setup_workspace(state: ScrapeState) -> dict[str, Any]:
         if removed:
             logger.info("setup_workspace: cleaned %d stale artifacts from %s", removed, slug)
 
-    # [jobs-79/80] If the draft is gone anyway (worker volume was recycled —
-    # Railway redeploys wipe the ephemeral FS), restore THIS job's own archive:
+    # [wave-55 C1] A workspace/src/ shadow predating this job is residue from a
+    # previous run on a persistent volume — remove it before this run's draft
+    # can import it.
+    _sweep_foreign_src(root, _job_created)
+
+    # [jobs-79/80] If the draft is gone anyway (_finalize_job rmtree's
+    # workspace/{slug}/ at the end of a run; workspace/ is a PERSISTENT Railway
+    # volume, so a redeploy does NOT reset it), restore THIS job's own archive:
     # code_writer snapshots every draft it completes to
     # scrapers/{slug}/jobs/scraper-draft-{job_id}.py. The key is per-job, so a
     # fresh user re-run (new job id) can never inherit a stale draft from it.

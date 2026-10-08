@@ -2,6 +2,9 @@
 url_list, URL stored); a truly-empty url_list intake returns 422 and creates
 NO ScrapeJob row; job_restart refuses an unrecoverable url_list job."""
 
+import sys
+from contextlib import ExitStack
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth.models import User
@@ -13,6 +16,39 @@ from scraper.models import ScrapeJob, Site
 
 PDP = "https://www.example.com/products/tee-1"
 HOME = "https://www.example.com/"
+
+
+def _fake_fm_client(write_json=None):
+    """A controllable stand-in for the src.artifacts File Master client.
+
+    Every consumer here resolves it with a function-local ``import
+    src.artifacts as artifacts`` at CALL time, which binds through EITHER
+    ``sys.modules["src.artifacts"]`` OR the parent package attribute
+    ``src.artifacts`` (bpo-30024) — and mock.patch("src.artifacts.exists")
+    resolves the same two ways via pkgutil.resolve_name. Sibling files plant
+    stand-ins at one of them, so patching one object's attributes is not
+    order-safe (the wave-55 gate: the patch landed on the real client while
+    the code consulted a 2-attr stub, and _write_input_urls_no_shrink logged
+    "input_urls write skipped … file holds 505 urls"). _bind_fm_client below
+    points BOTH binding sites at the same fake — test_api_create_persist's
+    _patch_fm idiom.
+    """
+    fake = ModuleType("src.artifacts")
+    fake.scrapers_key = lambda slug, *parts: "/".join(["scrapers", slug, *parts])
+    fake.exists = MagicMock(return_value=False)
+    fake.read_json = MagicMock(return_value=None)
+    fake.write_json = write_json if write_json is not None else MagicMock()
+    return fake
+
+
+def _bind_fm_client(fake):
+    """Enter both ``src.artifacts`` binding sites as `fake`; close to undo."""
+    import src as src_pkg
+
+    stack = ExitStack()
+    stack.enter_context(patch.dict(sys.modules, {"src.artifacts": fake}))
+    stack.enter_context(patch.object(src_pkg, "artifacts", fake, create=True))
+    return stack
 
 
 class TestIntakeUrlListGate(TestCase):
@@ -29,12 +65,9 @@ class TestIntakeUrlListGate(TestCase):
         fm = patch("scraper.views._fm_exists", MagicMock(return_value=False))
         self.mock_fm_exists = fm.start()
         self.addCleanup(fm.stop)
-        exists = patch("src.artifacts.exists", MagicMock(return_value=False))
-        self.mock_artifact_exists = exists.start()
-        self.addCleanup(exists.stop)
-        write = patch("src.artifacts.write_json", MagicMock(), create=True)
-        self.mock_write_json = write.start()
-        self.addCleanup(write.stop)
+        self.fake_fm = _fake_fm_client()
+        self.addCleanup(_bind_fm_client(self.fake_fm).close)
+        self.mock_write_json = self.fake_fm.write_json
 
     def _writes(self) -> dict:
         return {
@@ -50,6 +83,17 @@ class TestIntakeUrlListGate(TestCase):
             return self.client.post(
                 reverse("intake_create_job"), data,
                 HTTP_X_REQUESTED_WITH="XMLHttpRequest")
+
+    def test_both_fm_binding_sites_point_at_the_same_fake(self):
+        """The hermeticity contract this file depends on: a stand-in bound at
+        only ONE of the two sites leaves the patch and the code-under-test
+        holding different objects (the wave-55 gate: the patch landed on the
+        real client while the code read a stub, and the seed write logged
+        "input_urls write skipped … file holds 505 urls")."""
+        import src as src_pkg
+
+        self.assertIs(sys.modules["src.artifacts"], self.fake_fm)
+        self.assertIs(getattr(src_pkg, "artifacts", None), self.fake_fm)
 
     def test_coerced_pdp_is_seeded_not_rejected(self):
         resp = self._post()
@@ -87,14 +131,10 @@ class TestIntakeUrlListGate(TestCase):
         """[wave-40 T5 r1] the gate's FM check raced (no file at check time,
         a 50-URL production list by write time): the seed write refuses to
         shrink it — models._sync_input_urls_file's no-shrinkage rule."""
-        exists = patch("src.artifacts.exists", MagicMock(return_value=True))
-        read = patch(
-            "src.artifacts.read_json",
-            MagicMock(return_value={
-                "urls": [f"https://www.example.com/p/{i}" for i in range(50)]}),
-        )
-        with exists, read:
-            resp = self._post()
+        self.fake_fm.exists.return_value = True
+        self.fake_fm.read_json.return_value = {
+            "urls": [f"https://www.example.com/p/{i}" for i in range(50)]}
+        resp = self._post()
         self.assertNotEqual(resp.status_code, 422)
         self.assertTrue(ScrapeJob.objects.exists())
         self.assertEqual(self._writes(), {})
@@ -178,12 +218,11 @@ class TestScrapeCommandUrlListGate(TestCase):
     def _command(self, url) -> MagicMock:
         from scraper.management.commands import scrape as scrape_cmd
 
-        write_json = MagicMock()
-        with patch("scraper.tasks.run_scrape_task", MagicMock()), patch(
-            "src.artifacts.exists", MagicMock(return_value=False)
-        ), patch("src.artifacts.write_json", write_json, create=True):
+        fake_fm = _fake_fm_client()
+        with patch("scraper.tasks.run_scrape_task", MagicMock()), \
+                _bind_fm_client(fake_fm):
             call_command(scrape_cmd.Command(), url, mode="url_list")
-        return write_json
+        return fake_fm.write_json
 
     def test_home_url_list_systemexits_with_no_row(self):
         with self.assertRaises(SystemExit):
@@ -210,12 +249,9 @@ class HermeticFmTestCase(TestCase):
     def setUp(self):
         super().setUp()
         self.client = Client()
-        exists = patch("src.artifacts.exists", MagicMock(return_value=False))
-        exists.start()
-        self.addCleanup(exists.stop)
-        write = patch("src.artifacts.write_json", MagicMock(), create=True)
-        self.mock_write_json = write.start()
-        self.addCleanup(write.stop)
+        self.fake_fm = _fake_fm_client()
+        self.addCleanup(_bind_fm_client(self.fake_fm).close)
+        self.mock_write_json = self.fake_fm.write_json
 
 
 class TestSiteScrapeUrlListGate(HermeticFmTestCase):

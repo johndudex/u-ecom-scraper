@@ -343,6 +343,10 @@ def test_health_agent_workspace_scan_ignores_trash(tmp_path):
 
 
 # ─── retention: the `_trash` sweep rides the existing windows ────────────────
+# [wave-55 H13] the sweep is its own beat task now (scraper.retention.
+# sweep_workspace_trash, routed to the worker's queue) — purge_retention runs
+# on celery-events, whose workspace is a frozen snapshot, so it no longer
+# folds a trash count into its report.
 
 
 @pytest.mark.django_db
@@ -352,6 +356,9 @@ def test_retention_sweeps_trash_on_the_existing_windows(db, tmp_path, monkeypatc
     from scraper.models import ScrapeJob
 
     monkeypatch.setattr(settings, "PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "RETENTION_ENABLED", True)
+    monkeypatch.setattr(settings, "RETENTION_DAYS_FAILED", 7)
+    monkeypatch.setattr(settings, "RETENTION_DAYS_COMPLETED", 90)
     completed = ScrapeJob.objects.create(
         url="https://a.example/x", status=ScrapeJob.STATUS_COMPLETED)
     running = ScrapeJob.objects.create(
@@ -371,7 +378,7 @@ def test_retention_sweeps_trash_on_the_existing_windows(db, tmp_path, monkeypatc
         entry.mkdir()
         (entry / "scraper_draft.py").write_text("# d")
 
-    report = retention.purge_retention(days_failed=7, days_completed=90)
+    report = retention.sweep_workspace_trash()
 
     assert report["trash_entries_purged"] == 2
     assert not entries["completed-100d"].exists(), "past the completed window"
@@ -389,12 +396,13 @@ def test_retention_leaves_unparseable_trash_names_alone(db, tmp_path, monkeypatc
     from scraper import retention
 
     monkeypatch.setattr(settings, "PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "RETENTION_ENABLED", True)
     trash = tmp_path / "workspace" / "_trash"
     mystery = trash / "something-else"
     mystery.mkdir(parents=True)
     (mystery / "keep.txt").write_text("not ours")
 
-    report = retention.purge_retention(days_failed=0, days_completed=0)
+    report = retention.sweep_workspace_trash()
 
     assert report["trash_entries_purged"] == 0
     assert mystery.exists()

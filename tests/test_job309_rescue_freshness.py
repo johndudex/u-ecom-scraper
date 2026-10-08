@@ -63,11 +63,18 @@ ENV_GATE_SHAPE = """
 
 
 def _items(n):
+    # [wave-55 GAP-1a re-pin] The rows carry the full product core set: an
+    # availability/currency-less row set is the null-column shape the
+    # exhausted-partial gate now vetoes, and this file pins the FRESHNESS
+    # floor, not a licence to ship a dead column.
     return [
         {
             "title": f"Pillow {i}",
             "price": f"${i}.99",
+            "availability": "in stock",
+            "currency": "USD",
             "url": f"https://{SLUG}.example/p/{i}",
+            "src_url": f"https://{SLUG}.example/collections/all",
         }
         for i in range(1, n + 1)
     ]

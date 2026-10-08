@@ -165,6 +165,10 @@ services:
       DB_PASSWORD: scraper-password
       DB_PORT: "5432"
       REDIS_URL: redis://redis:6379/0
+      # [wave-55 L1] schedule_next_site rides this queue and writes
+      # input_urls.json through src.artifacts — _base() raises on an unset
+      # FILE_MASTER_URL, so the queued path dies without it.
+      FILE_MASTER_URL: http://file-master:8002
       DJANGO_SETTINGS_MODULE: config.settings
       SECRET_KEY: dev-secret-key-change-in-production
       PYTHONPATH: /app

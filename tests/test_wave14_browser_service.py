@@ -630,8 +630,10 @@ class TestHealthAndWatchdogSurfaces:
         src = open(
             os.path.join(ROOT, "webapp", "scraper", "tasks.py"), encoding="utf-8"
         ).read()
-        i_revoke = src.index('current_app.control.revoke(_task_id, terminate=True, signal="SIGKILL")')
-        i_cancel = src.index("cancel_scrape(job.id)", i_revoke)
+        # wave-55 H2 rewrote the kill tail into the shared _fail_stuck_job:
+        # the revoke local is `task_id` and the cancel is captured in `_cancel`
+        i_revoke = src.index('current_app.control.revoke(task_id, terminate=True, signal="SIGKILL")')
+        i_cancel = src.index("_cancel = cancel_scrape(job.id)", i_revoke)
         assert i_revoke < i_cancel, "browser_service cancel must ride the watchdog revoke path"
 
     def test_cancel_client_is_fire_and_forget(self):

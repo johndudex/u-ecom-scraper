@@ -293,6 +293,39 @@ def _enforce_not_skills(path: str, root: str) -> str:
     return resolved
 
 
+def _enforce_slug_scope(path: str, root: str, slug: str | None) -> str:
+    """Write-guard: an agent writes only inside its OWN job's workspace.
+
+    [wave-55 C1] Job 1156's code_writer issued four ``write_file`` calls into
+    ``workspace/src/`` — a directory no pipeline node creates — minting a
+    site-local, proxy-free clone of the pipeline's ``src`` package. The
+    templates' ``sys.path`` insert then resolved ``src`` to that shadow for
+    EVERY draft on the volume: 30/79 jobs crashed at import and writers that
+    merely read the shadow built drafts against the wrong API surface.
+    ``_enforce_root`` only bounds the project root, so nothing stopped a
+    writer from minting a sibling directory. Scoped by ``workspace_scope``
+    (the job's slug, the same value run_bash already scopes reads with), so
+    callers that pass no scope are unchanged.
+
+    Site-local helper modules belong in ``workspace/{slug}/_vendor/`` — inside
+    the slug dir, so the same guard admits them.
+    """
+    resolved = _enforce_root(path, root)
+    if not slug:
+        return resolved
+    scope_dir = os.path.join(os.path.abspath(root), "workspace", slug)
+    if resolved == scope_dir or resolved.startswith(scope_dir + os.sep):
+        return resolved
+    raise ValueError(
+        f"REJECTED — '{path}' resolves to '{resolved}', outside this job's "
+        f"workspace. Writes are scoped to workspace/{slug}/ (use "
+        f"workspace/{slug}/_vendor/ for site-local helper modules). NEVER "
+        "create workspace/src/ or another job's directory — a workspace-local "
+        "src/ package shadows the pipeline's src/ for every draft on this "
+        "volume."
+    )
+
+
 def get_filesystem_tools(
     project_root: str | None = None,
     workspace_scope: str | None = None,
@@ -304,8 +337,10 @@ def get_filesystem_tools(
         project_root: Root directory to restrict file operations to.
             Falls back to ``settings.PROJECT_ROOT`` then ``os.getcwd()``.
         workspace_scope: If set, restrict search_files and search_content
-            to only the ``workspace/{workspace_scope}/`` subdirectory.
-            Read/write/edit still work on any path under project_root.
+            to only the ``workspace/{workspace_scope}/`` subdirectory and
+            write/edit to files under ``workspace/{workspace_scope}/``
+            (reads stay project-root-wide). Callers that pass no scope keep
+            the unscoped behavior.
         syntax_gate: [wave-22 B1] If True, write_file/edit_file run the F821
             gate on .py files under workspace/ (code_writer only — 8 agents
             share these tools and none of the others draft code).
@@ -464,7 +499,7 @@ def get_filesystem_tools(
             Success message with the resolved path, or an error message.
         """
         try:
-            safe = _enforce_not_skills(path, root)
+            safe = _enforce_slug_scope(_enforce_not_skills(path, root), root, workspace_scope)
         except ValueError as e:
             return str(e)
         # [wave-22 B1] F821 gate: draft-shaped .py writes must define every
@@ -515,7 +550,11 @@ def get_filesystem_tools(
             Success or failure message with details.
         """
         try:
-            safe = _enforce_not_skills(path, root)
+            # [wave-55 C1] Same admission rule as write_file: an edit cannot
+            # mint a file, but with a scope set it can mutate any existing
+            # file under the project root (incl. src/*.py) — the write guard
+            # refuses the mint, so the edit path must refuse the mutation.
+            safe = _enforce_slug_scope(_enforce_not_skills(path, root), root, workspace_scope)
         except ValueError as e:
             return str(e)
         try:

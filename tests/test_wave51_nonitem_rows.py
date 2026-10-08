@@ -12,8 +12,10 @@ row carries title+price, so every ground-truth counter read it as data:
 
 Two wirings, one predicate (``src.discovery_quality.row_url_is_item_shaped``):
 a row whose URL has no path (``/#main``, bare origin) can never be an item
-on any site. The floor is deliberately narrow — ``/new-in/?sort=…`` still
-passes (deeper junk shapes are other gates' problem).
+on any site. The floor was deliberately narrow — ``/new-in/?sort=…`` passed
+(deeper junk shapes were other gates' problem) — until wave-55 C3's PDP-shape
+tier moved nav/listing positions behind it: job 1068 shipped one title across
+``/collections/<slug>`` rows and every counter read them as data.
 """
 
 import json
@@ -53,10 +55,14 @@ class TestRowUrlIsItemShaped:
             ("", False),
             (None, False),
             # Anything with a real path passes — including deeper junk
-            # shapes other gates own.
+            # shapes other gates own. [wave-55 C3] EXCEPT a navigation/listing
+            # position: `/new-in/?sort=…` and `/search?q=…` are pages a
+            # shallow crawl ships as products, not item detail pages, so the
+            # PDP-shape tier now fails them (the wave-51 pin said they pass —
+            # job 1068's `/collections/<slug>` rows are why that had to move).
             ("https://www.briscoes.co.nz/product/1136060/russell-hobbs-air-fryer/", True),
-            ("https://shop.com/new-in/?sort=NEW_ARRIVAL_DESC", True),
-            ("https://shop.com/search?q=air+fryer", True),
+            ("https://shop.com/new-in/?sort=NEW_ARRIVAL_DESC", False),
+            ("https://shop.com/search?q=air+fryer", False),
             ("https://shop.com/p/12345?variant=9", True),
         ],
     )
@@ -109,10 +115,27 @@ class TestNonitemRowGate:
         out = _write_output(tmp_path, rows)
         assert _nonitem_row_gate(out, "search_term") == ""
 
-    def test_url_list_never_fires(self, tmp_path):
-        """url_list seeds are user-provided — the gate never second-guesses
-        them (same scoping rule as T5e)."""
+    def test_url_list_fires_like_every_other_mode(self, tmp_path):
+        """[wave-55 C2] url_list used to be exempt here (T9 scoped it out
+        alongside T5e), which is how job 1229 shipped unsubmitted rows as
+        COMPLETED: a user-provided seed is by definition an item page, so a
+        shell row in a url_list output is the scraper's doing, not the
+        seed's."""
         out = _write_output(tmp_path, [_row("https://www.briscoes.co.nz/#main")])
+        msg = _nonitem_row_gate(out, "url_list")
+        assert msg
+        assert "Non-item row bar" in msg
+
+    def test_url_list_minority_junk_still_passes(self, tmp_path):
+        """The half-or-more rule is mode-blind: one shell row beside real
+        yield is not this gate's verdict even on a url_list run."""
+        rows = [
+            {"title": f"Real {i}", "price": 100.0 + i,
+             "url": f"https://www.briscoes.co.nz/product/{i}/thing-{i}/"}
+            for i in range(3)
+        ]
+        rows.append(_row("https://www.briscoes.co.nz/#main"))
+        out = _write_output(tmp_path, rows)
         assert _nonitem_row_gate(out, "url_list") == ""
 
     def test_empty_output_noops(self, tmp_path):

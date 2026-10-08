@@ -525,6 +525,18 @@ class Site(models.Model):
     class Meta:
         ordering = ["-created_at"]
         verbose_name = "Site"
+        constraints = [
+            # [wave-55 H14] One row per slug — check_tracker keys the Site row
+            # on the submitted URL, so two sample PDPs of one host minted
+            # duplicate slugs (101 groups in prod) and every
+            # filter(slug=...).first() read an arbitrary member. Partial on
+            # purpose: an unparseable URL yields slug="", which was legal
+            # long before this constraint existed.
+            models.UniqueConstraint(
+                fields=["slug"], condition=~models.Q(slug=""),
+                name="site_slug_unique",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.slug or self.url} ({self.status})"

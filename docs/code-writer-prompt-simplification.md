@@ -148,7 +148,7 @@ availability: method=jsonld, path=Product.availability, fallback=[data-stock]
 
 ## A/B test plan (before switching)
 
-1. Keep the old prompt as `code-writer-v1.md` (rename the current file).
+1. **Note (2026-10-05, wave-55):** `code-writer-v1.md` was deleted in wave-55; revert baseline = `git show c607ac8:.opencode/agents/code-writer-v1.md`.
 2. Write the new prompt as `code-writer.md`.
 3. Add a settings flag `CODE_WRITER_PROMPT_VERSION` (default "v2", fallback "v1").
 4. Run locumtenens + aya + adameve + dystaffing with both versions.
@@ -161,7 +161,7 @@ availability: method=jsonld, path=Product.availability, fallback=[data-stock]
 2. **Refactor `build_code_writer_message`** (~250 lines): collapse the 8 conditional
    section builders into a pretty-printed Strategy Contract + the existing
    `_summarize_product_analysis` Field Map + minimal Output Contract.
-3. **Rename old prompt** to `code-writer-v1.md`; keep as fallback.
+3. **Note (2026-10-05, wave-55):** `code-writer-v1.md` was deleted in wave-55; revert baseline = `git show c607ac8:.opencode/agents/code-writer-v1.md`.
 4. **Add settings flag** `CODE_WRITER_PROMPT_VERSION`.
 5. **A/B test** on locumtenens + aya + adameve + dystaffing.
 6. **Switch** (or revert if regression).

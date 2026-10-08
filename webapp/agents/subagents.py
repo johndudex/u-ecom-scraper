@@ -1322,19 +1322,21 @@ def _log_zombie_refusal(tool_name: str) -> None:
             return
         from scraper.models import SessionLog
 
-        seq = SessionLog.objects.filter(job_id=job_id).count()
-        SessionLog.objects.create(
-            job_id=job_id,
-            role=SessionLog.ROLE_SYSTEM,
-            agent=get_agent_name() or "unknown",
-            content=(
-                f"[ZOMBIE-REFUSED] {tool_name} refused by invocation latch "
-                f"(refusal {count} after this invocation's wall-clock "
-                "deadline) — the abandoned agent kept calling; the call "
-                "raised, artifacts untouched"
-            ),
-            seq=seq,
-        )
+        from agents.graph import _session_seq_alloc
+
+        with _session_seq_alloc(job_id) as alloc:
+            SessionLog.objects.create(
+                job_id=job_id,
+                role=SessionLog.ROLE_SYSTEM,
+                agent=get_agent_name() or "unknown",
+                content=(
+                    f"[ZOMBIE-REFUSED] {tool_name} refused by invocation latch "
+                    f"(refusal {count} after this invocation's wall-clock "
+                    "deadline) — the abandoned agent kept calling; the call "
+                    "raised, artifacts untouched"
+                ),
+                seq=alloc(),
+            )
     except Exception as _exc:
         logger.debug("zombie-refusal telemetry skipped (tool %s): %s", tool_name, _exc)
 

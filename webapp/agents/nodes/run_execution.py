@@ -606,6 +606,36 @@ def _checkpoint_reuse_env(
     return {CHECKPOINT_REUSE_ENV: "1" if armed else "0"}
 
 
+def _stage_extra_files(scraper_path: str, input_mode: str) -> dict:
+    """Sibling files the /scrape payload must carry (stateless staging — the
+    browser_service container has no shared filesystem with this one).
+
+    input_urls.json is staged UNCONDITIONALLY: it is the url_list seed AND
+    the persisted-discovery carrier the nav families re-read. The discovery
+    checkpoint is NOT — [wave-55 C2] it rides only where checkpoint reuse can
+    be armed (the SAME ``_wants_fresh_discovery`` set the ``--fresh-discovery``
+    append and ``_checkpoint_reuse_env`` key on, never a second literal set).
+    Staging it for url_list handed execution the tester's ``--sample``
+    discovery: job 1227 shipped 10 unrelated made-in-china products off a
+    1-URL PDP seed and 1229 shipped 2 sandro strays, both stamped
+    ``skipped_reason=checkpoint_loaded``. Contents go across VERBATIM — the
+    T13 reader owns host/age/floor filtering at the point of use.
+    """
+    staged = ["input_urls.json", "discovery_config.json"]
+    if _wants_fresh_discovery(input_mode):
+        staged.append(CHECKPOINT_FILENAME)
+    _extra: dict = {}
+    for _sf in staged:
+        _sp = os.path.join(os.path.dirname(scraper_path), _sf)
+        if os.path.isfile(_sp):
+            try:
+                with open(_sp, encoding="utf-8", errors="replace") as _fh:
+                    _extra[_sf] = _fh.read()
+            except OSError:
+                pass
+    return _extra
+
+
 def _args_with_listing_url(base_args: list, alt_url: str) -> list:
     """Swap the value after an existing ``--listing-url`` flag, or append the
     flag pair when the primary run carried none."""
@@ -1020,14 +1050,15 @@ def run_execution(state: ScrapeState) -> dict:
     # --fresh-discovery makes the scraper ignore any existing checkpoint and run
     # Phase 1 from scratch. The CLI-contract guard below drops this flag if the
     # generated scraper's argparse doesn't define it yet. [discovery-coverage-gate §4]
-    # [wave-30 W30-4] Phase-1 modes ONLY. A url_list job has no Phase-1 leg and
-    # never writes a discovery checkpoint, so the flag buys nothing there — and
-    # in the api family _force_fresh turns it into "ignore the user's URLs,
-    # crawl the API catalog instead" (job 570: a draft that promoted the flag
-    # to a Phase-1 trigger crashed at execution after a PASSing test cycle).
-    # Withholding the flag makes a wrong trigger clause unreachable at
-    # execution; the entry contract in src.listing_discovery guards Phase 1
-    # where it legitimately runs.
+    # [wave-30 W30-4] The FLAG stays Phase-1 modes only: in the api family
+    # _force_fresh turns it into "ignore the user's URLs, crawl the API
+    # catalog instead" (job 570: a draft that promoted the flag to a Phase-1
+    # trigger crashed at execution after a PASSing test cycle). [wave-55 C2]
+    # url_list still writes a checkpoint though — the tester's --sample run
+    # banks one (job 1227 shipped 10 unrelated products off a 1-URL PDP seed
+    # through exactly this hole) — so url_list is closed at the STAGING edge
+    # instead: _stage_extra_files below never ships the file to
+    # browser_service, and the in-process lane deletes it before launch.
     if _wants_fresh_discovery(input_mode):
         args.append("--fresh-discovery")
 
@@ -1051,6 +1082,13 @@ def run_execution(state: ScrapeState) -> dict:
             "rescue armed (%s present)",
             CHECKPOINT_FILENAME,
         )
+    # [wave-55 C2] A non-Phase-1 run can never arm the T14 rescue above, so a
+    # checkpoint still in the workspace is contamination, not a rescue asset:
+    # the in-process subprocess shares this filesystem and the template reads
+    # any checkpoint it finds there unconditionally. The browser_service lane
+    # closes the same hole by never staging the file (see _stage_extra_files).
+    if not _wants_fresh_discovery(input_mode):
+        _delete_discovery_checkpoint(workspace_folder, os.path.dirname(scraper_path))
 
     # DETERMINISTIC DISCOVERY (env-var): compute the listing URL for env-var
     # injection. This bypasses the argparse + _filter_supported_args chain —
@@ -1277,6 +1315,7 @@ def run_execution(state: ScrapeState) -> dict:
             # [wave-36 B1] two-vocabulary union — the scraper emits both key
             # sets pre-rename.
             target_fields=union_output_fields(state),
+            seed_urls=state.get("input_urls"),
         ))
 
     result = _run_in_process(
@@ -1285,6 +1324,7 @@ def run_execution(state: ScrapeState) -> dict:
         listing_url_env=_listing_url_env,
         input_mode=input_mode,
         target_fields=union_output_fields(state),
+        seed_urls=state.get("input_urls"),
     )
     # [wave-40 T1 guards 2+3] clear in place on the leg's RAW result: the
     # listing fallback below either keeps this dict (already normalized) or
@@ -1528,6 +1568,7 @@ def _run_in_process(
     listing_url_env: str = "",
     input_mode: str = "",
     target_fields: list[str] | None = None,
+    seed_urls: list | None = None,
 ) -> dict[str, Any]:
     cmd = ["python3", scraper_path] + args
     start = time.time()
@@ -1725,6 +1766,51 @@ def _run_in_process(
                 "error_message": _q,
             }
 
+        # [wave-55 C2] Nav-tree junk bar + non-item row bar, mirroring the
+        # browser_service lane's ordering (F9 -> shallow -> nonitem -> scope).
+        # This lane is the DEFAULT for the HTTP family (requests / api /
+        # http_navigation), so a url_list leg here shipped /#main shell rows
+        # and shallow-section rows with no junk verdict at all — F9 exempts
+        # url_list by design. listing_url_env is this lane's carried anchor
+        # (state url's equivalent); url_list has none, so the gate takes the
+        # seed's own URL.
+        _sh = _shallow_section_gate(
+            output_file, listing_url_env, input_mode, seed_urls=seed_urls,
+        )
+        if _sh:
+            logger.error("run_execution: %s", _sh)
+            return {
+                "execution_status": "FAILED",
+                "output_file": output_file,
+                "product_count": product_count,
+                "discovery_coverage": discovery_coverage,
+                "error_message": _sh,
+            }
+        _ni = _nonitem_row_gate(output_file, input_mode)
+        if _ni:
+            logger.error("run_execution: %s", _ni)
+            return {
+                "execution_status": "FAILED",
+                "output_file": output_file,
+                "product_count": product_count,
+                "discovery_coverage": discovery_coverage,
+                "error_message": _ni,
+            }
+
+        # [wave-55 C2] Post-run scope assertion for the one mode whose
+        # discovery the user owns. Same verdict shape as F9 above: fail the
+        # run, never edit rows.
+        _us = _url_list_scope_gate(output_file, seed_urls, input_mode)
+        if _us:
+            logger.error("run_execution: %s", _us)
+            return {
+                "execution_status": "FAILED",
+                "output_file": output_file,
+                "product_count": product_count,
+                "discovery_coverage": discovery_coverage,
+                "error_message": _us,
+            }
+
         # H3: in-process path owns its own checkpoint cleanup (no browser_service
         # to do it). Delete so a subsequent invocation starts fresh. Tried in both
         # the workspace dir (SCRIPT_DIR location) and the subprocess cwd, since
@@ -1859,22 +1945,17 @@ def _run_via_browser_service(
                 "execution_status": "FAILED",
                 "error_message": f"Could not read scraper source {scraper_path}: {exc}",
             }
-        # Read sibling files (input_urls.json, discovery_config.json) for staging
-        # [wave-40 T15] + the discovery checkpoint, staged VERBATIM (no
-        # filter_seed_payload — src.listing_discovery.load_discovery_checkpoint
+        # Read sibling files (input_urls.json, discovery_config.json) for
+        # staging [wave-40 T15] — see _stage_extra_files for the checkpoint's
+        # own Phase-1-only rule (content goes across VERBATIM either way: no
+        # filter_seed_payload, src.listing_discovery.load_discovery_checkpoint
         # owns host/age/floor filtering at the point of use). This is the
-        # EXECUTION lane's staging tuple; the probe lane's own loop in
+        # EXECUTION lane's staging; the probe lane's own loop in
         # graph._probe_phase1_discovery_once deliberately does NOT stage a
         # checkpoint — a probe must never see one (763 nastygal).
-        _extra = {}
-        for _sf in ("input_urls.json", "discovery_config.json", CHECKPOINT_FILENAME):
-            _sp = os.path.join(os.path.dirname(scraper_path), _sf)
-            if os.path.isfile(_sp):
-                try:
-                    with open(_sp, encoding="utf-8", errors="replace") as _fh:
-                        _extra[_sf] = _fh.read()
-                except OSError:
-                    pass
+        _extra = _stage_extra_files(
+            scraper_path, str((state or {}).get("input_mode") or "")
+        )
         # W8: bounded retry on 429/502/503/504 + transport errors — a bare
         # raise_for_status() turned backpressure into an execution failure.
         # [wave-33 C3] crash-retries stay load-bearing but are budget-bounded
@@ -2042,6 +2123,7 @@ def _run_via_browser_service(
         # editing rows (honest FAILED beats junk shipped as COMPLETED).
         _sh = _shallow_section_gate(
             output_file, state.get("url") or "", state.get("input_mode", ""),
+            seed_urls=(state or {}).get("input_urls"),
         )
         if _sh:
             logger.error("run_execution: %s", _sh)
@@ -2068,6 +2150,27 @@ def _run_via_browser_service(
                 "product_count": result.get("product_count", 0),
                 "discovery_coverage": discovery_coverage,
                 "error_message": _ni,
+            }
+
+        # [wave-55 C2] Post-run scope assertion: the one mode whose discovery
+        # the user owns must not ship rows the user never asked for. Same
+        # verdict shape as the two junk bars above — fail the run, never edit
+        # rows. Seeded from state, NOT the on-disk input_urls.json (the
+        # tester's own sample run rewrites that file, which is the
+        # laundering vector this gate exists to catch).
+        _us = _url_list_scope_gate(
+            output_file, (state or {}).get("input_urls"),
+            state.get("input_mode", ""),
+        )
+        if _us:
+            logger.error("run_execution: %s", _us)
+            _notify_phase(_exec_job_id, "execution", "failed")
+            return {
+                "execution_status": "FAILED",
+                "output_file": output_file,
+                "product_count": result.get("product_count", 0),
+                "discovery_coverage": discovery_coverage,
+                "error_message": _us,
             }
 
         _notify_phase(_exec_job_id, "execution", "done")
@@ -2289,12 +2392,12 @@ def _nonitem_row_gate(output_file: str, input_mode: str) -> str:
 
     Fires when junk rows are half or more of the output: all-junk runs must
     not ship COMPLETED, while a mostly-real run with one shell row is real
-    yield this gate must not punish. url_list is out of scope (user-provided
-    seeds), same scoping rule as T5e.
+    yield this gate must not punish. [wave-55 C2] url_list is IN scope: a
+    user-provided seed is by definition an item page, so any shell row in the
+    output is the scraper's doing, not the seed's (job 1229 shipped under the
+    old exemption).
 
     Returns the diagnostic sentence, empty when healthy (gate no-ops)."""
-    if str(input_mode or "").strip().lower() == "url_list":
-        return ""
     urls = _output_row_urls(output_file)
     if not urls:
         return ""
@@ -2318,6 +2421,7 @@ def _nonitem_row_gate(output_file: str, input_mode: str) -> str:
 
 def _shallow_section_gate(
     output_file: str, listing_url: str, input_mode: str,
+    seed_urls: list | None = None,
 ) -> str:
     """[wave-50 T5e] Generic nav-tree junk bar: fail list_page runs whose
     output rows are overwhelmingly sibling section links shallower in the tree
@@ -2325,29 +2429,47 @@ def _shallow_section_gate(
     products). Detection is structural (src/discovery_quality.py), site
     agnostic.
 
-    list_page ONLY: its anchor URL is exactly the page discovery walked, so
-    the depth comparison is grounded. navigation/search_term anchors are the
-    submitted URL (often a deep category picked by search), not necessarily
-    the walked listing — a depth comparison there could false-fire on sites
-    whose real PDPs sit in a flat namespace under a shared first segment, so
-    those modes keep their own junk nets (T5d gate, core-value bar, F9).
-    url_list is out of scope: its seeds are user-provided.
+    list_page and url_list: their anchor URL is exactly the page the run was
+    pointed at (the user's listing, or the user's own PDP), so the depth
+    comparison is grounded. navigation/search_term anchors are the submitted
+    URL (often a deep category picked by search), not necessarily the walked
+    listing — a depth comparison there could false-fire on sites whose real
+    PDPs sit in a flat namespace under a shared first segment, so those modes
+    keep their own junk nets (T5d gate, core-value bar, F9, and — since
+    [wave-55 C2] — the url_list scope assertion).
+
+    url_list grades against the DISPATCHED ``seed_urls``, never the on-disk
+    input_urls.json: the templates rewrite that file with their own Phase-1
+    discoveries (save_urls_to_file), so reading it back here would judge the
+    run by the very rows this bar exists to police. list_page keeps the file
+    — its anchor legitimately is the walked listing.
 
     Returns the diagnostic sentence, empty when healthy (gate no-ops)."""
-    if str(input_mode or "").lower() != "list_page":
+    if str(input_mode or "").lower() not in ("list_page", "url_list"):
         return ""
     urls = _output_row_urls(output_file)
-    seed_p = os.path.join(os.path.dirname(output_file or ""), "input_urls.json")
-    if os.path.isfile(seed_p):
-        try:
-            with open(seed_p, encoding="utf-8") as fh:
-                seed = json.load(fh)
-            if isinstance(seed, dict) and isinstance(seed.get("urls"), list):
-                seen = set(urls)
-                urls += [u for u in seed["urls"]
-                         if isinstance(u, str) and u not in seen]
-        except Exception:
-            pass
+    if str(input_mode or "").lower() == "url_list":
+        seeds = [u for u in (seed_urls or [])
+                 if isinstance(u, str) and u.strip()]
+        seen = set(urls)
+        urls += [u for u in seeds if u not in seen]
+        if not listing_url and seeds:
+            # A url_list run's anchor IS its seed PDP: the browser_service
+            # lane hands it over as the listing URL, the in-process lane has
+            # no listing env for this mode.
+            listing_url = seeds[0]
+    else:
+        seed_p = os.path.join(os.path.dirname(output_file or ""), "input_urls.json")
+        if os.path.isfile(seed_p):
+            try:
+                with open(seed_p, encoding="utf-8") as fh:
+                    seed = json.load(fh)
+                if isinstance(seed, dict) and isinstance(seed.get("urls"), list):
+                    seen = set(urls)
+                    urls += [u for u in seed["urls"]
+                             if isinstance(u, str) and u not in seen]
+            except Exception:
+                pass
     if not urls:
         return ""
     try:
@@ -2366,6 +2488,76 @@ def _shallow_section_gate(
         f"returned the listing's navigation tree, not item pages, and the "
         f"extraction counted navigation as products. Fix discovery (item-level "
         f"URL shape / platform catalog path), not the field selectors."
+    )
+
+
+def _submitted_url_key(url: str) -> str:
+    """Comparison key for "is this output row one the user submitted".
+
+    Scheme, a ``www.`` prefix, host case, the query string and a trailing
+    slash are the same item: a seed submitted as
+    ``http://shop.com/p/1?utm_source=feed`` routinely comes back as
+    ``https://www.shop.com/p/1/`` once the site canonicalises it (the audit's
+    own 1226/1227 seeds carry four tracking params). Host + path is the item
+    identity; anything else — a different path segment above all — is a
+    different product and stays a violation. Fragment dropped: it never
+    reaches the server.
+    """
+    s = str(url or "").strip()
+    try:
+        from urllib.parse import urlsplit
+
+        p = urlsplit(s)
+        if not p.netloc:
+            return s.split("#", 1)[0].rstrip("/")
+        host = p.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        return f"{p.scheme.lower()}://{host}{p.path.rstrip('/')}"
+    except Exception:
+        return s.split("#", 1)[0].rstrip("/")
+
+
+def _url_list_scope_gate(
+    output_file: str, seed_urls, input_mode: str = "",
+) -> str:
+    """[wave-55 C2] Post-run assertion: a url_list job ships ONLY submitted URLs.
+
+    url_list is the one mode whose discovery is decided by the user, so an
+    output row pointing anywhere else means the run went looking on its own —
+    job 1227 shipped 10 unrelated made-in-china laptops off a 1-URL PDP seed
+    and 1229 shipped 2 sandro strays, both COMPLETED and both invisible to
+    every existing gate (F9 exempts url_list, and the two junk bars used to).
+    Strict by design: ANY stray fails, the run is never edited. No seed list
+    (or no rows to judge) is a no-op — a gate must not guess.
+
+    url_list ONLY: Site.input_urls reaches graph state for every mode, and
+    navigation/list_page/search_term deliberately merge category-page rows
+    (_run_category_sources), so a seed comparison there would fail honest
+    multi-source runs. Same spelling as _shallow_section_gate's mode check.
+
+    Returns the diagnostic sentence, empty when healthy (gate no-ops)."""
+    if str(input_mode or "").strip().lower() != "url_list":
+        return ""
+    seeds = {
+        _submitted_url_key(u) for u in (seed_urls or []) if str(u or "").strip()
+    }
+    if not seeds:
+        return ""
+    urls = _output_row_urls(output_file)
+    if not urls:
+        return ""
+    strays = [u for u in urls if _submitted_url_key(u) not in seeds]
+    if not strays:
+        return ""
+    examples = ", ".join(repr(s[:100]) for s in strays[:3])
+    return (
+        f"url_list scope violation: {len(strays)}/{len(urls)} output rows are "
+        f"not submitted URLs ({examples}) — url_list discovery IS the seed "
+        f"list, so the run extracted pages the user never submitted "
+        f"(job 1227 shipped 10 unrelated products off a 1-URL PDP seed). "
+        f"Fix the scraper's url_list branch (seed file / --urls), not "
+        f"discovery."
     )
 
 

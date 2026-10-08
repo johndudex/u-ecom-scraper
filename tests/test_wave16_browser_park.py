@@ -350,7 +350,9 @@ class TestResumeTask:
         monkeypatch.setattr(f"{BH}.browser_service_strict_ok", lambda: True)
         monkeypatch.setattr(f"{BH}.BROWSER_RESUME_BATCH", 1)
         dispatched = []
-        monkeypatch.setattr(st, "dispatch_scrape_job", lambda jid: dispatched.append(jid))
+        monkeypatch.setattr(
+            st, "dispatch_scrape_job", lambda jid, **kw: dispatched.append(jid)
+        )
         old = baker.make(ScrapeJob, url="https://a.com", status=ScrapeJob.STATUS_BROWSER_UNAVAILABLE)
         new = baker.make(ScrapeJob, url="https://b.com", status=ScrapeJob.STATUS_BROWSER_UNAVAILABLE)
         running = baker.make(ScrapeJob, url="https://c.com", status=ScrapeJob.STATUS_RUNNING)
@@ -376,7 +378,7 @@ class TestResumeTask:
         monkeypatch.setattr(f"{BH}.BROWSER_RESUME_BATCH", 3)
         monkeypatch.setattr(
             st, "dispatch_scrape_job",
-            lambda jid: (_ for _ in ()).throw(RuntimeError("broker down")),
+            lambda jid, **kw: (_ for _ in ()).throw(RuntimeError("broker down")),
         )
         job = baker.make(ScrapeJob, url="https://a.com", status=ScrapeJob.STATUS_BROWSER_UNAVAILABLE)
         out = st.resume_browser_unavailable_jobs()

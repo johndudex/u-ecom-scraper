@@ -157,9 +157,10 @@ class TestLadderWiring:
         assert result.get("method") == "cloak_none"
 
     @pytest.mark.django_db
-    def test_all_blocked_still_declared_captcha_with_full_census(self, monkeypatch):
-        """When genuinely everything fails, the verdict still lists every rung
-        that was sent — the census the operator diagnoses from."""
+    def test_all_blocked_declares_probe_failed_with_full_census(self, monkeypatch):
+        """When genuinely everything fails with no captcha page anywhere, the
+        verdict is an honest probe failure — and it still lists every rung
+        that was sent (the census the operator diagnoses from)."""
         from agents.tools import probe_tools
 
         monkeypatch.setattr(
@@ -173,7 +174,12 @@ class TestLadderWiring:
         result = probe_tools.run_probe_with_captcha_check(
             "https://example.com/p/4", job_id=0
         )
-        assert result.get("captcha_detected") is True
-        assert set(result.get("methods_tried", [])) == set(_NAMES), (
-            "every ladder rung must be attempted before the captcha verdict"
+        assert result.get("probe_failed") is True, (
+            "no rung returned a captcha page — this is not a captcha verdict "
+            "(2026-10-05 audit: 61/62 captcha_blocked rows were false)"
         )
+        assert result.get("captcha_detected") is False
+        assert set(result.get("methods_tried", [])) == set(_NAMES), (
+            "every ladder rung must be attempted before the failure verdict"
+        )
+        assert "[PROBE-FAILED 0/" in result["error"]

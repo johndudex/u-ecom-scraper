@@ -101,17 +101,23 @@ def test_negative_write_never_touches_method(monkeypatch):
 
 
 @pytest.mark.django_db
-def test_plain_failures_keep_legacy_captcha_write(monkeypatch):
-    """Non-akamai all-fail keeps the legacy behavior untouched (captcha'd
-    domain cache) — B2 adds a direction, it does not remove one."""
+def test_plain_failures_write_a_field_scoped_flag_only(monkeypatch):
+    """[wave-55 H1] Non-akamai all-fail is NOT a captcha verdict — the write
+    stays field-scoped (no invented `method`) and the captcha flag records
+    what was actually seen, so a no-captcha all-fail leaves a visibly empty
+    row instead of captcha poison."""
     domain = _domain()
     _drive(
         monkeypatch, f"https://{domain}/c/knitwear",
         {"success": False, "status_code": 403},
     )
     row = ProbeCache.objects.get(domain=domain)
-    assert row.captcha_detected is True
+    assert row.captcha_detected is False
     assert row.needs_akamai_bypass is False
+    assert row.method == "", (
+        "the last-tried rung never worked — writing its name is how 32 "
+        "poison rows read as 'cloak_residential works'"
+    )
 
 
 @pytest.mark.django_db

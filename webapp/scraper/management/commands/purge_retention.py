@@ -9,8 +9,8 @@ older than ``--days-failed`` and completed jobs older than
 
 Dry-run by default (reports counts); ``--write`` applies. Parked/live
 statuses (pending, running, waiting_approval, captcha_blocked,
-akamai_blocked, browser_unavailable) are never touched — resumable jobs
-need their checkpoints.
+akamai_blocked, browser_unavailable, provider_dead) are never touched —
+resumable jobs need their checkpoints.
 """
 from __future__ import annotations
 
@@ -69,6 +69,7 @@ class Command(BaseCommand):
             self.stdout.write(f"sessionlog rows: {report['sessionlog_rows']}")
             self.stdout.write(f"toolcalllog rows: {report['toolcalllog_rows']}")
             self.stdout.write(f"step rows: {report['step_rows']}")
+            self.stdout.write(f"beat: {report['beat']}")
             return
         for key, value in report.items():
             self.stdout.write(f"{key}: {value}")

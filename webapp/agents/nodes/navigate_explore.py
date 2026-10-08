@@ -1223,14 +1223,16 @@ def _persist_explore_summary(job_id: int, findings: dict) -> None:
             for u in sample_urls:
                 summary += f"    - {u}\n"
 
-        seq = SessionLog.objects.filter(job_id=job_id).count()
-        SessionLog.objects.create(
-            job_id=job_id,
-            role=SessionLog.ROLE_ASSISTANT,
-            agent="navigation-explore",
-            content=summary,
-            seq=seq,
-        )
+        from agents.graph import _session_seq_alloc
+
+        with _session_seq_alloc(job_id) as alloc:
+            SessionLog.objects.create(
+                job_id=job_id,
+                role=SessionLog.ROLE_ASSISTANT,
+                agent="navigation-explore",
+                content=summary,
+                seq=alloc(),
+            )
     except Exception as exc:
         logger.warning("navigate_explore: failed to persist summary log: %s", exc)
 

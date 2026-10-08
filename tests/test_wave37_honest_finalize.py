@@ -27,7 +27,10 @@ import django  # noqa: E402
 
 django.setup()
 
-from scraper.models import JobListing, ScrapeJob  # noqa: E402
+from django.utils import timezone  # noqa: E402
+from datetime import timedelta  # noqa: E402
+
+from scraper.models import JobListing, ScrapeJob, Step  # noqa: E402
 from scraper.tasks import finalize_from_artifacts  # noqa: E402
 
 pytestmark = pytest.mark.django_db
@@ -50,7 +53,14 @@ def _output_file(records: list) -> str:
 
 
 def test_output_artifact_with_records_finalize_completed():
+    # [wave-55 C4-e] prod 593's execution HAD started (it wrote the rows the
+    # soft-limit kill interrupted) — the Step row is that clock, and the
+    # evidence finalize requires it before completing.
     job = _job(product_count=10)  # stale counter must not win
+    Step.objects.create(
+        job=job, phase="execution", status=Step.STATUS_DONE,
+        started_at=timezone.now() - timedelta(minutes=5),
+        completed_at=timezone.now())
     job.output_file = _output_file([{"title": "x", "price": "$1"}])
     job.save(update_fields=["output_file"])
     status = finalize_from_artifacts(job.id, "SoftTimeLimitExceeded")
@@ -63,7 +73,13 @@ def test_output_artifact_with_records_finalize_completed():
 
 def test_joblisting_rows_count_as_evidence_too():
     # jobs-domain evidence: store_job_listings rows without an artifact.
+    # [wave-55 C4-e] store_job_listings only runs on execution_status SUCCESS,
+    # so an execution Step always sits behind these rows — model it.
     job = _job()
+    Step.objects.create(
+        job=job, phase="execution", status=Step.STATUS_DONE,
+        started_at=timezone.now() - timedelta(minutes=5),
+        completed_at=timezone.now())
     JobListing.objects.create(scrape_job=job, url="https://example.com/j/1", title="x")
     assert finalize_from_artifacts(job.id, "SoftTimeLimitExceeded") == (
         ScrapeJob.STATUS_COMPLETED

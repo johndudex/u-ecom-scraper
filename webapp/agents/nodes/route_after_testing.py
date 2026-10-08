@@ -549,12 +549,15 @@ def _zero_yield_stop(state: ScrapeState) -> bool:
 
 
 def _row_url_has_path(row: dict) -> bool:
-    """[wave-51 T9] Item-shaped URL floor for ground-truth counting: a row
-    whose URL is root-only or fragment-only (job 499's ``/#main`` shell row,
-    title+price populated) is never an item, so it must not count toward the
-    ground-truth override. Rows with no URL key at all are not this floor's
-    verdict (URL presence is other bars' job) and fail open, as does import
-    trouble — ground truth must never go blind over a broken helper."""
+    """[wave-51 T9 / wave-55 C3] Item-shaped URL floor for ground-truth
+    counting: a row whose URL is root-only or fragment-only (job 499's
+    ``/#main`` shell row, title+price populated) — or a navigation/listing
+    position (``/collections/<slug>``, ``/new-in``; the PDP-shape tier in
+    ``src.discovery_quality``) — is never an item, so it must not count
+    toward the ground-truth override. Rows with no URL key at all are not
+    this floor's verdict (URL presence is other bars' job) and fail open, as
+    does import trouble — ground truth must never go blind over a broken
+    helper."""
     url = row.get("url") or row.get("product_url") or ""
     if not url:
         return True
@@ -793,11 +796,17 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
                             # F15: same core-field requirement as the primary
                             # predicate — a file full of brand-only rows must
                             # not rescue a failing test (job 337 pattern).
+                            # [wave-55 C3] same item-shape floor too, or the
+                            # fallback would count the very nav rows the
+                            # primary predicate just rejected.
                             if fields:
                                 _good = [p for p in _live
-                                         if any(_field_has_value(p.get(f)) for f in fields)]
+                                         if _row_url_has_path(p)
+                                         and any(_field_has_value(p.get(f)) for f in fields)]
                             else:
-                                _good = [p for p in _live if has_substantive_field(p)]
+                                _good = [p for p in _live
+                                         if _row_url_has_path(p)
+                                         and has_substantive_field(p)]
                             if len(_good) >= min_count:
                                 logger.info(
                                     "route_after_testing: OUTPUT-AS-TRUTH rescue — found %d real "
@@ -816,17 +825,163 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
 _scraper_has_priced_products = _scraper_has_real_items
 
 
+# [wave-55 GAP-C] The price-bearing core fields, and only these, may be judged
+# absent by a digit-free string. `currency` is deliberately NOT priceish: 'USD'
+# carries no digit and is real data, so the absence reading must never reach it.
+_PRICEISH = {"price", "current_price", "sale_price", "list_price",
+             "was_price", "regular_price"}
+
+
+def null_core_columns(
+    rows: list[dict], page_type: str, core_field_names: list[str] | None = None
+) -> list[str]:
+    """[wave-55 M1] Every CORE field that is empty on ALL of ``rows``.
+
+    THE one row predicate behind the null-core checks: ``_artifact_core_coverage``
+    (the router's coverage gate) and the finalize/partner stamps in
+    ``scraper/tasks.py`` + ``api/sample_persist.py`` all consume it, so a
+    column the router calls dead is the column every stamp names. Judged on
+    the LIVE rows only (``_is_dead_product`` — the tester's own schema excludes
+    dead URLs from quality) and reported in the content type's declared order;
+    ``[]`` when nothing is provable (no live rows, unknown content type).
+
+    ``core_field_names`` overrides the registry — a job whose
+    ``content_type_config`` carries its own core set is judged against that
+    set. Emptiness is ``_field_has_value`` — the same wave-49 "typed numeric
+    zero is data, empty string is not" rule the ground-truth check uses, so a
+    legitimate $0.00 price is never miscounted as a null column. [wave-55
+    GAP-C] a price column may also read as empty through a digit-free string
+    ('Book an appointment') — the same absence predicate the price gate uses,
+    so a producer's spelling of 'no price' cannot keep a dead column honest.
+    """
+    from src.field_mapping import price_string_is_absent
+    core = [
+        str(f).strip().lower() for f in (core_field_names or []) if str(f).strip()
+    ]
+    if not core:
+        try:
+            from src.content_types import get_content_type
+
+            ct = get_content_type((page_type or "product").lower())
+            if ct and getattr(ct, "core_fields", None):
+                core = [str(f).lower() for f in ct.core_fields]
+        except Exception:
+            core = []
+    if not core:
+        return []
+    try:
+        from src.content_types import _field_has_value
+    except Exception:
+
+        def _field_has_value(v):  # type: ignore
+            return bool(v)
+
+    live = [
+        r for r in (rows or []) if isinstance(r, dict) and not _is_dead_product(r)
+    ]
+    if not live:
+        return []
+
+    def _col_is_dead(f: str) -> bool:
+        # A row carries a value when `_field_has_value` says so — except on a
+        # price column, where a digit-free string is a *spelling* of absence
+        # rather than data (the same rule the price gate judges by).
+        priceish = f in _PRICEISH
+        return not any(
+            _field_has_value(r.get(f))
+            and not (priceish and price_string_is_absent(r.get(f)))
+            for r in live)
+
+    return [f for f in core if _col_is_dead(f)]
+
+
+def _artifact_core_coverage(
+    state: ScrapeState, core_order: list[str]
+) -> tuple[bool, str | None]:
+    """[wave-55 M1] Null-aware core-field coverage, read FROM THE OUTPUT ROWS.
+
+    Returns ``(rows_readable, dead_field)``. ``rows_readable`` is True when at
+    least one live (non-dead) row was recovered from the newest output
+    artifact; ``dead_field`` is then the first core field — in the content
+    type's declared order — that is empty on EVERY one of those rows (None
+    when they all carry data). ``rows_readable`` False means the artifact said
+    nothing (no rows, unreadable, or every row a dead URL) and the caller may
+    fall back to the tester's own claims.
+
+    The column predicate is the shared ``null_core_columns`` — the finalize
+    and partner-sample stamps read the same helper, so they can never name a
+    different field than the gate that rejected the run.
+    """
+    slug = (state.get("site_slug") or "").strip()
+    if not slug:
+        return False, None
+    rows = _items_from_output_file(
+        slug, mtime_floor=_job_started_floor(state), skip_discovery=True
+    )
+    live = [r for r in rows if isinstance(r, dict) and not _is_dead_product(r)]
+    if not live:
+        return False, None
+    dead = null_core_columns(
+        rows, (state.get("page_type") or "product").lower(),
+        core_field_names=core_order,
+    )
+    return True, (dead[0] if dead else None)
+
+
 def _core_field_zero_coverage(report: dict, state: ScrapeState) -> str | None:
     """Return the name of a CORE output field the scraper left at ~0% coverage.
 
-    code_tester records per-field coverage in ``results.field_coverage`` (e.g.
-    ``{"company": {"count": 0, "coverage": "0%", "status": "MISSING"}}``) but
-    only promotes SOME problems into the ``issues`` list.  A systematically
-    empty core field is a mapping bug (the code-writer pulled from the wrong
-    source) and must trigger a retry so the loop remaps it — otherwise a
-    scraper that silently drops a required field ships as PASS.
+    [wave-55 M1] NULL-AWARE, computed from the OUTPUT ARTIFACT: the newest
+    output's live rows are counted per core field and a field empty on every
+    one of them is a coverage failure — regardless of what code_tester
+    claimed. Prod 1219: 10/10 rows with ``price=None`` while the tester's own
+    ``results.field_coverage`` said price
+    ``{count: 19, coverage: "100%", status: "CORRECT", quality: "excellent"}``;
+    gating on that claim shipped the run as PASS. The LLM block is kept for
+    display only — it survives here solely as the fallback for a run whose
+    rows could not be read, where it can only be as wrong as before and can no
+    longer paper over a null column.
+
+    A systematically empty core field is a mapping bug (the code-writer pulled
+    from the wrong source) and must trigger a retry so the loop remaps it —
+    otherwise a scraper that silently drops a required field ships as PASS.
     Returns the missing field name, or None.
     """
+    page_type = (state.get("page_type") or "product").lower()
+    # [wave-55 GAP-1b] The judged set is the job's OWN contract INTERSECTED
+    # with the registry core — the same source `_scraper_has_real_items` uses
+    # for its job-118 schema-aware floor. Seeding the gate with the union
+    # wholesale (the first GAP-1b cut) made any requested OPTIONAL field the
+    # site never publishes strict core: it escalated to high severity, vetoed
+    # the PASS and failed the job, instead of the T2.8 medium remap issue the
+    # contract mandates. And the registry alone over-judged the other
+    # direction — a title+price+url job never asked for availability/currency,
+    # so an honest run against a site that does not publish them is not a
+    # 0%-coverage mapping bug. Only a job that requested nothing falls back to
+    # the full core set.
+    try:
+        from src.field_mapping import core_judged_set, union_output_fields
+
+        cfg = state.get("content_type_config") or {}
+        core_order = core_judged_set(
+            union_output_fields(state),
+            page_type,
+            cfg.get("core_field_names") if isinstance(cfg, dict) else None,
+        )
+    except Exception:
+        core_order = []
+    if not core_order:
+        return None
+
+    readable, dead_field = _artifact_core_coverage(state, core_order)
+    if readable:
+        return dead_field
+
+    # FALLBACK — display-grade input only: no artifact rows were readable, so
+    # the tester's per-field claims are all that is left. code_tester records
+    # per-field coverage in ``results.field_coverage`` (e.g. ``{"company":
+    # {"count": 0, "coverage": "0%", "status": "MISSING"}}``) but only
+    # promotes SOME problems into the ``issues`` list.
     results = report.get("results") or {}
     field_coverage = results.get("field_coverage") or {}
     if not field_coverage:
@@ -841,22 +996,7 @@ def _core_field_zero_coverage(report: dict, state: ScrapeState) -> str | None:
     if successful <= 0:
         return None
 
-    page_type = (state.get("page_type") or "product").lower()
-    core: set[str] = set()
-    try:
-        from src.content_types import get_content_type
-
-        ct = get_content_type(page_type)
-        if ct and getattr(ct, "core_fields", None):
-            core = {str(f).lower() for f in ct.core_fields}
-    except Exception:
-        pass
-    cfg = state.get("content_type_config") or {}
-    if cfg.get("core_field_names"):
-        core = {str(f).lower() for f in cfg["core_field_names"]}
-    if not core:
-        return None
-
+    core = set(core_order)
     for field, info in field_coverage.items():
         if not isinstance(info, dict) or str(field).lower() not in core:
             continue
@@ -997,7 +1137,9 @@ def _is_double_host(url: str) -> bool:
     return (f"//{host}" in rest) or (f"/{host}/" in rest)
 
 
-def _items_from_output_file(slug: str, mtime_floor: float | None = None) -> list[dict]:
+def _items_from_output_file(
+    slug: str, mtime_floor: float | None = None, skip_discovery: bool = False
+) -> list[dict]:
     """Read the newest scrape output's item rows (any content type).
 
     Scans every top-level list-of-dicts (products/articles/jobs/…) — no
@@ -1009,6 +1151,10 @@ def _items_from_output_file(slug: str, mtime_floor: float | None = None) -> list
     5-row sample and the checks validate the map against the wrong job's rows.
     Callers pass the current job's started_at so stale files are excluded —
     the same stale-artifact re-injection class as prod job 12.
+
+    ``skip_discovery`` [wave-55 M1]: a ``--discover-only`` artifact holds URL
+    stubs, not extraction rows — a coverage check reading it would report a
+    0%-filled extraction run that never happened.
     """
     if not slug:
         return []
@@ -1035,6 +1181,8 @@ def _items_from_output_file(slug: str, mtime_floor: float | None = None) -> list
         logger.debug("_items_from_output_file: read failed for %s: %s", slug, exc)
         return []
     if not isinstance(data, dict):
+        return []
+    if skip_discovery and _is_discovery_output(data):
         return []
     for v in data.values():
         if isinstance(v, list) and v and all(isinstance(r, dict) for r in v):
@@ -1643,6 +1791,51 @@ def _terminal_after_grace_check(state: ScrapeState, dest: str) -> str:
     return "code_writer"
 
 
+# [wave-55 M2] Tester dead-site verdicts: ``site_status`` values that mean the
+# store itself is gone (prod 1205's ``DEAD_STORE_SUNSET``). Substring match on
+# the normalized value so compound stamps ("site_dead", "parked_domain") match
+# without enumerating every wording an LLM has produced.
+_DEAD_SITE_TOKENS = (
+    "dead", "sunset", "closed", "cease", "defunct", "parked", "out_of_business",
+)
+
+# [wave-55 GAP-2] …but a substring test cannot read negation: the tester that
+# writes ``not_dead`` / ``dead_store_ruled_out`` is describing a LIVE site, and
+# every one of those contains ``dead``. A value carrying a negation marker is
+# skipped before the token test — a live site's run must not die on a "not".
+# ``not`` is deliberately bare: it covers ``not_dead``, ``not dead`` and
+# ``notdead`` in one marker, and no dead stamp in the vocabulary contains it.
+_DEAD_SITE_NEGATIONS = (
+    "not", "no_", "ruled_out", "alive", "active", "live", "operational",
+)
+
+
+def _dead_store_evidence(report: dict) -> str:
+    """[wave-55 M2] The tester's own dead-site verdict, "" when there is none.
+
+    Reads the two stamps the tester's dead-site handling produces — a
+    top-level ``site_status`` and ``dead_site_assessment.site_status``
+    (prod 1205 wrote both). Only the REPORT is read: a stale
+    ``product_analysis`` verdict from a previous job must not fail this one.
+    Negated values (``not_dead``, ``ruled_out``, ``operational``) are never
+    evidence — see ``_DEAD_SITE_NEGATIONS``.
+    """
+    if not isinstance(report, dict):
+        return ""
+    stamps = [report.get("site_status")]
+    assessment = report.get("dead_site_assessment")
+    if isinstance(assessment, dict):
+        stamps.append(assessment.get("site_status"))
+        stamps.append(assessment.get("status"))
+    for raw in stamps:
+        value = str(raw or "").strip().lower()
+        if not value or any(neg in value for neg in _DEAD_SITE_NEGATIONS):
+            continue
+        if any(tok in value for tok in _DEAD_SITE_TOKENS):
+            return value
+    return ""
+
+
 def _fast_fail_escalation_enabled() -> bool:
     """[wave-40 T1 guard 5] Kill-switch for the A5 named fast-fail arm.
 
@@ -1727,6 +1920,12 @@ def route_after_testing(state: ScrapeState) -> str:
     # Route functions return only a node name (no state update possible), so
     # the exhausted-retries error is recorded by the CALLER (code_tester's
     # exhausted-retry return) — see _invoke_code_tester. This fn only routes.
+    # [wave-55 GAP-1a round-7] The no-report rescue arms below are guarded on
+    # `_scraper_has_real_items` alone, and they sit ABOVE the `missing_core`
+    # computation — hoist the read so the veto reaches them. The artifact
+    # branch needs no report (that is its point), and a report-less run whose
+    # output is readable is exactly the shape the rescue arm trusts.
+    _nr_missing_core = _core_field_zero_coverage(report or {}, state)
     if not report:
         # [job-81 N-C] Two consecutive code_tester wall-clock deaths and no
         # verdict for the current attempt: the draft is UNJUDGED, not failed
@@ -1754,7 +1953,23 @@ def route_after_testing(state: ScrapeState) -> str:
             # produced real output during testing. Under skip_approvals,
             # field_confirmation goes straight to run_execution.
             _rescue_min = 1 if (state.get("input_mode") or "") in ("url_list", "list_page") else 3
-            if _scraper_has_real_items(state, min_count=_rescue_min):
+            # [wave-55 GAP-1a] Real rows whose core column is empty on every
+            # one are the 1219 ship, not a rescue.
+            if _nr_missing_core and _scraper_has_real_items(
+                state, min_count=_rescue_min
+            ):
+                logger.warning(
+                    "route_after_testing: no-report FINAL rescue vetoed — core "
+                    "field '%s' is empty on every output row → fix ladder",
+                    _nr_missing_core,
+                )
+                _log_cascade(
+                    state, "cascade-no-report-rescue-null-core",
+                    f"no test_report (FINAL) but core field "
+                    f"'{_nr_missing_core}' is null on every row → not "
+                    "field_confirmation",
+                )
+            elif _scraper_has_real_items(state, min_count=_rescue_min):
                 logger.info(
                     "route_after_testing: no test_report (final) but output has real "
                     "items → field_confirmation (rescue)"
@@ -1774,10 +1989,28 @@ def route_after_testing(state: ScrapeState) -> str:
             return "scraper_analyzer"
         # Retries exhausted with no test_report — check output files before giving up.
         _rescue_min = 1 if (state.get("input_mode") or "") in ("url_list", "list_page") else 3
-        if _scraper_has_real_items(state, min_count=_rescue_min):
+        # [wave-55 GAP-1a] Same veto as the FINAL arm above — this is literally
+        # a "retries exhausted" rescue, so a null core column must not walk out
+        # of it.
+        if _nr_missing_core and _scraper_has_real_items(
+            state, min_count=_rescue_min
+        ):
+            logger.warning(
+                "route_after_testing: no-report exhausted rescue vetoed — core "
+                "field '%s' is empty on every output row → fix ladder",
+                _nr_missing_core,
+            )
+            _log_cascade(
+                state, "cascade-no-report-rescue-null-core",
+                f"no test_report after {retry_count} retries but core field "
+                f"'{_nr_missing_core}' is null on every row → not "
+                "field_confirmation",
+            )
+        elif _scraper_has_real_items(state, min_count=_rescue_min):
             logger.info(
                 "route_after_testing: no test_report after %d retries but output has "
-                "real items → field_confirmation (rescue)"
+                "real items → field_confirmation (rescue)",
+                retry_count,
             )
             return "field_confirmation"
         logger.error(
@@ -1793,6 +2026,49 @@ def route_after_testing(state: ScrapeState) -> str:
         confidence = 0.0
     issues = report.get("issues", [])
     high_severity = any(i.get("severity") == "high" for i in issues)
+
+    # [wave-55 M2] DEAD-STORE short-circuit. When the tester itself proved the
+    # store is gone (prod 1205: DEAD_STORE_SUNSET after 3 independent access
+    # paths) and the output holds nothing real, every arm below burns a fix
+    # cycle against content that does not exist — that shape read
+    # "PASS 0.8 / ready=true" on an empty output and spent 81 minutes in a
+    # code-fix loop before an identical-draft guard killed it. Terminate
+    # honestly instead. Routing functions cannot mutate state, so
+    # "ready_for_execution=false" is expressed by routing: nothing below this
+    # arm can reach execution. The ground-truth check keeps the veto honest —
+    # an output that DOES hold real items outranks the dead-store claim (the
+    # tester is wrong about the site, not the scraper).
+    _dead_status = _dead_store_evidence(report)
+    if _dead_status:
+        _dead_min = (
+            1 if (state.get("input_mode") or "").strip() in ("url_list", "list_page")
+            else 3
+        )
+        if _scraper_has_real_items(state, min_count=_dead_min):
+            logger.warning(
+                "route_after_testing: tester reports a dead site (%s) but the "
+                "output holds real items — ground truth outranks the dead-store "
+                "claim", _dead_status,
+            )
+        else:
+            _dead_dest = (
+                "cleanup" if state.get("skip_approvals", False) else "human_approval"
+            )
+            logger.error(
+                "route_after_testing: tester verdict is a DEAD site (%s) with no "
+                "real items on disk — no fix cycle can create content that does "
+                "not exist → %s (honest fail, ready_for_execution=false)",
+                _dead_status, _dead_dest,
+            )
+            _log_cascade(
+                state, "dead-store",
+                f"tester site_status={_dead_status}, 0 real items → honest fail "
+                f"({_dead_dest})",
+            )
+            # Deliberately NOT _terminal_after_grace_check: granting a writer
+            # cycle for a never-attempted remediation on a dead domain is
+            # exactly the burn this arm exists to stop.
+            return _terminal_after_retest_check(state, _dead_dest)
 
     # [wave-24 W24-1] Un-proven verdict: the draft changed WHILE the tester
     # ran (leaked writer thread under a live test — prod 395: zombie
@@ -2086,6 +2362,21 @@ def route_after_testing(state: ScrapeState) -> str:
         and str(i.get("description") or "").startswith("Deterministic check:")
         and str(i.get("field") or "").lower() in _det_empty_core_fields
     ]
+    # [wave-55 C3] CONFIDENT-FAIL VETO: when the tester said FAIL and said so
+    # explicitly (ready_for_execution=false) while fix budget remains, ground
+    # truth does not overrule it — the audit's 88-job class is exactly this
+    # shape executed anyway (1200: FAIL / 0.8 / ready=false → 5 category rows
+    # COMPLETED). Retries exhausted (or a FINAL sentinel attempt) keeps the
+    # documented escape hatch: the override below may still stand, but it is
+    # on the record now. Routing functions cannot mutate state, so the veto
+    # is expressed as NOT taking the override: control falls through to the
+    # ladder, whose retry arms route into the fix loop.
+    _confident_tester_fail = (
+        str(assessment).strip().upper() == "FAIL"
+        and (report or {}).get("ready_for_execution") is False
+        and not is_final_attempt
+        and int(retry_count or 0) < MAX_TEST_RETRIES
+    )
     if not _det_empty_core:
         _override_min = 1 if (state.get("input_mode") or "").strip() in ("url_list", "list_page") else 3
         if (
@@ -2097,12 +2388,34 @@ def route_after_testing(state: ScrapeState) -> str:
             and not _det_blockers
             and _scraper_has_real_items(state, min_count=_override_min)
         ):
-            logger.info(
-                "route_after_testing: GROUND-TRUTH PASS — scraper produced ≥%d real "
-                "items (overriding code_tester's high_severity flags)",
-                _override_min,
-            )
-            return "field_confirmation"
+            if _confident_tester_fail:
+                logger.warning(
+                    "route_after_testing: ground-truth override VETOED — tester "
+                    "verdict is FAIL with ready_for_execution=false and %d/%d "
+                    "retries left → fix ladder",
+                    retry_count, MAX_TEST_RETRIES,
+                )
+                _log_cascade(
+                    state, "confident-fail-veto",
+                    f"tester FAIL + ready_for_execution=false at retry "
+                    f"{retry_count}/{MAX_TEST_RETRIES} blocks the ground-truth "
+                    "override",
+                )
+            else:
+                # [wave-55 C3] this arm used to logger.info only, so the
+                # 88-job class left no trace — every sibling arm logs.
+                logger.info(
+                    "route_after_testing: GROUND-TRUTH PASS — scraper produced ≥%d real "
+                    "items (overriding code_tester's high_severity flags)",
+                    _override_min,
+                )
+                _log_cascade(
+                    state, "ground-truth-override",
+                    f"≥{_override_min} real items override the tester verdict "
+                    f"({assessment}, ready="
+                    f"{(report or {}).get('ready_for_execution')})",
+                )
+                return "field_confirmation"
 
     # [wave-24 W24-3] Access-wall ×2 early terminal: throttling / tier-blocks
     # / render-walls are INFRA failures — no writer cycle can fix them (393:
@@ -2125,7 +2438,7 @@ def route_after_testing(state: ScrapeState) -> str:
         _rescue_min_aw = (
             1 if (state.get("input_mode") or "") in ("url_list", "list_page") else 3
         )
-        if not _contract_bad and _scraper_has_real_items(
+        if not _contract_bad and not missing_core and _scraper_has_real_items(
             state, min_count=_rescue_min_aw
         ):
             logger.info(
@@ -2133,6 +2446,20 @@ def route_after_testing(state: ScrapeState) -> str:
                 "→ field_confirmation (ground truth beats the wall)"
             )
             return "field_confirmation"
+        if not _contract_bad and missing_core and _scraper_has_real_items(
+            state, min_count=_rescue_min_aw
+        ):
+            logger.warning(
+                "route_after_testing: access-wall rescue vetoed — core field "
+                "'%s' is empty on every output row → fix ladder",
+                missing_core,
+            )
+            _log_cascade(
+                state, "cascade-access-wall-null-core",
+                f"access-wall ×2 with real items but core field "
+                f"'{missing_core}' is null on every row → not "
+                "field_confirmation",
+            )
         if bool(state.get("access_wall_all_throttled")):
             # Every counted stop was OUR browser-service 429 — park the job
             # (non-terminal, beat-resumed) instead of an honest-FAIL cleanup.
@@ -2264,7 +2591,10 @@ def route_after_testing(state: ScrapeState) -> str:
         # the tester's verdict, same rescue as the exhausted-cascade arm).
         if state.get("skip_approvals", False):
             _rescue_min = 1 if (state.get("input_mode") or "") in ("url_list", "list_page") else 3
-            if _scraper_has_real_items(state, min_count=_rescue_min):
+            # [wave-55 GAP-1a round-7] Class closure: the same single-guard
+            # hole the intake rescue arm had, on the last rescue arm in the
+            # ladder.
+            if _scraper_has_real_items(state, min_count=_rescue_min) and not missing_core:
                 logger.info(
                     "route_after_testing: FINAL attempt FAILED but output has real "
                     "items → field_confirmation (rescue, skip_approvals → run_execution)"
@@ -2432,24 +2762,59 @@ def route_after_testing(state: ScrapeState) -> str:
     # previously bypassed MAX_TEST_RETRIES (only the LLM fallback enforced it).
     if retry_count >= MAX_TEST_RETRIES:
         if confidence >= MIN_CONFIDENCE_PARTIAL and _scraper_produced_valid_output(state):
-            logger.warning(
-                "route_after_testing: retries exhausted in cascade (count=%d, "
-                "action=%s) → field_confirmation (partial valid output)",
-                retry_count, _action,
-            )
-            _log_cascade(
-                state, "cascade-exhausted-partial",
-                f"retries exhausted ({_action}) but partial valid output → "
-                "field_confirmation",
-            )
-            return "field_confirmation"
+            if missing_core:
+                # [wave-55 GAP-1] The null column the arms below veto on
+                # (_exhausted_cleanup_redirect) is a veto here too: a "partial
+                # valid output" whose core column is empty on every row is the
+                # 1219 ship (audit fix #13 clause 2) — it would land COMPLETED
+                # with no remap cycle and no record of why.
+                logger.warning(
+                    "route_after_testing: exhausted partial arm vetoed — core "
+                    "field '%s' is empty on every output row → fix ladder",
+                    missing_core,
+                )
+                _log_cascade(
+                    state, "cascade-exhausted-partial-null-core",
+                    f"partial valid output but core field '{missing_core}' is "
+                    "null on every row → not field_confirmation",
+                )
+            else:
+                logger.warning(
+                    "route_after_testing: retries exhausted in cascade (count=%d, "
+                    "action=%s) → field_confirmation (partial valid output)",
+                    retry_count, _action,
+                )
+                _log_cascade(
+                    state, "cascade-exhausted-partial",
+                    f"retries exhausted ({_action}) but partial valid output → "
+                    "field_confirmation",
+                )
+                return "field_confirmation"
         # For skip_approvals jobs (intake), human_approval auto-approves and
         # loops back to scraper_analyzer — creating an infinite retry cycle.
         # BUT: if the output files contain real items, route to field_confirmation
         # (which under skip_approvals goes straight to run_execution — NOT a loop).
         if state.get("skip_approvals", False):
             _rescue_min = 1 if (state.get("input_mode") or "") in ("url_list", "list_page") else 3
-            if _scraper_has_real_items(state, min_count=_rescue_min):
+            # [wave-55 GAP-1a] The rescue arm guards on item count alone, and
+            # field_confirmation auto-approves to run_execution under
+            # skip_approvals — so the same null column the partial arm above
+            # just vetoed came back through this door and shipped to COMPLETED
+            # (the intake/1227 blast radius).
+            _rescue_items = _scraper_has_real_items(state, min_count=_rescue_min)
+            if missing_core and _rescue_items:
+                logger.warning(
+                    "route_after_testing: exhausted intake rescue vetoed — core "
+                    "field '%s' is empty on every output row → fix ladder",
+                    missing_core,
+                )
+                _log_cascade(
+                    state, "cascade-exhausted-rescue-null-core",
+                    f"real items (min_count={_rescue_min}) but core field "
+                    f"'{missing_core}' is null on every row → not "
+                    "field_confirmation",
+                )
+            elif _rescue_items:
                 logger.info(
                     "route_after_testing: retries exhausted (count=%d, reason=%s) but "
                     "output has real items → field_confirmation (rescue, skip_approvals → run_execution)",
@@ -2471,8 +2836,9 @@ def route_after_testing(state: ScrapeState) -> str:
             # ran" mystery.
             _log_cascade(
                 state, "cascade-exhausted-cleanup",
-                f"retries exhausted ({_action}: {_reason}), no real items "
-                f"(min_count={_rescue_min}) → cleanup (skip_approvals)",
+                f"retries exhausted ({_action}: {_reason})"
+                + (f", core '{missing_core}' null on every row" if missing_core else "")
+                + f" → cleanup (skip_approvals, rescue floor {_rescue_min})",
             )
             return _exhausted_cleanup_redirect(
                 state,
@@ -2618,7 +2984,13 @@ def route_after_testing(state: ScrapeState) -> str:
         _log_cascade(state, "refine-fix", f"{assessment} confidence={confidence:.2f}")
         return "code_writer"
 
-    if confidence >= MIN_CONFIDENCE_PARTIAL and _scraper_produced_valid_output(state):
+    # [wave-55 GAP-1a] `missing_core` gates the cascade twin of this arm above —
+    # the catch-all must not be the door a null core column walks out of.
+    if (
+        not missing_core
+        and confidence >= MIN_CONFIDENCE_PARTIAL
+        and _scraper_produced_valid_output(state)
+    ):
         logger.warning(
             "route_after_testing: retries exhausted (count=%d, assessment=%s, "
             "confidence=%.2f) → field_confirmation (partial output with valid products)",

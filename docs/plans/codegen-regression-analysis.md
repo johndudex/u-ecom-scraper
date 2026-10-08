@@ -75,7 +75,7 @@ What it never gets:
 
 ### The `src_url` rule is real but unreachable in this configuration
 
-The builder does say it — `subagents.py:3098-3100`: *"src_url: Set to the URL where the item was discovered. If input comes from input_urls.json, src_url equals the item URL. For navigation scrapers, src_url is the listing/search page URL."* But it is generic prose ~200 lines deep in the message, and `api_section` (job 10's dominant section) never mentions `src_url` at all. The current `.opencode/agents/code-writer.md` prompt never mentions `src_url` either (only the retired `code-writer-v1.md:110,136` did). Neither the code_tester prompt nor `validate_coverage` checks `src_url` uniformity/semantics — `normalize_fields.py` merely passes the key through. So nothing downstream catches "every record cites itself".
+The builder does say it — `subagents.py:3098-3100`: *"src_url: Set to the URL where the item was discovered. If input comes from input_urls.json, src_url equals the item URL. For navigation scrapers, src_url is the listing/search page URL."* But it is generic prose ~200 lines deep in the message, and `api_section` (job 10's dominant section) never mentions `src_url` at all. The current `.opencode/agents/code-writer.md` prompt never mentions `src_url` either (only the retired `code-writer-v1.md:110,136` did; file deleted wave-55 — cite git history, not a path). Neither the code_tester prompt nor `validate_coverage` checks `src_url` uniformity/semantics — `normalize_fields.py` merely passes the key through. So nothing downstream catches "every record cites itself".
 
 ---
 

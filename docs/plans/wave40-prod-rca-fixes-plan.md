@@ -1479,6 +1479,8 @@ def test_finalize_publishes_the_draft(tmp_path, monkeypatch):
 
 ### Task 11: Slug-scoped finalize liveness guard + tombstone rename (cross-job class)
 
+> **[wave-55 H13 supersession]** T11's trash sweep moved out of `purge_retention` in wave-55 — see `scraper/retention.sweep_workspace_trash` (own beat entry `sweep-workspace-trash`, routed to the worker queue: the events container's `workspace/` is a frozen volume snapshot, so the in-purge sweep read the wrong FS and swept nothing). The "purge_retention gains the `_trash` sweep" instructions below are historical.
+
 **Files:**
 - Create: `webapp/agents/invocation_registry.py` (~60 lines)
 - Modify: `webapp/scraper/tasks.py` — register/unregister in `run_scrape_task` (`~:564`) and the resume path (`~:715`); extract `_maybe_delete_workspace(job, ws) -> str` from the rmtree tail (`:1810-1822`); `purge_retention` (`:2435` area) gains the `_trash` sweep

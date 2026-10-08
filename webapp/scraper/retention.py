@@ -8,16 +8,28 @@ and django_session grow the same way. All the byte hogs anchor on the job:
 checkpoints by ``thread_id = "job-{ScrapeJob.pk}"``
 (``scraper/services.get_thread_id``), the log tables by job FK.
 
-Retention windows (dead-end only — see ``_PURGEABLE_FAILED_GROUP``):
-  failed, cancelled  → after ``days_failed``  (default 7)
-  completed          → after ``days_completed`` (default 90)
+Retention windows (dead-end only — see ``_PURGEABLE_FAILED_GROUP``), anchored
+on the dead end itself: ``completed_at``, falling back to ``created_at`` only
+for rows that never got a terminal stamp (the UI cancel path leaves it NULL).
+  failed, cancelled  → ``completed_at`` older than ``days_failed``  (default 7)
+  completed          → ``created_at`` older than ``days_completed`` (default 90)
+
+[wave-55 C5] the failed window used to key ``created_at``, so a job that sat
+parked/pending for weeks and then failed yesterday was already past the line
+at birth — the first effective prod purge (2026-10-05 03:17Z) destroyed 481
+such rows' evidence hours after they failed.
 
 Never touched, ever: pending / running / waiting_approval and the parked
-statuses (captcha_blocked, akamai_blocked, browser_unavailable). These are
+statuses (captcha_blocked, akamai_blocked, browser_unavailable, provider_dead).
+These are
 NOT the model's ``_TERMINAL_JOB_STATUSES`` — that set counts captcha/akamai
-as "job ended", but those jobs get re-driven (park/resume, manual re-drive),
-so retention must keep their state. Interrupt/approval resume reads
-checkpoints back too.
+as "job ended", but a parked row may still be re-driven (park/resume, manual
+re-drive), so retention keeps its state. Interrupt/approval resume reads
+checkpoints back too. [wave-55] the all-fail probe rows that only *looked*
+blocked are reclassified to ``failed`` by the H1 fix (prod backfill) and age
+out on the failed window below — the audit's "78 blocked rows retained on a
+false premise" closes through that reclassification, not by widening this
+group (only browser_unavailable / provider_dead have automatic resumers).
 
 Deliberately kept: the ScrapeJob row itself + JobListing rows (tiny — job
 history, dashboards and site stats stay intact). This purges the byte hogs,
@@ -33,6 +45,13 @@ the Railway console against prod data (2026-09-16).
 The checkpoint tables are created by langgraph's saver at runtime, not by a
 migration — a fresh database may not have them yet. The sweep skips them
 (``to_regclass``) until they exist instead of crashing the beat entry.
+
+[wave-55 H13] The workspace tombstone sweep is a separate beat entry
+(``sweep-workspace-trash``, this module's ``sweep_workspace_trash`` task). It
+reads ``PROJECT_ROOT/workspace/_trash`` and the tombstones are written by
+celery-worker — folding it into this task (routed to celery-events) left it
+reading that container's frozen workspace snapshot, so it never swept
+anything.
 """
 
 from __future__ import annotations
@@ -41,6 +60,7 @@ import logging
 import shutil
 from pathlib import Path
 
+from celery import shared_task
 from django.conf import settings
 from django.db import connection, transaction
 from django.db.models import Q
@@ -78,6 +98,30 @@ def checkpoint_tables_present() -> bool:
     return True
 
 
+def _expired_dead_end(now, days_failed: int, days_completed: int) -> Q:
+    """Selector for the purgeable set — one definition, two consumers.
+
+    The live sweep and its dry-run report must never drift apart (the dry run
+    is the operator's only preview of what a live send will delete), so both
+    read this. The failed window anchors on ``completed_at`` — "7 days after
+    the dead end", not after dispatch (see module docstring) — and falls back
+    to ``created_at`` for rows that never reached a terminal stamp. The
+    completed window keeps ``created_at``: a run's own duration is noise
+    against 90 days.
+    """
+    failed_cutoff = now - timezone.timedelta(days=days_failed)
+    completed_cutoff = now - timezone.timedelta(days=days_completed)
+    return (
+        Q(status__in=_PURGEABLE_FAILED_GROUP, completed_at__lt=failed_cutoff)
+        | Q(
+            status__in=_PURGEABLE_FAILED_GROUP,
+            completed_at__isnull=True,
+            created_at__lt=failed_cutoff,
+        )
+        | Q(status=ScrapeJob.STATUS_COMPLETED, created_at__lt=completed_cutoff)
+    )
+
+
 def _expired_page(
     now,
     days_failed: int,
@@ -86,16 +130,8 @@ def _expired_page(
     limit: int,
 ) -> list[int]:
     """Next id-ordered page of expired dead-end jobs (cursor-paginated)."""
-    failed_cutoff = now - timezone.timedelta(days=days_failed)
-    completed_cutoff = now - timezone.timedelta(days=days_completed)
     qs = (
-        ScrapeJob.objects.filter(
-            Q(status__in=_PURGEABLE_FAILED_GROUP, created_at__lt=failed_cutoff)
-            | Q(
-                status=ScrapeJob.STATUS_COMPLETED,
-                created_at__lt=completed_cutoff,
-            )
-        )
+        ScrapeJob.objects.filter(_expired_dead_end(now, days_failed, days_completed))
         .filter(id__gt=after_id)
         .order_by("id")
         .values_list("id", flat=True)[:limit]
@@ -129,18 +165,47 @@ def _delete_job_children(job_ids: list[int]) -> dict[str, int]:
     return counts
 
 
+def _beat_entry_report() -> dict:
+    """[wave-55 H7 #22] The purge's own beat row, in the purge's own report.
+
+    The audit's 19-day silent entry was invisible partly because the 03:17
+    report never carried what the scheduler itself knew about it — how many
+    times the entry has actually fired and when it last changed. One query,
+    and a missing row (fresh DB, scheduler not yet synced) is an empty dict:
+    a report that dies here never gets sent, which is the opposite of the
+    visibility this exists for.
+    """
+    try:
+        from django_celery_beat.models import PeriodicTask
+
+        row = (
+            PeriodicTask.objects.filter(task="scraper.tasks.purge_retention")
+            .order_by("id")
+            .first()
+        )
+    except Exception as exc:  # pragma: no cover - beat not installed
+        logger.warning("retention: could not read the purge beat row: %s", exc)
+        return {}
+    if row is None:
+        return {}
+    return {
+        "name": row.name,
+        "enabled": row.enabled,
+        "total_run_count": row.total_run_count,
+        "date_changed": row.date_changed.isoformat() if row.date_changed else None,
+        "last_run_at": row.last_run_at.isoformat() if row.last_run_at else None,
+    }
+
+
 def _dry_run_report(
     now,
     days_failed: int,
     days_completed: int,
 ) -> dict:
     """Count what a live sweep would remove — delete nothing."""
-    failed_cutoff = now - timezone.timedelta(days=days_failed)
-    completed_cutoff = now - timezone.timedelta(days=days_completed)
-    selector = Q(
-        status__in=_PURGEABLE_FAILED_GROUP, created_at__lt=failed_cutoff
-    ) | Q(status=ScrapeJob.STATUS_COMPLETED, created_at__lt=completed_cutoff)
-    expired = ScrapeJob.objects.filter(selector)
+    expired = ScrapeJob.objects.filter(
+        _expired_dead_end(now, days_failed, days_completed)
+    )
     job_ids = list(expired.values_list("id", flat=True))
 
     report: dict = {
@@ -150,6 +215,7 @@ def _dry_run_report(
         "sessionlog_rows": SessionLog.objects.filter(job_id__in=job_ids).count(),
         "toolcalllog_rows": ToolCallLog.objects.filter(job_id__in=job_ids).count(),
         "step_rows": Step.objects.filter(job_id__in=job_ids).count(),
+        "beat": _beat_entry_report(),
     }
     if job_ids and checkpoint_tables_present():
         with connection.cursor() as cur:
@@ -185,6 +251,7 @@ def purge_retention(
         "sessionlog_rows_purged": 0,
         "toolcalllog_rows_purged": 0,
         "step_rows_purged": 0,
+        "beat": _beat_entry_report(),
     }
 
     after_id = 0
@@ -209,9 +276,9 @@ def purge_retention(
         )
 
     report["django_sessions_purged"] = _clear_django_sessions(now)
-    report["trash_entries_purged"] = _sweep_workspace_trash(
-        now, days_failed, days_completed
-    )
+    # No trash count here: the tombstones live on the worker's volume and this
+    # task runs on celery-events — sweep_workspace_trash (own beat entry) is
+    # the only thing that can see them.
     return report
 
 
@@ -238,6 +305,9 @@ def _sweep_workspace_trash(now, days_failed: int, days_completed: int) -> int:
     is NEVER swept (that sibling may still come back for it). The stamp in
     the name (``{slug}-{job_id}-{ns}``) is the age; a directory whose name
     the registry did not write is left alone.
+
+    Reached only through :func:`sweep_workspace_trash` — the tombstones are
+    written by celery-worker, so the sweep has to run there.
     """
     from agents.invocation_registry import TRASH_DIRNAME, parse_trash_name
 
@@ -274,3 +344,23 @@ def _sweep_workspace_trash(now, days_failed: int, days_completed: int) -> int:
                 entry.name, age_days, window_days,
             )
     return purged
+
+
+@shared_task(name="scraper.retention.sweep_workspace_trash")
+def sweep_workspace_trash() -> dict:
+    """[wave-55 H13] Daily tombstone sweep (beat: ``sweep-workspace-trash``).
+
+    Own beat entry, routed to the worker's queue: it reads the worker's
+    ``workspace/_trash`` (the events container's is a frozen volume snapshot
+    — the reason ``trash_entries_purged`` was 0 every prod send since
+    wave-40 T11). Same windows and kill-switch as the DB purge, so the two
+    cannot drift; see ``_sweep_workspace_trash``.
+    """
+    if not settings.RETENTION_ENABLED:
+        return {"disabled": True}
+    swept = _sweep_workspace_trash(
+        timezone.now(),
+        settings.RETENTION_DAYS_FAILED,
+        settings.RETENTION_DAYS_COMPLETED,
+    )
+    return {"trash_entries_purged": swept}

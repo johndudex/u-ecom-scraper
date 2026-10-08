@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import types
 import unittest.mock as mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -39,10 +38,11 @@ for _fname in ("_item_has_core_field", "_substantive_item_count",
     assert _m2, f"could not extract {_fname}"
     exec(compile(_m2.group(1), _SRC + ":" + _fname, "exec"), _shared)
 
-_src_art = types.ModuleType("src.artifacts")
-_src_art.latest_output_key = None
-_src_art.read = None
-sys.modules.setdefault("src.artifacts", _src_art)
+# No src.artifacts stub here: the three functions extracted above never touch
+# the File Master (only _find_newest_output does, and it is not under test in
+# this file). The 2-attr stub this file used to plant at import time stayed in
+# sys.modules for the whole session and shadowed the real client — see
+# test_wave55_fm_binding_isolation.py.
 _shared["__builtins__"] = __builtins__
 
 _gate = _shared["_extraction_quality_gate"]

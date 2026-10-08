@@ -208,7 +208,10 @@ class TestFrozenChildDeadman:
     @pytest.mark.django_db
     def test_unknown_liveness_keeps_the_silence_rule(self, monkeypatch):
         """An inspect outage must not upgrade to the frozen verdict (the
-        jobs-79/80 lesson: silence ≠ proof)."""
+        jobs-79/80 lesson: silence ≠ proof). [wave-55 H2] It must not produce
+        ANY verdict: the caller used to revoke an ``unknown`` task at the
+        30-min mark — no evidence is not a corpse — so keep-waiting now means
+        the row is left for the 90-min wedge backstop."""
         from scraper.models import ScrapeJob
 
         job = _make_running_job()
@@ -219,8 +222,8 @@ class TestFrozenChildDeadman:
         _run_watchdog()
 
         job.refresh_from_db()
-        assert job.status == ScrapeJob.STATUS_FAILED
-        assert "frozen" not in (job.error_message or "").lower()
+        assert job.status == ScrapeJob.STATUS_RUNNING
+        assert job.error_message == ""
 
 
 # ─── wiring contracts ────────────────────────────────────────────────────────

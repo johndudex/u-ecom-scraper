@@ -363,8 +363,14 @@ class TestPreGraphFastFail:
     def test_claimed_never_started_row_fails_fast(self, monkeypatch):
         from scraper.models import ScrapeJob
 
+        import scraper.tasks as wt
+
         job = _make_job(status=ScrapeJob.STATUS_RUNNING, celery_task_id="claimed")
         _backdate(job, 10)  # well past the 300s grace, well short of 30 min
+        # [wave-55 H2 job-1222] the shape is the candidate set, the probe is
+        # the verdict — absence is what makes this a corpse (a live child
+        # reporting ACTIVE keeps waiting; see test_wave55_watchdog_guards).
+        monkeypatch.setattr(wt, "_task_liveness", lambda task_id: "absent")
         self._run_watchdog(monkeypatch)
         job.refresh_from_db()
         assert job.status == ScrapeJob.STATUS_FAILED

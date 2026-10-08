@@ -3,9 +3,10 @@
 [wave-13 B1] Three facts about ``scraper_draft.py`` motivated this module:
 
 1. The draft can go missing between the writer's write and the tester's read
-   (watchdog re-drive, ephemeral-volume recycle, a wipe racing a cycle) — the
-   tester then burns its cascade crashing on an absent file (58% of the
-   campaign's test verdicts were missing-draft cycles).
+   (watchdog re-drive, the end-of-run workspace cleanup racing a retry on the
+   PERSISTENT volume — a redeploy does NOT reset ``workspace/``, a wipe racing
+   a cycle) — the tester then burns its cascade crashing on an absent file
+   (58% of the campaign's test verdicts were missing-draft cycles).
 2. A writer invocation that died mid-reply often LEFT the scraper in its last
    assistant message as a fenced code block, with no ``write_file`` call —
    the bytes were delivered, only the write never happened.

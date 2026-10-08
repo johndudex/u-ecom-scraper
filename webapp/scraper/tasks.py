@@ -29,7 +29,13 @@ from django.conf import settings
 from django.db.models import F, Q
 from django.utils import timezone
 
-from .models import Approval, JobListing, ScrapeJob, Step
+from .models import (
+    _TERMINAL_JOB_STATUSES,
+    Approval,
+    JobListing,
+    ScrapeJob,
+    Step,
+)
 from .services import LangGraphService
 
 logger = logging.getLogger(__name__)
@@ -221,6 +227,603 @@ def _output_artifact_item_count(job: ScrapeJob) -> int:
     return 0
 
 
+def _output_file_rows(locator: str) -> list:
+    """[wave-55 GAP-1] The record rows the file ``locator`` names, else ``[]``.
+
+    The read chain `_output_file_product_count` uses — File Master key first,
+    local path fallback — and the same row selection: a known record key
+    (`_RESCUE_ROW_KEYS`), else the first top-level list of dicts (the rule
+    `_prune_output_to_schema` / `_rename_output_keys` operate on). Anything
+    unreadable, or a payload with no record rows, is ``[]``.
+    """
+    if not locator:
+        return []
+    data: Any = None
+    try:
+        import src.artifacts as artifacts
+
+        data = json.loads(artifacts.read_text(locator))
+    except Exception:
+        try:
+            with open(locator, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return []
+    # [wave-55 GAP-1c] A --discover-only artifact holds URL stubs, not records —
+    # the router's own reader refuses it (`_items_from_output_file(
+    # skip_discovery=True)`), so this one must too: no row count, no MISSING-CORE
+    # stamp off a payload that never extracted a field.
+    if isinstance(data, dict):
+        try:
+            from agents.nodes.route_after_testing import _is_discovery_output
+
+            if _is_discovery_output(data):
+                return []
+        except Exception:
+            pass
+    rows: Any = None
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        for key in _RESCUE_ROW_KEYS:
+            value = data.get(key)
+            if isinstance(value, list) and value:
+                rows = value
+                break
+        if rows is None:
+            # No known key — the same "first top-level list of dicts" rule
+            # `_prune_output_to_schema` / `_rename_output_keys` operate on.
+            for value in data.values():
+                if isinstance(value, list) and value and isinstance(value[0], dict):
+                    rows = value
+                    break
+    return rows or []
+
+
+def _output_file_product_count(locator: str) -> int:
+    """[wave-55 C4] How many real rows does the file `locator` names hold?
+
+    The single source of the COMPLETED ``product_count``: the file
+    ``job.output_file`` points at is read (`_output_file_rows`) and its
+    record rows are counted with the ground-truth override's own row
+    predicate, so every arm that writes a count ends up describing the same
+    bytes (prod 966 recorded pc=14 over a 2-row artifact; prod 896 carried
+    10 / 548 / 618). Anything unreadable — or a payload with no record rows —
+    returns 0: the caller keeps the credited count rather than zeroing a
+    productive job.
+    """
+    return _override_count_items(_output_file_rows(locator))
+
+
+def _missing_core_stamp(job, schema_fields=None) -> str:
+    """[wave-55 GAP-1] ``[MISSING-CORE price: 10/10 rows empty]``, "" when none.
+
+    The finalize half of the M1 fix: the router's coverage gate remaps a null
+    core column before it ships, but a run that reaches finalize anyway (an
+    exhausted cascade, a mid-flight kill) landed COMPLETED with zero record of
+    why. Reads the file ``job.output_file`` names (the C4 read chain, so the
+    stamp describes the same bytes the count does) and judges it with the
+    router's own ``null_core_columns`` — the router and the row can never
+    disagree about which column died. The judged set is the SAME derivation
+    the router's gate uses (``core_judged_set``: the job's own schema
+    intersected with the registry core), so a requested optional field the
+    site never publishes can never be stamped here after the gate let it
+    through as a medium remap issue.
+    """
+    if not getattr(job, "output_file", ""):
+        return ""
+    try:
+        from agents.nodes.route_after_testing import (
+            _is_dead_product,
+            null_core_columns,
+        )
+
+        from src.field_mapping import core_judged_set
+    except Exception:
+        return ""
+    rows = _output_file_rows(job.output_file)
+    live = [r for r in rows if isinstance(r, dict) and not _is_dead_product(r)]
+    if not live:
+        return ""
+    judged = core_judged_set(
+        schema_fields or [], job.page_type or "product")
+    core = null_core_columns(
+        rows, job.page_type or "product", core_field_names=judged)
+    if not core:
+        return ""
+    total = len(live)
+    return " ".join(f"[MISSING-CORE {f}: {total}/{total} rows empty]" for f in core)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# [wave-55 R6b] Finalize data gates — audit M3 / M13 / M15 + the COMPLETED bar.
+#
+# The audit's inventory is the evidence: 1208 schylling shipped
+# `"price": "$3.99"` (string), 1176 clothbase `'$200.00'` with currency None,
+# 1196 senser a Max Mara coat at `price 1.0` COMPLETED, 1212 chacos 10 rows =
+# 3 products, 1191 houseoffraser 10 rows / 7 titles across `#colcode=`
+# variants. Nothing at the stamp judged any of it — `_finalize_job` read the
+# artifact only to count it. Both COMPLETED stamps run these gates now, after
+# the schema prune, so the gated rows ARE the shipped bytes.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# [M13] A price below this floor — in the row's OWN currency, no FX — is a
+# parse artifact, not a product price. Deliberately blunt: the constant is the
+# whole mechanism, and raising it is an owner knob, never a currency
+# conversion. A typed numeric zero stays data (job 468's real $0.00 samples).
+MIN_PLAUSIBLE_PRICE = 0.5
+
+# The currency symbols a price string may carry. One list so the residue strip
+# and the token test cannot drift apart.
+_CURRENCY_SYMBOLS = "$£€¥₹"
+
+
+def _group_corroborated(raw: str, residue: str) -> bool:
+    """Does a currency token FOLLOW the digits?
+
+    [wave-55 GAP-D] The dot-group reading needs locale evidence, and a token
+    anywhere in the string is not it: de-DE writes ``19.990 €`` for 19990 while
+    a US site writes ``$19.990`` for 19.99 with a stray digit, so
+    ``'$19.990'`` was minting 19990.0 on the strength of its own leading
+    symbol — the audit's M13 failure mode (~3 orders off), landing precisely
+    when a currency is present, which is always. Only the POSTFIXED shapes the
+    SEK/PLN/HUF fleet ships corroborate — ``1.295 kr``, ``1.299 €`` — where a
+    unit word after the number is a thousands grouping by construction. A
+    leading symbol is decoration, and a leading word still leaves the dot tail
+    unreadable, so both drop rather than guess.
+    """
+    stripped = str(raw).strip()
+    digits = [i for i, ch in enumerate(stripped) if ch.isdigit()]
+    if not digits:
+        return False
+    tail = stripped[digits[-1] + 1:]
+    if residue:
+        # a letter label corroborates only when it trails the number
+        return bool(tail.strip("0123456789., \xa0" + _CURRENCY_SYMBOLS))
+    return any(sym in tail for sym in _CURRENCY_SYMBOLS)
+
+
+# [M15] A single title group over this share of the rows — or an aggregate
+# duplicate-title share over it — reads as colour/fragment variant collapse.
+VARIANT_COLLAPSE_RATIO = 0.6
+
+
+def _parse_price_string(text: str) -> float | None:
+    """[wave-55 R6b M3] A record price that shipped as a string → float.
+
+    ``'$3.99'`` → 3.99, ``'$200.00'`` → 200.0, ``'1,299.00'`` and
+    ``'1.299,00'`` → 1299.0 (both separators: the last one is the decimal),
+    ``'1,299'`` → 1299.0, ``'1 299 kr'`` / ``'49,99 zł'`` / ``'3 490 Ft'`` /
+    ``'Ex VAT £12.99'`` are fine (round-10 GAP-1: a short digit-free suffix is
+    a currency/unit label — the audit's own fleet ships SEK/PLN/HUF).
+    Anything the separators cannot resolve without guessing at the locale is
+    None — ``'1.2'``, ``'1.2345'``, ``'19.990'`` (a lone 3-digit dot tail is
+    either a 3-decimal price or a group one thousand times larger, and
+    [wave-55 GAP-D] only a currency token AFTER the digits — ``'1.295 kr'``,
+    ``'1.299 €'`` — says which; a leading ``'$'``/``'£'`` proves nothing, so
+    ``'$19.990'`` and ``'kr 1.299'`` drop too), ``'Save 20%'`` — and the
+    caller drops the row rather than ship a guessed number.
+    """
+    import re
+
+    raw = str(text).replace("\xa0", " ").strip()
+    kept = re.sub(r"[^0-9.,]", "", raw)
+    if not kept.strip(".,"):
+        return None
+    # Whatever is left once the digits/separators/symbols go must be a short
+    # currency/unit label — 'kr', 'zł', 'Ft', 'ExVAT', 'USD' — not prose. A
+    # digit-free, percent-free residue of a dozen characters or fewer is a
+    # label; longer is a sentence, and a '%' is a retail annotation
+    # ('Save 20%'). The class is ``[^\W\d_]`` — Unicode letters, so ``\w``-in-
+    # Python-3 admits 'ł' where an ``[A-Za-z]`` sketch would drop the PLN shape.
+    residue = re.sub(rf"[\s0-9.,{_CURRENCY_SYMBOLS}]", "", raw)
+    if residue and (
+        "%" in residue or not re.fullmatch(r"[^\W\d_]{1,12}", residue, re.UNICODE)
+    ):
+        return None
+    dot, comma = kept.rfind("."), kept.rfind(",")
+    if dot >= 0 and comma >= 0:
+        dec = "." if dot > comma else ","
+        kept = kept.replace("," if dec == "." else ".", "")
+        whole, _, frac = kept.partition(dec)
+        if not frac or not (whole + frac).isdigit():
+            return None
+        return float(f"{whole}.{frac}")
+    if dot < 0 and comma < 0:
+        return float(kept) if kept.isdigit() else None
+    sep = "." if dot >= 0 else ","
+    whole, _, tail = kept.partition(sep)
+    if not whole and tail.isdigit() and len(tail) == 2:
+        return float(f"0.{tail}")  # '.99' — the retail convention
+    if not whole.isdigit() or not tail.isdigit():
+        return None
+    if len(tail) == 2:
+        return float(f"{whole}.{tail}")  # decimal
+    if len(tail) == 3:
+        # [round-10 GAP-2 + wave-55 GAP-D] A group reading, or a 1000x
+        # corruption? The dot form is also a legitimate 3-decimal price
+        # ('19.990' → 19.99 in the locale that writes decimals with a dot), so
+        # take it as a thousands group only when the string is unambiguous: a
+        # short non-zero head AND — on the dot form — a currency token that
+        # FOLLOWS the digits. The comma form is the shape the audit's own
+        # fleet ships and stays as the round-9 pin chose.
+        group = (
+            len(whole) in (1, 2, 3)
+            and not whole.startswith("0")
+            and (sep == "," or _group_corroborated(raw, residue))
+        )
+        return float(f"{whole}{tail}") if group else None
+    return None
+
+
+def _normalize_price(value) -> float | None:
+    """[wave-55 R6b M3] A record price as shipped → float, None when absent.
+
+    A typed number passes straight through (a bool is not a price); a string
+    goes through `_parse_price_string`; anything else is absence. `price` is
+    never *edited* here — the gate decides from the returned value and writes
+    the repair itself, so a `None` from an absent field can never be confused
+    with a repaired one.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        return _parse_price_string(value)
+    return None
+
+
+def _price_is_absent(value) -> bool:
+    """[round-10 GAP-7] Absence is null, "" — or a digit-free string.
+
+    Delegates to `src.field_mapping.price_string_is_absent` [wave-55 GAP-C]:
+    one absence definition, so the gate and the null-column predicate can
+    never disagree about whether 'Book an appointment' is a price.
+    """
+    from src.field_mapping import price_string_is_absent
+
+    return price_string_is_absent(value)
+
+
+def _gate_output_rows(rows: list) -> tuple[list, list[str], bool]:
+    """[wave-55 R6b M3 + M13] The price gates over one record list.
+
+    Returns ``(kept_rows, note_rows, changed)``. A string price is repaired IN
+    the kept row when the digits resolve; a row whose price cannot be parsed,
+    or whose price sits below the plausibility floor, is DROPPED from the
+    artifact — the note on the job row is the dropped-reason record, because
+    the job row is the only surface the operator reads once the workspace is
+    gone. A price with no currency is flagged, never silently passed and never
+    fatal. [round-10 GAP-7] A digit-free price string ('Book an appointment')
+    is a null price spelled in prose — it is not this gate's verdict either:
+    the MISSING-CORE coverage stamp and the bar's wall carve-out own it, so a
+    site is not failed for how its producer spelled 'no price'. ``changed`` is
+    True when the artifact must be rewritten — repairs mutate the kept dicts
+    in place, so a list identity/equality check cannot see them.
+    """
+    kept: list = []
+    notes: list[str] = []
+    changed = False
+    repaired = dropped_string = dropped_floor = currency_missing = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            kept.append(row)  # not a record — another reader's problem
+            continue
+        raw = row.get("price")
+        numeric = _normalize_price(raw)
+        if numeric is None and isinstance(raw, str) and not _price_is_absent(raw):
+            dropped_string += 1  # a price that claimed digits, unparseably
+            changed = True
+            continue
+        if numeric is not None and numeric != 0 and numeric < MIN_PLAUSIBLE_PRICE:
+            dropped_floor += 1
+            changed = True
+            continue
+        if numeric is not None and isinstance(raw, str):
+            row["price"] = numeric
+            repaired += 1
+            changed = True
+        if numeric is not None and not str(row.get("currency") or "").strip():
+            currency_missing += 1
+        kept.append(row)
+    if repaired:
+        notes.append(
+            f"[PRICE-GATE] {repaired} row(s) repaired: string price normalised "
+            "to a number")
+    if dropped_string:
+        notes.append(
+            f"[PRICE-GATE] {dropped_string} row(s) dropped: price not "
+            "parseable as a number")
+    if dropped_floor:
+        notes.append(
+            f"[PRICE-GATE] {dropped_floor} row(s) dropped: price below the "
+            f"{MIN_PLAUSIBLE_PRICE} floor")
+    if currency_missing:
+        notes.append(
+            f"[CURRENCY-MISSING] {currency_missing}/{len(rows)} row(s) carry a "
+            "price with no currency")
+    return kept, notes, changed
+
+
+def _variant_collapse_note(rows: list) -> str:
+    """[wave-55 R6b M15] The duplicate-title disclosure, "" when all distinct.
+
+    Prod 1212 shipped 10 rows for 3 products (SFCC colourways) and prod 1191
+    10 rows / 7 titles across ``#colcode=`` fragments — both read as a richer
+    haul than they were. Two triggers, one note: a single title group over
+    `VARIANT_COLLAPSE_RATIO` of the rows (the audit's literal wording), or the
+    aggregate duplicate-title share over it (which is what catches a
+    multi-product collapse where no one title dominates). Under the threshold
+    a duplicate is still disclosed — never silently passed — just not called a
+    collapse.
+    """
+    from collections import Counter
+
+    titles = [str(r.get("title") or "").strip().casefold()
+              for r in rows if isinstance(r, dict)]
+    titles = [t for t in titles if t]
+    total = len(titles)
+    if total < 2:
+        return ""
+    counts = Counter(titles)
+    distinct = len(counts)
+    if distinct == total:
+        return ""
+    dup_share = 1 - distinct / total
+    detail = f"{total} rows / {distinct} distinct titles ({dup_share:.0%} duplicated)"
+    if (max(counts.values()) / total) > VARIANT_COLLAPSE_RATIO \
+            or dup_share > VARIANT_COLLAPSE_RATIO:
+        return (f"[VARIANT-COLLAPSE] {detail} — colour/fragment variant rows "
+                "are presented as distinct products")
+    return f"[DUPLICATE-TITLES] {detail}"
+
+
+def _bar_content_type(page_type: str | None) -> str:
+    """The content type a job's ``page_type`` denotes — the bar's domain.
+
+    ``product_list``/``product_navigation`` are page types OF the product
+    content type, so the discriminator is the registry's mapping, not the
+    page-type string: a product job cannot escape the price bar by its scope.
+    Falls back to ``product`` for an unknown page type, as the registry does.
+    """
+    try:
+        from src.content_types import get_content_type
+
+        cfg = get_content_type((page_type or "product").strip().lower())
+        if cfg and getattr(cfg, "name", None):
+            return cfg.name
+    except Exception:
+        pass
+    return "product"
+
+
+def _real_item_bar_rows(rows, page_type: str | None = None) -> list:
+    """[wave-55 R6b] The standing COMPLETED bar, as a row list.
+
+    A real product row carries a real title and a non-empty numeric price.
+    Currency is deliberately a *flag* (M3), not a bar element: a priced row
+    with no currency is disclosed on the job row, and a run of them is not the
+    thing that kills an otherwise real extraction. A typed numeric zero is
+    data (job 468) and passes. [round-10 GAP-3] Every other content type is
+    judged by its own registry notion of a real row — ``output_filter_fields``
+    (the core fields minus the ones every row carries) with the wave-49
+    ``_field_has_value`` rule — because a serp result, an article and a forum
+    thread never carry a price, and a product's price floor failed every
+    honest non-product run.
+    """
+    domain = _bar_content_type(page_type)
+
+    def _nonproduct_row_is_real(row: dict) -> bool:
+        try:
+            from src.content_types import (
+                _field_has_value,
+                has_substantive_field,
+                output_filter_fields,
+            )
+
+            fields = [f for f in output_filter_fields(domain) if f]
+            if fields:
+                return any(_field_has_value(row.get(f)) for f in fields)
+            return has_substantive_field(row)
+        except Exception:
+            return True  # registry unavailable: never fail a domain unreadable
+
+    out: list = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        if domain == "product":
+            if not str(row.get("title") or "").strip():
+                continue
+            if _normalize_price(row.get("price")) is None:
+                continue
+        elif not _nonproduct_row_is_real(row):
+            continue
+        out.append(row)
+    return out
+
+
+def _price_wall(rows) -> bool:
+    """[wave-55 R6b] Every row titled and item-positioned, no price anywhere —
+    the 1219 honest site wall, not a junk haul.
+
+    A row that gives up a title or a price but not both is NOT a wall: that is
+    the junk shape the bar exists to fail (a defaulted category row with a
+    price and no name, or a titled row whose price never parsed). [round-10
+    GAP-7] 'No price' includes the digit-free string spelling — the same site
+    must not fail because its producer wrote 'Book an appointment' instead of
+    ``null``.
+    """
+    if not rows:
+        return False
+    for row in rows:
+        if not isinstance(row, dict):
+            return False
+        if not _price_is_absent(row.get("price")):
+            return False
+        if not str(row.get("title") or "").strip():
+            return False
+        if not _rescue_row_shaped(row):
+            return False
+    return True
+
+
+def _completed_bar_reason(
+    rows, pre_count: int = 0, page_type: str | None = None
+) -> str:
+    """[wave-55 R6b] Why the standing bar fails this artifact, "" when it is met.
+
+    COMPLETED requires >=1 real row (`_real_item_bar_rows`); zero good rows is
+    an honest FAIL — the wave-18 rule, never credit ``product_count == 0``.
+    Two carve-outs, deliberate: a uniform price wall (`_price_wall`, rows on
+    disk that are otherwise real with every price null) is the verdict the
+    MISSING-CORE stamp already records and census OQ13(b) leaves to the owner,
+    and it is a PRODUCT wall — no other content type has a price to wall
+    against. [round-10 GAP-3] A non-product run is judged by its own domain
+    (``_bar_content_type``) and its failure names the domain's core, never a
+    price gate that never ran. ``rows`` is the POST-gate list, so
+    ``pre_count`` carries the rows the price gate removed; all-gate-dropped is
+    a bar failure, not a wall.
+    """
+    domain = _bar_content_type(page_type)
+    if rows is None or not rows:
+        if pre_count:
+            return (
+                f"[COMPLETED-BAR] all {pre_count} row(s) failed the price gate "
+                "- no row with a real title + numeric price survives")
+        return ""  # empty/unreadable: the zero-item ladder arm owns this
+    if _real_item_bar_rows(rows, page_type):
+        return ""
+    if domain == "product" and _price_wall(rows):
+        return ""
+    if domain != "product":
+        try:
+            from src.content_types import get_content_type
+
+            cfg = get_content_type(page_type or "product")
+            core = ", ".join(getattr(cfg, "core_fields", []) or []) or domain
+        except Exception:
+            core = domain
+        return (
+            f"[COMPLETED-BAR] 0 of {len(rows)} row(s) carry any {domain} core "
+            f"field ({core})")
+    priced = [r for r in rows if isinstance(r, dict)
+              and not _price_is_absent(r.get("price"))]
+    return (
+        f"[COMPLETED-BAR] 0 of {len(rows)} row(s) carry a real title + numeric "
+        f"price"
+        + (f"; {len(priced)} row(s) carry a price but no title" if priced else ""))
+
+
+def _read_output_payload(locator: str):
+    """The payload ``locator`` names, its record key, and those rows.
+
+    The same selection AND the same refusals as `_output_file_rows` (the C4
+    read chain) — a ``--discover-only`` artifact holds URL stubs, not records,
+    and no gate may judge a payload that never extracted a field — keeping the
+    container so the gates can write the gated rows back under the key they
+    came from. ``None`` when nothing readable is there.
+    """
+    data: Any = None
+    try:
+        import src.artifacts as artifacts
+
+        data = json.loads(artifacts.read_text(locator))
+    except Exception:
+        try:
+            with open(locator, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return None
+    if isinstance(data, list):
+        return data, None, [r for r in data if isinstance(r, dict)]
+    if not isinstance(data, dict):
+        return None
+    try:
+        from agents.nodes.route_after_testing import _is_discovery_output
+
+        if _is_discovery_output(data):
+            return None
+    except Exception:
+        pass
+    for key in _RESCUE_ROW_KEYS:
+        value = data.get(key)
+        if isinstance(value, list) and value:
+            return data, key, [r for r in value if isinstance(r, dict)]
+    for key, value in data.items():
+        if isinstance(value, list) and value and isinstance(value[0], dict):
+            return data, key, [r for r in value if isinstance(r, dict)]
+    return None
+
+
+def _write_output_payload(locator: str, container, key, rows: list) -> bool:
+    """[wave-55 R6b] Put the gated rows back under the key they came from.
+
+    Same dual lane `_rename_output_keys` documents: a real local file is
+    written DIRECTLY (routing it through ``artifacts.*`` would store it in the
+    FM under the raw path and leave the local file stale). Best-effort — a
+    write accident must not move a finalize verdict.
+    """
+    import src.artifacts as artifacts
+
+    if key is not None and isinstance(container, dict):
+        container[key] = rows
+    else:
+        # A bare top-level array: `rows` is a filtered copy of it, so splice
+        # the gated rows back in place or the write re-ships the original.
+        container[:] = rows
+    if os.path.isfile(locator):
+        try:
+            with open(locator, "w", encoding="utf-8") as fh:
+                json.dump(container, fh, indent=2, ensure_ascii=False)
+            return True
+        except OSError:
+            return False
+    try:
+        artifacts.write_json(locator, container)
+        return True
+    except Exception:
+        try:
+            with open(locator, "w", encoding="utf-8") as fh:
+                json.dump(container, fh, indent=2, ensure_ascii=False)
+        except Exception:
+            return False
+        return True
+
+
+def _apply_finalize_row_gates(job, locator: str) -> tuple[list | None, list[str], int]:
+    """[wave-55 R6b] M3 + M13 + M15 over the artifact ``locator`` names.
+
+    Reads with the C4 chain, gates the rows, writes the payload back when the
+    gates changed it, and returns ``(post_gate_rows, note_rows, pre_gate_count)``
+    — the caller both judges the bar on these rows and lets `_output_file_
+    product_count` re-read the same bytes, so `product_count` and the shipped
+    artifact can never disagree (the wave-55 C4 invariant). An unreadable
+    payload is a no-op: the zero-item arms own that case, and a read failure
+    must never zero a productive job.
+    """
+    if not locator:
+        return None, [], 0
+    payload = _read_output_payload(locator)
+    if payload is None:
+        return None, [], 0
+    container, key, rows = payload
+    pre_count = len(rows)
+    if not rows:
+        return [], [], 0
+    kept, notes, changed = _gate_output_rows(rows)
+    collapse = _variant_collapse_note(kept)
+    if collapse:
+        notes.append(collapse)
+    if changed:
+        _write_output_payload(locator, container, key, kept)
+        logger.warning(
+            "Job %s: finalize gates rewrote %s — %d/%d row(s) kept",
+            job.id, locator, len(kept), pre_count)
+    return kept, notes, pre_count
+
+
 def finalize_from_artifacts(job_id: int, fallback_message: str) -> str:
     """[wave-37 W37-3a] Resolve the final status from on-disk evidence.
 
@@ -242,10 +845,100 @@ def finalize_from_artifacts(job_id: int, fallback_message: str) -> str:
     if items <= 0:
         items = JobListing.objects.filter(scrape_job=job).count()
     if items > 0:
+        # [wave-55 C4-e] DB truth before the stamp: no execution Step start in
+        # ANY attempt = no production window, so the artifact is test-phase or
+        # a prior attempt's (`_run_graph_job` stamps RUNNING without clearing
+        # `output_file`, so a re-driven job carries the old file). Same honest
+        # terminal the main stamp takes.
+        if _execution_started_epoch(job) is None:
+            logger.warning(
+                "Job %d: finalize_from_artifacts — %d record(s) on disk but no "
+                "execution step ever started; finalized FAILED (artifact is "
+                "test-phase or a prior attempt's)",
+                job_id, items,
+            )
+            _finalize_job_failed(job_id, fallback_message)
+            return ScrapeJob.STATUS_FAILED
+        # [wave-55 C4] This IS a second COMPLETED stamp (soft-time-limit
+        # kills, called mid-graph and mid-resume) — `_finalize_job` never runs
+        # for it, so the same artifact recorded 5 here and 4 on the main path
+        # (raw `len(first list value)` vs the ground-truth row counter). Apply
+        # the same file-derived correction the single stamp applies.
+        # [wave-55 R6b] And the same data gates, BEFORE that count: a gate
+        # that only ran on `_finalize_job` would let the kill path ship exactly
+        # the rows the main path just cleaned. The bar below owns the verdict.
+        try:
+            _gated, _gate_notes, _pre = _apply_finalize_row_gates(
+                job, job.output_file)
+        except Exception as _gate_exc:
+            logger.warning("Job %d: finalize row gates failed: %s",
+                           job_id, _gate_exc)
+            _gated, _gate_notes, _pre = None, [], 0
+        if _bar := _completed_bar_reason(_gated, _pre, page_type=job.page_type):
+            logger.warning("Job %d: finalize_from_artifacts — %s", job_id, _bar)
+            _finalize_job_failed(job_id, f"{fallback_message} {_bar}".strip())
+            return ScrapeJob.STATUS_FAILED
+        if _gate_notes:
+            # [round-10 GAP-4] `notes` is a column nothing renders — the job
+            # row's read surface is error_message, which job_detail.html prints
+            # as the Data caveat panel on a COMPLETED row. Both columns get the
+            # same text.
+            job.notes = ((job.notes or "") + "\n" + "\n".join(_gate_notes)).strip()
+            job.error_message = (
+                (job.error_message or "") + "\n" + "\n".join(_gate_notes)).strip()
+            logger.warning("Job %d: %s", job_id, " | ".join(_gate_notes))
+        try:
+            _file_rows = _output_file_product_count(job.output_file)
+        except Exception:
+            _file_rows = 0
+        if _file_rows:
+            items = _file_rows
         job.status = ScrapeJob.STATUS_COMPLETED
         job.product_count = items
         job.completed_at = timezone.now()
-        job.save(update_fields=["status", "product_count", "completed_at"])
+        # [wave-55 GAP-1] This stamp never runs the router's coverage gate, so
+        # a null core column reaches COMPLETED here with no record of why —
+        # say it on the row (the audit's 1219 shape, mid-flight-kill variant).
+        # [wave-55 GAP-1c] Schema-scoped exactly like `_finalize_job`'s stamp —
+        # a job that never asked for price is not missing price, and the two
+        # COMPLETED stamps must not disagree about that. Same two-source resolve
+        # (persisted mapping blob → target_fields / Site.output_schema); this
+        # path has no graph state, so the DB schema is the only second source.
+        try:
+            from scraper.models import Site as _StampSite
+            from src.content_types import schema_field_names
+            from src.field_mapping import resolved_fields_from_mapping
+
+            _stamp_site = _StampSite.objects.filter(
+                url=(job.url or "").rstrip("/")
+            ).first()
+            _stamp_os = (_stamp_site.output_schema or {}) if _stamp_site else {}
+            _stamp_blob = (
+                job.field_mapping
+                if isinstance(getattr(job, "field_mapping", None), dict)
+                else None
+            )
+            _stamp_schema = (
+                resolved_fields_from_mapping(_stamp_blob)
+                or schema_field_names(job.target_fields or [], _stamp_os)
+            )
+        except Exception as _schema_exc:
+            logger.warning(
+                "Job %d: missing-core schema resolve failed: %s",
+                job_id, _schema_exc,
+            )
+            _stamp_schema = []
+        try:
+            _mc = _missing_core_stamp(job, _stamp_schema or None)
+        except Exception as _mc_exc:
+            logger.warning("Job %d: missing-core stamp failed: %s", job_id, _mc_exc)
+            _mc = ""
+        if _mc:
+            job.error_message = f"{job.error_message or ''}\n{_mc}".strip()
+            logger.warning("Job %d: %s", job_id, _mc)
+        job.save(update_fields=[
+            "status", "product_count", "completed_at", "error_message", "notes",
+        ])
         logger.warning(
             "Job %d: finalize_from_artifacts — %d record(s) on disk after a "
             "mid-flight kill; finalized COMPLETED from evidence (was RUNNING)",
@@ -414,6 +1107,36 @@ def dispatch_scrape_job(job_id: int, **kwargs) -> str:
     return task_id
 
 
+def _reuse_eligible(job: ScrapeJob) -> bool:
+    """[wave-55 H4] The reuse gate re-derived at re-dispatch time.
+
+    The intake/API lanes decide reuse from the same two facts — a complete
+    Site and an unchanged config vs the newest prior completed run — but that
+    decision lives only in the publish kwargs, and nothing on the row records
+    it. A held or abandoned row re-dispatched with a hardcoded False would be
+    silently reverted to the full-pipeline build, so both lanes re-derive
+    here instead. Fail-open to a full build: a broken reuse gate must cost
+    pipeline time, never a job.
+    """
+    try:
+        from agents.nodes.check_tracker import config_unchanged_since_prior
+
+        from .models import Site
+
+        site = Site.objects.filter(slug=_generate_slug(job.url or "")).first()
+        if site is None or site.status != "complete":
+            return False
+        return config_unchanged_since_prior(
+            job.url, job.input_mode or "", job.search_criteria or "",
+            job.target_fields or [],
+        )
+    except Exception as exc:
+        logger.warning(
+            "Job %d: reuse gate errored (%s) → full build", job.id, exc
+        )
+        return False
+
+
 def resume_maintenance_held_jobs() -> list[int]:
     """Drain every row the maintenance lock held back: PENDING rows with the
     pristine "never dispatched" signature. Called by the toggle view when an
@@ -423,16 +1146,17 @@ def resume_maintenance_held_jobs() -> list[int]:
     held = list(
         ScrapeJob.objects.filter(
             status=ScrapeJob.STATUS_PENDING, celery_task_id=""
-        ).order_by("created_at").values_list("id", flat=True)
+        ).order_by("created_at")
     )
-    for job_id in held:
-        dispatch_scrape_job(job_id, rescrape=False)
-    if held:
+    for job in held:
+        dispatch_scrape_job(job.id, rescrape=_reuse_eligible(job))
+    held_ids = [job.id for job in held]
+    if held_ids:
         logger.warning(
             "Maintenance lock lifted: resumed %d held job(s): %s",
-            len(held), held,
+            len(held_ids), held_ids,
         )
-    return held
+    return held_ids
 
 
 @contextlib.contextmanager
@@ -626,13 +1350,36 @@ def _run_graph_job(job: ScrapeJob, rescrape: bool = False, force_full: bool = Fa
     graph = service.build_graph()
 
     # ── Transition to RUNNING ──────────────────────────────────────────
-    job.status = ScrapeJob.STATUS_RUNNING
-    job.started_at = timezone.now()
-
+    # [wave-55 H2 job-1222] The stamp used to be unconditional. The watchdog's
+    # pre-graph fast-fail failed the row 5.3 ms before this save landed and
+    # the save resurrected it over the verdict: 30 min of RUNNING behind a
+    # task that had already been SIGKILLed. The conditional UPDATE is the same
+    # atomic-claim shape run_scrape_task uses — only a non-terminal row may be
+    # stamped, so a verdict that lands inside the claim→graph window stands.
     # Store thread id on the model if the field exists (added in Phase 10).
     thread_id = service.get_thread_id(job.id)
+    _started_at = timezone.now()
+    stamped = (
+        ScrapeJob.objects.filter(pk=job.pk)
+        .exclude(status__in=_TERMINAL_JOB_STATUSES)
+        .update(
+            status=ScrapeJob.STATUS_RUNNING,
+            started_at=_started_at,
+            graph_thread_id=thread_id,
+        )
+    )
+    if not stamped:
+        job.refresh_from_db(fields=["status", "started_at"])
+        logger.error(
+            "Job %d: not resurrecting failed job (status=%s) — finalized while "
+            "the worker was building the graph; abandoning the run",
+            job.id,
+            job.status,
+        )
+        return
+    job.status = ScrapeJob.STATUS_RUNNING
+    job.started_at = _started_at
     job.graph_thread_id = thread_id
-    job.save(update_fields=["status", "started_at", "graph_thread_id"])
     _publish_job_status(job.id, ScrapeJob.STATUS_RUNNING)
     _emit_running_transition(job)
 
@@ -756,8 +1503,24 @@ def resume_scrape_task(self, job_id: int, human_response: Any) -> None:
         try:
             from langgraph.types import Command
 
+            # [wave-55 H2] Same guard as _run_graph_job's stamp: build_graph()
+            # ran above, so a verdict that landed in this window must not be
+            # overwritten by the resume's RUNNING write.
+            resumed = (
+                ScrapeJob.objects.filter(pk=job.pk)
+                .exclude(status__in=_TERMINAL_JOB_STATUSES)
+                .update(status=ScrapeJob.STATUS_RUNNING)
+            )
+            if not resumed:
+                job.refresh_from_db(fields=["status"])
+                logger.error(
+                    "Job %d: not resurrecting failed job (status=%s) on resume "
+                    "— abandoning the resume",
+                    job.id,
+                    job.status,
+                )
+                return
             job.status = ScrapeJob.STATUS_RUNNING
-            job.save(update_fields=["status"])
             _publish_job_status(job.id, ScrapeJob.STATUS_RUNNING)
             logger.warning(
                 "resume INVOKE job=%s recursion_limit=%s", job.id, config.get("recursion_limit")
@@ -981,16 +1744,20 @@ def _persist_field_mapping(job: ScrapeJob, blob: dict) -> None:
         except Exception:
             pass
         try:
+            from agents.graph import _session_seq_alloc
+
             from scraper.models import SessionLog
 
-            seq = SessionLog.objects.filter(job_id=job.id).count()
-            SessionLog.objects.create(
-                job_id=job.id,
-                role=SessionLog.ROLE_SYSTEM,
-                agent="check_tracker",
-                content=row[:4000],
-                seq=seq,
-            )
+            # [wave-55 H9b] allocated under the job lock — count() collides
+            # with the graph's own writers for this job.
+            with _session_seq_alloc(job.id) as alloc:
+                SessionLog.objects.create(
+                    job_id=job.id,
+                    role=SessionLog.ROLE_SYSTEM,
+                    agent="check_tracker",
+                    content=row[:4000],
+                    seq=alloc(),
+                )
         except Exception:
             pass
     except Exception as exc:
@@ -1605,6 +2372,7 @@ def _final_status_ladder(
     diagnose_no_execution=None,
     rescue_count: int = 0,
     rescue_file: str = "",
+    execution_started: bool = True,
 ) -> tuple[str, str]:
     """The finalize status decision, as a pure function. [wave-19 T1.5]
 
@@ -1648,7 +2416,8 @@ def _final_status_ladder(
     # invariant (count > 0, evidence file known, state claims zero, min count
     # held). Never fires for cancelled jobs (the arm above already returned);
     # never credits a zero.
-    if _rescue_fires(final_state, rescue_count, rescue_file):
+    if _rescue_fires(final_state, rescue_count, rescue_file,
+                     execution_started=execution_started):
         return ScrapeJob.STATUS_COMPLETED, ""
     if final_state.get("execution_status") == "FAILED":
         return ScrapeJob.STATUS_FAILED, ""
@@ -1709,7 +2478,8 @@ def _rescue_min_count(input_mode: str) -> int:
 
 
 def _rescue_fires(
-    final_state: dict, rescue_count: int, rescue_file: str = ""
+    final_state: dict, rescue_count: int, rescue_file: str = "",
+    *, execution_started: bool = True,
 ) -> bool:
     """[wave-40 T9 r1] The SINGLE statement of the rescue invariant.
 
@@ -1718,6 +2488,19 @@ def _rescue_fires(
     never drift. The rescue upgrades a FAILED/zero verdict to COMPLETED only
     when ALL of:
 
+    - the state carries an ``execution_status`` — run_execution produced a
+      verdict, so production actually ran. [wave-55 C4] A state without one
+      means execution never happened (skipped, or the graph died before it):
+      there is no production output to attribute and stamping the test
+      phase's rows COMPLETED is the prod-1225 lie (code_generation FAILED +
+      execution SKIPPED + COMPLETED pc=9);
+    - ``execution_started`` — the ``execution`` Step actually STARTED.
+      [wave-55 C4] The verdict above is a prompt-authored string, and graph.py
+      writes ``execution_status: "FAILED"`` from several fast-fail arms
+      (writer timeout, tester wall-clock death, discovery auth wall, …) with
+      ``goto="cleanup"`` and no execution Step behind it; the caller passes
+      ``_execution_started_epoch(job) is not None`` so the DB, not the state,
+      decides whether a production window exists.
     - ``rescue_count > 0`` — this job demonstrably produced real rows; a
       zero credit is structurally impossible;
     - ``rescue_file`` is truthy — nothing is credited without a pointer to
@@ -1728,12 +2511,17 @@ def _rescue_fires(
     Net effect: a COMPLETED row can never end with ``product_count == 0``.
     Cancelled jobs are excluded by the ladder's cancel arm, which runs first.
     """
+    state = final_state or {}
+    if not str(state.get("execution_status") or "").strip():
+        return False  # [wave-55 C4] execution never ran — see the docstring
+    if not execution_started:
+        return False  # [wave-55 C4] no execution Step start = no production window
     return (
         rescue_count > 0
         and bool(rescue_file)
-        and int((final_state or {}).get("product_count") or 0) == 0
+        and int(state.get("product_count") or 0) == 0
         and rescue_count >= _rescue_min_count(
-            (final_state or {}).get("input_mode") or "navigation")
+            state.get("input_mode") or "navigation")
     )
 
 
@@ -1759,6 +2547,130 @@ def _output_name_epoch(name: str) -> float | None:
     except ValueError:
         return None
     return stamp.replace(tzinfo=_dttz.utc).timestamp()
+
+
+# [wave-55 H5] A file younger than this relative to the kept-5 set belongs to
+# the same run era. Pruning inside the era is how prod 1186/1198 lost their
+# own output and were served another job's 10-row artifact.
+FM_PRUNE_GRACE_SECONDS = 300
+
+
+def _prunable_output_keys(
+    keys: list[str],
+    own_name: str = "",
+    protected: set[str] | None = None,
+    grace_seconds: int = FM_PRUNE_GRACE_SECONDS,
+) -> list[str]:
+    """Which of ``keys`` the keep-newest-5 prune may delete. [wave-55 H5]
+
+    The bare keep-5 rule orphans a job's ``output_file`` as soon as 5 newer
+    outputs land for the same slug — the File Master keys are slug-scoped, so
+    the file it names is this job's, and the job page then falls back to
+    another run's artifact. A key is prunable only when ALL of:
+
+    - it sits outside the newest 5 by name order (unchanged);
+    - it is not the finalizing job's own output (``own_name``, key or name);
+    - no live or recently-terminal sibling resolves through it (``protected``);
+    - its name-epoch is more than ``grace_seconds`` older than the oldest KEPT
+      key — a file near-in-time to the kept set is the same era.
+
+    A name with no parseable stamp carries no era claim, so the grace rule
+    cannot protect it and the bare keep-5 order still governs it.
+    """
+    ordered = sorted(keys)
+    if len(ordered) <= 5:
+        return []
+    candidates, kept = ordered[:-5], ordered[-5:]
+    kept_epochs = [
+        e for e in (_output_name_epoch(k.split("/")[-1]) for k in kept)
+        if e is not None
+    ]
+    floor = (min(kept_epochs) - grace_seconds) if kept_epochs else None
+    own = os.path.basename(own_name or "")
+    protected = protected or set()
+    doomed = []
+    for key in candidates:
+        name = key.split("/")[-1]
+        if own and name == own:
+            continue
+        if name in protected:
+            continue
+        if floor is not None:
+            epoch = _output_name_epoch(name)
+            if epoch is not None and epoch >= floor:
+                continue
+        doomed.append(key)
+    return doomed
+
+
+def _era_protected_output_names(slug: str) -> set[str]:
+    """Output basenames a live or recently-terminal sibling still points at.
+
+    [wave-55 H5] The keep-5 prune is slug-scoped, so it can delete a file a
+    non-terminal sibling — or one that finished inside the grace window —
+    still resolves through its own run window. Terminal-and-old rows are not
+    protected: their window is closed and the job page reports the pruned
+    output honestly.
+    """
+    if not slug:
+        return set()
+    cutoff = timezone.now() - timezone.timedelta(seconds=FM_PRUNE_GRACE_SECONDS)
+    rows = (
+        ScrapeJob.objects.filter(
+            Q(site_folder=slug) | Q(site_folder=f"scrapers/{slug}")
+        ).filter(
+            Q(completed_at__gte=cutoff) | ~Q(status__in=_TERMINAL_JOB_STATUSES)
+        )
+        .exclude(output_file="")
+        .values_list("output_file", flat=True)
+    )
+    return {os.path.basename(v) for v in rows if v}
+
+
+def _prune_fm_outputs(job, site_slug: str) -> None:
+    """Keep-newest-5 prune over ``scrapers/{slug}/output_*.json``, bounded.
+
+    The inline loop this replaces pruned purely by name order, so a busy site
+    deleted the file the just-finalized job (and its siblings) still point at.
+    The plan is `_prunable_output_keys`'s; every failure here skips the prune
+    rather than deleting blind.
+    """
+    if not site_slug:
+        return
+    try:
+        import src.artifacts as artifacts
+
+        outs = [
+            k for k in artifacts.list_keys(f"scrapers/{site_slug}/")
+            if k.split("/")[-1].startswith("output_") and k.endswith(".json")
+        ]
+        # M5/R2: partner-job outputs are exempt (spec: fetchable via the
+        # sync API forever). Unowned/legacy files keep pruning.
+        try:
+            from scraper.api.output_index import partner_owned_keys
+
+            protected = partner_owned_keys(site_slug)
+        except Exception:
+            protected = set()
+        outs = [k for k in outs if k not in protected]
+        doomed = _prunable_output_keys(
+            outs,
+            own_name=job.output_file or "",
+            protected=_era_protected_output_names(site_slug),
+        )
+        for old in doomed:
+            try:
+                artifacts.delete(old)
+            except Exception:
+                pass
+        if doomed:
+            logger.info(
+                "Job %d: pruned %d old output(s) from FM (kept newest 5, "
+                "%d protected)",
+                job.id, len(doomed), len(outs) - len(doomed),
+            )
+    except Exception as exc:
+        logger.warning("Job %d: FM output prune skipped: %s", job.id, exc)
 
 
 def _parse_iso_epoch(value) -> float | None:
@@ -1842,6 +2754,33 @@ def _rescue_dead_row(row: dict) -> bool:
         return False
 
 
+def _rescue_row_shaped(row: dict) -> bool:
+    """[wave-55 C3] The item-shape floor the router applies to ground truth,
+    mirrored here so the rescue's row counter cannot drift from it.
+
+    ``route_after_testing._row_url_has_path`` is the definition; the local
+    fallback keeps the floor alive if that module is ever unimportable (same
+    belt as `_rescue_dead_row`). A row with no URL key at all is not this
+    floor's verdict — it fails OPEN, so a content type that carries no URL
+    (or a shape problem) never blinds the rescue.
+    """
+    try:
+        from agents.nodes.route_after_testing import _row_url_has_path
+
+        return bool(_row_url_has_path(row))
+    except Exception:
+        pass
+    url = row.get("url") or row.get("product_url") or ""
+    if not url:
+        return True
+    try:
+        from src.discovery_quality import row_url_is_item_shaped
+
+        return bool(row_url_is_item_shaped(url))
+    except Exception:
+        return True
+
+
 def _good_rows(data: object, fields: list[str], output_key: str) -> list[dict]:
     """Rows of one output payload that qualify as real items.
 
@@ -1852,7 +2791,10 @@ def _good_rows(data: object, fields: list[str], output_key: str) -> list[dict]:
     rows, keeping rows that carry at least one filter/schema field — or, when
     the job declares none, any substantive (non-bookkeeping) field. A
     ``metadata.phase == "discovery"`` payload (job-76's URL stubs) is never
-    extraction truth. Any shape problem degrades to [] — never raises.
+    extraction truth. [wave-55 C3] rows also carry the item-shape floor: a
+    nav/listing URL (job 1200's category pages, 1068's collection paths) is
+    not a real item even with a defaulted price on it, so it must not count
+    toward the rescue. Any shape problem degrades to [] — never raises.
     """
     try:
         if isinstance(data, list):
@@ -1879,7 +2821,8 @@ def _good_rows(data: object, fields: list[str], output_key: str) -> list[dict]:
             # [wave-50 T4] Core-value bar: typed numeric zero is data (468),
             # empty string is not (1116's defaulted-currency junk rows).
             return [r for r in live
-                    if any(_field_has_value(r.get(field)) for field in fields)]
+                    if _rescue_row_shaped(r)
+                    and any(_field_has_value(r.get(field)) for field in fields)]
         try:
             from src.content_types import has_substantive_field
         except Exception:
@@ -1887,9 +2830,38 @@ def _good_rows(data: object, fields: list[str], output_key: str) -> list[dict]:
             def has_substantive_field(item):  # type: ignore[misc]
                 return bool(item.get("title"))
 
-        return [r for r in live if has_substantive_field(r)]
+        return [r for r in live
+                if _rescue_row_shaped(r) and has_substantive_field(r)]
     except Exception:
         return []
+
+
+def _execution_started_epoch(job: ScrapeJob) -> float | None:
+    """[wave-55 C4] When did THIS job's execution phase begin (UTC epoch)?
+
+    The ``execution`` Step row is the phase clock: `_notify_phase` stamps its
+    ``started_at`` the moment run_execution hands the subprocess off (latest
+    attempt), and nothing stamps it when the phase never began —
+    `_close_open_steps` finalizes a never-started step SKIPPED without a
+    start. ``None`` ⇒ no production window: every output on disk predates
+    execution and is test-phase or prior-job material. Unsaved instances
+    (the evidence fixtures) have no Step rows to read — same answer.
+    """
+    if getattr(job, "pk", None) is None:
+        return None
+    try:
+        step = (job.steps.filter(phase="execution", started_at__isnull=False)
+                .order_by("-started_at").only("started_at").first())
+    except Exception:
+        return None
+    started = getattr(step, "started_at", None) if step else None
+    if started is None:
+        return None
+    from datetime import timezone as _dttz
+
+    if timezone.is_naive(started):
+        started = started.replace(tzinfo=_dttz.utc)
+    return started.timestamp()
 
 
 def _real_items_evidence(
@@ -1911,8 +2883,13 @@ def _real_items_evidence(
     cycles, all older than the crashed attempt's draft floor → honest FAIL
     with 4+ real products on disk) and prod 770 (its own cleanup agent had
     already moved the 19-product output to ``scrapers/``, so a workspace-only
-    scan saw nothing) both escaped it. Here the window is the JOB's
-    (``started_at - 5s``, the 5s tolerating same-second writes).
+    scan saw nothing) both escaped it. Here the window opens at EXECUTION
+    start — the execution Step's ``started_at``, minus the same 5s
+    same-second-write tolerance, and never before the job's own start
+    ([wave-55 C4], the F8 precedent run_execution applies to its own output
+    pick: rows a test phase wrote before the subprocess ran are not
+    production output). A job with no execution Step start keeps the
+    job-scoped ``started_at - 5s`` window.
 
     HONEST LIMITS. (1) Attribution is job-scoped, not output-to-sha: output
     files carry no draft sha, so sha-level attribution is impossible
@@ -1984,7 +2961,20 @@ def _real_items_evidence(
         started_at = started
         if timezone.is_naive(started_at):
             started_at = started_at.replace(tzinfo=_dttz.utc)
-        floor = (started_at - _timedelta(seconds=5)).timestamp()
+        job_floor = (started_at - _timedelta(seconds=5)).timestamp()
+        # [wave-55 C4] The window opens at EXECUTION start — the F8 precedent
+        # (run_execution floors `_find_newest_output` at subprocess start and
+        # prod 319 shipped code_tester's sample written 32s BEFORE execution),
+        # never applied to this path. Rows written before the subprocess ran
+        # are test-phase or prior-job material: prod 879 and 1217 shipped an
+        # `output_file` 4.4 / 8.8 min OLDER than execution. No execution Step
+        # start (legacy rows, unsaved instances) keeps the job-scoped floor,
+        # with the same 5s same-second-write tolerance both floors use.
+        exec_floor = _execution_started_epoch(job)
+        floor = (
+            job_floor if exec_floor is None
+            else max(job_floor, exec_floor - _timedelta(seconds=5).total_seconds())
+        )
     except Exception:
         return 0, ""
     ct_config = state.get("content_type_config") or {}
@@ -2433,7 +3423,14 @@ def _finalize_job(job: ScrapeJob) -> None:
     ladder upgrades to COMPLETED, credits the evidence count, repoints
     output_file at the winning File Master key (the existing rule then
     scrubs the stale failure note) and promotes the draft compile-gated
-    (`_promote_rescued_draft`). HONEST LIMITS (identical to
+    (`_promote_rescued_draft`). [wave-55 C4] Two honesty rails on that arm:
+    it only fires when the state carries an `execution_status` AND the
+    `execution` Step actually started (graph.py's fast-fail arms write a
+    FAILED verdict with `goto="cleanup"` and no execution behind it — the
+    DB, not the state string, decides whether a production window exists),
+    and the COMPLETED `product_count` is re-read from the file `output_file`
+    points at after the schema prune, so the count and the artifact can never
+    disagree again. HONEST LIMITS (identical to
     `finalize_from_artifacts`, wave-37 W37-3a): `store_job_listings` and
     `nav_skill_review` do not re-run on a rescued finalize, and attribution
     is job-scoped, not output-to-sha.
@@ -2628,34 +3625,9 @@ def _finalize_job(job: ScrapeJob) -> None:
             logger.warning("Job %d: workspace publish failed: %s", job.id, exc)
 
     # ── Prune old outputs in the File Master (keep newest 5 per site) ──
-    if site_slug:
-        try:
-            import src.artifacts as artifacts
-            _outs = [
-                k for k in artifacts.list_keys(f"scrapers/{site_slug}/")
-                if k.split("/")[-1].startswith("output_") and k.endswith(".json")
-            ]
-            # M5/R2: partner-job outputs are exempt (spec: fetchable via the
-            # sync API forever). Unowned/legacy files keep pruning.
-            try:
-                from scraper.api.output_index import partner_owned_keys
-
-                _protected = partner_owned_keys(site_slug)
-            except Exception:
-                _protected = set()
-            _outs = [k for k in _outs if k not in _protected]
-            if len(_outs) > 5:
-                for _old in sorted(_outs)[:-5]:
-                    try:
-                        artifacts.delete(_old)
-                    except Exception:
-                        pass
-                logger.info(
-                    "Job %d: pruned %d old output(s) from FM (kept newest 5)",
-                    job.id, len(_outs) - 5,
-                )
-        except Exception:
-            pass
+    # [wave-55 H5] Bounded: never the job's own file, never a file a live or
+    # recently-terminal sibling still points at, never inside the kept era.
+    _prune_fm_outputs(job, site_slug)
 
     # ── Guard production input_urls.json against silent shrinkage ───────
     # A job's workspace input_urls.json can be a subset (e.g. a sample/manual
@@ -2697,6 +3669,12 @@ def _finalize_job(job: ScrapeJob) -> None:
     # HERE — after publish+prune — so the key handed to the ladder (and to
     # job.output_file on a rescue) is one the FM actually still holds.
     rescue_file = _resolve_rescue_file(rescue_locator, evidence_slug)
+    # [wave-55 C4] DB truth, not the prompt-authored state string: graph.py
+    # writes `execution_status: "FAILED"` from several fast-fail arms (writer
+    # timeout, tester wall-clock death, discovery auth wall, …) with
+    # `goto="cleanup"` and no execution Step behind it. No Step start = no
+    # production window, so the test phase's rows are not production output.
+    _execution_ran = _execution_started_epoch(job) is not None
     _status, _diag = _final_status_ladder(
         final_state,
         already_terminal=job.status in (
@@ -2710,6 +3688,7 @@ def _finalize_job(job: ScrapeJob) -> None:
         diagnose_no_execution=lambda: _diagnose_no_execution(site_slug, job.id),
         rescue_count=rescue_count,
         rescue_file=rescue_file,
+        execution_started=_execution_ran,
     )
     if _status:
         job.status = _status
@@ -2730,6 +3709,34 @@ def _finalize_job(job: ScrapeJob) -> None:
         )
         job.error_message = ""
 
+    # ── [wave-55 GAP-3] The dead-site verdict reaches the row ───────────
+    # The router's dead-store arm logs a celery ERROR and a [CASCADE] row, then
+    # terminates honestly — and the ladder above stamps the generic
+    # "Execution produced 0 items" / "Pipeline never executed". The verdict the
+    # tester proved (prod 1205: DEAD_STORE_SUNSET over 3 access paths) was only
+    # honest in a log file; prefix it so the operator and the retry UI read WHY
+    # nothing came back. Keyed on FAILED: a COMPLETED row's real items already
+    # outranked the dead claim, and a CANCELLED row's verdict is the user's,
+    # not the site's.
+    if job.status == ScrapeJob.STATUS_FAILED:
+        try:
+            from agents.nodes.route_after_testing import _dead_store_evidence
+
+            _dead = _dead_store_evidence(final_state.get("test_report"))
+        except Exception as exc:
+            logger.debug("Job %d: dead-site stamp unavailable: %s", job.id, exc)
+            _dead = ""
+        if _dead:
+            _report_dead = final_state.get("test_report") or {}
+            _dsa = _report_dead.get("dead_site_assessment")
+            _summary = (
+                str(_dsa.get("summary") or "").strip()
+                if isinstance(_dsa, dict) else ""
+            )
+            _stamp = f"[DEAD-SITE {_dead}] {_summary[:160]}".rstrip()
+            job.error_message = f"{_stamp} {job.error_message or ''}".strip()
+            logger.warning("Job %d: %s", job.id, _stamp)
+
     # ── [wave-40 T9] Rescue side effects. ────────────────────────────────
     # `_rescue_fires` is the single statement of the binding invariant; this
     # block re-checks it only because the ladder returns just (status, diag).
@@ -2739,7 +3746,8 @@ def _finalize_job(job: ScrapeJob) -> None:
     # reach _status == COMPLETED here. The stale-error scrub above already
     # cleared the failure note.
     if _status == ScrapeJob.STATUS_COMPLETED and _rescue_fires(
-        final_state, rescue_count, rescue_file
+        final_state, rescue_count, rescue_file,
+        execution_started=_execution_ran,
     ):
         job.product_count = rescue_count
         job.output_file = rescue_file
@@ -2829,6 +3837,99 @@ def _finalize_job(job: ScrapeJob) -> None:
             )
         except Exception as exc:
             logger.warning("Job %d: schema prune failed: %s", job.id, exc)
+
+    # ── [wave-55 R6b] Finalize data gates: M3 string prices, M13 the price ──
+    # floor, M15 variant collapse. After the prune (the gated rows ARE the
+    # shipped bytes — the count below and the MISSING-CORE stamp read the same
+    # artifact) and before the count, so a dropped row is a dropped credit.
+    # The COMPLETED bar rides the same pass: zero rows that carry a real title
+    # + numeric price is an honest FAIL, never a COMPLETED pc=0 (wave-18). One
+    # carve-out, deliberate: a uniform price wall is the MISSING-CORE stamp's
+    # verdict and census OQ13(b) leaves it to the owner — the bar does not
+    # re-judge it.
+    _gate_notes: list[str] = []
+    if job.status == ScrapeJob.STATUS_COMPLETED and job.output_file:
+        try:
+            _gated, _gate_notes, _pre = _apply_finalize_row_gates(
+                job, job.output_file)
+        except Exception as exc:
+            logger.warning("Job %d: finalize row gates failed: %s", job.id, exc)
+            _gated, _gate_notes, _pre = None, [], 0
+        _bar = _completed_bar_reason(_gated, _pre, page_type=job.page_type)
+        if _bar:
+            logger.warning("Job %d: %s — COMPLETED → FAILED", job.id, _bar)
+            job.status = ScrapeJob.STATUS_FAILED
+            job.product_count = 0
+            job.error_message = f"{_bar} {job.error_message or ''}".strip()
+
+    if _gate_notes:
+        # Disclosure rows land on any final status — a FAILED row owes the
+        # operator the same "4 rows were dropped" record a COMPLETED one does.
+        # [round-10 GAP-4] And on the surface the operator actually reads:
+        # nothing renders `notes`, while job_detail.html prints error_message
+        # (the Data caveat panel on a COMPLETED row, the red Error panel
+        # otherwise). The wave-19 T1.5 scrub above runs BEFORE this block, so
+        # nothing clears it.
+        job.notes = ((job.notes or "") + "\n" + "\n".join(_gate_notes)).strip()
+        job.error_message = (
+            (job.error_message or "") + "\n" + "\n".join(_gate_notes)).strip()
+        job.save(update_fields=["notes", "error_message"])
+        logger.warning("Job %d: %s", job.id, " | ".join(_gate_notes))
+
+    # ── [wave-55 C4] The COMPLETED count is the output file's own row count ──
+    # Three arms write product_count on the way here — the state's claim, the
+    # ground-truth override, the rescue evidence — and prod 966/879 shipped
+    # counts that disagreed with the bytes `output_file` names. Read the file
+    # the job now points at (post-prune, so the count describes the final
+    # bytes) and let ITS row count stand. A read that yields nothing keeps the
+    # credited count: never zero a COMPLETED job, never invent evidence.
+    if job.status == ScrapeJob.STATUS_COMPLETED and job.output_file:
+        try:
+            _file_rows = _output_file_product_count(job.output_file)
+        except Exception as exc:
+            logger.warning("Job %d: output row count failed: %s", job.id, exc)
+            _file_rows = 0
+        if _file_rows and _file_rows != job.product_count:
+            logger.warning(
+                "Job %d: product_count %s → %d — the row count of %s",
+                job.id, job.product_count, _file_rows, job.output_file,
+            )
+            job.product_count = _file_rows
+            # [wave-55 C4] The [SCOPE-SHORTFALL] rows the override and rescue
+            # arms wrote cite PRE-correction counts — a rescue crediting 5
+            # (dead row included) left "asked 6, shipped 5" on a row whose
+            # product_count this block just set to 4. Re-derive from the
+            # corrected count and swap the marker line in place.
+            try:
+                _ss_row = _scope_shortfall_row(
+                    job.scope, job.scope_value, job.product_count)
+                _kept = [ln for ln in (job.notes or "").splitlines()
+                         if not ln.startswith("[SCOPE-SHORTFALL]")]
+                if _ss_row:
+                    _kept.append(_ss_row)
+                _notes = "\n".join(_kept)
+                if _notes != (job.notes or ""):
+                    job.notes = _notes
+                    job.save(update_fields=["notes"])
+            except Exception as exc:
+                logger.warning(
+                    "Job %d: shortfall note rewrite failed: %s", job.id, exc)
+
+    # ── [wave-55 GAP-1] A COMPLETED row whose core column is null says so ──
+    # Read AFTER the schema prune, so the stamp describes the shipped bytes.
+    # Written into error_message deliberately after the wave-19 stale-error
+    # scrub above: this is not interrupt-era residue, it is the reason the run
+    # shipped a core column empty (audit 1219), and the row is the surface the
+    # operator and the retry UI read.
+    if job.status == ScrapeJob.STATUS_COMPLETED and job.output_file:
+        try:
+            _mc = _missing_core_stamp(job, _schema_fields or None)
+        except Exception as exc:
+            logger.warning("Job %d: missing-core stamp failed: %s", job.id, exc)
+            _mc = ""
+        if _mc:
+            job.error_message = f"{job.error_message or ''}\n{_mc}".strip()
+            logger.warning("Job %d: %s", job.id, _mc)
 
     # Partner API (fold M10): build the byte page-index AFTER the schema
     # prune (which rewrites the FM artifact — the index must describe the
@@ -3011,6 +4112,105 @@ ACTIVE_SILENCE_REVOKE_MINUTES = 90
 # deadman in cleanup_stuck_jobs instead of aging to the 90-min backstop: 538
 # lost 109 min and a worker slot exactly this way.
 FROZEN_CHILD_SILENCE_MINUTES = 15
+# [wave-55 M7] A task Celery proves absent fails on this much silence instead
+# of waiting out the full window — the docstring always promised an immediate
+# fail for an absent task; job 1222's corpse waited it anyway.
+LIVENESS_FAST_PATH_IDLE_MINUTES = 5
+# [wave-55 H2 job-1222] Ground truth for "who is in the cluster". The second
+# probe (below) compares the active() answerers to the ping() answerers — but
+# a worker too saturated to answer EITHER probe validates the partial reply,
+# and "runs nowhere" is concluded about a task that worker may own. Membership
+# closes it: an absent verdict now needs every member to have answered.
+CELERY_KNOWN_WORKERS_ENV = "CELERY_KNOWN_WORKERS"
+WORKER_SIGHTING_CACHE_KEY = "scraper:watchdog:worker-sightings"
+# A worker silent this long leaves the membership: it is a scaled-down node,
+# not a missing answer (and must not pin every verdict to unknown forever).
+WORKER_SIGHTING_TTL_SECONDS = 6 * 3600
+
+
+def _known_worker_names() -> frozenset:
+    """Workers the deployment names explicitly, or nothing.
+
+    No worker inventory exists in settings/queue config (queues name queues,
+    not nodes), so the list is opt-in: ``CELERY_KNOWN_WORKERS`` as a
+    comma-separated set of celery worker names, e.g.
+    ``celery@abc123,celery@def456``.
+    """
+    raw = os.environ.get(CELERY_KNOWN_WORKERS_ENV, "")
+    return frozenset(w.strip() for w in raw.split(",") if w.strip())
+
+
+def _record_cluster_sighting(worker_names) -> None:
+    """Remember who answered this tick's probe (the watchdog calls it once per
+    run). Workers that answer at all are the membership a later tick checks
+    its verdict against when the deployment pins no list. Backed by the Django
+    cache: shared when the deployment points CACHES at Redis, otherwise
+    per-process (each watchdog pool child accrues its own history)."""
+    names = {n for n in (worker_names or ()) if n}
+    if not names:
+        return
+    try:
+        from django.core.cache import cache
+
+        now = time.time()
+        seen = {
+            name: stamp
+            for name, stamp in (
+                cache.get(WORKER_SIGHTING_CACHE_KEY) or {}
+            ).items()
+            if now - stamp < WORKER_SIGHTING_TTL_SECONDS
+        }
+        seen.update({name: now for name in names})
+        cache.set(WORKER_SIGHTING_CACHE_KEY, seen, WORKER_SIGHTING_TTL_SECONDS)
+    except Exception as exc:
+        logger.debug("worker sighting cache unavailable: %s", exc)
+
+
+def _cluster_membership() -> frozenset:
+    """Who the cluster is believed to hold — empty when nothing grounds it.
+
+    The env list wins; the sighting history is the derived fallback and is a
+    LOWER BOUND: a worker that has never answered any probe is invisible to
+    it, so an absence verdict from an ungrounded membership is treated as
+    unproven by the caller (see ``_provably_absent``).
+    """
+    known = _known_worker_names()
+    if known:
+        return known
+    try:
+        from django.core.cache import cache
+
+        seen = cache.get(WORKER_SIGHTING_CACHE_KEY) or {}
+    except Exception:
+        return frozenset()
+    now = time.time()
+    return frozenset(
+        name
+        for name, stamp in (seen or {}).items()
+        if now - stamp < WORKER_SIGHTING_TTL_SECONDS
+    )
+
+
+def _provably_absent(task_id: str) -> bool:
+    """[wave-55 M7] Absence the watchdog may act on immediately.
+
+    ``_task_liveness`` returning ``absent`` is the probes' opinion; when the
+    membership is ungrounded (no env list, no sighting history yet — a fresh
+    boot) that opinion is exactly the pre-wave-55 evidence, and the silence
+    rule still owns the verdict.
+    """
+    return bool(_cluster_membership()) and _task_liveness(task_id) == "absent"
+
+
+def _ping_answerers() -> list:
+    """Worker names that answered a ping broadcast, or [] when none did."""
+    try:
+        from celery import current_app
+
+        reply = current_app.control.inspect(timeout=5.0).ping()
+    except Exception:
+        return []
+    return list(reply.keys()) if isinstance(reply, dict) else []
 
 
 def _task_liveness(task_id: str) -> str:
@@ -3033,10 +4233,15 @@ def _task_liveness(task_id: str) -> str:
       from a complete "runs nowhere" answer. When the probe sets disagree,
       the verdict degrades to ``unknown`` and the caller falls back to the
       silence rule instead of revoking a live run.
+      [wave-55 job-1222] And when the two sets AGREE but a member of the
+      cluster answered NEITHER probe, the agreement is worthless: the free
+      worker validates itself. ``absent`` therefore also requires the
+      answering set to cover ``_cluster_membership`` — a silent member means
+      ``unknown``.
     - ``active``  — a worker owns the task; silence means a long quiet
       phase. The caller only revokes past ``ACTIVE_SILENCE_REVOKE_MINUTES``.
-    - ``unknown`` — inspect failed or no worker replied (broker hiccup,
-      saturated pool). No evidence either way — the caller falls back to
+    - ``unknown`` — inspect failed, no worker replied, or a cluster member
+      missed both probes. No evidence either way — the caller falls back to
       the silence rule.
     """
     if not task_id:
@@ -3062,9 +4267,102 @@ def _task_liveness(task_id: str) -> str:
         ping = insp.ping()
     except Exception:
         return "unknown"
-    if ping is None or set(ping.keys()) != set(reply.keys()):
+    answering = set(reply.keys())
+    if ping is None or set(ping.keys()) != answering:
+        return "unknown"
+    # [wave-55 job-1222] Third leg: agreement between two probes that both
+    # missed a member is still a partial answer. The unseen member may be the
+    # one holding the task.
+    known = _cluster_membership()
+    if known and not known.issubset(answering):
+        logger.info(
+            "liveness probe answered by %s but cluster membership includes %s "
+            "— verdict unknown, not absent",
+            sorted(answering),
+            sorted(known - answering),
+        )
         return "unknown"
     return "absent"
+
+
+def _fail_stuck_job(job: ScrapeJob, task_id: str, error_msg: str) -> None:
+    """The shared kill tail: stamp the row, reclaim the slot, publish.
+
+    Every verdict arm funnels here so a row cannot be failed without its
+    celery task being revoked and browser_service told.
+    """
+    job.status = ScrapeJob.STATUS_FAILED
+    job.error_message = error_msg
+    job.completed_at = timezone.now()
+    job.save(update_fields=["status", "error_message", "completed_at"])
+
+    if task_id:
+        try:
+            from celery import current_app
+
+            current_app.control.revoke(task_id, terminate=True, signal="SIGKILL")
+            logger.info(
+                "Stuck job %d: revoked celery task %s (terminate)",
+                job.id,
+                task_id,
+            )
+        except Exception as exc:
+            logger.warning("Stuck job %d: revoke failed: %s", job.id, exc)
+
+    # [wave-14] The celery revoke kills THIS worker's task — but the wedge
+    # is often the /scrape SUBPROCESS inside browser_service, which has no
+    # celery parent and would keep burning the shared Scraper Chrome until
+    # its own timeout. Cancel it by job id (lock-free, short timeout, never
+    # raises). Runs AFTER the job is marked FAILED so a wedge that already
+    # ended still just gets an honest "nothing in flight".
+    try:
+        from agents.tools.browser_http import cancel_scrape
+
+        _cancel = cancel_scrape(job.id)
+        if _cancel.get("requested") is False and _cancel.get("error"):
+            logger.warning(
+                "Stuck job %d: browser_service cancel unavailable: %s",
+                job.id,
+                _cancel["error"],
+            )
+        elif _cancel.get("flagged"):
+            logger.info(
+                "Stuck job %d: browser_service cancelled run(s) %s",
+                job.id,
+                _cancel.get("flagged"),
+            )
+    except Exception as exc:
+        logger.warning("Stuck job %d: browser_service cancel failed: %s", job.id, exc)
+
+    Step.objects.filter(
+        job=job, status__in=(Step.STATUS_RUNNING, Step.STATUS_PENDING)
+    ).update(
+        status=Step.STATUS_FAILED,
+        completed_at=timezone.now(),
+    )
+
+    _publish_job_status(job.id, ScrapeJob.STATUS_FAILED)
+
+
+def _absent_error_msg(task_id: str, idle_minutes: int) -> str:
+    """The honest "worker process lost" message, with the ACTUAL broker
+    config instead of a hardcoded assumption."""
+    try:
+        from celery import current_app as _celery_app
+
+        _acks_late = bool(_celery_app.conf.task_acks_late)
+    except Exception:
+        _acks_late = False
+    _redelivery = (
+        "acks_late=True — a broker redelivery may still re-run it"
+        if _acks_late
+        else "acks_late=False means no redelivery"
+    )
+    return (
+        f"Worker process lost: celery task {task_id} is not active "
+        f"on any worker (silent {idle_minutes} min; {_redelivery}). "
+        f"Failed by the stuck-job watchdog."
+    )
 
 
 @shared_task
@@ -3078,10 +4376,13 @@ def cleanup_stuck_jobs() -> None:
     as failed — otherwise it stays RUNNING forever.
 
     Silence alone is no longer the verdict ([jobs 79/80]): before revoking,
-    ``_task_liveness`` asks Celery whether the task still executes. An
-    ``absent`` task fails immediately with an honest "worker process lost"
-    message; an ``active`` task is left alone until the much longer wedge
-    backstop, since silence there means a long quiet phase, not a corpse.
+    ``_task_liveness`` asks Celery whether the task still executes. A
+    PROVABLY ``absent`` task fails immediately with an honest "worker process
+    lost" message — [wave-55 M7] immediately means without waiting out the
+    window, which job 1222's corpse did (08:26:52 → 08:57:13); an ``active``
+    task is left alone until the much longer wedge backstop, since silence
+    there means a long quiet phase, not a corpse; an ``unknown`` task is
+    keep-waiting too — no evidence is not a corpse.
 
     Jobs in WAITING_APPROVAL are untouched — they are genuinely waiting
     for human input.
@@ -3095,11 +4396,19 @@ def cleanup_stuck_jobs() -> None:
         status=ScrapeJob.STATUS_RUNNING,
     )
 
+    # [wave-55 H2] Membership feed: one cheap broadcast per tick records who
+    # is answering right now, so a later tick can tell "one of two workers
+    # went quiet" from "this is the whole cluster". It runs before the idle
+    # short-circuit below — the history has to be warm BEFORE the first stuck
+    # row appears, or that tick's verdict is ungrounded.
+    _record_cluster_sighting(_ping_answerers())
+
     if not stuck_jobs.exists():
         return
 
     failed = 0
     for job in stuck_jobs:
+        _task_id = getattr(job, "celery_task_id", "") or ""
         # [wave-15 R1] A row claimed by celery but killed BEFORE the graph
         # started is provably pre-graph: RUNNING + started_at=None (stamped
         # only when _run_graph_job begins) + zero SessionLog rows of any kind
@@ -3109,16 +4418,44 @@ def cleanup_stuck_jobs() -> None:
         # sighting past a short grace instead. The grace keeps a just-claimed
         # job safe — it looks identical for its first seconds, but
         # _run_graph_job stamps started_at within moments of the claim.
-        _pre_graph = (
+        #
+        # [wave-55 H2 job-1222] The shape is the CANDIDATE set, not the
+        # verdict: a live child looks identical until it stamps started_at,
+        # and 1222's was 5.3 ms from doing exactly that when the fast-fail
+        # killed it. The probe decides — absent (the worker process is gone)
+        # fails, active or unknown falls back to the ladder and keeps
+        # waiting. A row with no task id has nothing to probe and no evidence
+        # either way, so the ladder owns it too (its backstop still ends it).
+        _pre_graph_age = int(
+            (timezone.now() - job.created_at).total_seconds()
+        )
+        _pre_graph = False
+        if (
             job.started_at is None
             and not SessionLog.objects.filter(job=job).exists()
-            and (
-                (timezone.now() - job.created_at).total_seconds()
-                > PRE_GRAPH_FAIL_GRACE_SECONDS
-            )
-        )
+            and _pre_graph_age > PRE_GRAPH_FAIL_GRACE_SECONDS
+        ):
+            if not _task_id:
+                logger.warning(
+                    "Stuck job %d: pre-graph shaped %ds after claim but carries "
+                    "no celery task id — nothing to probe, the silence ladder "
+                    "keeps it",
+                    job.id,
+                    _pre_graph_age,
+                )
+            elif _task_liveness(_task_id) == "absent":
+                _pre_graph = True
+            else:
+                logger.warning(
+                    "Stuck job %d: pre-graph shaped %ds after claim but celery "
+                    "task %s is not provably gone — not failing (the child may "
+                    "be alive between the claim and its started_at stamp)",
+                    job.id,
+                    _pre_graph_age,
+                    _task_id,
+                )
+                continue
         if _pre_graph:
-            _task_id = getattr(job, "celery_task_id", "") or ""
             error_msg = (
                 f"Job was claimed by celery task {_task_id} but never started "
                 f"the graph (no started_at and no session logs after "
@@ -3129,13 +4466,11 @@ def cleanup_stuck_jobs() -> None:
             logger.error(
                 "Stuck job %d: pre-graph fast-fail (age %ds, task %s)",
                 job.id,
-                int((timezone.now() - job.created_at).total_seconds()),
+                _pre_graph_age,
                 _task_id,
             )
             _liveness = "pre-graph"
-            idle_minutes = int(
-                (timezone.now() - job.created_at).total_seconds() / 60
-            )
+            idle_minutes = _pre_graph_age // 60
         else:
             latest_activity_qs = (
                 SessionLog.objects
@@ -3153,6 +4488,32 @@ def cleanup_stuck_jobs() -> None:
                 last_activity = job.started_at or job.created_at
 
             if last_activity >= threshold:
+                # [wave-55 M7] The silence rule is a WAIT, not a verdict — a
+                # legitimately quiet-but-alive run must not be probed into
+                # one. PROVABLE absence is different: every member of the
+                # cluster answered and the task is in nobody's active set,
+                # so the row is already a corpse and the window is pure
+                # delay. Bounded by LIVENESS_FAST_PATH_IDLE_MINUTES so a
+                # freshly active row costs no probe at all.
+                idle_now = int(
+                    (timezone.now() - last_activity).total_seconds() / 60
+                )
+                if (
+                    idle_now < LIVENESS_FAST_PATH_IDLE_MINUTES
+                    or not _provably_absent(_task_id)
+                ):
+                    continue
+                logger.error(
+                    "Stuck job %d: liveness=absent (provable), no activity for "
+                    "%d min (last: %s) — failing now instead of waiting out "
+                    "the %d min window",
+                    job.id,
+                    idle_now,
+                    last_activity.isoformat(timespec="seconds"),
+                    STUCK_JOB_ACTIVITY_TIMEOUT_MINUTES,
+                )
+                _fail_stuck_job(job, _task_id, _absent_error_msg(_task_id, idle_now))
+                failed += 1
                 continue
 
             idle_minutes = int(
@@ -3187,7 +4548,6 @@ def cleanup_stuck_jobs() -> None:
                     else idle_minutes
                 )
                 if _idle_any >= FROZEN_CHILD_SILENCE_MINUTES:
-                    _task_id = getattr(job, "celery_task_id", "") or ""
                     _liveness = _task_liveness(_task_id)
                     if _liveness == "active":
                         _frozen_msg = (
@@ -3212,13 +4572,24 @@ def cleanup_stuck_jobs() -> None:
                     continue
 
                 # Liveness check BEFORE revoking ([jobs 79/80] class): silent ≠ dead.
-                _task_id = getattr(job, "celery_task_id", "") or ""
                 _liveness = _task_liveness(_task_id)
-                if _liveness == "active" and idle_minutes < ACTIVE_SILENCE_REVOKE_MINUTES:
+                # [wave-55 H2] ``unknown`` keeps waiting like ``active`` does:
+                # a saturated pool that answers no probe is no evidence the
+                # task is gone, and the old caller revoked it anyway. The
+                # wedge backstop below still ends the row.
+                if (
+                    _liveness in ("active", "unknown")
+                    and idle_minutes < ACTIVE_SILENCE_REVOKE_MINUTES
+                ):
                     logger.warning(
-                        "Stuck job %d: silent %d min but celery task %s is ACTIVE — "
-                        "not revoking (long quiet phase, not a corpse)",
-                        job.id, idle_minutes, _task_id,
+                        "Stuck job %d: silent %d min but celery task %s is %s — "
+                        "not revoking (%s)",
+                        job.id, idle_minutes, _task_id, _liveness,
+                        (
+                            "long quiet phase, not a corpse"
+                            if _liveness == "active"
+                            else "no evidence either way, not a corpse"
+                        ),
                     )
                     continue
 
@@ -3236,24 +4607,7 @@ def cleanup_stuck_jobs() -> None:
                 # instead of being silently dropped (and the job stuck RUNNING
                 # forever). Harmless when acks_late is off (today's default).
                 if _liveness == "absent":
-                    # Report the ACTUAL broker config instead of a hardcoded
-                    # assumption.
-                    try:
-                        from celery import current_app as _celery_app
-
-                        _acks_late = bool(_celery_app.conf.task_acks_late)
-                    except Exception:
-                        _acks_late = False
-                    _redelivery = (
-                        "acks_late=True — a broker redelivery may still re-run it"
-                        if _acks_late
-                        else "acks_late=False means no redelivery"
-                    )
-                    error_msg = (
-                        f"Worker process lost: celery task {_task_id} is not active "
-                        f"on any worker (silent {idle_minutes} min; {_redelivery}). "
-                        f"Failed by the stuck-job watchdog."
-                    )
+                    error_msg = _absent_error_msg(_task_id, idle_minutes)
                 elif _liveness == "active":
                     error_msg = (
                         f"No activity for {idle_minutes} min while the task still "
@@ -3278,57 +4632,7 @@ def cleanup_stuck_jobs() -> None:
                 # [wave-53 job-538] The deadman already named the verdict.
                 _liveness = "frozen-child"
                 error_msg = _frozen_msg
-        job.status = ScrapeJob.STATUS_FAILED
-        job.error_message = error_msg
-        job.completed_at = timezone.now()
-        job.save(update_fields=["status", "error_message", "completed_at"])
-
-        if _task_id:
-            try:
-                from celery import current_app
-
-                current_app.control.revoke(_task_id, terminate=True, signal="SIGKILL")
-                logger.info(
-                    "Stuck job %d: revoked celery task %s (terminate)",
-                    job.id,
-                    _task_id,
-                )
-            except Exception as exc:
-                logger.warning("Stuck job %d: revoke failed: %s", job.id, exc)
-
-        # [wave-14] The celery revoke kills THIS worker's task — but the wedge
-        # is often the /scrape SUBPROCESS inside browser_service, which has no
-        # celery parent and would keep burning the shared Scraper Chrome until
-        # its own timeout. Cancel it by job id (lock-free, short timeout, never
-        # raises). Runs AFTER the job is marked FAILED so a wedge that already
-        # ended still just gets an honest "nothing in flight".
-        try:
-            from agents.tools.browser_http import cancel_scrape
-
-            _cancel = cancel_scrape(job.id)
-            if _cancel.get("requested") is False and _cancel.get("error"):
-                logger.warning(
-                    "Stuck job %d: browser_service cancel unavailable: %s",
-                    job.id,
-                    _cancel["error"],
-                )
-            elif _cancel.get("flagged"):
-                logger.info(
-                    "Stuck job %d: browser_service cancelled run(s) %s",
-                    job.id,
-                    _cancel.get("flagged"),
-                )
-        except Exception as exc:
-            logger.warning("Stuck job %d: browser_service cancel failed: %s", job.id, exc)
-
-        Step.objects.filter(
-            job=job, status__in=(Step.STATUS_RUNNING, Step.STATUS_PENDING)
-        ).update(
-            status=Step.STATUS_FAILED,
-            completed_at=timezone.now(),
-        )
-
-        _publish_job_status(job.id, ScrapeJob.STATUS_FAILED)
+        _fail_stuck_job(job, _task_id, error_msg)
         failed += 1
 
     if failed:
@@ -3350,10 +4654,9 @@ def purge_retention() -> dict:
     expired django_session cleanup. Never touches parked/live statuses —
     resumable jobs need their checkpoints (see scraper/retention.py).
 
-    [wave-40 T11] Also ages out tombstoned workspaces
-    (``workspace/_trash/{slug}-{job_id}-{ns}/``, the preserved directories
-    the finalize/wipe guard renames aside instead of deleting) on the same
-    windows — see ``retention._sweep_workspace_trash``.
+    Workspace tombstones are swept by the separate ``sweep-workspace-trash``
+    beat entry (scraper.retention.sweep_workspace_trash) — that FS lives on
+    the worker volume, not here (wave-55 H13).
     """
     if not settings.RETENTION_ENABLED:
         return {"disabled": True}
@@ -3453,7 +4756,17 @@ def resume_provider_dead_jobs() -> dict:
         if not claimed:
             continue
         try:
-            dispatch_scrape_job(job_id)
+            job = ScrapeJob.objects.filter(pk=job_id).first()
+            if job is None:
+                logger.warning(
+                    "provider-park resumer: job %d deleted between claim and "
+                    "publish — nothing to drive", job_id,
+                )
+                continue
+            # [wave-55 H4] The reuse decision rides the publish kwargs, so it
+            # is re-derived here — a parked row would otherwise re-enter as a
+            # full rebuild every time this resumer fires.
+            dispatch_scrape_job(job_id, rescrape=_reuse_eligible(job))
             resumed.append(job_id)
             logger.info(
                 "provider-park resumer: job %d re-dispatched "
@@ -3580,7 +4893,16 @@ def resume_browser_unavailable_jobs() -> dict:
         if not claimed:
             continue
         try:
-            dispatch_scrape_job(job_id)
+            job = ScrapeJob.objects.filter(pk=job_id).first()
+            if job is None:
+                logger.warning(
+                    "browser-park resumer: job %d deleted between claim and "
+                    "publish — nothing to drive", job_id,
+                )
+                continue
+            # [wave-55 H4] Same re-derivation as the provider-park resumer:
+            # the decision lives only in the publish kwargs, never on the row.
+            dispatch_scrape_job(job_id, rescrape=_reuse_eligible(job))
             resumed.append(job_id)
             logger.info(
                 "browser-park resumer: job %d re-dispatched (browser_service healthy)",
@@ -3682,7 +5004,7 @@ def redispatch_abandoned_pending() -> dict:
         # A concurrent sweep (or the row's own dispatch) won the race.
         return {"action": "contested"}
 
-    dispatch_scrape_job(candidate.pk, rescrape=False)
+    dispatch_scrape_job(candidate.pk, rescrape=_reuse_eligible(candidate))
     logger.warning(
         "Redispatch sweep: republished abandoned PENDING job %d "
         "(redispatch attempt %d)",

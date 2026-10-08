@@ -133,6 +133,13 @@ def _get_cached_method(domain: str) -> dict | None:
                 domain,
             )
             return None
+        if not entry.method:
+            logger.info(
+                "probe_page: cache HIT but method is empty for %s — "
+                "ignoring (all-fail/akamai-only row)",
+                domain,
+            )
+            return None
         entry.save(update_fields=["last_used_at"])
         logger.info(
             "probe_page: cache HIT for %s (method=%s, akamai=%s, cached %s)",
@@ -350,7 +357,9 @@ def run_probe_with_captcha_check(
       - method_that_worked: first successful method (backward compat)
       - http_method: cheapest HTTP method that worked (or None)
       - browser_method: cheapest browser method that worked (or None)
-      - captcha_detected=True if all methods hit captcha.
+      - captcha_detected=True only when a rung actually returned a captcha
+        page (captcha_hits counts them); a ladder that failed every rung
+        with no captcha evidence returns probe_failed=True instead.
     """
     service_url = _get_browser_service_url()
     domain = _get_domain(url)
@@ -374,6 +383,13 @@ def run_probe_with_captcha_check(
     http_method: str | None = None
     browser_method: str | None = None
     akamai_count = 0
+    # [wave-55 H1] rungs that actually returned a captcha page — the honest
+    # census the all-fail tail reports instead of assuming every rung was one.
+    captcha_count = 0
+    # [wave-55 H1] per-rung census ("direct_http http=403") so an all-fail
+    # verdict says what the wire returned, not just which rungs were sent.
+    rung_outcomes: list[str] = []
+    last_status_code = 0
     # [wave-21 T5] set when a rung fails with 404/410 — terminal: no transport
     # fixes a missing page, so the ladder stops instead of burning every
     # remaining rung (and the domain captcha cache stays untouched).
@@ -390,14 +406,16 @@ def run_probe_with_captcha_check(
         try:
             from scraper.models import SessionLog
 
-            seq = SessionLog.objects.filter(job_id=job_id).count()
-            SessionLog.objects.create(
-                job_id=job_id,
-                role=SessionLog.ROLE_SYSTEM,
-                agent="check_accessibility",
-                content=f"[PROBE] {message}",
-                seq=seq,
-            )
+            from agents.graph import _session_seq_alloc
+
+            with _session_seq_alloc(job_id) as alloc:
+                SessionLog.objects.create(
+                    job_id=job_id,
+                    role=SessionLog.ROLE_SYSTEM,
+                    agent="check_accessibility",
+                    content=f"[PROBE] {message}",
+                    seq=alloc(),
+                )
         except Exception:
             pass
 
@@ -418,7 +436,7 @@ def run_probe_with_captcha_check(
     def _try_single_step(step_name: str, proxy_tier: str) -> dict | None:
         """Try a single escalation step. Returns data on success, None on fail."""
         nonlocal methods_tried, captcha_info, akamai_count, not_found_status
-        nonlocal throttle_wait
+        nonlocal throttle_wait, captcha_count, rung_outcomes, last_status_code
 
         probe_payload: dict = {
             "url": url,
@@ -445,6 +463,15 @@ def run_probe_with_captcha_check(
             data["_request_url"] = url
             data["proxy_tier"] = proxy_tier
             methods_tried.append(step_name)
+            # [wave-55 H1] the per-rung census: what this rung actually
+            # returned. A 403 edge denial is a different site-state from a
+            # captcha page, and the all-fail tail has to be able to say which.
+            _sc = int(data.get("status_code") or 0)
+            last_status_code = _sc
+            rung_outcomes.append(
+                f"{step_name} http={_sc}"
+                + (" akamai" if data.get("needs_akamai_bypass") else "")
+            )
 
             if not data.get("success"):
                 # [wave-21 T5] 404/410 is TERMINAL — local e2e 335/336: the
@@ -452,7 +479,6 @@ def run_probe_with_captcha_check(
                 # playwright, cloak, both proxy tiers) burned against a page
                 # nothing can ever return, then the tail cached the whole
                 # DOMAIN as captcha'd.
-                _sc = int(data.get("status_code") or 0)
                 if _sc in (404, 410):
                     not_found_status = _sc
                     logger.info(
@@ -515,12 +541,20 @@ def run_probe_with_captcha_check(
                                 url[:80],
                             )
                             _log_probe_step(
-                                f"{step_name} Akamai bypass BLOCKED — still no content"
+                                f"{step_name} Akamai bypass BLOCKED "
+                                f"http={int(ak_data.get('status_code') or 0)} "
+                                "— still no content"
+                            )
+                            rung_outcomes.append(
+                                f"{_bypass_method} http="
+                                f"{int(ak_data.get('status_code') or 0)}"
                             )
                             return None
                         captcha_result = _verify_captcha_free(ak_data)
                         if captcha_result.get("captcha_detected"):
                             captcha_info = captcha_result
+                            captcha_count += 1
+                            rung_outcomes.append(f"{_bypass_method} captcha")
                             # [wave-15 3.1] This block (through the
                             # return) used to sit OUTSIDE the if — every
                             # successful bypass was discarded as a
@@ -567,17 +601,23 @@ def run_probe_with_captcha_check(
                         _log_probe_step(
                             f"{step_name} Akamai bypass failed: {str(ak_exc)[:100]}"
                         )
+                        rung_outcomes.append(f"{_bypass_method} error")
                 logger.info(
                     "probe_page[accessibility]: %s failed for %s",
                     step_name,
                     url[:80],
                 )
-                _log_probe_step(f"{step_name} FAILED")
+                # [wave-55 H1] the status code IS the diagnosis — a bare
+                # "FAILED" rung line is how 61 all-fail ladders got read as
+                # captcha walls with nobody noticing the 403s on the wire.
+                _log_probe_step(f"{step_name} FAILED http={_sc}")
                 return None
 
             captcha_result = _verify_captcha_free(data)
             if captcha_result.get("captcha_detected"):
                 captcha_info = captcha_result
+                captcha_count += 1
+                rung_outcomes.append(f"{step_name} captcha")
                 logger.info(
                     "probe_page[accessibility]: %s returned captcha page (%s) for %s",
                     step_name,
@@ -619,6 +659,7 @@ def run_probe_with_captcha_check(
             )
             _log_probe_step(f"{step_name} ERROR: {str(exc)[:100]}")
             methods_tried.append(step_name)
+            rung_outcomes.append(f"{step_name} error")
             return None
 
     # ── Main escalation loop ──────────────────────────────────────────
@@ -675,7 +716,7 @@ def run_probe_with_captcha_check(
         return primary
 
     logger.warning(
-        "probe_page[accessibility]: ALL methods hit captcha or failed for %s. Tried: %s",
+        "probe_page[accessibility]: no rung returned usable content for %s. Tried: %s",
         url[:80],
         methods_tried,
     )
@@ -779,16 +820,68 @@ def run_probe_with_captcha_check(
         try:
             from scraper.models import ProbeCache
 
+            # [wave-55 H1] Field scope (wave-32 B2 parity with the akamai
+            # tail above): this write touches the flags the rungs actually
+            # measured — a previously-learned good method must survive, and
+            # the last-tried rung must stop being minted as the "method that
+            # works" (the 2026-10-05 audit found 32 cloak_residential rows
+            # that never worked on any host). captcha_detected now records
+            # what was SEEN, so a no-captcha all-fail leaves a visibly empty
+            # row instead of captcha poison.
             ProbeCache.objects.update_or_create(
                 domain=domain,
                 defaults={
-                    "method": methods_tried[-1] if methods_tried else "unknown",
                     "needs_akamai_bypass": False,
-                    "captcha_detected": True,
+                    "captcha_detected": bool(captcha_info),
                 },
             )
         except Exception:
             pass
+
+    # [wave-55 H1] Honest tail. This used to declare captcha_detected=True
+    # whenever the ladder came back empty-handed, so a 403 on the wire on
+    # every rung (job 1220 skinceuticals: 15 rungs, 0 captcha pages) ended
+    # the job as a captcha wall — 61 of 62 captcha_blocked rows in the
+    # 2026-10-05 audit had NO captcha rung. The verdict now reads the census:
+    # zero captcha rungs AND zero akamai rungs is a distinct probe_failed
+    # outcome (an honest, retryable failure), not a captcha claim.
+    if not captcha_info and akamai_count == 0:
+        _census = ", ".join(rung_outcomes) or "no rungs completed"
+        _log_probe_step(
+            f"PROBE FAILED — all {len(methods_tried)} rungs returned no content "
+            f"and no captcha page ({_census})"
+        )
+        return {
+            "success": False,
+            "probe_failed": True,
+            "not_found": False,
+            "method": methods_tried[-1] if methods_tried else "none",
+            "http_method": None,
+            "browser_method": None,
+            "proxy_tier": "none",
+            "status_code": last_status_code,
+            "title": "",
+            "body_length": 0,
+            "needs_browser": True,
+            "blocked": False,
+            "captcha_detected": False,
+            "captcha_hits": 0,
+            "captcha_type": "",
+            "captcha_confidence": 0.0,
+            "captcha_reasoning": "no rung returned a captcha page",
+            "methods_tried": methods_tried,
+            "rung_outcomes": rung_outcomes,
+            "_request_url": url,
+            "jsonld": [],
+            "meta": {},
+            "selector_results": {},
+            "akamai_detected": False,
+            "akamai_method_count": 0,
+            "error": (
+                f"[PROBE-FAILED 0/{len(methods_tried)} captcha] all probe "
+                f"methods failed ({_census})"
+            ),
+        }
 
     return {
         "success": False,
@@ -797,20 +890,22 @@ def run_probe_with_captcha_check(
         "http_method": None,
         "browser_method": None,
         "proxy_tier": "none",
-        "status_code": 0,
+        "status_code": last_status_code,
         "title": "",
         "body_length": 0,
         "needs_browser": True,
         "blocked": True,
-        "captcha_detected": True,
+        "captcha_detected": bool(captcha_info),
+        "captcha_hits": captcha_count,
         "captcha_type": captcha_info.get("captcha_type", "unknown")
         if captcha_info
-        else "unknown",
+        else "",
         "captcha_confidence": captcha_info.get("confidence", 0) if captcha_info else 0,
         "captcha_reasoning": captcha_info.get("reasoning", "")
         if captcha_info
-        else "All methods returned captcha or failed",
+        else "no rung returned a captcha page",
         "methods_tried": methods_tried,
+        "rung_outcomes": rung_outcomes,
         "_request_url": url,
         "jsonld": [],
         "meta": {},
@@ -820,7 +915,10 @@ def run_probe_with_captcha_check(
         "error": (
             f"All {len(methods_tried)} probe methods blocked by Akamai Bot Manager"
             if akamai_count == len(methods_tried)
-            else "All probe methods returned captcha pages or failed"
+            else (
+                f"[{captcha_count}/{len(methods_tried)} captcha] "
+                "probe methods returned captcha pages or failed"
+            )
         ),
     }
 
@@ -881,14 +979,16 @@ def run_listing_probe_advisory(
         try:
             from scraper.models import SessionLog
 
-            seq = SessionLog.objects.filter(job_id=job_id).count()
-            SessionLog.objects.create(
-                job_id=job_id,
-                role=SessionLog.ROLE_SYSTEM,
-                agent="check_accessibility",
-                content=f"[LISTING-PROBE] {message}",
-                seq=seq,
-            )
+            from agents.graph import _session_seq_alloc
+
+            with _session_seq_alloc(job_id) as alloc:
+                SessionLog.objects.create(
+                    job_id=job_id,
+                    role=SessionLog.ROLE_SYSTEM,
+                    agent="check_accessibility",
+                    content=f"[LISTING-PROBE] {message}",
+                    seq=alloc(),
+                )
         except Exception:
             pass
 

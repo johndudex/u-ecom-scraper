@@ -190,7 +190,7 @@ item_count ≤ seed_count → FAILED.
   best — after P0 it can pick up a navigate_error discover-only file and downgrade
   a healthy job via `_COVERAGE_FAIL_STOP_REASONS` (route_after_testing.py:76).
   Guard it to skip discover-only artifacts.
-- Delete dead `.opencode/agents/code-writer-v1.md` eventually; do not edit.
+- **Note (2026-10-05, wave-55):** `code-writer-v1.md` was deleted in wave-55; revert baseline = `git show c607ac8:.opencode/agents/code-writer-v1.md` (zero .py/template/skill consumers at c607ac8).
 - Deploy note: `prompts.py:16 _PROMPT_CACHE` — .md edits need a worker restart.
 
 ## Tests

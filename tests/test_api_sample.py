@@ -56,6 +56,16 @@ def _job(u, status="running", slug_site="sampletest"):
 PASS_REPORT = {"overall_assessment": "PASS", "ready_for_execution": True}
 FAIL_REPORT = {"overall_assessment": "FAIL", "ready_for_execution": False}
 
+# [wave-55 GAP-4] The sample gate rejects a core column that is null on every
+# record (the 1219 shape), so every fixture row must carry the product core
+# set — title/price/availability/currency/url/src_url.
+def _core_row(title, price="10"):
+    return {
+        "title": title, "price": price, "availability": "in stock",
+        "currency": "USD", "url": f"https://www.example.com/p/{title}",
+        "src_url": "https://www.example.com/collections/all",
+    }
+
 
 class TestPersistHook:
     def test_pass_report_writes_sample_and_emits(self, partner, db, tmp_path):
@@ -64,7 +74,7 @@ class TestPersistHook:
         ws = tmp_path / "ws"
         ws.mkdir()
         (ws / "output_x.json").write_text(json.dumps(
-            {"site": "x", "products": [{"title": "Boot", "price": "10"}]}
+            {"site": "x", "products": [_core_row("Boot", "10")]}
         ))
         written = {}
 
@@ -95,8 +105,8 @@ class TestPersistHook:
         u, raw = partner
         job = _job(u)
         ws = tmp_path / "ws"; ws.mkdir()
-        (ws / "output_x.json").write_text(json.dumps({"products": [{"title": "A"}]}))
-        (ws / "output_x.json").write_text(json.dumps({"products": [{"title": "B"}]}))
+        (ws / "output_x.json").write_text(json.dumps({"products": [_core_row("A")]}))
+        (ws / "output_x.json").write_text(json.dumps({"products": [_core_row("B")]}))
         with patch("scraper.api.sample_persist._workspace_output", return_value=ws / "output_x.json"), \
              patch("scraper.api.sample_persist._fm_write"):
             persist_partner_sample(job, slug="sampletest", report=PASS_REPORT)

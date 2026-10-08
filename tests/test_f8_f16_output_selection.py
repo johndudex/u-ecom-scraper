@@ -16,6 +16,7 @@ import os
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # Extract the two functions under test without importing Django-bound modules:
@@ -44,14 +45,41 @@ for _fname in ("_substantive_item_count", "_find_newest_output"):
     exec(compile(_m2.group(1), _SRC + ":" + _fname, "exec"), _shared)
 
 # `import src.artifacts as artifacts` inside the FM fallback resolves through
-# sys.modules — pre-seed ONLY that submodule with a stub the FM tests control.
-# src.content_types is left alone: the lazy real import (repo root is on
-# sys.path) gives faithful output_filter_fields semantics — stubbing it would
-# leak wrong content-type behavior into sibling test files (test_f15).
+# EITHER sys.modules["src.artifacts"] OR the parent package attribute
+# src.artifacts (bpo-30024) — py3.12's IMPORT_FROM prefers the attribute and
+# falls back to sys.modules. So the stand-in is bound at BOTH sites, and only
+# inside the two tests that reach the fallback. src.content_types is left
+# alone: the lazy real import (repo root is on sys.path) gives faithful
+# output_filter_fields semantics — stubbing it would leak wrong content-type
+# behavior into sibling test files (test_f15).
 _src_art = types.ModuleType("src.artifacts")
 _src_art.latest_output_key = None
 _src_art.read = None
-sys.modules.setdefault("src.artifacts", _src_art)
+
+
+@contextmanager
+def _bound_fm():
+    """Bind the FM stand-in for one test, at both binding sites.
+
+    Module scope was the bug: an autouse ``scope="module"`` fixture planting
+    ``sys.modules["src.artifacts"]`` kept the 2-attr stub bound for the whole
+    module — and in a mixed-rootdir invocation (``../tests/x.py`` next to
+    ``tests/y.py``, which is what the full-suite gate does) pytest requests
+    that fixture for OTHER modules' tests too, so a late ``import
+    src.artifacts`` (test_wave55_template_path_anchor's File-Master pin) got
+    the stub and died on ``no attribute 'read_text'``. Function-local
+    patch.dict + patch.object (test_api_create_persist._patch_fm's idiom)
+    leaves nothing bound after the test returns.
+    """
+    import src as _src_pkg
+
+    _src_art.latest_output_key = None
+    _src_art.read = None
+    with mock.patch.dict(sys.modules, {"src.artifacts": _src_art}), \
+            mock.patch.object(_src_pkg, "artifacts", _src_art, create=True):
+        yield
+
+
 _shared["__builtins__"] = __builtins__
 
 _find = _shared["_find_newest_output"]
@@ -118,9 +146,10 @@ class TestMtimeFloor:
     def test_floored_call_never_hits_fm_fallback(self, tmp_path):
         # Even with a slug and NOTHING local, a floored call returns "" —
         # never downloads FM content into a fresh-mtime tmpfile.
-        sys.modules["src.artifacts"].latest_output_key = lambda slug: "scrapers/x/output_1.json"
-        sys.modules["src.artifacts"].read = lambda key: b"{}"
-        assert _find(str(tmp_path), slug="x", mtime_floor=time.time() - 1) == ""
+        with _bound_fm():
+            _src_art.latest_output_key = lambda slug: "scrapers/x/output_1.json"
+            _src_art.read = lambda key: b"{}"
+            assert _find(str(tmp_path), slug="x", mtime_floor=time.time() - 1) == ""
 
 
 class TestBestOfN:
@@ -146,9 +175,11 @@ class TestBestOfN:
 
     def test_legacy_call_keeps_fm_fallback(self, tmp_path):
         # graph.py:535/:3408 (tester + resume) pass no floor: FM fallback intact
-        sys.modules["src.artifacts"].latest_output_key = lambda slug: "scrapers/x/output_1.json"
-        sys.modules["src.artifacts"].read = lambda key: json.dumps({"products": [{"title": "x", "price": "$1"}]}).encode()
-        out = _find(str(tmp_path), slug="x")
+        with _bound_fm():
+            _src_art.latest_output_key = lambda slug: "scrapers/x/output_1.json"
+            _src_art.read = lambda key: json.dumps(
+                {"products": [{"title": "x", "price": "$1"}]}).encode()
+            out = _find(str(tmp_path), slug="x")
         assert out and out.startswith(tempfile.gettempdir())
 
 

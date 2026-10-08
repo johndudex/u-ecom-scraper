@@ -64,12 +64,26 @@ def ws(tmp_path, monkeypatch):
     return graph_mod, tmp_path
 
 
+def _plant_resolvable_src(tmp_path):
+    """[wave-55 C1] The injection only fires when ``src.discovery`` resolves
+    from the draft's import path — an unresolvable one is exactly the
+    workspace/src shadow class that crashed 27 prod drafts. These tests pin
+    the SPLICE mechanics, so they plant the real module first."""
+    src = tmp_path / "src"
+    src.mkdir(exist_ok=True)
+    (src / "discovery.py").write_text(
+        "def discover_item_urls(*a, **k):\n    return []\n"
+        "def config_for_load_more(*a, **k):\n    return {}\n"
+    )
+
+
 class TestDiscoveryImportSplice:
     def test_splice_survives_parenthesized_import_block(self, ws):
         """418's exact mechanism: last import is a paren block — the enforced
         import must land AFTER the whole block (top level), and the result
         must compile."""
         graph_mod, tmp_path = ws
+        _plant_resolvable_src(tmp_path)
         slug_dir = tmp_path / "workspace" / "paren-site"
         slug_dir.mkdir(parents=True)
         draft = slug_dir / "scraper_draft.py"
@@ -85,6 +99,10 @@ class TestDiscoveryImportSplice:
         """A draft that does not parse must be left EXACTLY as-is — the
         splice must not turn a writer bug into a different writer bug."""
         graph_mod, tmp_path = ws
+        # [wave-55] plant a resolvable src or the resolution gate returns
+        # before _safe_splice_write and this pins nothing (the file would be
+        # untouched by the GATE, not by the compile-refusal rollback).
+        _plant_resolvable_src(tmp_path)
         slug_dir = tmp_path / "workspace" / "broken-site"
         slug_dir.mkdir(parents=True)
         draft = slug_dir / "scraper_draft.py"
@@ -99,6 +117,7 @@ class TestDiscoveryImportSplice:
         """No regression: a plain draft still receives the enforced import
         and still compiles."""
         graph_mod, tmp_path = ws
+        _plant_resolvable_src(tmp_path)
         slug_dir = tmp_path / "workspace" / "plain-site"
         slug_dir.mkdir(parents=True)
         draft = slug_dir / "scraper_draft.py"

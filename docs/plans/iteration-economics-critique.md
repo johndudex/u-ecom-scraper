@@ -46,7 +46,7 @@ Corrections that change the plan (all code-verified by the critic):
 8. **I8 premise wrong (P1 already fixed part of it):** `_issue_text` reads
    description/message/problem (`subagents.py:1978-1985`) and Expected/Actual IS relayed for
    HIGH. Narrow item to: `suggested_fix` (zero readers in .py) + `feedback_for_writer`
-   (code-writer-v1.md:443, also unread).
+   (code-writer-v1.md:443, also unread; file deleted wave-55 — cite git history, not a path).
 9. **I11: THREE maps, and the missing entry is in the other two.** `AGENT_MAX_ITERATIONS`
    (dead, zero importers) HAS dagster_converter:15; the entries missing are in
    `AGENT_RECURSION_MAP` and `AGENT_MAX_ITERATIONS_LOOKUP`. Unit conflation: recursion_limit

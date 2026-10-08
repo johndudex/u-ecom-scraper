@@ -14,6 +14,25 @@ from scraper.models import ScrapeJob
 pytestmark = pytest.mark.django_db
 
 
+def _execution_step(job, minutes_ago=5):
+    """The `execution` Step row — the phase clock `_notify_phase` stamps when
+    run_execution hands the subprocess off.
+
+    [wave-55 C4] The rescue now also demands it: `_execution_started_epoch`
+    reads THIS row to decide whether a production window exists, and the
+    fixtures here pin scenarios where execution genuinely ran (770's 19
+    rows, 762's crashed-but-productive attempt), so they create it.
+    """
+    from django.utils import timezone
+
+    from scraper.models import Step
+
+    started = timezone.now() - timezone.timedelta(minutes=minutes_ago)
+    return Step.objects.create(
+        job=job, phase="execution", status=Step.STATUS_DONE,
+        started_at=started, completed_at=started)
+
+
 def _freeze_state(monkeypatch, state):
     """Freeze _finalize_job's checkpoint read to `state`.
 
@@ -139,6 +158,7 @@ def test_770_finalize_completes_with_19_from_fm_output(monkeypatch, tmp_path):
         url="https://www.sephora.cz/",   # slug "sephora-cz" via _generate_slug
         status=ScrapeJob.STATUS_RUNNING,
         started_at=timezone.now() - timezone.timedelta(hours=2))
+    _execution_step(job)
     key = "scrapers/sephora-cz/output_2026-09-20_235455_000001_99.json"
     # [wave-49 F3] 770 is a same-run publish — the payload is stamped at
     # write time even though its NAME predates the window
@@ -190,6 +210,7 @@ def test_promotion_skips_an_uncompilable_draft(monkeypatch, tmp_path):
     job = ScrapeJob.objects.create(
         url="https://x.example/", status=ScrapeJob.STATUS_RUNNING,
         started_at=timezone.now() - timezone.timedelta(hours=1))
+    _execution_step(job)
     # ADAPT (slug only): `_generate_slug("https://x.example/")` is "x-example",
     # and this checkpoint carries no state site_slug to override it — so the
     # per-job draft + output keys the evidence pass must find live under
@@ -230,6 +251,7 @@ def test_promotion_publishes_a_compiling_draft(monkeypatch, tmp_path):
     job = ScrapeJob.objects.create(
         url="https://y.example/", status=ScrapeJob.STATUS_RUNNING,
         started_at=timezone.now() - timezone.timedelta(hours=1))
+    _execution_step(job)
     slug = "y-example"
     draft_key = f"scrapers/{slug}/jobs/scraper-{job.id}.py"
     out_key = f"scrapers/{slug}/output_2026-09-20_040000_000001_2.json"
@@ -282,7 +304,13 @@ def test_kill_switch_disables_the_finalize_rescue(monkeypatch, tmp_path):
 def test_rescue_never_clobbers_a_productive_run(monkeypatch, tmp_path):
     """State claims 7 items: the finalize seam must not re-point output_file
     or rewrite product_count even when evidence exists — the rescue exists
-    only for the FAILED/zero verdict."""
+    only for the FAILED/zero verdict.
+
+    [wave-55 C4] The count assertion moved: the recorded product_count is the
+    row count of the file `output_file` names (5), not the state's 7 — the
+    state claim is exactly the disagreeing-count vice this wave removes. The
+    run itself is still not clobbered: status COMPLETED, output_file untouched.
+    """
     from django.conf import settings
     from django.utils import timezone
 
@@ -301,14 +329,19 @@ def test_rescue_never_clobbers_a_productive_run(monkeypatch, tmp_path):
     tasks._finalize_job(job)
     job.refresh_from_db()
     assert job.status == ScrapeJob.STATUS_COMPLETED
-    assert job.product_count == 7          # the run's own count stands
+    assert job.product_count == 5          # the output file's own row count
     assert job.output_file == (
         "scrapers/z-example/output_2026-09-20_050000_000001_3.json")
 
 
 def test_rescue_fires_is_the_one_predicate(tmp_path):
     """[T9 r1] The invariant is stated once: no count, no evidence file, a
-    productive run, or a below-minimum count — none of them rescue."""
+    productive run, or a below-minimum count — none of them rescue.
+
+    [wave-55 C4] The `absent == 0 items` arm flipped: a state with NO
+    `execution_status` never rescues, because run_execution never produced a
+    verdict (prod 1225: execution SKIPPED, test-phase rows shipped COMPLETED).
+    """
     from scraper.tasks import _rescue_fires
 
     failed_zero = {"execution_status": "FAILED", "product_count": 0,
@@ -317,7 +350,7 @@ def test_rescue_fires_is_the_one_predicate(tmp_path):
     assert _rescue_fires(failed_zero, 19, key) is True
     assert _rescue_fires(failed_zero, 0, key) is False       # never a zero
     assert _rescue_fires(failed_zero, 19, "") is False       # no file, no credit
-    assert _rescue_fires({}, 19, key) is True                # absent == 0 items
+    assert _rescue_fires({}, 19, key) is False               # execution never ran
     assert _rescue_fires({"product_count": 7}, 19, key) is False   # productive run
     assert _rescue_fires({"product_count": 0, "input_mode": "navigation"},
                          2, key) is False                    # 2 < 3

@@ -157,6 +157,12 @@
         .status-approved { background: rgba(52, 211, 153, 0.1); color: #34D399; }
         .status-rejected { background: rgba(248, 113, 113, 0.1); color: #F87171; }
 
+        /* ---- Django messages (the global block above the content block) ---- */
+        .messages>div { margin: 0.25rem 0; padding: 0.5rem 0.75rem; border-radius: 0.5rem; font-size: 0.8125rem; }
+        .messages>.warning { color: #FBBF24; border: 1px solid rgba(251, 191, 36, 0.3); background: rgba(251, 191, 36, 0.08); }
+        .messages>.error { color: #F87171; border: 1px solid rgba(248, 113, 113, 0.3); background: rgba(248, 113, 113, 0.08); }
+        .messages>.success { color: #34D399; border: 1px solid rgba(52, 211, 153, 0.3); background: rgba(52, 211, 153, 0.08); }
+
         /* ---- Custom select (shared dropdown) ---- */
         .custom-select { position: relative; }
         .cs-trigger {
@@ -509,6 +515,11 @@
     <!-- Main content -->
     <main class="flex-1 min-w-0 px-5 lg:px-8 pt-6 lg:pt-8 pb-12">
         <div class="max-w-5xl mx-auto anim-page">
+            {% if messages %}
+            <div class="messages mb-6" role="status">
+                {% for m in messages %}<div class="{{ m.tags }}">{{ m }}</div>{% endfor %}
+            </div>
+            {% endif %}
             {% block content %}{% endblock %}
         </div>
     </main>

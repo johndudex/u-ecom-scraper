@@ -34,6 +34,13 @@ from .skills_summary import summarize_job_skills
 
 logger = logging.getLogger(__name__)
 
+# [wave-55 H1] check_accessibility records an all-fail probe (every rung came
+# back empty, no rung showed a captcha page) as a plain STATUS_FAILED row
+# whose error_message starts with this prefix — produced by
+# agents/tools/probe_tools.py:run_probe_with_captcha_check. Such a row is
+# retryable backlog on the intake status board, never the anti-bot bucket.
+PROBE_FAILED_MSG_PREFIX = "[PROBE-FAILED"
+
 
 def _strip_scope_shortfall_notes(value) -> str:
     """[wave-48b H5] job_restart copies the old job's notes into the new row.
@@ -68,6 +75,17 @@ def _user_jobs(request):
 # shared disk. These wrappers keep views terse and centralize the locator logic.
 
 
+# [wave-55 H5] The run window a job's output may be resolved from. Every run
+# for a site shares one scrapers/{slug}/ prefix, so a file stamped outside this
+# window belongs to another run and must never be served for this one (jobs
+# 1186/1198 were shown another job's 10-row output while their own
+# product_count was 1). Same grace the FM prune honours — a file inside the
+# window is one the prune cannot have taken.
+JOB_OUTPUT_WINDOW_SECONDS = 300
+
+OUTPUT_PRUNED_NOTE = "output pruned by retention"
+
+
 def _fm_key_for(stored: str) -> str | None:
     """Normalize a DB-stored artifact locator to a File Master key (or None).
 
@@ -95,6 +113,45 @@ def _fm_read_text(key: str) -> str | None:
         return artifacts.read_text(key)
     except Exception:
         return None
+
+
+def _gate_rerun_output(data) -> tuple[list | dict, list[str]]:
+    """[wave-55 GAP-6] The rows of a re-run payload, through the finalize gates.
+
+    ``site_rerun`` is a second output publisher — it writes ``output_*.json``
+    to the File Master and stamps ``Site.product_count`` with no
+    ``run_execution`` behind it — so the COMPLETED stamp's row gates never see
+    the payload and a re-run could re-ship the exact string prices the main
+    path repairs (audit 1208/1215/1176). Same gate, reused, never
+    re-implemented; the container walk mirrors
+    ``scraper.tasks._read_output_payload`` because this payload is already in
+    memory. Anything that is not a record payload comes back untouched.
+
+    Returns ``(payload, gate_notes)`` — [wave-55 GAP-B] the caller owns the
+    dropped-reason record (celery log + the site page's message store), the
+    same surfaces a COMPLETED stamp's job row is on the main path.
+    """
+    if not isinstance(data, (list, dict)):
+        return data, []
+    try:
+        from scraper.tasks import _RESCUE_ROW_KEYS, _gate_output_rows
+    except Exception:
+        return data, []
+    if isinstance(data, list):
+        kept, notes, _changed = _gate_output_rows(data)
+        return kept, notes
+    for key in _RESCUE_ROW_KEYS:
+        value = data.get(key)
+        if isinstance(value, list) and value and isinstance(value[0], dict):
+            kept, notes, _changed = _gate_output_rows(value)
+            data[key] = kept
+            return data, notes
+    for key, value in data.items():
+        if isinstance(value, list) and value and isinstance(value[0], dict):
+            kept, notes, _changed = _gate_output_rows(value)
+            data[key] = kept
+            return data, notes
+    return data, []
 
 
 def _fm_read_json(key: str):
@@ -401,22 +458,12 @@ def job_detail(request, job_id):
             for k in _fm_list(f"scrapers/{scraper_slug}/")
             if k.split("/")[-1].startswith("output_") and k.endswith(".json")
         ]
-        job_start = job.started_at
-        if all_output:
-            if job_start:
-                filtered = []
-                for f in all_output:
-                    try:
-                        ts = datetime.strptime(
-                            f, "output_%Y-%m-%d_%H%M%S.json"
-                        ).replace(tzinfo=dt_timezone.utc)
-                        if ts >= job_start - timedelta(seconds=120):
-                            filtered.append(f)
-                    except ValueError:
-                        filtered.append(f)
-                output_files = sorted(filtered, reverse=True)
-            else:
-                output_files = sorted(all_output, reverse=True)
+        # [wave-55 H5] Same run window the output resolver honours — a later
+        # run's file must not appear in this job's Output files list.
+        output_files = sorted(
+            _outputs_in_run_window(all_output, job.started_at, job.completed_at),
+            reverse=True,
+        )
 
     fc_approval = (
         job.approvals.filter(approval_type=Approval.TYPE_FIELD_CONFIRM)
@@ -477,7 +524,12 @@ def job_cancel(request, job_id):
         ScrapeJob.STATUS_WAITING_APPROVAL,
     ]:
         job.status = ScrapeJob.STATUS_CANCELLED
-        job.save(update_fields=["status"])
+        # [wave-55 H10] Parity with the API cancel (api/writers.cancel_job):
+        # the UI cancel saved only the status, so every cancelled row stayed
+        # completed_at=NULL and its run history read duration_seconds=None
+        # (jobs 1199/1201). ``or`` keeps an already-stamped value.
+        job.completed_at = job.completed_at or timezone.now()
+        job.save(update_fields=["status", "completed_at"])
         if job.celery_task_id:
             try:
                 from .tasks import run_scrape_task
@@ -573,6 +625,15 @@ def _resolve_job_slug(job):
             if not char.isalnum() and char != "-":
                 name_slug = name_slug.replace(char, "-")
         return name_slug
+    # [wave-55 M5] site_folder/site_name stay empty until the graph sets
+    # them, so every PENDING row resolved to "" and the CFG panel read
+    # input_urls_count=0 while the seed sat under the slug intake itself
+    # derived from the URL (_generate_slug — the writer of
+    # scrapers/{slug}/input_urls.json).
+    if getattr(job, "url", ""):
+        from .tasks import _generate_slug
+
+        return _generate_slug(job.url)
     return ""
 
 
@@ -587,6 +648,13 @@ def job_output_view(request, job_id, filename):
     slug = _resolve_job_slug(job)
     if not slug:
         raise Http404("No scraper folder for this job")
+    # [wave-55 H5] Same boundary as the preview: this route reads any
+    # output_*.json in the slug dir, so a stale bookmark or hand-typed URL
+    # would otherwise serve another run's bytes under this job's route.
+    own = os.path.basename((job.output_file or "").strip())
+    if own != safe_name and not _outputs_in_run_window(
+            [safe_name], job.started_at or job.created_at, job.completed_at):
+        raise Http404("File is not from this job's run")
     key = f"scrapers/{slug}/{safe_name}"
     data = _fm_read_json(key)
     if data is None:
@@ -632,6 +700,13 @@ def job_output_download(request, job_id, filename):
     slug = _resolve_job_slug(job)
     if not slug:
         raise Http404("No scraper folder for this job")
+    # [wave-55 H5] Same boundary as the preview: this route reads any
+    # output_*.json in the slug dir, so a stale bookmark or hand-typed URL
+    # would otherwise serve another run's bytes under this job's route.
+    own = os.path.basename((job.output_file or "").strip())
+    if own != safe_name and not _outputs_in_run_window(
+            [safe_name], job.started_at or job.created_at, job.completed_at):
+        raise Http404("File is not from this job's run")
     key = f"scrapers/{slug}/{safe_name}"
     import src.artifacts as artifacts
     try:
@@ -1031,21 +1106,60 @@ def scraper_code_json(request, job_id):
     return JsonResponse({"path": key, "code": code})
 
 
+def _outputs_in_run_window(names, started_at, completed_at=None):
+    """The job-era subset of ``names`` (bare ``output_*.json`` filenames).
+
+    [wave-55 H5] Every run for a site shares one ``scrapers/{slug}/`` prefix,
+    so a file stamped outside ``[started_at - JOB_OUTPUT_WINDOW_SECONDS,
+    completed_at + JOB_OUTPUT_WINDOW_SECONDS]`` belongs to another run — jobs
+    1186/1198 were served a later run's 10-row output while their own
+    product_count was 1. The lower bound used to be 120s and there was no
+    upper bound at all. A name with no parseable stamp carries no era claim
+    and is never in-window.
+    """
+    def _utc(value):
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=dt_timezone.utc)
+        return value
+
+    if started_at is None:
+        return []
+    low = _utc(started_at) - timedelta(seconds=JOB_OUTPUT_WINDOW_SECONDS)
+    high = (
+        _utc(completed_at) + timedelta(seconds=JOB_OUTPUT_WINDOW_SECONDS)
+        if completed_at else None
+    )
+    in_window = []
+    for name in names:
+        ts = _output_key_ts(name)
+        if ts is None:
+            continue
+        if ts < low:
+            continue
+        if high is not None and ts > high:
+            continue
+        in_window.append(name)
+    return in_window
+
+
 def _resolve_job_output(job):
-    """Return (fm_key, filename) for THIS job's output file, or (None, None).
+    """Return (fm_key, filename, note) for THIS job's output file.
 
     All runs for a site share one scrapers/{slug}/ prefix in the File Master, so
     picking the newest there would show another job's output. We prefer the job's
     own ``output_file`` (authoritative, now an FM key); else the newest
     output_*.json whose timestamp falls within this job's run window.
+    ``note`` is empty when a file was resolved and the retention marker when
+    the job's own era holds no surviving artifact.
     """
     if job.status == ScrapeJob.STATUS_PENDING:
-        return None, None
+        return None, None, ""
     # 1. authoritative output_file (FM key now)
     of = (job.output_file or "").strip()
+    had_pointer = bool(of)
     key = _fm_key_for(of)
     if key and _fm_exists(key):
-        return key, os.path.basename(key)
+        return key, os.path.basename(key), ""
     # 2. slug → outputs in FM within the run window
     slug = _resolve_job_slug(job)
     if not slug:
@@ -1056,39 +1170,38 @@ def _resolve_job_output(job):
         except Exception:
             slug = ""
     if not slug:
-        return None, None
+        return None, None, ""
     outs = [
         k for k in _fm_list(f"scrapers/{slug}/")
         if k.split("/")[-1].startswith("output_") and k.endswith(".json")
     ]
     if not outs:
-        return None, None
+        return None, None, ""
 
     def _fname(k):
         return k.split("/")[-1]
 
-    if job.started_at:
-        cutoff = job.started_at - timedelta(seconds=120)
-        in_window = []
-        for k in outs:
-            ts = _output_key_ts(_fname(k))
-            if ts is None:
-                continue
-            if ts >= cutoff:
-                in_window.append(k)
-        if in_window:
-            # job-76 myhouse: a --discover-only artifact (URL stubs) must not
-            # be surfaced as the job's output ("40 products" on a FAILED job).
-            extracted = [k for k in in_window if not _is_discovery_output_key(k)]
-            pick = extracted[0] if extracted else None
-            if pick:
-                return pick, _fname(pick)
-            return None, None
-        return None, None
-    newest = [k for k in sorted(outs, key=_fname) if not _is_discovery_output_key(k)]
-    if not newest:
-        return None, None
-    return newest[-1], _fname(newest[-1])
+    # No start stamp (a fast-fail before the graph claimed the row) anchors on
+    # created_at — the old unbounded "newest in slug" arm is gone either way.
+    anchor = job.started_at or job.created_at
+    by_name = {_fname(k): k for k in outs}
+    in_window = [
+        by_name[n]
+        for n in _outputs_in_run_window(list(by_name), anchor, job.completed_at)
+    ]
+    if in_window:
+        # job-76 myhouse: a --discover-only artifact (URL stubs) must not
+        # be surfaced as the job's output ("40 products" on a FAILED job).
+        extracted = [k for k in in_window if not _is_discovery_output_key(k)]
+        pick = extracted[0] if extracted else None
+        if pick:
+            return pick, _fname(pick), ""
+        return None, None, ""
+    # Nothing in the job's own era. An out-of-era file is another run's output
+    # — never serve it in this job's name — but only a job that HAD an output
+    # may be told retention pruned it (a job whose output_file was always
+    # empty has nothing of its own to prune).
+    return None, None, OUTPUT_PRUNED_NOTE if had_pointer else ""
 
 
 def _output_key_ts(fname: str):
@@ -1142,8 +1255,20 @@ def _job_output_preview(job) -> dict | None:
     the preview is always THIS job's output, not another run's. Caps records so
     the job_api payload stays small (full output is via download_url).
     """
-    key, fname = _resolve_job_output(job)
+    key, fname, note = _resolve_job_output(job)
     if not key:
+        # [wave-55 H5] The keep-5 prune took this job's era — say so instead of
+        # leaving the card to imply there was never an output.
+        if note:
+            return {
+                "filename": None,
+                "output_key": None,
+                "item_label": None,
+                "count": None,
+                "records": [],
+                "download_url": None,
+                "note": note,
+            }
         return None
     data = _fm_read_json(key)
     if data is None:
@@ -1175,7 +1300,7 @@ def _job_run_history(job, limit: int = 15) -> list:
     qs = ScrapeJob.objects.filter(url=job.url, user=job.user).order_by("-created_at")[:limit]
     for j in qs:
         # per-run output: this run's own output_file / window, not the site's latest
-        _sd, out_fname = _resolve_job_output(j)
+        _sd, out_fname, _note = _resolve_job_output(j)
         out_url = f"/jobs/{j.id}/output/{out_fname}/download/" if out_fname else None
         dur = None
         if j.started_at and j.completed_at:
@@ -1214,7 +1339,13 @@ def _job_input_urls(job) -> dict:
         return empty
     urls: list = []
     slug = _resolve_job_slug(job)
-    site = Site.objects.filter(slug=slug).first() if slug else None
+    # [wave-55 H14] Slug has no unique constraint yet and prod carried 101
+    # duplicate groups: Meta's -created_at ordering makes `.first()` an
+    # arbitrary pick (and same-second rows tie nondeterministically). The
+    # lowest id is the canonical row — same rule migration 0046 dedupes by.
+    site = (
+        Site.objects.filter(slug=slug).order_by("id").first() if slug else None
+    )
     if site is not None and site.input_urls:
         urls = [u for u in site.input_urls if isinstance(u, str)]
     elif slug:
@@ -1678,6 +1809,9 @@ def probe_tester_cached_method(request):
             {
                 "method": entry.method,
                 "needs_akamai_bypass": entry.needs_akamai_bypass,
+                # [wave-55 H1] parity with /probe-cache/'s Captcha column: a
+                # poison row must be visible on this surface too.
+                "captcha_detected": entry.captcha_detected,
             }
         )
     return JsonResponse({"method": None})
@@ -1868,7 +2002,10 @@ def site_rerun(request, site_id):
     if not site.has_scraper or not site.default_scraper_path:
         return redirect("site_detail", site_id=site.id)
 
+    from django.contrib import messages
+
     import src.artifacts as artifacts
+
     scraper_key = site.default_scraper_path  # FM key now
     slug = site.slug or ""
     _source = _fm_read_text(scraper_key) or ""
@@ -1961,11 +2098,43 @@ def site_rerun(request, site_id):
             _content = result.get("output_content") or ""
             _name = result.get("output_name") or ""
             if _content and _name and slug:
+                # [wave-55 GAP-6] Gate before publishing — the service's own
+                # product_count describes the UNGATED rows, so recompute it
+                # from what actually ships. A payload that is not JSON keeps
+                # the service's count rather than zeroing a real re-run.
+                try:
+                    _payload, _gate_notes = _gate_rerun_output(json.loads(_content))
+                    from src.content_types import count_items_in_output
+                    # [wave-55 GAP-2-r13] Count BEFORE overwriting the bytes:
+                    # if the import/count raises, ``_content`` must still be
+                    # the service's original bytes — those are what the except
+                    # arm's service count describes, so the publisher and the
+                    # credit never describe different row sets.
+                    product_count = count_items_in_output(_payload)
+                    _content = json.dumps(_payload)
+                    if _gate_notes:
+                        logger.warning("site_rerun %s: %s", slug, " | ".join(_gate_notes))
+                        messages.warning(
+                            request, "Re-run gates: " + " | ".join(_gate_notes))
+                except Exception:
+                    # [wave-55 GAP-A] Not JSON / gate unavailable: the service's
+                    # count is all there is — never zero a real re-run on a
+                    # read failure, and never let it overwrite a kept-row count.
+                    product_count = result.get("product_count", 0)
                 try:
                     artifacts.write(artifacts.scrapers_key(slug, _name), _content.encode("utf-8"))
                 except Exception:
                     pass
-            product_count = result.get("product_count", 0)
+            else:
+                # [wave-55 GAP-A r12] A 200 with no output bytes is not a
+                # credit and not a 500: scraper_runner answers HTTP 200 with
+                # output_content="" when the scraper exits 0 and
+                # _find_output_file finds nothing (and on its read failure),
+                # and a slugless Site has no key to publish under. No bytes
+                # published -> nothing to re-count, so the service's count
+                # stands — but it must still be ASSIGNED, or the read below
+                # dies on an unbound local instead of redirecting.
+                product_count = result.get("product_count", 0)
         except Exception as e:
             logger.error("site_rerun: browser_service failed: %s", e)
             product_count = 0
@@ -1993,6 +2162,16 @@ def site_rerun(request, site_id):
                     if outs:
                         with open(os.path.join(_td, outs[-1]), encoding="utf-8") as f:
                             _data = json.load(f)
+                        # [wave-55 GAP-6] Same gate the COMPLETED stamp applies,
+                        # before the publish and the count: a dropped row is a
+                        # dropped credit on the Site row too.
+                        _data, _gate_notes = _gate_rerun_output(_data)
+                        if _gate_notes:
+                            logger.warning(
+                                "site_rerun %s: %s", slug, " | ".join(_gate_notes))
+                            messages.warning(
+                                request,
+                                "Re-run gates: " + " | ".join(_gate_notes))
                         if slug:
                             try:
                                 artifacts.write_json(artifacts.scrapers_key(slug, outs[-1]), _data)
@@ -2372,24 +2551,116 @@ def _check_celery_worker():
         return {"status": "down", "latency_ms": ms, "detail": str(exc)[:200]}
 
 
+# [wave-55 H7] Per-entry beat staleness. The old check read only the newest
+# last_run_at across enabled tasks, so one dead entry hid behind fresh
+# 30s/120s/300s peers — the purge-retention entry sat silent for 19 days while
+# /health/ read the beat green every day. Each ENABLED entry is now judged
+# against its OWN schedule period × BEAT_STALE_GRACE_MULTIPLIER, and any stale
+# enabled entry degrades the check with the task name in the detail.
+BEAT_STALE_GRACE_MULTIPLIER = 3
+# Sub-tick jitter (a 30s sweep firing 31s apart) must not flap the light.
+BEAT_MIN_GRACE_SECONDS = 60.0
+# An entry whose schedule cannot be read falls back to the legacy fixed
+# threshold rather than silently reading fresh forever.
+BEAT_FALLBACK_PERIOD_SECONDS = 300.0
+
+
+def _beat_age_text(seconds: float) -> str:
+    """Compact age for the health detail — one line per service on the board."""
+    if seconds < 120:
+        return f"{int(seconds)}s"
+    if seconds < 7200:
+        return f"{int(seconds // 60)}m"
+    if seconds < 172800:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+
+
+def _beat_period_seconds(sched, last_run_at) -> float:
+    """One period of a beat entry's schedule, in seconds.
+
+    Interval schedules carry ``run_every`` directly. crontab/solar carry
+    nothing comparable, so the period is read off two consecutive due
+    points: ``remaining_estimate(x)`` is the time from the schedule's own
+    clock to the next due point strictly after ``x``, so both endpoints
+    measured from the same ``now`` leave ``second_due - first_due`` equal to
+    one true period — 86400 for a daily cron, 900 for ``*/15``. The first
+    endpoint lands microseconds before its own due point (the estimate is
+    measured live), so the second ask steps past it rather than re-reading
+    the same lane. (``last_run_at`` stays in the signature for the call
+    contract; the period must NOT come from it — the slice left before the
+    next due point read a healthy daily entry as overdue for most of its day
+    and degraded the /health/ tile nightly.)
+    """
+    run_every = getattr(sched, "run_every", None)
+    if run_every is not None:
+        return max(run_every.total_seconds(), 1.0)
+    now = sched.now()
+    first_due = now + sched.remaining_estimate(now)
+    second_due = now + sched.remaining_estimate(first_due + timedelta(seconds=1))
+    return max((second_due - first_due).total_seconds(), 1.0)
+
+
 def _check_celery_beat():
     t0 = time.monotonic()
     try:
-        from django.utils import timezone as dj_tz
         from django_celery_beat.models import PeriodicTask
 
-        last_run = (
+        tasks = list(
             PeriodicTask.objects.filter(enabled=True)
-            .order_by("-last_run_at")
-            .first()
+            .select_related("interval", "crontab", "solar", "clocked")
         )
         ms = int((time.monotonic() - t0) * 1000)
-        if last_run and last_run.last_run_at:
-            age = (dj_tz.now() - last_run.last_run_at).total_seconds()
-            if age < 300:
-                return {"status": "up", "latency_ms": ms, "detail": f"Last run {int(age)}s ago"}
-            return {"status": "degraded", "latency_ms": ms, "detail": f"Last run {int(age)}s ago"}
-        return {"status": "unknown", "latency_ms": ms, "detail": "No scheduled tasks"}
+        if not tasks:
+            return {"status": "unknown", "latency_ms": ms, "detail": "No scheduled tasks"}
+
+        stale: list[str] = []
+        judged = 0
+        freshest_age: float | None = None
+        now = timezone.now()
+        for task in tasks:
+            # A one-off that already fired is supposed to be silent forever.
+            if task.one_off or not task.last_run_at:
+                continue
+            judged += 1
+            age = (now - task.last_run_at).total_seconds()
+            freshest_age = age if freshest_age is None else min(freshest_age, age)
+            try:
+                period = _beat_period_seconds(task.schedule, task.last_run_at)
+            except Exception:
+                period = BEAT_FALLBACK_PERIOD_SECONDS
+            grace = max(
+                period * BEAT_STALE_GRACE_MULTIPLIER, BEAT_MIN_GRACE_SECONDS
+            )
+            if age > grace:
+                stale.append(
+                    f"{task.name} (last run {_beat_age_text(age)} ago, "
+                    f"period {_beat_age_text(period)})"
+                )
+
+        if stale:
+            # Name the suspects — "something is stale" is a restart hunt with
+            # no starting point. Three named + a count keeps the one-line
+            # detail bounded no matter how many entries die together.
+            named = "; ".join(stale[:3])
+            if len(stale) > 3:
+                named += f"; +{len(stale) - 3} more"
+            detail = f"stale beat entries: {named}"
+            fresh_count = judged - len(stale)
+            if fresh_count > 0:
+                detail += f" — {fresh_count} fresh"
+            return {"status": "degraded", "latency_ms": ms, "detail": detail[:200]}
+        if not judged:
+            return {
+                "status": "unknown",
+                "latency_ms": ms,
+                "detail": f"{len(tasks)} enabled entries, none has run yet",
+            }
+        return {
+            "status": "up",
+            "latency_ms": ms,
+            "detail": f"{judged} enabled entries, last run {_beat_age_text(freshest_age)} ago",
+        }
     except Exception as exc:
         ms = int((time.monotonic() - t0) * 1000)
         return {"status": "down", "latency_ms": ms, "detail": str(exc)[:200]}
@@ -2870,7 +3141,7 @@ def intake_check_site(request):
     scraping_method = ""
 
     # 1. Site-level: output_schema (latest schema) + fields_extracted (accumulated union)
-    site = Site.objects.filter(slug=slug).first()
+    site = Site.objects.filter(slug=slug).order_by("id").first()  # H14, see above
     if site:
         platform = site.platform
         scraping_method = site.scraping_method
@@ -2913,6 +3184,52 @@ def _parse_url_lines(text: str) -> list[str]:
         if line and line.startswith(("http://", "https://")) and line not in urls:
             urls.append(line)
     return urls
+
+
+def _intake_config_unchanged(url: str, input_mode: str, search_criteria: str,
+                             fields_list: list[str]) -> bool:
+    """[wave-55 H4] Intake half of the selective-rescrape gate: did this
+    submission ask for exactly what the newest prior completed run already
+    built? ``check_tracker.config_unchanged_since_prior`` owns the comparison,
+    so intake and the graph's own diff can never disagree about which prior
+    row is "prior". Fail-open to a full build — a broken reuse gate must cost
+    pipeline time, never a job."""
+    try:
+        from agents.nodes.check_tracker import config_unchanged_since_prior
+
+        return config_unchanged_since_prior(
+            url, input_mode, search_criteria, fields_list
+        )
+    except Exception as exc:
+        logger.warning("intake reuse gate errored (%s) → full build", exc)
+        return False
+
+
+def _fragment_seed_warning(criteria: str, url: str = "") -> tuple[list[str], str]:
+    """[wave-55 M4] The '#' fragment URLs in a submission, plus the operator
+    warning for them. A fragment never reaches discovery —
+    ``first_criteria_url`` (src/seed_urls.py) hands the raw token on and
+    nothing in webapp/ or src/ urldefrags, so job 1230's facet query was
+    silently discarded before Phase 1 ran. WARN, never block — the bare path
+    sometimes still resolves, and the submitted text is stored verbatim
+    either way. URL tokens only: a '#' inside search keywords is content
+    ("C# books"), not a fragment.
+
+    One builder, two surfaces: intake renders the warning on the job screen
+    and the partner API returns it in the 202 payload (a second copy of the
+    regex is how the two surfaces would drift apart)."""
+    fragment_urls = sorted({
+        u for u in re.findall(r"https?://[^\s,]+", f"{criteria}\n{url}")
+        if "#" in u
+    })
+    if not fragment_urls:
+        return [], ""
+    warning = (
+        "Listing/search URL carries a '#' fragment — everything after it "
+        "is dropped before discovery (job 1230 lost its facet this way): "
+        + ", ".join(u[:80] for u in fragment_urls)
+    )
+    return fragment_urls, warning
 
 
 def _fm_file_exists_failopen(site_slug: str) -> bool | None:
@@ -3187,6 +3504,17 @@ def intake_create_job(request):
                     status=422,
                 )
 
+    # [wave-55 M4] A '#' fragment in a listing/search URL never reaches
+    # discovery — see _fragment_seed_warning for the rule. The warning rides
+    # the response (rendered on the job screen) and the row notes (the
+    # post-hoc surface, same channel as the W37-NEW-C coercion note).
+    _fragment_urls, _fragment_warning = _fragment_seed_warning(
+        search_criteria, search_url
+    )
+    if _fragment_warning:
+        notes = f"{notes} | [FRAGMENT-DROPPED] {_fragment_warning}".strip(" |")
+        logger.info("intake_create_job: %s", _fragment_warning)
+
     existing = ScrapeJob.objects.filter(
         url=url, status__in=[ScrapeJob.STATUS_PENDING, ScrapeJob.STATUS_RUNNING],
         user=request.user,
@@ -3350,15 +3678,59 @@ def intake_create_job(request):
                     url[:80],
                     exc,
                 )
+        else:
+            # [wave-55 e2e] The submission carries NO urls — this job will run
+            # on stored seeds (Site.input_urls, or the production
+            # input_urls.json via _build_initial_state's fallback), either of
+            # which may be stale: job 564 shipped 10 rows its user never
+            # submitted, COMPLETED and unremarked, because the seeds were
+            # posted under the wrong field name and the file fallback silently
+            # supplied September's list. The C2 scope gate cannot catch this —
+            # it is fed the same file-derived seeds — so disclose the
+            # substitution on the job row (job_detail.html renders notes; the
+            # stamp also travels into state["user_notes"] so the pipeline
+            # itself sees the provenance).
+            if site and site.input_urls:
+                _src = f"Site.input_urls ({len(site.input_urls)} urls)"
+            else:
+                _src = "the production input_urls.json file"
+            job.notes = (
+                (job.notes or "")
+                + "\n[SEEDS-FROM-FILE] No urls were submitted with this job — "
+                f"extraction will use {_src}, which may be stale. Verify the "
+                "output against the rows you intended."
+            ).strip()
+            job.save(update_fields=["notes"])
 
     from .tasks import dispatch_scrape_job
 
+    # [wave-55 H4] Intake never opted into the selective-rescrape path, so
+    # every re-submission of a site with a production scraper paid the full
+    # pipeline price (job 1198 re-ran site analysis + field mapping + code
+    # generation for 4m00s where its reuse-eligible sibling 1200 only
+    # re-executed). Opt in ONLY when the Site finished AND the submitted
+    # config is identical to the newest prior completed run — anything else
+    # keeps today's full build. The intake form has no explicit rebuild flag:
+    # ``force=1`` is the W31 duplicate-modal click-through that ANY
+    # re-submission of a processed host carries, not a rebuild request (the
+    # Full re-run button's force_full on the re-run endpoints is the only
+    # from-scratch escape, and it bypasses this gate downstream).
+    rescrape = bool(
+        site is not None
+        and site.status == "complete"
+        and _intake_config_unchanged(url, input_mode, search_criteria, fields_list)
+    )
+
     # [wave-15 1.0] keystone: stamp BEFORE publish (see dispatch_scrape_job).
-    dispatch_scrape_job(job.id, rescrape=False)
+    dispatch_scrape_job(job.id, rescrape=rescrape)
 
     return JsonResponse(
         {
             "job_id": job.id,
+            # [wave-55 M4] Non-fatal — the job runs anyway; intake.html
+            # renders this on the job screen, and the same text is on the
+            # row (notes) for the post-hoc read.
+            **({"warning": _fragment_warning} if _fragment_warning else {}),
             "events_url": reverse("job_events", args=[job.id]),
             "api_url": reverse("job_api", args=[job.id]),
             "tool_calls_url": reverse("tool_calls_api", args=[job.id]),
@@ -3535,6 +3907,11 @@ def _site_status_rows():
     # one of these is a dead end for Retry — it would just walk back into the
     # same wall — so it is not retryable backlog. It lands in the board's
     # anti-bot bucket instead (own tile + ?antibot=1 filter, no Retry button).
+    # [wave-55 H1] Deliberately closed: an all-fail probe with zero captcha
+    # evidence is NOT here. check_accessibility stamps it as a plain
+    # STATUS_FAILED row with the PROBE_FAILED_MSG_PREFIX error message, so it
+    # stays retryable backlog exactly like browser_unavailable — a 403 edge
+    # denial is a time-slice, not a wall.
     antibot_statuses = frozenset({
         ScrapeJob.STATUS_CAPTCHA_BLOCKED,
         ScrapeJob.STATUS_AKAMAI_BLOCKED,
@@ -3583,6 +3960,14 @@ def _site_status_rows():
             "latest_job_id": latest.id,
             "last_activity": (
                 latest.completed_at or latest.started_at or latest.created_at
+            ),
+            # [wave-55 H1] The probe ran out of transports, not into a wall —
+            # surfaced so an operator can tell a [PROBE-FAILED] row (retry it)
+            # from any other failure. Retryable by construction: the row is a
+            # plain STATUS_FAILED one, never in the anti-bot bucket.
+            "probe_failed": (
+                success is None
+                and (latest.error_message or "").startswith(PROBE_FAILED_MSG_PREFIX)
             ),
         })
     rows.sort(key=lambda r: (r["site_name"].lower(), r["product_url"]))

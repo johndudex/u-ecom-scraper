@@ -13,8 +13,17 @@ app.config_from_object("django.conf.settings", namespace="CELERY")
 app.autodiscover_tasks()
 # Events dispatcher lives outside tasks.py (scraper/events/) — autodiscover
 # only finds <app>.tasks. Explicit import so every worker (scrape + events
-# queue) registers deliver_callback/dispatch_pending_callbacks.
-app.conf.imports = ("scraper.events.dispatcher", "scraper.events.reconciler")
+# queue) registers deliver_callback/dispatch_pending_callbacks; the third
+# entry is the wave-55 tombstone sweep (scraper/retention.py), likewise
+# outside tasks.py. Everything a worker must register at boot goes IN THIS
+# TUPLE: it is the only ``imports`` source — a ``CELERY_IMPORTS`` setting
+# does not append here, it replaces the tuple via config_from_object above
+# and silently deregisters the other modules.
+app.conf.imports = (
+    "scraper.events.dispatcher",
+    "scraper.events.reconciler",
+    "scraper.retention",
+)
 
 
 @worker_ready.connect

@@ -177,9 +177,10 @@ class TestAntiBotEscalationUnchanged:
         assert result["success"] is True
         assert result.get("not_found", False) is False
 
-    def test_captcha_all_failed_path_unchanged(self, ladder_env, monkeypatch):
-        """Non-404 all-failed keeps the legacy captcha-shaped verdict AND the
-        domain cache write."""
+    def test_non404_all_failed_is_an_honest_probe_failed(self, ladder_env, monkeypatch):
+        """[wave-55 H1] Non-404 all-failed with NO captcha rung is no longer a
+        captcha-shaped verdict — it is a probe failure. The domain cache write
+        still happens (field-scoped, no invented method)."""
         calls = _fake_post_sequence(
             monkeypatch,
             {
@@ -226,9 +227,13 @@ class TestAntiBotEscalationUnchanged:
         # full ladder walked — every base rung was reached, nothing terminal
         assert set(name for name, _ in probe_tools.ESCALATION_STEPS) <= set(calls)
         assert result["success"] is False
-        assert result["captcha_detected"] is True
+        assert result["probe_failed"] is True
+        assert result["captcha_detected"] is False
         assert result.get("not_found") is False
-        assert len(ladder_env.calls) == 1  # legacy domain-cache write happens
+        assert len(ladder_env.calls) == 1  # domain-cache write still happens
+        # field-scoped [wave-55 H1]: no captcha claim, no invented method
+        assert ladder_env.calls[0]["defaults"]["captcha_detected"] is False
+        assert "method" not in ladder_env.calls[0]["defaults"]
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+from functools import lru_cache
 from typing import Any
 
 from django.conf import settings
@@ -37,6 +38,26 @@ def _get_redis() -> Any:
 
         _redis_client = redis_lib.from_url(settings.CELERY_BROKER_URL)
     return _redis_client
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Compiled scrape graph (compiled once per process) [wave-55 M6]
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@lru_cache(maxsize=1)
+def _compiled_graph(checkpointer) -> CompiledStateGraph:
+    """Compile the scrape graph once per checkpointer (one per process).
+
+    Keyed on the checkpointer rather than cached argument-free so the graph
+    follows the (already single) checkpointer instance; the ~26-node compile
+    must not re-run per dispatch. ``build_scrape_graph`` is imported here — at
+    call time — so tests can spy on it, and so importing this module never
+    pulls in the graph machinery.
+    """
+    from agents.graph import build_scrape_graph
+
+    return build_scrape_graph(checkpointer=checkpointer)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -193,16 +214,23 @@ class LangGraphService:
 
     @staticmethod
     def build_graph() -> CompiledStateGraph:
-        """Build and compile the scrape graph with a PostgreSQL checkpointer.
+        """Return the process-wide compiled scrape graph.
 
-        The checkpointer instance is obtained from ``agents.checkpointer`` and
-        cached by ``lru_cache``, so repeated calls are cheap.
+        The ~26-node compile is NOT cheap, so the result is cached: the audit
+        counted 49 compiles for 30 dispatches because only the CHECKPOINTER
+        was cached while ``build_scrape_graph`` re-ran every call. The cache
+        is keyed on the checkpointer (itself an ``lru_cache`` singleton), so
+        the graph is compiled once per process and every job shares it —
+        LangGraph graphs are stateless across invocations; per-job state lives
+        in the checkpoint under the job's thread id.
+
+        ``agents.graph.build_scrape_graph`` stays uncached: the graph-module
+        tests call it directly with patched nodes and must keep getting a
+        fresh compile.
         """
         from agents.checkpointer import get_checkpointer
-        from agents.graph import build_scrape_graph
 
-        checkpointer = get_checkpointer()
-        return build_scrape_graph(checkpointer=checkpointer)
+        return _compiled_graph(get_checkpointer())
 
     # ── Config helpers ──────────────────────────────────────────────────
 

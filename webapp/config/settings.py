@@ -206,7 +206,7 @@ CELERY_BEAT_SCHEDULE = {
     },
     # [wave-16 B3] Dependency-park resumer: poll browser_service /health and
     # re-dispatch parked jobs once it recovers. 120s cadence × batch 3 — the
-    # 2-slot scrape pool can't absorb more anyway. Kill-switch:
+    # 3-slot scrape pool can't absorb more anyway. Kill-switch:
     # BROWSER_RESUME_ENABLED=0 (off by default would strand parked jobs).
     "resume-browser-unavailable": {
         "task": "scraper.tasks.resume_browser_unavailable_jobs",
@@ -228,12 +228,21 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": 30.0,
     },
     # [wave-35] Daily retention purge — langgraph checkpoint_* + log tables
-    # behind dead-end jobs (failed/cancelled >7d, completed >90d by default;
-    # parked/resumable statuses never). Off-peak single daily run; rides the
-    # events pool (see CELERY_TASK_ROUTES). Kill-switch: RETENTION_ENABLED=0.
+    # behind dead-end jobs (anchored on completed_at since wave-55; parked/
+    # resumable statuses never). Off-peak single daily run; rides the events
+    # pool (see CELERY_TASK_ROUTES). Kill-switch: RETENTION_ENABLED=0.
     "purge-retention": {
         "task": "scraper.tasks.purge_retention",
         "schedule": crontab(hour=3, minute=17),
+    },
+    # [wave-55 H13] Same windows, own entry: the workspace tombstone sweep
+    # reads the FS under PROJECT_ROOT, and only celery-worker holds the volume
+    # the tombstones are written to (events' workspace is a frozen snapshot —
+    # trash_entries_purged was 0 on every prod send since wave-40 T11).
+    # Scheduled after the DB purge so the two reports never interleave.
+    "sweep-workspace-trash": {
+        "task": "scraper.retention.sweep_workspace_trash",
+        "schedule": crontab(hour=3, minute=43),
     },
 }
 
@@ -244,7 +253,7 @@ RETENTION_ENABLED = config("RETENTION_ENABLED", default=True, cast=bool)
 RETENTION_DAYS_FAILED = config("RETENTION_DAYS_FAILED", default=7, cast=int)
 RETENTION_DAYS_COMPLETED = config("RETENTION_DAYS_COMPLETED", default=90, cast=int)
 
-# Fold B5: delivery HTTP must never share the scrape workers' 2-slot pool —
+# Fold B5: delivery HTTP must never share the scrape workers' 3-slot pool —
 # one hung partner endpoint ≈ 10 min of zero scrape capacity otherwise.
 # [jobs 79/80] Same for the watchdog: cleanup_stuck_jobs is beat-scheduled on
 # the scrape pool it polices — with both slots busy it queued for 8+ min
@@ -256,7 +265,7 @@ CELERY_TASK_ROUTES = {
     "scraper.events.reconciler.dispatch_pending_callbacks": "events",
     "scraper.tasks.cleanup_stuck_jobs": "events",
     # [wave-15 1.2] Recovery/maintenance tasks ride the dedicated events pool:
-    # the sweep must not wait behind scraping tasks on the 2-slot scrape pool
+    # the sweep must not wait behind scraping tasks on the 3-slot scrape pool
     # (redispatch_stuck_approved_interrupts was unrouted before — it worked
     # only by luck of the scrape pool's queueing).
     "scraper.tasks.redispatch_abandoned_pending": "events",
@@ -268,6 +277,16 @@ CELERY_TASK_ROUTES = {
     "scraper.tasks.resume_provider_dead_jobs": "events",
     # [wave-35] Retention purge is maintenance — must not occupy a scrape slot.
     "scraper.tasks.purge_retention": "events",
+    # [wave-55 L1] The auto-scheduler tick is the same class of maintenance: it
+    # touches only the DB and the File Master (an HTTP service), and no-ops on
+    # the vast majority of its 5-min ticks, so those ticks must not queue
+    # behind real scrape jobs on the 3-slot pool.
+    "scraper.tasks.schedule_next_site": "events",
+    # [wave-55 H13] The tombstone sweep is the opposite case: it must run in
+    # the worker container (that is where workspace/_trash is real), so it is
+    # pinned to the default queue celery-worker consumes. Kept explicit — an
+    # unrouted task would follow whatever the default queue is renamed to.
+    "scraper.retention.sweep_workspace_trash": "celery",
 }
 
 # [wave-15 1.2] Master switch for the abandoned-PENDING redispatch sweep.

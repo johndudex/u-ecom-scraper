@@ -2308,6 +2308,18 @@ components:
           type: string
         scraper_code_url:
           type: string
+        warnings:
+          type: array
+          items:
+            type: string
+          description: |
+            Non-fatal advisories about the submitted config; the job still
+            runs. Today: one entry when a `listing_urls` / `search_url` token
+            carries a `#` fragment — everything after `#` is dropped before
+            discovery (the stored `search_criteria` keeps the submitted text
+            verbatim).
+          examples:
+            - ["Listing/search URL carries a '#' fragment — everything after it is dropped before discovery (job 1230 lost its facet this way): https://example.com/costumes#!/order=name"]
 
     # ── Status ─────────────────────────────────────────────────────────────
     PhaseStatus:

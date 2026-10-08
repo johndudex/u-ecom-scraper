@@ -599,6 +599,10 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
             <span><b id="job-records">3,512</b> records</span>
             <span id="job-when">—</span>
           </div>
+          <!-- [wave-55 M4] Non-fatal build advisories (e.g. a '#' fragment
+               dropped from a listing URL before discovery). A warning, not an
+               error: the job this announces is already running. -->
+          <p class="url-error hidden" id="build-warning"></p>
         </div>
         <div class="hero-actions">
           <button class="btn btn-ghost btn-sm" id="dl-output"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg> Output</button>
@@ -2025,7 +2029,11 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       if(j.started_at) det.push(['Started', new Date(j.started_at).toLocaleString()]);
       if(j.completed_at) det.push(['Finished', new Date(j.completed_at).toLocaleString()]);
       if(j.url) det.push(['Source', j.url]);
-      if(j.error_message) det.push(['Error', j.error_message]);
+      // [wave-55 GAP-1d] A COMPLETED row can carry an error_message that is a
+      // data caveat, not a crash (the `[MISSING-CORE …]` stamp) — labelling it
+      // "Error" reads an honest run as a failure on the primary ops board, the
+      // same COMPLETED+error shape wave-19 T1.5 scrubs on job_detail.html.
+      if(j.error_message) det.push([j.status==='completed' ? 'Data caveat' : 'Error', j.error_message]);
       X('#details-kv').innerHTML = det.map(function(r){ return '<div class="kv"><span class="kk">'+escHtml(r[0])+'</span><span class="kv-v">'+escHtml(String(r[1]))+'</span></div>'; }).join('');
       // [wave-44] Skills provenance — used (injected into the writer prompt /
       // loaded via load_skill) and written (actual tool calls vs skill_learner
@@ -2072,12 +2080,21 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
         X('#output-loading').classList.add('hidden');
         X('#output-content').classList.remove('hidden');
         X('#json-expand-toggle').classList.remove('hidden');
-        var note = op.count>3 ? ('first 3 of '+op.count+' '+op.item_label+(op.count===1?'':'s')+' — download for all') : '';
-        var pv={}; pv[op.output_key]=op.records; pv._count=op.count; if(note) pv._note=note;
-        var pretty=JSON.stringify(pv,null,2);
-        X('#sample-json-view').textContent=pretty;
-        X('#json-out').textContent=pretty;
-        intakeState.output_download_url=op.download_url;
+        if(op.note){
+          // [wave-55 H5] The keep-5 prune took this job's own output — say so
+          // instead of building a card from null count/output_key.
+          var pruned=JSON.stringify({status:j.status, note:op.note},null,2);
+          X('#sample-json-view').textContent=pruned;
+          X('#json-out').textContent=pruned;
+          intakeState.output_download_url=null;
+        } else {
+          var note = op.count>3 ? ('first 3 of '+op.count+' '+op.item_label+(op.count===1?'':'s')+' — download for all') : '';
+          var pv={}; pv[op.output_key]=op.records; pv._count=op.count; if(note) pv._note=note;
+          var pretty=JSON.stringify(pv,null,2);
+          X('#sample-json-view').textContent=pretty;
+          X('#json-out').textContent=pretty;
+          intakeState.output_download_url=op.download_url;
+        }
       }
       if(TERMINAL.indexOf(j.status)>=0){
         X('#output-loading').classList.add('hidden');
@@ -2177,10 +2194,23 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
       X('#job-title').textContent = 'Job #' + data.job_id;
       X('#job-id-badge').textContent = '#' + data.job_id;
       show('sample-screen'); stepState(2);
+      // [wave-55 M4] A fragment-bearing listing URL still builds, but the
+      // operator sees WHY the facets are missing before they read the output.
+      if(data.warning){ showBuildWarning(data.warning); }
       setRunning(true);
       captureConfigBaseline(); // re-baseline so the changed-badge resets after the create-job fires
       subscribeToJob(data);
     }).catch(function(err){ btn.disabled = false; showUrlError('Could not start the job (' + err + ').'); });
+  }
+  /* [wave-55 M4] The fragment notice is a WARNING on the job screen, not a
+     form error: showUrlError() is the URL-check gate's blocking surface (it
+     hides the fields and flags the input invalid) — the wrong shape for a
+     job that is already running. */
+  function showBuildWarning(msg){
+    var e = X('#build-warning');
+    if(!e) return;
+    e.textContent = msg;
+    e.classList.remove('hidden');
   }
   var dupFd = null;
   function openDupModal(data, fd){

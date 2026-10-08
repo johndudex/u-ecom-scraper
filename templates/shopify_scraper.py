@@ -26,7 +26,16 @@ from html import unescape
 
 import requests
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+# src.* is imported from the REPO ROOT (PROJECT_ROOT), never from the draft's
+# parent: a parent-of-file insert puts workspace/ on sys.path[0] and a stray
+# workspace/src/ package shadows the pipeline's src/ (audit 2026-10-05 C1).
+PROJECT_ROOT = os.environ.get(
+    "PROJECT_ROOT",
+    os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    ),
+)
+sys.path.insert(0, PROJECT_ROOT)
 from src.proxy import ProxyConfig, should_warn_residential, warn_residential_usage
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -25,6 +25,17 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
+# src.* is imported from the REPO ROOT (PROJECT_ROOT), never from the draft's
+# parent: a parent-of-file insert puts workspace/ on sys.path[0] and a stray
+# workspace/src/ package shadows the pipeline's src/ (audit 2026-10-05 C1).
+PROJECT_ROOT = os.environ.get(
+    "PROJECT_ROOT",
+    os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    ),
+)
+sys.path.insert(0, PROJECT_ROOT)
+
 # ── Configuration (Code Writer adapts these) ──────────────────────────────────
 
 OUTPUT_KEY = "jobs"            # "products" for e-commerce, "jobs" for job boards
@@ -91,9 +102,8 @@ def _get_proxy():
     if PROXY_TIER == "none":
         return None
     try:
-        import os as _os
-        import sys as _sys
-        _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".."))
+        # src.* resolves via the module-level PROJECT_ROOT anchor (repo root),
+        # never via the draft's parent — see the anchor next to the imports.
         from src.geo import detect_country
         from src.proxy import build_proxy_url
         return build_proxy_url(PROXY_TIER, country=detect_country(SITE_URL))

@@ -71,9 +71,13 @@ class TestGate:
         msg = gate(out, LISTING, "list_page")
         assert msg.startswith("Nav-tree junk bar:")
 
-    def test_url_list_out_of_scope(self, gate, tmp_path):
+    def test_url_list_now_in_scope(self, gate, tmp_path):
+        """[wave-55 C2] url_list used to be exempt (its seeds are
+        user-provided), which is how job 1229 shipped unsubmitted rows as
+        COMPLETED. Its anchor is the submitted PDP — grounded the same way a
+        list_page anchor is."""
         out = _write_run(tmp_path, _junk_rows())
-        assert gate(out, LISTING, "url_list") == ""
+        assert gate(out, LISTING, "url_list").startswith("Nav-tree junk bar:")
 
     def test_search_and_navigation_out_of_scope(self, gate, tmp_path):
         """Depth judgment needs an anchor that IS the walked listing — only

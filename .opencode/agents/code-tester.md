@@ -100,6 +100,19 @@ Fields `original_price` and `location` are optional. Missing optional fields = s
 - Scraper failed to start (exit code 1 or 2, no output file)
 - The scraper code itself has a bug
 
+## Dead-Site Verdict (`site_status` / `dead_site_assessment`)
+
+A domain proven dead by **>= 2 independent access methods** (e.g. direct HTTP **and** a rendered browser fetch, each returning a parked page / "cease trading" banner / registrar hold) is a SITE-level verdict, not a scraper bug. Set `overall_assessment` to `FAIL`, set `ready_for_execution` to `false`, report the real extraction count (0 when nothing survived), and stamp BOTH fields below. **Never report a dead domain as `PASS`**, whatever the code's exit code or JSON shape — no fix cycle can create content that does not exist.
+
+Write exactly one of these stamps (lowercase or uppercase both read the same downstream):
+
+- `DEAD_STORE_SUNSET` — the retailer wound the site down; a sunset/celebration page replaced the catalog
+- `DEAD_STORE_CLOSED` — a closed-for-good / "we have closed" page, no catalog anywhere
+- `DOMAIN_PARKED` — the domain now serves a registrar/for-sale park page
+- `OUT_OF_BUSINESS` — the business itself is gone (insolvency notice, holding page)
+
+When the store IS reachable use `"LIVE"` (or omit both fields). **Never write a negated value** such as `not_dead`, `dead_store_ruled_out` or `operational_site` — a negated stamp is read as "the site is fine", so write `LIVE` instead.
+
 ## Your Output
 
 Save to: `workspace/{site_slug}/test_report.json`
@@ -107,9 +120,13 @@ Save to: `workspace/{site_slug}/test_report.json`
 ```json
 {
   "site_slug": "site-name",
-  "test_timestamp": "ISO-8601",
   "scraper_file": "scraper_draft.py",
   "sample_size": 5,
+  "site_status": "LIVE|DEAD_STORE_SUNSET|DEAD_STORE_CLOSED|DOMAIN_PARKED|OUT_OF_BUSINESS",
+  "dead_site_assessment": {
+    "site_status": "DEAD_STORE_SUNSET|DEAD_STORE_CLOSED|DOMAIN_PARKED|OUT_OF_BUSINESS",
+    "summary": "One paragraph of proof: the >= 2 independent access methods tried, what each returned, and on which URL"
+  },
   "results": {
     "successful_extractions": 4,
     "failed_extractions": 1,

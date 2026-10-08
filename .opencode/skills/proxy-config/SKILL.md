@@ -62,7 +62,12 @@ Provide proxy integration for all scraping — Python scrapers and Playwright MC
 
 ```python
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+# Anchor `src.*` imports at the REPO ROOT, never at the draft's parent: a
+# parent-of-file insert puts workspace/ at sys.path[0] where a stray
+# workspace/src/ package shadows the pipeline's src/ (audit 2026-10-05 C1).
+PROJECT_ROOT = os.environ.get("PROJECT_ROOT", os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")))
+sys.path.insert(0, PROJECT_ROOT)
 
 from src.proxy import ProxyConfig, should_warn_residential, warn_residential_usage
 

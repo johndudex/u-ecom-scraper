@@ -118,6 +118,40 @@ def _fields_changed(state, prior) -> bool:
     return set(state.get("target_fields") or []) != set(prior.target_fields or [])
 
 
+def _prior_completed_job(url: str, exclude_pk: int | None = None):
+    """The prior COMPLETED job for this URL the rescrape diff judges against —
+    newest by ``completed_at``, never the running job itself. One definition,
+    shared by the graph-side skip flags and the intake reuse gate, so the two
+    can never disagree about which row is "prior"."""
+    from scraper.models import ScrapeJob
+
+    qs = ScrapeJob.objects.filter(url=url, status=ScrapeJob.STATUS_COMPLETED)
+    if exclude_pk:
+        qs = qs.exclude(pk=exclude_pk)
+    return qs.order_by("-completed_at").first()
+
+
+def config_unchanged_since_prior(url: str, input_mode: str = "",
+                                 search_criteria: str = "",
+                                 target_fields=None) -> bool:
+    """[wave-55 H4] True when the submitted config is identical to the newest
+    prior COMPLETED job for this URL — the precondition for intake to opt into
+    the selective-rescrape path instead of paying for a full rebuild.
+
+    Raw-vs-raw by design: a job created at intake carries no field_mapping
+    blob yet, so the resolved-vs-resolved arm of ``_fields_changed`` cannot
+    apply (the same legacy fallback the graph-side diff uses).
+    """
+    prior = _prior_completed_job(url)
+    if prior is None:
+        return False
+    if (input_mode or "") != (prior.input_mode or ""):
+        return False
+    if (search_criteria or "") != (prior.search_criteria or ""):
+        return False
+    return set(target_fields or []) == set(prior.target_fields or [])
+
+
 def _compute_rescrape_skip_flags(state, url: str):
     """Compute selective skip flags for a rescrape based on config diff vs the
     prior completed job for this URL. Returns (skip_site, skip_product, skip_code).
@@ -130,15 +164,7 @@ def _compute_rescrape_skip_flags(state, url: str):
       scraper bakes in the field map).
     """
     try:
-        from scraper.models import ScrapeJob
-
-        prior = (
-            ScrapeJob.objects
-            .filter(url=url, status=ScrapeJob.STATUS_COMPLETED)
-            .exclude(pk=state.get("job_id", 0))
-            .order_by("-completed_at")
-            .first()
-        )
+        prior = _prior_completed_job(url, exclude_pk=state.get("job_id", 0))
         if not prior:
             logger.info("_compute_rescrape_skip_flags: no prior completed job → full run")
             return False, False, False

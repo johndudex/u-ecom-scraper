@@ -32,6 +32,7 @@
                     <th class="px-4 py-3 text-left">Domain</th>
                     <th class="px-4 py-3 text-left">Method</th>
                     <th class="px-4 py-3 text-left">Akamai Bypass</th>
+                    <th class="px-4 py-3 text-left">Captcha</th>
                     <th class="px-4 py-3 text-left">Status</th>
                     <th class="px-4 py-3 text-left">Cached</th>
                     <th class="px-4 py-3 text-left">Last Used</th>
@@ -42,12 +43,19 @@
                 {% for entry in entries %}
                 <tr class="border-t border-line-subtle {% if entry.is_expired %}opacity-40{% endif %} hover:bg-raised/50 transition-colors">
                     <td class="px-4 py-3 font-medium text-ink whitespace-nowrap">{{ entry.domain }}</td>
-                    <td class="px-4 py-3"><code class="text-accent bg-accent/10 px-1.5 py-0.5 rounded text-xs font-mono">{{ entry.method }}</code></td>
+                    <td class="px-4 py-3"><code class="text-accent bg-accent/10 px-1.5 py-0.5 rounded text-xs font-mono">{{ entry.method|default:"—" }}</code></td>
                     <td class="px-4 py-3">
                         {% if entry.needs_akamai_bypass %}
                             <span class="status-badge status-failed">Yes</span>
                         {% else %}
                             <span class="status-badge status-pending">No</span>
+                        {% endif %}
+                    </td>
+                    <td class="px-4 py-3">
+                        {% if entry.captcha_detected %}
+                            <span class="status-badge status-failed">captcha seen</span>
+                        {% else %}
+                            <span class="status-badge status-pending">none</span>
                         {% endif %}
                     </td>
                     <td class="px-4 py-3">

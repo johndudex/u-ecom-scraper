@@ -145,12 +145,19 @@ def test_execution_lane_merges_the_arm_into_both_env_lanes():
     # carry the explicit value too, never inherit the other container's ambient
     # env (review minor 2).
     assert "_checkpoint_reuse_env" in _fn_src(src, "_run_category_sources")
-    staging = re.search(r'for _sf in \(([^)]*)\)', bs)
-    assert staging, "execution staging tuple moved — re-locate"
+    # [wave-55 C2] the tuple moved into _stage_extra_files (it now needs the
+    # input_mode). Still VERBATIM — no seed filtering, the T13 reader filters.
+    staging = _fn_src(src, "_stage_extra_files")
     # Either the literal or the T13 constant (same value, imported at the top
     # of run_execution) — the constant is the preferred spelling.
-    assert ("discovered_urls_checkpoint.json" in staging.group(1)
-            or "CHECKPOINT_FILENAME" in staging.group(1))
+    assert ("discovered_urls_checkpoint.json" in staging
+            or "CHECKPOINT_FILENAME" in staging)
+    # …and the checkpoint rides ONLY where reuse can be armed (the same
+    # _wants_fresh_discovery set the --fresh-discovery append keys on): staging
+    # it for url_list handed execution the tester's --sample discovery
+    # (job 1227 shipped 10 unrelated products off a 1-URL PDP seed).
+    assert "_wants_fresh_discovery" in staging
+    assert "_stage_extra_files(" in bs and "input_mode" in bs
     # The in-process legs must receive the armed value too: BOTH _run_in_process
     # call sites (primary + the RC1 listing redispatch) merge it into the
     # env_overrides dict that _run_in_process folds into its Popen env.

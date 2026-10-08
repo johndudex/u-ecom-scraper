@@ -65,13 +65,21 @@ def _freeze_state(monkeypatch, state):
 def _job(scope="", scope_value=0):
     from django.utils import timezone
 
-    from scraper.models import ScrapeJob
+    from scraper.models import ScrapeJob, Step
 
-    return ScrapeJob.objects.create(
+    job = ScrapeJob.objects.create(
         url="https://www.wonderbly.com/",
         status=ScrapeJob.STATUS_RUNNING,
         scope=scope, scope_value=scope_value,
         started_at=timezone.now() - timezone.timedelta(hours=1))
+    # [wave-55 C4] Every scenario here is "execution ran and wrote rows" —
+    # the rescue now reads the `execution` Step's start as the production
+    # window's existence proof, so the fixture carries it.
+    started = timezone.now() - timezone.timedelta(minutes=5)
+    Step.objects.create(
+        job=job, phase="execution", status=Step.STATUS_DONE,
+        started_at=started, completed_at=started)
+    return job
 
 
 def _stamped_rows(n):

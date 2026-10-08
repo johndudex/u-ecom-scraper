@@ -469,14 +469,17 @@ def get_shell_tools(
             _scrape_job_id = int(job_id or 0)
             if job_id:
                 from scraper.models import SessionLog
-                seq = SessionLog.objects.filter(job_id=job_id).count()
-                SessionLog.objects.create(
-                    job_id=job_id,
-                    role=SessionLog.ROLE_SYSTEM,
-                    agent="code-tester",
-                    content=f"[RUN_SCRAPER] Starting: {scraper_path} {cli_args}",
-                    seq=seq,
-                )
+
+                from agents.graph import _session_seq_alloc
+
+                with _session_seq_alloc(job_id) as alloc:
+                    SessionLog.objects.create(
+                        job_id=job_id,
+                        role=SessionLog.ROLE_SYSTEM,
+                        agent="code-tester",
+                        content=f"[RUN_SCRAPER] Starting: {scraper_path} {cli_args}",
+                        seq=alloc(),
+                    )
         except Exception:
             pass
 
@@ -763,7 +766,24 @@ def get_shell_tools(
             try:
                 cmd = ["python3", full_path] + cmd_args
                 # Inherit env + inject discovery env vars (same as browser path).
+                # [wave-55 C1] Pin the import path like the browser lane does
+                # (scraper_runner env, the job-317 lesson): PYTHONSAFEPATH kills
+                # the script-dir auto-prepend and PYTHONPATH re-adds exactly what
+                # drafts legitimately need — PROJECT_ROOT first, so ``src.*``
+                # resolves the pipeline package and not a workspace-local shadow
+                # sitting next to the draft. The browser lane already ran this
+                # way; without it the two lanes disagreed on the same draft
+                # (1215: 3 tester crashes, then a delivery from the writer's run).
+                _run_dir = os.path.dirname(full_path) or cwd
                 _run_env = dict(os.environ)
+                _run_env["PYTHONSAFEPATH"] = "1"
+                _run_env["PYTHONPATH"] = os.pathsep.join(
+                    p for p in (
+                        cwd,
+                        _run_dir,
+                        os.environ.get("PYTHONPATH", ""),
+                    ) if p
+                )
                 _run_env.update(env_overrides or {})
                 _run_start = time.time()
                 with _dispatch_alive(timeout):

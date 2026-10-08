@@ -26,6 +26,31 @@ from .views import _api_get_job, api_view
 logger = logging.getLogger("scraper.api")
 
 
+def _partner_reuse_eligible(url: str, input_mode: str, search_criteria: str,
+                            target_fields) -> bool:
+    """[wave-55 H4] The same gate intake applies, on the partner surface: did
+    this re-post ask for exactly what the newest prior completed run already
+    built? A partner re-post of a complete site otherwise pays the full
+    pipeline price (site analysis + field mapping + code generation) for the
+    4m00s-vs-164m class the audit sized. Fail-open to a full build — a broken
+    reuse gate must cost pipeline time, never a job.
+    """
+    try:
+        from agents.nodes.check_tracker import config_unchanged_since_prior
+
+        from ..tasks import _generate_slug
+
+        site = models.Site.objects.filter(slug=_generate_slug(url)).first()
+        if site is None or site.status != "complete":
+            return False
+        return config_unchanged_since_prior(
+            url, input_mode, search_criteria, target_fields
+        )
+    except Exception as exc:
+        logger.warning("api create: reuse gate errored (%s) → full build", exc)
+        return False
+
+
 def _body(request) -> dict:
     try:
         return json.loads(request.body.decode("utf-8") or "{}")
@@ -208,6 +233,19 @@ def create_job(request):
         }
 
     cb = None
+    # [wave-55 M4] Same fragment warning intake stamps — for a list_page job
+    # ``search_criteria`` already holds the newline-joined listing_urls, so
+    # the partner surface checks the same tokens intake does. The 202 payload
+    # carries it (no UI notice to render here) and the row notes carry it for
+    # the post-hoc read; the stored criteria stays verbatim either way.
+    from ..views import _fragment_seed_warning
+
+    _fragment_urls, _fragment_warning = _fragment_seed_warning(
+        search_criteria, str(body.get("search_url", "")).strip()
+    )
+    notes = str(body.get("notes", "")).strip()[:4000]
+    if _fragment_warning:
+        notes = f"{notes} | [FRAGMENT-DROPPED] {_fragment_warning}".strip(" |")
     if callback_url:
         # resolver=None → real DNS (create-time gate); tests inject via ssrf module
         from . import ssrf as _ssrf
@@ -274,7 +312,7 @@ def create_job(request):
             field_notes=field_notes,
             scope=scope,
             scope_value=str(body.get("scope_value", "")).strip(),
-            notes=str(body.get("notes", "")).strip()[:4000],
+            notes=notes,
             title=str(body.get("title", "")).strip()[:200],
             schema_text=schema_text,
             full_extraction=False,
@@ -309,8 +347,13 @@ def create_job(request):
     def _dispatch():
         from ..tasks import dispatch_scrape_job
 
+        # [wave-55 H4] Same reuse gate intake applies — see the helper.
+        rescrape = _partner_reuse_eligible(
+            url, input_mode, search_criteria, target_fields
+        )
+
         # [wave-15 1.0] keystone: stamp BEFORE publish (see dispatch_scrape_job).
-        dispatch_scrape_job(job.id, rescrape=False)
+        dispatch_scrape_job(job.id, rescrape=rescrape)
 
     def _persist_item_urls():
         """F1: url_list's input contract is scrapers/{slug}/input_urls.json —
@@ -355,6 +398,9 @@ def create_job(request):
             "output_url": f"/api/v1/jobs/{jid}/output",
             "output_download_url": f"/api/v1/jobs/{jid}/output/download",
             "scraper_code_url": f"/api/v1/jobs/{jid}/scraper-code",
+            # [wave-55 M4] Non-fatal advisory — the job runs anyway; a
+            # partner that ignores it loses the fragment's facet, not the job.
+            **({"warnings": [_fragment_warning]} if _fragment_warning else {}),
         },
         status=202,
         headers={"Location": f"/api/v1/jobs/{jid}"},

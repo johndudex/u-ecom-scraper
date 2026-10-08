@@ -248,7 +248,9 @@ class TestResumer:
         job = _make_running_job()
         _park_row(job, minutes_ago=2)
         dispatched = []
-        monkeypatch.setattr(wt, "dispatch_scrape_job", lambda jid: dispatched.append(jid))
+        monkeypatch.setattr(
+            wt, "dispatch_scrape_job", lambda jid, **kw: dispatched.append(jid)
+        )
 
         wt.resume_provider_dead_jobs.__wrapped__()
 
@@ -265,7 +267,9 @@ class TestResumer:
         job = _make_running_job()
         _park_row(job, minutes_ago=26, count=0)
         dispatched = []
-        monkeypatch.setattr(wt, "dispatch_scrape_job", lambda jid: dispatched.append(jid))
+        monkeypatch.setattr(
+            wt, "dispatch_scrape_job", lambda jid, **kw: dispatched.append(jid)
+        )
 
         wt.resume_provider_dead_jobs.__wrapped__()
 
@@ -283,7 +287,7 @@ class TestResumer:
         job = _make_running_job()
         _park_row(job, minutes_ago=26, count=0)
 
-        def boom(jid):
+        def boom(jid, **kw):
             raise RuntimeError("broker down")
 
         monkeypatch.setattr(wt, "dispatch_scrape_job", boom)
@@ -302,7 +306,9 @@ class TestResumer:
         job = _make_running_job()
         _park_row(job, minutes_ago=26, count=2)
         dispatched = []
-        monkeypatch.setattr(wt, "dispatch_scrape_job", lambda jid: dispatched.append(jid))
+        monkeypatch.setattr(
+            wt, "dispatch_scrape_job", lambda jid, **kw: dispatched.append(jid)
+        )
 
         wt.resume_provider_dead_jobs.__wrapped__()
 

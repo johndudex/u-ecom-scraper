@@ -45,10 +45,6 @@
     managed in git; delete/edit only affects learned sections.
   </p>
 
-  {% if messages %}
-    {% for m in messages %}<div class="{{ m.tags }}">{{ m }}</div>{% endfor %}
-  {% endif %}
-
   {% if not skills %}
     <div class="skill-card"><span class="skill-desc">No skills found (FM empty and no image fallback — is the File Master up?).</span></div>
   {% endif %}

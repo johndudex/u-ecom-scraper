@@ -17,7 +17,7 @@ The claim is a CAS — a second in-flight task for the same row (duplicate
 enqueue, redelivery, late leg) fails it and returns without POSTing.
 
 The dispatcher lives on the dedicated `events` queue (fold B5): delivery
-HTTP never shares the scrape workers' 2-slot pool.
+HTTP never shares the scrape workers' 3-slot pool.
 """
 from __future__ import annotations
 

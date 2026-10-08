@@ -272,7 +272,7 @@ template code is present in the system prompt.
 | SummarizationMiddleware loses critical context (e.g., test output) | `keep=("messages", 6)` retains the last 3 tool rounds. Test outputs are in recent messages. |
 | LLM ignores "do NOT read_file the template" + reads it anyway (double context) | The system prompt explicitly says don't. If it does, it wastes one call but doesn't break. |
 | Template selection mismatch (wrong template in system prompt) | Step 1's _select_template_file mirrors the existing selection logic exactly. Cross-check with unit test. |
-| Regression on passing sites | A/B test (above) before switching. Keep old prompt as code-writer-v1.md for revert. |
+| Regression on passing sites | A/B test (above) before switching. **Note (2026-10-05, wave-55):** `code-writer-v1.md` was deleted in wave-55; revert baseline = `git show c607ac8:.opencode/agents/code-writer-v1.md`. |
 | SummarizationMiddleware itself is slow (adds an LLM call for summarization) | Uses get_small_llm (cheap model). The summarization call is ~5s. Saves ~30s per subsequent call. Net positive. |
 
 ## Expected impact

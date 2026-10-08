@@ -58,9 +58,30 @@
 </div>
 
 {% if job.error_message %}
+{% if job.status == 'completed' %}
+<!-- [wave-55 GAP-1d] A COMPLETED row's error_message is a data caveat (the
+     finalize [MISSING-CORE ...] stamp — wave-19 T1.5 exists to scrub the
+     COMPLETED+error shape, so it must not read as a crash here). -->
+<div class="mb-5 panel border-warning/30 px-4 py-3" id="data-caveat" style="background:rgba(251,191,36,0.06)">
+    <p class="text-warning text-sm mb-0"><span class="font-semibold">Data caveat:</span></p>
+    <pre class="mt-2 text-warning/80 text-xs leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto scrollbar-thin font-mono">{{ job.error_message }}</pre>
+</div>
+{% else %}
 <div class="mb-5 panel border-danger/30 px-4 py-3" style="background:rgba(248,113,113,0.06)">
     <p class="text-danger text-sm mb-0"><span class="font-semibold">Error:</span></p>
     <pre class="mt-2 text-danger/80 text-xs leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto scrollbar-thin font-mono">{{ job.error_message }}</pre>
+</div>
+{% endif %}
+{% endif %}
+
+{% if job.notes %}
+<!-- [wave-55 e2e] job.notes was "a column nothing renders" (round-10 GAP-4):
+     every honest stamp ([SEEDS-FROM-FILE], [SCOPE-SHORTFALL], [FIELD-MAP],
+     finalize gate notes) was invisible to the user. Neutral styling — notes
+     are provenance, not failures. -->
+<div class="mb-5 panel border-ink/20 px-4 py-3" id="job-notes">
+    <p class="text-ink text-sm mb-0"><span class="font-semibold">Job notes:</span></p>
+    <pre class="mt-2 text-ink-muted text-xs leading-relaxed whitespace-pre-wrap break-words max-h-48 overflow-y-auto scrollbar-thin font-mono">{{ job.notes }}</pre>
 </div>
 {% endif %}
 

@@ -262,7 +262,11 @@ class TestFinalizeIntegration:
         """Ordering is load-bearing (fold M10): index AFTER the schema prune,
         BEFORE the workspace rmtree. Verified structurally — driving the real
         _finalize_job needs a live langgraph checkpoint; the hook's behavior
-        is covered by TestFinalizeHook above."""
+        is covered by TestFinalizeHook above.
+
+        [wave-55 H5] the keep-5 loop itself moved into `_prune_fm_outputs`
+        (it gained era bounds), so the partner exemption it carries is pinned
+        on the helper `_finalize_job` delegates to."""
         import inspect
 
         import scraper.tasks as tasks_mod
@@ -271,7 +275,12 @@ class TestFinalizeIntegration:
         i_prune = src.index("_prune_output_to_schema")
         i_index = src.index("finalize_output_index")
         assert i_prune < i_index, "index must be built AFTER the schema prune rewrites the artifact"
-        assert "partner_owned_keys" in src, "prune exemption must be wired"
+        assert "_prune_fm_outputs(" in src, "the FM keep-5 prune must stay wired into finalize"
+        helper = inspect.getsource(tasks_mod._prune_fm_outputs)
+        assert "partner_owned_keys" in helper, "prune exemption must be wired"
+        assert "own_name=job.output_file" in helper, (
+            "the bounded prune must never delete the file job.output_file names"
+        )
 
 
 if __name__ == "__main__":

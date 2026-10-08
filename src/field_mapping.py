@@ -112,6 +112,66 @@ def union_output_fields(state: dict) -> list[str]:
     return out
 
 
+def core_judged_set(
+    requested, page_type: str, cfg_core=None
+) -> list[str]:
+    """[wave-55 GAP-1b] The STRICT core set a job is judged against.
+
+    INTERSECTION, not replacement: ``null_core_columns`` (the router's
+    coverage gate and the finalize stamp's shared row predicate) used to be
+    seeded with either the registry core or — after the first GAP-1b round —
+    the job's whole ``union_output_fields``, and both ends were wrong in
+    opposite directions. A requested OPTIONAL field the site never publishes
+    (chips ``title,price,description,url`` over rows with no ``description``
+    key) is the T2.8 medium remap issue, never a strict-core veto; an
+    unrequested registry column (``availability`` on a title+price+url job)
+    is not a mapping bug at all. The registry core still owns the ceiling —
+    ``cfg_core`` (``content_type_config.core_field_names``) can PROMOTE a
+    requested field the registry does not know, never drop a registry-core
+    field the job asked for — and a job that requested nothing is judged
+    against the core its config declares, or the registry when it declares
+    none.
+
+    Returns the judged fields in the job's own order (registry order when
+    nothing was requested).
+    """
+    core = [str(f).strip().lower() for f in (cfg_core or []) if str(f).strip()]
+    registry: list[str] = []
+    try:
+        from src.content_types import get_content_type
+
+        ct = get_content_type((page_type or "product").lower())
+        if ct and getattr(ct, "core_fields", None):
+            registry = [str(f).lower() for f in ct.core_fields]
+    except Exception:
+        registry = []
+    if not core:
+        core = registry
+    asked = [str(f).strip().lower() for f in (requested or []) if str(f).strip()]
+    if not asked:
+        return core
+    # [wave-55 round-8 GAP-2] The declared core WIDENS the ceiling, never
+    # shrinks it: replace-shape let a narrow cfg_core silently drop a
+    # requested registry-core field (``url``) from the strict set.
+    ceiling = list(dict.fromkeys(core + registry))
+    return [f for f in asked if f in set(ceiling)]
+
+
+def price_string_is_absent(value) -> bool:
+    """[wave-55 GAP-C] Absence is None, "" — or a digit-free string.
+
+    ``'Book an appointment'`` / ``'See price in cart'`` are a producer's
+    spelling of 'no price', not a price that failed to parse: the audit's 1219
+    class ships both spellings of the same verdict and only the null one was
+    ever stamped. Lives here, cycle-free, because both consumers already
+    import from this module — the price gate (``scraper.tasks``) and the
+    shared null-column predicate (``route_after_testing.null_core_columns``).
+    """
+    if isinstance(value, str):
+        return not any(ch.isdigit() for ch in value)
+    return value is None
+
+
 def alias_lookup(chip: str) -> str | None:
     """Layer 1: exact alias-table hit (canonical name or "CUSTOM"), else None."""
     return ALIAS_FIELDS.get(chip.strip().lower())
