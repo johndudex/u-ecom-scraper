@@ -216,6 +216,20 @@ _WRITER_FEEDBACK_CAP = 600
 # cap so a chatty crash can't eat the feedback/caps above — the writer must
 # always see WHAT TO PRESERVE even when the failure text is huge.
 _EXACT_FAILURE_CAP = 1200
+# [wave-56 F1] issues[].details carries the failure PROOF (verbatim 406s,
+# harness kill notices) — relayed per-issue under its own cap so a chatty
+# detail can't eat the fix/caps above.
+_ISSUE_DETAILS_CAP = 400
+# [wave-56 F3] transport-wall evidence: HTTP-layer rejection signatures that
+# escalate into a "fix the transport, not the selectors" directive when the
+# probe proved a browser-class method (wonderbly 570: probe browser-tier,
+# every draft fetch HTTP 406 — the report prescribed selector edits no
+# selector can deliver).
+_WALL_EVIDENCE_RE = re.compile(
+    r"HTTP\s*40[36]\b|\b403\b|\b406\b|cloudflare|akamai|perimeterx|"
+    r"\bTLS\b|\bSSL\b|certificate|forbidden|banned",
+    re.IGNORECASE,
+)
 
 # T1.5 (I7): exact strategy tokens a mechanism_reassessment verdict may carry.
 # Value-match, NOT a key-alias set, and NEVER ``scraping_mechanism`` (a key
@@ -3220,6 +3234,14 @@ def _summarize_test_report(state: dict) -> str:
                 _fix = _issue_fix(i)
                 if _fix:
                     lines.append(_fix)
+                # [wave-56 F1] the proof line — the verbatim evidence the
+                # headline alone never carried (job 570's 406s, briscoes'
+                # harness kill notices).
+                _det = re.sub(r"\s+", " ", str(i.get("details") or "")).strip()
+                if _det:
+                    if len(_det) > _ISSUE_DETAILS_CAP:
+                        _det = _det[: _ISSUE_DETAILS_CAP - 1] + "…"
+                    lines.append(f"    Evidence: {_det}")
         if medium:
             lines.append(f"\n**MEDIUM severity ({len(medium)}):**")
             for i in medium[:3]:
@@ -3231,6 +3253,11 @@ def _summarize_test_report(state: dict) -> str:
                 _fix = _issue_fix(i)
                 if _fix:
                     lines.append(_fix)
+                _det = re.sub(r"\s+", " ", str(i.get("details") or "")).strip()
+                if _det:
+                    if len(_det) > _ISSUE_DETAILS_CAP:
+                        _det = _det[: _ISSUE_DETAILS_CAP - 1] + "…"
+                    lines.append(f"    Evidence: {_det}")
         # Relay CLI-contract issues verbatim (Edit 7): the marker-prefixed
         # bounce must reach the next code_writer message intact so the fix
         # instruction's vocabulary matches the guard's.
@@ -3239,6 +3266,53 @@ def _summarize_test_report(state: dict) -> str:
             lines.append(
                 "\n**⚠️ CLI CONTRACT VIOLATION — targeted argparse fix, do NOT "
                 "regenerate the scraper:**\n" + _issue_text(_marked[0])
+            )
+    # [wave-56 F1] The counts and the fix-execution proof. "35 failed / 2
+    # dead" reframes a summary the writer could read as selector nits; the
+    # proof line (briscoes 572: soft_block_escalations=0) says whether the
+    # LAST cycle's prescribed fixes ever executed — the no-op loop's own
+    # confession, recorded by the tester's discovery-coverage attach.
+    _counts = report.get("results") if isinstance(report, dict) else None
+    if isinstance(_counts, dict):
+
+        def _cnt(v) -> int:
+            try:
+                return int(v or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        _c_succ = _cnt(_counts.get("successful_extractions"))
+        _c_fail = _cnt(_counts.get("failed_extractions"))
+        _c_dead = _cnt(_counts.get("skipped_dead_urls"))
+        if _c_fail or _c_dead:
+            lines.append(
+                f"\n**Extraction counts:** {_c_succ} succeeded / "
+                f"{_c_fail} failed"
+                + (f" / {_c_dead} skipped-dead URLs" if _c_dead else "")
+            )
+    _cov_proof = (
+        report.get("discovery_coverage") if isinstance(report, dict) else None
+    )
+    if isinstance(_cov_proof, dict) and (
+        "soft_block_escalations" in _cov_proof
+        or "retried_empty_discovery" in _cov_proof
+    ):
+        _sbe = _cov_proof.get("soft_block_escalations")
+        _red = _cov_proof.get("retried_empty_discovery")
+        _jfp = _cov_proof.get("jsonld_fallback_pages")
+        _proof = (
+            "\n**Fix-execution proof (did the last cycle's prescribed fixes "
+            f"actually run?):** soft_block_escalations={_sbe}, "
+            f"retried_empty_discovery={_red}"
+        )
+        if _jfp is not None:
+            _proof += f", jsonld_fallback_pages={_jfp}"
+        lines.append(_proof)
+        if not _sbe and not _red:
+            lines.append(
+                "  → The previous cycle's prescribed discovery fixes were NOT "
+                "executed. Do not restate them — implement them in the draft "
+                "this cycle."
             )
     # T1.2: report-level remediation instructions (code-tester.md:146 — also
     # written deterministically on discovery-probe crashes and CLI contract
@@ -3394,12 +3468,62 @@ def _summarize_test_report(state: dict) -> str:
             "(do NOT rewrite from scratch — that reintroduces variance):**\n"
             f"```\n{_crash_text}\n```"
         )
+    # [wave-56 F3] Transport wall: the probe proved a browser-class tier
+    # reaches this site, the tested draft's own fetches were rejected at the
+    # HTTP/TLS layer, and nothing was extracted. Name the mismatch — without
+    # it the summary reads as selector nits and the writer burns the retry
+    # budget on selectors a wall makes irrelevant.
+    if _succ == 0:
+        _probe_method = str(
+            ((state.get("probe_result") or {}).get("connectivity") or {}).get(
+                "method_that_worked"
+            )
+            or ""
+        )
+        if _probe_method.startswith(("browser", "fingerprint", "stealth")):
+            _wall_hay = [str(crash_error or "") if crash_error else ""]
+            _sc_w = report.get("script_checks") if isinstance(report, dict) else None
+            if isinstance(_sc_w, dict):
+                _wall_hay.append(str(_sc_w.get("error_message") or ""))
+            for _wi in (issues if isinstance(issues, list) else []):
+                if isinstance(_wi, dict):
+                    _wall_hay.append(str(_wi.get("details") or ""))
+                    _wall_hay.append(str(
+                        _wi.get("description")
+                        or _wi.get("message")
+                        or _wi.get("problem")
+                        or ""
+                    ))
+            if _WALL_EVIDENCE_RE.search(" ".join(_wall_hay)):
+                lines.append(
+                    f"\n**🚧 TRANSPORT WALL — selector edits cannot fix this:** "
+                    f"the probe reached this site via `{_probe_method}` (a "
+                    f"real-browser tier), but the tested draft's own fetches "
+                    f"were rejected at the HTTP/TLS layer (evidence above). "
+                    f"Fix the TRANSPORT, not the selectors: move the fetch "
+                    f"layer to the browser-class method the probe proved, or "
+                    f"record the wall honestly."
+                )
     if retry_count > 0 and retry_count != FINAL_RETRY_SENTINEL:
         lines.append(f"\n*{retry_count} previous attempt(s) failed.*")
     elif retry_count == FINAL_RETRY_SENTINEL:
         lines.append(
             "\n*This is the FINAL retry attempt based on user feedback. "
             "If this does not pass, the job will end.*"
+        )
+    # [wave-56 F1] Differentiation directive: name the exact draft that was
+    # already tested and failed. The batch's five no-op deaths were the
+    # writer resubmitting those bytes — and nothing in the retry slot said
+    # the resubmission itself ends the job (EDIT-MODE hints push toward
+    # conservative same-bytes edits; this line outranks them).
+    _prior_fp = str(state.get("last_tested_draft_fp") or "")
+    if retry_count and _prior_fp:
+        lines.append(
+            f"\n**⚠️ DIFFERENTIATION REQUIRED:** the draft you are editing "
+            f"(sha1 {_prior_fp[:12]}) was already tested and FAILED. A "
+            f"byte-identical or comment-only resubmission is detected and "
+            f"ends this job. Your edit must change the failing LOGIC — "
+            f"selectors, transport, control flow — not the wording."
         )
     # [wave-29 B5] Cross-job memory (the load-bearing surface): when this
     # failure's structural fingerprint matches a prior job's FM entry, say

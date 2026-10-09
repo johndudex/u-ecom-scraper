@@ -16,6 +16,15 @@ Fired ⇒ phase 1 returned the nav tree, not item pages. Known-safe shapes,
 checked in tests: ``/products/<slug>`` (different first segment), deep PDPs
 under a shared prefix (never shallower than their listing).
 
+[wave-56 F5] One more safe shape: a LEAF item namespace under the listing's
+first segment — books-toscrape PDPs are ``/catalogue/<slug>_N/index.html``
+(3 segments, no nav-directory token) under a depth-5
+``/catalogue/category/books/travel_2/index.html`` listing; the depth rule
+alone read that flat PDP namespace as a nav tree and vetoed 1000 real
+product rows (job 578). A row-shaped URL carrying no nav-directory segment
+is exempt from the suspicious set; genuine section links keep their
+``/category|/collections|...`` segments and still fire.
+
 [wave-55 C3] ``row_url_is_item_shaped`` also carries a PDP-shape tier: a row
 URL that IS a navigation/listing position (``/collections/<slug>``,
 ``/search?q=``, ``/new-in``) fails the shape. Audit C3's job 1068 shipped one
@@ -118,6 +127,31 @@ def row_url_is_item_shaped(url: str) -> bool:
     return not any(s in _NAV_DIRECTORY_TOKENS for s in low)
 
 
+def _exempt_leaf_item(url: str, segs: list[str]) -> bool:
+    """[wave-56 F5] Is this URL a leaf item page rather than a section link?
+
+    Requires a LEAF MARKER, not just row-shapedness: a file-suffixed last
+    segment (books' ``/index.html``) or a digit-marked one in a
+    multi-segment path (the ``/catalogue/<slug>_981`` shape). The shape
+    floor deliberately passes bare keyword slugs — and the wave-50 junk
+    shapes (``/baby``, ``/sec3``) are exactly that class, so they stay
+    depth-judged. The nav-directory conjunct keeps genuine section links
+    (``/catalogue/category/...``) suspicious even on ``.html``-suffixed
+    sites where ``_SUFFIX_RE`` makes every URL row-shaped.
+    """
+    try:
+        if not row_url_is_item_shaped(url):
+            return False
+    except Exception:
+        return False
+    if any(s.lower() in _NAV_DIRECTORY_TOKENS for s in segs):
+        return False
+    last = segs[-1].lower()
+    if _SUFFIX_RE.search(last):
+        return True
+    return bool(_DIGIT_RE.search(last)) and len(segs) >= 3
+
+
 def _path_segments(url: str) -> tuple[str, list[str]]:
     parts = urlsplit(str(url or ""))
     segs = [s for s in parts.path.split("/") if s]
@@ -165,7 +199,11 @@ def shallow_section_links(
         if listing_host and host and host != listing_host:
             continue
         checked += 1
-        if segs[0] == first_seg and len(segs) < depth:
+        if (
+            segs[0] == first_seg
+            and len(segs) < depth
+            and not _exempt_leaf_item(raw, segs)
+        ):
             suspicious.append(raw)
     result["checked"] = checked
     result["suspicious"] = len(suspicious)

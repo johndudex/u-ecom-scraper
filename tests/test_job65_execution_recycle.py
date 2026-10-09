@@ -84,10 +84,45 @@ class TestRouteAfterExecution:
         ))
         assert _goto(res) == "cleanup"
 
-    def test_url_list_zero_items_goes_to_cleanup(self):
-        """url_list has no discovery phase — 0 items is not a strategy
-        verdict (item pages may be blocked; nothing to recycle)."""
+    def test_url_list_zero_items_recycles_once(self):
+        """[wave-56 F4] books-579: a url_list run whose tester PASS rode to
+        execution and extracted 0 of the submitted seeds went to cleanup as
+        SUCCESS+0. url_list has no discovery phase to recycle, but the FETCH
+        layer is still a strategy verdict — the run recycles ONCE through
+        scraper_analyzer so the ladder can move the transport; the seed list
+        itself is the user's."""
         res = self._route(_zero_state(input_mode="url_list"))
+        assert _goto(res) == "scraper_analyzer"
+        upd = _update(res)
+        assert upd["execution_recycle_count"] == 1
+        assert upd["strategies_tried"][0]["reason"].startswith(
+            "execution zero-items (url_list):"
+        )
+        assert upd["test_report"]["overall_assessment"] == "FAIL"
+        assert "EXECUTION RECYCLE (url_list)" in (
+            upd["test_report"]["feedback_for_writer"]
+        )
+
+    def test_url_list_zero_items_after_recycle_finalizes_honestly(self):
+        """Second zero-item url_list execution: the ladder had its shot —
+        cleanup must not promote a 0-item scraper."""
+        res = self._route(_zero_state(
+            input_mode="url_list", execution_recycle_count=1,
+        ))
+        assert _goto(res) == "cleanup"
+        upd = _update(res)
+        assert upd["execution_status"] == "FAILED"
+        assert "again after a strategy recycle" in upd["error_message"]
+
+    def test_url_list_failed_traceback_goes_to_cleanup(self):
+        """A rc=1 url_list run with a traceback is a CODE problem — the
+        no_fresh_output tag is absent, so the zero-row recycle must not
+        admit it (the ladder cannot fix an exception)."""
+        res = self._route(_zero_state(
+            input_mode="url_list",
+            execution_status="FAILED",
+            error_message="Traceback (most recent call last): ... KeyError: 'price'",
+        ))
         assert _goto(res) == "cleanup"
 
     def test_exhaustion_flavored_stop_reason_is_not_a_recycle(self):

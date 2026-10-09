@@ -2529,7 +2529,12 @@ def _url_list_scope_gate(
     and 1229 shipped 2 sandro strays, both COMPLETED and both invisible to
     every existing gate (F9 exempts url_list, and the two junk bars used to).
     Strict by design: ANY stray fails, the run is never edited. No seed list
-    (or no rows to judge) is a no-op — a gate must not guess.
+    is a no-op — a gate must not guess. [wave-56 F4] A PRESENT output file
+    with ZERO rows is no longer a no-op: that is the wholesale-seed-failure
+    shape F9's url_list exemption trusted code_tester to catch, and books 579
+    rode a tester PASS (1/3 live seeds) to ``SUCCESS, product_count=0`` with
+    cleanup recording outcome=success behind it. Seeds dispatched + zero rows
+    shipped = the run extracted nothing from the user's list.
 
     url_list ONLY: Site.input_urls reaches graph state for every mode, and
     navigation/list_page/search_term deliberately merge category-page rows
@@ -2546,7 +2551,18 @@ def _url_list_scope_gate(
         return ""
     urls = _output_row_urls(output_file)
     if not urls:
-        return ""
+        # [wave-56 F4] Zero rows from a PRESENT output file is a verdict, not
+        # a blind spot. A MISSING file stays the no_fresh_output arm's
+        # subject — this gate never saw it and still doesn't.
+        if not os.path.isfile(output_file or ""):
+            return ""
+        return (
+            f"url_list zero-yield: 0 of {len(seeds)} submitted seeds produced "
+            f"rows — the run extracted nothing from the user's URL list "
+            f"(books 579 rode a tester PASS to a SUCCESS + 0-rows record). "
+            f"Fix the scraper's url_list branch (seed file / --urls / "
+            f"transport), not discovery."
+        )
     strays = [u for u in urls if _submitted_url_key(u) not in seeds]
     if not strays:
         return ""

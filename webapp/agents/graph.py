@@ -1816,9 +1816,19 @@ def _record_writer_memory(state: dict, *, outcome: str) -> None:
         )
         platform = str((state.get("site_analysis") or {}).get("platform") or "")
 
+        # [wave-56 F4] books 579: cleanup stamped outcome=success over a
+        # zero-item run (the false SUCCESS rode through the gates). Zero rows
+        # is not a success — the entry lands as an honest zero-yield failure
+        # so cross-job memory and the retry fingerprint never celebrate an
+        # empty extraction.
+        _zero_yield_success = outcome == "success" and not (item_count or 0)
+        if _zero_yield_success:
+            outcome = "failure"
         failure_class = wmem.derive_failure_class(report) if outcome != "success" else None
         if outcome == "success":
             note = f"completed with {item_count or 0} items via {strategy or 'unknown strategy'}"
+        elif _zero_yield_success:
+            note = f"zero-yield execution: 0 items via {strategy or 'unknown strategy'}"
         else:
             parts = wmem.fingerprint_parts(report)
             exc = parts.get("exception") or ""
@@ -2706,6 +2716,46 @@ def _writer_invoke_timeout() -> int:
     wins for every phase).
     """
     return max(_AGENT_INVOKE_TIMEOUT, _env_int("WRITER_INVOKE_TIMEOUT", 0))
+
+
+# [wave-56 F6] The minimum wall clock the code_tester must be able to receive
+# once the writer has spent a window on the clock. Job 575: three writer
+# abandonments drained the task budget, the tester's 1800s request clamped to
+# 887s, and its FIRST LLM turn never returned — no test_report.json, no
+# diagnostics, nothing for any repair machinery to read.
+TESTER_WINDOW_FLOOR_S = 900.0
+
+
+def _writer_post_death_timeout(
+    state: ScrapeState, agent_cfg: dict | None = None
+) -> int:
+    """[wave-56 F6] The writer's window, capped after a wall-clock death so a
+    usable draft still gets a viable tester window.
+
+    The generic phase clamp can only divide what is left; it cannot reserve.
+    Once ``writer_wall_clock_timeouts`` >= 1 (a death with a usable draft —
+    which falls through to testing), the writer's NEXT window is capped at
+    remaining budget minus the tester floor. Below the floor there is no
+    viable tester window regardless — the base window is returned (a literal
+    0 would fire the join(0) WallClockTimeout arm and count a PHONY writer
+    death); the generic clamp owns the honest refusal. No deadline and no
+    prior deaths leave the base window byte-identical.
+    """
+    base = _writer_invoke_timeout()
+    try:
+        if int(state.get("writer_wall_clock_timeouts") or 0) < 1:
+            return base
+        _jd = ((agent_cfg or {}).get("configurable") or {}).get("task_deadline")
+        if not _jd:
+            return base
+        if hasattr(_jd, "timestamp"):
+            _jd = float(_jd.timestamp())
+        remaining = float(_jd) - time.time() - JOB_BUDGET_FINALIZE_MARGIN
+        if remaining <= TESTER_WINDOW_FLOOR_S:
+            return base
+        return int(min(float(base), remaining - TESTER_WINDOW_FLOOR_S))
+    except Exception:
+        return base
 
 
 def _writer_max_timeout() -> int:
@@ -5650,6 +5700,28 @@ def _escalate_strategy(
 _EXECUTION_RECYCLE_MAX = 1
 
 
+def _url_list_zero_row_should_recycle(
+    input_mode: str, status: str, items: int, *, error_message: str = ""
+) -> bool:
+    """[wave-56 F4] Is this a url_list zero-row run the ladder should see?
+
+    books 579: a url_list execution extracted 0 of 11 seeds and went STRAIGHT
+    to cleanup — the mode gate here refused the recycle because url_list has
+    "no discovery phase to recycle". But the zero rows were an extraction /
+    transport shape (the tester had PASSed the draft), exactly the class the
+    job-65 ladder exists for. A SUCCESS zero always qualifies; a FAILED zero
+    only when the F4 scope-gate diagnostic fired (its "zero-yield" marker) —
+    a traceback FAILED run is a code problem and stays cleanup's subject.
+    """
+    if str(input_mode or "").strip().lower() != "url_list":
+        return False
+    if int(items or 0) != 0:
+        return False
+    if str(status or "").strip().upper() == "SUCCESS":
+        return True
+    return "zero-yield" in str(error_message or "")
+
+
 def _park_browser_unavailable(state: ScrapeState) -> Command:
     """[wave-16 B3] Dependency park — browser_service itself cannot serve.
 
@@ -6053,11 +6125,25 @@ def _route_after_execution(state: ScrapeState):
         and bool(state.get("no_fresh_output"))
     )
     if (status != "SUCCESS" or items != 0) and not _zero_discovery_failed:
-        # Crashed / stalled / no-output executions are code problems, not
-        # strategy problems — the ladder cannot fix a traceback.
-        return Command(goto="cleanup")
-    if (state.get("input_mode") or "") not in ("list_page", "navigation", "search_term"):
-        return Command(goto="cleanup")  # url_list: no discovery phase to recycle
+        # [wave-56 F4] url_list zero-row runs (books 579) are the one
+        # exception — see _ul_recycle below. Everything else crashed /
+        # stalled / no-output is a code problem, not a strategy problem —
+        # the ladder cannot fix a traceback.
+        _ul_recycle = _url_list_zero_row_should_recycle(
+            state.get("input_mode") or "", status, items,
+            error_message=str(state.get("error_message") or ""),
+        )
+        if not _ul_recycle:
+            return Command(goto="cleanup")
+    else:
+        _ul_recycle = _url_list_zero_row_should_recycle(
+            state.get("input_mode") or "", status, items,
+            error_message=str(state.get("error_message") or ""),
+        )
+    if (state.get("input_mode") or "") not in (
+        "list_page", "navigation", "search_term"
+    ) and not _ul_recycle:
+        return Command(goto="cleanup")  # url_list with items: nothing to recycle
 
     # [wave-34 F6] Phase-2-only collapse (prod 624 brooksrunning): Phase 1
     # discovered URLs at execution but extraction yielded ZERO rows, yet rc=0
@@ -6088,7 +6174,9 @@ def _route_after_execution(state: ScrapeState):
     # for the --limit arm). Both are FAIL-class HERE; the tester-side
     # _COVERAGE_FAIL_STOP_REASONS set is deliberately untouched.
     _exec_fail_reasons = _COVERAGE_FAIL_STOP_REASONS | {"extraction_empty", "limit_hit"}
-    if stop_reason not in _exec_fail_reasons:
+    # [wave-56 F4] A url_list zero-row run IS the fail shape regardless of the
+    # stop_reason flavor — url_list has no discovery coverage to classify.
+    if stop_reason not in _exec_fail_reasons and not _ul_recycle:
         logger.warning(
             "_route_after_execution: 0 items but stop_reason=%r is not a "
             "FAIL-class coverage reason — cleanup (job %s)", stop_reason, job_id,
@@ -6118,20 +6206,33 @@ def _route_after_execution(state: ScrapeState):
         return Command(goto="cleanup")
 
     _reason = f"execution zero-items: stop_reason={stop_reason}"
+    if _ul_recycle:
+        _reason = f"execution zero-items (url_list): stop_reason={stop_reason}"
     report = state.get("test_report")
     recycled_report = dict(report) if isinstance(report, dict) else {}
-    recycled_report.update({
-        "overall_assessment": "FAIL",
-        "ready_for_execution": False,
-        # The writer retry must know the draft EXECUTED and still saw nothing
-        # — otherwise a passing tester report reads as "nothing to fix".
-        "feedback_for_writer": (
+    # The writer retry must know the draft EXECUTED and still saw nothing
+    # — otherwise a passing tester report reads as "nothing to fix".
+    if _ul_recycle:
+        _recycle_feedback = (
+            "EXECUTION RECYCLE (url_list) — the draft passed testing but "
+            "extracted 0 of the submitted seed URLs AT EXECUTION "
+            f"(stop_reason={stop_reason}). The transport/hydration layer is "
+            "being escalated; rebuild the FETCH layer for the new strategy. "
+            "The seed list is the user's — keep seed loading intact and make "
+            "every seed produce an extracted row or an honest per-seed failure."
+        )
+    else:
+        _recycle_feedback = (
             "EXECUTION RECYCLE — the draft passed testing but its Phase-1 "
             f"discovery found 0 URLs AT EXECUTION (stop_reason={stop_reason}). "
             "The strategy is being escalated; rebuild the discovery path for "
             "the new strategy. Keep the shared discovery module wiring intact "
             "and re-derive the listing URLs/selectors for it."
-        ),
+        )
+    recycled_report.update({
+        "overall_assessment": "FAIL",
+        "ready_for_execution": False,
+        "feedback_for_writer": _recycle_feedback,
     })
     update = {
         "execution_recycle_count": int(
@@ -7016,6 +7117,53 @@ def _noop_should_escalate(
     return test_retry_count >= MAX_TEST_RETRIES
 
 
+def _noop_strike1_ladder_bounce(state: ScrapeState, update: dict) -> dict | None:
+    """[wave-56 F2] Should no-op strike 1 spend a strategy-ladder rung?
+
+    The A2 gate detects a byte-identical draft honestly — and then re-tested
+    the identical bytes once (strike 1 fell through to code_tester) before
+    escalating on strike 2. Five of the 2026-10-09 batch's seven writer
+    deaths (570-576) ended exactly there, with the deterministic ladder one
+    bounce away and unreachable. On strike 1 (budget remaining —
+    _noop_should_escalate already claimed the exhausted-budget and step-death
+    cases), record the current strategy as tried (the no-op IS this
+    strategy's fix-loop death — it never entered ``strategies_tried`` because
+    ``classify_test_failure`` ranks the tester's ``target=scraper`` diagnosis
+    above the blocked arms) and let the caller bounce to scraper_analyzer:
+    ``_escalate_strategy`` spends the next rung, or its exhausted arm routes
+    out honestly. None = keep the legacy fall-through.
+    """
+    try:
+        if int(update.get("noop_fix_cycles") or 0) != 1:
+            return None
+        _analysis = dict(state.get("scraper_analysis") or {})
+        cur = str(_analysis.get("strategy") or "").strip()
+        if cur not in _STRATEGY_ESCALATION:
+            # Unknown/tier-suffixed tokens must not "escalate" — with idx=-1
+            # the ladder would DOWN-grade to http_requests, manufacturing a
+            # doomed rung.
+            return None
+        all_tried = {
+            (t.get("strategy") if isinstance(t, dict) else t)
+            for t in (state.get("strategies_tried") or [])
+        }
+        all_tried.add(cur)  # the no-op strike IS this strategy's failed cycle
+        _esc, goto = _escalate_strategy(dict(_analysis), all_tried)
+        if goto:
+            return None  # ladder exhausted — the escalate arm owns the exit
+        return {
+            "strategies_tried": [{
+                "strategy": cur,
+                "reason": (
+                    "no-op fix loop: writer could not repair within this "
+                    "strategy (draft unchanged after failed tests)"
+                ),
+            }],
+        }
+    except Exception:
+        return None
+
+
 def _writer_hit_step_budget(result) -> bool:
     """[wave-25 W25-c] True when the writer invocation ended on langgraph's
     remaining_steps exhaustion — the prebuilt loop replies "Sorry, need more
@@ -7089,12 +7237,14 @@ def _failure_region_block(state: ScrapeState, draft_path: str) -> str:
     - ``target == "mapping"`` with ``fields`` → the function(s) whose body
       mentions a failed field name, plus the ALL-CAPS constants they
       reference (EXTRACT_*-class or whose value mentions the field);
+    - ``target == "scraper"`` with crash text → [wave-56 F1] the function(s)
+      named in the traceback's own frames (the decline was wrong for this
+      class: a traceback crash NAMES its region — "the whole file" held only
+      for transport walls, which carry no traceback);
     - ``target == "strategy"``, or a ``discovery_coverage`` dict in the test
       report (the key code_tester actually copies from scraper output) → the
       ``discover_*`` / ``_extract_item_links`` / ``_get_next_page_url``
-      functions plus ``main()``'s CLI surface;
-    - ``target == "scraper"`` → nothing (transport-level; the region is the
-      whole file).
+      functions plus ``main()``'s CLI surface.
 
     Capped at ``CODE_WRITER_PRESEED_MAX_CHARS`` (0 disables). Unparseable or
     missing draft → "" (an unsupported state never raises here).
@@ -7116,10 +7266,19 @@ def _failure_region_block(state: ScrapeState, draft_path: str) -> str:
     rem = rem if isinstance(rem, dict) else {}
     target = str(rem.get("target") or "").strip()
     fields = [str(f).strip() for f in (rem.get("fields") or []) if str(f).strip()]
-    if target == "scraper":
-        return ""
+    _crash_txt = str(tr.get("crash_error") or "")
+    if not _crash_txt and isinstance(tr.get("script_checks"), dict):
+        _crash_txt = str(
+            tr["script_checks"].get("crash_error")
+            or tr["script_checks"].get("error_message")
+            or ""
+        )
     if target == "mapping" and fields:
         arm = "mapping"
+    elif target == "scraper" and _crash_txt:
+        # [wave-56 F1] The most common crash class is no longer declined.
+        # No crash text (a pure transport wall / harness kill) still is.
+        arm = "crash"
     elif target == "strategy" or isinstance(tr.get("discovery_coverage"), dict):
         arm = "discovery"
     else:
@@ -7164,6 +7323,25 @@ def _failure_region_block(state: ScrapeState, draft_path: str) -> str:
                     continue
                 if t.id.startswith("EXTRACT_") or any(f in seg for f in want):
                     selected.append((f"{t.id} (lines {node.lineno}-{getattr(node, 'end_lineno', node.lineno)})", seg))
+    elif arm == "crash":
+        # [wave-56 F1] Functions named in the traceback's own frames. Frames
+        # from other files (stdlib, harness) name functions the draft does
+        # not define — they simply match nothing here.
+        want_fns = {
+            m
+            for m in re.findall(r'File "[^"]+", line \d+, in (\w+)', _crash_txt)
+            if m and m != "<module>"
+        }
+        for node in tree.body:
+            if (
+                isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+                and node.name in want_fns
+            ):
+                selected.append((
+                    f"{node.name} (lines {node.lineno}-{node.end_lineno}) — "
+                    "named in the crash traceback",
+                    _seg(node),
+                ))
     else:  # discovery
         for node in tree.body:
             if not isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
@@ -7816,9 +7994,11 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
             # [wave-30 W30-1] Writer-scoped window (env WRITER_INVOKE_TIMEOUT,
             # floored at the module default) — the bare-default call is exactly
             # what sized job 569's writer to one draft cycle with zero slack.
+            # [wave-56 F6] After a wall-clock death the window is capped so
+            # the tester keeps a viable floor (job 575's 887s clamp).
             result = _invoke_agent_with_timeout(
                 agent, messages, _cw_cfg, "code_writer", job_id,
-                timeout=_writer_invoke_timeout(),
+                timeout=_writer_post_death_timeout(state, _cw_cfg),
             )
         finally:
             _stop_heartbeat(hb)
@@ -8365,6 +8545,32 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                                 {"type": "reject", "label": "Cancel", "allow_feedback": False},
                             ],
                         },
+                    )
+                # [wave-56 F2] Strike 1 with budget remaining: the fix loop
+                # just proved it cannot repair within this strategy. Spend a
+                # ladder rung instead of re-testing the identical bytes —
+                # scraper_analyzer's _escalate_strategy picks the next one,
+                # or routes out honestly when exhausted.
+                _bounce = _noop_strike1_ladder_bounce(state, update)
+                if _bounce is not None:
+                    _cur_strat = str(
+                        (state.get("scraper_analysis") or {}).get("strategy") or ""
+                    )
+                    logger.warning(
+                        "_invoke_code_writer: no-op strike 1 — draft unchanged; "
+                        "spending a strategy-ladder rung instead of re-testing "
+                        "identical code (strategy '%s' → scraper_analyzer, job %s)",
+                        _cur_strat, job_id,
+                    )
+                    _log_event_row(
+                        job_id, "code_writer",
+                        f"[NO-OP LADDER BOUNCE] draft fingerprint {_new_fp[:12]} "
+                        f"unchanged — strategy '{_cur_strat}' recorded as tried; "
+                        f"scraper_analyzer spends the next ladder rung",
+                    )
+                    return Command(
+                        goto="scraper_analyzer",
+                        update={**update, **_bounce, "messages": []},
                     )
             else:
                 # Draft changed (or nothing to compare yet) — reset the streak.
