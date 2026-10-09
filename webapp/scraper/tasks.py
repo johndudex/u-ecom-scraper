@@ -16,6 +16,7 @@ import contextlib
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -1020,6 +1021,74 @@ def _on_task_process_death(
         logger.exception("task_failure handler could not finalize job")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# [wave-56b F8] One job, one LIVE execution
+# ═══════════════════════════════════════════════════════════════════════════
+# Jobs 582 + 584 (2026-10-10): a redelivered / re-published copy of a running
+# scrape task passed the DB-row claim (the same-id reclaim arm matches ANY
+# redelivery of the same task id — alive original or not) and ran a SECOND
+# graph instance against the same workspace: two writers, one
+# scraper_draft.py, slot lost. A row's status column cannot say "an execution
+# is alive right now"; a renewing lock can.
+JOB_EXEC_LOCK_TTL_S = 300
+JOB_EXEC_LOCK_RENEW_S = 90
+
+
+class JobExecutionLock:
+    """SETNX-with-TTL lock keyed by job id, on the Django cache (Redis in
+    prod). ``add`` is atomic SETNX: exactly one live execution holds the key.
+    A crashed owner's key expires after the TTL so honest reclaim and the
+    watchdog's liveness ladder keep working; the heartbeat renew keeps a live
+    run's key fresh. Every cache failure refuses — without exclusivity proof,
+    no execution."""
+
+    def __init__(self, cache=None, ttl_s: int = JOB_EXEC_LOCK_TTL_S):
+        self._cache = cache
+        self._ttl = int(ttl_s)
+
+    @property
+    def cache(self):
+        if self._cache is None:
+            from django.core.cache import cache as _django_cache
+
+            self._cache = _django_cache
+        return self._cache
+
+    @staticmethod
+    def _key(job_id) -> str:
+        return f"scraper:job-exec-lock:{job_id}"
+
+    def acquire(self, job_id, owner: str) -> bool:
+        try:
+            return bool(self.cache.add(self._key(job_id), owner, self._ttl))
+        except Exception:
+            return False
+
+    def renew(self, job_id, owner: str) -> bool:
+        try:
+            if self.cache.get(self._key(job_id)) != owner:
+                return False
+        except Exception:
+            return False
+        # Owner-only delete+add: the ms-scale window beats a non-atomic
+        # stomp, and a lost renew is logged loudly by the caller.
+        self.cache.delete(self._key(job_id))
+        return self.acquire(job_id, owner)
+
+    def release(self, job_id, owner: str) -> None:
+        try:
+            if self.cache.get(self._key(job_id)) == owner:
+                self.cache.delete(self._key(job_id))
+        except Exception:
+            return
+
+    def is_held(self, job_id) -> bool:
+        try:
+            return self.cache.get(self._key(job_id)) is not None
+        except Exception:
+            return False
+
+
 # Celery-level deadline for a scrape job. The dominant job-level failure is
 # LLM-phase hangs (code_generation / product_analysis): the per-phase
 # _AGENT_INVOKE_TIMEOUT abandons its daemon thread on timeout, but the thread
@@ -1214,6 +1283,19 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False, force_full: bool 
     # status, so a skipped duplicate can no longer steal the stamp from the
     # live task — the watchdog used to inspect a task that runs nowhere,
     # conclude "absent", and revoke the healthy run (false corpse).
+    # [wave-56b F8] Liveness gate BEFORE the row claim: the same-id reclaim
+    # arm below matches ANY redelivery of this task id — alive original or
+    # not (jobs 582/584 ran two graph instances on one workspace that way).
+    # A live execution renews its lock; a dead one's key self-expires within
+    # JOB_EXEC_LOCK_TTL_S, so honest reclaim still works.
+    _exec_token = f"{os.getpid()}:{uuid4().hex[:8]}"
+    _exec_lock = JobExecutionLock()
+    if not _exec_lock.acquire(job_id, owner=_exec_token):
+        logger.warning(
+            "Job %d: execution lock held by a live run — skipping duplicate "
+            "dispatch (status=%s)", job_id, job.status,
+        )
+        return
     _task_id = getattr(self.request, "id", "") or ""
     _claim_pred = Q(status=ScrapeJob.STATUS_PENDING)
     _claim_values = {"status": ScrapeJob.STATUS_RUNNING}
@@ -1227,6 +1309,7 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False, force_full: bool 
         .update(**_claim_values)
     )
     if not claimed:
+        _exec_lock.release(job_id, owner=_exec_token)
         logger.warning(
             "Job %d: skipping duplicate dispatch (status=%s)", job_id, job.status
         )
@@ -1272,6 +1355,24 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False, force_full: bool 
             )
             return
 
+    # [wave-56b F8] Heartbeat keeps the execution lock honest: a live run
+    # renews every JOB_EXEC_LOCK_RENEW_S; process death stops the renew and
+    # the key self-expires (reclaim stays possible). The finally below
+    # releases on EVERY exit path — pass, soft-limit finalize, exception.
+    _hb_stop = threading.Event()
+
+    def _renew_exec_lock() -> None:
+        while not _hb_stop.wait(JOB_EXEC_LOCK_RENEW_S):
+            if not _exec_lock.renew(job_id, owner=_exec_token):
+                logger.warning(
+                    "Job %d: execution lock renew failed — another owner may "
+                    "hold it", job_id,
+                )
+
+    _hb_thread = threading.Thread(
+        target=_renew_exec_lock, name=f"job-exec-lock-{job_id}", daemon=True
+    )
+    _hb_thread.start()
     try:
         # [wave-40 T11] Registered for the whole generation — `_run_graph_job`
         # ends in _finalize_job, i.e. the workspace disposal runs INSIDE this
@@ -1294,6 +1395,10 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False, force_full: bool 
         # _finalize_job_failed recycles connections and guards every save so
         # the row always finalizes.
         _finalize_job_failed(job_id, str(exc))
+    finally:
+        _hb_stop.set()
+        _hb_thread.join(timeout=5)
+        _exec_lock.release(job_id, owner=_exec_token)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -4407,8 +4512,20 @@ def cleanup_stuck_jobs() -> None:
         return
 
     failed = 0
+    _exec_lock_for_watchdog = JobExecutionLock()
     for job in stuck_jobs:
         _task_id = getattr(job, "celery_task_id", "") or ""
+        # [wave-56b F8] A live execution renews its lock every
+        # JOB_EXEC_LOCK_RENEW_S — the row is RUNNING because a graph IS
+        # running. Silence under a held lock means a quiet phase, not a
+        # corpse; a wedged holder's key self-expires within
+        # JOB_EXEC_LOCK_TTL_S and the ladder below then owns it.
+        if _exec_lock_for_watchdog.is_held(job.id):
+            logger.info(
+                "Stuck job %d: execution lock held — live run, skipping "
+                "stuck-job verdict", job.id,
+            )
+            continue
         # [wave-15 R1] A row claimed by celery but killed BEFORE the graph
         # started is provably pre-graph: RUNNING + started_at=None (stamped
         # only when _run_graph_job begins) + zero SessionLog rows of any kind
