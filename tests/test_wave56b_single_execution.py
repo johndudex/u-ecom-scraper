@@ -142,3 +142,55 @@ class TestWiring:
         assert "is_held" in src or "JobExecutionLock" in src, (
             "stuck-job watchdog must consult the execution lock"
         )
+
+
+class TestDefaultBackendIsShared:
+    """F8 follow-up screw (found live at deploy, 2026-10-10): settings.py
+    defines NO CACHES, so Django's default cache is LocMemCache — per-process
+    memory in prefork children. A lock stored there is invisible to the
+    second pool child — exactly the dual-run shape it must prevent (582/583/
+    584 were two pids on ONE worker). The default backend must be Redis,
+    shared across every process that touches the queue."""
+
+    def test_default_cache_property_is_redis_backed(self):
+        import inspect
+
+        from scraper.tasks import JobExecutionLock
+
+        src = inspect.getsource(JobExecutionLock.cache.fget)
+        assert "redis" in src.lower(), (
+            "default backend must be Redis, not django.core.cache (LocMem "
+            "in this stack — per-process, useless across pool children)"
+        )
+
+    def test_default_lock_is_visible_across_processes(self):
+        """The real (non-injected) lock must round-trip through shared
+        memory: acquire here, observe from a CHILD process."""
+        import json
+        import subprocess
+        import sys
+
+        from scraper.tasks import JobExecutionLock
+
+        lck = JobExecutionLock(ttl_s=60)
+        assert lck.acquire(999901, owner="parent-proc") is True
+        try:
+            code = (
+                "import json,sys;"
+                "sys.path.insert(0,'/app');sys.path.insert(0,'/app/webapp');"
+                "import os;os.environ.setdefault('DJANGO_SETTINGS_MODULE','config.settings');"
+                "import django;django.setup();"
+                "from scraper.tasks import JobExecutionLock;"
+                "l=JobExecutionLock(ttl_s=60);"
+                "print(json.dumps({'held':l.is_held(999901),"
+                "'second':l.acquire(999901,owner='child-proc')}))"
+            )
+            out = subprocess.run(
+                [sys.executable, "-c", code],
+                capture_output=True, text=True, timeout=120,
+            )
+            payload = json.loads(out.stdout.strip().splitlines()[-1])
+            assert payload["held"] is True, "child must see the parent's lock"
+            assert payload["second"] is False, "child must be refused"
+        finally:
+            lck.release(999901, owner="parent-proc")

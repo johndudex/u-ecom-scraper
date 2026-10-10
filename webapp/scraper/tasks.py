@@ -1035,12 +1035,17 @@ JOB_EXEC_LOCK_RENEW_S = 90
 
 
 class JobExecutionLock:
-    """SETNX-with-TTL lock keyed by job id, on the Django cache (Redis in
-    prod). ``add`` is atomic SETNX: exactly one live execution holds the key.
-    A crashed owner's key expires after the TTL so honest reclaim and the
-    watchdog's liveness ladder keep working; the heartbeat renew keeps a live
-    run's key fresh. Every cache failure refuses — without exclusivity proof,
-    no execution."""
+    """SETNX-with-TTL lock keyed by job id. Default backend is REDIS — the
+    celery broker — because settings.py defines no CACHES and Django's
+    default LocMemCache is per-process memory in prefork children: a lock
+    stored there is invisible to the second pool child, which is exactly the
+    dual-run shape this class exists to prevent (jobs 582/583/584 were two
+    pids on ONE worker). ``add`` is atomic SET NX EX: exactly one live
+    execution holds the key. A crashed owner's key expires after the TTL so
+    honest reclaim and the watchdog's liveness ladder keep working; the
+    heartbeat renew keeps a live run's key fresh. Every backend failure
+    refuses — without exclusivity proof, no execution. Tests inject any
+    duck-typed store with add/get/delete."""
 
     def __init__(self, cache=None, ttl_s: int = JOB_EXEC_LOCK_TTL_S):
         self._cache = cache
@@ -1049,10 +1054,76 @@ class JobExecutionLock:
     @property
     def cache(self):
         if self._cache is None:
-            from django.core.cache import cache as _django_cache
-
-            self._cache = _django_cache
+            self._cache = _RedisSetnxStore.from_broker_url()
         return self._cache
+
+    @staticmethod
+    def _key(job_id) -> str:
+        return f"scraper:job-exec-lock:{job_id}"
+
+    def acquire(self, job_id, owner: str) -> bool:
+        try:
+            return bool(self.cache.add(self._key(job_id), owner, self._ttl))
+        except Exception:
+            return False
+
+    def renew(self, job_id, owner: str) -> bool:
+        try:
+            if self.cache.get(self._key(job_id)) != owner:
+                return False
+        except Exception:
+            return False
+        # Owner-only delete+add: the ms-scale window beats a non-atomic
+        # stomp, and a lost renew is logged loudly by the caller.
+        self.cache.delete(self._key(job_id))
+        return self.acquire(job_id, owner)
+
+    def release(self, job_id, owner: str) -> None:
+        try:
+            if self.cache.get(self._key(job_id)) == owner:
+                self.cache.delete(self._key(job_id))
+        except Exception:
+            return
+
+    def is_held(self, job_id) -> bool:
+        try:
+            return self.cache.get(self._key(job_id)) is not None
+        except Exception:
+            return False
+
+
+class _RedisSetnxStore:
+    """The add/get/delete surface over a real Redis connection (decode
+    responses so owner strings compare equal across processes)."""
+
+    _shared = None
+
+    def __init__(self, client):
+        self._client_ref = client
+
+    @classmethod
+    def from_broker_url(cls):
+        if cls._shared is None:
+            import redis as _redis
+            from django.conf import settings as _django_settings
+
+            _url = getattr(_django_settings, "REDIS_URL", None) or (
+                _django_settings.CELERY_BROKER_URL
+            )
+            cls._shared = cls(
+                _redis.Redis.from_url(_url, decode_responses=True)
+            )
+        return cls._shared
+
+    def add(self, key, value, timeout=None):
+        return bool(self._client_ref.set(key, value, nx=True, ex=timeout))
+
+    def get(self, key, default=None):
+        out = self._client_ref.get(key)
+        return out if out is not None else default
+
+    def delete(self, key):
+        return self._client_ref.delete(key)
 
     @staticmethod
     def _key(job_id) -> str:
