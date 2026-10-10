@@ -3658,9 +3658,33 @@ def intake_create_job(request):
     # rebinds a coerced PDP's nav_method to "pdp", so the old label check
     # skipped this write and the job ran with zero URLs (prod 775-814). The
     # T5 repair above puts the coerced URL into list_urls for exactly this.
+    # [wave-57 class 1a] Honest-mode stamp: seeds that all read as
+    # listing/category positions (job 566: 19 category urls run as url_list)
+    # get a visible warning — the panel describes the job that runs.
+    # Deliberately NOT a mode flip: the url_list lane extracts fine behind
+    # listing seeds (913 item rows in 566); the semantic fix is the runtime
+    # scope gate's listing-seed arm.
+    _listing_seed_warning = ""
     if input_mode == "url_list":
         urls = _parse_url_lines(list_urls)
         if urls:
+            try:
+                from src.discovery_quality import seeds_are_listing_shaped
+
+                if seeds_are_listing_shaped(urls):
+                    _listing_seed_warning = (
+                        "[LISTING-SEEDS] The submitted URLs read as "
+                        "listing/category pages, not item pages — this run "
+                        "will discover the catalog behind them and its rows "
+                        "are judged by item shape + host, not by membership "
+                        "in the submitted list (job 566 class)."
+                    )
+                    job.notes = (
+                        (job.notes or "") + "\n" + _listing_seed_warning
+                    ).strip()
+                    job.save(update_fields=["notes"])
+            except Exception as _lsw_exc:
+                logger.debug("intake: listing-seed stamp skipped: %s", _lsw_exc)
             try:
                 slug = _generate_slug(url)
                 import src.artifacts as artifacts
@@ -3731,6 +3755,11 @@ def intake_create_job(request):
             # renders this on the job screen, and the same text is on the
             # row (notes) for the post-hoc read.
             **({"warning": _fragment_warning} if _fragment_warning else {}),
+            # [wave-57 class 1a] listing-seed honesty stamp (job 566 class)
+            **(
+                {"listing_seeds": {"warning": _listing_seed_warning}}
+                if _listing_seed_warning else {}
+            ),
             "events_url": reverse("job_events", args=[job.id]),
             "api_url": reverse("job_api", args=[job.id]),
             "tool_calls_url": reverse("tool_calls_api", args=[job.id]),

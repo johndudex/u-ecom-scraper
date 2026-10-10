@@ -186,6 +186,93 @@ def _path_segments(url: str) -> tuple[str, list[str]]:
     return (parts.netloc.lower(), segs)
 
 
+# [wave-57 class 1] Seed-side listing signals. A url_list job whose seeds
+# are LISTING positions (job #566: 19 category/collection urls) was judged
+# by a gate whose premise — every seed is an item page — was false, and the
+# C2 scope gate vetoed a 913-row full-catalog success. The seed namespace
+# set is measured ZERO-collateral on the promoted scrapers/*/input_urls.json
+# corpus (20,892 urls): ``shop`` is deliberately EXCLUDED (928 real PDPs —
+# renttherunway /shop/designers/<x>/<slug> 900, jayjays 18, woolworths 9 —
+# classify listing-shaped under it; discovery_quality's own _NAV_DIRECTORY_
+# TOKENS docstring already recorded why shop stays out), and there is NO
+# query arm: ``/slug?sort=new`` must not lift an ambiguous plain slug.
+_SEED_LISTING_NAMESPACE = frozenset({
+    "all", "collection", "catalog", "catalogue",
+})
+
+
+def _seed_path_segments(url: str) -> list[str]:
+    try:
+        parts = urlsplit(str(url or ""))
+        return [s for s in (parts.path or "").split("/") if s]
+    except Exception:
+        return []
+
+
+def _seed_strongly_item_shaped(url: str) -> bool:
+    """Does this seed carry a POSITIVE item signal (Tier-2 arms of the row
+    floor: a PDP segment token, a digit or a file suffix in the last
+    segment)? Strong item evidence outranks every listing guess — a set
+    containing one such seed never loosens the scope gate."""
+    segs = _seed_path_segments(url)
+    if not segs:
+        return False
+    low = [s.lower() for s in segs]
+    if any(s in _PDP_SEGMENT_TOKENS for s in low):
+        return True
+    last = low[-1]
+    return bool(_DIGIT_RE.search(last) or _SUFFIX_RE.search(last))
+
+
+def seed_url_is_listing_shaped(url: str) -> bool:
+    """Is this SUBMITTED SEED a listing position rather than an item page?
+
+    Positive listing signal AND zero positive item signal:
+      - first path segment in ``_SEED_LISTING_NAMESPACE``
+        (``/all/..., /collection/..., /catalog/...``);
+      - OR the last segment is a terminal nav page (``/new-in``);
+      - OR the URL already fails ``row_url_is_item_shaped`` — the C3
+        nav-position class (``/collections/x``, ``/c/gifts``, ``/search``),
+        which carries the plural/c/department/browse vocabulary.
+    Ambiguous plain-slug paths (``/the-name-of-the-book``, with or without a
+    ``?sort=`` query) return False — the classifier never loosens a gate on
+    a guess.
+    """
+    segs = _seed_path_segments(url)
+    if not segs:
+        return False
+    low = [s.lower() for s in segs]
+    if _seed_strongly_item_shaped(url):
+        return False
+    if low[0] in _SEED_LISTING_NAMESPACE:
+        return True
+    if low[-1] in _NAV_TERMINAL_TOKENS:
+        return True
+    try:
+        return not row_url_is_item_shaped(url)
+    except Exception:
+        return False
+
+
+def seeds_are_listing_shaped(urls) -> bool:
+    """Does this seed SET read as listings (scope-extending), job-#566?
+
+    GUARDIAN-corrected set rule: at least one seed positively
+    listing-shaped AND no seed strongly item-shaped. Weak/ambiguous plain
+    slugs are inert — they neither block the loosening nor cause it. (An
+    earlier all()-seeds-listing rule kept the #566 set itself strict: its
+    ``/shop/accessories-shoes`` member is ambiguous, and the fix must fix
+    its own regression target.) All-ambiguous sets — the renttherunway
+    PDP-paste shape — stay strict.
+    """
+    cleaned = [str(u).strip() for u in (urls or []) if str(u or "").strip()]
+    if not cleaned:
+        return False
+    if not any(seed_url_is_listing_shaped(u) for u in cleaned):
+        return False
+    return not any(_seed_strongly_item_shaped(u) for u in cleaned)
+
+
 def shallow_section_links(
     listing_url: str,
     urls,

@@ -2664,6 +2664,11 @@ def _url_list_scope_gate(
     cleanup recording outcome=success behind it. Seeds dispatched + zero rows
     shipped = the run extracted nothing from the user's list.
 
+    [wave-57] LISTING-seed exception: a seed set that reads as listings
+    (``src.discovery_quality.seeds_are_listing_shaped`` — >=1 positively
+    listing-shaped seed, zero strongly item-shaped) extends the scope:
+    rows are judged by item-shape + registrable host, not membership.
+
     url_list ONLY: Site.input_urls reaches graph state for every mode, and
     navigation/list_page/search_term deliberately merge category-page rows
     (_run_category_sources), so a seed comparison there would fail honest
@@ -2672,9 +2677,8 @@ def _url_list_scope_gate(
     Returns the diagnostic sentence, empty when healthy (gate no-ops)."""
     if str(input_mode or "").strip().lower() != "url_list":
         return ""
-    seeds = {
-        _submitted_url_key(u) for u in (seed_urls or []) if str(u or "").strip()
-    }
+    seed_list = [u for u in (seed_urls or []) if str(u or "").strip()]
+    seeds = {_submitted_url_key(u) for u in seed_list}
     if not seeds:
         return ""
     urls = _output_row_urls(output_file)
@@ -2695,6 +2699,47 @@ def _url_list_scope_gate(
             f"(books 579 rode a tester PASS to a SUCCESS + 0-rows record). "
             f"Fix the scraper's url_list branch (seed file / --urls / "
             f"transport), not discovery."
+        )
+    # [wave-57 class 1] Listing-seed semantics (job #566): when the seed SET
+    # reads as listings (>=1 positively listing-shaped, zero strongly
+    # item-shaped), the submitted listings EXTEND the discovery scope —
+    # rows are judged by item-shape + same registrable host, not by
+    # membership. 913 item-shaped priced rows behind 19 category seeds were
+    # vetoed by a gate whose premise (every seed is an item page) was
+    # false. Genuine item-seeded sets never reach this arm: membership
+    # stays demanded (the job-1227 class is still policed by the branch
+    # below).
+    try:
+        from src.discovery_quality import seeds_are_listing_shaped
+
+        _listing_seeds = seeds_are_listing_shaped(seed_list)
+    except Exception:
+        _listing_seeds = False
+    if _listing_seeds:
+        try:
+            from src.discovery_quality import row_url_is_item_shaped
+            from src.registrable import registrable_of
+
+            _seed_hosts = {registrable_of(u) for u in seed_list}
+            _seed_hosts.discard("")
+            strays = [
+                u for u in urls
+                if (registrable_of(u) not in _seed_hosts)
+                or not row_url_is_item_shaped(u)
+            ]
+        except Exception:
+            strays = []
+        if not strays:
+            return ""
+        examples = ", ".join(repr(s[:100]) for s in strays[:3])
+        return (
+            f"url_list scope violation (listing seeds): {len(strays)}/"
+            f"{len(urls)} output rows are off-host or not item-shaped "
+            f"({examples}) — the submitted seeds are LISTING urls, so "
+            f"discovery scope extends behind them, but every row must "
+            f"still be an item page on the seeds' own host "
+            f"(jjshouse 566 class). Fix discovery's item-URL filtering, "
+            f"not the field selectors."
         )
     strays = [u for u in urls if _submitted_url_key(u) not in seeds]
     if not strays:
