@@ -275,13 +275,27 @@ def sweep_enabled(monkeypatch):
 class TestRedispatchSweep:
     def test_disabled_by_default(self):
         """The sweep MUST ship OFF: prod rows never carried a stamp before
-        wave-15, so "" still covers queued work until the keystone deploys."""
+        wave-15, so "" still covers queued work until the keystone deploys.
+
+        [wave-56b] The CODE default is pinned, not the operator's .env —
+        the 6h batch arms REDISPATCH_SWEEP_ENABLED=1 deliberately, and an
+        env-dependent pin would fail every operator-armed full gate."""
+        import inspect
+
         import scraper.tasks as wt
 
-        from django.conf import settings
+        from django.test.utils import override_settings
 
-        assert not getattr(settings, "REDISPATCH_SWEEP_ENABLED", True)
-        assert wt.redispatch_abandoned_pending() == {"action": "disabled"}
+        # 1. the shipped default literal in settings.py is False (decouple
+        #    reads /app/.env, so settings.REDISPATCH_SWEEP_ENABLED reflects
+        #    the operator, not the contract)
+        import config.settings as cfg
+
+        src = inspect.getsource(cfg)
+        assert 'config("REDISPATCH_SWEEP_ENABLED", default=False' in src
+        # 2. behavior: with the setting off, the sweep refuses
+        with override_settings(REDISPATCH_SWEEP_ENABLED=False):
+            assert wt.redispatch_abandoned_pending() == {"action": "disabled"}
 
     @pytest.mark.django_db
     def test_recovers_one_abandoned_pending_row(self, sweep_enabled, monkeypatch):
