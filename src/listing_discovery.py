@@ -44,7 +44,7 @@ import time
 from collections.abc import Callable
 from urllib.parse import urlencode, urljoin, urlparse
 
-from src.discovery import pdp_candidates
+from src.discovery import _pdp_score, pdp_candidates
 from src.http_fetch import SoftBlock
 from src.seed_urls import normalize_host
 
@@ -54,6 +54,43 @@ logger = logging.getLogger(__name__)
 # listing". Only these reclassify to empty_first_page when ZERO urls were
 # found across every listing — a real catalog-end requires having seen items.
 _EXHAUSTION_REASONS = ("short_page", "no_next_link", "no_new_items")
+
+
+def _page_pdp_anchor_count(soup, base_url: str) -> int | None:
+    """PDP-ish ``<a>`` anchors in the PARSED listing page.
+
+    The discovery-side mirror of browser_service/probe._count_item_links
+    (same ``_pdp_score`` floor, same host filter). This is the precision
+    discriminator behind ``client_shell_duplicate``: a client-rendered shell
+    carries ZERO parseable item anchors (its crumbs live inside <script>
+    bodies, which BeautifulSoup treats as text), while a genuinely
+    one-page server-rendered catalog whose ?page=2 echo serves the same
+    chrome still serves REAL item anchors. DOM equality alone cannot tell
+    those two apart — anchor count can. None when the scorer is unavailable
+    (callers then fall back to DOM identity alone)."""
+    try:
+        base_host = (urlparse(base_url).netloc or "").lower().removeprefix(
+            "www."
+        )
+        count = 0
+        for anchor in soup.find_all("a"):
+            href = (anchor.get("href") or "").strip()
+            if not href or href.startswith(
+                ("#", "mailto:", "tel:", "javascript:")
+            ):
+                continue
+            absolute = urljoin(base_url, href)
+            parsed = urlparse(absolute)
+            if parsed.scheme not in ("http", "https"):
+                continue
+            host = (parsed.netloc or "").lower().removeprefix("www.")
+            if base_host and host and host != base_host:
+                continue
+            if _pdp_score(absolute) > 0:
+                count += 1
+        return count
+    except Exception:
+        return None
 
 # [job-85 supercheapauto] Gates used to key on ``discovered_urls == 0``, but a
 # job URL that is an ITEM page yields exactly 1 junk link (itself / related
@@ -360,6 +397,10 @@ def discover_listing_urls(
         # [wave-48 T3] per-listing reset: listing N's tail must never leak
         # into listing N+1's comparison.
         prev_links = []
+        # [wave-57 class 3] previous page's serialized DOM — the duplicate-
+        # shell comparison (a client-side paginator re-serves the SAME
+        # document for every ?page=N; a server paginator re-renders).
+        prev_dom = ""
         while True:
             # Fail-fast: a blocked/slow discovery must not run unbounded.
             if time.monotonic() - deadline_start > deadline_s:
@@ -500,10 +541,36 @@ def discover_listing_urls(
             # Dedup worked: page returned items but none were new → exhausted.
             if new_on_page == 0:
                 # [wave-48 T3] identical LINK SET with the previous page is
-                # the client-rendered-shell signature. Telemetry only —
-                # stop_reason stays no_new_items.
+                # the client-rendered-shell signature.
                 identical_last_page = page_urls == prev_links
-                stop_reason = "no_new_items"
+                # [wave-57 class 3] job-1082 wonderbly: the shell re-serves
+                # the SAME document for every ?page=N (pagination is
+                # client-side) and the parseable page carries ZERO item
+                # anchors — the "items" were salvaged from script bodies.
+                # That is starvation with a measurable transport cause, not
+                # exhaustion: name it so the coverage gate routes to the
+                # strategy cascade (browser lane / algolia-first) instead of
+                # shipping the 2-link salvage as a completed catalog.
+                # Precision arms, BOTH required beyond link-set equality:
+                # DOM-identical documents (a server paginator re-renders),
+                # and zero PDP-ish anchors on the duplicating page (a real
+                # one-page catalog echoing its last page still serves real
+                # item anchors — DOM equality alone cannot tell the two
+                # apart, and a transport-invariant re-stamp would burn the
+                # ladder on sites that PASS today).
+                _shell_dup = False
+                if (
+                    identical_last_page
+                    and prev_dom
+                    and soup is not None
+                    and str(soup) == prev_dom
+                ):
+                    _anchor_ct = _page_pdp_anchor_count(soup, paginated_url)
+                    _shell_dup = _anchor_ct is None or _anchor_ct == 0
+                if _shell_dup:
+                    stop_reason = "client_shell_duplicate"
+                else:
+                    stop_reason = "no_new_items"
                 break
 
             # MAX_PAGES safety cap (only fires when max_pages is non-None).
@@ -519,6 +586,12 @@ def discover_listing_urls(
             # after every compare/break branch, so the exhausting page never
             # compares against itself.
             prev_links = list(page_urls)
+            # [wave-57 class 3] remember the page's serialized DOM the same
+            # way (soft-block pages carry no soup — nothing to compare).
+            try:
+                prev_dom = str(soup) if soup is not None else ""
+            except Exception:
+                prev_dom = ""
 
             page += 1
 
@@ -546,9 +619,16 @@ def discover_listing_urls(
         # [wave-48 T3] only meaningful when the loop actually stopped on the
         # no_new_items branch — a later listing's short_page/navigate_error
         # must not inherit an earlier listing's duplicate-shell verdict.
+        # [wave-57 class 3] client_shell_duplicate IS that branch's other
+        # exit, so the telemetry stays true there too.
         "identical_last_page": (
-            identical_last_page if stop_reason == "no_new_items" else False
+            identical_last_page
+            if stop_reason in ("no_new_items", "client_shell_duplicate")
+            else False
         ),
+        # [wave-57 class 3] the starved shell verdict rides discovery_meta
+        # (output metadata + the tester's discovery_coverage scalars).
+        "client_rendered_shell": stop_reason == "client_shell_duplicate",
     }
     return all_urls, discovery_meta
 

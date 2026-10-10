@@ -329,12 +329,27 @@ def algolia_gate_prescribed(state: dict) -> bool:
     client-rendered. Cloak-only winners (job-1107 jcrew: ``cloak_none``) are
     browser-flavoured — ``http_ok`` is False there and no creds hunt is
     prescribed.
+
+    [wave-57 class 3] Third arm — the run's OWN coverage evidence: a
+    ``client_shell_duplicate`` stop reason in ``test_report.discovery_
+    coverage`` proves the starved shell even when the listing probe never
+    ran (the check_tracker resume path skips it — exactly the wonderbly
+    #1082 shape, where the creds hunt was the proven full-catalog route and
+    nothing else could see the shell). The probe stamp is not needed when
+    the run itself measured the starvation.
     """
     if not isinstance(state, dict):
         return False
     mode = str(state.get("input_mode") or "").lower()
     if mode not in ("navigation", "list_page", "search_term"):
         return False
+    report = state.get("test_report")
+    if isinstance(report, dict):
+        cov = report.get("discovery_coverage")
+        if isinstance(cov, dict) and str(
+            cov.get("stop_reason") or ""
+        ) == "client_shell_duplicate":
+            return True
     probe = state.get("probe_result")
     listing = probe.get("listing_connectivity") if isinstance(probe, dict) else None
     if not isinstance(listing, dict):

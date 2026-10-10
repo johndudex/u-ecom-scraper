@@ -145,6 +145,14 @@ _COVERAGE_FAIL_STOP_REASONS = {
     # veto, anti-bot exemption) must see it consistently. classify's throttle
     # guard still outranks this set, so the "retest" lane is unchanged.
     "navigate_throttled",
+    # [wave-57 class 3] job-1082 wonderbly: the listing is a client-rendered
+    # shell (zero parseable item anchors) whose client-side pagination
+    # re-serves the SAME document — the "exhaustion" was starvation with a
+    # transport cause. A field-PASS on the 2-link salvage must fall through
+    # to the strategy cascade (browser lane / algolia-first), not ship.
+    # Deliberately NOT in _ACCESS_WALL_STOP_REASONS: a transport flip CAN
+    # fix this — it is a strategy-class wall, not infra.
+    "client_shell_duplicate",
 }
 
 # [wave-24 W24-3] Infra-class discovery walls: no writer cycle can fix these
@@ -1473,7 +1481,12 @@ def _gate_is_contract_bad(gate) -> bool:
 # checkpoint_reused means the yield lives in the reused set, not the
 # coverage block; skipped means Phase 1 never ran).
 _KYG_BLOCKED_STOP_REASONS = frozenset(
-    {"navigate_error", "dedup_flat", "phase1_skipped", "checkpoint_reused", "skipped"}
+    {"navigate_error", "dedup_flat", "phase1_skipped", "checkpoint_reused",
+     "skipped",
+     # [wave-57 class 3] the duplicate-shell verdict is already a coverage
+     # FAIL with its own cascade routing — the yield-gap gate must not
+     # double-fire on top of it.
+     "client_shell_duplicate"}
 )
 
 # [wave-48 T4 → wave-48b] The known-yield-gap checker and its routing were

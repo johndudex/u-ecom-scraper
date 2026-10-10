@@ -688,6 +688,11 @@ _STOP_REASON_PRIORITY = {
     #                         failed, not the site: must outrank navigate_error
     #                         so the cascade parks instead of "fixing" code.
     "navigate_error": 5,   # FAIL  — gave up due to 502/503/block (NOT exhaustion)
+    "client_shell_duplicate": 5,  # FAIL — [wave-57] client-rendered listing:
+    #                         ?page=2 re-served the SAME shell (zero parseable
+    #                         item anchors). Starvation with a transport cause,
+    #                         NOT exhaustion — must outrank no_new_items so a
+    #                         browser-lane cycle cannot bury the transport flip.
     "empty_first_page": 5,  # FAIL  — [job-58] zero URLs, no hard error = the
     #                         "200-but-blocked" signature (challenge/consent
     #                         wall served with HTTP 200), NOT a genuine end
