@@ -2770,6 +2770,28 @@ def _writer_max_timeout() -> int:
     return _env_int("WRITER_MAX_TIMEOUT", 2700)
 
 
+def _writer_extension_ceiling(state: dict | None = None) -> int:
+    """[wave-56b F7] The writer's activity-extension ceiling, retired after
+    one wall-clock death.
+
+    Job 580 paid the full 2700s ceiling on BOTH hangs: F6's post-death cap
+    only sizes the base window near the END of the task budget, so mid-budget
+    a second hang still consumed 2700s and the job died on the soft limit with
+    a validated checkpoint unfinalized. One hang is the signal that the
+    provider window is degraded — every window AFTER it gets the base clock
+    (``_writer_invoke_timeout``) and no extension slack; the zombie latch
+    still stops a true zombie at base. A healthy writer (deaths == 0) keeps
+    the full env-tunable ceiling byte-identically.
+    """
+    ceiling = _writer_max_timeout()
+    try:
+        if int((state or {}).get("writer_wall_clock_timeouts") or 0) >= 1:
+            ceiling = min(ceiling, _writer_invoke_timeout())
+    except Exception:
+        pass
+    return ceiling
+
+
 def _writer_canary_payload() -> dict:
     """[wave-52 candidate 8] The writer-shaped canary request body.
 
@@ -3045,6 +3067,55 @@ def _find_activity_logger(agent_cfg) -> _ToolCallLogger | None:
     return None
 
 
+# [wave-56b EDIT-OR-DIE] The writer's read-only tool set. nordstrom 581 died
+# "identical draft twice" after 125 read-only tool calls and ZERO edits
+# post-cycle-0 — the writer read itself in circles while the retry slot kept
+# asking for a fix and the context window truncated to 7 msgs/turn.
+_WRITER_READ_ONLY_TOOLS = frozenset({"read_file", "search_content", "search_files"})
+_WRITER_MUTATOR_TOOLS = frozenset({"edit_file", "write_file"})
+_WRITER_SPIRAL_WARN_READS = 25
+_WRITER_SPIRAL_ABORT_READS = 50
+
+
+def _writer_read_only_spiral(calls) -> str:
+    """Classify the writer's read-only spiral: "ok" / "warn" / "abort".
+
+    Read-only volume with NO mutator is the spiral: warn at >= 25 reads (a
+    force-edit directive goes into the retry slot), abort at >= 50 (the
+    identical draft is certain — escalate the strike instead of spending
+    another cycle on it). Any edit_file/write_file resets: a writer that
+    edits is not spinning, whatever its read count.
+    """
+    try:
+        _reads = 0
+        _mutated = 0
+        for c in calls or []:
+            _name = str((c or {}).get("name") or "")
+            if _name in _WRITER_READ_ONLY_TOOLS:
+                _reads += 1
+            elif _name in _WRITER_MUTATOR_TOOLS:
+                _mutated += 1
+        if _mutated:
+            return "ok"
+        if _reads >= _WRITER_SPIRAL_ABORT_READS:
+            return "abort"
+        if _reads >= _WRITER_SPIRAL_WARN_READS:
+            return "warn"
+        return "ok"
+    except Exception:
+        return "ok"
+
+
+def _writer_spiral_directive(reads: int, edits: int) -> str:
+    """The job-visible force-edit directive for a read-only spiral."""
+    return (
+        f"[WRITER READ-SPIRAL] {reads} read-only tool calls, {edits} edits "
+        "this window — reading is not fixing. Stop reading and make a "
+        "concrete edit_file/write_file change to the draft NOW; a window "
+        "with zero edits ends this job."
+    )
+
+
 def _join_with_activity_extension(
     thread,
     *,
@@ -3055,6 +3126,7 @@ def _join_with_activity_extension(
     clock=time.monotonic,
     job_deadline: float | None = None,
     poll_s: float = 5.0,
+    reserve_s: float = 0.0,
 ) -> float:
     """[wave-30 W30-1] Poll-join with activity-aware extension (sync path).
 
@@ -3070,10 +3142,22 @@ def _join_with_activity_extension(
     ``now + fresh_s`` but never SHRINK it and never past the cap — so one
     legitimate fresh stamp at t=0 buys at most ``fresh_s`` of tail, never a
     slide to the cap.
+
+    [wave-56b F6b] ``reserve_s`` reserves wall clock for the phase that
+    FOLLOWS this one (the tester floor): the job-deadline break and the
+    extension hard bound both move in by that many seconds, so a
+    continuously-fresh writer log can no longer hold the job until the
+    tester's guaranteed window is gone. Only meaningful together with
+    ``job_deadline`` (no deadline = nothing to reserve from).
     """
     start = clock()
     deadline = start + float(base_timeout)
     cap = start + float(max_timeout)
+    hard = (
+        float(job_deadline) - JOB_BUDGET_FINALIZE_MARGIN - float(reserve_s)
+        if job_deadline
+        else None
+    )
     while True:
         remaining = deadline - clock()
         if remaining <= 0:
@@ -3083,11 +3167,16 @@ def _join_with_activity_extension(
             break
         # Task-scoped budget wins over any extension: an extension may never
         # push into the finalize margin (mirrors _effective_timeout).
-        if job_deadline and clock() + JOB_BUDGET_FINALIZE_MARGIN >= job_deadline:
+        # [wave-56b F6b] ...nor into the reserved successor window.
+        if job_deadline and clock() + JOB_BUDGET_FINALIZE_MARGIN + float(reserve_s) >= job_deadline:
             break
         last = getattr(activity, "last_activity", None)
         if last is not None and (clock() - last) <= float(fresh_s):
-            deadline = max(deadline, min(cap, clock() + float(fresh_s)))
+            deadline = max(
+                deadline, min(cap, clock() + float(fresh_s), hard)
+                if hard is not None
+                else min(cap, clock() + float(fresh_s))
+            )
     return clock() - start
 
 
@@ -3420,6 +3509,8 @@ def _invoke_agent_with_timeout(
     agent, messages, agent_cfg, phase: str, job_id,
     timeout: int = _AGENT_INVOKE_TIMEOUT,
     allow_activity_extension: bool = True,
+    state: dict | None = None,
+    reserve_s: float = 0.0,
 ):
     """Run the agent with a wall-clock timeout.
 
@@ -3480,7 +3571,7 @@ def _invoke_agent_with_timeout(
         # deadline so its disarm latch stays sharp. Parent-side refresh is
         # not viable: the ContextVar is copied at thread start.
         _tool_window = (
-            max(float(timeout), float(_writer_max_timeout()))
+            max(float(timeout), float(_writer_extension_ceiling(state)))
             if phase in _ACTIVITY_EXTENDABLE_PHASES and allow_activity_extension
             else timeout
         )
@@ -3531,13 +3622,20 @@ def _invoke_agent_with_timeout(
         else None
     )
     if _activity is not None:
+        # [wave-56b F6b] After a writer wall-death, reserve the tester's
+        # floor out of any extension: mirrors _writer_post_death_timeout's
+        # condition, but for the join the generic clamp cannot reach.
+        _reserve = float(reserve_s) if reserve_s is not None else 0.0
+        if not _reserve and int((state or {}).get("writer_wall_clock_timeouts") or 0) >= 1:
+            _reserve = TESTER_WINDOW_FLOOR_S
         _waited = _join_with_activity_extension(
             thread,
             base_timeout=timeout,
             activity=_activity,
             fresh_s=_writer_activity_fresh_s(),
-            max_timeout=_writer_max_timeout(),
+            max_timeout=_writer_extension_ceiling(state),
             job_deadline=_jd,
+            reserve_s=_reserve,
         )
     else:
         _waited = float(timeout)
@@ -7147,10 +7245,38 @@ def _noop_strike1_ladder_bounce(state: ScrapeState, update: dict) -> dict | None
             (t.get("strategy") if isinstance(t, dict) else t)
             for t in (state.get("strategies_tried") or [])
         }
+        # [wave-56b F2b] Was THIS rung already given its chance before the
+        # no-op strike (restored/pre-populated history — the live 580 shape:
+        # history walked http_requests -> http_navigation, strike 1 no-op'd
+        # on the current rung and fell through)? A fresh rung climbs the
+        # strategy ladder; a burnt one must not re-test identical bytes.
+        _rung_already_tried = cur in all_tried
         all_tried.add(cur)  # the no-op strike IS this strategy's failed cycle
         _esc, goto = _escalate_strategy(dict(_analysis), all_tried)
-        if goto:
-            return None  # ladder exhausted — the escalate arm owns the exit
+        if goto or _rung_already_tried:
+            # [wave-56b F2b] Strategy axis exhausted at strike 1 — the top
+            # rung (playwright always gotos: internal_api is skipped) or the
+            # current rung is already burnt. Before strike 2 owns the exit,
+            # spend the TIER axis once: the same strategy at the next
+            # configured proxy tier is a genuinely different experiment;
+            # re-testing identical bytes is not.
+            if cur != "internal_api" and _two_dim_ladder_enabled():
+                _tier_esc = _escalate_tier_axis(dict(_analysis))
+                if _tier_esc is not None:
+                    _prev_tier = str(_analysis.get("proxy_tier") or "none") or "none"
+                    return {
+                        "scraper_analysis": _tier_esc,
+                        "strategies_tried": [{
+                            "strategy": cur,
+                            "reason": (
+                                "no-op fix loop: strategy ladder exhausted "
+                                f"for {cur} — climbing proxy tier "
+                                f"{_prev_tier} -> {_tier_esc.get('proxy_tier')} "
+                                "instead of re-testing identical bytes"
+                            ),
+                        }],
+                    }
+            return None  # tier axis spent/exhausted too — strike 2 owns the exit
         return {
             "strategies_tried": [{
                 "strategy": cur,
@@ -7996,9 +8122,12 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
             # what sized job 569's writer to one draft cycle with zero slack.
             # [wave-56 F6] After a wall-clock death the window is capped so
             # the tester keeps a viable floor (job 575's 887s clamp).
+            # [wave-56b F7] The extension ceiling retires after a death and
+            # [F6b] the join reserves the tester floor — both read state.
             result = _invoke_agent_with_timeout(
                 agent, messages, _cw_cfg, "code_writer", job_id,
                 timeout=_writer_post_death_timeout(state, _cw_cfg),
+                state=state,
             )
         finally:
             _stop_heartbeat(hb)
@@ -8489,6 +8618,62 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     f"{_new_fp[:12]} is UNCHANGED from the last tested version "
                     f"({_tested_fp[:12]}) — the fix loop produced no bytes",
                 )
+                # [wave-56b EDIT-OR-DIE] Classify the read-only spiral behind
+                # the unchanged draft: an unchanged draft with a read-only
+                # tool trail means the writer spent its window READING, not
+                # editing — a second identical cycle is the certain cost of
+                # ignoring it.
+                try:
+                    _spiral_calls = list(
+                        getattr(_find_activity_logger(_cw_cfg), "calls", None)
+                        or []
+                    )
+                except Exception:
+                    _spiral_calls = []
+                _spiral = _writer_read_only_spiral(_spiral_calls)
+                # [wave-56b critique fix] Thresholds are CROSS-WINDOW: the
+                # ToolCallLogger is fresh per invocation, and the evidence
+                # this arm was built on (581: 125 reads over 3 invocations
+                # ≈ 42/window) warn'd per-window but never crossed the abort
+                # line. Accumulate the read-only count in state; a window
+                # with a real edit resets it (a writer that edits is not
+                # spinning, whatever it read).
+                _prior_spiral_reads = int(
+                    state.get("writer_dup_read_count") or 0
+                )
+                if _spiral == "ok":
+                    if _prior_spiral_reads:
+                        update["writer_dup_read_count"] = 0
+                else:
+                    _spiral_reads = sum(
+                        1
+                        for _sc in _spiral_calls
+                        if str(_sc.get("name") or "") in _WRITER_READ_ONLY_TOOLS
+                    )
+                    _cross_reads = _prior_spiral_reads + _spiral_reads
+                    update["writer_dup_read_count"] = _cross_reads
+                    _spiral_msg = _writer_spiral_directive(
+                        _cross_reads, len(_spiral_calls) - _spiral_reads
+                    )
+                    _log_event_row(job_id, "code_writer", _spiral_msg)
+                    if _cross_reads >= _WRITER_SPIRAL_ABORT_READS:
+                        # abort: the spiral makes the next identical draft
+                        # certain — take the strike NOW instead of spending
+                        # another full window proving it.
+                        _noop = max(_noop, 2)
+                        update["noop_fix_cycles"] = _noop
+                    elif _cross_reads >= _WRITER_SPIRAL_WARN_READS:
+                        # Post-invocation directive on the retry slot. The
+                        # consumer (_summarize_test_report) merges this
+                        # top-level key into the report feedback it injects,
+                        # so the directive is writer-visible.
+                        update["feedback_for_writer"] = (
+                            (
+                                str(update.get("feedback_for_writer") or "")
+                                + "\n"
+                                + _spiral_msg
+                            ).strip()
+                        )
                 # [W26-5/prod-418] The node bumps update["test_retry_count"]
                 # at entry (state still holds the PRE-cycle count) — pass the
                 # bumped value so the final-round rule fires on time.

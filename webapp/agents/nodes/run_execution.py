@@ -606,7 +606,88 @@ def _checkpoint_reuse_env(
     return {CHECKPOINT_REUSE_ENV: "1" if armed else "0"}
 
 
-def _stage_extra_files(scraper_path: str, input_mode: str) -> dict:
+def _heal_url_list_seed(
+    scraper_path: str, input_mode: str, seed_urls, job_url: str = "",
+) -> None:
+    """[wave-56b F10] url_list: the JOB's seed replaces any on-disk
+    input_urls.json beside the scraper BEFORE execution reads it.
+
+    A resumed job's scraper_path points at the production ``scrapers/{slug}/``
+    dir, where a PREVIOUS job's seed still sits — 592 scraped a Sep-29
+    homepage seed over its submitted travel_2 payload, and cleanup rewrote
+    the file 23s after the run, erasing the evidence. Both execution lanes
+    read the seed from that directory (the in-process subprocess directly via
+    the template's ``SCRIPT_DIR/input_urls.json``, the browser_service lane
+    via ``_stage_extra_files``), so the heal lands in the file itself and
+    both lanes measure the payload the user submitted. Nav families are out
+    of scope: their input_urls.json is the persisted-discovery carrier the
+    tester wrote, not the payload. No seed on state → no guess (the C2
+    rule): the disk file stands and the scope gate still judges rows.
+
+    [wave-56b critique fix] The healed set passes the SAME A4 filter
+    setup_workspace applies (``src.seed_urls.filter_seed_urls``): healing the
+    raw paste over the workspace's filtered file would reintroduce the
+    cross-host/pagination strays A4 exists to keep out — and widen the C2
+    scope gate's seed set so rows A4 would have dropped read as "submitted".
+    Filter failure falls back to the unfiltered set (a heal must not crash
+    the run).
+    """
+    if str(input_mode or "").strip().lower() != "url_list":
+        return
+    seeds = [str(u).strip() for u in (seed_urls or []) if str(u or "").strip()]
+    if not seeds:
+        return
+    if job_url:
+        try:
+            from src.seed_urls import filter_seed_urls
+
+            seeds = filter_seed_urls(seeds, job_url) or seeds
+        except Exception:
+            pass
+    try:
+        with open(
+            os.path.join(os.path.dirname(scraper_path), "input_urls.json"),
+            "w", encoding="utf-8",
+        ) as fh:
+            json.dump({"urls": seeds}, fh, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def _stamp_seed_provenance(
+    output_file: str, seed_urls, input_mode: str,
+) -> bool:
+    """[wave-56b F10] Stamp ``metadata.seed_urls_used`` into the run's own
+    artifact so payload identity is auditable post-hoc — a 592-shaped
+    substitution must be visible in the bytes the pointer names, not only in
+    logs cleanup can rotate. url_list only (the one mode whose seed IS the
+    payload contract); metadata edit only, rows are never touched; called
+    before the gates so a gate-failed run keeps its provenance too."""
+    if str(input_mode or "").strip().lower() != "url_list":
+        return False
+    seeds = [str(u).strip() for u in (seed_urls or []) if str(u or "").strip()]
+    if not seeds or not output_file or not os.path.isfile(output_file):
+        return False
+    try:
+        with open(output_file, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return False
+        meta = data.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
+            data["metadata"] = meta
+        meta["seed_urls_used"] = seeds
+        with open(output_file, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def _stage_extra_files(
+    scraper_path: str, input_mode: str, seed_urls=None, job_url: str = "",
+) -> dict:
     """Sibling files the /scrape payload must carry (stateless staging — the
     browser_service container has no shared filesystem with this one).
 
@@ -624,6 +705,11 @@ def _stage_extra_files(scraper_path: str, input_mode: str) -> dict:
     staged = ["input_urls.json", "discovery_config.json"]
     if _wants_fresh_discovery(input_mode):
         staged.append(CHECKPOINT_FILENAME)
+    # [wave-56b F10] Stage the JOB's seed, never a stale production-dir file —
+    # the heal rewrites input_urls.json before the read below, so what crosses
+    # to browser_service is the payload the user submitted (592).
+    _heal_url_list_seed(scraper_path, input_mode, seed_urls,
+                        job_url=str(job_url or ""))
     _extra: dict = {}
     for _sf in staged:
         _sp = os.path.join(os.path.dirname(scraper_path), _sf)
@@ -1316,6 +1402,7 @@ def run_execution(state: ScrapeState) -> dict:
             # sets pre-rename.
             target_fields=union_output_fields(state),
             seed_urls=state.get("input_urls"),
+            job_url=str((state or {}).get("url") or ""),
         ))
 
     result = _run_in_process(
@@ -1325,6 +1412,7 @@ def run_execution(state: ScrapeState) -> dict:
         input_mode=input_mode,
         target_fields=union_output_fields(state),
         seed_urls=state.get("input_urls"),
+        job_url=str((state or {}).get("url") or ""),
     )
     # [wave-40 T1 guards 2+3] clear in place on the leg's RAW result: the
     # listing fallback below either keeps this dict (already normalized) or
@@ -1569,9 +1657,15 @@ def _run_in_process(
     input_mode: str = "",
     target_fields: list[str] | None = None,
     seed_urls: list | None = None,
+    job_url: str = "",
 ) -> dict[str, Any]:
     cmd = ["python3", scraper_path] + args
     start = time.time()
+    # [wave-56b F10] The subprocess reads the seed from the scraper's own
+    # directory — heal a stale production-dir input_urls.json with the JOB's
+    # seed before dispatch (592 measured a Sep-29 homepage payload).
+    _heal_url_list_seed(scraper_path, input_mode, seed_urls,
+                        job_url=str(job_url or ""))
 
     # The in-process subprocess can run 30+ min on a long scrape (the HTTP
     # navigation template's 200-page discovery is exactly that). The Celery
@@ -1745,6 +1839,9 @@ def _run_in_process(
                     "likely found 0 items or the scraper wrote nothing)."
                 ),
             }
+        # [wave-56b F10] Payload identity rides the artifact itself — stamped
+        # before the gates so a gate-failed run keeps its provenance too.
+        _stamp_seed_provenance(output_file, seed_urls, input_mode)
         product_count = _count_products(output_file)
         discovery_coverage = _read_discovery_coverage(output_file)
         # F9 quality gate (nav modes): collapse-level failure rates -> FAILED
@@ -1954,7 +2051,9 @@ def _run_via_browser_service(
         # graph._probe_phase1_discovery_once deliberately does NOT stage a
         # checkpoint — a probe must never see one (763 nastygal).
         _extra = _stage_extra_files(
-            scraper_path, str((state or {}).get("input_mode") or "")
+            scraper_path, str((state or {}).get("input_mode") or ""),
+            seed_urls=(state or {}).get("input_urls"),
+            job_url=str((state or {}).get("url") or ""),
         )
         # W8: bounded retry on 429/502/503/504 + transport errors — a bare
         # raise_for_status() turned backpressure into an execution failure.
@@ -2077,6 +2176,12 @@ def _run_via_browser_service(
             except OSError as exc:
                 logger.warning("run_execution: could not persist output locally: %s", exc)
         discovery_coverage = _read_discovery_coverage(output_file) if output_file else {}
+        # [wave-56b F10] Payload identity rides the artifact itself (592:
+        # cleanup rewrote the seed file 23s post-run, erasing the evidence).
+        _stamp_seed_provenance(
+            output_file, (state or {}).get("input_urls"),
+            str((state or {}).get("input_mode") or ""),
+        )
         try:
             _pruned = prune_empty_records(
                 output_file, union_output_fields(state) or None
@@ -2518,6 +2623,29 @@ def _submitted_url_key(url: str) -> str:
         return s.split("#", 1)[0].rstrip("/")
 
 
+def _output_row_count(output_file: str) -> int:
+    """Row count of the run's first record array, URL harvestability aside.
+
+    [wave-56b F4b] ``_output_row_urls`` returns [] both for zero rows and for
+    rows carrying none of ``_ROW_URL_KEYS`` — and the C2 scope gate must tell
+    those apart: rows shipped but unharvestable make the scope comparison
+    UNVERIFIABLE, not the run empty (a title+price-only url_list output is a
+    delivering run; "0 of N seeds produced rows" would be a false assertion).
+    """
+    try:
+        with open(output_file, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    for key in _OUTPUT_ROW_KEYS:
+        val = data.get(key)
+        if isinstance(val, list) and val:
+            return len(val)
+    return 0
+
+
 def _url_list_scope_gate(
     output_file: str, seed_urls, input_mode: str = "",
 ) -> str:
@@ -2555,6 +2683,11 @@ def _url_list_scope_gate(
         # a blind spot. A MISSING file stays the no_fresh_output arm's
         # subject — this gate never saw it and still doesn't.
         if not os.path.isfile(output_file or ""):
+            return ""
+        # [wave-56b F4b] Rows shipped but none carry a URL key: the scope
+        # comparison is unverifiable here, not the run empty — failing it
+        # "0 of N" would be a false assertion on a delivering run.
+        if _output_row_count(output_file) > 0:
             return ""
         return (
             f"url_list zero-yield: 0 of {len(seeds)} submitted seeds produced "

@@ -130,14 +130,26 @@ def row_url_is_item_shaped(url: str) -> bool:
 def _exempt_leaf_item(url: str, segs: list[str]) -> bool:
     """[wave-56 F5] Is this URL a leaf item page rather than a section link?
 
-    Requires a LEAF MARKER, not just row-shapedness: a file-suffixed last
-    segment (books' ``/index.html``) or a digit-marked one in a
-    multi-segment path (the ``/catalogue/<slug>_981`` shape). The shape
-    floor deliberately passes bare keyword slugs — and the wave-50 junk
-    shapes (``/baby``, ``/sec3``) are exactly that class, so they stay
-    depth-judged. The nav-directory conjunct keeps genuine section links
+    Requires a file-suffixed last segment (books' ``/index.html``, the
+    ``<slug>_<id>/index.html`` PDP namespace). The shape floor deliberately
+    passes bare keyword slugs — and the wave-50 junk shapes (``/baby``,
+    ``/sec3``) are exactly that class, so they stay depth-judged. The
+    nav-directory conjunct keeps genuine section links
     (``/catalogue/category/...``) suspicious even on ``.html``-suffixed
     sites where ``_SUFFIX_RE`` makes every URL row-shaped.
+
+    [wave-56b F5b, corrected per critique] A suffix is a LEAF MARKER, not
+    semantics: strip it before the terminal-token check so ``/us/sale.html``
+    and ``/new-in/index.html`` stop hiding behind their file extensions.
+    The terminal check judges the STRIPPED LAST SEGMENT ONLY — mid-path
+    terminal tokens are plain directory names on sites whose PDPs hang
+    under them (the token set's own contract), so an any-segment check
+    flipped real PDPs like ``/gifts/for-him/socks.html`` into the
+    suspicious set. The digit arm is RESTORED (16% of the promoted corpus
+    exempted through it — ``/catalog/item/12345``-class PDPs carry no
+    suffix); the junk shapes it can hide stay content-gated.
+    ``/catalogue/<slug>_981/index.html`` still exempts: its stem is the
+    slug, not a nav token.
     """
     try:
         if not row_url_is_item_shaped(url):
@@ -147,9 +159,25 @@ def _exempt_leaf_item(url: str, segs: list[str]) -> bool:
     if any(s.lower() in _NAV_DIRECTORY_TOKENS for s in segs):
         return False
     last = segs[-1].lower()
+    _stem = _SUFFIX_RE.sub("", last)
+    # An index FILE's stem is meaningless ("index") — the named token sits
+    # one level up: ``/new-in/index.html`` must judge "new-in", not "index".
+    if _stem in ("index", "default") and len(segs) >= 2:
+        _stem = _SUFFIX_RE.sub("", segs[-2].lower())
+    if _stem in _NAV_TERMINAL_TOKENS:
+        return False
     if _SUFFIX_RE.search(last):
         return True
-    return bool(_DIGIT_RE.search(last)) and len(segs) >= 3
+    if _DIGIT_RE.search(last) and len(segs) >= 3:
+        # Digit arm (restored — /catalog/item/12345 and /alyshia-black-2
+        # class PDPs carry no suffix; 16% of the promoted corpus exempted
+        # through it) with one carve-out: a PAGINATION stem before the
+        # digits is a listing counter, not an item identifier
+        # (``/fiction/page-2`` stays depth-judged).
+        _alpha = re.split(r"\d", last, maxsplit=1)[0].strip("-")
+        if _alpha not in ("page", "pages", "p"):
+            return True
+    return False
 
 
 def _path_segments(url: str) -> tuple[str, list[str]]:

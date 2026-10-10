@@ -51,7 +51,8 @@ def _extended_sync_payload(monkeypatch, base=1.0, extension=0.5):
     )
 
     def fake_join(thread, *, base_timeout, activity, fresh_s, max_timeout,
-                  clock=time.monotonic, job_deadline=None, poll_s=5.0):
+                  clock=time.monotonic, job_deadline=None, poll_s=5.0,
+                  reserve_s=0.0):  # [wave-56b F6b] tracks the real signature
         t0 = time.monotonic()
         deadline = t0 + float(base_timeout) + float(extension)
         while time.monotonic() < deadline:

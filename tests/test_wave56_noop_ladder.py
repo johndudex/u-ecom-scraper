@@ -84,34 +84,40 @@ class TestStrikeOneLadderBounce:
             is None
         )
 
-    def test_ladder_exhausted_never_bounces(self):
+    def test_ladder_exhausted_spends_the_tier_axis(self):
+        """[wave-56b F2b] UPDATED from 'never_bounces' — that pin asserted
+        the exact F2 hole the deep audit flagged (exhausted-by-history at
+        strike 1 fell through and re-tested identical bytes; 580 died there).
+        With the strategy axis exhausted, the tier axis fires instead."""
         from agents.graph import _noop_strike1_ladder_bounce
 
-        assert (
-            _noop_strike1_ladder_bounce(
-                _state(
-                    "http_requests",
-                    tried=[
-                        {"strategy": "http_navigation"},
-                        {"strategy": "playwright"},
-                    ],
-                ),
-                {"noop_fix_cycles": 1},
-            )
-            is None
+        out = _noop_strike1_ladder_bounce(
+            _state(
+                "http_requests",
+                tried=[
+                    {"strategy": "http_navigation"},
+                    {"strategy": "playwright"},
+                ],
+            ),
+            {"noop_fix_cycles": 1},
         )
+        assert out is not None
+        assert out["scraper_analysis"]["proxy_tier"] == "datacenter"
+        assert out["scraper_analysis"]["strategy"] == "http_requests"
 
-    def test_playwright_top_rung_cannot_escalate_into_internal_api(self):
+    def test_playwright_top_rung_spends_the_tier_axis_not_internal_api(self):
         from agents.graph import _noop_strike1_ladder_bounce
 
-        # job-12 honesty rule: never escalate INTO internal_api — from the
-        # top practical rung there is no untried next rung, so no bounce.
-        assert (
-            _noop_strike1_ladder_bounce(
-                _state("playwright"), {"noop_fix_cycles": 1}
-            )
-            is None
+        # job-12 honesty rule preserved: never escalate INTO internal_api.
+        # [wave-56b F2b] UPDATED from 'cannot_escalate' (None) — that pinned
+        # the audited F2 hole (top-rung decline). The strike now spends the
+        # TIER axis; the strategy token never becomes internal_api.
+        out = _noop_strike1_ladder_bounce(
+            _state("playwright"), {"noop_fix_cycles": 1}
         )
+        assert out is not None
+        assert out["scraper_analysis"]["strategy"] == "playwright"
+        assert out["scraper_analysis"]["proxy_tier"] == "datacenter"
 
     def test_internal_api_current_never_bounces(self):
         from agents.graph import _noop_strike1_ladder_bounce

@@ -269,7 +269,12 @@ class TestGateOutputRows:
                 {"title": "Look 2", "currency": "USD"}]
         kept, notes, _chg = tasks._gate_output_rows(rows)
         assert len(kept) == 2
-        assert not any("PRICE-GATE" in n for n in notes)
+        # [wave-56b F9] UPDATED from 'no PRICE-GATE note at all' — that pinned
+        # the exact silence the audit flagged (589 retained 214 null-price
+        # rows behind notes that said nothing). The verdict is still not the
+        # gate's: rows kept, nothing dropped — but the retention is named.
+        assert not any("dropped" in n for n in notes)
+        assert any("zero or null price" in n for n in notes)
 
     def test_non_dict_rows_pass_through(self):
         kept, _notes, _chg = tasks._gate_output_rows(["not-a-dict", 7])
@@ -285,7 +290,10 @@ class TestGateOutputRows:
         kept, notes, changed = tasks._gate_output_rows(rows)
         assert kept == rows
         assert changed is False
-        assert not any("PRICE-GATE" in n for n in notes)
+        # [wave-56b F9] UPDATED from silence — same 589 class: unpriced rows
+        # are disclosed, never dropped and never verdict-ed by this gate.
+        assert not any("dropped" in n for n in notes)
+        assert any("zero or null price" in n for n in notes)
 
     def test_a_digit_bearing_unparseable_price_still_drops(self):
         # the other half of GAP-7: digits mean a price was claimed, and a

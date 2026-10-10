@@ -507,12 +507,19 @@ def _gate_output_rows(rows: list) -> tuple[list, list[str], bool]:
     notes: list[str] = []
     changed = False
     repaired = dropped_string = dropped_floor = currency_missing = 0
+    unpriced = 0
     for row in rows:
         if not isinstance(row, dict):
             kept.append(row)  # not a record — another reader's problem
             continue
         raw = row.get("price")
         numeric = _normalize_price(raw)
+        # [wave-56b F9] Zero and null are not prices: the floor's `!= 0`
+        # exempted them and the notes never said how many shipped — job 589
+        # retained 92 zero-price + 214 null-price rows behind a disclosure
+        # that understated retained bad prices ~8x. Count what the gate
+        # keeps unpriced; the MISSING-CORE stamp owns the verdict (GAP-7),
+        # this gate owns the honesty about what it retained.
         if numeric is None and isinstance(raw, str) and not _price_is_absent(raw):
             dropped_string += 1  # a price that claimed digits, unparseably
             changed = True
@@ -521,6 +528,11 @@ def _gate_output_rows(rows: list) -> tuple[list, list[str], bool]:
             dropped_floor += 1
             changed = True
             continue
+        # [wave-56b critique fix] Counted AFTER the drop arms so a row the
+        # gate drops (unparseable price string) is not double-counted as
+        # both "dropped" and "retained unpriced".
+        if "price" in row and (numeric is None or numeric == 0):
+            unpriced += 1
         if numeric is not None and isinstance(raw, str):
             row["price"] = numeric
             repaired += 1
@@ -540,9 +552,16 @@ def _gate_output_rows(rows: list) -> tuple[list, list[str], bool]:
         notes.append(
             f"[PRICE-GATE] {dropped_floor} row(s) dropped: price below the "
             f"{MIN_PLAUSIBLE_PRICE} floor")
+    if unpriced:
+        # No "MISSING-CORE" wording here: that token is the coverage stamp's
+        # reserved marker on the operator surface (a job that never asked for
+        # price must never read as MISSING-CORE-stamped).
+        notes.append(
+            f"[PRICE-GATE] {unpriced}/{len(kept)} row(s) retained at a zero "
+            "or null price — disclosed, not counted as priced")
     if currency_missing:
         notes.append(
-            f"[CURRENCY-MISSING] {currency_missing}/{len(rows)} row(s) carry a "
+            f"[CURRENCY-MISSING] {currency_missing}/{len(kept)} row(s) carry a "
             "price with no currency")
     return kept, notes, changed
 
@@ -1125,40 +1144,6 @@ class _RedisSetnxStore:
     def delete(self, key):
         return self._client_ref.delete(key)
 
-    @staticmethod
-    def _key(job_id) -> str:
-        return f"scraper:job-exec-lock:{job_id}"
-
-    def acquire(self, job_id, owner: str) -> bool:
-        try:
-            return bool(self.cache.add(self._key(job_id), owner, self._ttl))
-        except Exception:
-            return False
-
-    def renew(self, job_id, owner: str) -> bool:
-        try:
-            if self.cache.get(self._key(job_id)) != owner:
-                return False
-        except Exception:
-            return False
-        # Owner-only delete+add: the ms-scale window beats a non-atomic
-        # stomp, and a lost renew is logged loudly by the caller.
-        self.cache.delete(self._key(job_id))
-        return self.acquire(job_id, owner)
-
-    def release(self, job_id, owner: str) -> None:
-        try:
-            if self.cache.get(self._key(job_id)) == owner:
-                self.cache.delete(self._key(job_id))
-        except Exception:
-            return
-
-    def is_held(self, job_id) -> bool:
-        try:
-            return self.cache.get(self._key(job_id)) is not None
-        except Exception:
-            return False
-
 
 # Celery-level deadline for a scrape job. The dominant job-level failure is
 # LLM-phase hangs (code_generation / product_analysis): the per-phase
@@ -1404,6 +1389,13 @@ def run_scrape_task(self, job_id: int, rescrape: bool = False, force_full: bool 
             "Job %d: another job is already running for %s — requeueing in 60s",
             job_id, job.url[:60],
         )
+        # [wave-56b critique fix] self.retry raises Retry past the finally
+        # below, which is the ONLY release path — with the lock still held
+        # (TTL 300s > countdown 60s) the retried dispatch finds it locked,
+        # returns, and strands the claimed-RUNNING row; the honest
+        # "requeue exhausted" finalize becomes unreachable. Release before
+        # raising so the retry can actually run.
+        _exec_lock.release(job_id, owner=_exec_token)
         try:
             raise self.retry(
                 exc=RuntimeError("same-site job already running"),
@@ -1639,9 +1631,32 @@ def resume_scrape_task(self, job_id: int, human_response: Any) -> None:
     *human_response* is the value to pass to ``Command(resume=...)``.  It
     typically mirrors the ``Approval.response_data`` that the user approved
     or a dict like ``{"choice": "Yes"}``.
-    """
-    job = ScrapeJob.objects.get(pk=job_id)
 
+    [wave-56b F8] This task drives the graph INLINE — build_graph(), no
+    run_scrape_task hop — so the dispatch path's execution lock did not
+    cover it: a redelivered resume of a WAITING_APPROVAL row passed the
+    status check and ran a second graph instance on the same checkpoint
+    (the 582/583/584 dual-run shape, one approval later). Same lock, same
+    fail-closed rule: without exclusivity proof, no execution.
+    """
+    _exec_token = f"{os.getpid()}:{uuid4().hex[:8]}"
+    _exec_lock = JobExecutionLock()
+    if not _exec_lock.acquire(job_id, owner=_exec_token):
+        logger.warning(
+            "Job %d: execution lock held by a live run — skipping duplicate "
+            "resume dispatch", job_id,
+        )
+        return
+    job = ScrapeJob.objects.get(pk=job_id)
+    try:
+        _resume_scrape_locked(job_id, job, human_response)
+    finally:
+        _exec_lock.release(job_id, owner=_exec_token)
+
+
+def _resume_scrape_locked(job_id: int, job: ScrapeJob, human_response: Any) -> None:
+    """Drive the resumed graph. The caller holds the job execution lock and
+    releases it on every exit path."""
     if job.status == ScrapeJob.STATUS_RUNNING:
         logger.warning(
             "Job %d: skipping duplicate resume dispatch (status=%s)", job_id, job.status
@@ -4586,17 +4601,6 @@ def cleanup_stuck_jobs() -> None:
     _exec_lock_for_watchdog = JobExecutionLock()
     for job in stuck_jobs:
         _task_id = getattr(job, "celery_task_id", "") or ""
-        # [wave-56b F8] A live execution renews its lock every
-        # JOB_EXEC_LOCK_RENEW_S — the row is RUNNING because a graph IS
-        # running. Silence under a held lock means a quiet phase, not a
-        # corpse; a wedged holder's key self-expires within
-        # JOB_EXEC_LOCK_TTL_S and the ladder below then owns it.
-        if _exec_lock_for_watchdog.is_held(job.id):
-            logger.info(
-                "Stuck job %d: execution lock held — live run, skipping "
-                "stuck-job verdict", job.id,
-            )
-            continue
         # [wave-15 R1] A row claimed by celery but killed BEFORE the graph
         # started is provably pre-graph: RUNNING + started_at=None (stamped
         # only when _run_graph_job begins) + zero SessionLog rows of any kind
@@ -4643,6 +4647,19 @@ def cleanup_stuck_jobs() -> None:
                     _task_id,
                 )
                 continue
+        # [wave-56b F8, re-ordered per critique] A live execution renews its
+        # lock every JOB_EXEC_LOCK_RENEW_S — the row is RUNNING because a
+        # graph IS running. This skip sits AFTER the pre-graph probe above:
+        # a dead task cannot renew, so a held key under a provably-absent
+        # task is ≤JOB_EXEC_LOCK_TTL_S stale and the fast-fail owns it
+        # instead of waiting out the TTL. Anything still held here is a live
+        # run — silence means a quiet phase, not a corpse.
+        if _exec_lock_for_watchdog.is_held(job.id):
+            logger.info(
+                "Stuck job %d: execution lock held — live run, skipping "
+                "stuck-job verdict", job.id,
+            )
+            continue
         if _pre_graph:
             error_msg = (
                 f"Job was claimed by celery task {_task_id} but never started "
@@ -5380,6 +5397,16 @@ def redispatch_stuck_approved_interrupts() -> None:
             )
             job.completed_at = timezone.now()
             job.save(update_fields=["status", "error_message", "completed_at"])
+            continue
+
+        # [wave-56b F8] A live resume holds the execution lock — queueing
+        # behind it would burn resume_attempts on a dispatch the lock then
+        # refuses. Skip this candidate; the next watchdog tick re-checks.
+        if JobExecutionLock().is_held(job.id):
+            logger.info(
+                "stuck-approved watchdog: job %d execution lock held by a "
+                "live run — skipping redispatch", job.id,
+            )
             continue
 
         approval.resume_attempts += 1

@@ -3319,7 +3319,14 @@ def _summarize_test_report(state: dict) -> str:
     # violations). Unread until now; the issue relay above carried only the
     # marker text, not the fix instruction. Outside the issues guard so a
     # report with feedback and an empty issue list is not silently dropped.
-    _feedback = str(report.get("feedback_for_writer") or "").strip()
+    # [wave-56b critique fix] Post-writer directives (read-spiral force-edit)
+    # land on the TOP-LEVEL state key — merge it here so the retry slot is
+    # writer-visible instead of dying in state.
+    _feedback = str(
+        report.get("feedback_for_writer")
+        or state.get("feedback_for_writer")
+        or ""
+    ).strip()
     if _feedback:
         if len(_feedback) > _WRITER_FEEDBACK_CAP:
             _feedback = _feedback[: _WRITER_FEEDBACK_CAP - 1] + "…"
@@ -3480,7 +3487,13 @@ def _summarize_test_report(state: dict) -> str:
             )
             or ""
         )
-        if _probe_method.startswith(("browser", "fingerprint", "stealth")):
+        # [wave-56b F3b] The ladder's real vocabulary: render-class rungs
+        # (playwright/cloak/uc_chrome/legacy browser/stealth) prove a
+        # real-browser tier; `fingerprint_*` proves HTTP-with-a-replicated-
+        # browser-TLS-stack — the opposite prescription. `direct_http*`
+        # stays silent (plain HTTP worked; a wall directive would lie).
+        _wall_hay = None
+        if _probe_method:
             _wall_hay = [str(crash_error or "") if crash_error else ""]
             _sc_w = report.get("script_checks") if isinstance(report, dict) else None
             if isinstance(_sc_w, dict):
@@ -3494,7 +3507,49 @@ def _summarize_test_report(state: dict) -> str:
                         or _wi.get("problem")
                         or ""
                     ))
-            if _WALL_EVIDENCE_RE.search(" ".join(_wall_hay)):
+        if _wall_hay is not None and _WALL_EVIDENCE_RE.search(" ".join(_wall_hay)):
+            if _probe_method.startswith("fingerprint"):
+                # [guardian checkpoint 1 caveat] A stale probe label can sit
+                # on a run that itself timed out — no transport is proved
+                # then, and claiming "replicate the TLS client" would
+                # amplify the stale label. Hedge on a LABEL/EVIDENCE
+                # mismatch: connectivity carries `method_that_worked` (no
+                # "outcome" key exists), so when the probe's own working
+                # method is unknown or NOT the fingerprint class the cache
+                # names, no transport is actually proved.
+                _method_worked = str(
+                    ((state.get("probe_result") or {}).get("connectivity") or {}).get(
+                        "method_that_worked"
+                    )
+                    or ""
+                ).strip().lower()
+                if not _method_worked.startswith("fingerprint"):
+                    lines.append(
+                        f"\n**🚧 TRANSPORT WALL — selector edits cannot fix "
+                        f"this:** the probe cache names `{_probe_method}`, "
+                        f"but the probe's own working method reads "
+                        f"`{_method_worked or 'unknown'}` — the fingerprint "
+                        f"label is stale or unproved, so no transport is "
+                        f"actually proved for this site. Treat plain HTTP as "
+                        f"hostile and take the browser-class rung the ladder "
+                        f"escalates to, or record the wall honestly."
+                    )
+                else:
+                    lines.append(
+                        f"\n**🚧 TRANSPORT WALL — selector edits cannot fix "
+                        f"this:** the probe reached this site via "
+                        f"`{_probe_method}` — HTTP carrying a replicated "
+                        f"browser TLS stack, i.e. plain HTTP fingerprints "
+                        f"are blocked. Fix the TRANSPORT, not the selectors: "
+                        f"replicate the proven TLS client inside the "
+                        f"scraper's own fetch layer (browser-equivalent "
+                        f"headers and header order, HTTP/2, matching TLS "
+                        f"fingerprint). Do not switch to a real-browser "
+                        f"strategy for this and do not chase selectors."
+                    )
+            elif _probe_method.startswith(
+                ("playwright", "cloak", "uc_chrome", "browser", "stealth")
+            ):
                 lines.append(
                     f"\n**🚧 TRANSPORT WALL — selector edits cannot fix this:** "
                     f"the probe reached this site via `{_probe_method}` (a "
@@ -3518,13 +3573,33 @@ def _summarize_test_report(state: dict) -> str:
     # conservative same-bytes edits; this line outranks them).
     _prior_fp = str(state.get("last_tested_draft_fp") or "")
     if retry_count and _prior_fp:
-        lines.append(
-            f"\n**⚠️ DIFFERENTIATION REQUIRED:** the draft you are editing "
-            f"(sha1 {_prior_fp[:12]}) was already tested and FAILED. A "
-            f"byte-identical or comment-only resubmission is detected and "
-            f"ends this job. Your edit must change the failing LOGIC — "
-            f"selectors, transport, control flow — not the wording."
+        # [wave-56b critique fix] The execution recycle writes its feedback
+        # into the TEST_REPORT channel (recycled_report.feedback_for_writer),
+        # not the top-level state key — read the report first, fall back to
+        # the top-level key the read-spiral directive uses.
+        _fb = str(
+            (state.get("test_report") or {}).get("feedback_for_writer")
+            or state.get("feedback_for_writer")
+            or ""
         )
+        if _fb.startswith("EXECUTION RECYCLE"):
+            # [wave-56b F1b] The draft PASSED testing and died at execution
+            # (F4's zero-yield recycle): "already tested and FAILED" is a
+            # false assertion about a passing draft — state the real verdict.
+            lines.append(
+                f"\n**♻️ EXECUTION RECYCLE:** the draft (sha1 "
+                f"{_prior_fp[:12]}) passed testing — it died at execution, "
+                f"not in the test loop. DIFFERENTIATION from a failed draft "
+                f"does not apply here; fix what killed the execution run."
+            )
+        else:
+            lines.append(
+                f"\n**⚠️ DIFFERENTIATION REQUIRED:** the draft you are editing "
+                f"(sha1 {_prior_fp[:12]}) was already tested and FAILED. A "
+                f"byte-identical or comment-only resubmission is detected and "
+                f"ends this job. Your edit must change the failing LOGIC — "
+                f"selectors, transport, control flow — not the wording."
+            )
     # [wave-29 B5] Cross-job memory (the load-bearing surface): when this
     # failure's structural fingerprint matches a prior job's FM entry, say
     # so in the retry slot — the one injection point with proven behavioral
