@@ -237,6 +237,12 @@ class ScrapeState(TypedDict, total=False):
     # spiral counter read 0 on every pass (batch 593-600 post-mortem).
     feedback_for_writer: str
     writer_dup_read_count: int
+    # [wave-57 class 2] Terminal-arm strategy-axis pivot ledger (job 597/581/
+    # 586 class): the identical-draft death must spend ONE strategy-axis (or
+    # proxy-tier) pivot before dying. Declared for the same langgraph reason
+    # as the two keys above — undeclared, the counter never persisted and the
+    # pivot would loop.
+    writer_axis_pivot_count: int
     budget_retry_summary: str
     site_budget_retries: int
     site_budget_retry_summary: str

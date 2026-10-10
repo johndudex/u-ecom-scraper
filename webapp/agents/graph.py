@@ -7215,25 +7215,56 @@ def _noop_should_escalate(
     return test_retry_count >= MAX_TEST_RETRIES
 
 
-def _noop_strike1_ladder_bounce(state: ScrapeState, update: dict) -> dict | None:
-    """[wave-56 F2] Should no-op strike 1 spend a strategy-ladder rung?
+def _next_strategy_rung(cur: str, tried: set) -> str:
+    """[wave-57] The next UNTRIED strategy rung after ``cur`` (never
+    internal_api), or "" when none exists. Read-only — used to NAME the axis
+    in the writer directive; the rung itself is spent by scraper_analyzer's
+    ``_escalate_strategy`` off ``strategies_tried``."""
+    if cur not in _STRATEGY_ESCALATION:
+        return ""
+    for nxt in _STRATEGY_ESCALATION[
+        _STRATEGY_ESCALATION.index(cur) + 1:
+    ]:
+        if nxt == "internal_api":
+            continue
+        if nxt not in tried:
+            return nxt
+    return ""
 
-    The A2 gate detects a byte-identical draft honestly — and then re-tested
-    the identical bytes once (strike 1 fell through to code_tester) before
-    escalating on strike 2. Five of the 2026-10-09 batch's seven writer
-    deaths (570-576) ended exactly there, with the deterministic ladder one
-    bounce away and unreachable. On strike 1 (budget remaining —
-    _noop_should_escalate already claimed the exhausted-budget and step-death
-    cases), record the current strategy as tried (the no-op IS this
-    strategy's fix-loop death — it never entered ``strategies_tried`` because
-    ``classify_test_failure`` ranks the tester's ``target=scraper`` diagnosis
-    above the blocked arms) and let the caller bounce to scraper_analyzer:
-    ``_escalate_strategy`` spends the next rung, or its exhausted arm routes
-    out honestly. None = keep the legacy fall-through.
-    """
+
+def _writer_axis_directive(next_strategy: str = "", tier: str = "") -> str:
+    """[wave-57 class 2] The strategy-axis directive the pivot rides on.
+
+    Writer-visible through the declared ``feedback_for_writer`` channel
+    (wave-56b): the axis changed for the next cycle and the writer must
+    write the NEW strategy's template fresh — re-reading the old draft is
+    the exact failure the pivot exists to escape (jomashop 597: 66 reads,
+    0 edits, then death with zero axis attempts)."""
+    if tier:
+        _axis = f"the proxy TIER was raised to {tier}"
+    elif next_strategy:
+        _axis = f"the strategy changed to {next_strategy}"
+    else:
+        _axis = "the strategy axis changed"
+    return (
+        f"[STRATEGY AXIS PIVOT] {_axis} for the next cycle. Write the draft "
+        "for the NEW strategy from its template file as a fresh "
+        "implementation. Do NOT re-read the previous draft and do NOT "
+        "reproduce it — a byte-identical regeneration after failed tests is "
+        "the failure this pivot exists to escape."
+    )
+
+
+def _strategy_axis_escape(state: ScrapeState, update: dict) -> dict | None:
+    """[wave-57] The strike-agnostic axis-escape body shared by the strike-1
+    bounce and the terminal-arm pivot: record the current strategy as tried
+    and let scraper_analyzer spend the next rung; when the strategy ladder
+    is exhausted (or the current rung is already burnt), spend the TIER axis
+    once. Returns the bounce update dict, or None when no axis experiment
+    remains. Deliberately does NOT touch ``writer_axis_pivot_count`` — that
+    ledger belongs to the terminal-arm pivot only, so the strike-1 ladder
+    keeps its full length."""
     try:
-        if int(update.get("noop_fix_cycles") or 0) != 1:
-            return None
         _analysis = dict(state.get("scraper_analysis") or {})
         cur = str(_analysis.get("strategy") or "").strip()
         if cur not in _STRATEGY_ESCALATION:
@@ -7253,6 +7284,7 @@ def _noop_strike1_ladder_bounce(state: ScrapeState, update: dict) -> dict | None
         _rung_already_tried = cur in all_tried
         all_tried.add(cur)  # the no-op strike IS this strategy's failed cycle
         _esc, goto = _escalate_strategy(dict(_analysis), all_tried)
+        _next = _next_strategy_rung(cur, all_tried - {cur})
         if goto or _rung_already_tried:
             # [wave-56b F2b] Strategy axis exhausted at strike 1 — the top
             # rung (playwright always gotos: internal_api is skipped) or the
@@ -7264,6 +7296,7 @@ def _noop_strike1_ladder_bounce(state: ScrapeState, update: dict) -> dict | None
                 _tier_esc = _escalate_tier_axis(dict(_analysis))
                 if _tier_esc is not None:
                     _prev_tier = str(_analysis.get("proxy_tier") or "none") or "none"
+                    _new_tier = str(_tier_esc.get("proxy_tier") or "")
                     return {
                         "scraper_analysis": _tier_esc,
                         "strategies_tried": [{
@@ -7271,10 +7304,13 @@ def _noop_strike1_ladder_bounce(state: ScrapeState, update: dict) -> dict | None
                             "reason": (
                                 "no-op fix loop: strategy ladder exhausted "
                                 f"for {cur} — climbing proxy tier "
-                                f"{_prev_tier} -> {_tier_esc.get('proxy_tier')} "
+                                f"{_prev_tier} -> {_new_tier} "
                                 "instead of re-testing identical bytes"
                             ),
                         }],
+                        "feedback_for_writer": _writer_axis_directive(
+                            tier=_new_tier
+                        ),
                     }
             return None  # tier axis spent/exhausted too — strike 2 owns the exit
         return {
@@ -7285,9 +7321,63 @@ def _noop_strike1_ladder_bounce(state: ScrapeState, update: dict) -> dict | None
                     "strategy (draft unchanged after failed tests)"
                 ),
             }],
+            "feedback_for_writer": _writer_axis_directive(next_strategy=_next),
         }
     except Exception:
         return None
+
+
+def _noop_strike1_ladder_bounce(state: ScrapeState, update: dict) -> dict | None:
+    """[wave-56 F2] Should no-op strike 1 spend a strategy-ladder rung?
+
+    The A2 gate detects a byte-identical draft honestly — and then re-tested
+    the identical bytes once (strike 1 fell through to code_tester) before
+    escalating on strike 2. Five of the 2026-10-09 batch's seven writer
+    deaths (570-576) ended exactly there, with the deterministic ladder one
+    bounce away and unreachable. On strike 1 (budget remaining —
+    _noop_should_escalate already claimed the exhausted-budget and step-death
+    cases), record the current strategy as tried (the no-op IS this
+    strategy's fix-loop death — it never entered ``strategies_tried`` because
+    ``classify_test_failure`` ranks the tester's ``target=scraper`` diagnosis
+    above the blocked arms) and let the caller bounce to scraper_analyzer:
+    ``_escalate_strategy`` spends the next rung, or its exhausted arm routes
+    out honestly. None = keep the legacy fall-through.
+
+    [wave-57] The bounce now carries the writer-visible strategy-axis
+    directive (``feedback_for_writer``), and the shared escape body it calls
+    never touches ``writer_axis_pivot_count`` — the strike-1 ladder must
+    keep its full length; only the terminal-arm pivot spends that ledger.
+    """
+    try:
+        if int(update.get("noop_fix_cycles") or 0) != 1:
+            return None
+    except Exception:
+        return None
+    return _strategy_axis_escape(state, update)
+
+
+def _writer_axis_pivot(state: ScrapeState, update: dict) -> dict | None:
+    """[wave-57 class 2] The terminal arm's last-chance axis spend.
+
+    jomashop 597 died "identical draft twice" with ZERO strategy-axis
+    attempts: the read-spiral abort arm force-set ``noop_fix_cycles=2`` and
+    the terminal return fired before the strike-1 bounce was reachable. The
+    identical-draft death must spend ONE axis pivot first — a different
+    strategy/template (or proxy tier) is a genuinely different experiment;
+    dying without trying one is a wasted proven-passer. Bounded: at most one
+    pivot per job (``writer_axis_pivot_count``); a pivot is refused when no
+    axis experiment remains (ladder + tier exhausted, or an unknown strategy
+    token no rung can be derived from)."""
+    try:
+        if int(state.get("writer_axis_pivot_count") or 0):
+            return None
+    except Exception:
+        return None
+    _out = _strategy_axis_escape(state, update)
+    if _out is None:
+        return None
+    _out["writer_axis_pivot_count"] = 1
+    return _out
 
 
 def _writer_hit_step_budget(result) -> bool:
@@ -8698,6 +8788,32 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                             "tested draft — the next tester cycle would "
                             "re-test identical code (escalating instead of "
                             "burning the round)."
+                        )
+                    # [wave-57 class 2] The death demands a strategy-axis try
+                    # first (job 597/581/586: the spiral-abort force-2 made
+                    # the terminal return fire with ZERO axis attempts — the
+                    # strike-1 bounce was unreachable from here). Spend the
+                    # pivot (once per job) before either terminal return;
+                    # scraper_analyzer spends the rung and the writer gets
+                    # the axis directive through the declared channel.
+                    _pivot = _writer_axis_pivot(state, update)
+                    if _pivot is not None:
+                        _log_event_row(
+                            job_id, "code_writer",
+                            "[NO-OP AXIS PIVOT] identical draft at the "
+                            "terminal arm — spending the strategy-axis "
+                            "pivot (bounce to scraper_analyzer) instead of "
+                            "dying with zero axis attempts",
+                        )
+                        return Command(
+                            goto="scraper_analyzer",
+                            update={**update, **_pivot, "messages": []},
+                        )
+                    if int(state.get("writer_axis_pivot_count") or 0):
+                        _noop_note += (
+                            " A strategy-axis pivot was already spent and "
+                            "the draft stayed identical — no untried axis "
+                            "experiment remains."
                         )
                     _notify_phase(job_id, "code_writer", "failed")
                     if state.get("skip_approvals", False):
