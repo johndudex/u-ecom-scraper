@@ -230,6 +230,13 @@ class ScrapeState(TypedDict, total=False):
     # product_analyzer the extended budget + skipped its escalation interrupt).
     # Kept (legacy alias) for back-compat; new code reads the per-phase fields.
     budget_retry_count: int
+    # [wave-56b edit-or-die, guardian veto-class fix] Both writer channels MUST
+    # be declared: langgraph silently strips undeclared keys from a node's
+    # update (same contract as shortfall_remediation_count above). Undeclared,
+    # the edit-or-die directive never reached the writer and the cross-window
+    # spiral counter read 0 on every pass (batch 593-600 post-mortem).
+    feedback_for_writer: str
+    writer_dup_read_count: int
     budget_retry_summary: str
     site_budget_retries: int
     site_budget_retry_summary: str
