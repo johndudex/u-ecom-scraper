@@ -2716,31 +2716,44 @@ def _url_list_scope_gate(
     except Exception:
         _listing_seeds = False
     if _listing_seeds:
+        # Host comparator needs ONE unambiguous seed host: a multi-host
+        # paste (intake's B3 gate only covers listing/search nav methods,
+        # not url_list) has no "the seeds' own host" to extend scope across
+        # — an ambiguous-host listing-seed set falls through to the strict
+        # membership branch below (never loosens on a guess).
+        _loosen_host = ""
         try:
-            from src.discovery_quality import row_url_is_item_shaped
             from src.registrable import registrable_of
 
             _seed_hosts = {registrable_of(u) for u in seed_list}
             _seed_hosts.discard("")
-            strays = [
-                u for u in urls
-                if (registrable_of(u) not in _seed_hosts)
-                or not row_url_is_item_shaped(u)
-            ]
+            if len(_seed_hosts) == 1:
+                _loosen_host = next(iter(_seed_hosts))
         except Exception:
-            strays = []
-        if not strays:
-            return ""
-        examples = ", ".join(repr(s[:100]) for s in strays[:3])
-        return (
-            f"url_list scope violation (listing seeds): {len(strays)}/"
-            f"{len(urls)} output rows are off-host or not item-shaped "
-            f"({examples}) — the submitted seeds are LISTING urls, so "
-            f"discovery scope extends behind them, but every row must "
-            f"still be an item page on the seeds' own host "
-            f"(jjshouse 566 class). Fix discovery's item-URL filtering, "
-            f"not the field selectors."
-        )
+            _loosen_host = ""
+        if _loosen_host:
+            try:
+                from src.discovery_quality import row_url_is_item_shaped
+
+                strays = [
+                    u for u in urls
+                    if (registrable_of(u) != _loosen_host)
+                    or not row_url_is_item_shaped(u)
+                ]
+            except Exception:
+                strays = []
+            if not strays:
+                return ""
+            examples = ", ".join(repr(s[:100]) for s in strays[:3])
+            return (
+                f"url_list scope violation (listing seeds): {len(strays)}/"
+                f"{len(urls)} output rows are off-host or not item-shaped "
+                f"({examples}) — the submitted seeds are LISTING urls, so "
+                f"discovery scope extends behind them, but every row must "
+                f"still be an item page on the seeds' own host "
+                f"(jjshouse 566 class). Fix discovery's item-URL filtering, "
+                f"not the field selectors."
+            )
     strays = [u for u in urls if _submitted_url_key(u) not in seeds]
     if not strays:
         return ""

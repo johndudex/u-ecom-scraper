@@ -256,6 +256,44 @@ class TestScopeGateListingSeeds:
             str(tmp_path / "nope.json"), JJHOUSE_SEEDS, "url_list"
         ) == ""
 
+    def test_multihost_listing_seeds_stay_strict(self, tmp_path):
+        """Critique fold: intake's B3 host gate covers only listing/search
+        nav methods, so a multi-host url_list paste is legal. There is no
+        'the seeds' own host' to extend scope across — stay strict."""
+        seeds = [
+            "https://www.jjshouse.com/all/bridesmaid-dresses",
+            "https://www.other-dresses.com/collection/girls-dresses",
+        ]
+        rows = [_row(i) for i in range(5)]
+        out = _write_output(tmp_path, rows)
+        assert "scope violation" in _url_list_scope_gate(
+            out, seeds, "url_list"
+        )
+
+    def test_unverifiable_rows_stay_noop_under_listing_seeds(self, tmp_path):
+        """Critique fold (F4b): rows shipped but NONE carry a URL key — the
+        scope comparison is unverifiable, not the run empty. The lenient
+        branch must not turn that into a violation."""
+        out = tmp_path / "output_run.json"
+        out.write_text(json.dumps({
+            "site": "jjshouse-com",
+            "products": [{"title": "no url key", "price": 1.0}],
+            "metadata": {},
+        }), encoding="utf-8")
+        assert _url_list_scope_gate(out, JJHOUSE_SEEDS, "url_list") == ""
+
+    def test_shallow_and_scope_gates_agree_on_566_shape(self, tmp_path):
+        """The shallow-section gate runs FIRST and anchors on seeds[0] — the
+        #566 shape must clear BOTH gates (a scope pass the shallow gate
+        vetoes is still a missed pass)."""
+        from webapp.agents.nodes.run_execution import _shallow_section_gate
+
+        out = _write_output(tmp_path, [_row(i) for i in range(913)])
+        assert _shallow_section_gate(
+            out, "", "url_list", seed_urls=JJHOUSE_SEEDS
+        ) == ""
+        assert _url_list_scope_gate(out, JJHOUSE_SEEDS, "url_list") == ""
+
 
 @pytest.mark.parametrize("url,expected", [
     ("https://www.jjshouse.com/all/bridesmaid-dresses", True),

@@ -1356,7 +1356,25 @@ def _job_input_urls(job) -> dict:
         "input_urls": urls[:INPUT_URLS_DISPLAY_CAP],
         "input_urls_count": len(urls),
         "input_urls_truncated": len(urls) > INPUT_URLS_DISPLAY_CAP,
+        # [wave-57 class 1a] Panel truth (wave-54 contract): a seed set that
+        # reads as listings drives the runtime scope gate's extending arm —
+        # the panel must say so, not describe a plain N-item url_list.
+        **(
+            {"seeds_class": "listing_shaped"}
+            if _seeds_class(urls) == "listing_shaped" else {}
+        ),
     }
+
+
+def _seeds_class(urls: list) -> str:
+    """Best-effort shape class of a url_list seed set (display + panel
+    truth). '' when the classifier cannot judge."""
+    try:
+        from src.discovery_quality import seeds_are_listing_shaped
+
+        return "listing_shaped" if seeds_are_listing_shaped(urls) else ""
+    except Exception:
+        return ""
 
 
 @login_required
