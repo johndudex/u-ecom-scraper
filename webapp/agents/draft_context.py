@@ -14,10 +14,12 @@ prompt every fix cycle. ``render_writer_embed`` is the single dispatch:
   PARSE (587's exact state) the slices degrade to raw character cuts and
   the map is dropped — never crash the embed.
 
-Dormancy: the kill-switch (``CODE_WRITER_EMBED_MODE``, resolved in
-``subagents``) defaults to ``full``, so bounded is dormant until wave-25e
-E2a flips it. [wave-25e E1] adds ``build_draft_map`` + ``classify_embed``;
-E2a owns the flip.
+Dormancy: LIFTED. [wave-25e E1] added ``build_draft_map`` +
+``classify_embed``; the settings kill-switch (``CODE_WRITER_EMBED_MODE``)
+has defaulted to ``bounded`` since wave-25e, and [wave-59 C2] wires fresh
+writes to the size-only golden (``classify_embed(eow_active=None)``) — a
+≥40k FILE template now ships bounded (with kind-aware pointer notes), while
+EOW fix cycles keep the True golden.
 """
 
 from __future__ import annotations
@@ -42,9 +44,33 @@ _FRAME_HEADER = (
 )
 
 _DO_NOT_READ_NOTE = (
+    # [wave-59 C2] The W24-6 text ("templates/ does not exist in this
+    # container") was FALSE — templates/ is baked into the writer container
+    # and reads are project-root-wide. The kind-aware note below says what
+    # is actually true for each embed kind.
     "NOTE: the template above is embedded in this prompt — do NOT "
     "read_file templates/*.py; that path does not exist in this container.\n"
 )
+
+
+def _do_not_read_note(embed_kind: str, template_file: str) -> str:
+    """Kind-aware honesty note under a bounded embed.
+
+    - file-kind: the elided bodies ARE on disk at templates/<name> (verified
+      present); point at targeted line-span reads — reading the whole 90k
+      file back into context would defeat the diet.
+    - draft-kind: the base is the existing draft at its workspace path (the
+      pointer note carries it); templates/ is not the source here.
+    """
+    if embed_kind == "file" and template_file:
+        return (
+            "NOTE: only HEAD and TAIL of the template are shown above. The "
+            f"elided bodies live at `templates/{template_file}` (present in "
+            "this container) at the line spans in the map below — read the "
+            "SPANS you need with `read_file(path, line=<span start>)`; do "
+            "NOT read the whole file back into context.\n"
+        )
+    return _DO_NOT_READ_NOTE
 
 _MAP_HEADER = (
     "### Draft map (line spans index the FULL file — middle body not shown)\n"
@@ -202,6 +228,8 @@ def render_writer_embed(
     head: int = HEAD_CHARS,
     tail: int = TAIL_CHARS,
     map_max_chars: int = MAP_MAX_CHARS,
+    embed_kind: str = "draft",
+    template_file: str = "",
 ) -> str:
     """Embed ``code`` into the writer's system prompt.
 
@@ -210,6 +238,12 @@ def render_writer_embed(
     ``head + tail`` (below that there is nothing to elide and full is
     returned — a small draft keeps the exact legacy embed) and indexes the
     elided region with the ast map.
+
+    [wave-59 C2] ``embed_kind`` selects the honesty notes: "draft" keeps the
+    legacy workspace-draft pointer (the draft exists on disk); "file" points
+    the elided-region reads at the REAL template file in templates/ (W24-6's
+    "does not exist" claim was false) instead of a workspace draft that does
+    not exist until the writer's first write.
     """
     if not code:
         return system_prompt
@@ -229,13 +263,21 @@ def render_writer_embed(
         )
     else:
         map_block = _MAP_UNAVAILABLE
+    if embed_kind == "file" and template_file:
+        pointer = (
+            "NOTE: the full template is at "
+            f"`templates/{template_file}` — inspect any elided region "
+            "there before editing; your draft starts as a copy of it.\n"
+        )
+    else:
+        pointer = _pointer_note(slug)
     return (
         system_prompt
         + _FRAME_HEADER
         + _slice_bounded(code, head, tail)
         + "\n```\n"
         + map_block
-        + _DO_NOT_READ_NOTE
-        + _pointer_note(slug)
+        + _do_not_read_note(embed_kind, template_file)
+        + pointer
         + _STALENESS_NOTE
     )

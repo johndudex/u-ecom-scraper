@@ -890,6 +890,7 @@ def create_code_writer(
     template_code: str = "",
     embed_mode: str = "",
     embed_kind: str = "",
+    template_file: str = "",
 ) -> object:
     return _build_agent(
         "code_writer",
@@ -897,6 +898,7 @@ def create_code_writer(
         template_code=template_code,
         embed_mode=embed_mode,
         embed_kind=embed_kind,
+        template_file=template_file,
     )
 
 
@@ -1266,8 +1268,15 @@ def _embed_template(system_prompt: str, template_code: str) -> str:
         "the argparse, and the env-var gate UNCHANGED. Do NOT define "
         "`_click_load_more`, `_get_next_page_url`, or any pagination loop inline.\n\n"
         "```python\n" + template_code + "\n```\n"
-        "NOTE: the template above is embedded in this prompt — do NOT "
-        "read_file templates/*.py; that path does not exist in this container.\n"
+        # [wave-59 C2] The W24-6 note claimed templates/ "does not exist in
+        # this container" — FALSE (verified: Dockerfile bakes it + the
+        # compose bind mounts it, reads are project-root-wide). The honest
+        # instruction keeps the original intent (job 393 burned 4 read_file
+        # attempts re-reading what the prompt already carried) without the
+        # false existence claim.
+        "NOTE: the template above is the COMPLETE file, already in your "
+        "context — do not spend read_file calls re-reading it from "
+        "templates/; spend them on the site instead.\n"
     )
 
 
@@ -1325,6 +1334,7 @@ def _build_agent(
     template_code: str = "",
     embed_mode: str = "",
     embed_kind: str = "",
+    template_file: str = "",
 ) -> object:
     prompt_stem = AGENT_PROMPT_MAP[agent_name]
     temperature = AGENT_TEMPERATURES[prompt_stem]
@@ -1366,6 +1376,8 @@ def _build_agent(
         head=_head,
         tail=_tail,
         map_max_chars=_embed_map_max_chars(),
+        embed_kind=embed_kind or "draft",
+        template_file=template_file,
     )
     # [wave-25e E0] Measure the embed + the final prompt. The numbers ride
     # the agent object so the NODE can persist one [WRITER-EMBED] SessionLog

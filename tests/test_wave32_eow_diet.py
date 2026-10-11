@@ -134,17 +134,20 @@ class TestKillSwitch:
 
 
 class TestWiring:
-    def test_first_cycle_still_full_embed(self):
-        """[EOW boundary, main call site] bounded is requested ONLY when
-        the edit-over-write base is live AND the base exceeds the budget —
-        a first cycle (no EOW) is always full."""
+    def test_first_cycle_classifies_on_size(self):
+        """[EOW boundary, main call site; wave-59 C2 revised] Fresh writes
+        (no EOW base) classify on SIZE alone — ``eow_active=(_eow_active or
+        None)`` — so a ≥40k file template ships bounded. EOW fix cycles keep
+        the True golden. (The pre-C2 claim "a first cycle is always full" is
+        what kept the 92,550-char template embed riding every fresh turn —
+        the R2 dormancy.)"""
         import inspect
 
         body = inspect.getsource(g._invoke_code_writer)
-        # the requested mode is the conditional: BOTH the EOW flag and the
-        # size budget helper gate it, and it rides the create call
+        # the requested mode is the conditional: the EOW flag (or the
+        # size-only golden) gates it, and it rides the create call
         assert "_embed_mode = (" in body
-        assert "_eow_active" in body.split("_embed_mode = (", 1)[1].split(")", 1)[0]
+        assert "eow_active=(_eow_active or None)" in body
         assert "_embed_full_max_chars()" in body
         assert "embed_mode=_embed_mode" in body
 

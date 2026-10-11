@@ -8388,17 +8388,22 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
             _pre_draft = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
             messages = _preseed_failure_region(state, messages, _pre_draft)
         try:
-            # [wave-32 D5] Embed diet: only a huge edit-over-write BASE is
-            # worth eliding — bounded iff the EOW base is live AND it
-            # exceeds the full-embed budget. The kill-switch (default
-            # "full") still vetoes at resolve time, so D5 ships dormant;
-            # fixers inherit the same agent object.
-            # [wave-25e E1] classify_embed IS this golden condition.
+            # [wave-32 D5] Embed diet: bounded iff the base exceeds the
+            # full-embed budget. [wave-25e E1] classify_embed IS this golden
+            # condition. [wave-59 C2] Fresh writes now classify on SIZE ALONE
+            # (``eow_active=None`` — the finisher's existing golden): a
+            # ≥40k template embed (http_navigation 92,550 / navigation ~57k)
+            # was eating 52-71% of the writer's 180k input budget every fresh
+            # turn, collapsing post-trim history to ~62k and driving the
+            # 114-reads/0-edits spiral (R2 623-inv2). EOW fix cycles keep the
+            # True golden byte-identically. The resolver honors the settings
+            # default ("bounded" since wave-25e); CODE_WRITER_EMBED_MODE=full
+            # env-restores the legacy embed.
             from .draft_context import classify_embed
 
             _embed_mode = (
                 classify_embed(
-                    _template_code, eow_active=_eow_active,
+                    _template_code, eow_active=(_eow_active or None),
                     full_max_chars=_embed_full_max_chars(),
                 )
             )
@@ -8406,6 +8411,7 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 site_slug=slug, template_code=_template_code,
                 embed_mode=_embed_mode,
                 embed_kind="draft" if _eow_active else "file",
+                template_file="" if _eow_active else _template_file,
             )
         except BaseException:
             _writer_fix_cycle.reset(_w24_nudge_token)
