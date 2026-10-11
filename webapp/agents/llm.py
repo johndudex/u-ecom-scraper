@@ -94,13 +94,28 @@ except Exception:  # pragma: no cover — httpx ships with langchain-openai
         """Fallback shape when httpx is unavailable (still timeout-flavored)."""
 
 
-def _no_chunk_timeout() -> float:
+def _no_chunk_timeout(client=None) -> float:
     """No-chunk watchdog budget in seconds (lazy read; 0 disables the guard).
 
     Default 240s: comfortably above healthy first-token latency for long
     codegen prompts (measured silent-but-healthy turns ran 73-150s) and far
     below the 1800s phase abandonment the watchdog replaces.
+
+    [wave-58 guardian change 5] ``client`` may carry a per-lane override
+    (``_no_chunk_timeout_override``): the writer lane streams now, and its
+    measured first-chunk latency over a writer-shaped prefill (58K chars +
+    9 tools, canary 2026-10-11, n=5) ran median 38.7s / p95 141.3s — only
+    1.7x under the global 240s. The writer lane therefore carries its own
+    300s budget instead of loosening the global for every short analysis
+    call.
     """
+    try:
+        if client is not None:
+            override = getattr(client, "_no_chunk_timeout_override", None)
+            if override:
+                return float(override)
+    except Exception:
+        pass
     try:
         return float(getattr(settings, "LLM_NO_CHUNK_TIMEOUT", 240))
     except Exception:
@@ -591,7 +606,7 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
             chunks = _retry_classified_sync(
                 lambda: _consume_with_no_chunk_deadline(
                     _super_stream(messages, stop=stop, run_manager=run_manager, **kwargs),
-                    _no_chunk_timeout(),
+                    _no_chunk_timeout(self),
                 ),
                 cfg,
                 model=self._breaker_key(),
@@ -611,7 +626,7 @@ class ClassifiedRetryChatOpenAI(ChatOpenAI):
             # Async twin of the sync no-chunk watchdog: per-chunk wait_for —
             # unlike the sync lane, async cancellation is clean here (the
             # pending __anext__ is actually cancelled on timeout).
-            timeout = _no_chunk_timeout()
+            timeout = _no_chunk_timeout(self)
             if timeout <= 0:
                 return [
                     chunk
@@ -672,6 +687,7 @@ def get_llm(
     temperature: float = 0.3,
     timeout: int | None = None,
     retry_cfg: dict | None = None,
+    streaming: bool | None = None,
 ) -> ChatOpenAI:
     """Create a ChatOpenAI instance configured for the Z.AI API (or the LiteLLM
     proxy for ``litellm/``-prefixed models — see ``_provider_for``).
@@ -683,6 +699,14 @@ def get_llm(
     ``LLM_CLASSIFIED_RETRY`` kill-switch is off. Pass ``timeout`` (seconds) to
     override the default ``LLM_REQUEST_TIMEOUT`` for short-lived calls (e.g.
     field discovery).
+
+    Pass ``streaming=True`` to force SSE streaming for a specific lane
+    (``None`` keeps the default: litellm-routed models only). [wave-58
+    guardian change 4] the code_writer lane passes True — a non-streaming
+    writer call burns its whole per-call budget in dead air before the first
+    byte (RCA A7: CODE_WRITER_LLM_TIMEOUT=1500 against a window with less
+    than that left, no chunk heartbeat, no watchdog), while a streamed call
+    surfaces a first chunk in seconds and lets the no-chunk watchdog work.
 
     LiteLLM-prefixed models get ``streaming=True``: the proxy's gateway 504s a
     non-streaming request whose generation exceeds ~60s (measured), and the
@@ -720,7 +744,11 @@ def get_llm(
         # here rather than hanging indefinitely).
         timeout=timeout if timeout is not None else getattr(settings, "LLM_REQUEST_TIMEOUT", 600),
         # LiteLLM proxy: gateway 504s non-streaming gens > ~60s (measured).
-        streaming=_is_litellm_model(effective),
+        # [wave-58] a lane may force streaming (code_writer); None keeps the
+        # litellm-only default.
+        streaming=(
+            _is_litellm_model(effective) if streaming is None else bool(streaming)
+        ),
     )
     if _classified_retry_enabled():
         # Phase 2: max_retries=0 (no blind SDK retry) + classified retry layer.
@@ -737,11 +765,14 @@ def get_llm(
     return ChatOpenAI(max_retries=getattr(settings, "LLM_MAX_RETRIES", 5), **base_kwargs)
 
 
-def get_main_llm(temperature: float = 0.3) -> ChatOpenAI:
+def get_main_llm(
+    temperature: float = 0.3, streaming: bool | None = None
+) -> ChatOpenAI:
     """Return the main model (glm-5-turbo) for subagent reasoning."""
     return get_llm(
         model=getattr(settings, "ZAI_MAIN_MODEL", "glm-5-turbo"),
         temperature=temperature,
+        streaming=streaming,
     )
 
 

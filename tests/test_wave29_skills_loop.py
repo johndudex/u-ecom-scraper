@@ -128,7 +128,10 @@ class TestSkillBlurbGating:
         monkeypatch.setattr(sa, "_get_tools_sync", fake_tools)
         monkeypatch.setattr(sa, "_strip_v_prefix_from_tools", lambda t: t)
         monkeypatch.setattr(sa, "_install_invocation_cancellation", lambda: None)
-        monkeypatch.setattr(sa, "get_main_llm", lambda temperature: object())
+        monkeypatch.setattr(
+            sa, "get_main_llm",
+            lambda temperature, streaming=None: object(),
+        )  # [wave-58] get_main_llm grew the optional streaming kwarg
         monkeypatch.setattr(sa, "create_react_agent", fake_react)
 
         tester_prompt = sa._build_agent("code_tester")["prompt"]

@@ -107,6 +107,47 @@ def _agent_llm_timeouts() -> dict[str, int]:
 _AGENT_LLM_TIMEOUTS: dict[str, int] = _agent_llm_timeouts()
 
 
+def _code_writer_streams() -> bool:
+    """[wave-58 guardian change 4] The writer lane streams its LLM calls.
+
+    RCA A7 (batch 613-616): the writer's client was built NON-streaming for
+    any non-litellp-prefixed model, so a slow generation produced ZERO bytes
+    until the whole per-call timeout — dead air the no-chunk watchdog cannot
+    see into, and the exact shape that burned 615s of a window that had less
+    than that left. Streaming surfaces a first chunk in seconds and lets
+    LLM_NO_CHUNK_TIMEOUT do its job. Writer-scoped ONLY: the analysis/tester
+    lanes keep the litellm-only default (their calls are short and their
+    prompts small). Kill-switch: ``CODE_WRITER_STREAMING=0``.
+    """
+    import os
+
+    return os.environ.get("CODE_WRITER_STREAMING", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _writer_no_chunk_timeout() -> float:
+    """[wave-58 guardian change 5] The writer lane's no-chunk watchdog
+    budget (env ``WRITER_LLM_NO_CHUNK_TIMEOUT``, default 300s).
+
+    Streaming canary through the writer's resolved client (writer-shaped
+    prefill: 58K chars + 9 tools, 2026-10-11, n=5): TTFC min 12.9s / median
+    38.7s / p95 141.3s. The global 240s budget leaves only 1.7x headroom
+    over measured healthy first-chunk latency — a healthy-but-slow tail
+    would be killed mid-codegen — so the streaming lane carries 300s (~2.1x
+    p95) WITHOUT loosening the global for every short analysis call.
+    """
+    import os
+
+    try:
+        return float(os.environ.get("WRITER_LLM_NO_CHUNK_TIMEOUT", "") or 300)
+    except Exception:
+        return 300.0
+
+
 # ── Internal name mapping: agent node name → prompt file stem ─────────────
 
 AGENT_PROMPT_MAP: dict[str, str] = {
@@ -1352,15 +1393,29 @@ def _build_agent(
     _model_override = (
         getattr(_settings, _model_setting, None) if _model_setting else None
     )
+    # [wave-58 guardian change 4] writer-scoped streaming (RCA A7): forced
+    # True for the writer lane (kill-switch CODE_WRITER_STREAMING=0), left
+    # None for every other agent so their clients keep the litellm-only
+    # default.
+    _writer_streams = prompt_stem == "code-writer" and _code_writer_streams()
     if _model_override:
         llm = get_llm(
             model=_model_override,
             temperature=temperature,
             timeout=_AGENT_LLM_TIMEOUTS.get(prompt_stem),
             retry_cfg=_AGENT_RETRY_OVERRIDES.get(prompt_stem),
+            streaming=True if _writer_streams else None,
         )
     else:
-        llm = get_main_llm(temperature)
+        llm = get_main_llm(temperature, streaming=True if _writer_streams else None)
+    if _writer_streams:
+        # [wave-58 guardian change 5] the streaming writer lane carries its
+        # own no-chunk budget — measured healthy TTFC runs to 141.3s (p95),
+        # too close to the global 240s.
+        try:
+            llm._no_chunk_timeout_override = _writer_no_chunk_timeout()
+        except Exception:
+            pass  # a stub client in tests; the override is best-effort
 
     logger.info(
         "Creating agent '%s' (model=%s, temp=%.1f, prompt_stem=%s, tools=%d)",
