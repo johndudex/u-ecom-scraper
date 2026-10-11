@@ -1210,7 +1210,15 @@ def _preserve_test_report(slug: str) -> None:
 # the wall clock it was never meant to outrun. 150 rounds (limit 452) puts
 # GraphRecursionError far past anything the 1800-2700s wall clock can reach
 # at the measured 15-160 s/turn: the wall clock is the backstop again.
-_WRITER_ROUNDS = 150
+# [wave-59 C5] 625 wonderbly still died on RecursionError BELOW its wall —
+# the R2 window restoral (1800/2700) buys ~120 more turns than the 1200s
+# pin did. 200 rounds (limit 602 ≈ 3070s at the measured 15 s/turn floor)
+# keeps GraphRecursionError past the 2700s max wall for every window the
+# operator can configure: the wall clock stays the backstop, the recursion
+# floor stays theoretical. (Reclassification of fast-ceiling deaths was
+# DROPPED in review — recursion-class stays recursion-class; wall-only
+# keeps the T12 grant.)
+_WRITER_ROUNDS = 200
 
 AGENT_RECURSION_MAP: dict[str, int] = {
     "site_analyzer": 250,
@@ -5670,19 +5678,35 @@ def _apply_listing_seed_strategy(analysis: dict, state: ScrapeState) -> dict:
     strategy = str(analysis.get("strategy") or "").strip().lower()
     from .constants import API_STRATEGIES
 
-    if strategy not in API_STRATEGIES:
+    # [wave-59 C6] LOCAL widen: http_requests joins the walk list for
+    # LISTING-SHAPED seeds. The shared API_STRATEGIES constant stays
+    # untouched — template-family flag maps and the escalation ladder must
+    # not see http_requests reclassified globally — but a bare http_requests
+    # pick on listing seeds walks too: its single-phase fetch of a LISTING
+    # page is the R2 shape (item discovery off a category page needs the
+    # two-phase machinery http_navigation carries; wave-58's "requests
+    # already walks" branch is env-gated and never fired in prod — the
+    # fleet scan found ZERO http_requests+listing-shaped shipped scrapers,
+    # so nothing regresses).
+    _walk = strategy in API_STRATEGIES or strategy == "http_requests"
+    if not _walk:
         return analysis
     out = dict(analysis)
     out["strategy"] = "http_navigation"
     out["listing_seed_discovery"] = True
+    out["listing_seed_reason"] = (
+        f"listing-shaped url_list seeds: {strategy} → http_navigation "
+        "two-phase discovery (walk the listing pages the user provided)"
+    )
     for _k in ("scraping_mechanism", "scraping_method", "recommended_strategy",
                "mechanism"):
         _v = str(out.get(_k) or "").strip().lower()
-        if _v in API_STRATEGIES:
+        if _v in API_STRATEGIES or _v == "http_requests":
             out[_k] = "http_navigation"
     logger.info(
-        "_apply_listing_seed_strategy: listing-shaped url_list seeds — api → "
+        "_apply_listing_seed_strategy: listing-shaped url_list seeds — %s → "
         "http_navigation (phase-1 discovery) [job %s]",
+        strategy or "api",
         (state or {}).get("job_id", 0),
     )
     return out
@@ -5841,6 +5865,33 @@ def _decide_strategy(state: ScrapeState) -> dict[str, Any]:
             )
         if _new_tried:
             update["strategies_tried"] = _new_tried  # append (Annotated[list, operator.add])
+        # [wave-59 C7] Death-arrival rotation: a writer-retry arrival (the
+        # writer stamped code_writer_error_count) whose deterministic pick
+        # DELTAS from the dead strategy must not inherit the dead draft —
+        # repairing a draft for an abandoned strategy is wasted windows, and
+        # the edit-over-write / draft-finisher / read_file lanes all pull the
+        # writer back into "finishing" it (wave-57 r3's exact lesson). Rotate
+        # the dead draft aside and clear the EOW arm so the fresh template
+        # rides the system prompt. Same-strategy picks keep the draft — the
+        # strike-2 finisher arms own that path (wave-59 C4).
+        if (
+            _prior_strategy
+            and not _w24_rerun
+            and int(state.get("code_writer_error_count") or 0) > 0
+        ):
+            _rot = _archive_dead_strategy_draft(state, str(_prior_strategy))
+            update["last_writer_template"] = ""
+            _log_event_row(
+                job_id,
+                "scraper_analyzer",
+                "[DEATH-ROTATION] strategy={old}→{new} after a writer death — "
+                "rotated the dead draft aside ({archived}) and cleared the "
+                "edit-over-write arm".format(
+                    old=_prior_strategy,
+                    new=analysis.get("strategy") or "",
+                    archived=os.path.basename(_rot) if _rot else "no draft on disk",
+                ),
+            )
         _notify_phase(job_id, "scraper_analyzer", "done")
         if _exhausted_goto:
             # Command routing (bypasses conditional edges — the node decides):

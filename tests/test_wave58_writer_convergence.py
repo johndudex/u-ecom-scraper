@@ -50,11 +50,16 @@ class TestRecursionFloor:
         assert AGENT_RECURSION_MAP["code_writer"] == _WRITER_ROUNDS * 3 + 2
 
     def test_writer_limit_clears_the_observed_death(self):
-        """51 turns = 153 super-steps killed 614/616. The floor must sit
-        far enough above the wall-clock's turn capacity that GraphRecursion
-        is never the binding backstop (measured 15-160 s/turn against a
-        1800-2700s window ⇒ the wall clock binds first)."""
-        assert AGENT_RECURSION_MAP["code_writer"] >= 400
+        """51 turns = 153 super-steps killed 614/616; wonderbly 625 then died
+        on RecursionError BELOW its wall even at limit 452 — the R2 window
+        restoral (1800/2700) buys ~120 more turns than the 1200s pin did.
+        [wave-59 C5] 200 rounds (limit 602 ≈ 3070s at the measured 15 s/turn
+        floor) keeps GraphRecursion past the 2700s max wall for any operator
+        window: the wall clock binds first, the recursion floor stays
+        theoretical. (Fast-ceiling deaths stay recursion-class — the
+        reclassification was dropped in review, so the T12 wall-only grant
+        below is unchanged.)"""
+        assert AGENT_RECURSION_MAP["code_writer"] >= 600
 
     def test_other_agents_keep_their_limits(self):
         """The raise is writer-only — no other phase's budget moves."""

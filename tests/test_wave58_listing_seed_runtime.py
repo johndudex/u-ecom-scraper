@@ -358,8 +358,13 @@ class TestStrategySeesListingSeeds:
         assert out.get("listing_seed_discovery") is True
 
     def test_http_requests_strategy_is_kept(self):
-        """requests_scraper already carries the env-gate two-phase branch —
-        the SSR case must not be pushed onto the browser lane."""
+        """[wave-59 C6 — contract FLIPPED] wave-58 kept http_requests on
+        listing seeds ("requests_scraper already carries the env-gate
+        two-phase branch"). That branch is env-gated and NEVER fired in prod,
+        and the fleet scan found ZERO http_requests+listing-shaped shipped
+        scrapers — while R2 showed a single-phase fetch of a LISTING page
+        cannot discover items. Listing-shaped seeds now walk via
+        http_navigation too, with the reason stamped."""
         from agents.graph import _apply_listing_seed_strategy
 
         out = _apply_listing_seed_strategy({"strategy": "http_requests"}, {
@@ -367,7 +372,31 @@ class TestStrategySeesListingSeeds:
             "input_urls": JJHOUSE_SEEDS,
             "url": "https://www.jjshouse.com/x",
         })
-        assert out["strategy"] == "http_requests"
+        assert out["strategy"] == "http_navigation"
+        assert out.get("listing_seed_discovery") is True
+        assert "http_requests" in (out.get("listing_seed_reason") or "")
+
+    def test_api_strategies_constant_untouched(self):
+        """The widen is LOCAL to the listing-seed arm — template-family flag
+        maps and the escalation ladder must not see http_requests
+        reclassified globally."""
+        from agents.constants import API_STRATEGIES
+
+        assert API_STRATEGIES == frozenset({"api", "internal_api"})
+
+    def test_http_requests_outside_listing_seeds_untouched(self):
+        from agents.graph import _apply_listing_seed_strategy
+
+        for mode in ("search_term", "navigation", "list_page"):
+            out = _apply_listing_seed_strategy(
+                {"strategy": "http_requests"},
+                {
+                    "input_mode": mode,
+                    "input_urls": JJHOUSE_SEEDS,
+                    "url": "https://www.jjshouse.com/x",
+                },
+            )
+            assert out["strategy"] == "http_requests", mode
 
     def test_item_seed_sets_are_never_touched(self):
         from agents.graph import _apply_listing_seed_strategy
