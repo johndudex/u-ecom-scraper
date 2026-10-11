@@ -1989,6 +1989,59 @@ def _promote_scraper(
                           dedupe_key=f"artifact:scraper_code:{job_id}")
             except Exception as exc:
                 logger.warning("_promote_scraper: emit: %s", exc)
+
+        # [wave-58 3c] A receipt for EVERY outcome. Until now the reasons a
+        # completed job has no production scraper.py lived only in log lines —
+        # a non-SUCCESS run, a zero-yield SUCCESS (job-77), or a run whose
+        # writer died before any draft existed all ended with
+        # scrapers/{slug}/scraper.py untouched and NOTHING on disk saying why.
+        # The receipt rides ALONGSIDE the gate above, never instead of it.
+        try:
+            if execution_status == "SUCCESS" and product_count == 0:
+                _reason = (
+                    "SUCCESS but 0 items extracted — zero-yield draft not "
+                    "promoted to production [job-77]"
+                )
+                _promoted_flag = False
+            elif promoted and execution_status == "SUCCESS":
+                _reason = "promoted to scraper.py"
+                _promoted_flag = True
+            elif not os.path.isfile(draft):
+                _reason = (
+                    f"no draft on disk (workspace/{slug}/scraper_draft.py "
+                    f"missing) — nothing to promote"
+                )
+                _promoted_flag = False
+            elif execution_status == "SUCCESS":
+                _reason = "no draft was produced this run"
+                _promoted_flag = False
+            else:
+                _reason = (
+                    f"execution_status={execution_status} — production "
+                    f"scraper.py left as-is"
+                )
+                _promoted_flag = False
+            artifacts.write(
+                artifacts.scrapers_key(
+                    slug, "jobs", f"scraper-{job_id}.promotion.json"),
+                json.dumps(
+                    {
+                        "job_id": job_id,
+                        "promoted": _promoted_flag,
+                        "reason": _reason,
+                        "execution_status": execution_status,
+                        "product_count": product_count,
+                        "scraper_key": promoted or "",
+                    },
+                    default=str,
+                ).encode("utf-8"),
+            )
+            logger.info(
+                "_promote_scraper: receipt → jobs/scraper-%s.promotion.json "
+                "(promoted=%s, job %s)", job_id, _promoted_flag, job_id,
+            )
+        except Exception as exc:
+            logger.warning("_promote_scraper: receipt write failed: %s", exc)
         return promoted
     except Exception as exc:
         logger.warning("_promote_scraper: failed: %s", exc)
@@ -11055,6 +11108,43 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         clear_tool_context()
 
 
+def _stamp_cleanup_report_extracted(slug: str, product_count) -> None:
+    """[wave-58 3b] Land the DETERMINISTIC extracted count on the cleanup
+    report — whatever the LLM wrote, the number the operator reads is the
+    pipeline's own (job 613: cleanup_report claimed ``extracted: 11`` while
+    Job.product_count said 3, and nothing ever reconciled the two because
+    cleanup's "extracted" was free text). Best-effort on purpose: a missing
+    or unparseable report must never fail the cleanup node. Called even when
+    the cleanup LLM died (critique N6) — an invented count is likeliest
+    exactly there.
+    """
+    if not slug or product_count is None:
+        return
+    try:
+        import json as _json
+
+        _pc = int(product_count or 0)
+        path = os.path.join(
+            _get_project_root(), "workspace", slug, "cleanup_report.json")
+        if not os.path.isfile(path):
+            return
+        with open(path, encoding="utf-8") as _f:
+            report = _json.load(_f)
+        if not isinstance(report, dict):
+            return
+        if report.get("extracted") != _pc:
+            logger.warning(
+                "_stamp_cleanup_report_extracted: cleanup_report extracted "
+                "%r → %d (deterministic row count, job site %s)",
+                report.get("extracted"), _pc, slug,
+            )
+        report["extracted"] = _pc
+        with open(path, "w", encoding="utf-8") as _f:
+            _json.dump(report, _f, indent=2, default=str)
+    except Exception as exc:
+        logger.warning("_stamp_cleanup_report_extracted: %s", exc)
+
+
 def _invoke_cleanup(state: ScrapeState, config: RunnableConfig) -> dict[str, Any]:
     job_id = state.get("job_id", 0)
     _notify_phase(job_id, "cleanup", "running")
@@ -11085,6 +11175,10 @@ def _invoke_cleanup(state: ScrapeState, config: RunnableConfig) -> dict[str, Any
         finally:
             _stop_heartbeat(hb)
         _persist_agent_logs(state, result, "cleanup", config)
+        # [wave-58 3b] the deterministic count lands on the report AFTER the
+        # LLM (and even if the LLM produced no report-shaped content) — the
+        # report can no longer disagree with Job.product_count.
+        _stamp_cleanup_report_extracted(slug, state.get("product_count"))
 
         # Deterministic, failure-safe scraper promotion (the agent no longer cp's
         # scraper.py — see build_cleanup_message). Per-job copy + success gate.

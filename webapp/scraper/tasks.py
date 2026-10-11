@@ -136,13 +136,25 @@ def _override_count_items(items) -> int:
     return kept
 
 
-def _finalize_job_failed(job_id: int, error_message: str, close_steps: bool = False) -> None:
+def _finalize_job_failed(
+    job_id: int,
+    error_message: str,
+    close_steps: bool = False,
+    reconcile_count: bool = True,
+) -> None:
     """Persist an honest FAILED row for *job_id* (F4-safe).
 
     Shared by the in-task ``except`` path and the ``task_failure`` signal
     handler (worker-child process death): recycle DB connections first, then
     guard every write so the row always finalizes even on a dead connection
     (prod 284/332/333 — the failure is often the DB connection itself).
+
+    ``reconcile_count`` [wave-58 3a] the FAILED count describes the final
+    bytes — EXCEPT when the caller already adjudicated the artifact as
+    not-this-run's-evidence (finalize_from_artifacts' no-execution-step
+    refusal and its bar-forced failure both zero the count deliberately and
+    pass False: re-reading the refused file would re-credit the exact rows
+    the wave-55 arm refused).
     """
     try:
         from django.db import close_old_connections
@@ -159,6 +171,15 @@ def _finalize_job_failed(job_id: int, error_message: str, close_steps: bool = Fa
     job.status = ScrapeJob.STATUS_FAILED
     job.error_message = message  # tail: keep the exception, not the banner
     job.completed_at = timezone.now()
+    # [wave-58 3a / critique S4] The crash path writes FAILED rows too — the
+    # same describe-the-bytes rule applies here (best-effort: a count
+    # correction must never un-fail the row). The reconciler saves its own
+    # field so the F4-guarded save below keeps its exact contract.
+    if reconcile_count:
+        try:
+            _reconcile_failed_product_count(job)
+        except Exception:
+            pass
     try:
         job.save(update_fields=["status", "error_message", "completed_at"])
     except Exception:
@@ -167,7 +188,13 @@ def _finalize_job_failed(job_id: int, error_message: str, close_steps: bool = Fa
             job.status = ScrapeJob.STATUS_FAILED
             job.error_message = message
             job.completed_at = timezone.now()
-            job.save(update_fields=["status", "error_message", "completed_at"])
+            if reconcile_count:
+                try:
+                    _reconcile_failed_product_count(job)
+                except Exception:
+                    pass
+            job.save(update_fields=[
+                "status", "error_message", "completed_at"])
         except Exception:
             logger.error("Job %s: could not persist FAILED status (job stranded)", job_id)
     try:
@@ -250,10 +277,71 @@ def _output_file_rows(locator: str) -> list:
                 data = json.load(f)
         except Exception:
             return []
-    # [wave-55 GAP-1c] A --discover-only artifact holds URL stubs, not records —
-    # the router's own reader refuses it (`_items_from_output_file(
-    # skip_discovery=True)`), so this one must too: no row count, no MISSING-CORE
-    # stamp off a payload that never extracted a field.
+    return _output_file_rows_from_payload(data)
+
+
+def _output_file_product_count(locator: str) -> int:
+    """[wave-55 C4] How many real rows does the file `locator` names hold?
+
+    The single source of the COMPLETED ``product_count``: the file
+    ``job.output_file`` points at is read (`_output_file_rows`) and its
+    record rows are counted with the ground-truth override's own row
+    predicate, so every arm that writes a count ends up describing the same
+    bytes (prod 966 recorded pc=14 over a 2-row artifact; prod 896 carried
+    10 / 548 / 618). Anything unreadable — or a payload with no record rows —
+    returns 0: the caller keeps the credited count rather than zeroing a
+    productive job.
+    """
+    return _override_count_items(_output_file_rows(locator))
+
+
+def _output_file_rows_parsed(locator: str) -> tuple[bool, list]:
+    """[wave-58 3a] One read, two verdicts: ``(parses, rows)``.
+
+    ``_output_file_product_count`` returns 0 for "unreadable" AND for
+    "readable, zero rows" — indistinguishable, which is exactly why its
+    COMPLETED caller keeps the credited count on a 0 (never zero a
+    productive job). The FAILED arm needs the distinction the other way: a
+    READABLE empty artifact is positive evidence of zero rows and the
+    credited count must fall to 0 (an inflated pc over an artifact that
+    demonstrably holds nothing is the same lie as a deflated one), while an
+    UNREADABLE file is no evidence at all and the credited count stays.
+    Deriving "parses" and "count" from ONE read (critique S5) so the two
+    verdicts can never disagree across two reads of a flaky locator. Same
+    read chain as `_output_file_rows` (File Master key first, local path
+    fallback), same row selection.
+    """
+    if not locator:
+        return False, []
+    data: Any = None
+    try:
+        import src.artifacts as artifacts
+
+        payload = artifacts.read_text(locator)
+        if payload:
+            data = json.loads(payload)
+    except Exception:
+        data = None
+    if data is None:
+        try:
+            with open(locator, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return False, []
+    if not isinstance(data, (dict, list)):
+        return True, []
+    return True, _output_file_rows_from_payload(data)
+
+
+def _output_file_rows_from_payload(data: Any) -> list:
+    """The row selection of `_output_file_rows`, on an already-parsed
+    payload (the wave-58 FAILED arm reuses the exact same rule).
+
+    [wave-55 GAP-1c] A --discover-only artifact holds URL stubs, not records —
+    the router's own reader refuses it (`_items_from_output_file(
+    skip_discovery=True)`), so this one must too: no row count, no MISSING-CORE
+    stamp off a payload that never extracted a field.
+    """
     if isinstance(data, dict):
         try:
             from agents.nodes.route_after_testing import _is_discovery_output
@@ -272,8 +360,6 @@ def _output_file_rows(locator: str) -> list:
                 rows = value
                 break
         if rows is None:
-            # No known key — the same "first top-level list of dicts" rule
-            # `_prune_output_to_schema` / `_rename_output_keys` operate on.
             for value in data.values():
                 if isinstance(value, list) and value and isinstance(value[0], dict):
                     rows = value
@@ -281,19 +367,47 @@ def _output_file_rows(locator: str) -> list:
     return rows or []
 
 
-def _output_file_product_count(locator: str) -> int:
-    """[wave-55 C4] How many real rows does the file `locator` names hold?
+def _output_file_parses(locator: str) -> bool:
+    """[wave-58 3a] Does the file ``locator`` names hold readable JSON?"""
+    return _output_file_rows_parsed(locator)[0]
 
-    The single source of the COMPLETED ``product_count``: the file
-    ``job.output_file`` points at is read (`_output_file_rows`) and its
-    record rows are counted with the ground-truth override's own row
-    predicate, so every arm that writes a count ends up describing the same
-    bytes (prod 966 recorded pc=14 over a 2-row artifact; prod 896 carried
-    10 / 548 / 618). Anything unreadable — or a payload with no record rows —
-    returns 0: the caller keeps the credited count rather than zeroing a
-    productive job.
-    """
-    return _override_count_items(_output_file_rows(locator))
+
+def _reconcile_failed_product_count(job: ScrapeJob) -> None:
+    """[wave-58 3a] A FAILED row's ``product_count`` describes its final
+    bytes — both directions, on BOTH finalize paths (`_finalize_job` and
+    `_finalize_job_failed`, critique S4). Readable artifact with rows → the
+    row count wins; readable and EMPTY → 0 (the artifact demonstrably holds
+    nothing); unreadable → the credited count stays (no evidence, no
+    invention). Best-effort by contract: never lets a count correction
+    un-fail a row."""
+    if not job.output_file:
+        return
+    try:
+        _parses, _rows = _output_file_rows_parsed(job.output_file)
+    except Exception as exc:
+        logger.warning("Job %s: failed-count parse check failed: %s",
+                       job.pk, exc)
+        return
+    if not _parses:
+        return
+    try:
+        _file_rows = _override_count_items(_rows)
+    except Exception as exc:
+        logger.warning("Job %s: failed-count row count failed: %s",
+                       job.pk, exc)
+        return
+    if _file_rows != int(job.product_count or 0):
+        logger.warning(
+            "Job %s: FAILED product_count %s → %s — the row count of %s",
+            job.pk, job.product_count, _file_rows, job.output_file,
+        )
+        job.product_count = _file_rows
+        try:
+            # Own field, own save: callers' F4-guarded saves keep their exact
+            # update_fields contracts (test_f4_db_hardening pins the literal).
+            job.save(update_fields=["product_count"])
+        except Exception as exc:
+            logger.warning("Job %s: failed-count save failed: %s", job.pk, exc)
 
 
 def _missing_core_stamp(job, schema_fields=None) -> str:
@@ -877,7 +991,11 @@ def finalize_from_artifacts(job_id: int, fallback_message: str) -> str:
                 "test-phase or a prior attempt's)",
                 job_id, items,
             )
-            _finalize_job_failed(job_id, fallback_message)
+            # [wave-58 3a] reconcile_count=False: this arm's whole verdict is
+            # that the artifact is NOT this run's evidence — re-reading it to
+            # re-credit the count would un-do the refusal.
+            _finalize_job_failed(
+                job_id, fallback_message, reconcile_count=False)
             return ScrapeJob.STATUS_FAILED
         # [wave-55 C4] This IS a second COMPLETED stamp (soft-time-limit
         # kills, called mid-graph and mid-resume) — `_finalize_job` never runs
@@ -896,7 +1014,11 @@ def finalize_from_artifacts(job_id: int, fallback_message: str) -> str:
             _gated, _gate_notes, _pre = None, [], 0
         if _bar := _completed_bar_reason(_gated, _pre, page_type=job.page_type):
             logger.warning("Job %d: finalize_from_artifacts — %s", job_id, _bar)
-            _finalize_job_failed(job_id, f"{fallback_message} {_bar}".strip())
+            # [wave-58 3a] reconcile_count=False: the bar zeroed the credit on
+            # purpose (pc counts GOOD rows; the artifact's raw rows are junk).
+            _finalize_job_failed(
+                job_id, f"{fallback_message} {_bar}".strip(),
+                reconcile_count=False)
             return ScrapeJob.STATUS_FAILED
         if _gate_notes:
             # [round-10 GAP-4] `notes` is a column nothing renders — the job
@@ -4039,6 +4161,7 @@ def _finalize_job(job: ScrapeJob) -> None:
     # verdict and census OQ13(b) leaves it to the owner — the bar does not
     # re-judge it.
     _gate_notes: list[str] = []
+    _bar_forced_failed = False
     if job.status == ScrapeJob.STATUS_COMPLETED and job.output_file:
         try:
             _gated, _gate_notes, _pre = _apply_finalize_row_gates(
@@ -4051,6 +4174,7 @@ def _finalize_job(job: ScrapeJob) -> None:
             logger.warning("Job %d: %s — COMPLETED → FAILED", job.id, _bar)
             job.status = ScrapeJob.STATUS_FAILED
             job.product_count = 0
+            _bar_forced_failed = True
             job.error_message = f"{_bar} {job.error_message or ''}".strip()
 
     if _gate_notes:
@@ -4105,6 +4229,20 @@ def _finalize_job(job: ScrapeJob) -> None:
             except Exception as exc:
                 logger.warning(
                     "Job %d: shortfall note rewrite failed: %s", job.id, exc)
+
+    # ── [wave-58 3a] A FAILED count describes the same final bytes ──────────
+    # The COMPLETED arm above is the only place the file's own row count won —
+    # a FAILED row kept whatever the state claim / override / rescue last
+    # credited, so a FAILED row could say pc=1 over a 5-row artifact (the
+    # ground-truth override only follows a LOCAL path) or pc=3 over a
+    # readable artifact that demonstrably holds nothing. Same rule, both
+    # directions, FAILED only: the COMPLETED semantics (truthy correction,
+    # never zero on a 0 read) are triple-pinned and stay byte-identical.
+    # NOT for a bar-forced FAILED: that pc=0 is GOOD-rows truth (the bar
+    # adjudicated the artifact's raw rows as junk) — re-reading the same file
+    # for raw rows would re-credit exactly what the bar refused.
+    if job.status == ScrapeJob.STATUS_FAILED and not _bar_forced_failed:
+        _reconcile_failed_product_count(job)
 
     # ── [wave-55 GAP-1] A COMPLETED row whose core column is null says so ──
     # Read AFTER the schema prune, so the stamp describes the shipped bytes.

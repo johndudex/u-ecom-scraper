@@ -5880,6 +5880,12 @@ def build_cleanup_message(state: dict) -> list:
     """Build the initial HumanMessage for the cleanup agent."""
     slug = state.get("site_slug", "unknown")
     url = state.get("url", "")
+    # [wave-58 3b] The deterministic extracted count — job 613's cleanup
+    # report wrote "extracted: 11" against Job.product_count=3 because the
+    # number the agent saw was whatever it inferred from filenames. Give it
+    # the pipeline's own number and forbid inventing another; the report is
+    # re-stamped deterministically after the agent returns regardless.
+    _pc = int(state.get("product_count") or 0)
 
     content = (
         f"## OBJECTIVE\n"
@@ -5891,6 +5897,9 @@ def build_cleanup_message(state: dict) -> list:
         f"**Site analysis:** workspace/{slug}/site_analysis.json\n"
         f"**Product analysis:** workspace/{slug}/product_analysis.json\n"
         f"**Target folder:** scrapers/{slug}/\n"
+        f"**Items extracted this run:** {_pc} (DETERMINISTIC — the pipeline "
+        f"counted them from the output rows. Record EXACTLY this number as "
+        f"`extracted` in your report; do NOT estimate, infer, or change it.)\n"
         f"**Save cleanup report to:** workspace/{slug}/cleanup_report.json\n\n"
         f"### Workflow\n"
         f"1. Use `run_bash` to copy files (NOT read_file — you don't need to read their contents):\n"
