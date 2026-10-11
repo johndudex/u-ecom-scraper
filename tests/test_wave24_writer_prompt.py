@@ -29,13 +29,21 @@ ROOT_DIR = ROOT  # repo root, for the wiring contract below
 
 class TestEmbeddedTemplateNote:
     def test_embedded_template_carries_do_not_read_note(self):
+        """[wave-59 C2 — pin updated to the truth] The note stopped claiming
+        "templates/ does not exist in this container" (FALSE — templates/ is
+        baked into the writer container and reads are project-root-wide; the
+        lie was W24-6). What is true: the template is the COMPLETE file,
+        already in context — reading it back is wasted turns (the R2 623
+        shape: 88% of turns re-reading its own draft)."""
         prompt = sub._embed_template("BASE PROMPT", "SCRAPER TEMPLATE CODE")
         assert "BASE PROMPT" in prompt
         assert "SCRAPER TEMPLATE CODE" in prompt, "template itself still embedded"
-        assert "embedded in this prompt" in prompt
-        assert "do NOT" in prompt
-        assert "read_file templates/" in prompt
-        assert "does not exist" in prompt
+        assert "COMPLETE file" in prompt
+        assert "already in your context" in prompt
+        assert "do not spend read_file calls" in prompt
+        assert "does not exist" not in prompt, (
+            "the W24-6 lie must never ride a writer prompt again"
+        )
 
     def test_no_template_means_no_note(self):
         assert sub._embed_template("BASE PROMPT", "") == "BASE PROMPT"
