@@ -7255,6 +7255,40 @@ def _writer_axis_directive(next_strategy: str = "", tier: str = "") -> str:
     )
 
 
+def _archive_dead_strategy_draft(state: ScrapeState, strategy: str) -> str:
+    """[wave-57 r3] Rotate the dead strategy's draft out of the workspace.
+
+    Guardian flag 1 (jobs 603/606): after an axis escape the writer kept
+    producing BYTE-IDENTICAL drafts — the fresh template rode the system
+    prompt, but the dead strategy's ``scraper_draft.py`` still sat in the
+    workspace, and the edit-over-write lane, the draft-finisher lane and
+    plain read_file habit all pulled the writer back into "finishing" it.
+    An axis change therefore rotates the draft aside first: the pivoted
+    cycle starts from a clean slate and "finish the existing scraper" is
+    not an available move. Best-effort — any failure loses only the chore,
+    never the escape. Returns the archive path ("" when nothing moved).
+    """
+    try:
+        slug = str(state.get("site_slug") or "").strip()
+        if not slug:
+            return ""
+        draft = os.path.join(
+            _get_project_root(), "workspace", slug, "scraper_draft.py"
+        )
+        if not os.path.isfile(draft):
+            return ""
+        base = f"scraper_draft-{strategy}-dead"
+        dest = os.path.join(os.path.dirname(draft), f"{base}.py")
+        _n = 0
+        while os.path.exists(dest):
+            _n += 1
+            dest = os.path.join(os.path.dirname(draft), f"{base}-{_n}.py")
+        os.replace(draft, dest)
+        return dest
+    except Exception:
+        return ""
+
+
 def _strategy_axis_escape(state: ScrapeState, update: dict) -> dict | None:
     """[wave-57] The strike-agnostic axis-escape body shared by the strike-1
     bounce and the terminal-arm pivot: record the current strategy as tried
@@ -7297,7 +7331,7 @@ def _strategy_axis_escape(state: ScrapeState, update: dict) -> dict | None:
                 if _tier_esc is not None:
                     _prev_tier = str(_analysis.get("proxy_tier") or "none") or "none"
                     _new_tier = str(_tier_esc.get("proxy_tier") or "")
-                    return {
+                    _out = {
                         "scraper_analysis": _tier_esc,
                         "strategies_tried": [{
                             "strategy": cur,
@@ -7312,8 +7346,21 @@ def _strategy_axis_escape(state: ScrapeState, update: dict) -> dict | None:
                             tier=_new_tier
                         ),
                     }
+                    # [wave-57 r3] the dead draft leaves the workspace with
+                    # the dead strategy — the pivoted cycle cannot "finish"
+                    # it (guardian flag 1: 603/606 byte-identical across the
+                    # strategy switch).
+                    _rotated = _archive_dead_strategy_draft(state, cur)
+                    if _rotated:
+                        _log_event_row(
+                            state.get("job_id"), "code_writer",
+                            "[DEAD-DRAFT-ROTATED] axis change rotated the "
+                            f"{cur} draft to {os.path.basename(_rotated)} — "
+                            "the next cycle writes the new axis fresh",
+                        )
+                    return _out
             return None  # tier axis spent/exhausted too — strike 2 owns the exit
-        return {
+        _out = {
             "strategies_tried": [{
                 "strategy": cur,
                 "reason": (
@@ -7323,6 +7370,15 @@ def _strategy_axis_escape(state: ScrapeState, update: dict) -> dict | None:
             }],
             "feedback_for_writer": _writer_axis_directive(next_strategy=_next),
         }
+        _rotated = _archive_dead_strategy_draft(state, cur)
+        if _rotated:
+            _log_event_row(
+                state.get("job_id"), "code_writer",
+                "[DEAD-DRAFT-ROTATED] axis change rotated the "
+                f"{cur} draft to {os.path.basename(_rotated)} — "
+                "the next cycle writes the new strategy fresh",
+            )
+        return _out
     except Exception:
         return None
 
