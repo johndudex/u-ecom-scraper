@@ -182,12 +182,14 @@ class TestRunExecutionDiagnosis:
         # -7000 window — widened again; [wave-55] the C2 url_list gates
         # (scope assertion + the in-process lane's junk bars) pushed it past
         # -12000 — widened a third time; [wave-57] the listing-seed arm of
-        # `_url_list_scope_gate` pushed it past -16000 — widened a fourth.
+        # `_url_list_scope_gate` pushed it past -16000 — widened a fourth;
+        # [wave-58] the listing-seed expansion gate (`_listing_seed_expansion_
+        # gate` + its docstring) pushed it past -20000 — widened a fifth.
         # The contract ("hygiene diagnosis is wired beside the quality gate")
         # is unchanged: both `_hygiene_diagnosis` call sites sit in the run
         # path before this string.
         gate_at = src.index("Extraction quality gate")
-        window = src[max(0, gate_at - 20000) : gate_at + 500]
+        window = src[max(0, gate_at - 26000) : gate_at + 500]
         assert "_discovered_url_issues(" in window
 
 

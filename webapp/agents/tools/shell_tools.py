@@ -234,7 +234,10 @@ def _tester_listing_candidate(state: dict) -> tuple[str, str]:
 
     Returns ``(candidate, drop_note)``. The candidate is the navigator's
     ``discovery.listing_url`` or — [rag-bone job 72] — the user's URL-shaped
-    ``search_criteria``; '' when there is nothing to inject OR when the
+    ``search_criteria``; [wave-58 1b, job 613] for a url_list job whose seeds
+    are LISTING positions it is ``url_list_discovery_seed`` — a listing-seed
+    url_list run IS a discovery run and the seed file drives nothing.
+    '' when there is nothing to inject OR when the
     candidate sits off the job's registrable domain (F17 drops it at
     execution, so injecting it would test a listing execution can never use
     — 587's tester burned budget on exactly that). Multi-line criteria:
@@ -250,6 +253,14 @@ def _tester_listing_candidate(state: dict) -> tuple[str, str]:
         from src.seed_urls import first_criteria_url
 
         cand = first_criteria_url(state.get("search_criteria"))
+    if not cand and str(state.get("input_mode") or "") == "url_list":
+        try:
+            from src.discovery_quality import url_list_discovery_seed
+
+            cand = url_list_discovery_seed(
+                state.get("input_urls"), state.get("url", ""))
+        except Exception:
+            cand = ""
     if not cand:
         return "", ""
     try:
@@ -398,6 +409,25 @@ def get_shell_tools(
             "--input" in cmd_args or "--urls" in cmd_args
         )
 
+        # [wave-58 1b / job 613] Listing-seed candidacy is decided EARLY: a
+        # url_list job whose seeds are LISTING positions is a DISCOVERY run
+        # even at --sample scope — the seed file drives nothing — so it keeps
+        # the 600s browser floor (a two-phase walk cannot fit the 180s
+        # verification floor; job 312's SIGKILL-mid-phase class) and its
+        # injection arm outranks the verification suppression below.
+        _listing_ts, _f17_note = "", ""
+        _listing_seeded = False
+        try:
+            from agents.tools.context import get_state as _get_state_early
+
+            _ts_early = _get_state_early() or {}
+            _listing_ts, _f17_note = _tester_listing_candidate(_ts_early)
+            _listing_seeded = bool(_listing_ts) and str(
+                _ts_early.get("input_mode") or ""
+            ) == "url_list"
+        except Exception:
+            _listing_ts, _f17_note, _listing_seeded = "", "", False
+
         # Floor the timeout for browser-based scrapers. code_tester's LLM often
         # passes a tight timeout, but two-phase drafts run discovery AND sample
         # extraction in ONE process — pillowtalk: 124s discovery (5 pages) +
@@ -409,7 +439,7 @@ def get_shell_tools(
         # timeouts, so the worst case is one bounded 660s wait. HTTP unaffected.
         _run_floor = (
             VERIFICATION_RUN_TIMEOUT_FLOOR
-            if _verification_scope
+            if (_verification_scope and not _listing_seeded)
             else BROWSER_RUN_TIMEOUT_FLOOR
         )
         if needs_browser and timeout < _run_floor:
@@ -454,7 +484,7 @@ def get_shell_tools(
                             "known URLs, a verification-scope run "
                             "(--input input_urls.json --sample) is budgeted "
                             f"at ~{VERIFICATION_RUN_TIMEOUT_FLOOR}s and may fit."
-                            if not _verification_scope
+                            if not (_verification_scope or _listing_seeded)
                             else ""
                         )
                     )
@@ -619,8 +649,17 @@ def get_shell_tools(
             # [wave-32 E1b] the candidate is F17-domain-guarded — a cross-host
             # listing (587's loveamika-on-marimekko shape) must not reach the
             # tester's env when execution's F17 would drop it anyway.
-            _listing_ts, _f17_note = _tester_listing_candidate(_ts)
-            if _verification_scope:
+            # ([wave-58 1b] computed early above so the floor could see it;
+            # this arm ORDER is the fix: the listing-seed injection outranks
+            # the verification suppression.)
+            if _listing_seeded:
+                env_overrides = dict(env_overrides or {})
+                env_overrides["SCRAPER_LISTING_URL"] = _listing_ts
+                _scope_note = (
+                    "[run scope] DISCOVERY — the seeds are LISTING pages; "
+                    f"SCRAPER_LISTING_URL injected → {_listing_ts}"
+                )
+            elif _verification_scope:
                 _scope_note = (
                     "[run scope] VERIFICATION — the seed file drives this run; "
                     "SCRAPER_LISTING_URL discovery injection suppressed"

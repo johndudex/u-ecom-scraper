@@ -577,6 +577,147 @@ def _row_url_has_path(row: dict) -> bool:
         return True
 
 
+def _listing_seed_rows_unexpanded(state: ScrapeState, rows=None) -> bool:
+    """[wave-58 1d] rows == the submitted listing-shaped seeds ⇒ not items.
+
+    Job 613's PASS: 3 listing-shaped url_list seeds, 3 rows whose URLs ARE
+    those seeds (category titles, defaulted prices), every counter read them
+    as data. The C2 scope gate passes such rows (item-shaped, same host), so
+    the verdict has to live where the credit is granted.
+
+    Bars (critique S1/B2): url_list only; the seed SET must read as
+    listings; more than one all-seed row (a correct one-product store whose
+    only page sits at a listing-shaped URL is byte-identical to the junk
+    shape); rows without a URL key are unverifiable and never assert; and
+    at least ONE row must sit outside the seed set to clear — item-shaped
+    seed sets (PDP pastes) are the mode's own contract and are never judged
+    here.
+
+    [wave-58 guardian change 3] An all-seed SAMPLE is not enough to veto:
+    the sample is a slice, so the verdict is confirmed against the FULL
+    output file read through the job's started-time floor (``_items_from_
+    output_file(slug, mtime_floor=_job_started_floor(state))``) — any
+    off-seed row in the floored artifact refuses the veto, while the floor
+    keeps a PREVIOUS job's artifact from rescuing this run.
+    """
+    st = state or {}
+    if str(st.get("input_mode") or "").strip().lower() != "url_list":
+        return False
+    seed_list = [u for u in (st.get("input_urls") or []) if str(u or "").strip()]
+    if not seed_list:
+        return False
+    try:
+        from src.discovery_quality import (
+            listing_seed_urls,
+            seeds_are_listing_shaped,
+        )
+
+        if not seeds_are_listing_shaped(seed_list):
+            return False
+        if not listing_seed_urls(seed_list):
+            return False
+    except Exception:
+        return False
+    if rows is None:
+        report = st.get("test_report") or {}
+        rows = report.get("sample_products") or []
+        if not rows:
+            so = report.get("sample_output") or {}
+            if isinstance(so, dict):
+                ct_config = st.get("content_type_config") or {}
+                output_key = (
+                    ct_config.get("output_key", "products")
+                    if ct_config else "products"
+                )
+                rows = so.get(output_key) or so.get("products", [])
+    urls = [
+        str(r.get("url") or r.get("src_url") or "").strip()
+        for r in (rows or [])
+        if isinstance(r, dict)
+    ]
+    urls = [u for u in urls if u]
+    if len(urls) < 2:
+        return False
+    try:
+        from .run_execution import _submitted_url_key
+
+        seeds = {_submitted_url_key(u) for u in seed_list}
+        if any(_submitted_url_key(u) not in seeds for u in urls):
+            # At least one row already sits outside the seed set — real
+            # extraction is on the sample; the seeds that DID come back are
+            # the deterministic_output_issues MEDIUM's business, not a veto.
+            return False
+    except Exception:
+        return False
+    # [wave-58 guardian change 3] the SAMPLE is all-seed, but the sample is a
+    # slice — judge the FULL freshness-floored output file before vetoing. A
+    # run whose artifact holds off-seed rows (a fuller page, a later cycle)
+    # is a real extraction, not seed echo. The floor is MANDATORY: it keeps a
+    # PREVIOUS job's artifact from rescuing this run (job-309's inverse
+    # false-pass), while this run's own newest file is the one read.
+    file_urls = _floored_output_urls(st)
+    try:
+        return not any(_submitted_url_key(u) not in seeds for u in file_urls)
+    except Exception:
+        return False
+
+
+def _floored_output_urls(state: ScrapeState) -> list:
+    """[wave-58 guardian change 3] Every URL row in the newest output file at
+    or after this job's started floor (best-effort: ``[]`` on any trouble —
+    the veto then rests on the tester sample alone)."""
+    st = state or {}
+    slug = str(st.get("site_slug") or "")
+    if not slug:
+        return []
+    try:
+        rows = _items_from_output_file(slug, mtime_floor=_job_started_floor(st))
+    except Exception:
+        return []
+    return [
+        str(r.get("url") or r.get("src_url") or "").strip()
+        for r in (rows or [])
+        if isinstance(r, dict)
+    ]
+
+
+def _seed_rows_among(state: ScrapeState, rows) -> tuple:
+    """[wave-58 guardian change 3] ``(seed_url_rows, total_url_rows)`` among
+    ``rows`` for a listing-seed url_list job — ``(0, 0)`` when the state is
+    not one (PDP pastes are the mode's own contract and are never judged)."""
+    st = state or {}
+    if str(st.get("input_mode") or "").strip().lower() != "url_list":
+        return (0, 0)
+    seed_list = [u for u in (st.get("input_urls") or []) if str(u or "").strip()]
+    if not seed_list:
+        return (0, 0)
+    try:
+        from src.discovery_quality import (
+            listing_seed_urls,
+            seeds_are_listing_shaped,
+        )
+
+        from .run_execution import _submitted_url_key
+
+        if not seeds_are_listing_shaped(seed_list) or not listing_seed_urls(
+            seed_list
+        ):
+            return (0, 0)
+        seeds = {_submitted_url_key(u) for u in seed_list}
+    except Exception:
+        return (0, 0)
+    urls = [
+        str(r.get("url") or r.get("src_url") or "").strip()
+        for r in (rows or [])
+        if isinstance(r, dict)
+    ]
+    urls = [u for u in urls if u]
+    if not urls:
+        return (0, 0)
+    n_seed = sum(1 for u in urls if _submitted_url_key(u) in seeds)
+    return (n_seed, len(urls))
+
+
 def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
     """GROUND-TRUTH check: did the scraper extract enough real items to PASS?
 
@@ -744,6 +885,16 @@ def _scraper_has_real_items(state: ScrapeState, min_count: int = 3) -> bool:
     # Content-type-aware "real item" check — fields/has_substantive_field are
     # computed above (the file scan ranks by them too).
     live = [p for p in sample_products if not _is_dead_product(p)]
+    # [wave-58 1d / critique B2] Central listing-seed veto. Every arm this
+    # predicate gates (ground-truth override, no-report rescue, exhausted
+    # ladder, dead-store, final-attempt) reads the SAME answer: rows that are
+    # byte-identical to the submitted listing seeds are not items. One
+    # predicate here, not ten per-arm patches.
+    try:
+        if _listing_seed_rows_unexpanded(state, live):
+            return False
+    except Exception:
+        pass
     if fields:
         # F15: when the content type defines filter fields, a "real" item must
         # carry at least one of THEM — not just any substantive field. The old
@@ -1238,6 +1389,56 @@ def deterministic_output_issues(slug: str, state: ScrapeState) -> list[dict]:
         return []
     issues: list[dict] = []
     n = len(rows)
+
+    # [wave-58 1d] Listing-seed no-op — the same class the run_execution
+    # expansion gate fails honestly post-run, surfaced here so the TESTER's
+    # report carries it (the tester's own sample is what the override reads).
+    try:
+        if _listing_seed_rows_unexpanded(state, rows):
+            issues.append({
+                "field": "url",
+                "issue_type": "WRONG_VALUE",
+                "severity": "high",
+                "count": n,
+                "description": (
+                    f"Deterministic check: all {n} extracted rows ARE the "
+                    "submitted listing seeds — these seeds are LISTING pages, "
+                    "not items; SCRAPER_LISTING_URL discovery never ran (or "
+                    "produced nothing), so Phase 1 returned nothing and the "
+                    "listing pages themselves were extracted as products"
+                ),
+                "suggested_fix": (
+                    "Implement/listen to Phase-1 discovery from the listing "
+                    "seeds (SCRAPER_LISTING_URL env — run_execution injects "
+                    "it): walk each listing's pagination, harvest item URLs, "
+                    "then extract those. Do not extract the listing pages."
+                ),
+            })
+        else:
+            # [wave-58 guardian change 3] PARTIAL run: some rows are real
+            # items but the seeds came back as rows too. Real extraction is
+            # present, so this is not the veto class — a non-blocking count
+            # the writer's fix cycle can act on.
+            n_seed, n_total = _seed_rows_among(state, rows)
+            if n_seed and n_total > n_seed:
+                issues.append({
+                    "field": "url",
+                    "issue_type": "WRONG_VALUE",
+                    "severity": "medium",
+                    "count": n_seed,
+                    "description": (
+                        f"Deterministic check: {n_seed} of {n_total} extracted "
+                        "rows ARE the submitted listing seeds (seed rows "
+                        "extracted as items) — discovery partially expanded"
+                    ),
+                    "suggested_fix": (
+                        "Keep the expanded item rows; drop the seed rows from "
+                        "the output (Phase 1 must harvest item URLs from each "
+                        "listing, not extract the listing pages themselves)"
+                    ),
+                })
+    except Exception:
+        pass
 
     dbl = sum(
         1 for r in rows

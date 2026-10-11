@@ -273,6 +273,60 @@ def seeds_are_listing_shaped(urls) -> bool:
     return not any(_seed_strongly_item_shaped(u) for u in cleaned)
 
 
+def listing_seed_urls(urls) -> list[str]:
+    """[wave-58 1a] The positively listing-shaped members of a seed set.
+
+    Runtime-facing (the scope gate only ever needed the set verdict): a
+    url_list job whose seeds are listing positions must DRIVE discovery, so
+    the pipeline needs the actual listing URLs, in submission order,
+    deduped. Ambiguous seeds are inert — they are excluded here and never
+    promoted to a discovery seed (exactly the wave-57 classifier contract;
+    the classifier never loosens a gate on a guess).
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in (urls or []):
+        u = str(raw or "").strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        if seed_url_is_listing_shaped(u):
+            out.append(u)
+    return out
+
+
+def url_list_discovery_seed(urls, job_url: str = "") -> str:
+    """[wave-58 1a] The ONE listing seed deterministic discovery may walk.
+
+    Three gates, all must hold:
+      1. the SET reads as listings (``seeds_are_listing_shaped``) — item
+         pastes never arm discovery (the mode's own contract);
+      2. ONE unambiguous registrable seed host — the same strictness the
+         scope gate's loosen arm keeps for multi-host pastes;
+      3. F17: the candidate sits on the JOB's own registrable domain (a
+         paste of someone else's listings never arms discovery).
+    Returns '' otherwise — the caller then runs the plain single-phase
+    url_list job it was handed.
+    """
+    candidates = listing_seed_urls(urls)
+    if not candidates or not seeds_are_listing_shaped(urls):
+        return ""
+    try:
+        from src.registrable import registrable_of
+
+        hosts = {registrable_of(u) for u in candidates}
+        hosts.discard("")
+        if len(hosts) != 1:
+            return ""
+        if job_url:
+            _job_reg = registrable_of(job_url)
+            if _job_reg and next(iter(hosts)) != _job_reg:
+                return ""
+    except Exception:
+        return ""
+    return candidates[0]
+
+
 def shallow_section_links(
     listing_url: str,
     urls,

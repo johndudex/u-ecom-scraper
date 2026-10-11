@@ -4082,17 +4082,73 @@ def build_code_writer_message(state: dict) -> list:
         _template_family = output_schema["template_family"]
 
     provided_urls_section = ""
+    _listing_seed_mode = False
     if site_input_urls:
         count = len(site_input_urls)
-        provided_urls_section = (
-            f"\n### PROVIDED URLs (FROM SITE MODEL)\n"
-            f"The user has provided {count} URLs via the Site configuration. "
-            f"These URLs are already saved to `workspace/{slug}/input_urls.json`.\n\n"
-            f"**You MUST use these URLs exactly as provided.** Do NOT discover new URLs, "
-            f"do NOT crawl categories or sitemaps, do NOT modify the URL list. "
-            f"Read the existing `input_urls.json` and use it as-is in the scraper.\n"
-            f"The `--sample` flag should scrape the first 5 URLs from this list.\n"
-        )
+        # [wave-58 1c] A listing-shaped seed set is NOT a PDP paste. The
+        # strict "use these URLs exactly / do NOT discover" directive is the
+        # junk-pass recipe here (job 613: the writer scraped the 3 submitted
+        # listing pages and shipped them as 3 products). The seeds are
+        # LISTING pages: Phase 1 discovers the item URLs behind them
+        # (SCRAPER_LISTING_URL is injected at runtime — run_execution — and
+        # the templates carry the two-phase machinery), Phase 2 extracts
+        # each item. Ambiguous seeds are context, not extraction targets.
+        _listing_seed_ctx = ""
+        try:
+            from src.discovery_quality import (
+                listing_seed_urls as _lsu,
+            )
+            from src.discovery_quality import (
+                seeds_are_listing_shaped as _sls,
+            )
+
+            _listing_seed_ctx = _lsu(site_input_urls) if _sls(
+                site_input_urls) else ""
+        except Exception:
+            _listing_seed_ctx = ""
+        if _listing_seed_ctx and (
+            state.get("input_mode") or ""
+        ).strip().lower() == "url_list":
+            _listing_seed_mode = True
+            _seed_list = "\n".join(f"  - {u}" for u in _listing_seed_ctx[:5])
+            provided_urls_section = (
+                f"\n### PROVIDED URLs — LISTING SEEDS ({count} URLs)\n"
+                f"The user provided {count} URLs via the Site configuration; "
+                f"they are saved to `workspace/{slug}/input_urls.json`.\n\n"
+                f"**These URLs are LISTING pages, not item pages.** Do NOT "
+                f"extract them as products — that ships category rows as "
+                f"items and the run is junk. Instead:\n"
+                f"1. PHASE 1 (discovery): for each listing seed, walk its "
+                f"pagination and collect the ITEM urls behind it "
+                f"(`product_url` field or equivalent). The runtime injects "
+                f"`SCRAPER_LISTING_URL` = EXACTLY ONE seed — the first seed "
+                f"on this job's own registrable host (a multi-host paste "
+                f"never arms it, and seed/URL identity compares "
+                f"scheme-insensitively: `http://` in, `https://` out is the "
+                f"same item). The template's `--discover` phase already "
+                f"walks it — keep that machinery intact.\n"
+                f"2. PHASE 2 (extraction): extract fields from every "
+                f"discovered item URL.\n"
+                f"Listing seeds:\n{_seed_list}\n"
+                f"The remaining seeds are NOT injected at runtime — "
+                f"`SCRAPER_LISTING_URL` carries only that one seed. Phase 1 "
+                f"must walk the rest of `input_urls.json` ITSELF (same "
+                f"scheme-insensitive host match), so the discovery code — "
+                f"not the runtime — fans out across them.\n"
+            )
+        else:
+            provided_urls_section = (
+                f"\n### PROVIDED URLs (FROM SITE MODEL)\n"
+                f"The user has provided {count} URLs via the Site "
+                f"configuration. These URLs are already saved to "
+                f"`workspace/{slug}/input_urls.json`.\n\n"
+                f"**You MUST use these URLs exactly as provided.** Do NOT "
+                f"discover new URLs, do NOT crawl categories or sitemaps, "
+                f"do NOT modify the URL list. Read the existing "
+                f"`input_urls.json` and use it as-is in the scraper.\n"
+                f"The `--sample` flag should scrape the first 5 URLs from "
+                f"this list.\n"
+            )
 
     retry_section = ""
     test_report_path = f"workspace/{slug}/test_report.json"
@@ -4224,7 +4280,29 @@ def build_code_writer_message(state: dict) -> list:
         "http_navigation",
         "",
     )
-    if (
+    # [wave-58 1c] Listing-shaped url_list seeds drive two-phase discovery.
+    # An `api` strategy with a bare single-phase api template ships the
+    # listing's own JSON as products (the 613 shape) — the discovery rung
+    # (http_navigation) is the template that walks a listing. A strategy
+    # with NO mechanism at all gets the SSR two-phase requests template,
+    # which already carries the SCRAPER_LISTING_URL phase-1 branch.
+    _listing_seed_template = ""
+    if input_mode == "url_list":
+        try:
+            from src.discovery_quality import seeds_are_listing_shaped as _sls2
+
+            if _sls2(site_input_urls):
+                from agents.constants import API_STRATEGIES
+
+                if mechanism in API_STRATEGIES:
+                    _listing_seed_template = "http_navigation_scraper.py"
+                elif not mechanism:
+                    _listing_seed_template = "requests_scraper.py"
+        except Exception:
+            _listing_seed_template = ""
+    if _listing_seed_template:
+        template_file = _listing_seed_template
+    elif (
         input_mode in ("navigation", "list_page", "search_term")
         and mechanism in _browser_strategies
     ):
@@ -5346,6 +5424,39 @@ def build_code_writer_message(state: dict) -> list:
             "the scraper MUST default to Phase 1 search discovery (using `--query` or the "
             "DEFAULT_QUERY constant), NEVER fall back to input_urls.json\n\n"
         )
+    elif _listing_seed_mode:
+        # [wave-58 1c] The listing-seed objective: two phases driven by the
+        # seeds. The generic single-phase DO-NOTs (no discover mode, no
+        # pagination, no added URLs) are the junk-pass recipe here — job 613
+        # followed them to the letter and shipped the listing pages
+        # themselves as products.
+        content += (
+            "The submitted seeds are LISTING pages, not item pages. The "
+            "scraper reads the seeds from `input_urls.json` in SCRIPT_DIR, "
+            "DISCOVERS the item URLs behind each listing, and extracts data "
+            "from EVERY discovered item page:\n"
+            "1. PHASE 1 — discovery: for each listing seed, walk its "
+            "pagination and collect item URLs (product links / PDP "
+            "shapes). Execution injects `SCRAPER_LISTING_URL` = EXACTLY "
+            "ONE seed — the first seed on this job's own registrable host "
+            "(a multi-host paste never arms it; seed/URL identity compares "
+            "scheme-insensitively). Honor it: when set, run discovery from "
+            "that listing (the template's phase-1 branch), then have YOUR "
+            "code walk the remaining seeds itself — nothing else injects "
+            "them. Write discovered item URLs to "
+            "`input_urls.json`.\n"
+            "2. PHASE 2 — extraction: extract fields from each discovered "
+            "item page and write results to `output_{datetime}.json`.\n\n"
+            "### DO NOT (Listing Seeds)\n"
+            "- Extract the listing seeds themselves as products — a row "
+            "whose URL is a submitted seed is the junk signature this "
+            "class ships\n"
+            "- Cap discovery at the seed count — a listing expands to many "
+            "items; scrape ALL pages up to max_pages\n"
+            "- Use `Accept-Encoding: gzip, deflate, br` — use only "
+            "`gzip, deflate` (requests library may not support Brotli)\n"
+            "- Deviate from the template's input/output structure\n\n"
+        )
     else:
         content += (
             f"The scraper reads URLs from `input_urls.json` in SCRIPT_DIR and "
@@ -5781,6 +5892,39 @@ def build_code_tester_message(state: dict) -> list:
         "targeted bug fix, not a full rewrite, so the verbatim error is essential.\n"
     )
 
+    # [wave-58 1c] url_list + listing-shaped seeds DO have a Phase 1 — the
+    # seeds are listing pages and execution drives discovery through
+    # SCRAPER_LISTING_URL. The blanket "url_list has no Phase 1" note is the
+    # lie that let 613's tester bless a 3-row listing-pages-as-products run.
+    try:
+        from src.discovery_quality import (
+            listing_seed_urls as _t_lsu,
+        )
+        from src.discovery_quality import (
+            seeds_are_listing_shaped as _t_sls,
+        )
+
+        _tester_listing = bool(
+            (state.get("input_mode") or "").strip().lower() == "url_list"
+            and _t_sls(state.get("input_urls") or [])
+            and _t_lsu(state.get("input_urls") or [])
+        )
+    except Exception:
+        _tester_listing = False
+    _tester_url_list_note = (
+        (
+            " For a url_list job whose seeds are LISTING pages, Phase 1 "
+            "APPLIES: execution injects SCRAPER_LISTING_URL (exactly ONE "
+            "seed — the first seed on the job's own registrable host) and "
+            "the run must DISCOVER the item URLs behind the listings "
+            "before extraction — a sample whose row URLs are the "
+            "submitted seeds themselves is a HIGH severity issue "
+            "(the listing pages were extracted as products)."
+        )
+        if _tester_listing
+        else " For url_list jobs, skip this (no Phase 1)."
+    )
+
     content = (
         f"## OBJECTIVE\n"
         f"Validate the generated scraper for {slug}.\n\n"
@@ -5801,7 +5945,7 @@ def build_code_tester_message(state: dict) -> list:
         f"{_tester_volume_rule} If argparse "
         f"rejects a flag (exit 2, `unrecognized arguments: ...`), that is a HIGH severity "
         f"issue whose problem text MUST start with `CLI CONTRACT VIOLATION:` and name the "
-        f'missing flags — set `target: "scraper"`. For url_list jobs, skip this (no Phase 1).\n'
+        f'missing flags — set `target: "scraper"`.{_tester_url_list_note}\n'
         f"2. Read `workspace/{slug}/product_analysis.json` for field expectations (1 call)\n"
         f"3. Read the output JSON file(s) that run_scraper produced (1 call)\n"
         f"4. Write test_report.json — include `phases_tested: {{phase1_discovery: <bool>, "

@@ -48,9 +48,17 @@ class TestBrowserTimeoutFloor:
         assert "if needs_browser and timeout < _run_floor:" in src
         assert "timeout = _run_floor" in src
         assert (
-            "VERIFICATION_RUN_TIMEOUT_FLOOR\n            if _verification_scope\n            else BROWSER_RUN_TIMEOUT_FLOOR"
+            "VERIFICATION_RUN_TIMEOUT_FLOOR\n"
+            "            if (_verification_scope and not _listing_seeded)\n"
+            "            else BROWSER_RUN_TIMEOUT_FLOOR"
             in src
-        ), "full-scope runs must keep the 600s discovery floor"
+        ), "full-scope runs must keep the verification floor; everything else keeps the 600s discovery floor"
+        # [wave-58 1c] a listing-seed url_list run IS a discovery run — it
+        # must NOT be compressed into the short verification floor (that is
+        # how 613's two-phase walk would have been starved).
+        assert "and not _listing_seeded" in src, (
+            "the listing-seed discovery exemption must gate the short floor"
+        )
 
     def test_verification_scope_is_seed_plus_sample(self):
         """[wave-14 job-133] verification scope = explicit seed (--input /

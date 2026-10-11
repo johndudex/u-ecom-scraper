@@ -5575,6 +5575,52 @@ def _invoke_nav_skill_review(
         clear_tool_context()
 
 
+def _apply_listing_seed_strategy(analysis: dict, state: ScrapeState) -> dict:
+    """[wave-58 1c] Listing-shaped url_list seeds drive two-phase discovery.
+
+    A bare ``api``/``internal_api`` pick on a listing-seed set hands the
+    writer a single-phase API template whose notion of "the input" is the
+    seed file — the exact shape that shipped job 613's 3 listing pages as 3
+    products. Listing seeds need a WALK: upgrade the api rung to
+    ``http_navigation`` (its template carries the phase-1 discovery
+    machinery) and stamp ``listing_seed_discovery`` so downstream consumers
+    can see why. ``http_requests`` keeps its own env-gated two-phase branch
+    (requests_scraper runs SCRAPER_LISTING_URL discovery in-process), and
+    item-shaped seed sets — the url_list contract — are never touched.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if str((state or {}).get("input_mode") or "").strip().lower() != "url_list":
+        return analysis
+    try:
+        from src.discovery_quality import url_list_discovery_seed
+
+        seeds = state.get("input_urls") or []
+        if not url_list_discovery_seed(seeds, state.get("url", "") or ""):
+            return analysis
+    except Exception:
+        return analysis
+    strategy = str(analysis.get("strategy") or "").strip().lower()
+    from .constants import API_STRATEGIES
+
+    if strategy not in API_STRATEGIES:
+        return analysis
+    out = dict(analysis)
+    out["strategy"] = "http_navigation"
+    out["listing_seed_discovery"] = True
+    for _k in ("scraping_mechanism", "scraping_method", "recommended_strategy",
+               "mechanism"):
+        _v = str(out.get(_k) or "").strip().lower()
+        if _v in API_STRATEGIES:
+            out[_k] = "http_navigation"
+    logger.info(
+        "_apply_listing_seed_strategy: listing-shaped url_list seeds — api → "
+        "http_navigation (phase-1 discovery) [job %s]",
+        (state or {}).get("job_id", 0),
+    )
+    return out
+
+
 def _decide_strategy(state: ScrapeState) -> dict[str, Any]:
     """Deterministic strategy selection (replaces the LLM scraper_analyzer).
 
@@ -5642,6 +5688,12 @@ def _decide_strategy(state: ScrapeState) -> dict[str, Any]:
         # Anti-bot ⇒ http_navigation (cloak). Sole strategy authority.
         if _PATCHES_ENABLED:
             analysis = _enforce_anti_bot_strategy(analysis, slug, "scraper_analysis.json")
+        # [wave-58 1c] Listing-shaped url_list seeds ⇒ the api rung must WALK
+        # (two-phase discovery), before the escalation ladder sees the pick.
+        try:
+            analysis = _apply_listing_seed_strategy(analysis, state)
+        except Exception as _exc:
+            logger.warning("_decide_strategy: listing-seed arm skipped: %s", _exc)
         # Escalation: _derive_strategy is a pure function of the probe method, so
         # without this it re-picks the SAME failing strategy every retry (the old
         # LLM analyzer read strategies_tried; the deterministic one must too). If

@@ -1243,6 +1243,31 @@ def run_execution(state: ScrapeState) -> dict:
         _listing_url_env = _env_candidate
         if _listing_url_env:
             logger.info("run_execution: setting SCRAPER_LISTING_URL=%s (env-var, deterministic discovery)", _listing_url_env[:80])
+    elif input_mode == "url_list":
+        # [wave-58 1b — job 613] A url_list job whose seeds are LISTING
+        # positions is a DISCOVERY job: the seeds name categories/collections,
+        # so a single-phase run extracts the listing pages themselves (3 rows
+        # that ARE the 3 seeds, defaulted prices) and every downstream gate
+        # that trusted url_list's item-paste premise credited it. Arm the
+        # same deterministic env gate the nav modes use — the template's
+        # two-phase branch then walks the listing and extracts the items
+        # behind it. Item-shaped seed sets never reach this arm
+        # (`url_list_discovery_seed` returns '' for them).
+        try:
+            from src.discovery_quality import url_list_discovery_seed
+        except Exception:
+            url_list_discovery_seed = None
+        _seed_env = (
+            url_list_discovery_seed(
+                state.get("input_urls"), state.get("url", ""))
+            if url_list_discovery_seed else ""
+        )
+        if _seed_env:
+            _listing_url_env = _seed_env
+            logger.info(
+                "run_execution: url_list seeds are listing-shaped — setting "
+                "SCRAPER_LISTING_URL=%s (deterministic discovery)", _seed_env[:80],
+            )
 
     # Enforce scope=firstn (intake UI): cap extraction at the user's N records.
     # scope_value is a CharField → parse defensively. The _filter_supported_args
@@ -1908,6 +1933,20 @@ def _run_in_process(
                 "error_message": _us,
             }
 
+        # [wave-58 1d] Listing-seed expansion bar: rows==seeds on a
+        # listing-shaped seed set means discovery never ran (the 613 junk
+        # pass). Same verdict shape — honest FAILED, no row edits.
+        _lse = _listing_seed_expansion_gate(output_file, seed_urls, input_mode)
+        if _lse:
+            logger.error("run_execution: %s", _lse)
+            return {
+                "execution_status": "FAILED",
+                "output_file": output_file,
+                "product_count": product_count,
+                "discovery_coverage": discovery_coverage,
+                "error_message": _lse,
+            }
+
         # H3: in-process path owns its own checkpoint cleanup (no browser_service
         # to do it). Delete so a subsequent invocation starts fresh. Tried in both
         # the workspace dir (SCRIPT_DIR location) and the subprocess cwd, since
@@ -1989,7 +2028,14 @@ def _run_via_browser_service(
         _nav_bs = (state or {}).get("navigation_analysis") or {}
         _disc_bs = (_nav_bs.get("discovery") if isinstance(_nav_bs, dict) else None) or {}
         _listing_env_bs = (_disc_bs.get("listing_url") if isinstance(_disc_bs, dict) else "") or ""
-    if _listing_env_bs and (state or {}).get("input_mode") in ("navigation", "list_page", "search_term"):
+    if _listing_env_bs and (
+        (state or {}).get("input_mode") in ("navigation", "list_page", "search_term")
+        # [wave-58 1b] a listing-seed url_list run IS a discovery run — the
+        # gate armed `_listing_url_env` upstream, so the browser lane must
+        # carry it too (M6's single source of truth, no re-derivation).
+        or ((state or {}).get("input_mode") == "url_list" and _listing_env_bs
+            == ((state or {}).get("_listing_url_env") or ""))
+    ):
         stealth_env["SCRAPER_LISTING_URL"] = _listing_env_bs
     # [wave-40 T15] Arm (or explicitly disarm) checkpoint reuse on the /scrape
     # payload env_overrides — browser_service forwards them into the scraper
@@ -2276,6 +2322,24 @@ def _run_via_browser_service(
                 "product_count": result.get("product_count", 0),
                 "discovery_coverage": discovery_coverage,
                 "error_message": _us,
+            }
+
+        # [wave-58 1d] Listing-seed expansion bar (browser lane mirror) —
+        # seeds from state, NOT the on-disk input_urls.json the template
+        # rewrites (same spelling as the scope gate above).
+        _lse = _listing_seed_expansion_gate(
+            output_file, (state or {}).get("input_urls"),
+            state.get("input_mode", ""), state.get("url") or "",
+        )
+        if _lse:
+            logger.error("run_execution: %s", _lse)
+            _notify_phase(_exec_job_id, "execution", "failed")
+            return {
+                "execution_status": "FAILED",
+                "output_file": output_file,
+                "product_count": result.get("product_count", 0),
+                "discovery_coverage": discovery_coverage,
+                "error_message": _lse,
             }
 
         _notify_phase(_exec_job_id, "execution", "done")
@@ -2599,14 +2663,19 @@ def _shallow_section_gate(
 def _submitted_url_key(url: str) -> str:
     """Comparison key for "is this output row one the user submitted".
 
-    Scheme, a ``www.`` prefix, host case, the query string and a trailing
-    slash are the same item: a seed submitted as
-    ``http://shop.com/p/1?utm_source=feed`` routinely comes back as
-    ``https://www.shop.com/p/1/`` once the site canonicalises it (the audit's
-    own 1226/1227 seeds carry four tracking params). Host + path is the item
-    identity; anything else — a different path segment above all — is a
-    different product and stays a violation. Fragment dropped: it never
-    reaches the server.
+    [wave-58 B4] Scheme now matches its own contract: a ``www.`` prefix,
+    host case, THE SCHEME, the query string and a trailing slash are the
+    same item — a seed submitted as ``http://shop.com/p/1?utm_source=feed``
+    routinely comes back as ``https://www.shop.com/p/1/`` once the site
+    canonicalises it (the audit's own 1226/1227 seeds carry four tracking
+    params; 613's seeds were submitted http:// and came back https://).
+    Dropping the scheme LOOSENS in the anti-veto direction only: fewer
+    honest rows read as strays in the strict scope arm, and canonicalized
+    SEED rows now count as seeds in the listing-seed gates (stricter against
+    junk, never against extraction). Host + path is the item identity;
+    anything else — a different path segment above all — is a different
+    product and stays a violation. Fragment dropped: it never reaches the
+    server.
     """
     s = str(url or "").strip()
     try:
@@ -2618,9 +2687,75 @@ def _submitted_url_key(url: str) -> str:
         host = p.netloc.lower()
         if host.startswith("www."):
             host = host[4:]
-        return f"{p.scheme.lower()}://{host}{p.path.rstrip('/')}"
+        return f"{host}{p.path.rstrip('/')}"
     except Exception:
         return s.split("#", 1)[0].rstrip("/")
+
+
+def _listing_seed_expansion_gate(
+    output_file: str, seed_urls, input_mode: str = "", job_url: str = "",
+) -> str:
+    """[wave-58 1d] Post-run assertion: a listing-seed url_list run must have
+    DISCOVERED something.
+
+    Companion to the wave-57 scope loosen arm: when the seed set reads as
+    listings, that loosen arm judges rows by item-shape + host — and 613
+    shipped 3 rows that WERE its 3 listing seeds (category titles, defaulted
+    prices) through it, because ``row_url_is_item_shaped('/all/x')`` passes.
+    This gate closes that hole: url_list + listing-shaped seeds + >=2 rows
+    AND ZERO rows whose URL is not one of the submitted seeds ⇒ every
+    "product" is a submitted listing page; discovery never ran. Honest
+    FAILED diagnostic — the run is never edited.
+
+    Deliberate bars (critique S1): ONE all-seed row stays silent — a correct
+    one-product store whose only page sits at a listing-shaped URL is
+    byte-identical to the junk shape, and a listing that expands yields
+    many. Rows with no URL key are unverifiable (F4b) and never assert.
+    Item-shaped seed sets never reach here: the url_list contract IS
+    rows==seeds for a PDP paste. Multi-host seed pastes stay silent — no
+    runtime arm drives discovery for them anyway.
+    """
+    if str(input_mode or "").strip().lower() != "url_list":
+        return ""
+    seed_list = [u for u in (seed_urls or []) if str(u or "").strip()]
+    if not seed_list:
+        return ""
+    try:
+        from src.discovery_quality import (
+            listing_seed_urls,
+            seeds_are_listing_shaped,
+            url_list_discovery_seed,
+        )
+
+        if not seeds_are_listing_shaped(seed_list):
+            return ""
+        if not listing_seed_urls(seed_list):
+            return ""
+        # Same eligibility the env gate demanded: one unambiguous seed host
+        # (+ F17 when the job URL is known). A set no discovery arm would
+        # walk gets no second verdict here.
+        if not url_list_discovery_seed(seed_list, job_url):
+            return ""
+    except Exception:
+        return ""
+    urls = _output_row_urls(output_file)
+    if len(urls) < 2:
+        # Zero rows is the zero-yield gate's subject; one row is S1's
+        # degenerate-store bar; no URL keys at all is unverifiable (F4b).
+        return ""
+    seeds = {_submitted_url_key(u) for u in seed_list}
+    expanded = [u for u in urls if _submitted_url_key(u) not in seeds]
+    if not expanded:
+        return (
+            f"url_list listing-seed no-op: all {len(urls)} extracted rows ARE "
+            f"the submitted listing URLs — the run extracted the listing "
+            f"pages themselves (category titles, defaulted fields), not the "
+            f"items behind them; SCRAPER_LISTING_URL discovery never ran or "
+            f"produced nothing. Fix the draft's Phase-1 discovery (listing "
+            f"walk / pagination / item-link harvest), not the field "
+            f"selectors."
+        )
+    return ""
 
 
 def _output_row_count(output_file: str) -> int:
