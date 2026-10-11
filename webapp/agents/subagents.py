@@ -1160,13 +1160,16 @@ def _make_pre_model_hook(embed_chars: int = 0):
                 )
             return {"llm_input_messages": trimmed}
 
-        # Step 2: still over budget — keep system + seed + recent N.
+        # Step 2: still over budget — keep system + seed + the newest history
+        # the char budget admits.
         system_msgs = [m for m in trimmed if hasattr(m, "type") and m.type == "system"]
         other = [m for m in trimmed if not (hasattr(m, "type") and m.type == "system")]
-        kept_recent = (
-            other[-_MIN_KEEP_RECENT:] if len(other) > _MIN_KEEP_RECENT else list(other)
-        )
-
+        # [wave-59 C1] Walk the WHOLE trimmed history newest-first under the
+        # char budget. The old `other[-6:]` pre-slice collapsed working memory
+        # to 6 messages REGARDLESS of budget (R2 measured `280 → 7` on a 62k
+        # budget; the writer then re-read its own draft 114× and never edited
+        # it — 88% of its turns were reads). The budget loop below always
+        # existed; it was applied to a pre-amputated window.
         budget = max(
             max_chars
             - embed_chars
@@ -1177,7 +1180,7 @@ def _make_pre_model_hook(embed_chars: int = 0):
 
         selected = []
         acc = 0
-        for m in reversed(kept_recent):
+        for m in reversed(other):
             if seed is not None and m is seed:
                 continue  # seed is prepended separately; don't double-count
             ml = _clen(m)
@@ -1185,6 +1188,20 @@ def _make_pre_model_hook(embed_chars: int = 0):
                 break
             selected.append(m)
             acc += ml
+        # [wave-59 C1] HARD floor: when the budget walk selected fewer than
+        # _MIN_KEEP_RECENT messages but more exist, take the newest 6 REGARDLESS
+        # of budget — byte-identical to today's unconditional `other[-6:]`, so
+        # this branch never ships MORE than the old code did; it only prevents
+        # working memory collapsing below the floor when every message is
+        # oversized. Explicitly: the floor may exceed the char budget.
+        # (Built newest-first to match the walk's convention — the .reverse()
+        # below restores chronological order for both paths.)
+        if len(selected) < _MIN_KEEP_RECENT and len(other) > len(selected):
+            selected = [
+                m
+                for m in reversed(other[-_MIN_KEEP_RECENT:])
+                if not (seed is not None and m is seed)
+            ]
         selected.reverse()  # back to chronological order
         kept = system_msgs + ([seed] if seed is not None else []) + selected
 
