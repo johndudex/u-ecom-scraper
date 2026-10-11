@@ -45,16 +45,28 @@ class TestNoDraftWallClockCounting:
     def _no_draft_arm(self) -> str:
         """The ``if not _draft_ok:`` arm of _invoke_code_writer (up to the
         draft-exists wall-clock arm that already counts). The arm itself may
-        contain the same wall-clock signature line (A6), so the boundary is
-        the SECOND occurrence of the signature after the arm opens."""
+        contain the same window-death signature line (A6), so the boundary is
+        the SECOND occurrence of the signature after the arm opens.
+        [wave-58 2c] the signature is now the shared ``_writer_window_death``
+        predicate (wall-clock AND recursion deaths count) — the legacy
+        literal ``"wall-clock timeout" in _cw_err`` is accepted as a
+        fallback for the same boundary."""
         src = self._writer_src()
         i_arm = src.index("if not _draft_ok:")
-        i_first = src.index('if "wall-clock timeout" in _cw_err', i_arm)
-        try:
-            i_after = src.index('if "wall-clock timeout" in _cw_err', i_first + 1)
-        except ValueError:
-            i_after = i_first  # A6 not implemented yet — RED boundary
+        i_first = self._index_after(src, i_arm)
+        i_after = self._index_after(src, i_first + 1) if i_first >= 0 else i_arm
         return src[i_arm:i_after]
+
+    def _index_after(self, src: str, start: int) -> int:
+        for needle in (
+            "if _writer_window_death(_cw_err",
+            'if "wall-clock timeout" in _cw_err',
+        ):
+            try:
+                return src.index(needle, start)
+            except ValueError:
+                continue
+        return -1
 
     def test_no_draft_arm_counts_wall_clock_timeouts(self):
         arm = self._no_draft_arm()
@@ -65,12 +77,14 @@ class TestNoDraftWallClockCounting:
         )
 
     def test_no_draft_arm_gates_the_count_on_the_timeout_signature(self):
-        """The increment must key on the same wall-clock signature the
-        draft-exists arm uses — not on every no-draft failure."""
+        """The increment must key on a window-death signature (wave-58: the
+        shared wall-clock-or-recursion predicate) — not on every no-draft
+        failure."""
         arm = self._no_draft_arm()
-        assert 'in _cw_err' in arm or "wall-clock timeout" in arm, (
-            "no-draft arm counts writer_wall_clock_timeouts unconditionally"
-        )
+        assert (
+            "_writer_window_death(" in arm
+            or "wall-clock timeout" in arm
+        ), "no-draft arm counts writer_wall_clock_timeouts unconditionally"
 
     def test_healthy_return_still_resets(self):
         src = self._writer_src()

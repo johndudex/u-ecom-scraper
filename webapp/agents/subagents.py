@@ -957,9 +957,97 @@ def _make_pre_model_hook(embed_chars: int = 0):
         if mode == "off":
             return input_dict
 
+        _MIN_KEEP_RECENT = 6
         messages = input_dict.get("messages", [])
         if not messages:
             return input_dict
+
+        # [wave-58 2b] Old write_file/edit_file ARGS stop riding every turn.
+        # Steps 1-2 capped tool RESULTS and chatter, but never touched
+        # ``tool_calls`` args — so every retained turn still carried the full
+        # draft text the writer pasted into that turn's write_file call
+        # (batch 613-616 measured 112-435k chars/turn PRE-trim, and the
+        # post-trim model input still reached the ~45k-token prefill scale
+        # the wave-52 canary proved kills provider windows). The draft lives
+        # on DISK; the writer re-reads it with read_file when it needs it.
+        # Args OLDER than the latest tool-call turn are elided (name + id kept
+        # so provider pairing holds); the LATEST tool-call turn keeps its full
+        # args — the writer reads its own latest edit from history.
+        _TOOL_CALL_ARG_STUB_CAP = 400
+
+        _non_system = [
+            m for m in messages if not (hasattr(m, "type") and m.type == "system")
+        ]
+        _recent_ids: set = set()
+        for _m in reversed(_non_system):
+            _tcs = [
+                _tc for _tc in (getattr(_m, "tool_calls", None) or [])
+                if isinstance(_tc, dict) and _tc.get("id")
+            ]
+            if _tcs:
+                _recent_ids = {_tc["id"] for _tc in _tcs}
+                break
+
+        def _stub_args(args) -> tuple:
+            if not isinstance(args, dict):
+                return args, False
+            stubbed = {}
+            changed = False
+            for _k, _v in args.items():
+                _sv = str(_v)
+                if len(_sv) > _TOOL_CALL_ARG_STUB_CAP:
+                    stubbed[_k] = (
+                        f"[elided {len(_sv)} chars — the file is on disk; "
+                        f"read_file it if you need it]"
+                    )
+                    changed = True
+                else:
+                    stubbed[_k] = _v
+            return stubbed, changed
+
+        stubbed_messages = []
+        for _m in messages:
+            _tcs = getattr(_m, "tool_calls", None)
+            if not _tcs:
+                stubbed_messages.append(_m)
+                continue
+            if all(
+                (isinstance(_tc, dict) and _tc.get("id") in _recent_ids)
+                or not isinstance(_tc, dict)
+                for _tc in _tcs
+            ):
+                stubbed_messages.append(_m)  # the latest tool-call turn — untouched
+                continue
+            _new_tcs = []
+            _changed = False
+            for _tc in _tcs:
+                if not isinstance(_tc, dict) or _tc.get("id") in _recent_ids:
+                    _new_tcs.append(_tc)
+                    continue
+                _new_tc = dict(_tc)
+                _new_tc["args"], _tc_changed = _stub_args(_tc.get("args"))
+                _changed = _changed or _tc_changed
+                _new_tcs.append(_new_tc)
+            if not _changed:
+                stubbed_messages.append(_m)
+                continue
+            try:
+                _clone = type(_m)(content=_m.content, tool_calls=_new_tcs)
+                # [wave-58 S6] keep the message's metadata — GLM usage /
+                # reasoning blocks ride in additional_kwargs and the model
+                # block in response_metadata; dropping them degrades the
+                # history accounting wave-25e measures on the next turn.
+                _ak = getattr(_m, "additional_kwargs", None)
+                if isinstance(_ak, dict) and _ak:
+                    _clone.additional_kwargs = dict(_ak)
+                _rm = getattr(_m, "response_metadata", None)
+                if isinstance(_rm, dict) and _rm:
+                    _clone.response_metadata = dict(_rm)
+                stubbed_messages.append(_clone)
+            except Exception:
+                stubbed_messages.append(_m)  # never break the history over a stub
+
+        messages = stubbed_messages
 
         # [wave-25e E0] per-turn input measurement: messages + embed.
         _in_total = sum(
@@ -975,7 +1063,6 @@ def _make_pre_model_hook(embed_chars: int = 0):
             f"{_in_total + embed_chars:,}",
         )
 
-        _MIN_KEEP_RECENT = 6  # always retain the most recent N non-system messages
         seed = next((m for m in messages if getattr(m, "type", "") == "human"), None)
 
         def _clen(m) -> int:

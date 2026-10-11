@@ -120,11 +120,11 @@ def test_writer_escalation_used_channel_is_declared():
 
 
 def _writer_two_strike_arm() -> str:
-    """The ``_wc >= 2`` abort arm of _invoke_code_writer (boundary = the
+    """The summed-strike abort arm of _invoke_code_writer (boundary = the
     healthy-return counter reset that follows it)."""
     with open(os.path.join(ROOT, "webapp", "agents", "graph.py")) as fh:
         src = fh.read()
-    i = src.index("if _wc >= 2:")
+    i = src.index("if _wc + _rec_deaths >= 2:")
     j = src.index("if not _cw_dead:", i)
     return src[i:j]
 

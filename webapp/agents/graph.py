@@ -1204,7 +1204,13 @@ def _preserve_test_report(slug: str) -> None:
 # super-steps: langgraph's prebuilt loop burns ~3 super-steps per tool round
 # (pre_model_hook + model + tool), so the old hard-coded 120 was only ~40
 # rounds — 587's writer died on steps while its wall clock still had room.
-_WRITER_ROUNDS = 50
+# [wave-58 2a] 50 rounds → recursion_limit 152, and revolve 614 / wonderbly
+# 616 inv2 both died mid-edit on "Recursion limit of 152 reached" (51 turns
+# = 153 super-steps) with ZERO draft bytes — the step counter bound BELOW
+# the wall clock it was never meant to outrun. 150 rounds (limit 452) puts
+# GraphRecursionError far past anything the 1800-2700s wall clock can reach
+# at the measured 15-160 s/turn: the wall clock is the backstop again.
+_WRITER_ROUNDS = 150
 
 AGENT_RECURSION_MAP: dict[str, int] = {
     "site_analyzer": 250,
@@ -1213,10 +1219,12 @@ AGENT_RECURSION_MAP: dict[str, int] = {
     "nav_skill_review": 60,
     "scraper_analyzer": 160,
     "code_writer": _WRITER_ROUNDS * 3 + 2,
-    # ≈50 tool rounds (+2 margin). The REAL backstop is the wall clock
+    # ≈150 tool rounds (+2 margin). The REAL backstop is the wall clock
     # (WRITER_INVOKE_TIMEOUT — 1800s base extending to the WRITER_MAX_TIMEOUT
     # cap, never 900s) plus wave-32 C1's no-source termination; this number
-    # only stops GraphRecursionError from firing mid-round.
+    # only stops GraphRecursionError from firing mid-round — and [wave-58]
+    # when it does fire anyway, `_writer_window_death` feeds the same ledger
+    # the wall clock feeds.
     "code_tester": 120,
     # T1.7: dagster_converter was absent → ran at the default AGENT_RECURSION_LIMIT
     # (150) — which is how job 302 burned 34 LLM calls. Capped BELOW default like
@@ -2823,22 +2831,62 @@ def _writer_max_timeout() -> int:
     return _env_int("WRITER_MAX_TIMEOUT", 2700)
 
 
-def _writer_extension_ceiling(state: dict | None = None) -> int:
-    """[wave-56b F7] The writer's activity-extension ceiling, retired after
-    one wall-clock death.
+def _writer_window_death(err: str, err_class: str = "") -> bool:
+    """[wave-58 2c] Did this writer invocation die against its WINDOW?
 
-    Job 580 paid the full 2700s ceiling on BOTH hangs: F6's post-death cap
-    only sizes the base window near the END of the task budget, so mid-budget
-    a second hang still consumed 2700s and the job died on the soft limit with
-    a validated checkpoint unfinalized. One hang is the signal that the
-    provider window is degraded — every window AFTER it gets the base clock
-    (``_writer_invoke_timeout``) and no extension slack; the zombie latch
-    still stops a true zombie at base. A healthy writer (deaths == 0) keeps
-    the full env-tunable ceiling byte-identically.
+    The F7 ledger (`writer_wall_clock_timeouts`) was fed by the literal
+    ``"wall-clock timeout" in err`` — so a GraphRecursionError death (614/616
+    inv2: 153 super-steps, zero draft bytes, a full window burned) never
+    reached it. A window death is a window death: wall-clock OR recursion.
+    Provider errors (429, gateway) are NOT window deaths — they have their
+    own park arm.
+    """
+    if not err:
+        return False
+    if err_class == "GraphRecursionError" or "Recursion limit of" in err:
+        return True
+    return err_class == "WallClockTimeout" or "wall-clock timeout" in err
+
+
+def _writer_recursion_death(err: str, err_class: str = "") -> bool:
+    """[wave-58 2c/S3] The recursion-only slice of `_writer_window_death`.
+
+    A recursion death means the writer could not converge within its TURN
+    budget — more wall-clock cannot fix that, only more turns, and more
+    turns are exactly what failed. The two ledgers are therefore separate:
+    `writer_recursion_deaths` feeds the F7 ceiling (a loop is as expensive
+    as a hang) but NEVER the T12 progress-escalation grant.
+    """
+    if not err:
+        return False
+    return err_class == "GraphRecursionError" or "Recursion limit of" in err
+
+
+def _writer_extension_ceiling(state: dict | None = None) -> int:
+    """[wave-56b F7 → wave-58 two-strike] The writer's extension ceiling.
+
+    F7 retired the ceiling after ONE death; wonderbly 616 then proved the
+    price: inv2 died mid-edit, and inv3 — with no draft at all — ran at the
+    1800 BASE while the operator's configured ceiling (WRITER_MAX_TIMEOUT=
+    2700) was never tried once. One death retires the GROWTH past the
+    configured max, not the max itself: the next invocation still gets the
+    full configured ceiling. The SECOND death is the degraded-window signal
+    F7 was built for (job 580 paid 2700s on both hangs; a second strike
+    restores the fail-fast base clock with no slack — the zombie-burn
+    protection). A healthy writer (deaths == 0) keeps the full env-tunable
+    ceiling byte-identically.
+
+    [wave-58 2c] BOTH window-death ledgers count toward the strike total:
+    a recursion death burns the window exactly like a timeout, so
+    616-inv2-class recursion deaths buy the fail-fast second strike too.
     """
     ceiling = _writer_max_timeout()
     try:
-        if int((state or {}).get("writer_wall_clock_timeouts") or 0) >= 1:
+        _strikes = (
+            int((state or {}).get("writer_wall_clock_timeouts") or 0)
+            + int((state or {}).get("writer_recursion_deaths") or 0)
+        )
+        if _strikes >= 2:
             ceiling = min(ceiling, _writer_invoke_timeout())
     except Exception:
         pass
@@ -3028,6 +3076,9 @@ def _writer_escalation_window(
 
     - ``WRITER_PROGRESS_ESCALATION=1`` (default OFF; with the flag off this
       helper is a constant None and every caller is byte-identical to today);
+    - **two WALL-CLOCK strikes on the ledger and zero recursion strikes**
+      ([wave-58 S3] — recursion deaths feed the F7 ceiling, never this
+      grant);
     - **verifiable progress**, per the tester's own stamps — the draft
       fingerprint of the last TESTED cycle is present
       (``last_tested_draft_fp``), the draft did not mutate while the tester
@@ -3048,6 +3099,16 @@ def _writer_escalation_window(
     already inside the finalize reserve) refuses the grant.
     """
     if not _writer_progress_escalation_enabled():
+        return None
+    # [wave-58 guardian change 2 / S3] the grant is bought by WALL-CLOCK
+    # strikes ONLY, and only at the two-strike threshold: recursion deaths
+    # feed the F7 ceiling, never the grant (a writer that cannot converge
+    # even in more turns does not get twice the window). The caller passes a
+    # ledger view with this invocation's stamps merged in, so the strike that
+    # just landed is visible here.
+    if int(state.get("writer_wall_clock_timeouts") or 0) < 2:
+        return None
+    if int(state.get("writer_recursion_deaths") or 0):
         return None
     if not str(state.get("last_tested_draft_fp") or ""):
         return None
@@ -8500,6 +8561,7 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
         # + regenerate), then honest escalation to a human.
         _cw_result = result if isinstance(result, dict) else {}
         _cw_err = str(_cw_result.get("_error") or "")
+        _cw_class = str(_cw_result.get("_error_class") or "")
         _cw_dead = bool(_cw_err) or not _cw_result.get("messages")
         _draft_path = os.path.join(_get_project_root(), "workspace", slug, "scraper_draft.py")
         # [jobs 83/88 RCA] A killed invocation that ALREADY wrote its draft used
@@ -8544,10 +8606,19 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
             # counter only lived in the draft-exists arm, so a timeout that
             # produced no draft was invisible to the budget telemetry (the
             # most expensive failure class reported 0 timeouts).
-            if "wall-clock timeout" in _cw_err:
-                update["writer_wall_clock_timeouts"] = int(
-                    state.get("writer_wall_clock_timeouts") or 0
-                ) + 1
+            # [wave-58 2c] via the shared predicate: a recursion death (614/
+            # 616 inv2 — full window, zero draft bytes) is a window death too.
+            # Ledgers stay SEPARATE: recursion strikes feed the F7 ceiling,
+            # wall-clock strikes feed the T12 grant (S3).
+            if _writer_window_death(_cw_err, _cw_class):
+                if _writer_recursion_death(_cw_err, _cw_class):
+                    update["writer_recursion_deaths"] = int(
+                        state.get("writer_recursion_deaths") or 0
+                    ) + 1
+                else:
+                    update["writer_wall_clock_timeouts"] = int(
+                        state.get("writer_wall_clock_timeouts") or 0
+                    ) + 1
             update["messages"] = []
             if _err_count + 1 >= 2:
                 # Second consecutive no-draft — stop burning wall-clock.
@@ -8624,14 +8695,47 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
             # written. Two in a row → the loop would keep re-running the full
             # writer window against a draft it cannot improve (the most
             # expensive pathological cycle there is) — escalate instead.
-            if "wall-clock timeout" in _cw_err:
-                _wc = int(state.get("writer_wall_clock_timeouts") or 0) + 1
-                update["writer_wall_clock_timeouts"] = _wc
+            # [wave-58 2c] shared predicate: recursion deaths count too.
+            if _writer_window_death(_cw_err, _cw_class):
+                if _writer_recursion_death(_cw_err, _cw_class):
+                    # [S3] recursion deaths NEVER buy the T12 grant — only
+                    # wall-clock strikes do. They still feed the F7 ceiling
+                    # through their own ledger.
+                    _rc = int(state.get("writer_recursion_deaths") or 0) + 1
+                    update["writer_recursion_deaths"] = _rc
+                    logger.warning(
+                        "_invoke_code_writer: recursion death #%d with a "
+                        "usable draft on disk — ceiling strike counted, T12 "
+                        "grant not eligible (job %s)", _rc, job_id,
+                    )
+                    _wc = int(state.get("writer_wall_clock_timeouts") or 0)
+                    update["writer_wall_clock_timeouts"] = _wc
+                else:
+                    _wc = int(state.get("writer_wall_clock_timeouts") or 0) + 1
+                    update["writer_wall_clock_timeouts"] = _wc
                 logger.warning(
-                    "_invoke_code_writer: wall-clock timeout #%d with a usable "
-                    "draft on disk (job %s)", _wc, job_id,
+                    "_invoke_code_writer: writer window death with a usable "
+                    "draft on disk — wall-clock strikes %d, recursion strikes "
+                    "%d (job %s)",
+                    _wc,
+                    int(update.get("writer_recursion_deaths") or 0),
+                    job_id,
                 )
-                if _wc >= 2:
+                # [wave-58 guardian change 2] the strike total is the SUMMED
+                # ledger — a recursion death reaches strike 2 exactly like a
+                # wall-clock death (same arithmetic as _writer_extension_
+                # ceiling). T12 stays WALL-ONLY below: any recursion strike on
+                # the ledger holds the grant (_esc_window → None, S3).
+                _rec_deaths = int(
+                    update.get("writer_recursion_deaths")
+                    if update.get("writer_recursion_deaths") is not None
+                    else state.get("writer_recursion_deaths") or 0
+                )
+                if _wc + _rec_deaths >= 2:
+                    # [wave-58 S3] recursion strikes NEVER buy the T12 grant —
+                    # only wall-clock strikes do. The honest abort arms below
+                    # still run for BOTH ledgers (a recursion loop at strike 2
+                    # is as dead as a hang at strike 2 — F7's fail-fast).
                     # [wave-40 T12] Opt-in escape hatch BEFORE the honest
                     # abort: if the run shows verifiable convergence (the
                     # tester stamped this draft's fingerprint, it did not
@@ -8646,7 +8750,17 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                     # escalates into a second grant. Flag off → the helper is
                     # a constant None → byte-identical to the pre-T12 arm.
                     _esc_window = _writer_escalation_window(
-                        state,
+                        # [wave-58 guardian change 2] the ledger view carries
+                        # THIS invocation's stamps — the strike that just
+                        # landed must be visible to the wall-only gate inside
+                        # the helper (recursion strikes refuse the grant there,
+                        # so the old caller-side `_rec_deaths` hold moved into
+                        # the helper as the single authority).
+                        {
+                            **state,
+                            "writer_wall_clock_timeouts": _wc,
+                            "writer_recursion_deaths": _rec_deaths,
+                        },
                         ((_cw_cfg or {}).get("configurable") or {}).get(
                             "task_deadline"
                         ),
@@ -8674,6 +8788,7 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                             _cw_dead = False
                             _cw_err = ""
                             update["writer_wall_clock_timeouts"] = 0
+                            update["writer_recursion_deaths"] = 0
                             logger.warning(
                                 "_invoke_code_writer: WRITER-PROGRESS-"
                                 "ESCALATION window salvaged the converging "
@@ -8684,7 +8799,8 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                         # fall through to the UNCHANGED abort arms below.
 
                     _wc_note = (
-                        "code_writer hit its wall-clock timeout twice in a row "
+                        "code_writer burned its writer window twice in a row "
+                        "(wall-clock timeouts or recursion deaths) "
                         f"({_cw_err or 'no detail'}) while a draft already "
                         "existed — the generation loop is not making progress."
                     )
@@ -8718,6 +8834,10 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                             _cw_dead = False
                             _cw_err = ""
                             update["writer_wall_clock_timeouts"] = 0
+                            # [wave-58 guardian change 2] the strike total is
+                            # summed — the salvage clears BOTH ledgers or a
+                            # stale recursion strike aborts the next death.
+                            update["writer_recursion_deaths"] = 0
                             logger.warning(
                                 "_invoke_code_writer: DRAFT-FINISHER salvaged "
                                 "the mid-fix draft (job %s)", job_id,
@@ -8762,8 +8882,12 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                         )
 
         if not _cw_dead:
-            # Healthy run — reset the consecutive wall-clock-death counter.
+            # Healthy run — reset the consecutive-death counter. [wave-58
+            # guardian change 2] BOTH ledgers: the strike total is summed, so
+            # resetting only the wall ledger would let a stale recursion
+            # strike abort on the very next single death.
             update["writer_wall_clock_timeouts"] = 0
+            update["writer_recursion_deaths"] = 0
         # [T2.5] Record the template this successful draft was built on, so the
         # NEXT cycle can hand the writer its own draft back (edit-over-write)
         # whenever the base template is unchanged. Set only on the usable-draft

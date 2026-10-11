@@ -37,6 +37,12 @@ CHANNELS = {                       # key -> the value a writer stamps
     "draft_absent_count": 1,
     "last_tested_draft_bytes": 1024,
     "no_fresh_output": True,
+    # [wave-58] the recursion-death ledger, declared with the code that
+    # writes it (guardian change 1): GraphRecursionError deaths stamp the
+    # counter through the same Command(update) channel the wall-clock
+    # ledger uses.
+    "writer_recursion_deaths": 1,
+    "writer_wall_clock_timeouts": 1,
 }
 
 
@@ -48,7 +54,7 @@ def _stale(value):
     return "stale " + value
 
 
-def test_six_channels_are_declared():
+def test_writer_channels_are_declared():
     for key in CHANNELS:
         assert key in ScrapeState.__annotations__, f"ScrapeState lacks {key}"
 

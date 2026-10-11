@@ -190,6 +190,12 @@ class ScrapeState(TypedDict, total=False):
     # the loop is re-running a 900s writer against a draft it cannot improve —
     # escalate to human_approval instead of burning another cycle.
     writer_wall_clock_timeouts: int
+    # [wave-58 2c] the sibling ledger: code_writer invocations that died on
+    # GraphRecursionError (full window spent, zero draft bytes — jobs 614/616
+    # inv2). Declared beside the wall-clock ledger because the strike total
+    # that arms the two-strike abort and the F7 ceiling is their SUM: recursion
+    # strikes feed the ceiling, never the T12 grant (S3, wall-only).
+    writer_recursion_deaths: int
     # [wave-30 W30-2] the draft-finisher salvage invocation (the _wc >= 2
     # skip_approvals arm) fires at most once per job — this flag routes the
     # second arrival straight to the honest cleanup instead of another

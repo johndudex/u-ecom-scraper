@@ -7,7 +7,7 @@ consecutive-death arm (``writer_wall_clock_timeouts >= 2``) then failed the
 job with that salvageable draft still untested.
 
 Contract:
-1. At the ``_wc >= 2`` arm, ``skip_approvals`` branch ONLY: fire ONE bounded
+1. At the strike-2 arm, ``skip_approvals`` branch ONLY: fire ONE bounded
    FINISH invocation (``WRITER_FINISH_TIMEOUT``, default 1800, fixed window —
    no activity extension; the job is already deep in budget), guarded by a
    once-per-job flag (``writer_finisher_attempted``).
@@ -283,7 +283,7 @@ class TestArmWiring:
 
     def _arm(self) -> str:
         src = self._writer_src()
-        i = src.index("if _wc >= 2:")
+        i = src.index("if _wc + _rec_deaths >= 2:")
         j = src.index("if not _cw_dead:", i)
         return src[i:j]
 
@@ -328,7 +328,7 @@ class TestArmWiring:
         i_node = src.index("def _invoke_code_writer")
         j = src.index("\ndef ", i_node + 10)
         assert src[i_node:j].count("_run_draft_finisher(") == 1, (
-            "the finisher must exist ONLY in the skip_approvals _wc >= 2 arm — "
+            "the finisher must exist ONLY in the skip_approvals strike-2 arm — "
             "the human_approval path must not burn pre-interrupt LLM spend"
         )
 
