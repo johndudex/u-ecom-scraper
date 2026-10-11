@@ -324,12 +324,25 @@ class TestArmWiring:
         assert 'goto="cleanup"' in after_guard or 'goto="human_approval"' in arm
 
     def test_finisher_appears_exactly_once_in_the_node(self):
+        """[wave-59 C4 revised] Exactly TWO call sites, both behind
+        skip_approvals strike-2 arms: the draft-exists salvage (parseable
+        draft — this file's original arm) and the no-draft REPAIR arm
+        (``require_parses=False`` — the unparsable-but-substantial 623
+        class). The human_approval paths still must not burn pre-interrupt
+        LLM spend."""
         src = self._writer_src()
         i_node = src.index("def _invoke_code_writer")
         j = src.index("\ndef ", i_node + 10)
-        assert src[i_node:j].count("_run_draft_finisher(") == 1, (
-            "the finisher must exist ONLY in the skip_approvals strike-2 arm — "
-            "the human_approval path must not burn pre-interrupt LLM spend"
+        body = src[i_node:j]
+        assert body.count("_run_draft_finisher(") == 2, (
+            "the finisher must exist ONLY in the two skip_approvals strike-2 "
+            "arms (draft-exists salvage + no-draft repair) — the "
+            "human_approval paths must not burn pre-interrupt LLM spend"
+        )
+        assert body.count("require_parses=False") == 1, (
+            "exactly one call site is the repair window (the draft is "
+            "unparsable by construction); the draft-exists salvage keeps "
+            "the deterministic parse gate"
         )
 
     def test_state_declares_the_once_per_job_flag(self):

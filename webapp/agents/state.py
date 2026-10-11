@@ -196,10 +196,19 @@ class ScrapeState(TypedDict, total=False):
     # that arms the two-strike abort and the F7 ceiling is their SUM: recursion
     # strikes feed the ceiling, never the T12 grant (S3, wall-only).
     writer_recursion_deaths: int
+    # [wave-25 W25-c] code_writer invocations that died on langgraph
+    # remaining_steps exhaustion ("Sorry, need more steps..."). [wave-59 C4]
+    # DECLARED ONLY NOW: the counter was stamped at the death site since
+    # wave-25 but never declared, and langgraph strips undeclared keys —
+    # every read saw 0, so step-budget deaths never reached the strike
+    # arithmetic. Declared beside its siblings: the F7 strike total is the
+    # sum of all three window-death ledgers.
+    writer_step_budget_deaths: int
     # [wave-30 W30-2] the draft-finisher salvage invocation (the _wc >= 2
     # skip_approvals arm) fires at most once per job — this flag routes the
     # second arrival straight to the honest cleanup instead of another
-    # full-length window.
+    # full-length window. [wave-59 C4] shared with the no-draft strike-2
+    # REPAIR arm: either arm consuming the latch retires both.
     writer_finisher_attempted: bool
     # [job-65 phase 3a] Execution-phase strategy recycles. When the run reaches
     # EXECUTION and the draft's Phase 1 discovers 0 URLs with a FAIL-class

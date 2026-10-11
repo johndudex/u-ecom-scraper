@@ -61,13 +61,58 @@ _F821_REPAIR_CONTRACT = (
     "are the fix."
 )
 
+# [wave-59 C3] Gate 0 streak state. Consecutive syntax rejections by the
+# same process; a clean gate-0 pass resets. Bounded at 3 (the block lifts on
+# the 4th bad write) so a writer in a syntax loop is never wedged — the
+# phase-boundary syntax fixer owns the file then. The counter counts
+# REJECTIONS (pre-write content) — never "current file state", which after a
+# rejection is stale bytes.
+_SYNTAX_REJECT_MAX = 3
+_syntax_reject_streak = {"n": 0}
+
+
+def _syntax_gate_rejection(content: str) -> str:
+    """[wave-59 C3] Gate 0: parseability. "" (open) or a rejection."""
+    if os.getenv("SCRAPER_DRAFT_SYNTAX_GATE", "1") == "0":
+        return ""
+    try:
+        compile(content, "<draft>", "exec")
+    except SyntaxError as exc:
+        _syntax_reject_streak["n"] += 1
+        if _syntax_reject_streak["n"] > _SYNTAX_REJECT_MAX:
+            return ""  # bounded: lift the block, the backstop owns the file
+        where = f"line {exc.lineno or 0} col {exc.offset or 0}"
+        if _syntax_reject_streak["n"] == _SYNTAX_REJECT_MAX:
+            return (
+                f"REJECTED — NOT applied; file unchanged. SYNTAX ERROR "
+                f"{where}: {exc.msg}. {_SYNTAX_REJECT_MAX} consecutive "
+                f"syntax rejections — stop editing this region; REWRITE the "
+                f"file fresh with write_file containing the full corrected "
+                f"content. {_F821_REPAIR_CONTRACT}"
+            )
+        return (
+            f"REJECTED — NOT applied; file unchanged. SYNTAX ERROR "
+            f"{where}: {exc.msg}. {_F821_REPAIR_CONTRACT}"
+        )
+    except Exception:
+        return ""  # judge nothing on an internal error — fall open
+    _syntax_reject_streak["n"] = 0
+    return ""
+
 
 def _f821_rejections(path: str, content: str) -> str:
     """Run the draft write gates over content; "" (gate open) or a rejection.
 
-    Two gates, one seam (every code_writer write_file/edit_file call site goes
-    through here):
+    Three gates, one seam (every code_writer write_file/edit_file call site
+    goes through here):
 
+    0. [wave-59 C3] parseability — ``compile()`` the content pre-write. Prod
+       623's terminal bug (an unterminated string literal inside a
+       ``re.compile`` regex — written TWICE, never checked) sailed through
+       both older gates: ruff emits invalid-syntax with no F821 code (the
+       findings filter drops it) and ``draft_call_violation`` returns "" on
+       unparseable, so the broken write landed and two 2700s windows died
+       "no draft". Rejects with the exact line:col.
     1. ruff F821 — an undefined name is the more basic defect and keeps
        priority: the call gate below is only reached once this one is clean.
     2. [wave-40 T7] ``draft_call_violation`` — helper CALL signatures. The F821
@@ -82,8 +127,18 @@ def _f821_rejections(path: str, content: str) -> str:
     disarms both gates on that write (gate 2 rides gate 1's clean path);
     ``draft_call_violation`` itself falls open on anything it cannot judge, so
     a gate bug never blocks a draft here. ``SCRAPER_DRAFT_CALL_GATE=0``
-    disarms gate 2 only.
+    disarms gate 2 only; ``SCRAPER_DRAFT_SYNTAX_GATE=0`` disarms gate 0 only.
+
+    Gate 0 is BOUNDED (critic-2's wedging concern): after 3 consecutive
+    syntax rejections the streak counter lifts the block — the write proceeds
+    and the phase-boundary backstop owns the file — so a writer stuck in a
+    syntax loop is never wedged out of its window.
     """
+    # [wave-59 C3] Gate 0 first — cheapest, and when the content does not
+    # parse the gates below cannot judge it anyway.
+    _syn = _syntax_gate_rejection(content)
+    if _syn:
+        return _syn
     try:
         proc = subprocess.run(
             [

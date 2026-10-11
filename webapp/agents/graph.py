@@ -2879,12 +2879,18 @@ def _writer_extension_ceiling(state: dict | None = None) -> int:
     [wave-58 2c] BOTH window-death ledgers count toward the strike total:
     a recursion death burns the window exactly like a timeout, so
     616-inv2-class recursion deaths buy the fail-fast second strike too.
+
+    [wave-59 C4] step-budget deaths join the strike total — a window spent
+    to langgraph's remaining_steps ceiling burns exactly like a hang. The
+    ledger only began surviving graph state once the key was declared
+    (state.py, wave-59); before that it read 0 on every pass.
     """
     ceiling = _writer_max_timeout()
     try:
         _strikes = (
             int((state or {}).get("writer_wall_clock_timeouts") or 0)
             + int((state or {}).get("writer_recursion_deaths") or 0)
+            + int((state or {}).get("writer_step_budget_deaths") or 0)
         )
         if _strikes >= 2:
             ceiling = min(ceiling, _writer_invoke_timeout())
@@ -7851,7 +7857,13 @@ def _preseed_failure_region(
 
 
 def _run_draft_finisher(
-    state: ScrapeState, config: RunnableConfig, slug: str, job_id: Any
+    state: ScrapeState,
+    config: RunnableConfig,
+    slug: str,
+    job_id: Any,
+    *,
+    require_parses: bool = True,
+    error_note: str = "",
 ) -> dict[str, Any] | None:
     """[wave-30 W30-2] One bounded FINISH invocation before an honest fail.
 
@@ -7860,12 +7872,18 @@ def _run_draft_finisher(
     ~300-600s short of self-validation — and the consecutive-death arm failed
     the job with that salvageable draft still untested.
 
-    Caller guarantees the draft parses (the arm sits behind the deterministic
-    parse gate); re-verified defensively. The seed carries the CURRENT on-disk
-    draft as template_code plus the refreshed strategy and strategies_tried —
-    569's inv-2 edited an old-strategy draft because strategy switches never
-    rotate the draft file. Outcome contract (all failure modes → None, the
-    caller's honest cleanup; never raises):
+    Caller guarantees the draft parses when ``require_parses`` (the arm sits
+    behind the deterministic parse gate); re-verified defensively.
+    [wave-59 C4] ``require_parses=False`` is the no-draft strike-2 REPAIR
+    window: the on-disk draft is unparsable BY CONSTRUCTION — that is why
+    the arm fired (623: ~1,045 lines of correct-shape scraper with one bad
+    regex line) — so only a ≥200-line substance floor gates entry, the
+    death's SyntaxError rides the seed via ``error_note``, and the
+    post-invocation parse gate below still owns salvage. The seed carries
+    the CURRENT on-disk draft as template_code plus the refreshed strategy
+    and strategies_tried — 569's inv-2 edited an old-strategy draft because
+    strategy switches never rotate the draft file. Outcome contract (all
+    failure modes → None, the caller's honest cleanup; never raises):
     - healthy return + draft still parses → the result dict (salvage);
     - wall-clock death / BudgetRefused / empty return → None;
     - unparseable draft after the finisher → None.
@@ -7876,8 +7894,19 @@ def _run_draft_finisher(
         draft_path = os.path.join(
             _get_project_root(), "workspace", slug, "scraper_draft.py"
         )
-        if not draft_parses(draft_path):
-            return None
+        if require_parses:
+            if not draft_parses(draft_path):
+                return None
+        else:
+            # [wave-59 C4] Substance floor: an unparsable stub (a few dozen
+            # lines) cannot plausibly be one edit from working — refuse it
+            # the window. An absent file reads as 0 lines and refuses too.
+            try:
+                with open(draft_path, encoding="utf-8", errors="replace") as _sz:
+                    if _sz.read().count("\n") < 200:
+                        return None
+            except Exception:
+                return None
         with open(draft_path, encoding="utf-8", errors="replace") as _ff:
             _draft_text = _ff.read()
 
@@ -7917,6 +7946,16 @@ def _run_draft_finisher(
                 "in your context as the base — edit it, do NOT rewrite from "
                 "scratch).\n"
             )
+        # [wave-59 C4] Repair-window seed: the death's exact SyntaxError must
+        # ride the seed or the finisher re-diagnoses from scratch.
+        _err_clause = (
+            f"- The previous invocation died leaving the draft with this "
+            f"SYNTAX ERROR: {error_note}\n"
+            "  Fix THAT error first (read the exact line, correct it), then "
+            "confirm the file parses.\n"
+            if error_note
+            else ""
+        )
         seed = (
             "[DRAFT-FINISHER] You are FINISHING an existing scraper, not "
             "restarting. The previous invocation was cut off by its "
@@ -7928,7 +7967,9 @@ def _run_draft_finisher(
             "written — adapt the draft to the CURRENT strategy, or add a "
             "comment justifying why the draft's strategy is still the right "
             "one.\n"
-            f"- Last tester feedback: {_fb or '(none)'}\n\n"
+            f"- Last tester feedback: {_fb or '(none)'}\n"
+            + _err_clause
+            + "\n"
             "Land the remaining edits, then run check_syntax and ONE sample "
             "run to confirm. Work efficiently — this is the final window."
         )
@@ -8626,6 +8667,11 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                         state.get("writer_wall_clock_timeouts") or 0
                     ) + 1
             update["messages"] = []
+            # [wave-59 C4] set by the strike-2 repair arm below: a salvaged
+            # draft skips the no-draft returns and falls through to the
+            # usable-draft tail (test ladder), mirroring the draft-exists
+            # finisher salvage.
+            _salvaged = False
             if _err_count + 1 >= 2:
                 # Second consecutive no-draft — stop burning wall-clock.
                 # [jobs-79/80] skip_approvals jobs must CLEANUP here, not
@@ -8656,39 +8702,113 @@ def _invoke_code_writer(state: ScrapeState, config: RunnableConfig) -> dict[str,
                                 ),
                             },
                         )
-                    logger.error(
-                        "_invoke_code_writer: repeated no-draft writer failures + "
-                        "skip_approvals → cleanup (honest failure, job %s)", job_id,
+                    # [wave-59 C4] REPAIR arm: a window death that left a
+                    # SUBSTANTIAL but unparsable draft (623: ~1,045 lines of
+                    # correct-shape scraper with one bad regex line) is ONE
+                    # syntax fix from salvageable — spend ONE bounded
+                    # finisher window with the death's SyntaxError in the
+                    # seed before the honest cleanup. Inside the
+                    # non-provider-dead branch deliberately: the finisher
+                    # runs no provider-window gate, so a provider-dead double
+                    # death must park unconditionally above. Latched
+                    # once-per-job via writer_finisher_attempted, shared with
+                    # the draft-exists arm — no double window. Keyed on the
+                    # death ledgers too: two consecutive ALIVE no-ops (no
+                    # window death) left nothing worth repairing.
+                    _window_death = bool(
+                        update.get("writer_wall_clock_timeouts")
+                        or update.get("writer_recursion_deaths")
+                        or int(state.get("writer_wall_clock_timeouts") or 0)
+                        or int(state.get("writer_recursion_deaths") or 0)
+                        or int(state.get("writer_step_budget_deaths") or 0)
                     )
+                    if _window_death and not state.get("writer_finisher_attempted"):
+                        _repair_draft = os.path.join(
+                            _get_project_root(), "workspace", slug, "scraper_draft.py"
+                        )
+                        _repair_lines = 0
+                        try:
+                            with open(
+                                _repair_draft, encoding="utf-8", errors="replace"
+                            ) as _rf:
+                                _repair_lines = _rf.read().count("\n")
+                        except Exception:
+                            _repair_lines = 0
+                        if _repair_lines >= 200:
+                            update["writer_finisher_attempted"] = True
+                            logger.warning(
+                                "_invoke_code_writer: strike-2 death left a "
+                                "substantial unparsable draft (%d lines) — ONE "
+                                "repair-finisher window before cleanup (job %s)",
+                                _repair_lines, job_id,
+                            )
+                            _fin = _run_draft_finisher(
+                                state, config, slug, job_id,
+                                require_parses=False, error_note=_err_note,
+                            )
+                            if _fin is not None:
+                                # Salvage: healthy-writer-cycle contract, same
+                                # as the draft-exists finisher salvage — clean
+                                # death ledgers and error counters, then fall
+                                # through to the usable-draft tail (test
+                                # ladder). NO second ledger increment: the
+                                # stamps above stand for telemetry; only the
+                                # salvage clears them.
+                                _salvaged = True
+                                result = _fin
+                                _cw_dead = False
+                                _cw_err = ""
+                                update["writer_wall_clock_timeouts"] = 0
+                                update["writer_recursion_deaths"] = 0
+                                update["code_writer_error"] = ""
+                                update["code_writer_error_count"] = 0
+                                logger.warning(
+                                    "_invoke_code_writer: repair-finisher "
+                                    "SALVAGED the unparsable draft — proceeding "
+                                    "to test (job %s)", job_id,
+                                )
+                            else:
+                                logger.error(
+                                    "_invoke_code_writer: repair-finisher "
+                                    "refused or died → cleanup (honest failure, "
+                                    "job %s)", job_id,
+                                )
+                    if not _salvaged:
+                        logger.error(
+                            "_invoke_code_writer: repeated no-draft writer failures + "
+                            "skip_approvals → cleanup (honest failure, job %s)", job_id,
+                        )
+                        return Command(
+                            goto="cleanup",
+                            update={
+                                **update,
+                                "messages": [],
+                                "error_message": (
+                                    f"code_writer failed twice without producing a draft "
+                                    f"({_err_note})"
+                                ),
+                            },
+                        )
+                if not _salvaged:
                     return Command(
-                        goto="cleanup",
+                        goto="human_approval",
                         update={
                             **update,
-                            "messages": [],
-                            "error_message": (
-                                f"code_writer failed twice without producing a draft "
-                                f"({_err_note})"
+                            "interrupt_reason": "code_writer_failed",
+                            "interrupt_message": (
+                                f"code_writer invocation failed twice without producing a draft "
+                                f"({_err_note}). Inspect the model/provider logs, then retry or cancel."
                             ),
+                            "interrupt_options": ["Retry code generation", "Cancel"],
+                            "interrupt_decisions": [
+                                {"type": "approve", "label": "Retry code generation",
+                                 "allow_feedback": True},
+                                {"type": "reject", "label": "Cancel", "allow_feedback": False},
+                            ],
                         },
                     )
-                return Command(
-                    goto="human_approval",
-                    update={
-                        **update,
-                        "interrupt_reason": "code_writer_failed",
-                        "interrupt_message": (
-                            f"code_writer invocation failed twice without producing a draft "
-                            f"({_err_note}). Inspect the model/provider logs, then retry or cancel."
-                        ),
-                        "interrupt_options": ["Retry code generation", "Cancel"],
-                        "interrupt_decisions": [
-                            {"type": "approve", "label": "Retry code generation",
-                             "allow_feedback": True},
-                            {"type": "reject", "label": "Cancel", "allow_feedback": False},
-                        ],
-                    },
-                )
-            return Command(goto="scraper_analyzer", update=update)
+            if not _salvaged:
+                return Command(goto="scraper_analyzer", update=update)
         if _cw_dead:
             # Dead invocation but a draft WAS written (timeout hit after the
             # write) — the draft is usable; log loudly and keep testing.
