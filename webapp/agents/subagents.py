@@ -293,6 +293,9 @@ _MR_APPLIED_MARKER = "mechanism_reassessment"
 # cycles and stays UNCAPPED; do not move the guard into shell_tools.
 RUN_SCRAPER_PROBE_PREFIXES = ("probe", "test_", "debug")
 RUN_SCRAPER_DRAFT_PREFIX = "scraper_draft"
+# [wave-60 N1] the syntax-gate lift sidecar is a rejected payload, not a
+# runnable draft of record — it must never burn the writer's 2-run draft cap.
+RUN_SCRAPER_SIDECAR_STEM = "scraper_draft-rejected"
 RUN_SCRAPER_CAPS = {"probe_family": 2, "scraper_draft": 2, "other": 3}
 _RUN_SCRAPER_BUCKET_LABELS = {
     "probe_family": "probe-family (probe*/test_*/debug* targets)",
@@ -307,6 +310,8 @@ def _run_scraper_bucket(target: object) -> str:
     stem = base.removesuffix(".py")
     if stem.startswith(RUN_SCRAPER_PROBE_PREFIXES):
         return "probe_family"
+    if stem == RUN_SCRAPER_SIDECAR_STEM:
+        return "other"
     if stem.startswith(RUN_SCRAPER_DRAFT_PREFIX):
         return "scraper_draft"
     return "other"
@@ -892,6 +897,18 @@ def create_code_writer(
     embed_kind: str = "",
     template_file: str = "",
 ) -> object:
+    # [wave-60 N1] gate-0 streak hygiene at writer-window START. Every
+    # production writer goes through this factory — graph.py's three
+    # invocation seams (main window, progress escalation, strike-2 finisher)
+    # all build here — so one reset covers all of them: a terminal streak
+    # left by one seam must never lift the block on the next seam's FIRST
+    # bad write (the 632 repair window re-armed inside an inherited streak).
+    try:
+        from .tools.filesystem_tools import reset_syntax_reject_streak
+
+        reset_syntax_reject_streak()
+    except Exception:
+        pass
     return _build_agent(
         "code_writer",
         site_slug=site_slug,

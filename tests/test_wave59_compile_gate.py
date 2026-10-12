@@ -119,14 +119,18 @@ class TestFallOpenAndKillSwitch:
 
     def test_gate0_wired_first_in_the_f821_seam(self):
         """Gate 0 runs before the ruff subprocess — cheapest first, and the
-        gates below cannot judge content that does not parse."""
+        gates below cannot judge content that does not parse. [wave-60 N1]
+        the seam's disposition logic lives in ``_f821_outcome`` now (the
+        call-scoped ``(rejection, lift)`` tuple); the public
+        ``_f821_rejections`` is its string wrapper — the invariant this pin
+        guards (gate 0 before ruff, kill switch present) is unchanged."""
         src = open(
             os.path.join(ROOT, "webapp", "agents", "tools", "filesystem_tools.py")
         ).read()
-        i_seam = src.index("def _f821_rejections")
-        i_ruff = src.index("subprocess.run(", i_seam)
-        i_gate0 = src.index("_syntax_gate_rejection(content)", i_seam)
-        assert i_seam < i_gate0 < i_ruff
+        i_outcome = src.index("def _f821_outcome")
+        i_ruff = src.index("subprocess.run(", i_outcome)
+        i_gate0 = src.index("_syntax_gate_outcome(content)", i_outcome)
+        assert i_outcome < i_gate0 < i_ruff
         assert 'os.getenv("SCRAPER_DRAFT_SYNTAX_GATE", "1")' in src
 
 

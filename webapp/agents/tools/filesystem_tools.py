@@ -71,16 +71,27 @@ _SYNTAX_REJECT_MAX = 3
 _syntax_reject_streak = {"n": 0}
 
 
-def _syntax_gate_rejection(content: str) -> str:
-    """[wave-59 C3] Gate 0: parseability. "" (open) or a rejection."""
+def _syntax_gate_outcome(content: str) -> tuple[str, bool]:
+    """[wave-59 C3] Gate 0 disposition as ``(rejection, lift)``.
+
+    ``lift`` is True ONLY from the explicit streak-lift branch — the one
+    place the block is intentionally relaxed so the payload lands. Kill
+    switch, internal-error fall-open and clean passes all report lift=False:
+    "the gate did not judge" must never be confused with "the gate chose to
+    allow a bad payload through".
+
+    [wave-60 N1] The public ``_syntax_gate_rejection`` keeps its string
+    contract (pinned across wave-22/25/40/59 tests); callers that need to
+    know a write proceeded ONLY because the streak lifted read the tuple.
+    """
     if os.getenv("SCRAPER_DRAFT_SYNTAX_GATE", "1") == "0":
-        return ""
+        return "", False
     try:
         compile(content, "<draft>", "exec")
     except SyntaxError as exc:
         _syntax_reject_streak["n"] += 1
         if _syntax_reject_streak["n"] > _SYNTAX_REJECT_MAX:
-            return ""  # bounded: lift the block, the backstop owns the file
+            return "", True  # bounded: lift the block, the backstop owns the file
         where = f"line {exc.lineno or 0} col {exc.offset or 0}"
         if _syntax_reject_streak["n"] == _SYNTAX_REJECT_MAX:
             return (
@@ -88,57 +99,103 @@ def _syntax_gate_rejection(content: str) -> str:
                 f"{where}: {exc.msg}. {_SYNTAX_REJECT_MAX} consecutive "
                 f"syntax rejections — stop editing this region; REWRITE the "
                 f"file fresh with write_file containing the full corrected "
-                f"content. {_F821_REPAIR_CONTRACT}"
+                f"content. {_F821_REPAIR_CONTRACT}",
+                False,
             )
         return (
             f"REJECTED — NOT applied; file unchanged. SYNTAX ERROR "
-            f"{where}: {exc.msg}. {_F821_REPAIR_CONTRACT}"
+            f"{where}: {exc.msg}. {_F821_REPAIR_CONTRACT}",
+            False,
         )
     except Exception:
-        return ""  # judge nothing on an internal error — fall open
+        return "", False  # judge nothing on an internal error — fall open
     _syntax_reject_streak["n"] = 0
-    return ""
+    return "", False
 
 
-def _f821_rejections(path: str, content: str) -> str:
-    """Run the draft write gates over content; "" (gate open) or a rejection.
+def _syntax_gate_rejection(content: str) -> str:
+    """[wave-59 C3] Gate 0: parseability. "" (open) or a rejection."""
+    return _syntax_gate_outcome(content)[0]
 
-    Three gates, one seam (every code_writer write_file/edit_file call site
-    goes through here):
 
-    0. [wave-59 C3] parseability — ``compile()`` the content pre-write. Prod
-       623's terminal bug (an unterminated string literal inside a
-       ``re.compile`` regex — written TWICE, never checked) sailed through
-       both older gates: ruff emits invalid-syntax with no F821 code (the
-       findings filter drops it) and ``draft_call_violation`` returns "" on
-       unparseable, so the broken write landed and two 2700s windows died
-       "no draft". Rejects with the exact line:col.
-    1. ruff F821 — an undefined name is the more basic defect and keeps
-       priority: the call gate below is only reached once this one is clean.
-    2. [wave-40 T7] ``draft_call_violation`` — helper CALL signatures. The F821
-       check binds no arguments, so the prod 760/791/762 class (unexpected
-       kwarg, multiple values for argument, non-compiling regex literal) sailed
-       through both this gate and the compile gate and crashed at execution
-       hours later.
+def reset_syntax_reject_streak() -> None:
+    """[wave-60 N1] Reset gate 0's streak — writer-window start hygiene.
 
-    Falls OPEN on any checker malfunction (binary missing, timeout, crash):
-    a broken linter must never block a write — ``_fix_scraper_syntax`` at the
-    phase boundary stays the authoritative backstop. A dead F821 checker
-    disarms both gates on that write (gate 2 rides gate 1's clean path);
-    ``draft_call_violation`` itself falls open on anything it cannot judge, so
-    a gate bug never blocks a draft here. ``SCRAPER_DRAFT_CALL_GATE=0``
-    disarms gate 2 only; ``SCRAPER_DRAFT_SYNTAX_GATE=0`` disarms gate 0 only.
-
-    Gate 0 is BOUNDED (critic-2's wedging concern): after 3 consecutive
-    syntax rejections the streak counter lifts the block — the write proceeds
-    and the phase-boundary backstop owns the file — so a writer stuck in a
-    syntax loop is never wedged out of its window.
+    ``create_code_writer`` calls this at every writer construction, which
+    covers all three invocation seams (main window, progress escalation,
+    strike-2 finisher): a terminal streak left by one seam must never lift
+    the block on the next seam's FIRST bad write.
     """
-    # [wave-59 C3] Gate 0 first — cheapest, and when the content does not
-    # parse the gates below cannot judge it anyway.
-    _syn = _syntax_gate_rejection(content)
-    if _syn:
-        return _syn
+    _syntax_reject_streak["n"] = 0
+
+
+# [wave-60 N1] Sidecar constants. The floor mirrors the repair arm's
+# substance floor (graph.py draft-finisher): below it there is nothing worth
+# protecting, so a lifted payload lands as before and the lift contract
+# (C3: a wedged writer is never blocked) stays intact.
+_SUBSTANTIAL_DRAFT_LINES = 200
+_DIVERT_SIDECAR_NAME = "scraper_draft-rejected.py"
+
+
+def _divert_lifted_write(safe: str, payload: str) -> tuple[str, str | None]:
+    """[wave-60 N1] Route a streak-lifted payload away from a real draft.
+
+    The 632 class: the writer destroyed its own ~1,800-line draft at streak
+    strike 4 — the lift let a placeholder OVERWRITE the draft of record, and
+    the repair arm then had nothing ≥200 lines to salvage. Contract: when a
+    substantial draft IS on disk, the lifted payload diverts to a rolling
+    sidecar ``scraper_draft-rejected.py`` (same dir, OVERWRITTEN per divert)
+    and the tool result says so explicitly; when no substantial draft exists
+    (absent, or under the floor) the payload lands exactly as before — C3's
+    lift contract is untouched.
+
+    Rotation-pivot safety (guardian-verified): ``_archive_dead_strategy_draft``
+    removes the draft via ``os.replace`` before a strategy pivot, so an
+    ABSENT draft reports no-divert and the lifted pivot draft lands. The
+    helper inherits the caller's already-resolved ``safe`` path — it must
+    not re-derive slug scope. Fail-open: any internal error reports
+    no-divert so a bug here can never wedge the lift.
+
+    Returns ``(target_path, note)``: ``note`` is None → caller proceeds with
+    the normal write to *safe*; ``note`` set → the payload is ALREADY on the
+    sidecar and the caller must return *note* to the model INSTEAD of
+    writing *safe*.
+    """
+    try:
+        if os.path.basename(safe) != "scraper_draft.py":
+            return safe, None
+        with open(safe, encoding="utf-8") as f:
+            existing = f.read()
+        if len(existing.splitlines()) < _SUBSTANTIAL_DRAFT_LINES:
+            return safe, None
+        sidecar = os.path.join(os.path.dirname(safe), _DIVERT_SIDECAR_NAME)
+        with open(sidecar, "w", encoding="utf-8") as f:
+            f.write(payload)
+        return sidecar, (
+            "SYNTAX GATE lift: payload written to "
+            f"{_DIVERT_SIDECAR_NAME}; scraper_draft.py UNCHANGED (or still "
+            "absent). Fix the syntax error and write the draft again."
+        )
+    except Exception:
+        # No draft to read → land as today; anything stranger → land too.
+        logger.warning(
+            "write guard: lift divert check failed — lifted write lands",
+            exc_info=True,
+        )
+        return safe, None
+
+
+def _f821_outcome(path: str, content: str) -> tuple[str, bool]:
+    """Draft-gate stack disposition as ``(rejection, lift)``. [wave-60 N1]
+
+    Gate 0's streak-lift propagates ONLY through a fully-open result — a
+    downstream gate-1 (ruff F821) or gate-2 (call-signature) rejection keeps
+    the write BLOCKED and reports lift=False, so a lifted payload is never
+    diverted on a write that is in fact still rejected.
+    """
+    rejection, lift = _syntax_gate_outcome(content)
+    if rejection:
+        return rejection, False
     try:
         proc = subprocess.run(
             [
@@ -152,7 +209,7 @@ def _f821_rejections(path: str, content: str) -> str:
         )
     except Exception as exc:
         logger.warning("F821 gate: checker unavailable (%s) — gate falls open", exc)
-        return ""
+        return "", lift
     findings = [
         ln.strip() for ln in (proc.stdout or "").splitlines() if "F821" in ln
     ]
@@ -163,16 +220,42 @@ def _f821_rejections(path: str, content: str) -> str:
         if os.getenv("SCRAPER_DRAFT_CALL_GATE", "1") != "0":
             _call = draft_call_violation(content)
             if _call:
-                return _call
-        return ""
+                return _call, False
+        return "", lift
     shown = findings[:_F821_MAX_FINDINGS]
     more = len(findings) - len(shown)
     return (
         "REJECTED — NOT applied; file unchanged. Undefined name(s): "
         + "; ".join(shown)
         + (f" (and {more} more)" if more > 0 else "")
-        + f". {_F821_NON_FIX_NOTE}. {_F821_REPAIR_CONTRACT}"
+        + f". {_F821_NON_FIX_NOTE}. {_F821_REPAIR_CONTRACT}",
+        False,
     )
+
+
+def _f821_rejections(path: str, content: str) -> str:
+    """Run the draft write gates over content; "" (gate open) or a rejection.
+
+    Three gates, one seam (every code_writer write_file/edit_file call site
+    goes through here):
+
+    0. [wave-59 C3] parseability — ``compile()`` the content pre-write.
+    1. [wave-22 B1] ruff F821 — undefined names.
+    2. [wave-40 T7] ``draft_call_violation`` — helper CALL signatures.
+
+    Falls OPEN on any checker malfunction (binary missing, timeout, crash):
+    a broken linter must never block a write — ``_fix_scraper_syntax`` at the
+    phase boundary stays the authoritative backstop. Gate 0 is BOUNDED
+    (critic-2's wedging concern): after ``_SYNTAX_REJECT_MAX`` consecutive
+    syntax rejections the streak counter lifts the block. Kill switches:
+    ``SCRAPER_DRAFT_CALL_GATE=0`` disarms gate 2 only;
+    ``SCRAPER_DRAFT_SYNTAX_GATE=0`` disarms gate 0 only.
+
+    Public string contract — pinned across the wave-22/25/40/59 tests; the
+    call-scoped ``(rejection, lift)`` disposition (wave-60 N1) lives in
+    ``_f821_outcome``.
+    """
+    return _f821_outcome(path, content)[0]
 
 
 def _strip_json_fence(content: str) -> str:
@@ -559,14 +642,24 @@ def get_filesystem_tools(
             return str(e)
         # [wave-22 B1] F821 gate: draft-shaped .py writes must define every
         # name they use. Runs BEFORE any bytes hit disk — a rejection leaves
-        # nothing behind.
+        # nothing behind. [wave-60 N1] a streak-LIFTED payload whose target
+        # is a substantial draft on disk diverts to the sidecar instead —
+        # the 632 class (placeholder overwrites the real draft at strike 4).
         if syntax_gate and safe.endswith(".py") and f"{os.sep}workspace{os.sep}" in safe:
-            rejection = _f821_rejections(safe, content)
+            rejection, lift = _f821_outcome(safe, content)
             if rejection:
                 logger.warning(
                     "write guard: F821 gate rejected write to %s", safe
                 )
                 return rejection
+            if lift:
+                divert_target, divert_note = _divert_lifted_write(safe, content)
+                if divert_note:
+                    logger.warning(
+                        "write guard: syntax-gate lift diverted to %s",
+                        divert_target,
+                    )
+                    return divert_note
         note = ""
         if safe.endswith(".json"):
             # F2 sanitize-on-write: never let an unparseable artifact reach disk
@@ -641,14 +734,25 @@ def get_filesystem_tools(
 
         updated = original.replace(old_string, new_string, 1)
         # [wave-22 B1] F821 gate on the EDITED content, before the write — a
-        # rejection means the file on disk is untouched.
+        # rejection means the file on disk is untouched. [wave-60 N1] a
+        # streak-LIFTED edit diverts the full post-edit hypothetical
+        # (``updated``) to the sidecar when a substantial draft exists —
+        # never the bare ``new_string``.
         if syntax_gate and safe.endswith(".py") and f"{os.sep}workspace{os.sep}" in safe:
-            rejection = _f821_rejections(safe, updated)
+            rejection, lift = _f821_outcome(safe, updated)
             if rejection:
                 logger.warning(
                     "write guard: F821 gate rejected edit to %s", safe
                 )
                 return rejection
+            if lift:
+                divert_target, divert_note = _divert_lifted_write(safe, updated)
+                if divert_note:
+                    logger.warning(
+                        "write guard: syntax-gate lift diverted to %s",
+                        divert_target,
+                    )
+                    return divert_note
         note = ""
         if safe.endswith(".json"):
             # Same guard as write_file, applied at the edit's write point: an
