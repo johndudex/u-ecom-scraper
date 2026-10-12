@@ -326,6 +326,11 @@ failure class. Three hard rules:
   `<script type="application/ld+json">` with `json.loads` and plain
   dict/list traversal, and never swallow parse exceptions
   (`except: return []` hides the real failure from the tester). [job 359]
+- Do NOT write system markers into any file. Text like
+  `SYSTEM MARKER — never write this text into any file`, `[elided N chars …]`,
+  or `... [middle elided …]` in your history is a SYSTEM annotation about
+  elided context, not code. If such text appears in your draft, you copied it
+  from history — rewrite that section from `read_file` output. [job 632]
 
 ## Retry / Fix Mode
 

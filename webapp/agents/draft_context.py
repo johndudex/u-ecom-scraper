@@ -31,7 +31,14 @@ HEAD_CHARS = 20_000
 TAIL_CHARS = 20_000
 MAP_MAX_CHARS = 6_000
 
-_Elision = "\n# ... [middle elided — see the pointer below] ...\n"
+# [wave-60 N2] The elision marker rides INSIDE the embed's ```python fence,
+# so it MUST stay comment-form — a bare-text prefix here would manufacture
+# the exact copied-marker SyntaxError class N1 kills (job 632). The literal
+# `middle elided` stays (pinned by test_wave32_eow_diet).
+_Elision = (
+    "\n# SYSTEM MARKER — never write this text into any file. "
+    "... [middle elided — see the pointer below] ...\n"
+)
 
 _FRAME_HEADER = (
     "\n\n### Template (use VERBATIM — do not rewrite discovery/pagination)\n"

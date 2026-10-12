@@ -1056,7 +1056,13 @@ def _make_pre_model_hook(embed_chars: int = 0):
             for _k, _v in args.items():
                 _sv = str(_v)
                 if len(_sv) > _TOOL_CALL_ARG_STUB_CAP:
+                    # [wave-60 N2] the 632 class: the writer copied its own
+                    # history's stubs into the draft as literals. The prefix
+                    # makes the stub self-identify as a system annotation —
+                    # and the writer prompt carries the matching rule. Keep
+                    # the `elided N chars` substring (pins + recognition).
                     stubbed[_k] = (
+                        "SYSTEM MARKER — never write this text into any file. "
                         f"[elided {len(_sv)} chars — the file is on disk; "
                         f"read_file it if you need it]"
                     )
