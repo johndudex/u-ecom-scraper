@@ -911,6 +911,7 @@ def _maybe_retry_execution_listing(
     state: ScrapeState,
     primary_listing: str,
     redispatch,
+    job_id: int | None = None,
 ) -> dict:
     """[job-77 RC1] One bounded listing fallback for a clean-zero execution.
 
@@ -928,16 +929,95 @@ def _maybe_retry_execution_listing(
     shape — a clean rc=0 run that wrote no output file IS the clean zero
     (its discovery found nothing to extract), and that exact run shape was
     the one where the rescue never fired.
+    [wave-61 N2] Shape B (wall-clock/transport FAILED, NO output file) now
+    admits too — but ONLY on direct probe evidence: the attempt-attributed
+    ``listing_probe_verdict`` naming THIS primary as dead. A failed run has
+    no yield evidence of its own; without the verdict it stays skipped (no
+    speculative rescue on an unmeasured primary). Every admission exit
+    writes a durable record (``_log_event_row`` SessionLog row + a result
+    field) — 653's rescue silence was unrecoverable because the only log
+    stream died mid-batch.
     """
+    admissions: list[dict] = []
+
+    def _admit(event: str, **detail) -> None:
+        # [wave-61 N2] durable at EVERY exit — no silent skips remain. The
+        # record rides the result dict (every return path) AND one SessionLog
+        # row; 653's rescue silence was unrecoverable because the only log
+        # stream died mid-batch.
+        rec = {"event": event, **detail}
+        admissions.append(rec)
+        try:
+            (result or {}).setdefault(
+                "listing_rescue_admissions", []
+            ).append(rec)
+        except Exception:
+            pass
+        try:
+            from agents.graph import _log_event_row
+
+            _log_event_row(
+                job_id,
+                "run_execution",
+                "LISTING_RESCUE_ADMISSION "
+                + json.dumps(rec, default=str)[:1500],
+            )
+        except Exception:
+            pass
+
     try:
-        if (result or {}).get("execution_status") == "FAILED" and not (
-            result or {}
-        ).get("no_fresh_output"):
+        _status = str((result or {}).get("execution_status") or "")
+        _no_out = bool((result or {}).get("no_fresh_output"))
+        _out_file = (result or {}).get("output_file") or ""
+        _zero = _execution_zero_discovery(result)
+        _verdict = (
+            state.get("listing_probe_verdict")
+            if isinstance(state, dict) else None
+        )
+        _verdict_on_primary = bool(
+            isinstance(_verdict, dict)
+            and _verdict.get("verdict") == "zero_yield"
+            and str(_verdict.get("candidate") or "").strip()
+            == str(primary_listing or "").strip()
+        )
+        # [wave-61 N2] shape B: FAILED with no on-disk output to read — the
+        # run never produced yield evidence. The probe verdict supplies it.
+        _shape_b = (
+            _status == "FAILED"
+            and not _no_out
+            and not (_out_file and os.path.isfile(_out_file))
+        )
+        primary_dead = _zero
+        if not primary_dead and _shape_b and _verdict_on_primary:
+            primary_dead = True
+            _admit(
+                "shape_b_admitted_by_verdict",
+                execution_status=_status,
+                stop_reason=str(_verdict.get("stop_reason") or ""),
+                primary_listing=str(primary_listing or "")[:200],
+            )
+        if _status == "FAILED" and not _no_out and not primary_dead:
+            _admit(
+                "skip_failed_no_rescue_evidence",
+                execution_status=_status,
+                shape_b=_shape_b,
+                verdict_on_primary=_verdict_on_primary,
+            )
             return result
-        if not _execution_zero_discovery(result):
+        if not primary_dead:
+            _admit(
+                "skip_not_a_clean_zero",
+                execution_status=_status,
+                no_fresh_output=_no_out,
+            )
             return result
         alt = _distinct_same_domain_listing(state, primary_listing)
         if not alt:
+            _admit(
+                "skip_no_alt",
+                primary_listing=str(primary_listing or "")[:200],
+                shape_b=_shape_b,
+            )
             return result
         logger.warning(
             "run_execution: clean zero (0 discovered URLs or no output file) "
@@ -945,8 +1025,15 @@ def _maybe_retry_execution_listing(
             "listing %s [job-77 RC1]",
             str(primary_listing)[:80], alt[:80],
         )
+        _admit(
+            "rescue_fired",
+            primary_listing=str(primary_listing or "")[:200],
+            fallback_listing=alt[:200],
+            shape_b=_shape_b,
+        )
         retry_result = redispatch(alt)
         if not isinstance(retry_result, dict) or not retry_result:
+            _admit("rescue_result_unusable", fallback_listing=alt[:200])
             return result
         _n = int(retry_result.get("product_count") or 0)
         if _n > 0:
@@ -954,6 +1041,11 @@ def _maybe_retry_execution_listing(
                 "run_execution: listing fallback produced %d items (primary "
                 "had 0) — adopting the retry result", _n,
             )
+            _admit("rescue_adopted", fallback_listing=alt[:200], items=_n)
+            # The adopted result replaces the primary's — carry the admission
+            # trail over so the adopt boundary keeps the full record.
+            retry_result.setdefault("listing_rescue_admissions", [])
+            retry_result["listing_rescue_admissions"].extend(admissions)
             retry_result["listing_fallback"] = {
                 "primary_listing": primary_listing, "fallback_listing": alt,
                 "adopted": True,
@@ -965,8 +1057,13 @@ def _maybe_retry_execution_listing(
             "run_execution: listing fallback also produced 0 items — keeping "
             "the primary (honest zero, both listings tried)"
         )
+        _admit("rescue_zero_kept_primary", fallback_listing=alt[:200])
     except Exception as exc:
         logger.warning("run_execution: listing fallback skipped: %s", exc)
+        try:
+            _admit("rescue_error", error=str(exc)[:300])
+        except Exception:
+            pass
     return result
 
 
@@ -1516,7 +1613,8 @@ def run_execution(state: ScrapeState) -> dict:
 
         # [job-77 RC1] bounded listing fallback on a clean zero (see helper).
         result = _maybe_retry_execution_listing(
-            result, state, _listing_url_env or _working_url, _redispatch_browser
+            result, state, _listing_url_env or _working_url, _redispatch_browser,
+            job_id=job_id,
         )
         # [wave-33 C2] the browser-service leg ended FAILED (transport death,
         # infra park, rc≠0 — whatever the fallback/merge decided): cancel any
@@ -1567,7 +1665,8 @@ def run_execution(state: ScrapeState) -> dict:
     _clear_transient_channels(result)
     # [job-77 RC1] bounded listing fallback on a clean zero (see helper).
     return _maybe_retry_execution_listing(
-        result, state, _listing_url_env or _working_url, _redispatch_inprocess
+        result, state, _listing_url_env or _working_url, _redispatch_inprocess,
+        job_id=job_id,
     )
 
 
