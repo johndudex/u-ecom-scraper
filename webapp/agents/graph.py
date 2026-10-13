@@ -9426,32 +9426,23 @@ def classify_discovery_failure(text: str) -> str | None:
 
 def _probe_listing_candidates(state: dict) -> tuple[str, str]:
     """(primary, alternate) ``SCRAPER_LISTING_URL`` candidates for the Phase-1
-    probe, mirroring run_execution's chain. [rag-bone job 72] a URL-shaped
-    search_criteria is the USER'S OWN listing assertion — the intake UI puts
-    the sample PDP in ``url`` and the real listing in search_criteria — so it
-    outranks the list_page job URL (which stays ahead of every navigator
-    candidate, job-310 contract). The alternate is what the single retry uses
-    when the primary yields zero (job-76: the list_page job URL was an ITEM
-    page — as a listing it can only ever yield 0). [job-85] the navigator's
-    ``discovery.listing_url`` is the retry candidate when it was not already
-    the primary — job 85's real listing lived only in search_criteria.
+    probe — [wave-61] the unified chain. Primary = URL-shaped search_criteria
+    (job-72) → list_page job URL (job-310) → navigator promotion, demoted by
+    the probe verdict when the primary is proven dead. Alternate = the rescue
+    chain's first survivor: promotion → criteria → job URL (job-76: the
+    list_page job URL was an ITEM page — as a listing it can only ever yield
+    0; job-85: the navigator's verified promotion outranks the user's
+    assertion once the primary is dead).
     """
-    _sc = first_criteria_url(state.get("search_criteria"))
-    criteria = _sc if _sc.startswith(("http://", "https://")) else ""
-    primary = ""
-    if state.get("input_mode") == "list_page":
-        _jl = criteria or (state.get("url") or "").strip()
-        if _jl.startswith(("http://", "https://")):
-            primary = _jl
-    _nav = state.get("navigation_analysis") or {}
-    _disc = (_nav.get("discovery") if isinstance(_nav, dict) else None) or {}
-    _alt = (_disc.get("listing_url") if isinstance(_disc, dict) else "") or ""
-    if not _alt:
-        # criteria is only a useful retry when the primary is something else.
-        _alt = "" if criteria == primary else criteria
-    if _alt == primary:
-        _alt = ""
-    return primary, _alt
+    try:
+        from agents.nodes.run_execution import resolve_listing_candidate
+
+        primary, alt, _note = resolve_listing_candidate(state)
+    except Exception:
+        return "", ""
+    if alt == primary:
+        alt = ""
+    return primary, alt
 
 
 _NO_DISCOVERY_SOURCE_MARKER = "No --query, --category-url, or --listing-url provided"
@@ -9563,6 +9554,63 @@ def _probe_yield_dead(probe_yield: dict) -> bool:
         return listing_yield_failure({**probe_yield, "coverage": _cov_pf})
     except Exception:
         return int(probe_yield.get("discovered_urls") or 0) == 0
+
+
+def _arm_listing_probe_verdict(state: dict, probe_yield, crashed: bool) -> dict | None:
+    """[wave-61] Attempt-attributed zero-yield verdict on the injected listing.
+
+    Arms the execution demotion ONLY when every leg holds (guardian R2/R5):
+    the final probe yield is a clean-exit DEAD yield (``_probe_yield_dead`` —
+    raw zero, empty_first_page, or junk-yield), the attempt ledger attributes
+    that dead yield to the CURRENT primary candidate, and the first fallback
+    candidate has NO dead attempt (demoting onto a proven-dead fallback is
+    the 653-inverse — both-dead means no verdict). A crashed or inconclusive
+    attempt is unknown, not dead: the 653 shape (PDP dead, promotion retry
+    timed out) arms; a both-yields-zero shape does not.
+
+    Returns the verdict dict for ``state["listing_probe_verdict"]`` or None.
+    Un-attributed yields (no ledger) never arm — blind demotion is the
+    hijack class the evidence gate exists to prevent.
+    """
+    if crashed or not isinstance(probe_yield, dict):
+        return None
+    if not _probe_yield_dead(probe_yield):
+        return None
+    attempts = probe_yield.get("listing_attempts")
+    if not isinstance(attempts, list) or not attempts:
+        return None
+    try:
+        from agents.nodes.run_execution import (
+            listing_fallback_chain,
+            listing_primary_chain,
+        )
+
+        primary_chain = listing_primary_chain(state)
+        if not primary_chain:
+            return None
+        dead_candidate = str(probe_yield.get("listing_candidate") or "").strip()
+        if dead_candidate != str(primary_chain[0][0]).strip():
+            return None
+        dead_set = {
+            str(_a.get("candidate") or "").strip()
+            for _a in attempts
+            if isinstance(_a, dict) and _a.get("dead") is True
+        }
+        if not dead_candidate or dead_candidate not in dead_set:
+            return None
+        for cand in listing_fallback_chain(state):
+            c = str(cand or "").strip()
+            if c and c not in dead_set:
+                return {
+                    "verdict": "zero_yield",
+                    "candidate": dead_candidate,
+                    "demotion_target": c,
+                    "stop_reason": str(probe_yield.get("stop_reason") or ""),
+                    "attempts": attempts,
+                }
+    except Exception:
+        return None
+    return None
 
 
 def _probe_retry_warranted(state: dict, probe_yield: dict | None) -> bool:
@@ -9741,7 +9789,36 @@ def _probe_phase1_discovery(
     # [wave-24 W24-2] The three probe invocations below run through the
     # checkpoint-guarded wrapper: a probe that discovers 0 must not destroy
     # the real run's banked discovery checkpoint.
+    # [wave-61 R2] attempt ledger — which candidate each attempt ran, so a
+    # dead yield can be ATTRIBUTED before a demotion verdict arms (an
+    # un-attributed yield never arms; a dead fallback vetoed the demotion).
+    _attempts: list[dict] = []
+    try:
+        _cand_used = _probe_listing_env_candidate(state)
+    except Exception:
+        _cand_used = ""
+    _current_candidate = _cand_used
+
+    def _stamp_attempt(yield_: dict | None, crashed_: bool, candidate: str) -> None:
+        _attempts.append({
+            "candidate": str(candidate or "")[:300],
+            "crashed": bool(crashed_),
+            "dead": bool(
+                not crashed_
+                and isinstance(yield_, dict)
+                and _probe_yield_dead(yield_)
+            ),
+            "inconclusive": not crashed_ and not isinstance(yield_, dict),
+        })
+
+    def _attach_ledger(yield_: dict | None, candidate: str) -> dict | None:
+        if isinstance(yield_, dict):
+            yield_["listing_candidate"] = str(candidate or "")[:300]
+            yield_["listing_attempts"] = _attempts
+        return yield_
+
     crashed, tb, probe_yield = _probe_phase1_discovery_checked(slug, state, job_id)
+    _stamp_attempt(probe_yield, crashed, _current_candidate)
     _listing_used = ""
     if not crashed and _probe_retry_warranted(state, probe_yield):
         _primary, _alt = _probe_listing_candidates(state)
@@ -9751,9 +9828,11 @@ def _probe_phase1_discovery(
             job_id, _alt[:80],
         )
         _listing_used = _alt
+        _current_candidate = _alt
         crashed, tb, probe_yield = _probe_phase1_discovery_checked(
             slug, state, job_id, listing_override=_alt
         )
+        _stamp_attempt(probe_yield, crashed, _alt)
     if (
         not crashed
         and isinstance(probe_yield, dict)
@@ -9776,7 +9855,7 @@ def _probe_phase1_discovery(
             probe_yield["stop_reason"] = "phase1_skipped"
             _cov["stop_reason"] = "phase1_skipped"
             probe_yield["coverage"] = _cov
-            return crashed, tb, probe_yield
+            return crashed, tb, _attach_ledger(probe_yield, _current_candidate)
         _esc_state, _next_tier, _prev_tier = _state_at_next_tier(state)
         if _esc_state is not None:
             logger.info(
@@ -9787,6 +9866,7 @@ def _probe_phase1_discovery(
             _esc_crashed, _esc_tb, _esc_yield = _probe_phase1_discovery_checked(
                 slug, _esc_state, job_id, listing_override=_listing_used
             )
+            _stamp_attempt(_esc_yield, _esc_crashed, _current_candidate)
             _annotation = {
                 "attempted": True,
                 "tier": _next_tier,
@@ -9808,7 +9888,9 @@ def _probe_phase1_discovery(
                     _esc_cov = dict(_esc_yield.get("coverage") or {})
                     _esc_cov["tier_escalation"] = _annotation
                     _esc_yield["coverage"] = _esc_cov
-                    return _esc_crashed, _esc_tb, _esc_yield
+                    return _esc_crashed, _esc_tb, _attach_ledger(
+                        _esc_yield, _current_candidate
+                    )
             else:
                 _annotation["inconclusive"] = True
             if isinstance(probe_yield, dict):
@@ -9821,7 +9903,7 @@ def _probe_phase1_discovery(
                     _cov["stop_reason"] = "all_tiers_blocked"
                     probe_yield["stop_reason"] = "all_tiers_blocked"
                 probe_yield["coverage"] = _cov
-    return crashed, tb, probe_yield
+    return crashed, tb, _attach_ledger(probe_yield, _current_candidate)
 
 
 def _read_discovery_checkpoint(ws: str) -> dict | None:
@@ -11087,6 +11169,22 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
         # (same listing injection as run_execution), so a draft whose discovery
         # cannot see the site never reaches the 0-item execution.
         crashed, tb, probe_yield = _probe_phase1_discovery(slug, dict(state), job_id)
+        # [wave-61] attempt-attributed listing verdict: when the probe's dead
+        # yield belongs to the CURRENT primary candidate and a fallback
+        # survived the attempt ledger, execution — and every later tester
+        # cycle's injection — demotes to that fallback (job 653: the PDP job
+        # URL seeded execution twice against the promotion the tester had
+        # proven). The verdict rides `update` on every path that continues;
+        # the arms below keep their own verdicts.
+        _lpv = _arm_listing_probe_verdict(state, probe_yield, crashed)
+        if _lpv:
+            update["listing_probe_verdict"] = _lpv
+            logger.warning(
+                "_invoke_code_tester: LISTING VERDICT — primary %s is "
+                "probe-dead (stop_reason=%s); execution demotes to %s (job %s)",
+                _lpv["candidate"][:70], _lpv.get("stop_reason") or "zero-yield",
+                _lpv["demotion_target"][:70], job_id,
+            )
         if crashed and classify_discovery_failure(tb or "") == "auth_wall":
             # [wave-37 W37-NEW-F] Site-side wall, not a code defect (prod 652
             # goodreads: the login redirect crashed Phase-1 discovery and the
@@ -11181,10 +11279,17 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
             and _probe_yield_dead(probe_yield)
             and isinstance(report, dict)
             and report.get("discovery_transient")
+            and not _lpv
         ):
             # Job-311 lesson: a transient site-side block window must not burn
             # the strategy ladder — the draft demonstrably worked earlier in
-            # this same testing phase.
+            # this same testing phase. [wave-61 R4] CANDIDATE-ATTRIBUTED:
+            # when the verdict armed, the dead yield belongs to the current
+            # primary — positive evidence from outputs produced under other
+            # candidates (job 653: 20/20 on the promotion while the PDP seed
+            # starved) is phase-disagreement, not a site transient, and must
+            # not silence it. Same-candidate transients (job 311's own shape)
+            # suppress exactly as before.
             logger.info(
                 "_invoke_code_tester: probe found no usable URLs but "
                 "discovery_transient evidence is attached — suppressing the "
@@ -11234,6 +11339,15 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 "Fix the discovery selectors/URL-building for this listing's "
                 "markup. Do NOT remove the shared discovery module wiring."
             )
+            if _lpv:
+                report["feedback_for_writer"] += (
+                    "\n[wave-61] LISTING VERDICT: the injected listing "
+                    f"{_lpv['candidate'][:80]} is probe-verified dead "
+                    f"(stop_reason={_lpv.get('stop_reason') or 'zero-yield'}); "
+                    "execution will demote to "
+                    f"{_lpv['demotion_target'][:80]}. If your discovery code "
+                    "is correct on that listing, resubmit the draft unchanged."
+                )
             update["test_report"] = report
             # [wave-24 W24-3] Access-wall accounting: count infra-class stops
             # toward the router's ×2 early terminal — but only when the

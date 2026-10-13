@@ -232,9 +232,11 @@ def _tester_listing_candidate(state: dict) -> tuple[str, str]:
     """[wave-32 E1b] The tester's ``SCRAPER_LISTING_URL`` injection candidate,
     F17-domain-guarded (mirrors run_execution's chain guard).
 
-    Returns ``(candidate, drop_note)``. The candidate is the navigator's
-    ``discovery.listing_url`` or — [rag-bone job 72] — the user's URL-shaped
-    ``search_criteria``; [wave-58 1b, job 613] for a url_list job whose seeds
+    Returns ``(candidate, drop_note)``. The candidate is [wave-61] the
+    unified chain's primary for navigation/list_page jobs (see below); for
+    the legacy branch it is the navigator's ``discovery.listing_url`` or —
+    [rag-bone job 72] — the user's URL-shaped ``search_criteria``;
+    [wave-58 1b, job 613] for a url_list job whose seeds
     are LISTING positions it is ``url_list_discovery_seed`` — a listing-seed
     url_list run IS a discovery run and the seed file drives nothing.
     '' when there is nothing to inject OR when the
@@ -245,7 +247,25 @@ def _tester_listing_candidate(state: dict) -> tuple[str, str]:
     (wave-40 T4). ``drop_note`` is ''
     unless a candidate was dropped; it becomes the run-scope note so the
     suppression is visible to the agent, not a silent side effect.
+
+    [wave-61 R3 — pinned behavior change] navigation/list_page jobs resolve
+    through the UNIFIED chain (``resolve_listing_candidate``: criteria →
+    list_page job URL → promotion, demoted by the probe verdict) — the same
+    candidate execution injects. The old promotion-first order let the
+    tester bless a listing execution never seeded (job 653: 20/20 PASS on
+    the promotion while execution starved on the PDP job URL). search_term
+    and url_list keep the legacy branch below verbatim (T6c owns
+    search_term; the url_list seed arm is wave-58-pinned).
     """
+    if str(state.get("input_mode") or "") in ("navigation", "list_page"):
+        try:
+            from agents.nodes.run_execution import resolve_listing_candidate
+
+            cand, _alt, _note = resolve_listing_candidate(state)
+        except Exception:
+            cand = ""
+        # F17 already applied per-candidate inside the chain.
+        return (cand or "").strip(), ""
     _nav = state.get("navigation_analysis") or {}
     _disc = (_nav.get("discovery") if isinstance(_nav, dict) else None) or {}
     cand = (_disc.get("listing_url") if isinstance(_disc, dict) else "") or ""

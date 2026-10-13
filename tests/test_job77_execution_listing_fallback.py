@@ -52,8 +52,11 @@ BRAS = "https://www.adoreme.com/bras"
 
 
 def _state(nav_listing=BRAS, url=JOB_URL):
+    # [wave-61] input_mode added: the shared fallback chain
+    # (listing_fallback_chain) is scoped to the Phase-1 modes — job 77 was a
+    # list_page job, and the fixture now says so.
     nav = {"discovery": {"listing_url": nav_listing}} if nav_listing else {}
-    return {"url": url, "navigation_analysis": nav}
+    return {"url": url, "navigation_analysis": nav, "input_mode": "list_page"}
 
 
 def _zero_result(tmp_path, stop_reason="empty_first_page", discovered=0):
@@ -77,10 +80,13 @@ class TestDistinctSameDomainListing:
 
         assert _distinct_same_domain_listing(_state(), JOB_URL) == BRAS
 
-    def test_primary_already_the_promotion_means_no_retry(self):
+    def test_primary_already_the_promotion_falls_to_the_job_url(self):
+        # [wave-61] 3-deep fallback chain: with the promotion already used,
+        # the rescue's last resort is the list_page job URL (still
+        # same-domain; the rescue stays bounded at one retry either way).
         from webapp.agents.nodes.run_execution import _distinct_same_domain_listing
 
-        assert _distinct_same_domain_listing(_state(), BRAS) == ""
+        assert _distinct_same_domain_listing(_state(), BRAS) == JOB_URL
 
     def test_cross_domain_promotion_rejected(self):
         from webapp.agents.nodes.run_execution import _distinct_same_domain_listing

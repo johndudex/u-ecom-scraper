@@ -90,12 +90,21 @@ class TestSearchArmWiring:
         assert "F17 dropped cross-domain SCRAPER_LISTING_URL" in arm
 
     def test_nav_arm_still_prefers_discovery_listing(self):
-        """The navigation/list_page arm keeps its F7+M6 priority unchanged."""
+        """The navigation/list_page arm keeps its F7+M6 priority unchanged.
+        [wave-61] the priority now lives in the shared unified chain
+        (``listing_primary_chain`` — criteria → job URL → promotion, pinned
+        by test_job310) and the arm resolves through it."""
         body = self._gate_body()
         nav_arm = body[: body.index('elif input_mode == "search_term":')]
-        assert "_url_shaped_criteria(state) or _job_listing or \"\"" in nav_arm
-        assert "_disc_env.get(\"listing_url\")" in nav_arm
+        assert "_chain_env = listing_primary_chain(state)" in nav_arm
+        assert "listing_primary_chain" not in body[
+            body.index('elif input_mode == "search_term":') :
+        ], "the search/url_list arms keep their own branches"
 
     def test_injection_log_still_fires_for_both_arms(self):
         body = self._gate_body()
-        assert body.count("(env-var, deterministic discovery)") >= 2
+        # [wave-61] the nav arm's log gained a source= note; both arms still
+        # log every deterministic injection.
+        assert body.count("deterministic discovery") >= 2
+        nav_arm = body[: body.index('elif input_mode == "search_term":')]
+        assert "source=%s" in nav_arm

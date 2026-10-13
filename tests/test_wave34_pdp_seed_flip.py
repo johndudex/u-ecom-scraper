@@ -385,4 +385,14 @@ class TestMultiLineCriteria:
     def test_traverse_and_probe_sites_read_the_helper(self):
         with open(graph.__file__, encoding="utf-8") as fh:
             src = fh.read()
-        assert src.count("first_criteria_url(") >= 4
+        # [wave-61] the probe's criteria slot moved into the shared resolver:
+        # graph.py's direct call count drops 4 → 3, and the probe path reads
+        # the SAME multiline helper transitively (resolver →
+        # _url_shaped_criteria → first_criteria_url, run_execution.py).
+        assert src.count("first_criteria_url(") >= 3
+        from webapp.agents.graph import _probe_listing_candidates
+
+        st = {"input_mode": "list_page", "url": PDP_URL,
+              "search_criteria": MULTI, "navigation_analysis": {}}
+        primary, _alt = _probe_listing_candidates(st)
+        assert primary == LISTING_URL and "\n" not in primary

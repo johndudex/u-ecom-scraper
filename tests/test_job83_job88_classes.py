@@ -276,7 +276,8 @@ class TestRC1NoFreshOutput:
         from webapp.agents.nodes.run_execution import _maybe_retry_execution_listing
 
         state = {"url": JOB88_PDP, "navigation_analysis": {},
-                 "search_criteria": JOB88_LISTING}
+                 "search_criteria": JOB88_LISTING,
+                 "input_mode": "list_page"}
         calls = []
 
         def redispatch(alt):
@@ -298,7 +299,8 @@ class TestRC1NoFreshOutput:
         from webapp.agents.nodes.run_execution import _maybe_retry_execution_listing
 
         state = {"url": JOB88_PDP, "navigation_analysis": {},
-                 "search_criteria": JOB88_LISTING}
+                 "search_criteria": JOB88_LISTING,
+                 "input_mode": "list_page"}
         result = {"execution_status": "FAILED",
                   "error_message": "Scraper exited with code 1. boom",
                   "product_count": 0}

@@ -60,11 +60,15 @@ class TestListingCandidates:
 
         assert _probe_listing_candidates(_state()) == (JOB_URL, NAV_LISTING)
 
-    def test_non_list_page_has_no_job_url_candidate(self):
+    def test_navigation_mode_carries_the_navigator_primary(self):
+        # [wave-61] tester/execution/probe unification: navigation jobs get a
+        # PRIMARY now (the navigator's promotion — execution has injected it
+        # for navigation since the F7 chain shipped); the probe env walk
+        # resolves the same URL it always did, through the primary slot.
         from webapp.agents.graph import _probe_listing_candidates
 
         assert _probe_listing_candidates(_state(mode="navigation")) == (
-            "", NAV_LISTING,
+            NAV_LISTING, "",
         )
 
     def test_missing_navigator_listing_is_empty_alt(self):

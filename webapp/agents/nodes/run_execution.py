@@ -515,33 +515,157 @@ def _scope_target(state: ScrapeState) -> int:
     return 1
 
 
-def _distinct_same_domain_listing(state: ScrapeState, primary_listing: str) -> str:
-    """[job-77 RC1] The navigator-promoted listing, when it is a DIFFERENT
-    same-domain URL than the one execution just used.
+def listing_primary_chain(state) -> list[tuple[str, str]]:
+    """[wave-61] The unified SCRAPER_LISTING_URL injection order for
+    navigation/list_page jobs: URL-shaped search_criteria (job-72, the
+    user's own listing assertion) → the list_page job URL (job-310 contract —
+    the draft's discovery selectors were built from the job URL's shape) →
+    the navigator's promotion. F17 drops each candidate against the job's
+    registrable domain with fall-through (wave-32 E1a: a dropped candidate
+    must not null the whole chain).
 
-    Returns "" when there is nothing better to try: no navigation analysis,
-    no discovery.listing_url, cross-domain (F17), or identical to the
-    primary. Mirrors the F6 probe retry's candidate discipline.
-    [job-85 supercheapauto] A URL-shaped search_criteria is a second
-    candidate behind the navigator's promotion — the user's own listing
-    assertion outranks nothing but is better than a dead PDP.
+    [wave-61 demotion] When ``state["listing_probe_verdict"]`` arms (the
+    Phase-1 probe measured a DEAD yield against the current primary, with a
+    surviving fallback — see ``_arm_listing_probe_verdict``), the demotion
+    target is hoisted over the proven-dead candidate and its note gains
+    ``(demoted)``. Absent a verdict this is byte-for-byte the job-310 order
+    that job 310 shipped with.
+
+    Returns ``[(url, source_note), ...]``; empty for other input modes (the
+    search_term/url_list branches keep their own arms).
     """
-    nav = state.get("navigation_analysis") or {}
-    disc = (nav.get("discovery") if isinstance(nav, dict) else None) or {}
-    primary = str(primary_listing or "").strip()
+    mode = str(state.get("input_mode") or "")
+    if mode not in ("navigation", "list_page"):
+        return []
+    entries: list[tuple[str, str]] = []
+    _crit = _url_shaped_criteria(state)
+    if _crit:
+        entries.append((_crit, "criteria"))
+    if mode == "list_page":
+        _jl = (state.get("url") or "").strip()
+        if _jl.startswith(("http://", "https://")):
+            entries.append((_jl, "job_url"))
+    _nav = state.get("navigation_analysis") or {}
+    _disc = (_nav.get("discovery") if isinstance(_nav, dict) else None) or {}
+    _promo = (_disc.get("listing_url") if isinstance(_disc, dict) else "") or ""
+    if _promo:
+        entries.append((_promo, "promotion"))
+    _verdict = state.get("listing_probe_verdict")
+    if isinstance(_verdict, dict) and _verdict.get("verdict") == "zero_yield":
+        _demoted = str(_verdict.get("candidate") or "").strip()
+        _target = str(_verdict.get("demotion_target") or "").strip()
+        if _demoted and _target:
+            _didx = next(
+                (i for i, (u, _s) in enumerate(entries) if u == _demoted), -1
+            )
+            _tidx = next(
+                (i for i, (u, _s) in enumerate(entries) if u == _target), -1
+            )
+            if 0 <= _didx < _tidx:
+                _t_entry = entries.pop(_tidx)
+                entries.insert(_didx, (_t_entry[0], f"{_t_entry[1]}(demoted)"))
     job_reg = _registrable_of(state.get("url", ""))
-    candidates = [
-        (disc.get("listing_url") if isinstance(disc, dict) else "") or "",
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for u, s in entries:
+        u = str(u or "").strip()
+        if not u or u in seen:
+            continue
+        u_reg = _registrable_of(u)
+        if job_reg and u_reg and u_reg != job_reg:
+            continue
+        seen.add(u)
+        out.append((u, s))
+    return out
+
+
+def listing_fallback_chain(state) -> list[str]:
+    """[wave-61] The rescue/retry order once a primary is dead: the navigator
+    promotion → URL-shaped criteria → the list_page job URL (job-76/85: the
+    navigator-VERIFIED candidate outranks the user's assertion after death;
+    the job URL joins last). F17-guarded, deduped, every verdict-dead
+    candidate removed — the chain is the full 3-deep survivor list; WHICH
+    survivor serves is the consumer's call (``resolve_listing_candidate``
+    skips the chain head, ``_distinct_same_domain_listing`` skips the URL
+    execution actually used).
+
+    Returns ``[url, ...]``; empty for other input modes.
+    """
+    mode = str(state.get("input_mode") or "")
+    if mode not in ("navigation", "list_page"):
+        return []
+    _nav = state.get("navigation_analysis") or {}
+    _disc = (_nav.get("discovery") if isinstance(_nav, dict) else None) or {}
+    _jl = ""
+    if mode == "list_page":
+        _jl_raw = (state.get("url") or "").strip()
+        if _jl_raw.startswith(("http://", "https://")):
+            _jl = _jl_raw
+    entries = [
+        (_disc.get("listing_url") if isinstance(_disc, dict) else "") or "",
         _url_shaped_criteria(state),
+        _jl,
     ]
-    for candidate in candidates:
-        alt = str(candidate or "").strip()
-        if not alt or not primary or alt == primary:
+    dead: set[str] = set()
+    _verdict = state.get("listing_probe_verdict")
+    if isinstance(_verdict, dict):
+        if _verdict.get("verdict") == "zero_yield" and _verdict.get("candidate"):
+            dead.add(str(_verdict["candidate"]).strip())
+        for _a in _verdict.get("attempts") or []:
+            if (
+                isinstance(_a, dict)
+                and _a.get("dead") is True
+                and _a.get("candidate")
+            ):
+                dead.add(str(_a["candidate"]).strip())
+    job_reg = _registrable_of(state.get("url", ""))
+    out: list[str] = []
+    for u in entries:
+        u = str(u or "").strip()
+        if not u or u in out or u in dead:
             continue
-        alt_reg = _registrable_of(alt)
-        if job_reg and alt_reg and alt_reg != job_reg:
+        u_reg = _registrable_of(u)
+        if job_reg and u_reg and u_reg != job_reg:
             continue
-        return alt
+        out.append(u)
+    return out
+
+
+def resolve_listing_candidate(state) -> tuple[str, str, str]:
+    """[wave-61] ``(primary, alt, source_note)`` for one state — the one
+    candidate answer every consumer (execution env chain, tester injection,
+    probe candidates, tester CLI hint) shares. ``alt`` is the first fallback
+    survivor DISTINCT from the primary ('' when none)."""
+    chain = listing_primary_chain(state)
+    if not chain:
+        return "", "", ""
+    primary = chain[0][0]
+    alt = ""
+    for cand in listing_fallback_chain(state):
+        if cand and cand != primary:
+            alt = cand
+            break
+    return primary, alt, chain[0][1]
+
+
+def _distinct_same_domain_listing(state: ScrapeState, primary_listing: str) -> str:
+    """[job-77 RC1] The listing-fallback rescue candidate, when it is a
+    DIFFERENT same-domain URL than the one execution just used.
+
+    [wave-61] Walks the shared fallback chain (``listing_fallback_chain``:
+    navigator promotion → URL-shaped criteria → job URL — the job-85
+    promotion-first order preserved, the job URL added last — the 3-deep
+    chain), F17-guarded and verdict-dead-filtered, skipping the URL that
+    just failed. Returns "" when there is nothing better to try.
+    """
+    primary = str(primary_listing or "").strip()
+    try:
+        chain = listing_fallback_chain(state)
+    except Exception:
+        chain = []
+    for alt in chain:
+        if alt and alt != primary:
+            return alt
     return ""
 
 
@@ -1186,28 +1310,26 @@ def run_execution(state: ScrapeState) -> dict:
     # fall back to the CLI chain's value; F17 domain-guarded either way.
     _listing_url_env = ""
     if input_mode in ("navigation", "list_page"):
-        _nav_env = state.get("navigation_analysis") or {}
-        _disc_env = (_nav_env.get("discovery") if isinstance(_nav_env, dict) else None) or {}
-        # Same priority as the --listing-url chain: URL-shaped search_criteria
-        # (the user's listing assertion, [rag-bone job 72]) first, then the
-        # job-310 list_page job URL, then the navigator's promotion.
-        _env_candidate = _url_shaped_criteria(state) or _job_listing or ""
-        if not _env_candidate:
-            _env_candidate = (_disc_env.get("listing_url") if isinstance(_disc_env, dict) else "") or ""
+        # [wave-61] the unified candidate chain (criteria → list_page job URL
+        # → navigator promotion; F17 per-candidate with fall-through)
+        # replaces the inline job-310 ranking — same order absent a probe
+        # verdict, demoted when the probe verified the primary dead. The
+        # job-310 contract survives as the no-verdict order (pinned).
+        _chain_env = listing_primary_chain(state)
+        if _chain_env:
+            _env_candidate, _env_source = _chain_env[0]
+        else:
+            _env_candidate, _env_source = "", ""
         if not _env_candidate:
             _env_candidate = _working_url if (_listing_reached or not _respect_flag) else ""
-        _job_reg_env = _registrable_of(state.get("url", ""))
-        if _env_candidate:
-            _cand_reg = _registrable_of(_env_candidate)
-            if _job_reg_env and _cand_reg and _cand_reg != _job_reg_env:
-                logger.warning(
-                    "run_execution: F17 dropped cross-domain SCRAPER_LISTING_URL "
-                    "%s (job domain %s)", _env_candidate[:70], _job_reg_env,
-                )
-                _env_candidate = ""
+            _env_source = "working_url"
         _listing_url_env = _env_candidate
         if _listing_url_env:
-            logger.info("run_execution: setting SCRAPER_LISTING_URL=%s (env-var, deterministic discovery)", _listing_url_env[:80])
+            logger.info(
+                "run_execution: setting SCRAPER_LISTING_URL=%s (env-var, "
+                "deterministic discovery, source=%s)",
+                _listing_url_env[:80], _env_source or "unknown",
+            )
     elif input_mode == "search_term":
         # [wave-50 T6c — job 497] A search job's discovery is owned by
         # --query: the draft's Query-mode branch builds the search URL

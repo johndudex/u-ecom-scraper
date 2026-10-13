@@ -178,9 +178,11 @@ class TestRC1ReadsYield(_RC1Base):
 
 class TestCriteriaCandidate(_RC1Base):
     def _state(self, nav_listing=None, criteria=LISTING):
+        # [wave-61] input_mode added: the shared fallback chain is scoped to
+        # the Phase-1 modes — job 85 was a list_page job.
         nav = {"discovery": {"listing_url": nav_listing}} if nav_listing else {}
         return {"url": JOB_URL, "navigation_analysis": nav,
-                "search_criteria": criteria}
+                "search_criteria": criteria, "input_mode": "list_page"}
 
     def test_criteria_used_when_navigator_promoted_nothing(self):
         from webapp.agents.nodes.run_execution import _distinct_same_domain_listing
@@ -207,10 +209,13 @@ class TestCriteriaCandidate(_RC1Base):
         st = self._state(criteria="https://other-shop.org/brands/hardkorr")
         assert _distinct_same_domain_listing(st, JOB_URL) == ""
 
-    def test_criteria_identical_to_primary_means_no_retry(self):
+    def test_criteria_identical_to_primary_falls_to_the_job_url(self):
+        # [wave-61] 3-deep fallback chain: with criteria already used as the
+        # primary, the job URL is the last-resort rescue candidate (bounded
+        # at one retry either way).
         from webapp.agents.nodes.run_execution import _distinct_same_domain_listing
 
-        assert _distinct_same_domain_listing(self._state(), LISTING) == ""
+        assert _distinct_same_domain_listing(self._state(), LISTING) == JOB_URL
 
     def test_no_criteria_no_nav_means_no_retry(self):
         from webapp.agents.nodes.run_execution import _distinct_same_domain_listing
@@ -223,7 +228,7 @@ class TestRC1EndToEndJob85(_RC1Base):
         from webapp.agents.nodes.run_execution import _maybe_retry_execution_listing
 
         state = {"url": JOB_URL, "navigation_analysis": {},
-                 "search_criteria": LISTING}
+                 "search_criteria": LISTING, "input_mode": "list_page"}
         calls = []
 
         def redispatch(alt):
@@ -262,14 +267,16 @@ class TestProbeGates(_RC1Base):
         """[rag-bone job 72] the criteria listing is now the PRIMARY (it is
         the user's own listing assertion) — pre-wave-10 the PDP was primary
         and criteria only the retry. Job url still wins when criteria is not
-        URL-shaped (job-310 shape, see TestJob72CriteriaFirstChain)."""
+        URL-shaped (job-310 shape, see TestJob72CriteriaFirstChain).
+        [wave-61] the alternate is the 3-deep fallback chain's first survivor:
+        promotion (absent here) → the list_page job URL."""
         from webapp.agents.graph import _probe_listing_candidates
 
         state = {"input_mode": "list_page", "url": JOB_URL,
                  "search_criteria": LISTING}
         primary, alt = _probe_listing_candidates(state)
         assert primary == LISTING
-        assert alt == ""
+        assert alt == JOB_URL
 
     def test_retry_warranted_on_junk_yield(self):
         from webapp.agents.graph import _probe_retry_warranted
@@ -285,9 +292,12 @@ class TestProbeGates(_RC1Base):
         assert _probe_retry_warranted(state, junk) is True
 
     def test_job85_exact_shape_converges_without_a_retry(self):
-        """The job-85 state (criteria = the real listing) now probes the REAL
-        listing as primary — the retry path is simply never needed. Protection
-        was not lost; the probe starts one step further ahead."""
+        """The job-85 state (criteria = the real listing) probes the REAL
+        listing as primary — one step ahead, as shipped. [wave-61] the probe
+        now also MEASURES the last-resort job URL when the primary dies: the
+        retry is bounded, and a dead PDP yield lands in the attempt ledger —
+        which then VETOES any demotion onto the PDP (the 653-inverse guard):
+        a fallback the probe proved dead is never a demotion target."""
         from webapp.agents.graph import _probe_listing_candidates, _probe_retry_warranted
 
         state = {"input_mode": "list_page", "url": JOB_URL,
@@ -295,8 +305,8 @@ class TestProbeGates(_RC1Base):
         junk = {"discovered_urls": 1, "stop_reason": "short_page",
                 "coverage": {"found": 0}}
         primary, alt = _probe_listing_candidates(state)
-        assert primary == LISTING and alt == ""
-        assert _probe_retry_warranted(state, junk) is False
+        assert primary == LISTING and alt == JOB_URL
+        assert _probe_retry_warranted(state, junk) is True
 
     def test_retry_not_warranted_on_healthy_yield(self):
         from webapp.agents.graph import _probe_retry_warranted
@@ -413,10 +423,15 @@ class TestJob72CriteriaFirstChain:
         assert alt == other
 
     def test_probe_no_pointless_retry_when_promotion_equals_criteria(self):
+        # [wave-61] criteria == promotion → both collapse to one candidate;
+        # the alternate becomes the 3-deep chain's next survivor (the PDP job
+        # URL, last resort — a measured retry, never a re-run of the same URL).
         from webapp.agents.graph import _probe_listing_candidates
 
         primary, alt = _probe_listing_candidates(self._job72_state())
-        assert alt == "", "criteria == promotion → a retry would re-run the same URL"
+        assert alt == self.PDP, (
+            "criteria == promotion collapsed to one; the PDP is the last-resort retry"
+        )
 
     def test_job310_shape_still_selects_the_job_url(self):
         """Regression lock: pillowtalk's contract — no URL-shaped criteria →
@@ -433,13 +448,17 @@ class TestJob72CriteriaFirstChain:
         assert primary == LISTING
         assert alt == ""
 
-    def test_navigation_mode_primary_unchanged(self):
+    def test_navigation_mode_primary_is_the_criteria_listing(self):
+        # [wave-61] tester/execution/probe unification: navigation jobs now
+        # carry the criteria listing as PRIMARY at the probe too (execution
+        # has injected criteria-first for navigation since job 72; the probe
+        # env walk lands on the same URL either way).
         from webapp.agents.graph import _probe_listing_candidates
 
         st = self._job72_state(input_mode="navigation")
         primary, alt = _probe_listing_candidates(st)
-        assert primary == ""
-        assert alt == self.CRITERIA
+        assert primary == self.CRITERIA
+        assert alt == ""
 
     # ── execution chain wiring (source pins — the chain is inline) ──
 
@@ -450,7 +469,13 @@ class TestJob72CriteriaFirstChain:
         assert (
             "_candidates = [\n                _url_shaped_criteria(state),\n                _job_listing,"
         ) in src
-        assert "_env_candidate = _url_shaped_criteria(state) or _job_listing or \"\"" in src
+        # [wave-61] the SCRAPER_LISTING_URL env gate routes through the shared
+        # unified chain (same job-72/job-310 order; verdict-demoted when the
+        # probe verified the primary dead) instead of the old inline ranking.
+        assert "_chain_env = listing_primary_chain(state)" in src
+        _lpc = src[src.index("def listing_primary_chain("):]
+        assert "_url_shaped_criteria(state)" in _lpc
+        assert _lpc.index('"criteria"') < _lpc.index('"job_url"') < _lpc.index('"promotion"')
 
     def test_tester_env_knows_the_criteria_listing_too(self):
         # [wave-32 E1b amended] the criteria fallback moved into the

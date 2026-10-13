@@ -51,14 +51,22 @@ class TestListPageListingPriority:
         assert head.index("_job_listing,") < head.index('_disc.get("listing_url")')
 
     def test_env_gate_puts_job_listing_first(self):
+        # [wave-61] the SCRAPER_LISTING_URL env gate routes through the shared
+        # unified chain; the job-310 order (criteria → job URL → promotion)
+        # lives in listing_primary_chain and holds absent a probe verdict.
         src = self._src()
-        assert '_env_candidate = _url_shaped_criteria(state) or _job_listing or ""' in src, (
-            "SCRAPER_LISTING_URL env gate must prefer the user's listing "
-            "assertion (job 72), then the list_page job URL (job 310)"
+        assert "_chain_env = listing_primary_chain(state)" in src, (
+            "SCRAPER_LISTING_URL env gate must resolve through the shared "
+            "unified chain (job 72 criteria-first, job 310 job-URL-second)"
         )
-        # the navigator's promotion is only a THIRD fallback
-        assert src.index('_env_candidate = _url_shaped_criteria(state) or _job_listing or ""') < src.index(
-            '_disc_env.get("listing_url")'
+        chain = src[src.index("def listing_primary_chain("):]
+        chain = chain[:chain.index("\ndef ", 10)]
+        assert chain.index('"criteria"') < chain.index('"job_url"'), (
+            "the unified chain keeps criteria (job 72) ahead of the list_page "
+            "job URL (job 310)"
+        )
+        assert chain.index('"job_url"') < chain.index('"promotion"'), (
+            "the job URL still outranks every navigator candidate (job 310)"
         )
 
     def test_navigation_mode_unaffected(self):

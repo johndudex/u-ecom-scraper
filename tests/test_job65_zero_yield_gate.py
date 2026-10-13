@@ -261,7 +261,11 @@ class TestCallerGateStatic:
         first = tester_src.find("_probe_yield_dead(probe_yield)")
         i = tester_src.find("_probe_yield_dead(probe_yield)", first + 1)
         assert i != -1, "zero-yield force-FAIL branch missing"
-        return tester_src[i : i + 3200]
+        # [wave-61] the force-FAIL branch now carries the listing-probe-verdict
+        # feedback block (~700 chars) before the final-attempt sentinel — the
+        # window widens to keep the whole final-attempt block
+        # (FINAL_RETRY_SENTINEL @3336, the FAILED update @3621) inside it.
+        return tester_src[i : i + 4000]
 
     def test_zero_checks_use_the_shared_predicate(self, tester_src):
         """A bare ``discovered_urls == 0`` here would bless a PDP's junk link

@@ -265,6 +265,16 @@ class ScrapeState(TypedDict, total=False):
     product_budget_retry_summary: str
     nav_budget_retries: int
     nav_budget_retry_summary: str
+    # [wave-61] deterministic probe verdict on the injected listing candidate.
+    # When the Phase-1 discovery probe measures a DEAD yield attributed (via
+    # the attempt ledger) to the CURRENT primary candidate and a fallback
+    # candidate survived the ledger, the tester arms this verdict and every
+    # consumer (execution env chain, tester injection, probe candidates, CLI
+    # hint) demotes the primary below the surviving fallback via
+    # ``listing_primary_chain`` (run_execution.py). Absent a verdict, the
+    # job-310 order stands unchanged. Declared per the wave-56b rule:
+    # undeclared keys are silently stripped from a node's update.
+    listing_probe_verdict: Annotated[dict[str, Any], _last_write_wins]
 
     # ── Phase artifacts (JSON / code produced by each phase) ────────────
     site_analysis: Annotated[dict[str, Any], _last_write_wins]

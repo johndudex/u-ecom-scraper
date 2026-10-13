@@ -52,16 +52,23 @@ def _state(criteria="", nav_listing="", mode="list_page", url=JOB_URL):
 
 
 class TestProbeFallsThrough:
-    """E1a — ``_probe_listing_env_candidate`` F17-walks the chain."""
+    """E1a — ``_probe_listing_env_candidate`` F17-walks the chain.
+
+    [wave-61] the F17 fall-through moved INTO the shared resolver
+    (``listing_primary_chain``): cross-host candidates are dropped per
+    candidate before the walk, and the same-domain survivor is the job-310
+    job URL (the PDP fixture here) — the same candidate execution injects.
+    The invariant below is unchanged: a cross-host candidate never rides.
+    """
 
     def test_cross_host_primary_falls_through_to_same_host_alt(self):
         from webapp.agents.graph import _probe_listing_env_candidate
 
-        # list_page: primary = URL-shaped search_criteria (cross-host),
-        # alt = the navigator's same-domain promotion. Old code nulled the
-        # whole candidate; the chain walk must land on the alt.
+        # list_page: criteria (cross-host) dropped by the resolver, the
+        # same-domain job URL survives — the env lands on it, never on the
+        # cross-host candidate.
         st = _state(criteria=CROSS_LISTING, nav_listing=SAME_LISTING)
-        assert _probe_listing_env_candidate(st) == SAME_LISTING
+        assert _probe_listing_env_candidate(st) == JOB_URL
 
     def test_same_host_override_wins_without_fallthrough(self):
         from webapp.agents.graph import _probe_listing_env_candidate
@@ -76,18 +83,22 @@ class TestProbeFallsThrough:
         from webapp.agents.graph import _probe_listing_env_candidate
 
         # The retry's navigator promotion is F17-guarded too; a dropped
-        # override falls to the surviving chain, not to "".
+        # override falls to the surviving chain, not to "". [wave-61] the
+        # survivor is the job URL (resolver primary), ahead of the promotion.
         st = _state(criteria=CROSS_LISTING, nav_listing=SAME_LISTING)
         assert (
             _probe_listing_env_candidate(st, listing_override=CROSS_LISTING)
-            == SAME_LISTING
+            == JOB_URL
         )
 
     def test_all_candidates_cross_host_or_empty_yields_empty(self):
         from webapp.agents.graph import _probe_listing_env_candidate
 
+        # [wave-61] every NAVIGATOR/criteria candidate is cross-host, but the
+        # job URL is same-domain and survives — the env lands on it (the
+        # pre-wave-61 shape injected nothing here; job-310 parity now wins).
         st = _state(criteria=CROSS_LISTING, nav_listing=CROSS_LISTING)
-        assert _probe_listing_env_candidate(st) == ""
+        assert _probe_listing_env_candidate(st) == JOB_URL
 
     def test_no_job_registrable_is_unguarded(self):
         from webapp.agents.graph import _probe_listing_env_candidate
@@ -108,7 +119,14 @@ class TestProbeFallsThrough:
 
 
 class TestTesterToolGuard:
-    """E1b — run_scraper never injects a cross-host SCRAPER_LISTING_URL."""
+    """E1b — run_scraper never injects a cross-host SCRAPER_LISTING_URL.
+
+    [wave-61 R3 — pinned behavior change] list_page/navigation resolve through
+    the unified chain (criteria → job URL → promotion, F17 per candidate):
+    the tester now validates the SAME candidate execution injects. Where the
+    only same-domain survivor is the job URL, the job URL is the candidate
+    (job-310 parity); a cross-host candidate still never rides.
+    """
 
     def _helper(self):
         from webapp.agents.tools import shell_tools
@@ -118,24 +136,29 @@ class TestTesterToolGuard:
     def test_cross_host_listing_url_is_dropped_with_note(self):
         st = _state(nav_listing=CROSS_LISTING)
         cand, note = self._helper()(st)
-        assert cand == ""
-        assert "loveamika.com" in note and "marimekko.com" in note
+        # promotion dropped by F17 → the same-domain job URL is the candidate
+        assert cand == JOB_URL
+        assert note == ""
 
     def test_cross_host_criteria_is_dropped_with_note(self):
         st = _state(criteria=CROSS_LISTING, nav_listing="")
         cand, note = self._helper()(st)
-        assert cand == ""
-        assert "F17" in note
+        # criteria dropped by F17 → the same-domain job URL is the candidate
+        assert cand == JOB_URL
+        assert note == ""
 
     def test_same_host_listing_url_passes(self):
         st = _state(nav_listing=SAME_LISTING)
         cand, note = self._helper()(st)
-        assert cand == SAME_LISTING
+        # job-310 order: the job URL outranks the navigator's promotion
+        assert cand == JOB_URL
         assert note == ""
 
     def test_nothing_to_inject_is_quiet(self):
         cand, note = self._helper()(_state(nav_listing=""))
-        assert cand == "" and note == ""
+        # [wave-61] "nothing to inject" now means the job URL is the only
+        # survivor — the tester validates what execution will seed.
+        assert cand == JOB_URL and note == ""
 
     def test_same_host_multiline_criteria_candidate_is_line_one(self):
         # [wave-40 T4 r1] intake.html:509 stores "One listing page per line"

@@ -5893,9 +5893,23 @@ def build_code_tester_message(state: dict) -> list:
             if input_mode == "search_term" and "query" in _accepted and search_criteria:
                 _p1_flags = ["--query", search_criteria]
             elif "listing-url" in _accepted:
-                _listing = (
-                    (state.get("navigation_analysis") or {}).get("discovery") or {}
-                ).get("listing_url") or ""
+                # [wave-61 consumer #4] the hint routes through the SAME
+                # resolver as the env injection — the agent-driven path can no
+                # longer diverge from it (job 653: the tester's env walked one
+                # candidate while nothing corrected the agent's own runs).
+                if input_mode in ("navigation", "list_page"):
+                    try:
+                        from .nodes.run_execution import (
+                            resolve_listing_candidate,
+                        )
+
+                        _listing, _alt, _note = resolve_listing_candidate(state)
+                    except Exception:
+                        _listing = ""
+                else:
+                    _listing = (
+                        (state.get("navigation_analysis") or {}).get("discovery") or {}
+                    ).get("listing_url") or ""
                 _p1_flags = ["--listing-url", _listing] if _listing else []
             if "fresh-discovery" in _accepted:
                 _p1_flags.append("--fresh-discovery")
