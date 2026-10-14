@@ -1,7 +1,24 @@
 # Wave-64: Writer contract adherence — make the system-borne exec budget actually reach drafts
 
-**Status**: PLAN v2 — critique-1 REVISE findings incorporated (file-path fix, F3 insertion-point + issue
-shape pinned, units gap closed, evidence belt replaced). Awaiting Guardian plan gate before build.
+**Status**: COMPLETE — e2e 1/1 PASS (2026-10-14). Commit `24402fc` (F1 alias belt + F2 writer prompt
+contract + F3 position-safe contract-env scan) + `8e24735` gitignore chore. TDD
+`tests/test_wave64_exec_budget.py`→`test_wave64_writer_contract.py` 16/16; full gate after the F3 RCA
+fix: **5115 passed / 5 baseline known-reds / 11 collection errors** (exact baseline arithmetic). The
+first gate caught a real F3 wiring bug — `report = report or {}` manufactured a test_report on the
+dead-tester `test_report=None` path (job-81 stale-report rejection); fixed by gating on
+`isinstance(report, dict)` + regression pin `test_graph_wiring_never_manufactures_a_report`; job81
+27/27 green after.
+
+**e2e (job 666, jomashop watches.html re-fire)**: COMPLETED **pc=3426** — 3426/3426 on ALL FOUR core
+fields, 3426 unique titles + urls, tester PASS 0.97 pre-execution. ALL mechanisms certified live:
+draft consumed `SCRAPER_EXEC_TIME_BUDGET` verbatim + startup "Env gate" log (F2);
+`exec_time_budget_seconds=3000` — **system-borne bound proven** (663's writer-borne 540 is dead);
+`time_budget_bounded` at the discovery_coverage placement; the `EXEC BUDGET` note FIRED via
+`_note_budget_bound` (silent in 663). 50,000 URLs discovered, gracefully bounded. Guardian ledger
+row 12. jomashop arc: 662 FAIL pc=0 → 663 PASS 92 (writer-borne fuse) → 666 PASS 3426 (system-borne,
+fully governed). Merge of waves 57-64 to ExtractorBuilderAi fork main: user-unparked 2026-10-14 —
+`129cdd8` sync + `153459b` scratch cleanup + `75321c7` outputs deletion/gitignore (all pushed
+`sync-w54:main`, SHA-verified, merge-tree clean vs aimleap/main).
 
 ## Critique history
 
