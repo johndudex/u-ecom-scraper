@@ -365,7 +365,14 @@ def _tree(name: str) -> ast.AST:
 
 def _assigned_dicts(tree: ast.AST) -> dict[str, ast.Dict]:
     """`name = { ... }` assignments anywhere in the module (last one wins), so a
-    `"discovery_coverage": discovery_coverage` reference can be resolved."""
+    `"discovery_coverage": discovery_coverage` reference can be resolved.
+
+    [wave-63 re-pin] also maps `fn:<name>` → the single dict literal a
+    zero-arg builder returns: wave-63 moved each navigation template's
+    coverage block into a closure/helper (`_provisional_coverage()` / the
+    flush builder), making `"discovery_coverage": _provisional_coverage()` a
+    Call hop. Same one-hop resolution the Name case always had — the contract
+    keys themselves are unchanged."""
     out: dict[str, ast.Dict] = {}
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign):
@@ -375,6 +382,15 @@ def _assigned_dicts(tree: ast.AST) -> dict[str, ast.Dict]:
         for tgt in node.targets:
             if isinstance(tgt, ast.Name):
                 out[tgt.id] = node.value
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        rets = [
+            n.value for n in ast.walk(node)
+            if isinstance(n, ast.Return) and isinstance(n.value, ast.Dict)
+        ]
+        if len(rets) == 1:
+            out[f"fn:{node.name}"] = rets[0]
     return out
 
 
@@ -388,12 +404,21 @@ def _literal_keys(node: ast.AST) -> set[str]:
 
 
 def _resolve_keys(node: ast.AST, assigned: dict[str, ast.Dict]) -> set[str]:
-    """String key set of a dict VALUE — inline literal, or one `Name` hop to the
-    dict literal it was built from."""
+    """String key set of a dict VALUE — inline literal, one `Name` hop to the
+    dict literal it was built from, or (wave-63) one zero-arg-call hop to a
+    builder's returned dict literal."""
     if isinstance(node, ast.Dict):
         return _literal_keys(node)
     if isinstance(node, ast.Name) and node.id in assigned:
         return _literal_keys(assigned[node.id])
+    if (
+        isinstance(node, ast.Call)
+        and not node.args
+        and not node.keywords
+        and isinstance(node.func, ast.Name)
+        and f"fn:{node.func.id}" in assigned
+    ):
+        return _literal_keys(assigned[f"fn:{node.func.id}"])
     return set()
 
 

@@ -283,6 +283,10 @@ def _discovery_goto(page, url: str, state: dict) -> bool:
 # runner's hard wall with zero output.
 EXEC_BUDGET_STOP = "exec_time_budget"
 
+# [wave-63] Partial-output flush interval: rewrite the output file every N
+# extracted items so a SIGKILL at the budget wall leaves rows on disk.
+FLUSH_EVERY = 25
+
 
 def _exec_budget_deadlines(budget: int, start_monotonic: float) -> tuple[float, float]:
     """Two-deadline math: (discovery_deadline, extraction_deadline).
@@ -1026,6 +1030,56 @@ def main():
             EXEC_TIME_BUDGET, time.monotonic()
         )
 
+    # [wave-63] ONE output file per run, name fixed at START (job-71 collision
+    # contract: subsecond timestamp + pid). The extraction loop flushes partial
+    # output to it every FLUSH_EVERY items (atomic tmp+replace, tmp never
+    # matches the runner's output_*.json scan), so a runner SIGKILL at the
+    # budget wall salvages rows instead of losing everything (job 662).
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S_%f")
+    output_filename = os.path.join(
+        SCRIPT_DIR, f"output_{timestamp}_{os.getpid()}.json"
+    )
+
+    def _provisional_coverage() -> dict:
+        return {
+            "stop_reason": discovery_state["stop_reason"],
+            "found": len(items),
+            "discovered_urls": len(discovered_urls),
+            "expected_total": COVERAGE_TARGET_TOTAL,
+            "dimensions_iterated": discovery_state["dimensions_iterated"],
+            "dimensions_total": discovery_state["dimensions_total"],
+            "max_pages_hit": discovery_state["max_pages_hit"],
+            "ran_phase1": ran_phase1,
+            "skipped_reason": skipped_reason,
+            "time_budget_bounded": _exec_bounded,
+            "exec_time_budget_seconds": EXEC_TIME_BUDGET,
+        }
+
+    def _write_output_atomic() -> None:
+        """Full output shape (gate-readable even as a partial harvest),
+        written atomically: tmp side-name then os.replace."""
+        output = {
+            "site": {
+                "name": SITE_NAME,
+                "url": SITE_URL,
+                "platform": PLATFORM,
+                "scraping_method": "playwright_navigation",
+                "scraped_at": datetime.now(timezone.utc).isoformat(),
+            },
+            OUTPUT_KEY: items,
+            "metadata": {
+                "phase": "discovery" if args.discover_only else "extraction",
+                "scraping_duration_seconds": round(time.time() - start_time, 1),
+                "discovered_urls": len(discovered_urls),
+                "extracted_items": len(items),
+                "discovery_coverage": _provisional_coverage(),
+            },
+        }
+        tmp_path = output_filename + ".json.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(output, f, indent=2, ensure_ascii=False, default=str)
+        os.replace(tmp_path, output_filename)
+
     # Discovery-coverage accumulator (contract §1/§2). Threaded through every
     # Phase-1 termination point so the gate can tell genuine exhaustion apart
     # from a scraper that gave up (H4). `navigate_error` is sticky.
@@ -1251,6 +1305,16 @@ def main():
                     logger.error("Failed to extract %s: %s", url[:80], exc)
                     items.append(_error_item(url, src_url_base, str(exc)))
 
+                # [wave-63] Periodic partial-output flush (crash/timeout
+                # salvage). Flushed rows are UNFILTERED — a harvested count is
+                # a RAW count; the final write below overwrites with the
+                # filtered result on a clean finish.
+                if i % FLUSH_EVERY == 0:
+                    try:
+                        _write_output_atomic()
+                    except Exception as _flush_exc:
+                        logger.warning("Partial-output flush failed: %s", _flush_exc)
+
                 if i < total:
                     time.sleep(DELAY_BETWEEN_REQUESTS)
 
@@ -1267,23 +1331,7 @@ def main():
     # Discovery-coverage block (contract §1). `found` is the POST-FILTER
     # extracted item count (0 when Phase 2 was skipped via --discover-only or
     # when discovery found nothing) — NOT raw len(discovered_urls).
-    discovery_coverage = {
-        "stop_reason": discovery_state["stop_reason"],
-        "found": len(items),
-        "discovered_urls": len(discovered_urls),
-        "expected_total": COVERAGE_TARGET_TOTAL,
-        "dimensions_iterated": discovery_state["dimensions_iterated"],
-        "dimensions_total": discovery_state["dimensions_total"],
-        "max_pages_hit": discovery_state["max_pages_hit"],
-        "ran_phase1": ran_phase1,
-        "skipped_reason": skipped_reason,
-        # [wave-63] Honest bounded-run marker: scope=all was trimmed by the
-        # execution time budget, not by a site failure. found stays the
-        # post-filter count (never repurposed) so shortfall remediation
-        # never arms on a bounded run.
-        "time_budget_bounded": _exec_bounded,
-        "exec_time_budget_seconds": EXEC_TIME_BUDGET,
-    }
+    discovery_coverage = _provisional_coverage()
 
     # [wave-40 T14] A checkpoint-rescued run reports the REUSED yield as its
     # verdict: stop_reason becomes "checkpoint_reused" (in NEITHER the
@@ -1300,36 +1348,9 @@ def main():
             checkpoint_coverage_patch(discovery_coverage, checkpoint_reuse)
         )
 
-    output = {
-        "site": {
-            "name": SITE_NAME,
-            "url": SITE_URL,
-            "platform": PLATFORM,
-            "scraping_method": "playwright_navigation",
-            "scraped_at": datetime.now(timezone.utc).isoformat(),
-        },
-        OUTPUT_KEY: items,
-        "metadata": {
-            # job-76 myhouse: lets every consumer tell a discovery artifact
-            # (URL stubs, no fields) from an extraction result.
-            "phase": "discovery" if args.discover_only else "extraction",
-            "scraping_duration_seconds": round(time.time() - start_time, 1),
-            "discovered_urls": len(discovered_urls),
-            "extracted_items": len(items),
-            "discovery_coverage": discovery_coverage,
-        },
-    }
-
-    # Unique per process: a second-resolution timestamp collides when two
-    # runs of this draft start in the same second (job-71 popsockets — the
-    # discovery run clobbered the extraction result).
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S_%f")
-    output_filename = os.path.join(
-        SCRIPT_DIR, f"output_{timestamp}_{os.getpid()}.json"
-    )
-
-    with open(output_filename, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False, default=str)
+    # [wave-63] Final write goes through the SAME atomic single-name path —
+    # a SIGKILL mid-final-write cannot leave a truncated file behind.
+    _write_output_atomic()
 
     logger.info(
         "Done: %d/%d items in %.1fs (stop_reason=%s) → %s",

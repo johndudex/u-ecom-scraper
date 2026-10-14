@@ -252,6 +252,10 @@ DISCOVERY_DEADLINE_SECONDS = 300
 # clamped reserve, extraction may run to the FULL budget — so a catalogue-scale
 # walk still finishes with rows instead of dying at the runner's hard wall.
 EXEC_BUDGET_STOP = "exec_time_budget"
+
+# [wave-63] Partial-output flush interval: rewrite the output file every N
+# completed items so a SIGKILL at the budget wall leaves rows on disk.
+FLUSH_EVERY = 25
 _EXEC_DISCOVERY_DEADLINE: float | None = None
 _EXEC_EXTRACTION_DEADLINE: float | None = None
 _EXEC_BOUNDED = False
@@ -1732,6 +1736,59 @@ def main():
             _EXEC_EXTRACTION_DEADLINE,
         ) = _exec_budget_deadlines(_exec_budget, time.monotonic())
 
+    # [wave-63] ONE output file per run, name fixed at START (job-71 collision
+    # contract: subsecond timestamp + pid). The extraction loop flushes partial
+    # output to it every FLUSH_EVERY completions (atomic tmp+replace, tmp never
+    # matches the runner's output_*.json scan), so a runner SIGKILL at the
+    # budget wall salvages rows instead of losing everything (job 662).
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S_%f")
+    output_filename = os.path.join(
+        SCRIPT_DIR, f"output_{timestamp}_{os.getpid()}.json"
+    )
+
+    def _write_output_atomic() -> None:
+        """Full output shape (gate-readable even as a partial harvest),
+        written atomically: tmp side-name then os.replace. Flushed rows are
+        UNFILTERED — a harvested count is a RAW count; the final write on a
+        clean finish overwrites with the filtered result."""
+        coverage = {
+            "stop_reason": aggregate_stop_reason,
+            "found": len(items),
+            "discovered_urls": len(discovered_urls),
+            "expected_total": COVERAGE_TARGET_TOTAL,
+            "dimensions_iterated": dimensions_iterated,
+            "dimensions_total": dimensions_total,
+            "max_pages_hit": max_pages_hit,
+            "ran_phase1": ran_phase1,
+            "skipped_reason": skipped_reason,
+            "phase2_instant_fail": False,
+            "time_budget_bounded": _EXEC_BOUNDED,
+            "exec_time_budget_seconds": _exec_budget,
+        }
+        output = {
+            "site": {
+                "name": SITE_NAME,
+                "url": SITE_URL,
+                "platform": PLATFORM,
+                "scraping_method": "http_navigation",
+                "scraped_at": datetime.now(timezone.utc).isoformat(),
+            },
+            OUTPUT_KEY: items,
+            "metadata": {
+                "phase": "discovery" if args.discover_only else "extraction",
+                "scraping_duration_seconds": round(time.time() - start_time, 1),
+                "discovered_urls": len(discovered_urls),
+                "extracted_items": len(items),
+                "execution_model": "http_navigate",
+                "stealth": "cloak" if str(STEALTH).lower() == "cloak" else "none",
+                "discovery_coverage": coverage,
+            },
+        }
+        tmp_path = output_filename + ".json.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(output, f, indent=2, ensure_ascii=False, default=str)
+        os.replace(tmp_path, output_filename)
+
     # ── Coverage-gate state (contract §1) ───────────────────────────────────
     # ran_phase1=False emits stop_reason="skipped" + skipped_reason.
     ran_phase1 = True
@@ -1995,6 +2052,14 @@ def main():
                     "Progress: [%d/%d] (%.1f%%) %s — %s",
                     completed, total, (completed / total) * 100, status, url[:90],
                 )
+                # [wave-63] Periodic partial-output flush (crash/timeout
+                # salvage). GIL-safe: this is the single writer thread — the
+                # worker threads only mutate their own future-local item.
+                if completed % FLUSH_EVERY == 0:
+                    try:
+                        _write_output_atomic()
+                    except Exception as _flush_exc:
+                        logger.warning("Partial-output flush failed: %s", _flush_exc)
         # [T3.13c/job-76 myhouse] Mechanical "fetch actually happened"
         # detector — surfaced in discovery_coverage below.
         phase2_instant = phase2_instant_fail(
@@ -2063,37 +2128,9 @@ def main():
             checkpoint_coverage_patch(discovery_coverage, checkpoint_reuse)
         )
 
-    output = {
-        "site": {
-            "name": SITE_NAME,
-            "url": SITE_URL,
-            "platform": PLATFORM,
-            "scraping_method": "http_navigation",
-            "scraped_at": datetime.now(timezone.utc).isoformat(),
-        },
-        OUTPUT_KEY: items,
-        "metadata": {
-            # job-76 myhouse: lets every consumer tell a discovery artifact
-            # (URL stubs, no fields) from an extraction result.
-            "phase": "discovery" if args.discover_only else "extraction",
-            "scraping_duration_seconds": round(time.time() - start_time, 1),
-            "discovered_urls": len(discovered_urls),
-            "extracted_items": len(items),
-            "execution_model": "http_navigate",
-            "stealth": "cloak" if str(STEALTH).lower() == "cloak" else "none",
-            "discovery_coverage": discovery_coverage,
-        },
-    }
-
-    # Unique per process: a second-resolution timestamp collides when two
-    # runs of this draft start in the same second (job-71 popsockets — the
-    # discovery run clobbered the extraction result).
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S_%f")
-    output_filename = os.path.join(
-        SCRIPT_DIR, f"output_{timestamp}_{os.getpid()}.json"
-    )
-    with open(output_filename, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False, default=str)
+    # [wave-63] Final write goes through the SAME atomic single-name path —
+    # a SIGKILL mid-final-write cannot leave a truncated file behind.
+    _write_output_atomic()
 
     logger.info(
         "Done: %d/%d items in %.1fs → %s",

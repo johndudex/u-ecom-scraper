@@ -225,15 +225,15 @@ class TestTemplateFlush:
             src = _read(path)
             main_idx = src.index("def main(")
             fname = src.find("output_filename", main_idx)
-            phase2 = src.find("Phase 2", main_idx)
+            phase2 = src.find("Phase 2: Extracting", main_idx)
             assert fname != -1 and phase2 != -1
             assert fname < phase2, (
                 f"{os.path.basename(path)}: output filename computed after the "
                 "extraction loop — the flush has no target"
             )
             # Collision pin compatibility: subsecond timestamp + pid.
-            fname_line = src[fname : src.index("\n", fname)]
-            assert "%f" in fname_line and "os.getpid()" in fname_line
+            fname_window = src[max(0, fname - 200) : fname + 300]
+            assert re.search(r"strftime\([^)]*%f", fname_window) and "os.getpid()" in fname_window
 
     def test_flush_atomic_and_glob_safe(self):
         """Flush writes via ``.json.tmp`` + ``os.replace`` — the tmp name must
@@ -259,7 +259,8 @@ class TestTemplateFlush:
         metadata.discovery_coverage (run_execution._read_discovery_coverage)."""
         for path in (NAV, HTTP):
             src = _read(path)
-            flush_idx = src.find("os.replace")
+            flush_idx = src.find("os.replace(tmp_path")
+            assert flush_idx != -1
             region = src[:flush_idx]
             # The output-shape builder the flush uses must include coverage.
             assert '"discovery_coverage"' in region, (
@@ -435,8 +436,11 @@ class TestHarvestInProcessLane:
         src = _read(RUN_EXEC)
         stall = src.index("if stall_reason:")
         region = src[stall : stall + 2500]
-        assert "_find_newest_output" in region, "stall return loses flushed rows"
-        assert "mtime_floor=start" in region, "stall harvest must be floored"
+        assert "_inprocess_partial_harvest" in region, (
+            "stall return loses flushed rows"
+        )
+        helper = _grab(src, "_inprocess_partial_harvest")
+        assert "mtime_floor=start" in helper, "stall harvest must be floored"
 
     def test_rc0_crash_return_harvests(self):
         src = _read(RUN_EXEC)
@@ -461,11 +465,23 @@ class TestHarvestInProcessLane:
         assert '"execution_status": "FAILED"' in arm
 
 
+class TestLane3Merge:
+    def test_timed_out_leg_content_still_merges(self):
+        """Lane-3 merge pin: category-leg merge is CONTENT-gated, not
+        returncode-gated — a timed-out leg's flushed rows merge exactly like
+        today's failed-leg rows (B3's env change must not alter this)."""
+        src = _read(RUN_EXEC)
+        leg = src.index('"timeout": 600')
+        region = src[leg : leg + 3000]
+        assert 'cat_result.get("output_content")' in region
+        assert "if cat_content:" in region
+
+
 class TestBudgetWallMarker:
     def test_runner_timeout_dict_marked(self):
         src = _read(RUNNER)
-        to = src.index("subprocess.TimeoutExpired")
-        region = src[to : to + 1800]
+        to = src.index('"Scraper timed out after %ds')
+        region = src[to : to + 2200]
         assert MARKER in region, "runner timeout dict lacks the budget-wall marker"
 
     def test_run_execution_marked_on_timeout_paths(self):
@@ -522,7 +538,7 @@ class TestRunnerHarvest:
         """Source pin: the timeout catch returns timed_out=True and embeds the
         harvest (output_content) instead of the unconditional hard-zero."""
         src = _read(RUNNER)
-        to = src.index("subprocess.TimeoutExpired")
+        to = src.index('"Scraper timed out after %ds')
         region = src[to : to + 2600]
         assert '"timed_out": True' in region
         assert "_harvest_partial_output" in region
@@ -531,7 +547,7 @@ class TestRunnerHarvest:
     def test_hard_zero_unchanged_when_no_harvest(self):
         """No fresh output ⇒ today's hard-zero dict shape (fields intact)."""
         src = _read(RUNNER)
-        to = src.index("subprocess.TimeoutExpired")
+        to = src.index('"Scraper timed out after %ds')
         region = src[to : to + 2600]
         for field in ('"returncode": -1', '"stdout": ""', '"product_count": 0'):
             assert field in region, f"hard-zero field {field} lost"

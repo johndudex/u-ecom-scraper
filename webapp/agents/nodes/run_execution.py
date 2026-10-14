@@ -2112,6 +2112,22 @@ def _run_in_process(
 
         if stall_reason:
             logger.error("run_execution: %s after %ds", stall_reason, elapsed)
+            # [wave-63] Salvage flushed rows before the honest FAILED — the
+            # floor (subprocess start) is LOAD-BEARING here: the tester's
+            # output lives in this same workspace (prod 319 class).
+            _salvage = _inprocess_partial_harvest(
+                workspace_folder, site_folder, start, job_id,
+                why=(
+                    "budget_wall_timeout" if "wall-clock" in stall_reason
+                    else "stall"
+                ),
+            )
+            if _salvage:
+                _msg = f"{stall_reason}. Last output: {stderr[-4000:]}"
+                if "wall-clock" in stall_reason:
+                    _msg += " [budget_wall_timeout]"
+                _salvage["error_message"] = _msg
+                return _salvage
             return {
                 "execution_status": "FAILED",
                 "error_message": f"{stall_reason}. Last output: {stderr[-4000:]}",
@@ -2146,6 +2162,17 @@ def _run_in_process(
                         f"Scraper exited with code {returncode}. {stderr[-4000:]}"
                     ),
                 }
+            # [wave-63] Crash salvage: a nonzero exit may still have flushed
+            # partial rows (every-25 flush) — record them under an honest
+            # FAILED instead of dropping them. rc==3 never reaches here.
+            _salvage = _inprocess_partial_harvest(
+                workspace_folder, site_folder, start, job_id, why="crash"
+            )
+            if _salvage:
+                _salvage["error_message"] = (
+                    f"Scraper exited with code {returncode}. {stderr[-4000:]}"
+                )
+                return _salvage
             return {
                 "execution_status": "FAILED",
                 "error_message": f"Scraper exited with code {returncode}. {stderr[-4000:]}",
@@ -2521,6 +2548,54 @@ def _run_via_browser_service(
                         _marker or "browser_service unavailable during discovery"
                     )
                 return _failed
+            # [wave-63] Salvage arm — trigger key (pinned): ``timed_out`` from
+            # the runner OR fresh floored partial output on a crashed run. The
+            # flushed rows persist + coverage-read BEFORE the honest FAILED
+            # (662: a certified draft died at the wall with rows flushed but
+            # unread). Status stays FAILED — NEVER COMPLETED (C4 belt: rows
+            # bypass prune/normalize/gates, so the raw count is stated as raw).
+            _h_content = result.get("output_content") or ""
+            _h_name = result.get("output_name") or ""
+            if result.get("timed_out") or _h_content:
+                output_file = ""
+                if _h_content and _h_name:
+                    output_file = os.path.join(os.path.dirname(scraper_path), _h_name)
+                    try:
+                        with open(output_file, "w", encoding="utf-8") as _of:
+                            _of.write(_h_content)
+                    except OSError as exc:
+                        logger.warning(
+                            "run_execution: could not persist salvaged output: %s", exc
+                        )
+                discovery_coverage = (
+                    _read_discovery_coverage(output_file) if output_file else {}
+                )
+                _h_count = result.get("product_count") or 0
+                _h_why = "budget_wall_timeout" if result.get("timed_out") else "crash"
+                _append_execution_note(
+                    _exec_job_id,
+                    f"PARTIAL HARVEST ({_h_why}; raw row count {_h_count})",
+                )
+                if result.get("timed_out"):
+                    _note_budget_bound(_exec_job_id, discovery_coverage)
+                logger.warning(
+                    "run_execution: partial harvest (%s, %d raw rows) — FAILED with rows",
+                    _h_why, _h_count,
+                )
+                if result.get("timed_out"):
+                    _h_head = "Scraper timed out (budget wall)"
+                else:
+                    _h_head = f"Scraper exited with code {result['returncode']}"
+                return {
+                    "execution_status": "FAILED",
+                    "partial_harvest": True,
+                    "output_file": output_file,
+                    "product_count": _h_count,
+                    "discovery_coverage": discovery_coverage or {},
+                    "error_message": (
+                        f"{_h_head}; partial output harvested. {stderr}"
+                    ),
+                }
             return {
                 "execution_status": "FAILED",
                 "error_message": f"Scraper exited with code {result['returncode']}. {stderr}",
@@ -3510,6 +3585,47 @@ def _find_newest_output(
     scored = [(mtime, _substantive_item_count(path), path) for mtime, path in candidates]
     scored.sort(key=lambda t: (t[1], t[0]), reverse=True)
     return scored[0][2]
+
+
+def _inprocess_partial_harvest(
+    workspace_folder: str,
+    site_folder: str,
+    start: float,
+    job_id: int,
+    why: str = "crash",
+) -> dict[str, Any] | None:
+    """[wave-63] In-process lane salvage (stall kill / nonzero exit).
+
+    The templates flush partial output every FLUSH_EVERY items; this reads the
+    freshest output floored to the SUBPROCESS start (load-bearing in this lane:
+    the tester's output lives in the same workspace — prod 319 class). Returns
+    None when nothing fresh — the caller keeps today's exact shape. The status
+    stays FAILED (C4 belt: partial rows are recorded honestly, never completed;
+    the count is RAW — flushed rows bypass the core-field filter).
+    """
+    if not workspace_folder and not site_folder:
+        return None
+    try:
+        path = _find_newest_output(
+            workspace_folder, site_folder, slug=None, mtime_floor=start
+        )
+    except Exception:
+        return None
+    if not path:
+        return None
+    coverage = _read_discovery_coverage(path) or {}
+    count = _count_products(path)
+    _append_execution_note(
+        job_id, f"PARTIAL HARVEST ({why}; raw row count {count})"
+    )
+    _note_budget_bound(job_id, coverage)
+    return {
+        "execution_status": "FAILED",
+        "partial_harvest": True,
+        "output_file": path,
+        "product_count": count,
+        "discovery_coverage": coverage,
+    }
 
 
 def _count_products(output_path: str) -> int:

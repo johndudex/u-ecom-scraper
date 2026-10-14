@@ -694,7 +694,14 @@ class TestDeadTesterProbeArm:
         i_guard = src.find(
             "elif probe_yield is not None and not isinstance(report, dict):"
         )
-        i_unguarded = src.find("elif probe_yield is not None:")
+        # [wave-63 re-pin repair] the healthy-yield arm lost its bare form in
+        # wave-34 (6d59594, job 372) — it is now isinstance-guarded, which is
+        # STRONGER than what this pin originally demanded. Anchor on the
+        # current guarded form; the ORDER guarantee (dead-verdict arm first)
+        # is unchanged.
+        i_unguarded = src.find(
+            "elif probe_yield is not None and isinstance("
+        )
         assert i_guard != -1, "the dead-verdict logging arm must exist"
         assert i_unguarded != -1
         assert i_guard < i_unguarded, (
@@ -704,7 +711,9 @@ class TestDeadTesterProbeArm:
 
     def test_healthy_arm_does_not_synthesize_a_verdict(self):
         src = self._tester_src()
-        i_unguarded = src.find("elif probe_yield is not None:")
+        i_unguarded = src.find(
+            "elif probe_yield is not None and isinstance("
+        )
         block = src[i_unguarded:i_unguarded + 1800]  # the arm body, not the fn
         assert "report = report or {}" not in block, (
             "resurrecting a dead tester's report as {} would read as a judged "

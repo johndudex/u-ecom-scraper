@@ -731,10 +731,31 @@ def _run_scraper_script_impl(
                 timeout,
             )
             _restart_scraper_chrome()
+            # [wave-63] Salvage: the templates flush partial output every
+            # FLUSH_EVERY items — read the freshest file floored to THIS
+            # attempt before the workdir is torn down, instead of the
+            # unconditional hard-zero (job 662 lost everything at the wall).
+            _partial = _harvest_partial_output(
+                os.path.dirname(scraper_path), attempt_start
+            )
+            if _partial:
+                logger.warning(
+                    "Scraper: salvaged partial output on timeout (%d raw rows) — "
+                    "caller records FAILED with rows, never COMPLETED",
+                    _partial["product_count"],
+                )
+                return {
+                    "returncode": -1,
+                    "stdout": "",
+                    "stderr": f"Timed out after {timeout}s [budget_wall_timeout]",
+                    "timed_out": True,
+                    "duration": round(time.time() - start, 2),
+                    **_partial,
+                }
             return {
                 "returncode": -1,
                 "stdout": "",
-                "stderr": f"Timed out after {timeout}s",
+                "stderr": f"Timed out after {timeout}s [budget_wall_timeout]",
                 "output_file": "",
                 "product_count": 0,
                 "duration": round(time.time() - start, 2),
@@ -769,7 +790,7 @@ def _run_scraper_script_impl(
     }
 
 
-def _find_output_file(site_folder: str) -> str:
+def _find_output_file(site_folder: str, mtime_floor: float | None = None) -> str:
     if not site_folder or not os.path.isdir(site_folder):
         return ""
     try:
@@ -780,9 +801,44 @@ def _find_output_file(site_folder: str) -> str:
                 if f.startswith("output_") and f.endswith(".json")
             ]
         )
+        # [wave-63] F8 parity with run_execution._find_newest_output: only
+        # files written at/after the floor are eligible (a mid-flush
+        # ``.json.tmp`` sidecar never matches the suffix filter).
+        if mtime_floor is not None:
+            candidates = [
+                c for c in candidates if os.path.getmtime(c) >= mtime_floor
+            ]
         return candidates[-1] if candidates else ""
     except Exception:
         return ""
+
+
+def _harvest_partial_output(
+    workdir: str, mtime_floor: float
+) -> dict[str, Any] | None:
+    """[wave-63] Timeout/crash salvage: read the freshest output the run
+    flushed (templates flush partial output every FLUSH_EVERY items).
+
+    Floored to the ATTEMPT start (not the outer start) so a prior retry's
+    file is never credited. Returns ``None`` when nothing fresh exists — the
+    caller keeps its hard-zero shape. Never raises.
+    """
+    try:
+        path = _find_output_file(workdir, mtime_floor=mtime_floor)
+        if not path:
+            return None
+        with open(path, "r", encoding="utf-8") as fh:
+            content = fh.read()
+        if not content.strip():
+            return None
+        return {
+            "output_file": path,
+            "output_name": os.path.basename(path),
+            "output_content": content,
+            "product_count": _count_products(path),
+        }
+    except Exception:
+        return None
 
 
 def _count_products(output_path: str) -> int:
