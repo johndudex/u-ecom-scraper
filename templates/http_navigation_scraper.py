@@ -246,6 +246,28 @@ TOTAL_COUNT_SELECTOR = "{TOTAL_COUNT_SELECTOR}"    # e.g. ".results-count" (info
 # instead of an unbounded hang. Bounds discovery regardless of failure mode.
 DISCOVERY_DEADLINE_SECONDS = 300
 
+# [wave-63] Execution time budget (job 662): run_execution injects
+# SCRAPER_EXEC_TIME_BUDGET (setting EXECUTION_ITEM_TIME_BUDGET, default 3000s).
+# Absent ⇒ unlimited. Two-deadline split — discovery gets the budget minus a
+# clamped reserve, extraction may run to the FULL budget — so a catalogue-scale
+# walk still finishes with rows instead of dying at the runner's hard wall.
+EXEC_BUDGET_STOP = "exec_time_budget"
+_EXEC_DISCOVERY_DEADLINE: float | None = None
+_EXEC_EXTRACTION_DEADLINE: float | None = None
+_EXEC_BOUNDED = False
+
+
+def _exec_budget_deadlines(budget: int, start_monotonic: float) -> tuple[float, float]:
+    """Two-deadline math: (discovery_deadline, extraction_deadline).
+
+    The reserve is CLAMPED so it scales down with small budgets (critique-2
+    B4): ``min(max(600, 0.3*budget), 0.5*budget)`` — budget 3000 → reserve 900
+    (discovery ≤ 2100s, extraction ≥ 900s); budget 540 → reserve 270. Never
+    negative, never already-expired.
+    """
+    reserve = min(max(600, int(0.3 * budget)), int(0.5 * budget))
+    return start_monotonic + (budget - reserve), start_monotonic + budget
+
 # Coverage gate (contract §1 expected_total): trusted total item count when
 # deterministically known from analysis (e.g. site-reported "3771 jobs across
 # 207 specialties"). None → the Tier 3 ratio gate stays a no-op. code_writer
@@ -864,7 +886,10 @@ def _discover_urls_via_search(
     # [wave-50] Wall-clock bound — the same fail-fast 1b gives its category
     # walk. A blocking/slow site must not turn one stuck search URL into a
     # full retry-ladder burn (job 490: 3 consecutive 600s probe timeouts).
+    # [wave-63] Honors min(own 300s deadline, exec budget discovery deadline).
     _deadline = time.monotonic() + DISCOVERY_DEADLINE_SECONDS
+    if _EXEC_DISCOVERY_DEADLINE:
+        _deadline = min(_deadline, _EXEC_DISCOVERY_DEADLINE)
 
     # [wave-50] Algolia-first search: client-rendered search pages answer the
     # query from an index, not from SSR anchors, and on TLS-gated sites the
@@ -909,6 +934,12 @@ def _discover_urls_via_search(
             # INCONCLUSIVE, and _route_after_execution can tell the
             # difference between our cap and the site's end.
             stop_reason = "limit_hit"
+            break
+        if _EXEC_DISCOVERY_DEADLINE and time.monotonic() > _EXEC_DISCOVERY_DEADLINE:
+            # [wave-63] Budget discovery sub-deadline spent — a bounded run,
+            # not a site failure (never reads as coverage-fail downstream).
+            logger.info("Phase 1: exec time budget discovery deadline — stopping")
+            stop_reason = EXEC_BUDGET_STOP
             break
 
         next_url = _get_next_page_url(final_url, current_page + 1, html)
@@ -1061,6 +1092,11 @@ def _discover_urls_via_form_search(
         if limit and len(all_urls) >= limit:
             logger.info("Phase 1 (form-search): reached limit=%d", limit)
             stop_reason = "limit_hit"  # [wave-34 F6] self-imposed cap
+            break
+        if _EXEC_DISCOVERY_DEADLINE and time.monotonic() > _EXEC_DISCOVERY_DEADLINE:
+            # [wave-63] Budget discovery sub-deadline spent (see search walk).
+            logger.info("Phase 1 (form-search): exec budget discovery deadline — stopping")
+            stop_reason = EXEC_BUDGET_STOP
             break
 
         # Submit the form with this option
@@ -1257,6 +1293,11 @@ def _discover_urls_via_category(
             break
         if limit and len(all_urls) >= limit:
             stop_reason = "limit_hit"  # [wave-34 F6] self-imposed cap
+            break
+        if _EXEC_DISCOVERY_DEADLINE and time.monotonic() > _EXEC_DISCOVERY_DEADLINE:
+            # [wave-63] Budget discovery sub-deadline spent (see search walk).
+            logger.info("Phase 1: exec time budget discovery deadline — stopping")
+            stop_reason = EXEC_BUDGET_STOP
             break
 
         next_url = _get_next_page_url(final_url, current_page + 1, html)
@@ -1672,9 +1713,24 @@ def main():
         logger.info("Env gate: SCRAPER_LISTING_URL → --listing-url %s (fresh)",
                     _env_listing[:80])
 
+    # [wave-63] Execution time budget (env-var, injected by run_execution).
+    global _EXEC_DISCOVERY_DEADLINE, _EXEC_EXTRACTION_DEADLINE, _EXEC_BOUNDED
+    _env_budget = os.environ.get("SCRAPER_EXEC_TIME_BUDGET", "").strip()
+    _exec_budget = int(_env_budget) if _env_budget.isdigit() else None
+    if _exec_budget:
+        logger.info("Env gate: SCRAPER_EXEC_TIME_BUDGET → %ss (graceful bound)", _exec_budget)
+
     limit = 5 if args.sample else args.limit
     start_time = time.time()
     discovered_urls: list[str] = []
+
+    # [wave-63] Two-deadline split: discovery must reserve extraction time;
+    # extraction itself may run to the full budget (the protected window).
+    if _exec_budget:
+        (
+            _EXEC_DISCOVERY_DEADLINE,
+            _EXEC_EXTRACTION_DEADLINE,
+        ) = _exec_budget_deadlines(_exec_budget, time.monotonic())
 
     # ── Coverage-gate state (contract §1) ───────────────────────────────────
     # ran_phase1=False emits stop_reason="skipped" + skipped_reason.
@@ -1737,6 +1793,8 @@ def main():
             logger.error("No --query, --category-url, or --listing-url provided")
             sys.exit(1)
         logger.info("Phase 1: discovered %d URLs (pre-category)", len(discovered_urls))
+        if aggregate_stop_reason == EXEC_BUDGET_STOP:
+            _EXEC_BOUNDED = True
         _write_checkpoint(discovered_urls)
     else:
         src_url_base = args.query or args.category_url or args.listing_url or "(checkpoint)"
@@ -1750,12 +1808,29 @@ def main():
         for cat_url in CATEGORY_URLS:
             # Fail-fast: bound discovery wall-clock so a blocking/slow site can't
             # hang across many categories. navigate_error lets the gate switch.
-            if time.monotonic() - _deadline_start > DISCOVERY_DEADLINE_SECONDS:
-                logger.warning(
-                    "Phase 1b: discovery exceeded %ss deadline — stopping (navigate_error)",
-                    DISCOVERY_DEADLINE_SECONDS,
-                )
-                aggregate_stop_reason = _merge_stop_reason(aggregate_stop_reason, "navigate_error")
+            # [wave-63] Honors min(own 300s deadline, exec budget discovery
+            # deadline); a budget stop is BOUNDED, not navigate_error.
+            _exec_spent = (
+                _EXEC_DISCOVERY_DEADLINE and time.monotonic() > _EXEC_DISCOVERY_DEADLINE
+            )
+            if _exec_spent or (
+                time.monotonic() - _deadline_start > DISCOVERY_DEADLINE_SECONDS
+            ):
+                if _exec_spent:
+                    logger.warning(
+                        "Phase 1b: exec time budget discovery deadline — stopping (%s)",
+                        EXEC_BUDGET_STOP,
+                    )
+                    _EXEC_BOUNDED = True
+                    aggregate_stop_reason = _merge_stop_reason(
+                        aggregate_stop_reason, EXEC_BUDGET_STOP
+                    )
+                else:
+                    logger.warning(
+                        "Phase 1b: discovery exceeded %ss deadline — stopping (navigate_error)",
+                        DISCOVERY_DEADLINE_SECONDS,
+                    )
+                    aggregate_stop_reason = _merge_stop_reason(aggregate_stop_reason, "navigate_error")
                 break
             if not isinstance(cat_url, str) or cat_url in existing:
                 continue
@@ -1895,6 +1970,18 @@ def main():
                 for url in discovered_urls
             }
             for future in as_completed(futures):
+                # [wave-63] Extraction runs to the FULL budget (its protected
+                # window). Stop between completions; queued (not-yet-started)
+                # items are cancelled — running ones finish and are counted.
+                if _EXEC_EXTRACTION_DEADLINE and time.monotonic() > _EXEC_EXTRACTION_DEADLINE:
+                    logger.warning(
+                        "Phase 2: exec time budget extraction deadline at %d/%d "
+                        "— finalizing (bounded run)", completed, total,
+                    )
+                    _EXEC_BOUNDED = True
+                    for _f in futures:
+                        _f.cancel()
+                    break
                 url = futures[future]
                 completed += 1
                 try:
@@ -1953,6 +2040,12 @@ def main():
         # [T3.13c/job-76 myhouse] True when Phase 2 finished faster than its
         # per-fetch floor allows — the item fetches never actually happened.
         "phase2_instant_fail": phase2_instant,
+        # [wave-63] Honest bounded-run marker: scope=all was trimmed by the
+        # execution time budget, not by a site failure. found stays the
+        # post-filter count (never repurposed) so shortfall remediation
+        # never arms on a bounded run.
+        "time_budget_bounded": _EXEC_BOUNDED,
+        "exec_time_budget_seconds": _exec_budget,
     }
 
     # [wave-40 T14] A checkpoint-rescued run reports the REUSED yield as its

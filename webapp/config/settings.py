@@ -463,6 +463,14 @@ SCRAPER_EXECUTION_MODE = config("SCRAPER_EXECUTION_MODE", default="auto")
 EXECUTION_STALL_TIMEOUT = config("EXECUTION_STALL_TIMEOUT", default=300, cast=int)
 EXECUTION_TIMEOUT = config("EXECUTION_TIMEOUT", default=3600, cast=int)
 EXECUTION_MAX_TIMEOUT = config("EXECUTION_MAX_TIMEOUT", default=9600, cast=int)
+#   EXECUTION_ITEM_TIME_BUDGET — [wave-63] graceful per-execution time budget
+#       (seconds), injected to scrapers as SCRAPER_EXEC_TIME_BUDGET. Templates
+#       split it into two deadlines — discovery gets the budget minus a
+#       clamped reserve, extraction may run to the full budget — so a
+#       catalogue-scale walk FINISHES with rows instead of dying at the hard
+#       runner wall with zero output (job 662). Default 3000 = 3600 wall −
+#       600s finalize margin. 0 disables (unlimited, today's behavior).
+EXECUTION_ITEM_TIME_BUDGET = config("EXECUTION_ITEM_TIME_BUDGET", default=3000, cast=int)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 SCRAPERS_DIR = PROJECT_ROOT / "scrapers"

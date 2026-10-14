@@ -730,6 +730,88 @@ def _checkpoint_reuse_env(
     return {CHECKPOINT_REUSE_ENV: "1" if armed else "0"}
 
 
+EXEC_TIME_BUDGET_ENV = "SCRAPER_EXEC_TIME_BUDGET"
+
+
+def _item_time_budget() -> int:
+    """The configured per-execution item time budget (0 ⇒ disabled)."""
+    from django.conf import settings
+
+    try:
+        return int(getattr(settings, "EXECUTION_ITEM_TIME_BUDGET", 3000) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _exec_budget_env(budget_seconds: int | None = None) -> dict[str, str]:
+    """[wave-63] Graceful execution time budget for one run (job 662).
+
+    662: the tester certified the draft at ``--limit 50`` (579s) then
+    execution fired the SAME scraper UNCAPPED on a catalogue-scale listing —
+    the walk mathematically exceeded the runner's 3600s wall, the SIGKILL lost
+    the end-of-run-only output, and a certified-good draft shipped an honest
+    FAILED pc=0. The budget travels by ENV (immune to
+    ``_filter_supported_args`` — no ``--limit`` ladder at execution, per the
+    MUST-NOT); the templates split it into TWO deadlines (discovery gets the
+    budget minus a clamped reserve; extraction may run to the full budget) so
+    execution can always FINISH with rows.
+
+    Returns an EXPLICIT value in BOTH directions (the T15 shape):
+    - budget on → ``{"SCRAPER_EXEC_TIME_BUDGET": "<seconds>"}``
+    - disabled  → ``{}`` — but the AMBIENT env is never a carrier here (the
+      in-process Popen starts from celery's env and the bs lane stages a fresh
+      subprocess env), so nothing to explicitly zero; the probe lane composes
+      its own env and never sees this (probes are discovery, not execution).
+    """
+    budget = budget_seconds
+    if budget is None:
+        budget = _item_time_budget()
+    try:
+        budget = int(budget)
+    except (TypeError, ValueError):
+        return {}
+    if budget <= 0:
+        return {}
+    return {EXEC_TIME_BUDGET_ENV: str(budget)}
+
+
+def _append_execution_note(job_id, note: str) -> None:
+    """[wave-63] Run-scope note delivery to the job record.
+
+    No note mechanism existed in run_execution (grep-verified at plan time);
+    this mirrors graph.py's PDP-flip note append (ORM append +
+    ``update_fields=["notes"]``). A note is instrumentation — never worth a
+    run — so every failure path is swallowed.
+    """
+    if not job_id or not note:
+        return
+    try:
+        from scraper.models import ScrapeJob
+
+        _job = ScrapeJob.objects.filter(pk=job_id).first()
+        if _job is not None:
+            _job.notes = ((_job.notes + "\n") if _job.notes else "") + note
+            _job.save(update_fields=["notes"])
+    except Exception as exc:
+        logger.warning("run_execution: note write failed: %s", exc)
+
+
+def _note_budget_bound(job_id, coverage) -> None:
+    """Deliver the bounded-run honesty note when the template reports
+    ``time_budget_bounded`` in its discovery_coverage."""
+    if not isinstance(coverage, dict) or not coverage.get("time_budget_bounded"):
+        return
+    _budget = coverage.get("exec_time_budget_seconds") or "?"
+    _append_execution_note(
+        job_id,
+        "EXEC BUDGET: scope bounded at {}s (graceful time budget) — "
+        "found={} discovered={} stop={}".format(
+            _budget, coverage.get("found"), coverage.get("discovered_urls"),
+            coverage.get("stop_reason"),
+        ),
+    )
+
+
 def _heal_url_list_seed(
     scraper_path: str, input_mode: str, seed_urls, job_url: str = "",
 ) -> None:
@@ -1793,9 +1875,14 @@ def _run_category_sources(state, scraper_path, base_args, site_folder, primary_r
                 # W8: 429/502 backpressure used to land here un-checked — the
                 # error body became output_content="" and the category was
                 # silently skipped, under-counting the merged output.
+                # [wave-63] Budget SCALED per leg: min(item budget, leg wall
+                # 600s − 60s finalize margin) ⇒ 540 today — the clamped-reserve
+                # template math keeps the leg's discovery window alive (B4).
                 _res = post_scrape_with_retry(
                     f"{service_url}/scrape",
-                    {"scraper_source": _cat_source, "scraper_name": os.path.basename(scraper_path), "args": cat_args, "timeout": 600, "env_overrides": stealth_env},
+                    {"scraper_source": _cat_source, "scraper_name": os.path.basename(scraper_path), "args": cat_args, "timeout": 600, "env_overrides": {**stealth_env, **_exec_budget_env(min(
+                        _item_time_budget(), 600 - 60
+                    ))}},
                     timeout=620,
                 )
                 if not _res.ok:
@@ -1947,6 +2034,10 @@ def _run_in_process(
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd,
             env={**os.environ, **(env_overrides or {}),
+                 # [wave-63] Graceful execution time budget (job 662) — every
+                 # in-process scraper subprocess gets it (this lane is the
+                 # DEFAULT for the HTTP family).
+                 **_exec_budget_env(),
                  # DETERMINISTIC DISCOVERY: set SCRAPER_LISTING_URL for nav/list_page
                  # jobs so the template's main() runs Phase 1 discovery (env-var gate)
                  # regardless of CLI flags (which code_writer may not declare). This
@@ -2090,6 +2181,9 @@ def _run_in_process(
         _stamp_seed_provenance(output_file, seed_urls, input_mode)
         product_count = _count_products(output_file)
         discovery_coverage = _read_discovery_coverage(output_file)
+        # [wave-63] Deliver the bounded-run honesty note (instrumentation —
+        # the run itself is judged by the normal gates).
+        _note_budget_bound(job_id, discovery_coverage)
         # F9 quality gate (nav modes): collapse-level failure rates -> FAILED
         _q = _extraction_quality_gate(
             output_file, input_mode, product_count,
@@ -2335,7 +2429,9 @@ def _run_via_browser_service(
                 "args": args,
                 "timeout": timeout,
                 "max_retries": bounded_scrape_attempts(timeout),
-                "env_overrides": stealth_env,
+                # [wave-63] budget env rides the payload (merged, not mutated —
+                # stealth_env is reused by the category-leg lane below).
+                "env_overrides": {**stealth_env, **_exec_budget_env()},
             },
             timeout=timeout + 60,
         )
@@ -2443,6 +2539,9 @@ def _run_via_browser_service(
             except OSError as exc:
                 logger.warning("run_execution: could not persist output locally: %s", exc)
         discovery_coverage = _read_discovery_coverage(output_file) if output_file else {}
+        # [wave-63] Deliver the bounded-run honesty note (instrumentation —
+        # the run itself is judged by the normal gates).
+        _note_budget_bound(_exec_job_id, discovery_coverage)
         # [wave-56b F10] Payload identity rides the artifact itself (592:
         # cleanup rewrote the seed file 23s post-run, erasing the evidence).
         _stamp_seed_provenance(
