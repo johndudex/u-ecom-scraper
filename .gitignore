@@ -49,6 +49,12 @@ downloaded_files/
 # (scripts/seed_fm_input_urls.py).
 scrapers/
 
+# Defense-in-depth inside scrapers/: run outputs and regenerable copies stay
+# out of git even if the blanket rule above is ever narrowed.
+scrapers/*/output_*.json
+scrapers/*/scraper-*.py
+scrapers/*/*_dagster.py
+
 # Sensitive session cookies
 data/akamai-cookies/
 
