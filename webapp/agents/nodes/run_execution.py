@@ -731,6 +731,11 @@ def _checkpoint_reuse_env(
 
 
 EXEC_TIME_BUDGET_ENV = "SCRAPER_EXEC_TIME_BUDGET"
+# [wave-64 F1] Draft-side compatibility alias. The job-663 writer invented
+# this name (defaulting 540 — a category-leg value) instead of consuming the
+# contract env, so run_execution had no control over the bound. Both names
+# now carry the same system-chosen value; templates never read the alias.
+ALIAS_TIME_BUDGET_ENV = "SCRAPER_TIME_BUDGET_S"
 
 
 def _item_time_budget() -> int:
@@ -757,7 +762,11 @@ def _exec_budget_env(budget_seconds: int | None = None) -> dict[str, str]:
     execution can always FINISH with rows.
 
     Returns an EXPLICIT value in BOTH directions (the T15 shape):
-    - budget on → ``{"SCRAPER_EXEC_TIME_BUDGET": "<seconds>"}``
+    - budget on → ``{"SCRAPER_EXEC_TIME_BUDGET": "<seconds>",
+      "SCRAPER_TIME_BUDGET_S": "<seconds>"}`` — the second key is the
+      [wave-64 F1] draft-side alias (job-663's writer invented that name and
+      self-bounded at 540s, ignoring the contract env; both spellings are now
+      system-controlled).
     - disabled  → ``{}`` — but the AMBIENT env is never a carrier here (the
       in-process Popen starts from celery's env and the bs lane stages a fresh
       subprocess env), so nothing to explicitly zero; the probe lane composes
@@ -772,7 +781,7 @@ def _exec_budget_env(budget_seconds: int | None = None) -> dict[str, str]:
         return {}
     if budget <= 0:
         return {}
-    return {EXEC_TIME_BUDGET_ENV: str(budget)}
+    return {EXEC_TIME_BUDGET_ENV: str(budget), ALIAS_TIME_BUDGET_ENV: str(budget)}
 
 
 def _append_execution_note(job_id, note: str) -> None:

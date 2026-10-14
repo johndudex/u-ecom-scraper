@@ -11562,6 +11562,44 @@ def _invoke_code_tester(state: ScrapeState, config: RunnableConfig) -> dict[str,
                 "_invoke_code_tester: CLI contract violation → test FAIL "
                 "(job %s, retry_count=%s)", job_id, _retry_now,
             )
+        # [wave-64 F3] contract-env scan: WARNING-ONLY, appended to the issues
+        # TAIL (never position 0 — that slot is the remediation-message
+        # fallback; never a forced FAIL — MEDIUM is non-veto by routing). Job
+        # 663's writer invented its own budget env; this surfaces the drift
+        # in the tester's report so it stops being invisible. Gated on a LIVE
+        # dict report: the dead-tester arm ships test_report=None on purpose
+        # (stale-report rejection, job-81) — the scan must never manufacture
+        # a report where the harness refused one.
+        if not _cli_violation and isinstance(report, dict):
+            try:
+                from .draft_safety import missing_contract_env_issue
+
+                _f3_issue = missing_contract_env_issue(_call_src)
+                if _f3_issue:
+                    _known = {
+                        (str(i.get("field")), str(i.get("description")))
+                        for i in (report.get("issues") or [])
+                        if isinstance(i, dict)
+                    }
+                    if (
+                        str(_f3_issue.get("field")),
+                        str(_f3_issue.get("description")),
+                    ) not in _known:
+                        report["issues"] = (report.get("issues") or []) + [
+                            _f3_issue
+                        ]
+                        update["test_report"] = report
+                        logger.warning(
+                            "_invoke_code_tester: contract-env drift warning "
+                            "appended (job %s): %s",
+                            job_id,
+                            str(_f3_issue.get("description", ""))[:120],
+                        )
+            except Exception as _exc:
+                logger.warning(
+                    "_invoke_code_tester: contract-env scan errored (job %s): %s",
+                    job_id, _exc,
+                )
         # [job-329 wall] Pin the draft the tester just judged, whatever the
         # verdict — run_execution refuses any post-verdict drift against it.
         from .nodes.run_execution import _stamp_tested_draft

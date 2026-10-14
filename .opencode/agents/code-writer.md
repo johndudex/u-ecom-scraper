@@ -88,6 +88,24 @@ extraction functions** with the field map provided — NOT to rewrite the templa
 If the template has `_extract_item(html, url)` or similar, replace ITS BODY with
 the field map's selectors/methods. Keep the function signature + all surrounding code.
 
+### Execution time budget — CONTRACT (wave-64)
+
+The harness injects `SCRAPER_EXEC_TIME_BUDGET` (alias `SCRAPER_TIME_BUDGET_S`, same value) into every
+execution run — **units are SECONDS**. This is a CONTRACT, not a suggestion:
+
+- **Consume the env names verbatim** when the draft needs a time budget. **Never invent** a different
+  env name (job 663's draft invented `SCRAPER_TIME_BUDGET_S` with a hard-coded 540 default and the
+  harness could not control the bound), and **never hard-default a budget**: absent env ⇒ no bound
+  (the template's two-deadline structure already handles this — keep it).
+- Keep the template's budget machinery when adapting: TWO deadlines (discovery gets budget minus a
+  clamped reserve; extraction may run to the full budget), the periodic partial-output flush, and the
+  `exec_time_budget` stop reason.
+- Record the bound at `metadata.discovery_coverage.time_budget_bounded` (plus the resolved seconds in
+  `exec_time_budget_seconds`) — NOT at the metadata top level (downstream gates read the
+  discovery_coverage placement).
+- **Log the resolved budget once at startup** (e.g. `Env gate: SCRAPER_EXEC_TIME_BUDGET=…`) so the job
+  log carries the proof the draft consumed the system value.
+
 ### Discovery & pagination — SHARED IMPORT (CRITICAL)
 
 The template's Phase-1 discovery (pagination, load-more, page-param) is now an

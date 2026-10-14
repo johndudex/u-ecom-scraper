@@ -806,6 +806,56 @@ def draft_call_violation(source: str) -> str:
     )
 
 
+_CONTRACT_BUDGET_ENV = "SCRAPER_EXEC_TIME_BUDGET"
+_CONTRACT_BUDGET_ALIAS = "SCRAPER_TIME_BUDGET_S"
+
+
+def missing_contract_env_issue(source: str) -> dict | None:
+    """[wave-64 F3] Warning-only contract scan over a generated draft: does
+    it consume the harness-injected execution time budget?
+
+    Job 663: the writer received the job-662 RCA and self-implemented a
+    graceful budget under its OWN env name (``SCRAPER_TIME_BUDGET_S``,
+    hard-defaulted to 540s — a category-leg value), so run_execution had no
+    control over the bound and the flagship passed on a writer-guessed fuse.
+    The scan surfaces that drift in the tester's report: severity ``medium``
+    — a WARNING, never a verdict (small sites legitimately finish under any
+    budget; run_execution's F1 alias belt controls the value for drafts that
+    read either name). Callers APPEND this to the issues tail — never
+    position 0 (issues[0] is the remediation-message fallback).
+
+    No runtime import/exec of the draft, no network, no LLM.
+    """
+    has_name = isinstance(source, str) and _CONTRACT_BUDGET_ENV in source
+    if has_name:
+        return None
+    if not isinstance(source, str) or not source.strip():
+        _why = "draft source is EMPTY — cannot verify contract consumption"
+    else:
+        _why = (
+            "draft never reads the contract env (drift class: job 663's "
+            "writer invented its own budget env and hard-defaulted 540s)"
+        )
+    return {
+        "field": "time_budget",
+        "issue_type": "missing_contract_env",
+        "severity": "medium",
+        "description": (
+            f"Deterministic check: {_why}. The harness injects "
+            f"{_CONTRACT_BUDGET_ENV} (SECONDS) into every execution run; a "
+            "draft that ignores it cannot be scope-bounded by run_execution"
+        ),
+        "suggested_fix": (
+            f"Consume {_CONTRACT_BUDGET_ENV} (alias {_CONTRACT_BUDGET_ALIAS}, "
+            "SECONDS) verbatim; never invent a budget env name and never "
+            "hard-default a bound (absent env ⇒ no bound); keep the "
+            "template's two-deadline structure and record the bound at "
+            "metadata.discovery_coverage.time_budget_bounded; log the "
+            "resolved budget once at startup"
+        ),
+    }
+
+
 def _draft_call_findings(tree) -> list[str]:
     registry = _helper_registry()
     if not registry:
