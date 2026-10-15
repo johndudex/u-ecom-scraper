@@ -20,6 +20,14 @@ the URL matches `/p/<id>` (a single 32-piece-set product page). The coercion not
 carries a `warning` slot (wave-55 M4 fragment warning, spread at :3775) and intake.html renders it
 via `showBuildWarning` (:2209, call at :2199) — **the coercion never uses either**.
 
+**Face A correction (2026-10-15, user testimony — supersedes the first reading).** The user did
+NOT paste a bare PDP: they pasted the `/b/` baccarat catalog (`/crystal-baccarat/b/002-800087`)
+into the listing box with the Lismore-set PDP as the main example URL — the exact shape the intake
+form invites (its homepage error says to paste "one product, listing…"). Coercion fired on the
+PDP-shaped main URL and rebound nav_method BEFORE the listing branch read `listing_urls`, so the
+catalog URL was silently DISCARDED — the job ran as a 1-row PDP scrape. Coercion-with-seeds-present
+is wrong in every shape; F4 below narrows the trigger.
+
 **Face B — prod 1418 (amazon.in `/s?rh=` listing, FAILED pc=0 after ~2.5h).** Exact-list mode
 accepted a search-results URL as a product-URL seed; no intake check covers the "listing submitted
 as PDP list" direction. Execution died honestly (`navigate_error`).
@@ -70,6 +78,16 @@ is checked; `isRunSampleReady` (:1156) blocks loudly — the two disagree.
    `showUrlError('Choose how we should find the pages — exact list, listing page, or search.')`
    and return before building FormData. (The `scope || 'all'` fallback is unreachable — firstn
    ships `checked` at intake.html:546; leave it.)
+4. **F4 — coercion never fires when seeds were supplied (Face A correction, post-ship).** In
+   `intake_create_job`, the `coerce_pdp_intake` call is skipped when the POST carries ANY of
+   `listing_urls` / `search_url` / `search_keywords` (non-empty): those submissions are
+   definitionally catalog jobs and the PDP-shaped main URL is just the example page. Bare-PDP
+   submissions (626-class — wave-40/wave-55 view pins all use that shape) still coerce.
+   Wave-37's unit pins are on the function itself and are untouched. Test evidence: RED ×2 →
+   GREEN; the first search-mode test draft tripped the wave-32 cross-host gate (test bug, fixed
+   in-test). The original MUST-NOT ("no change to wave-37 coercion semantics") is hereby amended
+   by evidence: narrowing the TRIGGER to the bare-PDP shape preserves wave-37's purpose (every
+   wave-37/wave-40/wave-55 pinned shape still coerces) while closing the 1417 seed-discard class.
 
 ## MUST-NOT
 

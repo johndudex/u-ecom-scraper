@@ -152,6 +152,48 @@ class TestF2SearchLookalikeGuard(_IntakeHarness):
         self.assertEqual(job.input_mode, "list_page")
 
 
+class TestF4CoercionGuard(_IntakeHarness):
+    """[wave-65 F4] Coercion is for the BARE-PDP shape (626-class: nothing
+    but a PDP pasted in). When the submission carries listing/search seeds,
+    a PDP-shaped main URL is just the example page — the intake form invites
+    exactly that (its homepage error says to paste 'one product, listing…').
+    Coercing that shape silently discards the seeds: prod 1417 ran a
+    /b/ baccarat catalog as a 1-row PDP scrape because the Lismore set
+    example URL sat in the main field."""
+
+    def test_pdp_example_with_listing_seeds_keeps_listing_mode(self):
+        resp = self._post(
+            url=PDP_URL, nav_method="listing",
+            listing_urls="https://www.replacements.com/crystal-baccarat/b/002-800087")
+        self.assertEqual(resp.status_code, 200, resp.content[:300])
+        self.assertNotIn("warning", resp.json())  # no coercion happened
+        job = ScrapeJob.objects.latest("id")
+        self.assertEqual(job.input_mode, "list_page")
+        self.assertEqual(job.url, PDP_URL)
+        self.assertEqual(
+            job.search_criteria,
+            "https://www.replacements.com/crystal-baccarat/b/002-800087")
+
+    def test_pdp_example_with_search_fields_keeps_search_mode(self):
+        resp = self._post(
+            url=PDP_URL, nav_method="search",
+            search_url="https://www.replacements.com/search?q=lismore",
+            search_keywords="lismore")
+        self.assertEqual(resp.status_code, 200, resp.content[:300])
+        self.assertNotIn("warning", resp.json())
+        job = ScrapeJob.objects.latest("id")
+        self.assertEqual(job.input_mode, "search_term")
+        self.assertEqual(
+            job.search_url, "https://www.replacements.com/search?q=lismore")
+
+    def test_bare_pdp_still_coerces(self):
+        # 626-class regression pin: the seeds-absent shape coerces as before
+        resp = self._post(url=PDP_URL, nav_method="listing", listing_urls="")
+        self.assertEqual(resp.status_code, 200, resp.content[:300])
+        self.assertIn("warning", resp.json())
+        self.assertEqual(ScrapeJob.objects.latest("id").input_mode, "url_list")
+
+
 class TestF3TemplatePins(TestCase):
     def test_intake_template_pins(self):
         template_path = os.path.join(

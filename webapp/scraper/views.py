@@ -3451,7 +3451,18 @@ def intake_create_job(request):
     # wave-32 B3 host gate, the mode map — follows the coerced mode.
     from src.intake_coerce import coerce_pdp_intake, looks_like_search_seed
 
-    nav_method, _coerce_note = coerce_pdp_intake(url, nav_method)
+    # [wave-65 F4] Coercion is for the BARE-PDP shape (626-class). When the
+    # submission supplies listing/search seeds, a PDP-shaped main URL is just
+    # the example page (the form invites that) — coercing would flip the mode
+    # BEFORE the branches below ever read the seeds, silently discarding them
+    # (prod 1417: /b/ catalog in the listing box, Lismore PDP example in the
+    # main field → 1-row PDP scrape).
+    if (request.POST.get("listing_urls", "").strip()
+            or request.POST.get("search_url", "").strip()
+            or request.POST.get("search_keywords", "").strip()):
+        _coerce_note = ""
+    else:
+        nav_method, _coerce_note = coerce_pdp_intake(url, nav_method)
     if _coerce_note:
         notes = f"{notes} | {_coerce_note}".strip(" |")
         logger.info("intake_create_job: %s", _coerce_note)
