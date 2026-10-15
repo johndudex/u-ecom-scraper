@@ -3449,7 +3449,7 @@ def intake_create_job(request):
     # carousels as a "listing" and died on the cross-domain guard). Rebind
     # nav_method so EVERY downstream branch — search_criteria selection, the
     # wave-32 B3 host gate, the mode map — follows the coerced mode.
-    from src.intake_coerce import coerce_pdp_intake
+    from src.intake_coerce import coerce_pdp_intake, looks_like_search_seed
 
     nav_method, _coerce_note = coerce_pdp_intake(url, nav_method)
     if _coerce_note:
@@ -3532,6 +3532,14 @@ def intake_create_job(request):
     if _fragment_warning:
         notes = f"{notes} | [FRAGMENT-DROPPED] {_fragment_warning}".strip(" |")
         logger.info("intake_create_job: %s", _fragment_warning)
+    # [wave-65 F1] one merged submit-time warning: coercion note + fragment
+    # notice, joined once (a second "warning" spread in the response would
+    # silently clobber this one). Coercion rebinds nav_method BEFORE the
+    # listing/search branches read listing_urls/search_url, so the arms are
+    # disjoint in practice — the join is defensive.
+    _submit_warning = "; ".join(
+        w for w in (_coerce_note, _fragment_warning) if w
+    )
 
     existing = ScrapeJob.objects.filter(
         url=url, status__in=[ScrapeJob.STATUS_PENDING, ScrapeJob.STATUS_RUNNING],
@@ -3648,6 +3656,32 @@ def intake_create_job(request):
     )
     if _reason:
         return JsonResponse({"error": _reason, "missing_url_list": True}, status=422)
+
+    # [wave-65 F2] Search-lookalike guard (prod 1418: an amazon /s?rh= URL
+    # shipped as an exact-list seed and burned 2.5h to an honest pc=0).
+    # NARROW on purpose: only SEARCH-shaped seeds hard-fail — category and
+    # collection seeds keep wave-57's warn-stamp contract (job 566 shipped
+    # 913 rows behind them), and /s/<slug>/<digits> PDPs are spared by the
+    # runtime classifier's item-shaped veto. User choice, never mutation:
+    # exact_list_override=1 re-submits past this (dup-modal pattern).
+    if nav_method == "list":
+        _submitted_seeds = [u.strip() for u in list_urls.splitlines() if u.strip()]
+        if (
+            not request.POST.get("exact_list_override")
+            and any(looks_like_search_seed(u) for u in _submitted_seeds)
+        ):
+            return JsonResponse(
+                {
+                    "error": (
+                        "That looks like a search/results page, not a product "
+                        "URL. Switch to 'listing page' or 'search' mode — or "
+                        "keep exact-list mode if you really want this URL "
+                        "extracted as one item."
+                    ),
+                    "listing_lookalike": True,
+                },
+                status=422,
+            )
 
     job = ScrapeJob.objects.create(
         url=url,
@@ -3772,7 +3806,16 @@ def intake_create_job(request):
             # [wave-55 M4] Non-fatal — the job runs anyway; intake.html
             # renders this on the job screen, and the same text is on the
             # row (notes) for the post-hoc read.
-            **({"warning": _fragment_warning} if _fragment_warning else {}),
+            # [wave-65 F1] the wave-37 coercion note joins the same slot
+            # (prod 1417: the user only found out about the mode flip from
+            # the badge). Single spread — two "warning" spreads would
+            # clobber. Arms are disjoint in practice (coercion empties
+            # search_criteria before the fragment read) but the join is
+            # defensive.
+            **(
+                {"warning": _submit_warning}
+                if _submit_warning else {}
+            ),
             # [wave-57 class 1a] listing-seed honesty stamp (job 566 class)
             **(
                 {"listing_seeds": {"warning": _listing_seed_warning}}

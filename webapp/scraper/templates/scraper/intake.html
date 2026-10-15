@@ -2147,7 +2147,13 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
   function runBuild(){
     var url = X('#example-url').value.trim();
     if(!url){ showUrlError('Enter a sample page URL first.'); X('#example-url').focus(); return; }
-    var navMethod = (document.querySelector('input[name=nav]:checked')||{}).value || 'list';
+    // [wave-65 F3] No silent mode default — a job created without a chosen
+    // method is how a listing URL ends up in the exact-list lane (prod 1418).
+    var navMethod = (document.querySelector('input[name=nav]:checked')||{}).value;
+    if(!navMethod){
+      showUrlError('Choose how we should find the pages — exact list, listing page, or search.');
+      return;
+    }
     var scope = (document.querySelector('input[name=scope]:checked')||{}).value || 'all';
     var fd = new FormData();
     fd.append('url', url);
@@ -2182,9 +2188,19 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
      duplicate-site modal can re-submit the same form with force=1. */
   function submitBuild(fd){
     var btn = X('#run-sample'); btn.disabled = true;
+    // [wave-65] clear any previous submit-time warning so a stale notice
+    // never persists across a clean re-submit.
+    var staleWarn = X('#build-warning');
+    if(staleWarn) staleWarn.classList.add('hidden');
     postJSON(INTAKE_CONFIG.createJobUrl, fd).then(function(data){
       btn.disabled = false;
       if(data.duplicate && data.scope === 'site'){ openDupModal(data, fd); return; }
+      // [wave-65 F2] must precede the generic error branch — showUrlError
+      // hides the pasted-URL textarea, the wrong surface for a mode-choice.
+      if(data.listing_lookalike){
+        showLookalikeNotice(data.error || 'That looks like a search/results page.', fd);
+        return;
+      }
       if(data.error){ showUrlError(data.error); return; }
       intakeState.job = data; intakeState.jobId = data.job_id; intakeState.terminal = false;
       if(data.job_id){ history.replaceState(null, '', location.pathname + '?job=' + data.job_id); }
@@ -2210,6 +2226,55 @@ textarea.locked{background:var(--surface-2); color:var(--faint); cursor:not-allo
     var e = X('#build-warning');
     if(!e) return;
     e.textContent = msg;
+    e.classList.remove('hidden');
+  }
+  /* [wave-65 F2] a search-shaped URL landed in the exact-list lane. Offer
+     the mode switch inline (user choice, never a silent rebind) — the same
+     surface showBuildWarning uses, plus two actions. */
+  function showLookalikeNotice(msg, fd){
+    var e = X('#build-warning');
+    if(!e){ return; }
+    e.innerHTML = '';
+    var txt = document.createElement('span');
+    txt.textContent = msg + ' ';
+    e.appendChild(txt);
+    var switchBtn = document.createElement('button');
+    switchBtn.type = 'button'; switchBtn.className = 'btn btn-sm';
+    switchBtn.textContent = 'Switch to listing mode';
+    switchBtn.addEventListener('click', function(){
+      e.classList.add('hidden');
+      // move the pasted URLs into the listing textarea, select the listing
+      // card (radio + .sel — the wave-54 restore DOM pattern), re-run.
+      var listText = X('#nav-list-text'), listingText = X('#nav-listing-text');
+      if(listText && listingText && listText.value.trim()){
+        listingText.value = listingText.value.trim()
+          ? listingText.value.trim() + '\n' + listText.value.trim()
+          : listText.value.trim();
+        listText.value = '';
+      }
+      var rad = document.querySelector('input[name=nav][value=listing]');
+      if(rad){
+        rad.checked = true;
+        document.querySelectorAll('#navlist .navcard').forEach(function(c){ c.classList.remove('sel'); });
+        var card = rad.closest('.navcard'); if(card) card.classList.add('sel');
+      }
+      var sub = document.getElementById('sub-list'), subL = document.getElementById('sub-listing');
+      if(sub) sub.classList.add('hidden');
+      if(subL) subL.classList.remove('hidden');
+      refreshRunSampleGate();
+      runBuild();
+    });
+    e.appendChild(switchBtn);
+    var keepBtn = document.createElement('button');
+    keepBtn.type = 'button'; keepBtn.className = 'btn btn-sm';
+    keepBtn.style.marginLeft = '8px';
+    keepBtn.textContent = 'Keep exact list';
+    keepBtn.addEventListener('click', function(){
+      e.classList.add('hidden');
+      fd.set('exact_list_override', '1');
+      submitBuild(fd);
+    });
+    e.appendChild(keepBtn);
     e.classList.remove('hidden');
   }
   var dupFd = null;
